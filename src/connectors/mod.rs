@@ -49,6 +49,7 @@ pub struct NormalizedConversation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedMessage {
+    pub idx: i64,
     pub role: String,
     pub author: Option<String>,
     pub created_at: Option<i64>,
@@ -70,38 +71,3 @@ pub trait Connector {
     fn detect(&self) -> DetectionResult;
     fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>>;
 }
-
-macro_rules! stub_connector {
-    ($name:ident) => {
-        pub struct $name;
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self
-            }
-        }
-
-        impl $name {
-            pub fn new() -> Self {
-                Self
-            }
-        }
-
-        impl Connector for $name {
-            fn detect(&self) -> DetectionResult {
-                DetectionResult::not_found()
-            }
-
-            fn scan(&self, _ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
-                Ok(Vec::new())
-            }
-        }
-    };
-}
-
-stub_connector!(CodexConnector);
-stub_connector!(ClineConnector);
-stub_connector!(GeminiConnector);
-stub_connector!(ClaudeCodeConnector);
-stub_connector!(OpenCodeConnector);
-stub_connector!(AmpConnector);
