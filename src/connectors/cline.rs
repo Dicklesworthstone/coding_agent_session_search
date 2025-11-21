@@ -1,1 +1,1 @@
-//! cline connector placeholder.
+pub use crate::connectors::ClineConnector;

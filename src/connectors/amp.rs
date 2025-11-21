@@ -1,1 +1,1 @@
-//! amp connector placeholder.
+pub use crate::connectors::AmpConnector;

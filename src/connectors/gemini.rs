@@ -1,1 +1,1 @@
-//! gemini connector placeholder.
+pub use crate::connectors::GeminiConnector;

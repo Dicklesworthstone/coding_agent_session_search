@@ -1,1 +1,1 @@
-//! claude_code connector placeholder.
+pub use crate::connectors::ClaudeCodeConnector;

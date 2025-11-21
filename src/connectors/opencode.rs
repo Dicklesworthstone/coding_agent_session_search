@@ -1,1 +1,1 @@
-//! opencode connector placeholder.
+pub use crate::connectors::OpenCodeConnector;
