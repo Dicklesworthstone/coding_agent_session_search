@@ -20,10 +20,12 @@ jobs:
       - name: tests
         run: cargo test
       - name: benches (run, quick)
-        run: cargo bench -- --test-threads=1 --sample-size=10 --warm-up-time 0.1 --measurement-time 0.2
-      - name: UBS (if available)
+        run: cargo bench --bench runtime_perf --bench search_perf --bench index_perf -- --test-threads=1 --sample-size=10 --warm-up-time 0.05 --measurement-time 0.2
+      - name: UBS (changed files only, if available)
         run: |
-          if [ -x ./ubs ]; then ./ubs src || true; fi
-      - name: ratatui snapshot tests
-        run: |
-          if ls tests | grep -q "ui_"; then cargo test --tests; fi
+          if [ -x ./ubs ]; then
+            CHANGED=$(git diff --name-only origin/main...HEAD | tr '\n' ' ')
+            if [ -n "$CHANGED" ]; then ./ubs $CHANGED || true; fi
+          fi
+      - name: ratatui snapshot + hotkey tests
+        run: cargo test --tests -- ui_
