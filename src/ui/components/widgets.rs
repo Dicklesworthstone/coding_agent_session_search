@@ -13,7 +13,15 @@ pub fn search_bar(query: &str, palette: ThemePalette, focused: bool) -> Paragrap
         Style::default().fg(palette.hint)
     };
 
-    Paragraph::new(Line::from(Span::styled(format!("/ {}", query), style)))
+    let body = vec![
+        Line::from(Span::styled(format!("/ {}", query), style)),
+        Line::from(vec![
+            Span::styled("Tips: ", palette.title()),
+            Span::raw("a/w/f/t filters • A/W/F clear • x clear all • o open"),
+        ]),
+    ];
+
+    Paragraph::new(body)
         .block(
             Block::default()
                 .title(title)
