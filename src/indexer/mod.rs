@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,7 +58,7 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
 
     if opts.watch {
         let opts_clone = opts.clone();
-        let state = Arc::new(Mutex::new(HashMap::new()));
+        let state = Arc::new(Mutex::new(load_watch_state(&opts.data_dir)));
         watch_sources(move |paths| {
             let _ = reindex_paths(&opts_clone, paths, state.clone());
         })?;
@@ -185,13 +186,14 @@ fn reindex_paths(
             let mut guard = state.lock().unwrap();
             let entry = guard.entry(kind).or_insert(ts_val);
             *entry = (*entry).max(ts_val);
+            save_watch_state(&opts.data_dir, &guard)?;
         }
     }
     t_index.commit()?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConnectorKind {
     Codex,
     Cline,
@@ -199,6 +201,30 @@ enum ConnectorKind {
     Claude,
     Amp,
     OpenCode,
+}
+
+fn state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("watch_state.json")
+}
+
+fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
+    let path = state_path(data_dir);
+    if let Ok(bytes) = fs::read(&path)
+        && let Ok(map) = serde_json::from_slice(&bytes)
+    {
+        return map;
+    }
+    HashMap::new()
+}
+
+fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
+    let path = state_path(data_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(state)?;
+    fs::write(path, json)?;
+    Ok(())
 }
 
 fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
