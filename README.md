@@ -16,17 +16,19 @@ Load `.env` at startup using dotenvy (see `src/main.rs`); do not use `std::env::
 - `cargo fmt --check`
 
 ## Install
-- Shell (Linux/macOS): `curl -fsSL https://raw.githubusercontent.com/coding-agent-search/coding-agent-search/main/install.sh | sh` (supports `--version`, `--dest`, `--easy-mode`, `OWNER`, `REPO`, `CHECKSUM`). Provide `CHECKSUM` for release tarballs if you want verification; otherwise it will skip.
-- PowerShell (Windows): `irm https://raw.githubusercontent.com/coding-agent-search/coding-agent-search/main/install.ps1 | iex`.
-- Binaries are built via cargo-dist (`.github/workflows/dist.yml`).
+- Shell (Linux/macOS): `curl -fsSL https://raw.githubusercontent.com/coding-agent-search/coding-agent-search/main/install.sh | sh`  
+  Flags: `--version vX.Y.Z`, `--dest DIR`, `--easy-mode`, `OWNER/REPO override`, `--checksum` or `--checksum-url`. The installer *requires* verification: by default it fetches `<tar>.sha256` next to the artifact; override with `--checksum` if you already have it.
+- PowerShell (Windows): `irm https://raw.githubusercontent.com/coding-agent-search/coding-agent-search/main/install.ps1 | iex` with the same checksum rules (defaults to `<zip>.sha256`).
+- Homebrew: `brew install coding-agent-search` (formula refuses to install while `sha256` is a placeholder—set real SHA before publishing).
+- Releases: built via cargo-dist (`.github/workflows/dist.yml`). When publishing, upload the platform archives **and** matching `.sha256` files; keep README links and the Homebrew formula in sync.
 
-## Usage (TUI help)
-- Footer lists main hotkeys; toggle detailed legend with `?` inside TUI.
-- `coding-agent-search index --full` – rebuild SQLite + Tantivy (no source file deletion).
-- `coding-agent-search index --watch` – watch known agent roots and re-index touched connectors.
-- `coding-agent-search tui` – launch TUI.
-- `coding-agent-search completions <shell>` – emit shell completions.
-- `coding-agent-search man` – emit man page.
+## Usage (TUI & indexing)
+- Quickstart: `coding-agent-search index --full` (first run) then `coding-agent-search tui`.
+- Toggle detailed hotkey legend with `?` (initially shown). Open selected hit in your editor with `o` (uses `$EDITOR` + `$EDITOR_LINE_FLAG`, defaults `vi` and `+` for line jumps).
+- Filter hotkeys: `a/w/f/t` to add agent/workspace/time filters, uppercase `A/W/F` to clear each, `x` to clear all; filter pills show their clear keys.
+- Indexing full rebuild: `coding-agent-search index --full` truncates SQLite tables and Tantivy, then re-ingests—never deletes source logs.
+- Incremental watch: `coding-agent-search index --watch` registers filesystem watchers on all known connector roots. Changes are routed to the relevant connector only, using per-connector mtime high-water marks (`since_ts`) to avoid full rescans.
+- Completions/man: `coding-agent-search completions <shell>`, `coding-agent-search man`.
 
 ## Structure (scaffold)
 - `src/main.rs` – entrypoint wiring tracing + dotenvy
