@@ -38,7 +38,7 @@ impl AmpConnector {
         roots
     }
 
-    fn candidate_roots() -> Vec<PathBuf> {
+    pub fn candidate_roots() -> Vec<PathBuf> {
         let mut roots = vec![Self::cache_root()];
         roots.extend(Self::vscode_global_storage());
         roots
@@ -67,7 +67,14 @@ impl Connector for AmpConnector {
         let mut convs = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
-        for root in Self::candidate_roots() {
+        // allow tests to override via ctx.data_root
+        let roots = if ctx.data_root.exists() {
+            vec![ctx.data_root.clone()]
+        } else {
+            Self::candidate_roots()
+        };
+
+        for root in roots {
             if !root.exists() {
                 continue;
             }

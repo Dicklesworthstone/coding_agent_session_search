@@ -41,8 +41,12 @@ impl Connector for GeminiConnector {
         }
     }
 
-    fn scan(&self, _ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let root = Self::root();
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let root = if ctx.data_root.exists() {
+            ctx.data_root.clone()
+        } else {
+            Self::root()
+        };
         if !root.exists() {
             return Ok(Vec::new());
         }

@@ -43,8 +43,12 @@ impl Connector for ClineConnector {
         }
     }
 
-    fn scan(&self, _ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let root = Self::storage_root();
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let root = if ctx.data_root.exists() {
+            ctx.data_root.clone()
+        } else {
+            Self::storage_root()
+        };
         if !root.exists() {
             return Ok(Vec::new());
         }

@@ -61,8 +61,12 @@ impl Connector for CodexConnector {
         }
     }
 
-    fn scan(&self, _ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let home = Self::home();
+    fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let home = if ctx.data_root.exists() {
+            ctx.data_root.clone()
+        } else {
+            Self::home()
+        };
         let files = Self::rollout_files(&home);
         let mut convs = Vec::new();
         for file in files {
