@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "coding-agent-search"
-version = "0.1.4"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -410,7 +410,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "colored",
- "console 0.16.1",
+ "console 0.15.11",
  "criterion",
  "crossbeam-channel",
  "crossterm",
@@ -432,7 +432,7 @@ dependencies = [
  "shell-words",
  "tantivy",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
@@ -481,6 +481,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
+ "unicode-width 0.2.0",
  "windows-sys 0.59.0",
 ]
 
