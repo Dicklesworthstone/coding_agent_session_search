@@ -19,7 +19,7 @@ pub struct SearchFilters {
     pub created_to: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,

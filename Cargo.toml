@@ -53,10 +53,6 @@ tempfile = "*"
 insta = { version = "*", features = ["yaml", "json"] }
 criterion = "*"
 
-[[bin]]
-name = "cass"
-path = "src/main.rs"
-
 [profile.release]
 lto = true
 codegen-units = 1

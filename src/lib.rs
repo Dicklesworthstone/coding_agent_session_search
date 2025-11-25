@@ -67,6 +67,26 @@ pub enum Commands {
     },
     /// Generate man page to stdout
     Man,
+    /// Run a one-off search and print results to stdout
+    Search {
+        /// The query string
+        query: String,
+        /// Filter by agent slug (can be specified multiple times)
+        #[arg(long)]
+        agent: Vec<String>,
+        /// Filter by workspace path (can be specified multiple times)
+        #[arg(long)]
+        workspace: Vec<String>,
+        /// Max results
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -84,83 +104,117 @@ pub async fn run() -> Result<()> {
             // TUI mode: Log to file to avoid breaking the UI
             let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
             std::fs::create_dir_all(&log_dir).ok();
-
+            
             let file_appender = tracing_appender::rolling::daily(&log_dir, "cass.log");
             let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
+            
             tracing_subscriber::registry()
                 .with(filter)
-                .with(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .compact()
-                        .with_target(false)
-                        .with_ansi(false),
-                )
+                .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).compact().with_target(false).with_ansi(false))
                 .init();
-
-            // We must keep _guard alive? No, init() sets the global subscriber.
-            // But non_blocking writer needs the guard to stay alive to flush on drop.
-            // Since run() is async and runs until exit, we can keep _guard here?
-            // No, match arms have different scopes.
-            // Solution: Initialize logging *before* match, but conditionally.
-            // But `non_blocking` returns a guard that must be bound.
-            // Refactor:
-            // We can't easily conditionally init the global subscriber with a guard in a match arm and have it live for the duration of `run` if `run` continues after match (it doesn't, it returns).
-            // Actually, we can just run the TUI logic inside the match arm, keeping `_guard` alive there.
-
+            
             maybe_prompt_for_update(matches!(command, Commands::Tui { once: true, .. })).await?;
-
+            
             if let Commands::Tui { once: false, .. } = &command {
-                let bg_data_dir = log_dir.clone();
-                let bg_db = cli.db.clone();
-                spawn_background_indexer(bg_data_dir, bg_db);
+                 let bg_data_dir = log_dir.clone();
+                 let bg_db = cli.db.clone();
+                 spawn_background_indexer(bg_data_dir, bg_db);
             }
-
+            
             if let Commands::Tui { once, data_dir } = command {
-                ui::tui::run_tui(data_dir, once)?;
+                 ui::tui::run_tui(data_dir, once)?;
             }
         }
-        Commands::Index { .. } => {
-            // CLI mode: Log to stderr so user sees progress
+        Commands::Index { .. } | Commands::Search { .. } => {
+            // CLI mode: Log to stderr so user sees progress/errors, stdout reserved for data
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
                 .compact()
                 .with_target(false)
                 .init();
-
-            if let Commands::Index {
-                full,
-                watch,
-                data_dir,
-            } = command
-            {
-                run_index_with_data(cli.db, full, watch, data_dir)?;
-            }
-        }
-        _ => {
-            // Completions/Man: No logging needed usually, or stderr
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .compact()
-                .with_target(false)
-                .init();
-
+                
             match command {
-                Commands::Completions { shell } => {
-                    let mut cmd = Cli::command();
-                    clap_complete::generate(shell, &mut cmd, "cass", &mut std::io::stdout());
+                Commands::Index { full, watch, data_dir } => {
+                    run_index_with_data(cli.db, full, watch, data_dir)?;
                 }
-                Commands::Man => {
-                    let cmd = Cli::command();
-                    let man = clap_mangen::Man::new(cmd);
-                    man.render(&mut std::io::stdout())?;
+                Commands::Search { query, agent, workspace, limit, json, data_dir } => {
+                    run_cli_search(&query, &agent, &workspace, &limit, &json, &data_dir, cli.db)?;
                 }
                 _ => {}
             }
         }
+        _ => {
+             // Completions/Man: No logging needed usually, or stderr
+             tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .compact()
+                .with_target(false)
+                .init();
+             
+             match command {
+                 Commands::Completions { shell } => {
+                    let mut cmd = Cli::command();
+                    clap_complete::generate(shell, &mut cmd, "cass", &mut std::io::stdout());
+                 }
+                 Commands::Man => {
+                    let cmd = Cli::command();
+                    let man = clap_mangen::Man::new(cmd);
+                    man.render(&mut std::io::stdout())?;
+                 }
+                 _ => {}
+             }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_cli_search(
+    query: &str,
+    agents: &[String],
+    workspaces: &[String],
+    limit: &usize,
+    json: &bool,
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+) -> Result<()> {
+    use crate::search::query::{SearchClient, SearchFilters};
+    use crate::search::tantivy::index_dir;
+    use std::collections::HashSet;
+
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let index_path = index_dir(&data_dir)?;
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+
+    let client = SearchClient::open(&index_path, Some(&db_path))?
+        .ok_or_else(|| anyhow::anyhow!("Index not found at {}. Run 'cass index --full' first.", index_path.display()))?;
+
+    let mut filters = SearchFilters::default();
+    if !agents.is_empty() {
+        filters.agents = HashSet::from_iter(agents.iter().cloned());
+    }
+    if !workspaces.is_empty() {
+        filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
+    }
+
+    let hits = client.search(query, filters, *limit, 0)?;
+
+    if *json {
+        let out = serde_json::to_string_pretty(&hits)?;
+        println!("{}", out);
+    } else {
+        if hits.is_empty() {
+            eprintln!("No results found.");
+        }
+        for hit in hits {
+            println!("----------------------------------------------------------------");
+            println!("Score: {:.2} | Agent: {} | WS: {}", hit.score, hit.agent, hit.workspace);
+            println!("Path: {}", hit.source_path);
+            println!("Snippet: {}", hit.snippet.replace('\n', " ").trim());
+        }
+        println!("----------------------------------------------------------------");
     }
 
     Ok(())
