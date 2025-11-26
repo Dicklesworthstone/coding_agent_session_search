@@ -5,8 +5,8 @@ fn footer_mentions_editor_and_clear_keys() {
     // Simplified footer shows essential keys only
     let short = footer_legend(false);
     assert!(
-        short.contains("Enter open"),
-        "short footer should show Enter open"
+        short.contains("Enter view"),
+        "short footer should show Enter view"
     );
     assert!(
         short.contains("Esc quit"),

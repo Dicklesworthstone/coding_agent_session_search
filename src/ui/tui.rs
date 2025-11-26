@@ -556,7 +556,8 @@ fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     lines.extend(add_section(
         "Actions",
         &[
-            "Enter/F8 open hit in $EDITOR; y copy path/content",
+            "Enter opens detail modal (c=copy, n=nano, Esc=close)",
+            "F8 open hit in $EDITOR; y copy path/content",
             "F1 toggle this help; Esc/F10 quit (or back from detail)",
         ],
     ));
@@ -621,6 +622,280 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1]);
 
     horizontal[1]
+}
+
+/// Render parsed content lines from a conversation for the detail modal.
+/// Parses tool use, code blocks, and formats beautifully for human reading.
+fn render_parsed_content(
+    detail: &ConversationView,
+    query: &str,
+    palette: ThemePalette,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header with conversation info
+    if let Some(title) = &detail.convo.title {
+        lines.push(Line::from(vec![
+            Span::styled("📋 ", Style::default()),
+            Span::styled(
+                title.clone(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Workspace info
+    if let Some(ws) = &detail.workspace {
+        lines.push(Line::from(vec![
+            Span::styled("📁 Workspace: ", Style::default().fg(palette.hint)),
+            Span::styled(
+                ws.display_name
+                    .clone()
+                    .unwrap_or_else(|| ws.path.display().to_string()),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Time info
+    if let Some(ts) = detail.convo.started_at {
+        lines.push(Line::from(vec![
+            Span::styled("🕐 Started: ", Style::default().fg(palette.hint)),
+            Span::styled(format_relative_time(ts), Style::default().fg(palette.fg)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "─".repeat(60),
+        Style::default().fg(palette.hint),
+    )));
+    lines.push(Line::from(""));
+
+    // Render messages with beautiful formatting
+    for msg in &detail.messages {
+        let (role_icon, role_label, role_color) = match &msg.role {
+            MessageRole::User => ("👤", "You", palette.user),
+            MessageRole::Agent => ("🤖", "Assistant", palette.agent),
+            MessageRole::Tool => ("🔧", "Tool", palette.tool),
+            MessageRole::System => ("⚙️", "System", palette.system),
+            MessageRole::Other(r) => ("📝", r.as_str(), palette.hint),
+        };
+
+        // Role header with timestamp
+        let ts_text = msg
+            .created_at
+            .map(|t| format!(" · {}", format_relative_time(t)))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", role_icon), Style::default()),
+            Span::styled(
+                role_label.to_string(),
+                Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(ts_text, Style::default().fg(palette.hint)),
+        ]));
+        lines.push(Line::from(""));
+
+        // Parse and render content
+        let content = &msg.content;
+        let parsed_lines = parse_message_content(content, query, palette);
+        lines.extend(parsed_lines);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(60),
+            Style::default()
+                .fg(palette.hint)
+                .add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+/// Parse message content and render with beautiful formatting.
+/// Handles code blocks, tool calls, JSON, and highlights search terms.
+fn parse_message_content(content: &str, query: &str, palette: ThemePalette) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut in_code_block = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buffer: Vec<String> = Vec::new();
+
+    for line_text in content.lines() {
+        let trimmed = line_text.trim_start();
+
+        // Handle code block start/end
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                // End of code block - render buffered code
+                in_code_block = false;
+                if !code_buffer.is_empty() {
+                    let lang_label = code_lang
+                        .take()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| format!(" {}", l))
+                        .unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled("┌──", Style::default().fg(palette.hint)),
+                        Span::styled(
+                            lang_label,
+                            Style::default()
+                                .fg(palette.accent_alt)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    for code_line in code_buffer.drain(..) {
+                        lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(palette.hint)),
+                            Span::styled(
+                                code_line,
+                                Style::default().fg(palette.fg).bg(palette.surface),
+                            ),
+                        ]));
+                    }
+                    lines.push(Line::from(Span::styled(
+                        "└──",
+                        Style::default().fg(palette.hint),
+                    )));
+                }
+            } else {
+                // Start of code block - extract language (first word after ```)
+                in_code_block = true;
+                let lang_str = trimmed.trim_start_matches('`');
+                code_lang = Some(lang_str.split_whitespace().next().unwrap_or("").to_string());
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_buffer.push(line_text.to_string());
+            continue;
+        }
+
+        // Handle tool call markers
+        if trimmed.starts_with("[Tool:") || trimmed.starts_with("⚙️") {
+            lines.push(Line::from(vec![
+                Span::styled("  🔧 ", Style::default()),
+                Span::styled(
+                    line_text.trim().to_string(),
+                    Style::default()
+                        .fg(palette.tool)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            continue;
+        }
+
+        // Try to detect and format JSON objects on a single line
+        if ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+            && let Ok(json_val) = serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            // Pretty print JSON
+            if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
+                lines.push(Line::from(Span::styled(
+                    "  ┌── JSON",
+                    Style::default().fg(palette.hint),
+                )));
+                for json_line in pretty.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::default().fg(palette.hint)),
+                        Span::styled(
+                            json_line.to_string(),
+                            Style::default().fg(palette.accent_alt),
+                        ),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "  └──",
+                    Style::default().fg(palette.hint),
+                )));
+                continue;
+            }
+        }
+
+        // Regular text with search term highlighting
+        let rendered = highlight_terms_owned_with_style(
+            format!("  {}", line_text),
+            query,
+            palette,
+            Style::default(),
+        );
+        lines.push(rendered);
+    }
+
+    // Handle unclosed code block
+    if in_code_block && !code_buffer.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "┌── code",
+            Style::default().fg(palette.hint),
+        )));
+        for code_line in code_buffer {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(palette.hint)),
+                Span::styled(
+                    code_line,
+                    Style::default().fg(palette.fg).bg(palette.surface),
+                ),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "└──",
+            Style::default().fg(palette.hint),
+        )));
+    }
+
+    lines
+}
+
+/// Render the full-screen detail modal for viewing parsed conversation content.
+fn render_detail_modal(
+    frame: &mut Frame,
+    detail: &ConversationView,
+    hit: &SearchHit,
+    query: &str,
+    palette: ThemePalette,
+    scroll: u16,
+) {
+    let area = frame.area();
+    // Use near-full-screen for maximum readability
+    let popup_area = centered_rect(90, 90, area);
+
+    let lines = render_parsed_content(detail, query, palette);
+    let total_lines = lines.len();
+    // Clamp scroll for display (actual scroll handled by Paragraph)
+    let display_line = (scroll as usize).min(total_lines.saturating_sub(1)) + 1;
+
+    // Build title with scroll position and hints
+    let title_text = format!(
+        " {} · line {}/{} · Esc close · c copy · n nano ",
+        hit.title, display_line, total_lines
+    );
+
+    let block = Block::default()
+        .title(Span::styled(
+            title_text,
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.accent));
+
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup_area,
+    );
 }
 
 /// Calculate optimal items per pane based on terminal height.
@@ -1022,9 +1297,9 @@ enum FocusRegion {
 
 pub fn footer_legend(show_help: bool) -> &'static str {
     if show_help {
-        "Esc quit • arrows nav • Tab focus • Enter open • F1-F9 commands • Ctrl-R history • y copy"
+        "Esc quit • arrows nav • Tab focus • Enter view • F8 editor • F1-F9 commands • y copy"
     } else {
-        "F1 help | Enter open | Esc quit"
+        "F1 help | Enter view | Esc quit"
     }
 }
 
@@ -1093,6 +1368,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
     // Show onboarding overlay only on first launch (when has_seen_help is not set).
     // After user dismisses with F1, we persist has_seen_help=true to avoid showing again.
     let mut show_help = !persisted.has_seen_help.unwrap_or(false);
+    // Full-screen modal for viewing parsed content
+    let mut show_detail_modal = false;
+    let mut modal_scroll: u16 = 0;
     let mut cached_detail: Option<(String, ConversationView)> = None;
     let mut last_query = String::new();
     let mut needs_draw = true;
@@ -1676,6 +1954,15 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                 if show_help {
                     render_help_overlay(f, palette, help_scroll);
                 }
+
+                // Detail modal takes priority over help
+                if show_detail_modal
+                    && let Some((_, ref detail)) = cached_detail
+                    && let Some(pane) = panes.get(active_pane)
+                    && let Some(hit) = pane.hits.get(pane.selected)
+                {
+                    render_detail_modal(f, detail, hit, &last_query, palette, modal_scroll);
+                }
             })?;
             needs_draw = false;
         }
@@ -1691,8 +1978,12 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
         if crossterm::event::poll(timeout)? {
             let event = event::read()?;
 
-            // Handle mouse events
+            // Handle mouse events (skip when modal is open)
             if let Event::Mouse(mouse) = event {
+                // Ignore mouse events when help or detail modal is open
+                if show_help || show_detail_modal {
+                    continue;
+                }
                 needs_draw = true;
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -1817,6 +2108,145 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                     }
                     KeyCode::Home => help_scroll = 0,
                     KeyCode::End => help_scroll = help_lines(ThemePalette::dark()).len() as u16,
+                    _ => {}
+                }
+                continue;
+            }
+
+            // While detail modal is open, handle its keyboard shortcuts
+            if show_detail_modal {
+                match key.code {
+                    KeyCode::Esc => {
+                        show_detail_modal = false;
+                        modal_scroll = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        modal_scroll = modal_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        modal_scroll = modal_scroll.saturating_add(1);
+                    }
+                    KeyCode::PageUp => {
+                        modal_scroll = modal_scroll.saturating_sub(20);
+                    }
+                    KeyCode::PageDown => {
+                        modal_scroll = modal_scroll.saturating_add(20);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => modal_scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => modal_scroll = u16::MAX,
+                    KeyCode::Char('c') => {
+                        // Copy rendered content to clipboard using xclip/xsel/pbcopy
+                        if let Some((_, ref detail)) = cached_detail {
+                            let mut text = String::new();
+                            for msg in &detail.messages {
+                                let role_label = match &msg.role {
+                                    MessageRole::User => "YOU",
+                                    MessageRole::Agent => "ASSISTANT",
+                                    MessageRole::Tool => "TOOL",
+                                    MessageRole::System => "SYSTEM",
+                                    MessageRole::Other(r) => r,
+                                };
+                                text.push_str(&format!("=== {} ===\n", role_label));
+                                text.push_str(&msg.content);
+                                text.push_str("\n\n");
+                            }
+                            // Try clipboard tools in order of preference
+                            let clipboard_cmd = if cfg!(target_os = "macos") {
+                                Some("pbcopy")
+                            } else {
+                                // Linux: prefer xclip, fallback to xsel
+                                if StdCommand::new("which")
+                                    .arg("xclip")
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false)
+                                {
+                                    Some("xclip -selection clipboard")
+                                } else if StdCommand::new("which")
+                                    .arg("xsel")
+                                    .output()
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false)
+                                {
+                                    Some("xsel --clipboard --input")
+                                } else {
+                                    None
+                                }
+                            };
+
+                            status = if let Some(cmd) = clipboard_cmd {
+                                let result = StdCommand::new("sh")
+                                    .arg("-c")
+                                    .arg(cmd)
+                                    .stdin(std::process::Stdio::piped())
+                                    .spawn()
+                                    .and_then(|mut child| {
+                                        use std::io::Write;
+                                        if let Some(stdin) = child.stdin.as_mut() {
+                                            stdin.write_all(text.as_bytes())?;
+                                        }
+                                        child.wait()
+                                    });
+                                if result.map(|s| s.success()).unwrap_or(false) {
+                                    "✓ Copied to clipboard".to_string()
+                                } else {
+                                    "✗ Clipboard copy failed".to_string()
+                                }
+                            } else {
+                                "✗ No clipboard tool found (xclip/xsel/pbcopy)".to_string()
+                            };
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        // Open content in nano via temp file
+                        if let Some((_, ref detail)) = cached_detail {
+                            let mut text = String::new();
+                            for msg in &detail.messages {
+                                let role_label = match &msg.role {
+                                    MessageRole::User => "YOU",
+                                    MessageRole::Agent => "ASSISTANT",
+                                    MessageRole::Tool => "TOOL",
+                                    MessageRole::System => "SYSTEM",
+                                    MessageRole::Other(r) => r,
+                                };
+                                text.push_str(&format!("=== {} ===\n", role_label));
+                                text.push_str(&msg.content);
+                                text.push_str("\n\n");
+                            }
+                            // Create temp file
+                            let tmp_path = std::env::temp_dir().join(format!(
+                                "cass_view_{}.md",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                            ));
+                            if std::fs::write(&tmp_path, &text).is_ok() {
+                                // Exit raw mode, run nano, re-enter
+                                disable_raw_mode().ok();
+                                execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)
+                                    .ok();
+                                let nano_result = StdCommand::new("nano")
+                                    .arg("--view") // Read-only mode
+                                    .arg(&tmp_path)
+                                    .status();
+                                execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+                                    .ok();
+                                enable_raw_mode().ok();
+                                // Clean up temp file
+                                std::fs::remove_file(&tmp_path).ok();
+                                status = if nano_result.is_ok() {
+                                    "Returned from nano".to_string()
+                                } else {
+                                    "✗ Failed to launch nano".to_string()
+                                };
+                                show_detail_modal = false;
+                                modal_scroll = 0;
+                            } else {
+                                status = "✗ Failed to create temp file".to_string();
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -2247,7 +2677,9 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                 dirty_since = Some(Instant::now());
                                 continue;
                             }
-                            if key.modifiers.is_empty() && c == '-' {
+                            // Only resize panes with `-` when there are actual panes showing
+                            // Otherwise, allow `-` to be typed in the search query
+                            if key.modifiers.is_empty() && c == '-' && !panes.is_empty() {
                                 per_pane_limit = per_pane_limit.saturating_sub(2).max(4);
                                 status = format!("Pane size: {} items", per_pane_limit);
                                 panes = build_agent_panes(&results, per_pane_limit);
@@ -2455,22 +2887,15 @@ pub fn run_tui(data_dir_override: Option<std::path::PathBuf>, once: bool) -> Res
                                         "Edit to timestamp (Enter apply, Esc cancel)".to_string();
                                     continue;
                                 }
-                            } else if let Some(hit) = active_hit(&panes, active_pane) {
-                                let path = &hit.source_path;
-                                // Prefer line_number field, fallback to parsing snippet
-                                let line_hint = hit.line_number.or_else(|| {
-                                    hit.snippet
-                                        .find("line ")
-                                        .and_then(|i| {
-                                            hit.snippet[i + 5..].split_whitespace().next()
-                                        })
-                                        .and_then(|s| s.parse::<usize>().ok())
-                                });
-                                let mut cmd = StdCommand::new(&editor_cmd);
-                                if let Some(line) = line_hint {
-                                    cmd.arg(format!("{}{}", editor_line_flag, line));
-                                }
-                                let _ = cmd.arg(path).status();
+                            } else if active_hit(&panes, active_pane).is_some()
+                                && cached_detail.is_some()
+                            {
+                                // Open full-screen detail modal for parsed viewing
+                                show_detail_modal = true;
+                                modal_scroll = 0;
+                                status = "Detail view · Esc close · c copy · n nano".to_string();
+                            } else if active_hit(&panes, active_pane).is_some() {
+                                status = "Loading conversation...".to_string();
                             }
                         }
                         _ => {}

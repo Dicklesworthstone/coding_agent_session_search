@@ -1,0 +1,5 @@
+{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"test-session-id","cwd":"/test/soldier/project","cli_version":"0.42.0","git":{"branch":"main"}}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Help me implement soldier matrix completion cma-es"}]}}
+{"timestamp":"2025-09-30T15:42:56.168Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"Considering CMA-ES optimization approaches for matrix completion"}}
+{"timestamp":"2025-09-30T15:43:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"Here's how to implement matrix completion with CMA-ES optimization"}]}}
+{"timestamp":"2025-09-30T15:43:05.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":100,"output_tokens":200}}

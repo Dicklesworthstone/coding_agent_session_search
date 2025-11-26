@@ -8,8 +8,8 @@ fn footer_legend_toggles_help() {
         "hidden footer should show F1 help"
     );
     assert!(
-        hidden.contains("Enter open"),
-        "hidden footer should show Enter open"
+        hidden.contains("Enter view"),
+        "hidden footer should show Enter view"
     );
     assert!(
         hidden.contains("Esc quit"),

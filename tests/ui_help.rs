@@ -9,8 +9,8 @@ fn help_legend_has_hotkeys() {
         "short footer should show F1 help"
     );
     assert!(
-        short.contains("Enter open"),
-        "short footer should show Enter open"
+        short.contains("Enter view"),
+        "short footer should show Enter view"
     );
 
     // Expanded footer (when help shown) has more detail
