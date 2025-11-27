@@ -62,6 +62,7 @@ To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier ca
 The system is designed for extensibility via the `Connector` trait (`src/connectors/mod.rs`). This allows `cass` to treat disparate log formats as a uniform stream of events.
 
 ```mermaid
+%% Compact, pastel, narrow-friendly class diagram
 classDiagram
     class Connector {
         <<interface>>
@@ -69,18 +70,32 @@ classDiagram
         +scan(ScanContext) Vec<NormalizedConversation>
     }
     class NormalizedConversation {
-        +String agent_slug
-        +Vec<NormalizedMessage> messages
+        +agent_slug: String
+        +messages: Vec<NormalizedMessage>
     }
     class CodexConnector
     class ClaudeCodeConnector
     class GeminiConnector
-    
+    class OpenCodeConnector
+    class AmpConnector
+
     Connector <|-- CodexConnector
     Connector <|-- ClaudeCodeConnector
     Connector <|-- GeminiConnector
-    
-    CodexConnector ..> NormalizedConversation : produces
+    Connector <|-- OpenCodeConnector
+    Connector <|-- AmpConnector
+
+    CodexConnector ..> NormalizedConversation : emits
+    ClaudeCodeConnector ..> NormalizedConversation : emits
+    GeminiConnector ..> NormalizedConversation : emits
+    OpenCodeConnector ..> NormalizedConversation : emits
+    AmpConnector ..> NormalizedConversation : emits
+
+    classDef pastel fill:#f4f2ff,stroke:#c2b5ff,color:#2e2963;
+    classDef pastelEdge fill:#e6f7ff,stroke:#9bd5f5,color:#0f3a4d;
+    class Connector pastel
+    class NormalizedConversation pastelEdge
+    class CodexConnector,ClaudeCodeConnector,GeminiConnector,OpenCodeConnector,AmpConnector pastel
 ```
 
 - **Polymorphic Scanning**: The indexer iterates over a `Vec<Box<dyn Connector>>`, unaware of the underlying file formats (JSONL, SQLite, specialized JSON).
@@ -109,31 +124,36 @@ flowchart LR
     classDef pastel5 fill:#ffeef2,stroke:#f5b0c2,color:#4d1f2c;
 
     subgraph Sources
-      A[Codex
-      Cline
-      Gemini
-      Claude
-      OpenCode
-      Amp]:::pastel
+      A1[Codex]:::pastel
+      A2[Cline]:::pastel
+      A3[Gemini]:::pastel
+      A4[Claude]:::pastel
+      A5[OpenCode]:::pastel
+      A6[Amp]:::pastel
     end
 
     subgraph "Ingestion Layer"
-      C1[**Connectors**<br/>Detect & Scan<br/>Normalize<br/>Dedupe]:::pastel2
+      C1["Connectors\nDetect & Scan\nNormalize & Dedupe"]:::pastel2
     end
 
     subgraph "Dual Storage"
-      S1[**SQLite (WAL)**<br/>Source of Truth<br/>Relational Data<br/>Migrations]:::pastel3
-      T1[**Tantivy Index**<br/>Search Optimized<br/>Edge N-Grams<br/>Prefix Cache]:::pastel4
+      S1["SQLite (WAL)\nSource of Truth\nRelational Data\nMigrations"]:::pastel3
+      T1["Tantivy Index\nSearch Optimized\nEdge N-Grams\nPrefix Cache"]:::pastel4
     end
 
     subgraph "Presentation"
-      U1[**TUI (Ratatui)**<br/>Async Search<br/>Filter Pills<br/>Details]:::pastel5
-      U2[**CLI / Robot**<br/>JSON Output<br/>Automation]:::pastel5
+      U1["TUI (Ratatui)\nAsync Search\nFilter Pills\nDetails"]:::pastel5
+      U2["CLI / Robot\nJSON Output\nAutomation"]:::pastel5
     end
 
-    A --> C1
+    A1 --> C1
+    A2 --> C1
+    A3 --> C1
+    A4 --> C1
+    A5 --> C1
+    A6 --> C1
     C1 -->|Persist| S1
-    C1 -->|Index New| T1
+    C1 -->|Index| T1
     S1 -.->|Rebuild| T1
     T1 -->|Query| U1
     T1 -->|Query| U2
