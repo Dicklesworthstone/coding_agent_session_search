@@ -109,6 +109,12 @@ impl Connector for CodexConnector {
                         .get("timestamp")
                         .and_then(crate::connectors::parse_timestamp);
 
+                    if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                        && ts <= since
+                    {
+                        continue;
+                    }
+
                     match entry_type {
                         "session_meta" => {
                             // Extract workspace from session metadata
@@ -232,6 +238,12 @@ impl Connector for CodexConnector {
                         let created = item
                             .get("timestamp")
                             .and_then(crate::connectors::parse_timestamp);
+
+                        if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                            && ts <= since
+                        {
+                            continue;
+                        }
 
                         started_at = started_at.or(created);
                         ended_at = created.or(ended_at);

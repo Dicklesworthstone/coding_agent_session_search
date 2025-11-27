@@ -74,8 +74,24 @@ fn extract_path_from_position(content: &str, start: usize) -> Option<PathBuf> {
 
     let path_str = rest.get(..end)?.trim_end_matches(['/', ':', ']', ')']);
 
-    if !path_str.starts_with('/') || path_str.len() <= 5 {
+    // Check for Unix absolute path OR Windows absolute path (C:\ or \\)
+    let is_unix_abs = path_str.starts_with('/');
+    let is_win_drive = path_str.len() >= 3
+        && path_str
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+        && path_str.chars().nth(1) == Some(':')
+        && (path_str.chars().nth(2) == Some('\\') || path_str.chars().nth(2) == Some('/'));
+    let is_win_unc = path_str.starts_with("\\\\");
+
+    if !is_unix_abs && !is_win_drive && !is_win_unc {
         return None;
+    }
+
+    if path_str.len() <= 3 {
+        return None; // Too short to be a useful workspace path
     }
 
     let path = PathBuf::from(path_str);
@@ -245,6 +261,13 @@ impl Connector for GeminiConnector {
                 let created = item
                     .get("timestamp")
                     .and_then(crate::connectors::parse_timestamp);
+
+                if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                    && ts <= since
+                {
+                    continue;
+                }
+
                 started_at = started_at.or(created);
                 ended_at = created.or(ended_at);
 
@@ -322,5 +345,48 @@ impl Connector for GeminiConnector {
         }
 
         Ok(convs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_path_handles_windows_and_unix() {
+        // Unix absolute
+        let content = "Working directory: /home/user/project";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from("/home/user/project")));
+
+        // Unix absolute with trailing slash
+        let content = "Working directory: /data/projects/foo/";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from("/data/projects/foo")));
+
+        // Windows drive letter
+        let content = r"Working directory: C:\Users\User\Project";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from(r"C:\Users\User\Project")));
+
+        // Windows drive with forward slashes (mixed)
+        let content = "Working directory: D:/Code/Rust";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from("D:/Code/Rust")));
+
+        // Windows UNC
+        let content = r"Working directory: \\Server\Share\Project";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, Some(PathBuf::from(r"\\Server\Share\Project")));
+
+        // Invalid/Relative
+        let content = "Working directory: relative/path";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, None);
+
+        // Too short
+        let content = "Working directory: /a";
+        let path = extract_path_from_position(content, 19);
+        assert_eq!(path, None);
     }
 }

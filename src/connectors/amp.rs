@@ -96,7 +96,7 @@ impl Connector for AmpConnector {
                     Err(_) => continue,
                 };
 
-                if let Some(mut messages) = extract_messages(&val, ctx.since_ts) {
+                if let Some(messages) = extract_messages(&val, ctx.since_ts) {
                     if messages.is_empty() {
                         continue;
                     }
@@ -129,10 +129,6 @@ impl Connector for AmpConnector {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string())
                         });
-
-                    for (i, msg) in messages.iter_mut().enumerate() {
-                        msg.idx = i as i64;
-                    }
 
                     let key = external_id
                         .clone()
@@ -177,7 +173,7 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
         })?;
 
     let mut out = Vec::new();
-    for (idx, m) in msgs.into_iter().enumerate() {
+    for m in msgs.into_iter() {
         let role = m
             .get("role")
             .or_else(|| m.get("speaker"))
@@ -192,12 +188,13 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
         let created_at = m
             .get("created_at")
             .or_else(|| m.get("createdAt"))
             .or_else(|| m.get("timestamp"))
             .or_else(|| m.get("ts"))
-            .and_then(|v| v.as_i64());
+            .and_then(crate::connectors::parse_timestamp);
         let author = m
             .get("author")
             .or_else(|| m.get("sender"))
@@ -212,7 +209,7 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
         }
 
         out.push(NormalizedMessage {
-            idx: idx as i64,
+            idx: 0, // Will be re-assigned after filtering
             role,
             author,
             created_at,
@@ -220,6 +217,11 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
             extra: m.clone(),
             snippets: Vec::new(),
         });
+    }
+
+    // Re-assign indices after filtering to maintain sequential order
+    for (i, msg) in out.iter_mut().enumerate() {
+        msg.idx = i as i64;
     }
 
     if out.is_empty() { None } else { Some(out) }

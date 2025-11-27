@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -170,20 +171,29 @@ fn load_db(
 
     let mut convs = Vec::new();
 
+    // Calculate stable hash of db path to disambiguate session IDs between projects
+    let mut hasher = DefaultHasher::new();
+    db_path.hash(&mut hasher);
+    let db_hash = hasher.finish();
+
     for (session_id, mut messages) in by_session {
         if messages.is_empty() {
             continue;
         }
         messages.sort_by_key(|m| m.created_at.unwrap_or(i64::MAX));
+
+        // Assign stable indices based on full history order before filtering
+        for (i, msg) in messages.iter_mut().enumerate() {
+            msg.idx = i as i64;
+        }
+
         if let Some(since) = since_ts {
             messages.retain(|m| m.created_at.is_some_and(|ts| ts > since));
             if messages.is_empty() {
                 continue;
             }
         }
-        for (i, msg) in messages.iter_mut().enumerate() {
-            msg.idx = i as i64;
-        }
+
         let meta = session_meta.get(&session_id);
         let title = meta.and_then(|m| m.title.clone()).or_else(|| {
             messages
@@ -198,7 +208,7 @@ fn load_db(
 
         convs.push(NormalizedConversation {
             agent_slug: "opencode".into(),
-            external_id: Some(format!("session-{session_id}")),
+            external_id: Some(format!("session-{session_id}-{:x}", db_hash)),
             title,
             workspace: meta.and_then(|m| m.workspace.clone()),
             source_path: db_path.clone(),

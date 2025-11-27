@@ -72,41 +72,66 @@ impl Connector for ClineConnector {
             let ui_messages_path = path.join("ui_messages.json");
             let api_messages_path = path.join("api_conversation_history.json");
 
-            let mut messages = Vec::new();
+            // Prefer UI messages as they are user-facing. Fallback to API history.
+            let source_file = if ui_messages_path.exists() {
+                Some(ui_messages_path)
+            } else if api_messages_path.exists() {
+                Some(api_messages_path)
+            } else {
+                None
+            };
 
-            for file in [ui_messages_path, api_messages_path] {
-                if !file.exists() {
-                    continue;
-                }
-                let data = fs::read_to_string(&file)
-                    .with_context(|| format!("read {}", file.display()))?;
-                let val: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
-                if let Some(arr) = val.as_array() {
-                    for (idx, item) in arr.iter().enumerate() {
-                        let role = item
-                            .get("role")
-                            .or_else(|| item.get("type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("agent");
-                        let created = item
-                            .get("timestamp")
-                            .or_else(|| item.get("created_at"))
-                            .and_then(|v| v.as_i64());
-                        let content = item
-                            .get("content")
-                            .or_else(|| item.get("text"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        messages.push(NormalizedMessage {
-                            idx: idx as i64,
-                            role: role.to_string(),
-                            author: None,
-                            created_at: created,
-                            content: content.to_string(),
-                            extra: item.clone(),
-                            snippets: Vec::new(),
-                        });
+            let Some(file) = source_file else {
+                continue;
+            };
+
+            let data =
+                fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+            let val: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+
+            let mut messages = Vec::new();
+            if let Some(arr) = val.as_array() {
+                for item in arr {
+                    // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
+                    let created = item
+                        .get("timestamp")
+                        .or_else(|| item.get("created_at"))
+                        .or_else(|| item.get("ts"))
+                        .and_then(crate::connectors::parse_timestamp);
+
+                    // Skip if older than since_ts
+                    if let (Some(since), Some(ts)) = (ctx.since_ts, created)
+                        && ts <= since
+                    {
+                        continue;
                     }
+
+                    let role = item
+                        .get("role")
+                        .or_else(|| item.get("type"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("agent");
+
+                    let content = item
+                        .get("content")
+                        .or_else(|| item.get("text"))
+                        .or_else(|| item.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if content.trim().is_empty() {
+                        continue;
+                    }
+
+                    messages.push(NormalizedMessage {
+                        idx: 0, // set later
+                        role: role.to_string(),
+                        author: None,
+                        created_at: created,
+                        content: content.to_string(),
+                        extra: item.clone(),
+                        snippets: Vec::new(),
+                    });
                 }
             }
 
@@ -114,25 +139,52 @@ impl Connector for ClineConnector {
                 continue;
             }
 
-            let title = meta_path
-                .exists()
-                .then(|| fs::read_to_string(&meta_path).ok())
-                .flatten()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| {
-                    v.get("title")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                });
+            // Sort by timestamp to ensure correct ordering
+            messages.sort_by_key(|m| m.created_at.unwrap_or(0));
+
+            // Re-index
+            for (i, msg) in messages.iter_mut().enumerate() {
+                msg.idx = i as i64;
+            }
+
+            let mut title = None;
+            let mut workspace = None;
+
+            if meta_path.exists()
+                && let Ok(s) = fs::read_to_string(&meta_path)
+                && let Ok(v) = serde_json::from_str::<Value>(&s)
+            {
+                title = v
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+                // Try to find workspace path
+                // Cline doesn't standardize this in metadata, but sometimes it's there or in state.
+                // We check common keys.
+                workspace = v
+                    .get("rootPath")
+                    .or_else(|| v.get("cwd"))
+                    .or_else(|| v.get("workspace"))
+                    .and_then(|s| s.as_str())
+                    .map(PathBuf::from);
+            }
+
+            // Fallback title from first message
+            if title.is_none() {
+                title = messages
+                    .first()
+                    .and_then(|m| m.content.lines().next())
+                    .map(|s| s.chars().take(100).collect());
+            }
 
             convs.push(NormalizedConversation {
                 agent_slug: "cline".to_string(),
                 external_id: task_id,
                 title,
-                workspace: None,
+                workspace,
                 source_path: path.clone(),
-                started_at: None,
-                ended_at: None,
+                started_at: messages.first().and_then(|m| m.created_at),
+                ended_at: messages.last().and_then(|m| m.created_at),
                 metadata: serde_json::json!({"source": "cline"}),
                 messages,
             });
