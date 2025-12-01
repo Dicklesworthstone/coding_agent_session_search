@@ -40,6 +40,7 @@ ratatui = { version = "*", features = ["crossterm"] }
 crossterm = "*"
 dirs = "*"
 walkdir = "*"
+glob = "*"
 base64 = "*"
 chrono = "*"
 semver = "*"
