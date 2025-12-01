@@ -353,12 +353,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn test_store() -> BookmarkStore {
+    fn test_store() -> (BookmarkStore, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_bookmarks.db");
-        // Keep dir alive by leaking it (test only)
-        std::mem::forget(dir);
-        BookmarkStore::open(&path).unwrap()
+        let store = BookmarkStore::open(&path).unwrap();
+        (store, dir)
     }
 
     #[test]
@@ -377,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_add_and_get() {
-        let store = test_store();
+        let (store, _dir) = test_store();
         let bookmark = Bookmark::new("Test Result", "/path/to/file.jsonl", "codex", "/my/project")
             .with_note("Found the bug here");
 
@@ -391,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_list_and_count() {
-        let store = test_store();
+        let (store, _dir) = test_store();
 
         store
             .add(&Bookmark::new("First", "/a.rs", "claude", "/ws"))
@@ -409,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let store = test_store();
+        let (store, _dir) = test_store();
         let id = store
             .add(&Bookmark::new("ToDelete", "/x.rs", "agent", "/ws"))
             .unwrap();
@@ -421,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_tag_filter() {
-        let store = test_store();
+        let (store, _dir) = test_store();
 
         store
             .add(&Bookmark::new("A", "/a.rs", "a", "/w").with_tags("rust"))
@@ -439,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_search() {
-        let store = test_store();
+        let (store, _dir) = test_store();
 
         store
             .add(&Bookmark::new("Bug fix for auth", "/auth.rs", "a", "/w"))
@@ -460,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_is_bookmarked() {
-        let store = test_store();
+        let (store, _dir) = test_store();
 
         store
             .add(&Bookmark::new("X", "/file.rs", "a", "/w").with_line(10))
@@ -473,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_export_import() {
-        let store1 = test_store();
+        let (store1, _dir1) = test_store();
         store1
             .add(&Bookmark::new("A", "/a.rs", "agent", "/w").with_tags("tag1"))
             .unwrap();
@@ -483,7 +482,7 @@ mod tests {
 
         let json = store1.export_json().unwrap();
 
-        let store2 = test_store();
+        let (store2, _dir2) = test_store();
         let imported = store2.import_json(&json).unwrap();
         assert_eq!(imported, 2);
         assert_eq!(store2.count().unwrap(), 2);
