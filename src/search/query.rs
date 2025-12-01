@@ -1633,14 +1633,16 @@ fn hit_matches_query_cached(hit: &CachedHit, query: &str) -> bool {
         }
     }
 
-    // Fallback substring checks on lowered fields
-    hit.lc_content.contains(&q)
-        || hit
-            .lc_title
-            .as_ref()
-            .map(|t: &String| t.contains(&q))
-            .unwrap_or(false)
-        || hit.lc_snippet.contains(&q)
+    // Verify each token exists in at least one field (implicit AND)
+    tokens.iter().all(|t| {
+        hit.lc_content.contains(t)
+            || hit
+                .lc_title
+                .as_ref()
+                .map(|title| title.contains(t))
+                .unwrap_or(false)
+            || hit.lc_snippet.contains(t)
+    })
 }
 
 fn is_prefix_only(query: &str) -> bool {

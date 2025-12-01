@@ -73,6 +73,15 @@ impl Connector for AmpConnector {
             .file_name()
             .map(|n| n.to_str().unwrap_or("").contains("amp"))
             .unwrap_or(false)
+            || std::fs::read_dir(&ctx.data_root)
+                .map(|mut d| {
+                    d.any(|e| {
+                        e.ok()
+                            .map(|e| is_amp_log_file(&e.path()))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
         {
             vec![ctx.data_root.clone()]
         } else {
@@ -197,6 +206,11 @@ fn extract_messages(val: &Value, since_ts: Option<i64>) -> Option<Vec<Normalized
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        
+        if content.trim().is_empty() {
+            continue;
+        }
+
         // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
         let created_at = m
             .get("created_at")
