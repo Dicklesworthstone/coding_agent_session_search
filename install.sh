@@ -150,13 +150,18 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
   fi
 fi
 
-exec 9>"$LOCK_FILE" || true
+# Cross-platform locking (mkdir is atomic on all Unix systems)
 LOCKED=0
-if flock -n 9; then LOCKED=1; else err "Another installer is running (lock $LOCK_FILE)"; exit 1; fi
+if mkdir "$LOCK_FILE" 2>/dev/null; then
+  LOCKED=1
+else
+  err "Another installer is running (lock $LOCK_FILE)"
+  exit 1
+fi
 
 cleanup() {
   rm -rf "$TMP"
-  if [ "$LOCKED" -eq 1 ]; then rm -f "$LOCK_FILE"; fi
+  if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_FILE"; fi
 }
 
 TMP=$(mktemp -d)
