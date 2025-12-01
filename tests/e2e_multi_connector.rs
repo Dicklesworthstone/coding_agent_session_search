@@ -44,7 +44,7 @@ fn make_gemini_fixture(root: &Path) {
 fn make_cline_fixture(root: &Path) {
     let task_dir = root.join("Code/User/globalStorage/saoudrizwan.claude-dev/task_123");
     fs::create_dir_all(&task_dir).unwrap();
-    
+
     let ui_messages = task_dir.join("ui_messages.json");
     let sample = r#"[
   {"role": "user", "ts": 1700000000000, "content": "cline_user"},
@@ -73,7 +73,7 @@ fn multi_connector_pipeline() {
     let home = tmp.path();
     let xdg_data = home.join("xdg_data");
     let _config_home = home.join(".config"); // For Cline on Linux usually, but our fixture path was mostly hardcoded in the connector? 
-    // ClineConnector uses: 
+    // ClineConnector uses:
     // dirs::home_dir().join(".config/Code/User/globalStorage/saoudrizwan.claude-dev")
     // So we just need HOME set correctly.
 
@@ -82,7 +82,7 @@ fn multi_connector_pipeline() {
     // Override env vars
     let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
     let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg_data.to_string_lossy());
-    
+
     // Setup fixture roots
     let dot_codex = home.join(".codex");
     let dot_claude = home.join(".claude");
@@ -132,19 +132,43 @@ fn multi_connector_pipeline() {
 
     assert!(output.status.success());
     let json_out: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
-    
+
     // Check results
-    let hits = json_out.get("hits").and_then(|h| h.as_array()).expect("hits array");
-    
-    let found_agents: std::collections::HashSet<&str> = hits.iter()
+    let hits = json_out
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
+
+    let found_agents: std::collections::HashSet<&str> = hits
+        .iter()
         .filter_map(|h| h.get("agent").and_then(|s| s.as_str()))
         .collect();
 
-    assert!(found_agents.contains("codex"), "Missing codex hit. Found: {:?}", found_agents);
-    assert!(found_agents.contains("claude_code"), "Missing claude hit. Found: {:?}", found_agents);
-    assert!(found_agents.contains("gemini"), "Missing gemini hit. Found: {:?}", found_agents);
-    assert!(found_agents.contains("cline"), "Missing cline hit. Found: {:?}", found_agents);
-    assert!(found_agents.contains("amp"), "Missing amp hit. Found: {:?}", found_agents);
+    assert!(
+        found_agents.contains("codex"),
+        "Missing codex hit. Found: {:?}",
+        found_agents
+    );
+    assert!(
+        found_agents.contains("claude_code"),
+        "Missing claude hit. Found: {:?}",
+        found_agents
+    );
+    assert!(
+        found_agents.contains("gemini"),
+        "Missing gemini hit. Found: {:?}",
+        found_agents
+    );
+    assert!(
+        found_agents.contains("cline"),
+        "Missing cline hit. Found: {:?}",
+        found_agents
+    );
+    assert!(
+        found_agents.contains("amp"),
+        "Missing amp hit. Found: {:?}",
+        found_agents
+    );
 
     // 3. INCREMENTAL TEST
     // Ensure mtime is strictly greater than last scan
@@ -153,12 +177,12 @@ fn multi_connector_pipeline() {
     // Add a new file to Codex with CURRENT timestamp so message isn't filtered out
     let sessions = dot_codex.join("sessions/2025/11/22");
     fs::create_dir_all(&sessions).unwrap();
-    
+
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    
+
     // Use modern envelope format
     let content = format!(
         r#"{{"type": "event_msg", "timestamp": {}, "payload": {{"type": "user_message", "message": "codex_new"}}}}"#,
@@ -183,10 +207,17 @@ fn multi_connector_pipeline() {
         .arg(&data_dir)
         .output()
         .expect("failed to execute search");
-    
-    let json_inc: serde_json::Value = serde_json::from_slice(&output_inc.stdout).expect("valid json");
-    let hits_inc = json_inc.get("hits").and_then(|h| h.as_array()).expect("hits array");
-    assert!(!hits_inc.is_empty(), "Incremental index failed to pick up new file");
+
+    let json_inc: serde_json::Value =
+        serde_json::from_slice(&output_inc.stdout).expect("valid json");
+    let hits_inc = json_inc
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
+    assert!(
+        !hits_inc.is_empty(),
+        "Incremental index failed to pick up new file"
+    );
     assert_eq!(hits_inc[0]["content"], "codex_new");
 
     // 4. FILTER TEST
@@ -202,9 +233,13 @@ fn multi_connector_pipeline() {
         .output()
         .expect("failed to execute search");
 
-    let json_filter: serde_json::Value = serde_json::from_slice(&output_filter.stdout).expect("valid json");
-    let hits_filter = json_filter.get("hits").and_then(|h| h.as_array()).expect("hits array");
-    
+    let json_filter: serde_json::Value =
+        serde_json::from_slice(&output_filter.stdout).expect("valid json");
+    let hits_filter = json_filter
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
+
     for hit in hits_filter {
         assert_eq!(hit["agent"], "claude_code");
     }

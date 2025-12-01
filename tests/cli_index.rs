@@ -34,12 +34,7 @@ fn index_creates_db_and_index() {
     fs::create_dir_all(&data_dir).unwrap();
 
     let mut cmd = base_cmd(tmp.path());
-    cmd.args([
-        "index",
-        "--data-dir",
-        data_dir.to_str().unwrap(),
-        "--json",
-    ]);
+    cmd.args(["index", "--data-dir", data_dir.to_str().unwrap(), "--json"]);
 
     cmd.assert().success();
 
@@ -57,12 +52,7 @@ fn index_full_rebuilds() {
 
     // First run
     let mut cmd1 = base_cmd(tmp.path());
-    cmd1.args([
-        "index",
-        "--data-dir",
-        data_dir.to_str().unwrap(),
-        "--json",
-    ]);
+    cmd1.args(["index", "--data-dir", data_dir.to_str().unwrap(), "--json"]);
     cmd1.assert().success();
 
     // Second run with --full
@@ -74,7 +64,7 @@ fn index_full_rebuilds() {
         data_dir.to_str().unwrap(),
         "--json",
     ]);
-    
+
     cmd2.assert().success();
 }
 
@@ -83,7 +73,7 @@ fn index_watch_once_triggers() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
-    
+
     let dummy_path = data_dir.join("dummy.txt");
     fs::write(&dummy_path, "dummy content").unwrap();
 
@@ -102,7 +92,7 @@ fn index_watch_once_triggers() {
 
 #[test]
 fn index_force_rebuild_flag() {
-     let tmp = TempDir::new().unwrap();
+    let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
