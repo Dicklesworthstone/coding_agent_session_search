@@ -381,6 +381,7 @@ fn reindex_paths(
             ConnectorKind::Claude => Box::new(ClaudeCodeConnector::new()),
             ConnectorKind::Amp => Box::new(AmpConnector::new()),
             ConnectorKind::OpenCode => Box::new(OpenCodeConnector::new()),
+            ConnectorKind::Aider => Box::new(AiderConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -448,6 +449,7 @@ enum ConnectorKind {
     Claude,
     Amp,
     OpenCode,
+    Aider,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -499,6 +501,8 @@ fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
                     Some(ConnectorKind::Amp)
                 } else if s.contains(".opencode") || s.contains("/opencode/") {
                     Some(ConnectorKind::OpenCode)
+                } else if s.contains(".aider.chat.history.md") {
+                    Some(ConnectorKind::Aider)
                 } else {
                     None
                 };
