@@ -11,7 +11,6 @@ Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, C
 <div align="center">
 
 ```bash
-# Fast path: checksum-verified install + self-test
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh \
   | bash -s -- --easy-mode --verify
 ```
