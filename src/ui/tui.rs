@@ -1555,6 +1555,7 @@ fn agent_color(agent: &str) -> Color {
         "cursor" => Color::Rgb(147, 112, 219), // Medium Purple
         "chatgpt" => Color::Rgb(16, 163, 127), // ChatGPT Green
         "aider" => Color::Rgb(255, 165, 0), // Orange
+        "pi_agent" => Color::Rgb(255, 140, 0), // Dark Orange (Pi)
         _ => Color::Rgb(169, 169, 169),     // Dark Gray (fallback)
     }
 }

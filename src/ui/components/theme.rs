@@ -431,6 +431,7 @@ impl ThemePalette {
             "cursor" => (colors::AGENT_CURSOR_BG, Color::Rgb(236, 72, 153)), // Pink accent
             "chatgpt" => (colors::AGENT_CHATGPT_BG, Color::Rgb(16, 163, 127)), // ChatGPT green
             "opencode" => (colors::AGENT_OPENCODE_BG, colors::ROLE_USER), // Neutral/sage
+            "pi_agent" => (colors::AGENT_CODEX_BG, Color::Rgb(255, 140, 0)), // Orange for pi
             _ => (colors::BG_DEEP, colors::ACCENT_PRIMARY),
         };
 
@@ -454,6 +455,7 @@ impl ThemePalette {
             "cursor" => "🎯",
             "chatgpt" => "💬",
             "opencode" => "📦",
+            "pi_agent" => "🥧",
             _ => "✨",
         }
     }

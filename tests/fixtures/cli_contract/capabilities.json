@@ -1,5 +1,5 @@
 {
-  "crate_version": "0.1.34",
+  "crate_version": "0.1.35",
   "api_version": 1,
   "contract_version": "1",
   "features": [
@@ -35,7 +35,8 @@
     "cline",
     "aider",
     "cursor",
-    "chatgpt"
+    "chatgpt",
+    "pi_agent"
   ],
   "limits": {
     "max_limit": 10000,
