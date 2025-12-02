@@ -71,6 +71,7 @@ pub struct TantivyIndex {
 
 impl TantivyIndex {
     pub fn open_or_create(path: &Path) -> Result<Self> {
+        // Schema we will use if we need to (re)create the index.
         let schema = build_schema();
         std::fs::create_dir_all(path)?;
 
@@ -85,25 +86,44 @@ impl TantivyIndex {
         }
 
         if needs_rebuild {
-            // Recreate index directory completely to avoid stale lock files.
+            // Recreate index directory completely to avoid stale lock files or
+            // stale tantivy internals.
             let _ = std::fs::remove_dir_all(path);
             std::fs::create_dir_all(path)?;
         }
 
         let mut index = if path.join("meta.json").exists() && !needs_rebuild {
-            Index::open_in_dir(path)?
+            // We believe the schema hash matches; try to open. If this fails
+            // (e.g. corrupted meta.json / index), fall back to a clean rebuild.
+            match Index::open_in_dir(path) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to open existing index; rebuilding from scratch"
+                    );
+                    let _ = std::fs::remove_dir_all(path);
+                    std::fs::create_dir_all(path)?;
+                    Index::create_in_dir(path, schema.clone())?
+                }
+            }
         } else {
             Index::create_in_dir(path, schema.clone())?
         };
 
         ensure_tokenizer(&mut index);
 
+        // Always write the current schema hash so future runs can detect mismatches.
         std::fs::write(&meta_path, format!("{{\"schema_hash\":\"{SCHEMA_HASH}\"}}"))?;
 
+        // Use the schema actually attached to this index to derive field ids.
+        // This avoids subtle field-id mismatches if the on-disk index was created
+        // by a slightly different binary.
+        let actual_schema = index.schema();
         let writer = index
             .writer(50_000_000)
             .map_err(|e| anyhow!("create index writer: {e:?}"))?;
-        let fields = fields_from_schema(&schema)?;
+        let fields = fields_from_schema(&actual_schema)?;
         Ok(Self {
             index,
             writer,
@@ -336,15 +356,24 @@ pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
 }
 
 fn build_preview(content: &str, max_chars: usize) -> String {
-    let char_count = content.chars().count();
-    if char_count <= max_chars {
-        return content.to_string();
-    }
     let mut out = String::new();
-    for ch in content.chars().take(max_chars) {
-        out.push(ch);
+    let mut chars = content.chars();
+
+    // Copy at most max_chars characters into the preview.
+    for _ in 0..max_chars {
+        if let Some(ch) = chars.next() {
+            out.push(ch);
+        } else {
+            // Content shorter than or equal to max_chars; no ellipsis.
+            return out;
+        }
     }
-    out.push('…');
+
+    // If there are more characters, append an ellipsis.
+    if chars.next().is_some() {
+        out.push('…');
+    }
+
     out
 }
 
@@ -435,10 +464,10 @@ mod tests {
 
         // Should fail to read (non-JSON) but rebuild successfully
         let result = TantivyIndex::open_or_create(path);
-        // Reading invalid JSON will fail but rebuild should happen
+        // Reading invalid JSON will fail but rebuild should happen cleanly
         assert!(
-            result.is_ok() || result.is_err(),
-            "Should not panic on corrupted schema_hash.json"
+            result.is_ok(),
+            "Should rebuild index on corrupted schema_hash.json"
         );
     }
 
@@ -489,13 +518,11 @@ mod tests {
             fs::write(&meta_path, "corrupted meta content").unwrap();
         }
 
-        // Should detect corruption and rebuild (schema hash won't match or open fails)
-        // Note: This may fail on open, but should not panic
+        // Should detect corruption and rebuild (open_in_dir fails)
         let result = TantivyIndex::open_or_create(path);
-        // Accept either success (rebuild) or error (corruption detected)
         assert!(
-            result.is_ok() || result.is_err(),
-            "Should not panic on corrupted meta.json"
+            result.is_ok(),
+            "Should rebuild index on corrupted meta.json without panicking"
         );
     }
 
@@ -537,10 +564,9 @@ mod tests {
 
         // Should handle truncated segment gracefully
         let result = TantivyIndex::open_or_create(path);
-        // Accept either success (recreate) or error (detected corruption) - no panic
         assert!(
-            result.is_ok() || result.is_err(),
-            "Should not panic on truncated segment file"
+            result.is_ok(),
+            "Should open or rebuild index cleanly after truncated segment file"
         );
     }
 
