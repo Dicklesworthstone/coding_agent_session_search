@@ -181,6 +181,10 @@ struct TuiStatePersisted {
     saved_views: Option<Vec<SavedViewPersisted>>,
     /// Persist help strip pinned state across runs.
     help_pinned: Option<bool>,
+    /// Persisted per-pane item limit (bead 46t.1).
+    per_pane_limit: Option<usize>,
+    /// Persisted ranking mode (bead 46t.1): "recent", "balanced", "relevance", etc.
+    ranking_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -2308,9 +2312,12 @@ pub fn run_tui(
         Some("spacious") => DensityMode::Spacious,
         _ => DensityMode::Cozy, // Default
     };
-    // Calculate initial pane limit based on terminal height and density
+    // Calculate initial pane limit based on terminal height and density,
+    // or restore from persisted state if user previously adjusted it (bead 46t.1)
     let initial_height = terminal.size().map(|r| r.height).unwrap_or(24);
-    let mut per_pane_limit: usize = calculate_pane_limit(initial_height, density_mode);
+    let mut per_pane_limit: usize = persisted
+        .per_pane_limit
+        .unwrap_or_else(|| calculate_pane_limit(initial_height, density_mode));
     let mut last_terminal_height: u16 = initial_height;
     let mut page: usize = 0;
     let mut results: Vec<SearchHit> = Vec::new();
@@ -2384,7 +2391,11 @@ pub fn run_tui(
         Some("standard") => MatchMode::Standard,
         _ => MatchMode::Prefix,
     };
-    let mut ranking_mode = RankingMode::Balanced;
+    let mut ranking_mode = persisted
+        .ranking_mode
+        .as_deref()
+        .map(ranking_from_str)
+        .unwrap_or(RankingMode::Balanced);
     let mut saved_views: Vec<SavedView> = persisted
         .saved_views
         .as_ref()
@@ -6156,6 +6167,16 @@ pub fn run_tui(
                 })
                 .collect(),
         ),
+        // Persist pane count & ranking mode (bead 46t.1)
+        per_pane_limit: Some(per_pane_limit),
+        ranking_mode: Some(match ranking_mode {
+            RankingMode::RecentHeavy => "recent".into(),
+            RankingMode::RelevanceHeavy => "relevance".into(),
+            RankingMode::MatchQualityHeavy => "quality".into(),
+            RankingMode::DateNewest => "newest".into(),
+            RankingMode::DateOldest => "oldest".into(),
+            RankingMode::Balanced => "balanced".into(),
+        }),
     };
     save_state(&state_path, &persisted_out);
 
@@ -6212,6 +6233,8 @@ mod tests {
                 created_to: Some(2),
                 ranking: Some("recent".into()),
             }]),
+            per_pane_limit: Some(12),
+            ranking_mode: Some("balanced".into()),
         };
         save_state(&path, &state);
 
@@ -6221,6 +6244,9 @@ mod tests {
         assert_eq!(loaded.has_seen_help, Some(true));
         assert_eq!(loaded.query_history.as_ref().map(|v| v.len()), Some(2));
         assert_eq!(loaded.saved_views.as_ref().map(|v| v.len()), Some(1));
+        // Verify new fields (bead 46t.1)
+        assert_eq!(loaded.per_pane_limit, Some(12));
+        assert_eq!(loaded.ranking_mode.as_deref(), Some("balanced"));
     }
 
     #[test]

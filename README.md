@@ -258,6 +258,7 @@ cass stats --json
 
 `cass` is designed to be used by *other* AI agents.
 
+- **Robot Mode Guide:** see `docs/ROBOT_MODE.md` for quickstarts, schemas, and integration examples.
 - **Self-Documenting**: Run `cass --robot-help` for a machine-optimized guide (Contract v1).
 - **Structured Data**: Use `--robot` or `--json` for strictly typed JSON output on stdout.
 - **Exit Codes**:

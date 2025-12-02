@@ -33,7 +33,7 @@ pub struct UpdateState {
 }
 
 impl UpdateState {
-    /// Load state from disk, returning default if not found or invalid
+    /// Load state from disk (synchronous)
     pub fn load() -> Self {
         let path = state_path();
         match std::fs::read_to_string(&path) {
@@ -42,7 +42,16 @@ impl UpdateState {
         }
     }
 
-    /// Save state to disk
+    /// Load state from disk (asynchronous)
+    pub async fn load_async() -> Self {
+        let path = state_path();
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Save state to disk (synchronous)
     pub fn save(&self) -> Result<()> {
         let path = state_path();
         if let Some(parent) = path.parent() {
@@ -51,6 +60,21 @@ impl UpdateState {
         }
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Save state to disk (asynchronous)
+    pub async fn save_async(&self) -> Result<()> {
+        let path = state_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating update state directory {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        tokio::fs::write(&path, json)
+            .await
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
@@ -118,7 +142,7 @@ struct GitHubRelease {
 /// - Parse error
 /// - Already on latest
 pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
-    let mut state = UpdateState::load();
+    let mut state = UpdateState::load_async().await;
 
     // Respect check interval
     if !state.should_check() {
@@ -128,7 +152,7 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
 
     // Mark that we're checking (even if it fails)
     state.mark_checked();
-    if let Err(e) = state.save() {
+    if let Err(e) = state.save_async().await {
         warn!("update check: failed to save state: {e}");
     }
 
@@ -173,9 +197,9 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
 
 /// Force a check regardless of interval (for manual refresh)
 pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
-    let mut state = UpdateState::load();
+    let mut state = UpdateState::load_async().await;
     state.last_check_ts = 0; // Reset to force check
-    if let Err(e) = state.save() {
+    if let Err(e) = state.save_async().await {
         warn!("update check: failed to reset state: {e}");
     }
     check_for_updates(current_version).await

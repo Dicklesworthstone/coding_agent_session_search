@@ -613,14 +613,15 @@ async fn execute_cli(
                 let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
                 spawn_background_indexer(bg_data_dir, bg_db, Some(progress.clone()));
 
-                ui::tui::run_tui(data_dir, false, reset_state, Some(progress), None)
-                    .map_err(|e| CliError {
+                ui::tui::run_tui(data_dir, false, reset_state, Some(progress), None).map_err(
+                    |e| CliError {
                         code: 9,
                         kind: "tui",
                         message: format!("tui failed: {e}"),
                         hint: None,
                         retryable: false,
-                    })?;
+                    },
+                )?;
             } else if let Commands::Tui {
                 once,
                 reset_state,
@@ -899,16 +900,23 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
             "db_path": db_path.display().to_string()
         }
     })
+}
+
 fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value> {
     let index = state.get("index")?;
-    let pending = state.get("pending")?;
+    let pending = state.get("pending");
     Some(serde_json::json!({
-        "age_seconds": index.get("age_seconds"),
+        "exists": index.get("exists"),
         "fresh": index.get("fresh"),
+        "last_indexed_at": index.get("last_indexed_at"),
+        "age_seconds": index.get("age_seconds"),
         "stale": index.get("stale"),
-        "pending_sessions": pending.get("sessions"),
+        "stale_threshold_seconds": index.get("stale_threshold_seconds"),
+        "pending_sessions": pending.and_then(|p| p.get("sessions")),
     }))
 }
+
+fn configure_color(choice: ColorPref, stdout_is_tty: bool, stderr_is_tty: bool) {
     let enabled = match choice {
         ColorPref::Always => true,
         ColorPref::Never => false,
@@ -1616,7 +1624,7 @@ fn run_cli_search(
     } else {
         None
     };
-    let index_freshness = state_meta.as_ref().and_then(|s| s.get("index").cloned());
+    let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
     let warning = index_freshness
         .as_ref()
         .and_then(|f: &serde_json::Value| f.get("stale"))
