@@ -477,7 +477,11 @@ fn codex_connector_sets_external_id_from_filename() {
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
-    assert_eq!(c.external_id, Some("rollout-unique-id-123".to_string()));
+    // external_id is now the relative path from sessions dir for uniqueness across directories
+    assert_eq!(
+        c.external_id,
+        Some("2025/12/02/rollout-unique-id-123".to_string())
+    );
 }
 
 /// Test empty sessions directory returns no conversations
@@ -640,7 +644,11 @@ fn codex_connector_ignores_non_rollout_files() {
     let convs = connector.scan(&ctx).unwrap();
     // Only the rollout- prefixed file should be processed
     assert_eq!(convs.len(), 1);
-    assert_eq!(convs[0].external_id, Some("rollout-valid".to_string()));
+    // external_id is now the relative path from sessions dir for uniqueness across directories
+    assert_eq!(
+        convs[0].external_id,
+        Some("2025/12/06/rollout-valid".to_string())
+    );
 }
 
 /// Test legacy JSON with missing optional fields

@@ -84,10 +84,19 @@ impl Connector for CodexConnector {
                 continue;
             }
             let source_path = file.clone();
+            // Use relative path from sessions dir as external_id for uniqueness
+            // e.g., "2025/11/20/rollout-1" instead of just "rollout-1"
+            let sessions_dir = home.join("sessions");
             let external_id = source_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string());
+                .strip_prefix(&sessions_dir)
+                .ok()
+                .and_then(|rel| rel.with_extension("").to_str().map(|s| s.to_string()))
+                .or_else(|| {
+                    source_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                });
             let content = fs::read_to_string(&file)
                 .with_context(|| format!("read rollout {}", file.display()))?;
 

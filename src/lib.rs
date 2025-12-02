@@ -600,36 +600,35 @@ async fn execute_cli(
                     retryable: false,
                 })?;
 
-            if let Commands::Tui { once: false, .. } = &command {
+            if let Commands::Tui {
+                once: false,
+                reset_state,
+                data_dir,
+                ..
+            } = command.clone()
+            {
                 let bg_data_dir = log_dir.clone();
                 let bg_db = cli.db.clone();
                 // Create shared progress tracker
                 let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
                 spawn_background_indexer(bg_data_dir, bg_db, Some(progress.clone()));
 
-                if let Commands::Tui {
-                    once,
-                    data_dir,
-                    reset_state,
-                } = command
-                {
-                    ui::tui::run_tui(data_dir.clone(), once, reset_state, Some(progress)).map_err(
-                        |e| CliError {
-                            code: 9,
-                            kind: "tui",
-                            message: format!("tui failed: {e}"),
-                            hint: None,
-                            retryable: false,
-                        },
-                    )?;
-                }
+                ui::tui::run_tui(data_dir, false, reset_state, Some(progress), None)
+                    .map_err(|e| CliError {
+                        code: 9,
+                        kind: "tui",
+                        message: format!("tui failed: {e}"),
+                        hint: None,
+                        retryable: false,
+                    })?;
             } else if let Commands::Tui {
                 once,
-                data_dir,
                 reset_state,
-            } = command
+                data_dir,
+                ..
+            } = command.clone()
             {
-                ui::tui::run_tui(data_dir.clone(), once, reset_state, None).map_err(|e| {
+                ui::tui::run_tui(data_dir, once, reset_state, None, None).map_err(|e| {
                     CliError {
                         code: 9,
                         kind: "tui",
@@ -876,6 +875,11 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
         "index": {
             "exists": index_exists,
             "fresh": fresh,
+            "last_indexed_at": last_indexed_at.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
             "age_seconds": index_age_secs,
             "stale": is_stale,
             "stale_threshold_seconds": stale_threshold
@@ -895,9 +899,16 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
             "db_path": db_path.display().to_string()
         }
     })
+fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value> {
+    let index = state.get("index")?;
+    let pending = state.get("pending")?;
+    Some(serde_json::json!({
+        "age_seconds": index.get("age_seconds"),
+        "fresh": index.get("fresh"),
+        "stale": index.get("stale"),
+        "pending_sessions": pending.get("sessions"),
+    }))
 }
-
-fn configure_color(choice: ColorPref, stdout_is_tty: bool, stderr_is_tty: bool) {
     let enabled = match choice {
         ColorPref::Always => true,
         ColorPref::Never => false,
@@ -1063,7 +1074,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass diag [--json] [--verbose] [--data-dir DIR]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
-            "  cass tui [--once] [--data-dir DIR]".to_string(),
+            "  cass tui [--once] [--data-dir DIR] [--reset-state]".to_string(),
             "  cass capabilities [--json]".to_string(),
             "  cass robot-docs <topic>".to_string(),
             "  cass --robot-help".to_string(),
@@ -1605,6 +1616,46 @@ fn run_cli_search(
     } else {
         None
     };
+    let index_freshness = state_meta.as_ref().and_then(|s| s.get("index").cloned());
+    let warning = index_freshness
+        .as_ref()
+        .and_then(|f: &serde_json::Value| f.get("stale"))
+        .and_then(|v: &serde_json::Value| v.as_bool())
+        .filter(|stale| *stale)
+        .map(|_| {
+            let age = index_freshness
+                .as_ref()
+                .and_then(|f: &serde_json::Value| f.get("age_seconds"))
+                .and_then(|v: &serde_json::Value| v.as_u64())
+                .map(|s| format!("{s} seconds"))
+                .unwrap_or_else(|| "an unknown age".to_string());
+            let pending = index_freshness
+                .as_ref()
+                .and_then(|f: &serde_json::Value| f.get("pending_sessions"))
+                .and_then(|v: &serde_json::Value| v.as_u64())
+                .unwrap_or(0);
+            format!(
+                "Index may be stale (age: {age}; pending sessions: {pending}). Run `cass index --full` or enable watch mode for fresh results."
+            )
+        });
+
+    let index_freshness_for_closure = index_freshness.clone();
+    let state_meta_with_warning = state_meta.map(|mut meta| {
+        if let Some(fresh) = index_freshness_for_closure
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert("index_freshness".to_string(), fresh);
+        }
+        if let Some(warn) = &warning
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert(
+                "_warning".to_string(),
+                serde_json::Value::String(warn.clone()),
+            );
+        }
+        meta
+    });
 
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
@@ -1622,7 +1673,9 @@ fn run_cli_search(
             request_id.clone(),
             cursor.clone(),
             next_cursor,
-            state_meta,
+            state_meta_with_warning,
+            index_freshness,
+            warning,
             &aggregations,
             total_matches,
         )?;
@@ -1868,6 +1921,8 @@ fn output_robot_results(
     input_cursor: Option<String>,
     next_cursor: Option<String>,
     state_meta: Option<serde_json::Value>,
+    index_freshness: Option<serde_json::Value>,
+    warning: Option<String>,
     aggregations: &Aggregations,
     total_matches: usize,
 ) -> CliResult<()> {
@@ -1944,7 +1999,19 @@ fn output_robot_results(
                 {
                     m.insert("state".to_string(), state);
                 }
+                if let Some(freshness) = index_freshness
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("index_freshness".to_string(), freshness);
+                }
                 map.insert("_meta".to_string(), meta);
+
+                if let Some(warn) = &warning {
+                    map.insert(
+                        "_warning".to_string(),
+                        serde_json::Value::String(warn.clone()),
+                    );
+                }
             }
 
             let out = serde_json::to_string_pretty(&payload).map_err(|e| CliError {
@@ -1986,6 +2053,12 @@ fn output_robot_results(
                 {
                     m.insert("state".to_string(), state);
                 }
+                if let Some(freshness) = index_freshness
+                    && let serde_json::Value::Object(ref mut outer) = meta
+                    && let Some(serde_json::Value::Object(m)) = outer.get_mut("_meta")
+                {
+                    m.insert("index_freshness".to_string(), freshness);
+                }
                 // Add suggestions to meta line
                 if !result.suggestions.is_empty()
                     && let serde_json::Value::Object(ref mut map) = meta
@@ -1998,6 +2071,14 @@ fn output_robot_results(
                 // Add aggregations to meta line
                 if let (Some(agg), serde_json::Value::Object(map)) = (&agg_json, &mut meta) {
                     map.insert("aggregations".to_string(), agg.clone());
+                }
+                if let Some(warn) = &warning
+                    && let Some(m) = meta.get_mut("_meta").and_then(|v| v.as_object_mut())
+                {
+                    m.insert(
+                        "_warning".to_string(),
+                        serde_json::Value::String(warn.clone()),
+                    );
                 }
                 println!("{}", serde_json::to_string(&meta).unwrap_or_default());
             }
@@ -2037,22 +2118,31 @@ fn output_robot_results(
             }
 
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
-                map.insert(
-                    "_meta".to_string(),
-                    serde_json::json!({
-                        "elapsed_ms": elapsed_ms,
-                        "wildcard_fallback": result.wildcard_fallback,
-                        "tokens_estimated": tokens_estimated,
-                        "max_tokens": max_tokens,
-                        "request_id": request_id,
-                        "next_cursor": next_cursor,
-                        "hits_clamped": hits_clamped,
-                    }),
-                );
+                let mut meta = serde_json::json!({
+                    "elapsed_ms": elapsed_ms,
+                    "wildcard_fallback": result.wildcard_fallback,
+                    "tokens_estimated": tokens_estimated,
+                    "max_tokens": max_tokens,
+                    "request_id": request_id,
+                    "next_cursor": next_cursor,
+                    "hits_clamped": hits_clamped,
+                });
                 if let Some(state) = state_meta
-                    && let Some(serde_json::Value::Object(meta)) = map.get_mut("_meta")
+                    && let serde_json::Value::Object(ref mut m) = meta
                 {
-                    meta.insert("state".to_string(), state);
+                    m.insert("state".to_string(), state);
+                }
+                if let Some(freshness) = index_freshness
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert("index_freshness".to_string(), freshness);
+                }
+                map.insert("_meta".to_string(), meta);
+                if let Some(warn) = &warning {
+                    map.insert(
+                        "_warning".to_string(),
+                        serde_json::Value::String(warn.clone()),
+                    );
                 }
             }
 
@@ -3176,6 +3266,7 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                         }
                     }
                 },
+                "_warning": { "type": ["string", "null"] },
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -3202,6 +3293,7 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                                     "properties": {
                                         "exists": { "type": "boolean" },
                                         "fresh": { "type": "boolean" },
+                                        "last_indexed_at": { "type": ["string", "null"] },
                                         "age_seconds": { "type": ["integer", "null"] },
                                         "stale": { "type": "boolean" },
                                         "stale_threshold_seconds": { "type": "integer" }
@@ -3215,6 +3307,16 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                                         "messages": { "type": "integer" }
                                     }
                                 }
+                            }
+                        },
+                        "index_freshness": {
+                            "type": "object",
+                            "properties": {
+                                "last_indexed_at": { "type": ["string", "null"] },
+                                "age_seconds": { "type": ["integer", "null"] },
+                                "stale": { "type": "boolean" },
+                                "pending_sessions": { "type": "integer" },
+                                "fresh": { "type": "boolean" }
                             }
                         }
                     }
@@ -3663,11 +3765,16 @@ fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> 
     Ok(())
 }
 
+use crossbeam_channel::Sender;
+use indexer::IndexerEvent;
+
 fn spawn_background_indexer(
     data_dir: PathBuf,
     db: Option<PathBuf>,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
-) {
+) -> Option<Sender<IndexerEvent>> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let tx_clone = tx.clone();
     std::thread::spawn(move || {
         let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
         let opts = IndexOptions {
@@ -3679,10 +3786,12 @@ fn spawn_background_indexer(
             data_dir,
             progress,
         };
-        if let Err(e) = indexer::run_index(opts) {
+        // Pass the receiver to run_index so it can listen for commands
+        if let Err(e) = indexer::run_index(opts, Some((tx_clone, rx))) {
             warn!("Background indexer failed: {}", e);
         }
     });
+    Some(tx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3738,7 +3847,8 @@ fn run_index_with_data(
     }
 
     let start = Instant::now();
-    let res = indexer::run_index(opts).map_err(|e| {
+    // CLI index command doesn't support manual reindex triggering from TUI, so pass None
+    let res = indexer::run_index(opts, None).map_err(|e| {
         let chain = e
             .chain()
             .map(|c| c.to_string())

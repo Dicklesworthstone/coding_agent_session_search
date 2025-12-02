@@ -2242,6 +2242,7 @@ pub fn run_tui(
     once: bool,
     reset_state: bool,
     progress: Option<std::sync::Arc<crate::indexer::IndexingProgress>>,
+    reindex_tx: Option<crossbeam_channel::Sender<crate::indexer::IndexerEvent>>,
 ) -> Result<()> {
     // Resolve data dir early so we can honor reset-state in headless mode too.
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -4578,7 +4579,14 @@ pub fn run_tui(
                         if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
                             // Ctrl+Shift+R = refresh search (re-query index)
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                status = "Refreshing search...".to_string();
+                                if let Some(tx) = &reindex_tx {
+                                    let _ = tx.send(crate::indexer::IndexerEvent::Command(
+                                        crate::indexer::ReindexCommand::Full,
+                                    ));
+                                    status = "Triggered background re-index...".to_string();
+                                } else {
+                                    status = "Refreshing search view...".to_string();
+                                }
                                 page = 0;
                                 dirty_since = Some(Instant::now());
                                 cached_detail = None;

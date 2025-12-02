@@ -1,219 +1,137 @@
 {
   "api_version": 1,
-  "contract_version": "1",
-  "global_flags": [
-    {
-      "name": "db",
-      "description": "Path to the SQLite database (defaults to platform data dir)",
-      "arg_type": "option",
-      "value_type": "path",
-      "required": false
-    },
-    {
-      "name": "robot-help",
-      "description": "Deterministic machine-first help (no TUI)",
-      "arg_type": "flag",
-      "required": false
-    },
-    {
-      "name": "trace-file",
-      "description": "Trace command execution spans to JSONL file",
-      "arg_type": "option",
-      "value_type": "path",
-      "required": false
-    },
-    {
-      "name": "quiet",
-      "short": "q",
-      "description": "Reduce log noise (warnings and errors only)",
-      "arg_type": "flag",
-      "required": false
-    },
-    {
-      "name": "verbose",
-      "short": "v",
-      "description": "Increase verbosity (debug information)",
-      "arg_type": "flag",
-      "required": false
-    },
-    {
-      "name": "color",
-      "description": "Color behavior for CLI output",
-      "arg_type": "option",
-      "value_type": "enum",
-      "required": false,
-      "default": "auto",
-      "enum_values": [
-        "auto",
-        "never",
-        "always"
-      ]
-    },
-    {
-      "name": "progress",
-      "description": "Progress output style",
-      "arg_type": "option",
-      "value_type": "enum",
-      "required": false,
-      "default": "auto",
-      "enum_values": [
-        "auto",
-        "bars",
-        "plain",
-        "none"
-      ]
-    },
-    {
-      "name": "wrap",
-      "description": "Wrap informational output to N columns",
-      "arg_type": "option",
-      "value_type": "integer",
-      "required": false
-    },
-    {
-      "name": "nowrap",
-      "description": "Disable wrapping entirely",
-      "arg_type": "flag",
-      "required": false
-    }
-  ],
   "commands": [
     {
-      "name": "tui",
-      "description": "Launch interactive TUI",
       "arguments": [
         {
-          "name": "once",
+          "arg_type": "flag",
+          "default": "false",
           "description": "Render once and exit (headless-friendly)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "once",
+          "required": false
         },
         {
-          "name": "reset-state",
+          "arg_type": "flag",
+          "default": "false",
           "description": "Delete persisted UI state (tui_state.json) before launch",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "reset-state",
+          "required": false
         },
         {
-          "name": "data-dir",
+          "arg_type": "option",
           "description": "Override data dir (matches index --data-dir)",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        }
-      ],
-      "has_json_output": false
-    },
-    {
-      "name": "index",
-      "description": "Run indexer",
-      "arguments": [
-        {
-          "name": "full",
-          "description": "Perform full rebuild",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "force-rebuild",
-          "description": "Force Tantivy index rebuild even if schema matches",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "watch",
-          "description": "Watch for changes and reindex automatically",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "watch-once",
-          "description": "Trigger a single watch cycle for specific paths (comma-separated or repeated)",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false,
-          "repeatable": true
-        },
-        {
           "name": "data-dir",
-          "description": "Override data dir (index + db). Defaults to platform data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (for automation)",
-          "arg_type": "flag",
           "required": false,
+          "value_type": "path"
+        }
+      ],
+      "description": "Launch interactive TUI",
+      "has_json_output": false,
+      "name": "tui"
+    },
+    {
+      "arguments": [
+        {
+          "arg_type": "flag",
+          "description": "Perform full rebuild",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "full",
+          "required": false
+        },
+        {
+          "arg_type": "flag",
+          "default": "false",
+          "description": "Force Tantivy index rebuild even if schema matches",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "force-rebuild",
+          "required": false
+        },
+        {
+          "arg_type": "flag",
+          "description": "Watch for changes and reindex automatically",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "watch",
+          "required": false
+        },
+        {
+          "arg_type": "option",
+          "description": "Trigger a single watch cycle for specific paths (comma-separated or repeated)",
+          "name": "watch-once",
+          "repeatable": true,
+          "required": false,
+          "value_type": "path"
+        },
+        {
+          "arg_type": "option",
+          "description": "Override data dir (index + db). Defaults to platform data dir",
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
+        },
+        {
+          "arg_type": "flag",
+          "description": "Output as JSON (for automation)",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "json",
+          "required": false
         }
       ],
-      "has_json_output": true
+      "description": "Run indexer",
+      "has_json_output": true,
+      "name": "index"
     },
     {
-      "name": "completions",
-      "description": "Generate shell completions to stdout",
       "arguments": [
         {
-          "name": "shell",
-          "description": "",
           "arg_type": "positional",
-          "value_type": "enum",
-          "required": true,
+          "description": "",
           "enum_values": [
             "bash",
             "elvish",
             "fish",
             "powershell",
             "zsh"
-          ]
+          ],
+          "name": "shell",
+          "required": true,
+          "value_type": "enum"
         }
       ],
-      "has_json_output": false
+      "description": "Generate shell completions to stdout",
+      "has_json_output": false,
+      "name": "completions"
     },
     {
-      "name": "man",
-      "description": "Generate man page to stdout",
       "arguments": [],
-      "has_json_output": false
+      "description": "Generate man page to stdout",
+      "has_json_output": false,
+      "name": "man"
     },
     {
-      "name": "robot-docs",
-      "description": "Machine-focused docs for automation agents",
       "arguments": [
         {
-          "name": "topic",
-          "description": "Topic to print",
           "arg_type": "positional",
-          "value_type": "enum",
-          "required": true,
+          "description": "Topic to print",
           "enum_values": [
             "commands",
             "env",
@@ -223,420 +141,559 @@
             "examples",
             "contracts",
             "wrap"
-          ]
+          ],
+          "name": "topic",
+          "required": true,
+          "value_type": "enum"
         }
       ],
-      "has_json_output": false
+      "description": "Machine-focused docs for automation agents",
+      "has_json_output": false,
+      "name": "robot-docs"
     },
     {
-      "name": "search",
-      "description": "Run a one-off search and print results to stdout",
       "arguments": [
         {
-          "name": "query",
-          "description": "The query string",
           "arg_type": "positional",
-          "value_type": "string",
-          "required": true
+          "description": "The query string",
+          "name": "query",
+          "required": true,
+          "value_type": "string"
         },
         {
-          "name": "agent",
+          "arg_type": "option",
           "description": "Filter by agent slug (can be specified multiple times)",
-          "arg_type": "option",
-          "value_type": "string",
+          "name": "agent",
+          "repeatable": true,
           "required": false,
-          "repeatable": true
+          "value_type": "string"
         },
         {
-          "name": "workspace",
+          "arg_type": "option",
           "description": "Filter by workspace path (can be specified multiple times)",
-          "arg_type": "option",
-          "value_type": "string",
+          "name": "workspace",
+          "repeatable": true,
           "required": false,
-          "repeatable": true
+          "value_type": "string"
         },
         {
-          "name": "limit",
+          "arg_type": "option",
+          "default": "10",
           "description": "Max results",
-          "arg_type": "option",
-          "value_type": "integer",
+          "name": "limit",
           "required": false,
-          "default": "10"
+          "value_type": "integer"
         },
         {
-          "name": "offset",
+          "arg_type": "option",
+          "default": "0",
           "description": "Offset for pagination (start at Nth result)",
-          "arg_type": "option",
-          "value_type": "integer",
+          "name": "offset",
           "required": false,
-          "default": "0"
+          "value_type": "integer"
         },
         {
-          "name": "json",
-          "description": "Output as JSON (--robot also works). Equivalent to --robot-format json",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON (--robot also works). Equivalent to --robot-format json",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "json",
+          "required": false
         },
         {
-          "name": "robot-format",
-          "description": "Robot output format: json (pretty), jsonl (streaming), compact (single-line)",
           "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
+          "description": "Robot output format: json (pretty), jsonl (streaming), compact (single-line)",
           "enum_values": [
             "json",
             "jsonl",
             "compact"
-          ]
+          ],
+          "name": "robot-format",
+          "required": false,
+          "value_type": "enum"
         },
         {
-          "name": "robot-meta",
-          "description": "Include extended metadata in robot output (elapsed_ms, wildcard_fallback, cache_stats)",
           "arg_type": "flag",
-          "required": false,
+          "description": "Include extended metadata in robot output (elapsed_ms, wildcard_fallback, cache_stats)",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "robot-meta",
+          "required": false
         },
         {
-          "name": "fields",
+          "arg_type": "option",
           "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for source_path,line_number,agent or 'summary' for source_path,line_number,agent,title,score. Example: --fields source_path,line_number",
-          "arg_type": "option",
-          "value_type": "string",
+          "name": "fields",
+          "repeatable": true,
           "required": false,
-          "repeatable": true
+          "value_type": "string"
         },
         {
-          "name": "max-content-length",
+          "arg_type": "option",
           "description": "Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false
-        },
-        {
-          "name": "max-tokens",
-          "description": "Soft token budget for robot output (approx; 4 chars ≈ 1 token). Adjusts truncation",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false
-        },
-        {
-          "name": "request-id",
-          "description": "Request ID to echo in robot _meta for correlation",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "cursor",
-          "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
-        },
-        {
-          "name": "display",
-          "description": "Human-readable display format: table (aligned columns), lines (one-liner), markdown",
-          "arg_type": "option",
-          "value_type": "enum",
+          "name": "max-content-length",
           "required": false,
+          "value_type": "integer"
+        },
+        {
+          "arg_type": "option",
+          "description": "Soft token budget for robot output (approx; 4 chars \u2248 1 token). Adjusts truncation",
+          "name": "max-tokens",
+          "required": false,
+          "value_type": "integer"
+        },
+        {
+          "arg_type": "option",
+          "description": "Request ID to echo in robot _meta for correlation",
+          "name": "request-id",
+          "required": false,
+          "value_type": "string"
+        },
+        {
+          "arg_type": "option",
+          "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
+          "name": "cursor",
+          "required": false,
+          "value_type": "string"
+        },
+        {
+          "arg_type": "option",
+          "description": "Human-readable display format: table (aligned columns), lines (one-liner), markdown",
           "enum_values": [
             "table",
             "lines",
             "markdown"
-          ]
+          ],
+          "name": "display",
+          "required": false,
+          "value_type": "enum"
         },
         {
-          "name": "data-dir",
-          "description": "Override data dir",
           "arg_type": "option",
-          "value_type": "path",
-          "required": false
+          "description": "Override data dir",
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
         },
         {
-          "name": "days",
+          "arg_type": "option",
           "description": "Filter to last N days",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false
+          "name": "days",
+          "required": false,
+          "value_type": "integer"
         },
         {
-          "name": "today",
+          "arg_type": "flag",
           "description": "Filter to today only",
-          "arg_type": "flag",
-          "required": false,
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "today",
+          "required": false
         },
         {
-          "name": "yesterday",
+          "arg_type": "flag",
           "description": "Filter to yesterday only",
-          "arg_type": "flag",
-          "required": false,
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "yesterday",
+          "required": false
         },
         {
-          "name": "week",
+          "arg_type": "flag",
           "description": "Filter to last 7 days",
-          "arg_type": "flag",
-          "required": false,
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "week",
+          "required": false
         },
         {
-          "name": "since",
+          "arg_type": "option",
           "description": "Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
+          "name": "since",
+          "required": false,
+          "value_type": "string"
         },
         {
-          "name": "until",
+          "arg_type": "option",
           "description": "Filter to entries until ISO date",
-          "arg_type": "option",
-          "value_type": "string",
-          "required": false
+          "name": "until",
+          "required": false,
+          "value_type": "string"
         },
         {
-          "name": "aggregate",
+          "arg_type": "option",
           "description": "Server-side aggregation by field(s). Comma-separated: agent,workspace,date,match_type Returns buckets with counts instead of full results. Use with --limit to get both",
-          "arg_type": "option",
-          "value_type": "string",
+          "name": "aggregate",
+          "repeatable": true,
           "required": false,
-          "repeatable": true
+          "value_type": "string"
         }
       ],
-      "has_json_output": true
+      "description": "Run a one-off search and print results to stdout",
+      "has_json_output": true,
+      "name": "search"
     },
     {
-      "name": "stats",
+      "arguments": [
+        {
+          "arg_type": "option",
+          "description": "Override data dir",
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
+        },
+        {
+          "arg_type": "flag",
+          "description": "Output as JSON",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "json",
+          "required": false
+        }
+      ],
       "description": "Show statistics about indexed data",
-      "arguments": [
-        {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        }
-      ],
-      "has_json_output": true
+      "has_json_output": true,
+      "name": "stats"
     },
     {
-      "name": "diag",
-      "description": "Output diagnostic information for troubleshooting",
       "arguments": [
         {
-          "name": "data-dir",
-          "description": "Override data dir",
           "arg_type": "option",
-          "value_type": "path",
-          "required": false
+          "description": "Override data dir",
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
         },
         {
-          "name": "json",
-          "description": "Output as JSON",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "json",
+          "required": false
         },
         {
-          "name": "verbose",
-          "short": "v",
+          "arg_type": "flag",
           "description": "Include verbose information (file sizes, timestamps)",
-          "arg_type": "flag",
-          "required": false,
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "verbose",
+          "required": false,
+          "short": "v"
         }
       ],
-      "has_json_output": true
+      "description": "Output diagnostic information for troubleshooting",
+      "has_json_output": true,
+      "name": "diag"
     },
     {
-      "name": "status",
+      "arguments": [
+        {
+          "arg_type": "option",
+          "description": "Override data dir",
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
+        },
+        {
+          "arg_type": "flag",
+          "description": "Output as JSON (default for robot consumption)",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "json",
+          "required": false
+        },
+        {
+          "arg_type": "option",
+          "default": "1800",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
+          "name": "stale-threshold",
+          "required": false,
+          "value_type": "integer"
+        }
+      ],
       "description": "Quick health check for agents: index freshness, db stats, recommended action",
+      "has_json_output": true,
+      "name": "status"
+    },
+    {
       "arguments": [
         {
-          "name": "data-dir",
-          "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON (default for robot consumption)",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON (default for robot consumption)",
           "enum_values": [
             "true",
             "false"
-          ]
-        },
-        {
-          "name": "stale-threshold",
-          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false,
-          "default": "1800"
+          ],
+          "name": "json",
+          "required": false
         }
       ],
-      "has_json_output": true
-    },
-    {
-      "name": "capabilities",
       "description": "Discover available features, versions, and limits for agent introspection",
-      "arguments": [
-        {
-          "name": "json",
-          "description": "Output as JSON (default for robot consumption)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        }
-      ],
-      "has_json_output": true
+      "has_json_output": true,
+      "name": "capabilities"
     },
     {
-      "name": "state",
-      "description": "Quick state/health check (alias of status)",
       "arguments": [
         {
-          "name": "data-dir",
+          "arg_type": "option",
           "description": "Override data dir",
-          "arg_type": "option",
-          "value_type": "path",
-          "required": false
+          "name": "data-dir",
+          "required": false,
+          "value_type": "path"
         },
         {
-          "name": "json",
-          "description": "Output as JSON (default for robot consumption)",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON (default for robot consumption)",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "json",
+          "required": false
         },
         {
-          "name": "stale-threshold",
+          "arg_type": "option",
+          "default": "1800",
           "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
-          "arg_type": "option",
-          "value_type": "integer",
+          "name": "stale-threshold",
           "required": false,
-          "default": "1800"
+          "value_type": "integer"
         }
       ],
-      "has_json_output": true
+      "description": "Quick state/health check (alias of status)",
+      "has_json_output": true,
+      "name": "state"
     },
     {
-      "name": "api-version",
-      "description": "Show API + contract version info",
       "arguments": [
         {
-          "name": "json",
-          "description": "Output as JSON (default for robot consumption)",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON (default for robot consumption)",
           "enum_values": [
             "true",
             "false"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "introspect",
-      "description": "Full API schema introspection - commands, arguments, and response schemas",
-      "arguments": [
-        {
+          ],
           "name": "json",
-          "description": "Output as JSON (default for robot consumption)",
-          "arg_type": "flag",
-          "required": false,
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        }
-      ],
-      "has_json_output": true
-    },
-    {
-      "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
-      "arguments": [
-        {
-          "name": "path",
-          "description": "Path to the source file",
-          "arg_type": "positional",
-          "value_type": "path",
-          "required": true
-        },
-        {
-          "name": "line",
-          "short": "n",
-          "description": "Line number to show (1-indexed)",
-          "arg_type": "option",
-          "value_type": "integer",
           "required": false
-        },
+        }
+      ],
+      "description": "Show API + contract version info",
+      "has_json_output": true,
+      "name": "api-version"
+    },
+    {
+      "arguments": [
         {
-          "name": "context",
-          "short": "C",
-          "description": "Number of context lines before/after",
-          "arg_type": "option",
-          "value_type": "integer",
-          "required": false,
-          "default": "5"
-        },
-        {
-          "name": "json",
-          "description": "Output as JSON",
           "arg_type": "flag",
-          "required": false,
+          "description": "Output as JSON (default for robot consumption)",
           "enum_values": [
             "true",
             "false"
-          ]
+          ],
+          "name": "json",
+          "required": false
         }
       ],
-      "has_json_output": true
+      "description": "Full API schema introspection - commands, arguments, and response schemas",
+      "has_json_output": true,
+      "name": "introspect"
+    },
+    {
+      "arguments": [
+        {
+          "arg_type": "positional",
+          "description": "Path to the source file",
+          "name": "path",
+          "required": true,
+          "value_type": "path"
+        },
+        {
+          "arg_type": "option",
+          "description": "Line number to show (1-indexed)",
+          "name": "line",
+          "required": false,
+          "short": "n",
+          "value_type": "integer"
+        },
+        {
+          "arg_type": "option",
+          "default": "5",
+          "description": "Number of context lines before/after",
+          "name": "context",
+          "required": false,
+          "short": "C",
+          "value_type": "integer"
+        },
+        {
+          "arg_type": "flag",
+          "description": "Output as JSON",
+          "enum_values": [
+            "true",
+            "false"
+          ],
+          "name": "json",
+          "required": false
+        }
+      ],
+      "description": "View a source file at a specific line (follow up on search results)",
+      "has_json_output": true,
+      "name": "view"
+    }
+  ],
+  "contract_version": "1",
+  "global_flags": [
+    {
+      "arg_type": "option",
+      "description": "Path to the SQLite database (defaults to platform data dir)",
+      "name": "db",
+      "required": false,
+      "value_type": "path"
+    },
+    {
+      "arg_type": "flag",
+      "description": "Deterministic machine-first help (no TUI)",
+      "name": "robot-help",
+      "required": false
+    },
+    {
+      "arg_type": "option",
+      "description": "Trace command execution spans to JSONL file",
+      "name": "trace-file",
+      "required": false,
+      "value_type": "path"
+    },
+    {
+      "arg_type": "flag",
+      "description": "Reduce log noise (warnings and errors only)",
+      "name": "quiet",
+      "required": false,
+      "short": "q"
+    },
+    {
+      "arg_type": "flag",
+      "description": "Increase verbosity (debug information)",
+      "name": "verbose",
+      "required": false,
+      "short": "v"
+    },
+    {
+      "arg_type": "option",
+      "default": "auto",
+      "description": "Color behavior for CLI output",
+      "enum_values": [
+        "auto",
+        "never",
+        "always"
+      ],
+      "name": "color",
+      "required": false,
+      "value_type": "enum"
+    },
+    {
+      "arg_type": "option",
+      "default": "auto",
+      "description": "Progress output style",
+      "enum_values": [
+        "auto",
+        "bars",
+        "plain",
+        "none"
+      ],
+      "name": "progress",
+      "required": false,
+      "value_type": "enum"
+    },
+    {
+      "arg_type": "option",
+      "description": "Wrap informational output to N columns",
+      "name": "wrap",
+      "required": false,
+      "value_type": "integer"
+    },
+    {
+      "arg_type": "flag",
+      "description": "Disable wrapping entirely",
+      "name": "nowrap",
+      "required": false
     }
   ],
   "response_schemas": {
+    "api-version": {
+      "properties": {
+        "api_version": {
+          "type": "integer"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "crate_version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "capabilities": {
+      "properties": {
+        "api_version": {
+          "type": "integer"
+        },
+        "connectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "crate_version": {
+          "type": "string"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limits": {
+          "properties": {
+            "max_agg_buckets": {
+              "type": "integer"
+            },
+            "max_content_length": {
+              "type": "integer"
+            },
+            "max_fields": {
+              "type": "integer"
+            },
+            "max_limit": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "diag": {
       "properties": {
         "connectors": {
@@ -711,6 +768,59 @@
         },
         "version": {
           "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "index": {
+      "properties": {
+        "conversations": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "data_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "db_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "force_rebuild": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "full": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -849,388 +959,6 @@
       },
       "type": "object"
     },
-    "stats": {
-      "properties": {
-        "by_agent": {
-          "items": {
-            "properties": {
-              "agent": {
-                "type": "string"
-              },
-              "count": {
-                "type": "integer"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "conversations": {
-          "type": "integer"
-        },
-        "date_range": {
-          "properties": {
-            "newest": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "oldest": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "db_path": {
-          "type": "string"
-        },
-        "messages": {
-          "type": "integer"
-        },
-        "top_workspaces": {
-          "items": {
-            "properties": {
-              "count": {
-                "type": "integer"
-              },
-              "workspace": {
-                "type": "string"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "index": {
-      "properties": {
-        "conversations": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "data_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "db_path": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "elapsed_ms": {
-          "type": "integer"
-        },
-        "error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "force_rebuild": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "full": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "messages": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "success": {
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "api-version": {
-      "properties": {
-        "api_version": {
-          "type": "integer"
-        },
-        "contract_version": {
-          "type": "string"
-        },
-        "crate_version": {
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "view": {
-      "properties": {
-        "end_line": {
-          "type": "integer"
-        },
-        "highlight_line": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "lines": {
-          "items": {
-            "properties": {
-              "content": {
-                "type": "string"
-              },
-              "highlighted": {
-                "type": "boolean"
-              },
-              "number": {
-                "type": "integer"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "path": {
-          "type": "string"
-        },
-        "start_line": {
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "capabilities": {
-      "properties": {
-        "api_version": {
-          "type": "integer"
-        },
-        "connectors": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "contract_version": {
-          "type": "string"
-        },
-        "crate_version": {
-          "type": "string"
-        },
-        "features": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "limits": {
-          "properties": {
-            "max_agg_buckets": {
-              "type": "integer"
-            },
-            "max_content_length": {
-              "type": "integer"
-            },
-            "max_fields": {
-              "type": "integer"
-            },
-            "max_limit": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        }
-      },
-      "type": "object"
-    },
-    "status": {
-      "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "healthy": {
-          "type": "boolean"
-        },
-        "index": {
-          "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "fresh": {
-              "type": "boolean"
-            },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "state": {
-      "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "healthy": {
-          "type": "boolean"
-        },
-        "index": {
-          "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "fresh": {
-              "type": "boolean"
-            },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "search": {
       "properties": {
         "_meta": {
@@ -1254,6 +982,32 @@
             },
             "hits_clamped": {
               "type": "boolean"
+            },
+            "index_freshness": {
+              "properties": {
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pending_sessions": {
+                  "type": "integer"
+                },
+                "stale": {
+                  "type": "boolean"
+                }
+              },
+              "type": "object"
             },
             "max_tokens": {
               "type": [
@@ -1303,6 +1057,12 @@
                     "fresh": {
                       "type": "boolean"
                     },
+                    "last_indexed_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "stale": {
                       "type": "boolean"
                     },
@@ -1326,6 +1086,12 @@
             }
           },
           "type": "object"
+        },
+        "_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "aggregations": {
           "additionalProperties": {
@@ -1444,6 +1210,278 @@
           ]
         },
         "total_matches": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "state": {
+      "properties": {
+        "_meta": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "stats": {
+      "properties": {
+        "by_agent": {
+          "items": {
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "conversations": {
+          "type": "integer"
+        },
+        "date_range": {
+          "properties": {
+            "newest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "oldest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "top_workspaces": {
+          "items": {
+            "properties": {
+              "count": {
+                "type": "integer"
+              },
+              "workspace": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "status": {
+      "properties": {
+        "_meta": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "view": {
+      "properties": {
+        "end_line": {
+          "type": "integer"
+        },
+        "highlight_line": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lines": {
+          "items": {
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "highlighted": {
+                "type": "boolean"
+              },
+              "number": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
           "type": "integer"
         }
       },

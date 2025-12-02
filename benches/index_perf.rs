@@ -28,7 +28,9 @@ fn bench_index_full(c: &mut Criterion) {
     // create empty index dir so Tantivy opens cleanly
     let _ = index_dir(&data_dir);
 
-    c.bench_function("index_full_empty", |b| b.iter(|| run_index(opts.clone())));
+    c.bench_function("index_full_empty", |b| {
+        b.iter(|| run_index(opts.clone(), None))
+    });
 }
 
 criterion_group!(benches, bench_index_full);

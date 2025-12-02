@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 
 use crate::connectors::NormalizedConversation;
@@ -16,6 +17,17 @@ use crate::connectors::{
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
+
+#[derive(Debug, Clone)]
+pub enum ReindexCommand {
+    Full,
+}
+
+#[derive(Debug)]
+pub enum IndexerEvent {
+    Notify(Vec<PathBuf>),
+    Command(ReindexCommand),
+}
 
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
@@ -38,7 +50,10 @@ pub struct IndexOptions {
     pub progress: Option<Arc<IndexingProgress>>,
 }
 
-pub fn run_index(opts: IndexOptions) -> Result<()> {
+pub fn run_index(
+    opts: IndexOptions,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+) -> Result<()> {
     let mut storage = SqliteStorage::open(&opts.db_path)?;
     let index_path = index_dir(&opts.data_dir)?;
 
@@ -156,15 +171,42 @@ pub fn run_index(opts: IndexOptions) -> Result<()> {
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
-        watch_sources(opts.watch_once_paths.clone(), move |paths| {
-            let _ = reindex_paths(
-                &opts_clone,
-                paths,
-                state.clone(),
-                storage.clone(),
-                t_index.clone(),
-            );
-        })?;
+        watch_sources(
+            opts.watch_once_paths.clone(),
+            event_channel,
+            move |paths, is_rebuild| {
+                if is_rebuild {
+                    // For full rebuild, we effectively restart the index process
+                    // But here we just trigger a re-scan of all roots
+                    // For simplicity, we can't easily recurse into run_index (lock issues)
+                    // So we emulate a re-scan by passing all watch roots and clearing since_ts logic
+                    // Or we can just call reindex_paths with all roots and a flag to ignore ts?
+                    // reindex_paths uses classify_paths which uses mtime.
+                    // To force reindex, we might need to clear watch state.
+                    if let Ok(mut g) = state.lock() {
+                        g.clear();
+                        let _ = save_watch_state(&opts_clone.data_dir, &g);
+                    }
+                    // Pass all watch roots
+                    let roots = watch_roots();
+                    let _ = reindex_paths(
+                        &opts_clone,
+                        roots,
+                        state.clone(),
+                        storage.clone(),
+                        t_index.clone(),
+                    );
+                } else {
+                    let _ = reindex_paths(
+                        &opts_clone,
+                        paths,
+                        state.clone(),
+                        storage.clone(),
+                        t_index.clone(),
+                    );
+                }
+            },
+        )?;
     }
 
     Ok(())
@@ -185,21 +227,24 @@ fn ingest_batch(
     Ok(())
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(
+fn watch_sources<F: Fn(Vec<PathBuf>, bool) + Send + 'static>(
     watch_once_paths: Option<Vec<PathBuf>>,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     callback: F,
 ) -> Result<()> {
     if let Some(paths) = watch_once_paths {
         if !paths.is_empty() {
-            callback(paths);
+            callback(paths, false);
         }
         return Ok(());
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = event_channel.unwrap_or_else(crossbeam_channel::unbounded);
+    let tx_clone = tx.clone();
+
     let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            let _ = tx.send(event.paths);
+            let _ = tx_clone.send(IndexerEvent::Notify(event.paths));
         }
     })?;
 
@@ -215,17 +260,24 @@ fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(
     loop {
         if pending.is_empty() {
             match rx.recv() {
-                Ok(paths) => {
-                    pending.extend(paths);
-                    first_event = Some(std::time::Instant::now());
-                }
+                Ok(event) => match event {
+                    IndexerEvent::Notify(paths) => {
+                        pending.extend(paths);
+                        first_event = Some(std::time::Instant::now());
+                    }
+                    IndexerEvent::Command(cmd) => match cmd {
+                        ReindexCommand::Full => {
+                            callback(vec![], true);
+                        }
+                    },
+                },
                 Err(_) => break, // Channel closed
             }
         } else {
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(first_event.unwrap());
             if elapsed >= max_wait {
-                callback(std::mem::take(&mut pending));
+                callback(std::mem::take(&mut pending), false);
                 first_event = None;
                 continue;
             }
@@ -234,12 +286,25 @@ fn watch_sources<F: Fn(Vec<PathBuf>) + Send + 'static>(
             let wait = debounce.min(remaining);
 
             match rx.recv_timeout(wait) {
-                Ok(paths) => pending.extend(paths),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    callback(std::mem::take(&mut pending));
+                Ok(event) => match event {
+                    IndexerEvent::Notify(paths) => pending.extend(paths),
+                    IndexerEvent::Command(cmd) => match cmd {
+                        ReindexCommand::Full => {
+                            // Flush pending first? Or discard?
+                            // Let's flush pending then do full.
+                            if !pending.is_empty() {
+                                callback(std::mem::take(&mut pending), false);
+                            }
+                            callback(vec![], true);
+                            first_event = None; // Reset debounce
+                        }
+                    },
+                },
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    callback(std::mem::take(&mut pending), false);
                     first_event = None;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
     }

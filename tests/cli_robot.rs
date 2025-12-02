@@ -37,14 +37,12 @@ fn robot_help_has_sections_and_no_ansi() {
         "robot-help should not emit ANSI when color=never"
     );
     for needle in &[
-        "Summary:",
-        "Commands:",
-        "Defaults:",
+        "QUICKSTART",
+        "TIME FILTERS:",
+        "WORKFLOW:",
+        "OUTPUT:",
+        "Subcommands:",
         "Exit codes:",
-        "Examples:",
-        "Env:",
-        "Paths:",
-        "Contracts:",
     ] {
         assert!(
             stdout.contains(needle),
@@ -240,6 +238,29 @@ fn robot_docs_commands_includes_tui_reset_and_no_ansi() {
         stdout.contains("cass robot-docs <topic>"),
         "commands topic should list robot-docs command"
     );
+}
+
+#[test]
+fn robot_docs_env_lists_key_vars_and_no_ansi() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "env"]);
+    let out = cmd.assert().success().get_output().clone();
+    assert!(
+        out.stderr.is_empty(),
+        "robot-docs env should not log to stderr"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs env should not emit ANSI when color=never"
+    );
+    for needle in &[
+        "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",
+        "CASS_DATA_DIR",
+        "TUI_HEADLESS",
+    ] {
+        assert!(stdout.contains(needle), "env topic should include {needle}");
+    }
 }
 
 fn read_fixture(name: &str) -> Value {
