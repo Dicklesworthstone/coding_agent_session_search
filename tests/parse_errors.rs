@@ -11,6 +11,7 @@ use coding_agent_search::connectors::claude_code::ClaudeCodeConnector;
 use coding_agent_search::connectors::cline::ClineConnector;
 use coding_agent_search::connectors::codex::CodexConnector;
 use coding_agent_search::connectors::gemini::GeminiConnector;
+use coding_agent_search::connectors::repoprompt::RepoPromptConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
 use std::fs;
 use tempfile::TempDir;
@@ -298,6 +299,57 @@ fn gemini_handles_wrong_messages_type() {
     // Should not panic
     let result = conn.scan(&ctx);
     assert!(result.is_ok());
+}
+
+// =============================================================================
+// RepoPrompt Connector - Parsing Error Tests
+// =============================================================================
+
+/// Invalid JSON in RepoPrompt chat session
+#[test]
+fn repoprompt_skips_invalid_json() {
+    let tmp = TempDir::new().unwrap();
+    let workspaces_root = tmp.path().join("RepoPrompt").join("Workspaces");
+    let chats_dir = workspaces_root.join("Workspace-1").join("Chats");
+    fs::create_dir_all(&chats_dir).unwrap();
+
+    fs::write(chats_dir.join("ChatSession-bad.json"), "{ not valid json }").unwrap();
+
+    let conn = RepoPromptConnector::new();
+    let ctx = ScanContext {
+        data_root: workspaces_root.clone(),
+        since_ts: None,
+    };
+    let convs = conn.scan(&ctx).unwrap();
+    assert!(convs.is_empty());
+}
+
+/// Missing messages array in RepoPrompt
+#[test]
+fn repoprompt_handles_missing_messages() {
+    let tmp = TempDir::new().unwrap();
+    let workspaces_root = tmp.path().join("RepoPrompt").join("Workspaces");
+    let chats_dir = workspaces_root.join("Workspace-1").join("Chats");
+    fs::create_dir_all(&chats_dir).unwrap();
+
+    let session = serde_json::json!({
+        "id": "test-session",
+        "workspaceID": "ws-1"
+        // No "messages" field
+    });
+    fs::write(
+        chats_dir.join("ChatSession-nomsg.json"),
+        serde_json::to_string(&session).unwrap(),
+    )
+    .unwrap();
+
+    let conn = RepoPromptConnector::new();
+    let ctx = ScanContext {
+        data_root: workspaces_root.clone(),
+        since_ts: None,
+    };
+    let convs = conn.scan(&ctx).unwrap();
+    assert!(convs.is_empty() || convs[0].messages.is_empty());
 }
 
 // =============================================================================

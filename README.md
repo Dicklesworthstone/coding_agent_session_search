@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, and Pi-Agent into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, and RepoPrompt into a single, searchable timeline.
 
 <div align="center">
 
@@ -30,7 +30,7 @@ install.ps1 -EasyMode -Verify
 <div align="center">
 
 ### Search Results Across All Your Agents
-*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, Pi-Agent, etc.), and syntax-highlighted detail preview*
+*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, Pi-Agent, RepoPrompt, etc.), and syntax-highlighted detail preview*
 
 <img src="screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
 
@@ -56,7 +56,7 @@ install.ps1 -EasyMode -Verify
 
 ### The Problem
 
-AI coding agents are transforming how we write software. Claude Code, Codex, Cursor, Copilot, Aider, Pi-Agent; each creates a trail of conversations, debugging sessions, and problem-solving attempts. But this wealth of knowledge is **scattered and unsearchable**:
+AI coding agents are transforming how we write software. Claude Code, Codex, Cursor, Copilot, Aider, Pi-Agent, RepoPrompt; each creates a trail of conversations, debugging sessions, and problem-solving attempts. But this wealth of knowledge is **scattered and unsearchable**:
 
 - **Fragmented storage**: Each agent stores data differently—JSONL files, SQLite databases, markdown logs, proprietary JSON formats
 - **No cross-agent visibility**: Solutions discovered in Cursor are invisible when you're using Claude Code
@@ -121,6 +121,7 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **RepoPrompt**: `~/Library/Application Support/RepoPrompt/Workspaces/*/Chats` (Chat JSON)
 
 ## 🤖 AI / Automation Mode
 
@@ -472,7 +473,7 @@ When an exact query returns fewer than 3 results, `cass` automatically retries w
 | `F1` or `?` | Toggle help screen |
 | `F2` | Toggle dark/light theme |
 | `Ctrl+B` | Toggle border style (rounded/plain) |
-| `Ctrl+Shift+R` | Force re-index |
+| `Ctrl+Shift+R` | Reload index/view (refresh search results from the latest on-disk index; use after running `cass index` outside the TUI) |
 | `Ctrl+Shift+Del` | Reset all TUI state |
 
 ### Search Bar (Query Input)
@@ -991,7 +992,7 @@ graph TD
  Input([User Input]) -->|Key/Mouse| EventLoop
  EventLoop -->|Update| State[App State]
  State -->|Render| Terminal
- 
+
  State -->|Query Change| Debounce{Debounce}
  Debounce -->|Fire| SearchTask[Async Search]
  SearchTask -->|Results| Channel

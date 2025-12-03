@@ -14,7 +14,7 @@ use crate::connectors::{
     Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
     cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector,
+    pi_agent::PiAgentConnector, repoprompt::RepoPromptConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
@@ -142,6 +142,7 @@ pub fn run_index(
         ("cursor", || Box::new(CursorConnector::new())),
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("repoprompt", || Box::new(RepoPromptConnector::new())),
     ];
 
     // Run connector detection and scanning in parallel using rayon
@@ -393,6 +394,10 @@ fn watch_roots() -> Vec<PathBuf> {
             .unwrap_or_default()
             .join(".opencode"),
         dirs::home_dir().unwrap_or_default().join(".opencode"),
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("RepoPrompt")
+            .join("Workspaces"),
     ];
 
     // Cursor IDE chat storage
@@ -460,6 +465,7 @@ fn reindex_paths(
             ConnectorKind::Aider => Box::new(AiderConnector::new()),
             ConnectorKind::Cursor => Box::new(CursorConnector::new()),
             ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
+            ConnectorKind::RepoPrompt => Box::new(RepoPromptConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -531,6 +537,7 @@ enum ConnectorKind {
     Aider,
     Cursor,
     ChatGpt,
+    RepoPrompt,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -588,6 +595,8 @@ fn classify_paths(paths: Vec<PathBuf>) -> Vec<(ConnectorKind, Option<i64>)> {
                     Some(ConnectorKind::Cursor)
                 } else if s.contains("com.openai.chat") || s.contains("conversations-") {
                     Some(ConnectorKind::ChatGpt)
+                } else if s.contains("RepoPrompt/Workspaces") && s.contains("/Chats/") {
+                    Some(ConnectorKind::RepoPrompt)
                 } else {
                     None
                 };
@@ -864,7 +873,20 @@ mod tests {
         std::fs::create_dir_all(chatgpt.parent().unwrap()).unwrap();
         std::fs::write(&chatgpt, "{}").unwrap();
 
-        let paths = vec![codex.clone(), claude.clone(), aider, cursor, chatgpt];
+        let repoprompt = tmp
+            .path()
+            .join("RepoPrompt/Workspaces/Workspace-1/Chats/ChatSession-1.json");
+        std::fs::create_dir_all(repoprompt.parent().unwrap()).unwrap();
+        std::fs::write(&repoprompt, "{}").unwrap();
+
+        let paths = vec![
+            codex.clone(),
+            claude.clone(),
+            aider,
+            cursor,
+            chatgpt,
+            repoprompt,
+        ];
         let classified = classify_paths(paths);
 
         let kinds: std::collections::HashSet<_> = classified.iter().map(|(k, _)| *k).collect();
@@ -873,6 +895,7 @@ mod tests {
         assert!(kinds.contains(&ConnectorKind::Aider));
         assert!(kinds.contains(&ConnectorKind::Cursor));
         assert!(kinds.contains(&ConnectorKind::ChatGpt));
+        assert!(kinds.contains(&ConnectorKind::RepoPrompt));
 
         for (_, ts) in classified {
             assert!(ts.is_some(), "mtime should be captured");

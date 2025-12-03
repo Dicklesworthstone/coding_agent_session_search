@@ -864,7 +864,7 @@ pub fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
             "  agent_search.db - Full-text search index".to_string(),
             "  tui_state.json - Persisted UI preferences".to_string(),
             "  update_state.json - Update check state".to_string(),
-            "Agent histories auto-detected from: Claude, Codex, Gemini, Copilot, Cursor"
+            "Agent histories auto-detected from: Claude, Codex, Gemini, Copilot, Cursor, Pi-Agent, RepoPrompt"
                 .to_string(),
         ],
     ));
@@ -898,7 +898,7 @@ pub fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     lines.extend(add_section(
         "Filters",
         &[
-            format!("{} agent | {} workspace | {} from | {} to | {} clear all", 
+            format!("{} agent | {} workspace | {} from | {} to | {} clear all",
                 shortcuts::FILTER_AGENT, shortcuts::FILTER_WORKSPACE, shortcuts::FILTER_DATE_FROM, shortcuts::FILTER_DATE_TO, shortcuts::CLEAR_FILTERS),
             format!("{} scope to active agent | {} clear scope | {} cycle time presets (24h/7d/30d/all)",
                 shortcuts::SCOPE_AGENT, shortcuts::SCOPE_WORKSPACE, shortcuts::CYCLE_TIME_PRESETS),
@@ -1490,6 +1490,11 @@ const KNOWN_AGENTS: &[&str] = &[
     "gemini_cli",
     "amp",
     "opencode",
+    "aider",
+    "cursor",
+    "chatgpt",
+    "pi_agent",
+    "repoprompt",
 ];
 
 /// Returns agent suggestions matching the given prefix (case-insensitive)

@@ -3626,6 +3626,7 @@ fn run_diag(
     // Agent search paths - compute path once, then check existence
     let home = dirs::home_dir().unwrap_or_default();
     let config_dir = dirs::config_dir().unwrap_or_default();
+    let data_root = dirs::data_dir().unwrap_or_default();
 
     let codex_path = home.join(".codex/sessions");
     let claude_path = home.join(".claude/projects");
@@ -3637,6 +3638,7 @@ fn run_diag(
         .unwrap_or_else(|| home.join("Library/Application Support/Cursor/User"));
     let chatgpt_path = crate::connectors::chatgpt::ChatGptConnector::app_support_dir()
         .unwrap_or_else(|| home.join("Library/Application Support/com.openai.chat"));
+    let repoprompt_path = data_root.join("RepoPrompt").join("Workspaces");
 
     let agent_paths: Vec<(&str, &std::path::Path, bool)> = vec![
         ("codex", &codex_path, codex_path.exists()),
@@ -3647,6 +3649,7 @@ fn run_diag(
         ("amp", &amp_path, amp_path.exists()),
         ("cursor", &cursor_path, cursor_path.exists()),
         ("chatgpt", &chatgpt_path, chatgpt_path.exists()),
+        ("repoprompt", &repoprompt_path, repoprompt_path.exists()),
     ];
 
     let platform = std::env::consts::OS;
@@ -4609,6 +4612,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "cursor".to_string(),
             "chatgpt".to_string(),
             "pi_agent".to_string(),
+            "repoprompt".to_string(),
         ],
         limits: CapabilitiesLimits {
             max_limit: 10000,
