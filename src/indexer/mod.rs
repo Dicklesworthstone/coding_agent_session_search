@@ -13,8 +13,8 @@ use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
-    cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector,
+    copilot::CopilotConnector, cursor::CursorConnector, gemini::GeminiConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::storage::sqlite::SqliteStorage;
@@ -142,6 +142,7 @@ pub fn run_index(
         ("cursor", || Box::new(CursorConnector::new())),
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("copilot", || Box::new(CopilotConnector::new())),
     ];
 
     // Run connector detection and scanning in parallel using rayon

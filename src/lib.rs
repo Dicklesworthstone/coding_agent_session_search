@@ -4607,6 +4607,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "cline".to_string(),
             "aider".to_string(),
             "cursor".to_string(),
+            "copilot".to_string(),
             "chatgpt".to_string(),
             "pi_agent".to_string(),
         ],
