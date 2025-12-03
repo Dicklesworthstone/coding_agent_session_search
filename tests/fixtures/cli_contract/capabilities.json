@@ -36,7 +36,8 @@
     "aider",
     "cursor",
     "chatgpt",
-    "pi_agent"
+    "pi_agent",
+    "repoprompt"
   ],
   "limits": {
     "max_limit": 10000,
