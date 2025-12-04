@@ -21,56 +21,39 @@ impl OpenCodeConnector {
         Self
     }
 
-    /// Get candidate directories where OpenCode stores its data.
-    /// OpenCode uses ~/.local/share/opencode/project/ on Linux/macOS.
-    fn data_root() -> Option<PathBuf> {
+    /// Get the OpenCode global storage directory.
+    /// OpenCode stores sessions in ~/.local/share/opencode/storage/
+    fn storage_root() -> Option<PathBuf> {
         // Primary location: XDG data directory
         if let Some(data) = dirs::data_local_dir() {
-            let opencode_dir = data.join("opencode/project");
-            if opencode_dir.exists() {
-                return Some(opencode_dir);
+            let storage_dir = data.join("opencode/storage");
+            if storage_dir.exists() {
+                return Some(storage_dir);
             }
         }
 
-        // Fallback: ~/.local/share/opencode/project
+        // Fallback: ~/.local/share/opencode/storage
         if let Some(home) = dirs::home_dir() {
-            let opencode_dir = home.join(".local/share/opencode/project");
-            if opencode_dir.exists() {
-                return Some(opencode_dir);
+            let storage_dir = home.join(".local/share/opencode/storage");
+            if storage_dir.exists() {
+                return Some(storage_dir);
             }
         }
 
         None
     }
-
-    /// Find all project directories containing session storage.
-    fn find_project_dirs(root: &PathBuf) -> Vec<PathBuf> {
-        let mut projects = Vec::new();
-
-        // Walk the root looking for directories with storage/session subdirectories
-        for entry in WalkDir::new(root)
-            .max_depth(10) // Limit depth to avoid infinite recursion in nested project/project dirs
-            .into_iter()
-            .flatten()
-        {
-            if entry.file_type().is_dir() {
-                let session_dir = entry.path().join("storage/session");
-                if session_dir.exists() && session_dir.is_dir() {
-                    projects.push(entry.path().to_path_buf());
-                }
-            }
-        }
-
-        projects
-    }
 }
 
-/// OpenCode session info from info/*.json
+/// OpenCode session info from session/<project_hash>/<session_id>.json
 #[derive(Debug, Deserialize)]
 struct SessionInfo {
     id: String,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    directory: Option<String>,
+    #[serde(rename = "projectID", default)]
+    project_id: Option<String>,
     #[serde(default)]
     time: Option<SessionTime>,
 }
@@ -83,25 +66,15 @@ struct SessionTime {
     updated: Option<i64>,
 }
 
-/// OpenCode message from message/<session>/<msg>.json
+/// OpenCode message from message/<session_id>/<msg_id>.json
 #[derive(Debug, Deserialize)]
 struct MessageInfo {
     id: String,
     role: String,
     #[serde(default)]
-    path: Option<MessagePath>,
-    #[serde(default)]
     time: Option<MessageTime>,
     #[serde(rename = "modelID", default)]
     model_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessagePath {
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,18 +85,35 @@ struct MessageTime {
     completed: Option<i64>,
 }
 
-/// OpenCode part (content) from part/<session>/<msg>/<part>.json
+/// OpenCode part (content) from part/<session_id>/<msg_id>/<part_id>.json
 #[derive(Debug, Deserialize)]
 struct PartInfo {
     #[serde(rename = "type", default)]
     part_type: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    state: Option<ToolState>,
+}
+
+/// Tool state for tool parts
+#[derive(Debug, Deserialize)]
+struct ToolState {
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    metadata: Option<ToolMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolMetadata {
+    #[serde(default)]
+    preview: Option<String>,
 }
 
 impl Connector for OpenCodeConnector {
     fn detect(&self) -> DetectionResult {
-        if let Some(root) = Self::data_root() {
+        if let Some(root) = Self::storage_root() {
             DetectionResult {
                 detected: true,
                 evidence: vec![format!("found {}", root.display())],
@@ -134,75 +124,77 @@ impl Connector for OpenCodeConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        // Determine root directory to scan
-        let root = if ctx.data_root.exists()
+        // Determine storage root directory
+        let storage_root = if ctx.data_root.exists()
             && (ctx
                 .data_root
                 .to_str()
                 .is_some_and(|s| s.contains("opencode"))
-                || ctx.data_root.join("storage/session").exists())
+                || ctx.data_root.join("session").exists())
         {
-            // Test mode or custom path with opencode structure
+            // Test mode or custom path with opencode storage structure
             ctx.data_root.clone()
-        } else if let Some(data_root) = Self::data_root() {
-            data_root
+        } else if let Some(root) = Self::storage_root() {
+            root
         } else {
             return Ok(Vec::new());
         };
 
-        tracing::debug!(root = %root.display(), "opencode scanning root");
+        tracing::debug!(root = %storage_root.display(), "opencode scanning storage root");
+
+        let session_root = storage_root.join("session");
+        let message_root = storage_root.join("message");
+        let part_root = storage_root.join("part");
+
+        if !session_root.exists() {
+            tracing::debug!("opencode session directory does not exist");
+            return Ok(Vec::new());
+        }
 
         let mut convs = Vec::new();
         let mut seen_sessions = std::collections::HashSet::new();
 
-        // Find all project directories
-        let project_dirs = if root.join("storage/session").exists() {
-            // The root itself is a project directory
-            vec![root.clone()]
-        } else {
-            Self::find_project_dirs(&root)
-        };
-
-        tracing::debug!(count = project_dirs.len(), "opencode found project directories");
-
-        for project_dir in project_dirs {
-            let session_root = project_dir.join("storage/session");
-            if !session_root.exists() {
+        // Walk through all project directories under session/
+        // Structure: session/<project_hash>/<session_id>.json
+        for project_entry in WalkDir::new(&session_root)
+            .min_depth(1)
+            .max_depth(1)
+            .into_iter()
+            .flatten()
+        {
+            if !project_entry.file_type().is_dir() {
                 continue;
             }
 
-            let info_dir = session_root.join("info");
-            let message_dir = session_root.join("message");
-            let part_dir = session_root.join("part");
+            let project_dir = project_entry.path();
+            tracing::debug!(project = %project_dir.display(), "opencode scanning project");
 
-            if !info_dir.exists() {
-                continue;
-            }
-
-            // Read all session info files
-            for entry in WalkDir::new(&info_dir)
+            // Read all session files in this project directory
+            for session_entry in WalkDir::new(project_dir)
+                .min_depth(1)
                 .max_depth(1)
                 .into_iter()
                 .flatten()
             {
-                if !entry.file_type().is_file() {
+                if !session_entry.file_type().is_file() {
                     continue;
                 }
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+
+                let session_path = session_entry.path();
+                if session_path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
 
                 // Skip files not modified since last scan
-                if !crate::connectors::file_modified_since(path, ctx.since_ts) {
+                if !crate::connectors::file_modified_since(session_path, ctx.since_ts) {
                     continue;
                 }
 
                 // Parse session info
-                let content = match fs::read_to_string(path) {
+                let content = match fs::read_to_string(session_path) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!(path = %path.display(), error = %e, "opencode failed to read session info");
+                        tracing::debug!(path = %session_path.display(), error = %e, "opencode failed to read session");
                         continue;
                     }
                 };
@@ -210,28 +202,32 @@ impl Connector for OpenCodeConnector {
                 let session_info: SessionInfo = match serde_json::from_str(&content) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::debug!(path = %path.display(), error = %e, "opencode failed to parse session info");
+                        tracing::debug!(path = %session_path.display(), error = %e, "opencode failed to parse session");
                         continue;
                     }
                 };
 
-                // Deduplicate sessions across nested project directories
+                // Deduplicate sessions
                 if !seen_sessions.insert(session_info.id.clone()) {
                     continue;
                 }
 
+                // Get workspace from session directory field
+                let workspace = session_info.directory.as_ref().map(PathBuf::from);
+
                 // Find and read messages for this session
-                let session_message_dir = message_dir.join(&session_info.id);
-                let session_part_dir = part_dir.join(&session_info.id);
+                // Messages are in: message/<session_id>/<msg_id>.json
+                // Parts are in: part/<msg_id>/<part_id>.json (NOTE: no session_id in path!)
+                let session_message_dir = message_root.join(&session_info.id);
 
                 let mut messages = Vec::new();
-                let mut workspace: Option<PathBuf> = None;
                 let mut started_at = session_info.time.as_ref().and_then(|t| t.created);
                 let mut ended_at = session_info.time.as_ref().and_then(|t| t.updated);
 
                 if session_message_dir.exists() {
-                    // Collect message files
+                    // Collect and sort message files by filename (contains timestamp)
                     let mut message_files: Vec<_> = WalkDir::new(&session_message_dir)
+                        .min_depth(1)
                         .max_depth(1)
                         .into_iter()
                         .flatten()
@@ -241,7 +237,6 @@ impl Connector for OpenCodeConnector {
                         })
                         .collect();
 
-                    // Sort by filename to maintain order
                     message_files.sort_by_key(|e| e.file_name().to_os_string());
 
                     for msg_entry in message_files {
@@ -256,16 +251,6 @@ impl Connector for OpenCodeConnector {
                             Err(_) => continue,
                         };
 
-                        // Extract workspace from first message with path info
-                        if workspace.is_none() && msg_info.path.is_some() {
-                            let path_info = msg_info.path.as_ref().unwrap();
-                            workspace = path_info
-                                .root
-                                .as_ref()
-                                .or(path_info.cwd.as_ref())
-                                .map(PathBuf::from);
-                        }
-
                         // Get message timestamp
                         let created = msg_info
                             .time
@@ -279,11 +264,13 @@ impl Connector for OpenCodeConnector {
                         }
 
                         // Get content from part files
+                        // Parts are in: part/<msg_id>/<part_id>.json
                         let mut content_parts = Vec::new();
-                        let msg_part_dir = session_part_dir.join(&msg_info.id);
+                        let msg_part_dir = part_root.join(&msg_info.id);
 
                         if msg_part_dir.exists() {
                             let mut part_files: Vec<_> = WalkDir::new(&msg_part_dir)
+                                .min_depth(1)
                                 .max_depth(1)
                                 .into_iter()
                                 .flatten()
@@ -294,7 +281,6 @@ impl Connector for OpenCodeConnector {
                                 })
                                 .collect();
 
-                            // Sort parts by filename
                             part_files.sort_by_key(|e| e.file_name().to_os_string());
 
                             for part_entry in part_files {
@@ -303,20 +289,48 @@ impl Connector for OpenCodeConnector {
                                     Err(_) => continue,
                                 };
 
-                                let part_info: PartInfo = match serde_json::from_str(&part_content)
-                                {
+                                let part_info: PartInfo = match serde_json::from_str(&part_content) {
                                     Ok(p) => p,
                                     Err(_) => continue,
                                 };
 
-                                // Include text parts
-                                if let Some(text) = part_info.text.filter(|t| !t.trim().is_empty()) {
-                                    // For tool_result or other special types, add context
-                                    if part_info.part_type.as_deref() == Some("tool_result") {
-                                        content_parts.push(format!("[Tool Result]\n{text}"));
-                                    } else {
-                                        content_parts.push(text);
+                                // Extract content based on part type
+                                match part_info.part_type.as_deref() {
+                                    Some("text") => {
+                                        if let Some(text) =
+                                            part_info.text.filter(|t| !t.trim().is_empty())
+                                        {
+                                            content_parts.push(text);
+                                        }
                                     }
+                                    Some("tool") => {
+                                        // Include tool output/preview for searchability
+                                        if let Some(state) = &part_info.state {
+                                            if let Some(preview) = state
+                                                .metadata
+                                                .as_ref()
+                                                .and_then(|m| m.preview.as_ref())
+                                            {
+                                                if !preview.trim().is_empty() {
+                                                    content_parts
+                                                        .push(format!("[Tool Output]\n{preview}"));
+                                                }
+                                            } else if let Some(output) = &state.output {
+                                                // Truncate very long tool outputs (UTF-8 safe)
+                                                let truncated: String = if output.chars().count() > 500 {
+                                                    format!("{}...", output.chars().take(500).collect::<String>())
+                                                } else {
+                                                    output.clone()
+                                                };
+                                                if !truncated.trim().is_empty() {
+                                                    content_parts
+                                                        .push(format!("[Tool Output]\n{truncated}"));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Skip step-start, step-finish, snapshot, patch, etc.
+                                    _ => {}
                                 }
                             }
                         }
@@ -355,9 +369,6 @@ impl Connector for OpenCodeConnector {
                     "opencode extracted session"
                 );
 
-                // Determine source path - use the session info file
-                let source_path = path.to_path_buf();
-
                 convs.push(NormalizedConversation {
                     agent_slug: "opencode".into(),
                     external_id: Some(session_info.id.clone()),
@@ -376,18 +387,23 @@ impl Connector for OpenCodeConnector {
                             })
                     }),
                     workspace,
-                    source_path,
+                    source_path: session_path.to_path_buf(),
                     started_at,
                     ended_at,
                     metadata: serde_json::json!({
                         "source": "opencode",
                         "session_id": session_info.id,
-                        "project_dir": project_dir.display().to_string(),
+                        "project_id": session_info.project_id,
                     }),
                     messages,
                 });
             }
         }
+
+        tracing::info!(
+            conversations = convs.len(),
+            "opencode scan complete"
+        );
 
         Ok(convs)
     }

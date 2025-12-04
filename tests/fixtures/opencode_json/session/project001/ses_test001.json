@@ -1,5 +1,7 @@
 {
   "id": "ses_test001",
+  "projectID": "project001",
+  "directory": "/tmp/test-project",
   "title": "OpenCode Test Session",
   "time": {
     "created": 1700000000000,

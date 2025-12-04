@@ -1,0 +1,10 @@
+{
+  "id": "msg_002",
+  "sessionID": "ses_test001",
+  "role": "assistant",
+  "time": {
+    "created": 1700000005000,
+    "completed": 1700000010000
+  },
+  "modelID": "claude-3-opus"
+}
