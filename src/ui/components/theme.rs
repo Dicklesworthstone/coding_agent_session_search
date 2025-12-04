@@ -429,6 +429,7 @@ impl ThemePalette {
             "amp" => (colors::AGENT_AMP_BG, colors::STATUS_ERROR), // Orange/Red
             "aider" => (colors::AGENT_AIDER_BG, Color::Rgb(64, 224, 208)), // Turquoise accent
             "cursor" => (colors::AGENT_CURSOR_BG, Color::Rgb(236, 72, 153)), // Pink accent
+            "copilot" => (colors::AGENT_CODEX_BG, Color::Rgb(36, 150, 237)), // GitHub Copilot blue
             "chatgpt" => (colors::AGENT_CHATGPT_BG, Color::Rgb(16, 163, 127)), // ChatGPT green
             "opencode" => (colors::AGENT_OPENCODE_BG, colors::ROLE_USER), // Neutral/sage
             "pi_agent" => (colors::AGENT_CODEX_BG, Color::Rgb(255, 140, 0)), // Orange for pi
@@ -453,6 +454,7 @@ impl ThemePalette {
             "amp" => "⚡",
             "aider" => "🔧",
             "cursor" => "🎯",
+            "copilot" => "✈️",
             "chatgpt" => "💬",
             "opencode" => "📦",
             "pi_agent" => "🥧",

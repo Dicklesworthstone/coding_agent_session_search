@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  cass-mcp-server:
+    build:
+      context: ..
+      dockerfile: mcp_server/Dockerfile
+    container_name: cass-mcp-server
+    ports:
+      - "8888:8888"
+    volumes:
+      # Mount your VS Code data for Copilot sessions (macOS)
+      - "${HOME}/Library/Application Support/Code/User:/vscode-data:ro"
+      # Persistent storage for the cass index
+      - cass-data:/data
+    environment:
+      - CASS_BINARY=/app/cass
+      - CASS_DATA_DIR=/data
+      - PORT=8888
+      - HOST=0.0.0.0
+      # Point cass to VS Code data
+      - XDG_CONFIG_HOME=/vscode-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  cass-data:
+    driver: local

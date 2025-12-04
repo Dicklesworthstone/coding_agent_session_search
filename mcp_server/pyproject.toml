@@ -1,0 +1,16 @@
+[project]
+name = "cass-mcp-server"
+version = "1.0.0"
+description = "MCP Server for Coding Agent Session Search - search across AI coding agent histories"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "starlette>=0.41.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "sse-starlette>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

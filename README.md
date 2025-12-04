@@ -118,6 +118,7 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **OpenCode**: `.opencode` directories (SQLite)
 - **Amp**: `~/.local/share/amp` & VS Code storage
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
+- **Copilot**: VS Code `globalStorage/emptyWindowChatSessions/` + `workspaceStorage/*/chatSessions/` (Session JSON)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
