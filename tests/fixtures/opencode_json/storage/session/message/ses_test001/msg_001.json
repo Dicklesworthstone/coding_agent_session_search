@@ -1,0 +1,12 @@
+{
+  "id": "msg_001",
+  "role": "user",
+  "path": {
+    "cwd": "/tmp/test-project",
+    "root": "/tmp/test-project"
+  },
+  "time": {
+    "created": 1700000000000
+  },
+  "sessionID": "ses_test001"
+}

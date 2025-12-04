@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use rusqlite::{Connection, Row};
+use serde::Deserialize;
 use walkdir::WalkDir;
 
 use crate::connectors::{
@@ -22,409 +21,374 @@ impl OpenCodeConnector {
         Self
     }
 
-    fn dir_candidates() -> Vec<PathBuf> {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let mut dirs = vec![cwd.join(".opencode")];
+    /// Get candidate directories where OpenCode stores its data.
+    /// OpenCode uses ~/.local/share/opencode/project/ on Linux/macOS.
+    fn data_root() -> Option<PathBuf> {
+        // Primary location: XDG data directory
+        if let Some(data) = dirs::data_local_dir() {
+            let opencode_dir = data.join("opencode/project");
+            if opencode_dir.exists() {
+                return Some(opencode_dir);
+            }
+        }
 
+        // Fallback: ~/.local/share/opencode/project
         if let Some(home) = dirs::home_dir() {
-            dirs.push(home.join(".opencode"));
+            let opencode_dir = home.join(".local/share/opencode/project");
+            if opencode_dir.exists() {
+                return Some(opencode_dir);
+            }
         }
 
-        if let Some(data) = dirs::data_dir() {
-            dirs.push(data.join("opencode"));
-            dirs.push(data.join("opencode/project"));
-        }
-
-        dirs
+        None
     }
 
-    fn find_dbs() -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for root in Self::dir_candidates() {
-            if !root.exists() {
-                continue;
-            }
-            for entry in WalkDir::new(root).into_iter().flatten() {
-                if entry.file_type().is_file() {
-                    let path = entry.path();
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.ends_with(".db")
-                        || name.ends_with(".sqlite")
-                        || name.eq_ignore_ascii_case("database")
-                        || name.eq_ignore_ascii_case("storage")
-                    {
-                        out.push(path.to_path_buf());
-                    }
+    /// Find all project directories containing session storage.
+    fn find_project_dirs(root: &PathBuf) -> Vec<PathBuf> {
+        let mut projects = Vec::new();
+
+        // Walk the root looking for directories with storage/session subdirectories
+        for entry in WalkDir::new(root)
+            .max_depth(10) // Limit depth to avoid infinite recursion in nested project/project dirs
+            .into_iter()
+            .flatten()
+        {
+            if entry.file_type().is_dir() {
+                let session_dir = entry.path().join("storage/session");
+                if session_dir.exists() && session_dir.is_dir() {
+                    projects.push(entry.path().to_path_buf());
                 }
             }
         }
-        out
+
+        projects
     }
+}
+
+/// OpenCode session info from info/*.json
+#[derive(Debug, Deserialize)]
+struct SessionInfo {
+    id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    time: Option<SessionTime>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    updated: Option<i64>,
+}
+
+/// OpenCode message from message/<session>/<msg>.json
+#[derive(Debug, Deserialize)]
+struct MessageInfo {
+    id: String,
+    role: String,
+    #[serde(default)]
+    path: Option<MessagePath>,
+    #[serde(default)]
+    time: Option<MessageTime>,
+    #[serde(rename = "modelID", default)]
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagePath {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+/// OpenCode part (content) from part/<session>/<msg>/<part>.json
+#[derive(Debug, Deserialize)]
+struct PartInfo {
+    #[serde(rename = "type", default)]
+    part_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 impl Connector for OpenCodeConnector {
     fn detect(&self) -> DetectionResult {
-        for d in Self::dir_candidates() {
-            if d.exists() {
-                return DetectionResult {
-                    detected: true,
-                    evidence: vec![format!("found {}", d.display())],
-                };
+        if let Some(root) = Self::data_root() {
+            DetectionResult {
+                detected: true,
+                evidence: vec![format!("found {}", root.display())],
             }
+        } else {
+            DetectionResult::not_found()
         }
-        DetectionResult::not_found()
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut convs = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-
-        // Use ctx.data_root for tests/custom paths, but filter out CASS internal databases
-        let dbs = if ctx.data_root.exists() {
-            WalkDir::new(&ctx.data_root)
-                .into_iter()
-                .flatten()
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.path().to_path_buf())
-                .filter(|p| {
-                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    // Exclude CASS's own internal databases to prevent self-indexing
-                    if name == "agent_search.db" || name == "conversations.db" {
-                        return false;
-                    }
-                    name.ends_with(".db") || name.ends_with(".sqlite")
-                })
-                .collect()
+        // Determine root directory to scan
+        let root = if ctx.data_root.exists()
+            && (ctx
+                .data_root
+                .to_str()
+                .is_some_and(|s| s.contains("opencode"))
+                || ctx.data_root.join("storage/session").exists())
+        {
+            // Test mode or custom path with opencode structure
+            ctx.data_root.clone()
+        } else if let Some(data_root) = Self::data_root() {
+            data_root
         } else {
-            Self::find_dbs()
+            return Ok(Vec::new());
         };
 
-        for db_path in dbs {
-            // Skip files not modified since last scan (incremental indexing)
-            if !crate::connectors::file_modified_since(&db_path, ctx.since_ts) {
+        tracing::debug!(root = %root.display(), "opencode scanning root");
+
+        let mut convs = Vec::new();
+        let mut seen_sessions = std::collections::HashSet::new();
+
+        // Find all project directories
+        let project_dirs = if root.join("storage/session").exists() {
+            // The root itself is a project directory
+            vec![root.clone()]
+        } else {
+            Self::find_project_dirs(&root)
+        };
+
+        tracing::debug!(count = project_dirs.len(), "opencode found project directories");
+
+        for project_dir in project_dirs {
+            let session_root = project_dir.join("storage/session");
+            if !session_root.exists() {
                 continue;
             }
-            let conn = match Connection::open(&db_path) {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::warn!("opencode: failed to open {}: {err}", db_path.display());
+
+            let info_dir = session_root.join("info");
+            let message_dir = session_root.join("message");
+            let part_dir = session_root.join("part");
+
+            if !info_dir.exists() {
+                continue;
+            }
+
+            // Read all session info files
+            for entry in WalkDir::new(&info_dir)
+                .max_depth(1)
+                .into_iter()
+                .flatten()
+            {
+                if !entry.file_type().is_file() {
                     continue;
                 }
-            };
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
 
-            match load_db(&conn, &db_path, ctx.since_ts, &mut seen_ids) {
-                Ok(mut found) => convs.append(&mut found),
-                Err(err) => tracing::warn!("opencode: failed to read {}: {err}", db_path.display()),
+                // Skip files not modified since last scan
+                if !crate::connectors::file_modified_since(path, ctx.since_ts) {
+                    continue;
+                }
+
+                // Parse session info
+                let content = match fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(path = %path.display(), error = %e, "opencode failed to read session info");
+                        continue;
+                    }
+                };
+
+                let session_info: SessionInfo = match serde_json::from_str(&content) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(path = %path.display(), error = %e, "opencode failed to parse session info");
+                        continue;
+                    }
+                };
+
+                // Deduplicate sessions across nested project directories
+                if !seen_sessions.insert(session_info.id.clone()) {
+                    continue;
+                }
+
+                // Find and read messages for this session
+                let session_message_dir = message_dir.join(&session_info.id);
+                let session_part_dir = part_dir.join(&session_info.id);
+
+                let mut messages = Vec::new();
+                let mut workspace: Option<PathBuf> = None;
+                let mut started_at = session_info.time.as_ref().and_then(|t| t.created);
+                let mut ended_at = session_info.time.as_ref().and_then(|t| t.updated);
+
+                if session_message_dir.exists() {
+                    // Collect message files
+                    let mut message_files: Vec<_> = WalkDir::new(&session_message_dir)
+                        .max_depth(1)
+                        .into_iter()
+                        .flatten()
+                        .filter(|e| {
+                            e.file_type().is_file()
+                                && e.path().extension().and_then(|x| x.to_str()) == Some("json")
+                        })
+                        .collect();
+
+                    // Sort by filename to maintain order
+                    message_files.sort_by_key(|e| e.file_name().to_os_string());
+
+                    for msg_entry in message_files {
+                        let msg_path = msg_entry.path();
+                        let msg_content = match fs::read_to_string(msg_path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+
+                        let msg_info: MessageInfo = match serde_json::from_str(&msg_content) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+
+                        // Extract workspace from first message with path info
+                        if workspace.is_none() && msg_info.path.is_some() {
+                            let path_info = msg_info.path.as_ref().unwrap();
+                            workspace = path_info
+                                .root
+                                .as_ref()
+                                .or(path_info.cwd.as_ref())
+                                .map(PathBuf::from);
+                        }
+
+                        // Get message timestamp
+                        let created = msg_info
+                            .time
+                            .as_ref()
+                            .and_then(|t| t.created.or(t.completed));
+                        if started_at.is_none() {
+                            started_at = created;
+                        }
+                        if let Some(ts) = created {
+                            ended_at = Some(ended_at.map_or(ts, |e| e.max(ts)));
+                        }
+
+                        // Get content from part files
+                        let mut content_parts = Vec::new();
+                        let msg_part_dir = session_part_dir.join(&msg_info.id);
+
+                        if msg_part_dir.exists() {
+                            let mut part_files: Vec<_> = WalkDir::new(&msg_part_dir)
+                                .max_depth(1)
+                                .into_iter()
+                                .flatten()
+                                .filter(|e| {
+                                    e.file_type().is_file()
+                                        && e.path().extension().and_then(|x| x.to_str())
+                                            == Some("json")
+                                })
+                                .collect();
+
+                            // Sort parts by filename
+                            part_files.sort_by_key(|e| e.file_name().to_os_string());
+
+                            for part_entry in part_files {
+                                let part_content = match fs::read_to_string(part_entry.path()) {
+                                    Ok(c) => c,
+                                    Err(_) => continue,
+                                };
+
+                                let part_info: PartInfo = match serde_json::from_str(&part_content)
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => continue,
+                                };
+
+                                // Include text parts
+                                if let Some(text) = part_info.text.filter(|t| !t.trim().is_empty()) {
+                                    // For tool_result or other special types, add context
+                                    if part_info.part_type.as_deref() == Some("tool_result") {
+                                        content_parts.push(format!("[Tool Result]\n{text}"));
+                                    } else {
+                                        content_parts.push(text);
+                                    }
+                                }
+                            }
+                        }
+
+                        let content = content_parts.join("\n\n");
+                        if content.trim().is_empty() {
+                            continue;
+                        }
+
+                        messages.push(NormalizedMessage {
+                            idx: messages.len() as i64,
+                            role: msg_info.role.clone(),
+                            author: msg_info.model_id.clone(),
+                            created_at: created,
+                            content,
+                            extra: serde_json::json!({
+                                "message_id": msg_info.id,
+                                "model": msg_info.model_id,
+                            }),
+                            snippets: Vec::new(),
+                        });
+                    }
+                }
+
+                if messages.is_empty() {
+                    tracing::debug!(
+                        session_id = %session_info.id,
+                        "opencode no messages found for session"
+                    );
+                    continue;
+                }
+
+                tracing::debug!(
+                    session_id = %session_info.id,
+                    message_count = messages.len(),
+                    "opencode extracted session"
+                );
+
+                // Determine source path - use the session info file
+                let source_path = path.to_path_buf();
+
+                convs.push(NormalizedConversation {
+                    agent_slug: "opencode".into(),
+                    external_id: Some(session_info.id.clone()),
+                    title: session_info.title.or_else(|| {
+                        messages
+                            .iter()
+                            .find(|m| m.role == "user")
+                            .map(|m| {
+                                m.content
+                                    .lines()
+                                    .next()
+                                    .unwrap_or(&m.content)
+                                    .chars()
+                                    .take(100)
+                                    .collect()
+                            })
+                    }),
+                    workspace,
+                    source_path,
+                    started_at,
+                    ended_at,
+                    metadata: serde_json::json!({
+                        "source": "opencode",
+                        "session_id": session_info.id,
+                        "project_dir": project_dir.display().to_string(),
+                    }),
+                    messages,
+                });
             }
         }
 
         Ok(convs)
     }
-}
-
-fn load_db(
-    conn: &Connection,
-    db_path: &PathBuf,
-    since_ts: Option<i64>,
-    seen_ids: &mut std::collections::HashSet<String>,
-) -> Result<Vec<NormalizedConversation>> {
-    let sessions_present = has_table(conn, "sessions")?;
-    let messages_present = has_table(conn, "messages")?;
-
-    if !messages_present {
-        return Ok(Vec::new());
-    }
-
-    // Build session metadata map if available.
-    let session_meta: HashMap<i64, SessionRow> = if sessions_present {
-        read_sessions(conn)?
-    } else {
-        HashMap::new()
-    };
-
-    let mut by_session: HashMap<i64, Vec<NormalizedMessage>> = HashMap::new();
-    let mut fallback_messages: Vec<NormalizedMessage> = Vec::new();
-
-    let msg_cols = table_columns(conn, "messages")?;
-    let order_col = msg_cols
-        .iter()
-        .find(|c| c.as_str() == "created_at" || c.as_str() == "timestamp" || c.as_str() == "ts")
-        .cloned();
-    let sql = match order_col {
-        Some(col) => format!("SELECT * FROM messages ORDER BY {col}"),
-        None => "SELECT * FROM messages".to_string(),
-    };
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| message_from_row(row, &msg_cols))?;
-    for msg in rows {
-        let msg = msg?;
-        // NOTE: Do NOT filter individual messages by timestamp here!
-        // The file-level check in file_modified_since() is sufficient.
-        // Filtering messages would cause older messages to be lost when
-        // the file is re-indexed after new messages are added.
-
-        if let Some(id) = msg
-            .extra
-            .get("session_id")
-            .and_then(serde_json::Value::as_i64)
-        {
-            by_session.entry(id).or_default().push(msg);
-        } else if let Some(id) = msg.extra.get("task_id").and_then(serde_json::Value::as_i64) {
-            by_session.entry(id).or_default().push(msg);
-        } else {
-            fallback_messages.push(msg);
-        }
-    }
-
-    let mut convs = Vec::new();
-
-    // Calculate stable hash of db path to disambiguate session IDs between projects
-    let mut hasher = DefaultHasher::new();
-    db_path.hash(&mut hasher);
-    let db_hash = hasher.finish();
-
-    for (session_id, mut messages) in by_session {
-        if messages.is_empty() {
-            continue;
-        }
-        messages.sort_by_key(|m| m.created_at.unwrap_or(i64::MAX));
-
-        // Assign stable indices based on full history order before filtering
-        for (i, msg) in messages.iter_mut().enumerate() {
-            msg.idx = i as i64;
-        }
-
-        if let Some(since) = since_ts {
-            messages.retain(|m| m.created_at.is_some_and(|ts| ts > since));
-            if messages.is_empty() {
-                continue;
-            }
-        }
-
-        let meta = session_meta.get(&session_id);
-        let title = meta.and_then(|m| m.title.clone()).or_else(|| {
-            messages
-                .first()
-                .and_then(|m| m.content.lines().next())
-                .map(std::string::ToString::to_string)
-        });
-        let started_at = meta
-            .and_then(|m| m.started_at)
-            .or_else(|| messages.first().and_then(|m| m.created_at));
-        let ended_at = messages.last().and_then(|m| m.created_at);
-
-        convs.push(NormalizedConversation {
-            agent_slug: "opencode".into(),
-            external_id: Some(format!("session-{session_id}-{db_hash:x}")),
-            title,
-            workspace: meta.and_then(|m| m.workspace.clone()),
-            source_path: db_path.clone(),
-            started_at,
-            ended_at,
-            metadata: serde_json::json!({
-                "db_path": db_path,
-                "session_id": session_id,
-            }),
-            messages,
-        });
-    }
-
-    if !fallback_messages.is_empty() {
-        for (i, msg) in fallback_messages.iter_mut().enumerate() {
-            msg.idx = i as i64;
-        }
-        convs.push(NormalizedConversation {
-            agent_slug: "opencode".into(),
-            external_id: Some(format!("db:{}", db_path.display())),
-            title: fallback_messages
-                .first()
-                .and_then(|m| m.content.lines().next())
-                .map(std::string::ToString::to_string),
-            workspace: None,
-            source_path: db_path.clone(),
-            started_at: fallback_messages.first().and_then(|m| m.created_at),
-            ended_at: fallback_messages.last().and_then(|m| m.created_at),
-            metadata: serde_json::json!({"db_path": db_path}),
-            messages: fallback_messages,
-        });
-    }
-
-    // Apply since_ts post-filter to ensure late-binding still respects high-water mark.
-    if let Some(since) = since_ts {
-        let mut filtered = Vec::new();
-        for mut conv in convs {
-            let mut msgs: Vec<_> = conv
-                .messages
-                .into_iter()
-                .filter(|m| m.created_at.is_some_and(|ts| ts > since))
-                .collect();
-            if msgs.is_empty() {
-                continue;
-            }
-            for (i, m) in msgs.iter_mut().enumerate() {
-                m.idx = i as i64;
-            }
-            conv.messages = msgs;
-            conv.started_at = conv.messages.first().and_then(|m| m.created_at);
-            conv.ended_at = conv.messages.last().and_then(|m| m.created_at);
-            filtered.push(conv);
-        }
-        convs = filtered;
-    }
-
-    // Deduplicate external IDs in case multiple DBs share identifiers.
-    let mut unique = Vec::new();
-    for conv in convs {
-        if let Some(ext) = &conv.external_id {
-            let key = format!("opencode:{ext}");
-            if seen_ids.insert(key) {
-                unique.push(conv);
-            }
-        } else {
-            unique.push(conv);
-        }
-    }
-
-    Ok(unique)
-}
-
-fn has_table(conn: &Connection, name: &str) -> Result<bool> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1")?;
-    Ok(stmt.exists([name])?)
-}
-
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?; // 1 = name
-    let mut cols = Vec::new();
-    for c in rows {
-        cols.push(c?);
-    }
-    Ok(cols)
-}
-
-#[derive(Debug, Clone)]
-struct SessionRow {
-    id: i64,
-    title: Option<String>,
-    workspace: Option<PathBuf>,
-    started_at: Option<i64>,
-}
-
-fn read_sessions(conn: &Connection) -> Result<HashMap<i64, SessionRow>> {
-    let cols = table_columns(conn, "sessions")?;
-    let mut stmt = conn.prepare("SELECT * FROM sessions")?;
-    let rows = stmt.query_map([], |row| session_from_row(row, &cols))?;
-    let mut map = HashMap::new();
-    for r in rows {
-        let r = r?;
-        map.insert(r.id, r);
-    }
-    Ok(map)
-}
-
-fn session_from_row(row: &Row<'_>, cols: &[String]) -> rusqlite::Result<SessionRow> {
-    let id = get_opt_i64(row, cols, "id")?.unwrap_or_else(|| row.get::<_, i64>(0).unwrap_or(0));
-
-    let mut title = get_opt_string(row, cols, "title")?;
-    if title.is_none() {
-        title = get_opt_string(row, cols, "name")?;
-    }
-
-    let mut workspace = get_opt_string(row, cols, "workspace")?;
-    if workspace.is_none() {
-        workspace = get_opt_string(row, cols, "root_path")?;
-    }
-    let workspace = workspace.map(PathBuf::from);
-
-    let mut started_at = get_opt_i64(row, cols, "created_at")?;
-    if started_at.is_none() {
-        started_at = get_opt_i64(row, cols, "started_at")?;
-    }
-    if started_at.is_none() {
-        started_at = get_opt_i64(row, cols, "timestamp")?;
-    }
-
-    Ok(SessionRow {
-        id,
-        title,
-        workspace,
-        started_at,
-    })
-}
-
-fn message_from_row(row: &Row<'_>, cols: &[String]) -> rusqlite::Result<NormalizedMessage> {
-    let mut role = get_opt_string(row, cols, "role")?;
-    if role.is_none() {
-        role = get_opt_string(row, cols, "sender")?;
-    }
-    let role = role.unwrap_or_else(|| "agent".to_string());
-
-    let mut author = get_opt_string(row, cols, "author")?;
-    if author.is_none() {
-        author = get_opt_string(row, cols, "sender")?;
-    }
-
-    let mut created_at = get_opt_i64(row, cols, "created_at")?;
-    if created_at.is_none() {
-        created_at = get_opt_i64(row, cols, "timestamp")?;
-    }
-    if created_at.is_none() {
-        created_at = get_opt_i64(row, cols, "ts")?;
-    }
-
-    let mut content = get_opt_string(row, cols, "content")?;
-    if content.is_none() {
-        content = get_opt_string(row, cols, "text")?;
-    }
-    if content.is_none() {
-        content = get_opt_string(row, cols, "message")?;
-    }
-    let content = content.unwrap_or_default();
-
-    // Capture the entire row as best-effort metadata for debugging.
-    let mut extra = serde_json::Map::new();
-    for (idx, c) in cols.iter().enumerate() {
-        if let Ok(val) = row.get::<_, rusqlite::types::Value>(idx) {
-            extra.insert(c.clone(), sqlite_value_to_json(val));
-        }
-    }
-
-    Ok(NormalizedMessage {
-        idx: 0,
-        role,
-        author,
-        created_at,
-        content,
-        extra: serde_json::Value::Object(extra),
-        snippets: Vec::new(),
-    })
-}
-
-fn sqlite_value_to_json(v: rusqlite::types::Value) -> serde_json::Value {
-    use base64::Engine;
-    use rusqlite::types::Value as V;
-    match v {
-        V::Null => serde_json::Value::Null,
-        V::Integer(i) => serde_json::Value::from(i),
-        V::Real(f) => serde_json::Value::from(f),
-        V::Text(t) => serde_json::Value::from(t),
-        V::Blob(b) => serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(b)),
-    }
-}
-
-fn get_opt_string(row: &Row<'_>, cols: &[String], name: &str) -> rusqlite::Result<Option<String>> {
-    if let Some(idx) = cols.iter().position(|c| c == name) {
-        return row.get::<_, Option<String>>(idx);
-    }
-    Ok(None)
-}
-
-fn get_opt_i64(row: &Row<'_>, cols: &[String], name: &str) -> rusqlite::Result<Option<i64>> {
-    if let Some(idx) = cols.iter().position(|c| c == name) {
-        return row.get::<_, Option<i64>>(idx);
-    }
-    Ok(None)
 }

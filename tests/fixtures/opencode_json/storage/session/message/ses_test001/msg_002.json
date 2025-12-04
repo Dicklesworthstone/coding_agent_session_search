@@ -1,0 +1,14 @@
+{
+  "id": "msg_002",
+  "role": "assistant",
+  "path": {
+    "cwd": "/tmp/test-project",
+    "root": "/tmp/test-project"
+  },
+  "time": {
+    "created": 1700000005000,
+    "completed": 1700000010000
+  },
+  "modelID": "claude-3-opus",
+  "sessionID": "ses_test001"
+}
