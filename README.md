@@ -30,21 +30,24 @@ install.ps1 -EasyMode -Verify
 <div align="center">
 
 ### Search Results Across All Your Agents
-*Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, Pi-Agent, etc.), and syntax-highlighted detail preview*
+
+_Three-pane layout: filter bar, results list with color-coded agents (Claude, Codex, Gemini, Pi-Agent, etc.), and syntax-highlighted detail preview_
 
 <img src="screenshots/screenshot_01.webp" alt="Main TUI showing search results across multiple coding agents" width="800">
 
 ---
 
 ### Rich Conversation Detail View
-*Full conversation rendering with markdown formatting, code blocks, headers, and structured content*
+
+_Full conversation rendering with markdown formatting, code blocks, headers, and structured content_
 
 <img src="screenshots/screenshot_02.webp" alt="Detail view showing formatted conversation content" width="800">
 
 ---
 
 ### Quick Start & Keyboard Reference
-*Built-in help screen (press `F1` or `?`) with all shortcuts, filters, modes, and navigation tips*
+
+_Built-in help screen (press `F1` or `?`) with all shortcuts, filters, modes, and navigation tips_
 
 <img src="screenshots/screenshot_03.webp" alt="Help screen showing keyboard shortcuts and features" width="500">
 
@@ -84,12 +87,14 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 ## ✨ Key Features
 
 ### ⚡ Instant Search (Sub-60ms Latency)
+
 - **"Search-as-you-type"**: Results update instantly with every keystroke.
 - **Edge N-Gram Indexing**: We frontload the work by pre-computing prefix matches (e.g., "cal" -> "calculate") during indexing, trading disk space for O(1) lookup speed at query time.
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 
 ### 🎯 Advanced Search Features
+
 - **Wildcard Patterns**: Full glob-style pattern support:
   - `foo*` - Prefix match (finds "foobar", "foo123")
   - `*foo` - Suffix match (finds "barfoo", "configfoo")
@@ -100,6 +105,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms with markers (`**bold**` for text, `<mark>` for HTML output).
 
 ### 🖥️ Rich Terminal UI (TUI)
+
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
 - **Multi-Line Result Display**: Each result shows location and up to 3 lines of context; alternating stripes improve scanability.
 - **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress with sparkline visualization (e.g., `📦 Indexing 150/2000 (7%) ▁▂▄▆█`)—plus active filters.
@@ -110,12 +116,14 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
 
 ### 🔗 Universal Connectors
+
 Ingests history from all major local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
+
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
 - **Claude Code**: `~/.claude/projects` (Session JSONL)
-- **OpenCode**: `.opencode` directories (SQLite)
+- **OpenCode**: `~/.local/share/opencode/storage` (JSON files)
 - **Amp**: `~/.local/share/amp` & VS Code storage
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
@@ -129,6 +137,7 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 ### Why Cross-Agent Search Matters
 
 Imagine you're Claude Code working on a React authentication bug. With `cass`, you can instantly search across:
+
 - Your own previous sessions where you solved similar auth issues
 - Codex sessions where someone debugged OAuth flows
 - Cursor conversations about token refresh patterns
@@ -160,16 +169,17 @@ cass robot-docs guide # Quick-start walkthrough
 
 AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input to maximize acceptance when intent is clear:
 
-| What you type | What `cass` understands | Correction note |
-|---------------|------------------------|-----------------|
-| `cass serach "error"` | `cass search "error"` | "Did you mean 'search'?" |
-| `cass -robot -limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
-| `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
-| `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` |
-| `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
-| `cass search --limt 5` | `cass search --limit 5` | Levenshtein distance ≤2 corrected |
+| What you type            | What `cass` understands  | Correction note                   |
+| ------------------------ | ------------------------ | --------------------------------- |
+| `cass serach "error"`    | `cass search "error"`    | "Did you mean 'search'?"          |
+| `cass -robot -limit=5`   | `cass --robot --limit=5` | Single-dash long flags normalized |
+| `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized                   |
+| `cass find "auth"`       | `cass search "auth"`     | `find`/`query`/`q` → `search`     |
+| `cass --robot-docs`      | `cass robot-docs`        | Flag-as-subcommand detected       |
+| `cass search --limt 5`   | `cass search --limit 5`  | Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
+
 1. **Typo correction**: Flags within edit distance 2 are auto-corrected
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
@@ -203,14 +213,14 @@ cass search "error" --robot --robot-meta
 
 LLMs have context limits. `cass` provides multiple levers to control output size:
 
-| Flag | Effect |
-|------|--------|
-| `--fields minimal` | Only `source_path`, `line_number`, `agent` |
-| `--fields summary` | Adds `title`, `score` |
-| `--fields score,title,snippet` | Custom field selection |
-| `--max-content-length 500` | Truncate long fields (UTF-8 safe, adds "...") |
-| `--max-tokens 2000` | Soft budget (~4 chars/token); adjusts truncation dynamically |
-| `--limit 5` | Cap number of results |
+| Flag                           | Effect                                                       |
+| ------------------------------ | ------------------------------------------------------------ |
+| `--fields minimal`             | Only `source_path`, `line_number`, `agent`                   |
+| `--fields summary`             | Adds `title`, `score`                                        |
+| `--fields score,title,snippet` | Custom field selection                                       |
+| `--max-content-length 500`     | Truncate long fields (UTF-8 safe, adds "...")                |
+| `--max-tokens 2000`            | Soft budget (~4 chars/token); adjusts truncation dynamically |
+| `--limit 5`                    | Cap number of results                                        |
 
 Truncated fields include a `*_truncated: true` indicator so agents know when they're seeing partial content.
 
@@ -220,13 +230,13 @@ Errors are structured, actionable, and include recovery hints:
 
 ```json
 {
- "error": {
- "code": 3,
- "kind": "index_missing",
- "message": "Search index not found",
- "hint": "Run 'cass index --full' to build the index",
- "retryable": false
- }
+  "error": {
+    "code": 3,
+    "kind": "index_missing",
+    "message": "Search index not found",
+    "hint": "Run 'cass index --full' to build the index",
+    "retryable": false
+  }
 }
 ```
 
@@ -331,28 +341,28 @@ cass search "error" --robot --trace-file /tmp/cass-trace.json
 
 ### Search Flags Reference
 
-| Flag | Purpose |
-|------|---------|
-| `--robot` / `--json` | JSON output (pretty-printed) |
-| `--robot-format jsonl\|compact` | Streaming or single-line JSON |
-| `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness) |
-| `--fields minimal\|summary\|<list>` | Reduce payload size |
-| `--max-content-length N` | Truncate content fields to N chars |
-| `--max-tokens N` | Soft token budget (~4 chars/token) |
-| `--timeout N` | Timeout in milliseconds; returns partial results on expiry |
-| `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
-| `--request-id ID` | Echoed in response for correlation |
-| `--aggregate agent,workspace,date` | Server-side aggregations |
-| `--explain` | Include query analysis (parsed query, cost estimate) |
-| `--dry-run` | Validate query without executing |
-| `--highlight` | Wrap matching terms with markers |
+| Flag                                | Purpose                                                          |
+| ----------------------------------- | ---------------------------------------------------------------- |
+| `--robot` / `--json`                | JSON output (pretty-printed)                                     |
+| `--robot-format jsonl\|compact`     | Streaming or single-line JSON                                    |
+| `--robot-meta`                      | Include `_meta` block (elapsed_ms, cache stats, index freshness) |
+| `--fields minimal\|summary\|<list>` | Reduce payload size                                              |
+| `--max-content-length N`            | Truncate content fields to N chars                               |
+| `--max-tokens N`                    | Soft token budget (~4 chars/token)                               |
+| `--timeout N`                       | Timeout in milliseconds; returns partial results on expiry       |
+| `--cursor <token>`                  | Cursor-based pagination (from `_meta.next_cursor`)               |
+| `--request-id ID`                   | Echoed in response for correlation                               |
+| `--aggregate agent,workspace,date`  | Server-side aggregations                                         |
+| `--explain`                         | Include query analysis (parsed query, cost estimate)             |
+| `--dry-run`                         | Validate query without executing                                 |
+| `--highlight`                       | Wrap matching terms with markers                                 |
 
 ### Index Flags Reference
 
-| Flag | Purpose |
-|------|---------|
+| Flag                    | Purpose                                                         |
+| ----------------------- | --------------------------------------------------------------- |
 | `--idempotency-key KEY` | Safe retries: same key + params returns cached result (24h TTL) |
-| `--json` | JSON output with stats |
+| `--json`                | JSON output with stats                                          |
 
 ### Ready-to-paste blurb for AGENTS.md / CLAUDE.md
 
@@ -408,21 +418,21 @@ cass search "error" --robot --trace-file /tmp/cass-trace.json
 
 ### Basic Queries
 
-| Query | Matches |
-|-------|---------|
-| `error` | Messages containing "error" (case-insensitive) |
-| `python error` | Messages containing both "python" AND "error" |
-| `"authentication failed"` | Exact phrase match |
-| `auth fail` | Both terms, in any order |
+| Query                     | Matches                                        |
+| ------------------------- | ---------------------------------------------- |
+| `error`                   | Messages containing "error" (case-insensitive) |
+| `python error`            | Messages containing both "python" AND "error"  |
+| `"authentication failed"` | Exact phrase match                             |
+| `auth fail`               | Both terms, in any order                       |
 
 ### Wildcard Patterns
 
-| Pattern | Type | Matches | Performance |
-|---------|------|---------|-------------|
-| `auth*` | Prefix | "auth", "authentication", "authorize" | Fast (uses edge n-grams) |
-| `*tion` | Suffix | "authentication", "function", "exception" | Slower (regex scan) |
-| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (full regex) |
-| `test_*` | Prefix | "test_user", "test_auth", "test_helpers" | Fast |
+| Pattern    | Type      | Matches                                       | Performance              |
+| ---------- | --------- | --------------------------------------------- | ------------------------ |
+| `auth*`    | Prefix    | "auth", "authentication", "authorize"         | Fast (uses edge n-grams) |
+| `*tion`    | Suffix    | "authentication", "function", "exception"     | Slower (regex scan)      |
+| `*config*` | Substring | "reconfigure", "config.json", "misconfigured" | Slowest (full regex)     |
+| `test_*`   | Prefix    | "test_user", "test_auth", "test_helpers"      | Fast                     |
 
 **Tip**: Prefix wildcards (`foo*`) are optimized via pre-computed edge n-grams. Suffix and substring wildcards fall back to regex and are slower on large indexes.
 
@@ -445,17 +455,18 @@ cass search "authentication" --agent codex --workspace myproject --week
 
 Search results include a `match_type` indicator:
 
-| Type | Meaning | Score Boost |
-|------|---------|-------------|
-| `exact` | Query terms found verbatim | Highest |
-| `prefix` | Matched via prefix expansion (e.g., `auth*`) | High |
-| `suffix` | Matched via suffix pattern | Medium |
-| `substring` | Matched via substring pattern | Lower |
-| `fuzzy` | Auto-fallback match when exact results sparse | Lowest |
+| Type        | Meaning                                       | Score Boost |
+| ----------- | --------------------------------------------- | ----------- |
+| `exact`     | Query terms found verbatim                    | Highest     |
+| `prefix`    | Matched via prefix expansion (e.g., `auth*`)  | High        |
+| `suffix`    | Matched via suffix pattern                    | Medium      |
+| `substring` | Matched via substring pattern                 | Lower       |
+| `fuzzy`     | Auto-fallback match when exact results sparse | Lowest      |
 
 ### Auto-Fuzzy Fallback
 
 When an exact query returns fewer than 3 results, `cass` automatically retries with wildcard expansion:
+
 - `auth` → `*auth*`
 - Results are flagged with `wildcard_fallback: true` in robot mode
 - TUI shows a "fuzzy" indicator in the status bar
@@ -466,84 +477,84 @@ When an exact query returns fewer than 3 results, `cass` automatically retries w
 
 ### Global Keys
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+C` | Quit |
-| `F1` or `?` | Toggle help screen |
-| `F2` | Toggle dark/light theme |
-| `Ctrl+B` | Toggle border style (rounded/plain) |
-| `Ctrl+Shift+R` | Force re-index |
-| `Ctrl+Shift+Del` | Reset all TUI state |
+| Key              | Action                              |
+| ---------------- | ----------------------------------- |
+| `Ctrl+C`         | Quit                                |
+| `F1` or `?`      | Toggle help screen                  |
+| `F2`             | Toggle dark/light theme             |
+| `Ctrl+B`         | Toggle border style (rounded/plain) |
+| `Ctrl+Shift+R`   | Force re-index                      |
+| `Ctrl+Shift+Del` | Reset all TUI state                 |
 
 ### Search Bar (Query Input)
 
-| Key | Action |
-|-----|--------|
-| Type | Live search as you type |
-| `Enter` | Open selected result in `$EDITOR` |
-| `Esc` | Clear query / exit search |
-| `Up`/`Down` | Navigate query history |
-| `Ctrl+R` | Cycle through query history |
+| Key         | Action                                              |
+| ----------- | --------------------------------------------------- |
+| Type        | Live search as you type                             |
+| `Enter`     | Open selected result in `$EDITOR`                   |
+| `Esc`       | Clear query / exit search                           |
+| `Up`/`Down` | Navigate query history                              |
+| `Ctrl+R`    | Cycle through query history                         |
 | `Backspace` | Delete character; if empty, remove last filter chip |
 
 ### Navigation
 
-| Key | Action |
-|-----|--------|
-| `Up`/`Down` | Move selection in results list |
-| `Left`/`Right` | Switch focus between results and detail pane |
-| `Tab`/`Shift+Tab` | Cycle focus: search → results → detail |
-| `PageUp`/`PageDown` | Scroll by page |
-| `Home`/`End` | Jump to first/last result |
-| `Alt+h/j/k/l` | Vim-style navigation (left/down/up/right) |
+| Key                 | Action                                       |
+| ------------------- | -------------------------------------------- |
+| `Up`/`Down`         | Move selection in results list               |
+| `Left`/`Right`      | Switch focus between results and detail pane |
+| `Tab`/`Shift+Tab`   | Cycle focus: search → results → detail       |
+| `PageUp`/`PageDown` | Scroll by page                               |
+| `Home`/`End`        | Jump to first/last result                    |
+| `Alt+h/j/k/l`       | Vim-style navigation (left/down/up/right)    |
 
 ### Filtering
 
-| Key | Action |
-|-----|--------|
-| `F3` | Open agent filter palette |
-| `F4` | Open workspace filter palette |
-| `F5` | Set "from" time filter |
-| `F6` | Set "to" time filter |
+| Key        | Action                                     |
+| ---------- | ------------------------------------------ |
+| `F3`       | Open agent filter palette                  |
+| `F4`       | Open workspace filter palette              |
+| `F5`       | Set "from" time filter                     |
+| `F6`       | Set "to" time filter                       |
 | `Shift+F3` | Scope to currently selected result's agent |
-| `Shift+F4` | Clear workspace filter |
-| `Shift+F5` | Cycle time presets: 24h → 7d → 30d → all |
-| `Ctrl+Del` | Clear all active filters |
+| `Shift+F4` | Clear workspace filter                     |
+| `Shift+F5` | Cycle time presets: 24h → 7d → 30d → all   |
+| `Ctrl+Del` | Clear all active filters                   |
 
 ### Modes & Display
 
-| Key | Action |
-|-----|--------|
-| `F7` | Cycle context window size: S → M → L → XL |
-| `F9` | Toggle match mode: prefix (default) ↔ standard |
-| `F12` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
-| `Shift+`/`=` | Increase items per pane (density) |
-| `-` | Decrease items per pane |
+| Key          | Action                                                                   |
+| ------------ | ------------------------------------------------------------------------ |
+| `F7`         | Cycle context window size: S → M → L → XL                                |
+| `F9`         | Toggle match mode: prefix (default) ↔ standard                           |
+| `F12`        | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
+| `Shift+`/`=` | Increase items per pane (density)                                        |
+| `-`          | Decrease items per pane                                                  |
 
 ### Selection & Actions
 
-| Key | Action |
-|-----|--------|
-| `m` | Toggle selection on current result |
-| `Ctrl+A` | Select/deselect all visible results |
-| `A` | Open bulk actions menu (when items selected) |
-| `Ctrl+Enter` | Add to multi-open queue |
-| `Ctrl+O` | Open all queued items in editor |
-| `y` | Copy current item (path or content to clipboard) |
-| `Ctrl+Y` | Copy all selected items |
+| Key          | Action                                           |
+| ------------ | ------------------------------------------------ |
+| `m`          | Toggle selection on current result               |
+| `Ctrl+A`     | Select/deselect all visible results              |
+| `A`          | Open bulk actions menu (when items selected)     |
+| `Ctrl+Enter` | Add to multi-open queue                          |
+| `Ctrl+O`     | Open all queued items in editor                  |
+| `y`          | Copy current item (path or content to clipboard) |
+| `Ctrl+Y`     | Copy all selected items                          |
 
 ### Detail Pane
 
-| Key | Action |
-|-----|--------|
-| `Space` | Toggle full-screen detail view |
-| `/` | Start find-in-detail search |
-| `n` | Jump to next match (in find mode) |
-| `N` | Jump to previous match |
-| `g` | Scroll to top (in full-screen) |
-| `G` | Scroll to bottom (in full-screen) |
-| `c` | Copy visible content |
-| `o` | Open in external viewer |
+| Key     | Action                            |
+| ------- | --------------------------------- |
+| `Space` | Toggle full-screen detail view    |
+| `/`     | Start find-in-detail search       |
+| `n`     | Jump to next match (in find mode) |
+| `N`     | Jump to previous match            |
+| `g`     | Scroll to top (in full-screen)    |
+| `G`     | Scroll to bottom (in full-screen) |
+| `c`     | Copy visible content              |
+| `o`     | Open in external viewer           |
 
 ### Mouse Support
 
@@ -623,24 +634,24 @@ Each connector transforms agent-specific formats into a unified schema:
 
 Different agents use different role names:
 
-| Agent | Original | Normalized |
-|-------|----------|------------|
-| Claude Code | `human`, `assistant` | `user`, `assistant` |
-| Codex | `user`, `assistant` | `user`, `assistant` |
-| ChatGPT | `user`, `assistant`, `system` | `user`, `assistant`, `system` |
-| Cursor | `user`, `assistant` | `user`, `assistant` |
-| Aider | (markdown headers) | `user`, `assistant` |
+| Agent       | Original                      | Normalized                    |
+| ----------- | ----------------------------- | ----------------------------- |
+| Claude Code | `human`, `assistant`          | `user`, `assistant`           |
+| Codex       | `user`, `assistant`           | `user`, `assistant`           |
+| ChatGPT     | `user`, `assistant`, `system` | `user`, `assistant`, `system` |
+| Cursor      | `user`, `assistant`           | `user`, `assistant`           |
+| Aider       | (markdown headers)            | `user`, `assistant`           |
 
 ### Timestamp Handling
 
 Agents store timestamps inconsistently:
 
-| Format | Example | Handling |
-|--------|---------|----------|
-| Unix milliseconds | `1699900000000` | Direct conversion |
-| Unix seconds | `1699900000` | Multiply by 1000 |
-| ISO 8601 | `2024-01-15T10:30:00Z` | Parse with chrono |
-| Missing | `null` | Use file modification time |
+| Format            | Example                | Handling                   |
+| ----------------- | ---------------------- | -------------------------- |
+| Unix milliseconds | `1699900000000`        | Direct conversion          |
+| Unix seconds      | `1699900000`           | Multiply by 1000           |
+| ISO 8601          | `2024-01-15T10:30:00Z` | Parse with chrono          |
+| Missing           | `null`                 | Use file modification time |
 
 ### Content Flattening
 
@@ -659,6 +670,7 @@ Tool calls, code blocks, and nested structures are flattened for searchability:
 ## 🧹 Deduplication Strategy
 
 The same conversation content can appear multiple times due to:
+
 - Agent file rewrites
 - Backup files
 - Symlinked directories
@@ -680,6 +692,7 @@ The same conversation content can appear multiple times due to:
 ### Noise Filtering
 
 Common low-value content is filtered from results:
+
 - Empty messages
 - Pure whitespace
 - System prompts (unless searching for them)
@@ -753,22 +766,22 @@ Press `Ctrl+P` to open the command palette—a fuzzy-searchable menu of all avai
 
 ### Available Commands
 
-| Command | Description |
-|---------|-------------|
-| Toggle theme | Switch between dark/light mode |
-| Toggle density | Cycle Compact → Cozy → Spacious |
-| Toggle help strip | Pin/unpin the contextual help bar |
-| Check updates | Show update assistant banner |
-| Filter: agent | Open agent filter picker |
-| Filter: workspace | Open workspace filter picker |
-| Filter: today | Restrict results to today |
-| Filter: last 7 days | Restrict results to past week |
-| Filter: date range | Prompt for custom since/until |
-| Saved views | List and manage saved view slots |
-| Save view to slot N | Save current filters to slot 1-9 |
-| Load view from slot N | Restore filters from slot 1-9 |
-| Bulk actions | Open bulk menu (when items selected) |
-| Reload index/view | Refresh the search reader |
+| Command               | Description                          |
+| --------------------- | ------------------------------------ |
+| Toggle theme          | Switch between dark/light mode       |
+| Toggle density        | Cycle Compact → Cozy → Spacious      |
+| Toggle help strip     | Pin/unpin the contextual help bar    |
+| Check updates         | Show update assistant banner         |
+| Filter: agent         | Open agent filter picker             |
+| Filter: workspace     | Open workspace filter picker         |
+| Filter: today         | Restrict results to today            |
+| Filter: last 7 days   | Restrict results to past week        |
+| Filter: date range    | Prompt for custom since/until        |
+| Saved views           | List and manage saved view slots     |
+| Save view to slot N   | Save current filters to slot 1-9     |
+| Load view from slot N | Restore filters from slot 1-9        |
+| Bulk actions          | Open bulk menu (when items selected) |
+| Reload index/view     | Refresh the search reader            |
 
 ### Usage
 
@@ -792,10 +805,10 @@ Save your current filter configuration to one of 9 slots for instant recall.
 
 ### Keyboard Shortcuts
 
-| Key | Action |
-|-----|--------|
+| Key                         | Action                    |
+| --------------------------- | ------------------------- |
 | `Shift+1` through `Shift+9` | Save current view to slot |
-| `1` through `9` | Load view from slot |
+| `1` through `9`             | Load view from slot       |
 
 ### Via Command Palette
 
@@ -813,11 +826,11 @@ Views are stored in `tui_state.json` and persist across sessions. Clear all save
 
 Control how many lines each search result occupies. Cycle with `Shift+D` or via the command palette.
 
-| Mode | Lines per Result | Best For |
-|------|------------------|----------|
-| **Compact** | 3 | Maximum results visible, scanning many items |
-| **Cozy** (default) | 5 | Balanced view with context |
-| **Spacious** | 8 | Detailed preview, fewer results |
+| Mode               | Lines per Result | Best For                                     |
+| ------------------ | ---------------- | -------------------------------------------- |
+| **Compact**        | 3                | Maximum results visible, scanning many items |
+| **Cozy** (default) | 5                | Balanced view with context                   |
+| **Spacious**       | 8                | Detailed preview, fewer results              |
 
 The pane automatically adjusts how many results fit based on terminal height and density mode.
 
@@ -854,6 +867,7 @@ Save important search results with notes and tags for later reference.
 ### Storage Location
 
 Bookmarks are stored separately from the main index:
+
 - Linux: `~/.local/share/coding-agent-search/bookmarks.db`
 - macOS: `~/Library/Application Support/coding-agent-search/bookmarks.db`
 - Windows: `%APPDATA%\coding-agent-search\bookmarks.db`
@@ -861,6 +875,7 @@ Bookmarks are stored separately from the main index:
 ---
 
 ## 🏎️ Performance Engineering: Caching & Warming
+
 To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier caching strategy in `src/search/query.rs`:
 
 1. **Sharded LRU Cache**: The `prefix_cache` is split into shards (default 256 entries each) to reduce mutex contention during concurrent reads/writes from the async searcher.
@@ -868,6 +883,7 @@ To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier ca
 3. **Predictive Warming**: A background `WarmJob` thread watches the input. When the user pauses typing, it triggers a lightweight "warm-up" query against the Tantivy reader to pre-load relevant index segments into the OS page cache.
 
 ## 🔌 The Connector Interface (Polymorphism)
+
 The system is designed for extensibility via the `Connector` trait (`src/connectors/mod.rs`). This allows `cass` to treat disparate log formats as a uniform stream of events.
 
 ```mermaid
@@ -913,12 +929,14 @@ classDiagram
 `cass` employs a dual-storage strategy to balance data integrity with search performance.
 
 ### The Pipeline
+
 1. **Ingestion**: Connectors scan proprietary agent files and normalize them into standard structs.
 2. **Storage (SQLite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`). This ensures ACID compliance, reliable storage, and supports complex relational queries (stats, grouping).
 3. **Search Index (Tantivy)**: The **Speed Layer**. New messages are incrementally pushed to a Tantivy full-text index. This index is optimized for speed:
- * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
- * **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
- * **Deduping**: Search results are deduplicated by content hash to remove noise from repeated tool outputs.
+
+- **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
+- **Prefix Fields**: `title_prefix` and `content_prefix` use **Index-Time Edge N-Grams** (not stored on disk to save space) for instant prefix matching.
+- **Deduping**: Search results are deduplicated by content hash to remove noise from repeated tool outputs.
 
 ```mermaid
 flowchart LR
@@ -971,6 +989,7 @@ flowchart LR
 ```
 
 ### Background Indexing & Watch Mode
+
 - **Non-Blocking**: The indexer runs in a background thread. You can search while it works.
 - **Parallel Discovery**: Connector detection and scanning run in parallel across all CPU cores using rayon, significantly reducing startup time when multiple agents are installed.
 - **Watch Mode**: Uses file system watchers (`notify`) to detect changes in agent logs. When you save a file or an agent replies, `cass` re-indexes just that conversation and refreshes the search view automatically.
@@ -979,19 +998,20 @@ flowchart LR
 ## 🔍 Deep Dive: Internals
 
 ### The TUI Engine (State Machine & Async Loop)
+
 The interactive interface (`src/ui/tui.rs`) is the largest component (~3.5k lines), implementing a sophisticated **Immediate Mode** architecture using `ratatui`.
 
 1. **Application State**: A monolithic struct tracks the entire UI state (search query, cursor position, scroll offsets, active filters, and cached details).
 2. **Event Loop**: A polling loop handles standard inputs (keyboard/mouse) and custom events (Search results ready, Progress updates).
 3. **Debouncing**: User input triggers an async search task via a `tokio` channel. To prevent UI freezing, we debounce keystrokes (150ms) and run queries on a separate thread, updating the state only when results return.
-4. **Optimistic Rendering**: The UI renders the *current* state immediately (60 FPS), drawing "stale" results or loading skeletons while waiting for the async searcher.
+4. **Optimistic Rendering**: The UI renders the _current_ state immediately (60 FPS), drawing "stale" results or loading skeletons while waiting for the async searcher.
 
 ```mermaid
 graph TD
  Input([User Input]) -->|Key/Mouse| EventLoop
  EventLoop -->|Update| State[App State]
  State -->|Render| Terminal
- 
+
  State -->|Query Change| Debounce{Debounce}
  Debounce -->|Fire| SearchTask[Async Search]
  SearchTask -->|Results| Channel
@@ -999,6 +1019,7 @@ graph TD
 ```
 
 ### Append-Only Storage Strategy
+
 Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sqlite.rs`) as an **append-only log** for conversations:
 
 - **Immutable History**: When an agent adds a message to a conversation, we don't update the existing row. We insert the new message linked to the conversation ID.
@@ -1016,17 +1037,17 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
 Every Tantivy index stores a `schema_hash.json` file containing the schema version:
 
 ```json
-{"schema_hash":"tantivy-schema-v4-edge-ngram-agent-string"}
+{ "schema_hash": "tantivy-schema-v4-edge-ngram-agent-string" }
 ```
 
 ### Automatic Recovery Scenarios
 
-| Scenario | Detection | Recovery |
-|----------|-----------|----------|
-| Missing index | No `meta.json` | Clean create |
-| Schema mismatch | Hash differs from current | Full rebuild |
-| Corrupted `schema_hash.json` | Invalid JSON or missing | Delete and recreate |
-| Missing `schema_hash.json` | File not found | Assume outdated, rebuild |
+| Scenario                     | Detection                 | Recovery                 |
+| ---------------------------- | ------------------------- | ------------------------ |
+| Missing index                | No `meta.json`            | Clean create             |
+| Schema mismatch              | Hash differs from current | Full rebuild             |
+| Corrupted `schema_hash.json` | Invalid JSON or missing   | Delete and recreate      |
+| Missing `schema_hash.json`   | File not found            | Assume outdated, rebuild |
 
 ### Manual Recovery
 
@@ -1086,10 +1107,7 @@ Watch mode maintains `watch_state.json`:
 ```json
 {
   "last_scan_ts": 1699900000000,
-  "watched_paths": [
-    "~/.claude/projects",
-    "~/.codex/sessions"
-  ]
+  "watched_paths": ["~/.claude/projects", "~/.codex/sessions"]
 }
 ```
 
@@ -1108,23 +1126,27 @@ Generate tab-completion scripts for your shell.
 ### Installation
 
 **Bash**:
+
 ```bash
 cass completions bash > ~/.local/share/bash-completion/completions/cass
 # Or: cass completions bash >> ~/.bashrc
 ```
 
 **Zsh**:
+
 ```bash
 cass completions zsh > "${fpath[1]}/_cass"
 # Or add to ~/.zshrc: eval "$(cass completions zsh)"
 ```
 
 **Fish**:
+
 ```bash
 cass completions fish > ~/.config/fish/completions/cass.fish
 ```
 
 **PowerShell**:
+
 ```powershell
 cass completions powershell >> $PROFILE
 ```
@@ -1140,39 +1162,43 @@ cass completions powershell >> $PROFILE
 ## 🚀 Quickstart
 
 ### 1. Install
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh \
   | bash -s -- --easy-mode --verify
 ```
 
 ### 2. Launch
+
 ```bash
 cass
 ```
-*On first run, `cass` performs a full index. You'll see progress in the footer. Search works immediately (falling back to SQLite or partial results until complete).*
+
+_On first run, `cass` performs a full index. You'll see progress in the footer. Search works immediately (falling back to SQLite or partial results until complete)._
 
 ### 3. Usage
+
 - **Type to search**: "python error", "refactor auth", "c++".
 - **Wildcards**: Use `foo*` (prefix), `*foo` (suffix), or `*foo*` (contains) for flexible matching.
 - **Navigation**: `Up`/`Down` to select, `Right` to focus detail pane. `Up`/`Down` in search bar navigates query history.
 - **Filters**:
-    - `F3`: Filter by Agent (e.g., "codex").
-    - `F4`: Filter by Workspace/Project.
-    - `F5`/`F6`: Time filters (Today, Week, etc.).
+  - `F3`: Filter by Agent (e.g., "codex").
+  - `F4`: Filter by Workspace/Project.
+  - `F5`/`F6`: Time filters (Today, Week, etc.).
 - **Modes**:
-    - `F2`: Toggle Dark/Light theme.
-    - `F12`: Cycle ranking mode (recent → balanced → relevance → quality → newest → oldest).
-    - `Ctrl+B`: Toggle rounded/plain borders.
+  - `F2`: Toggle Dark/Light theme.
+  - `F12`: Cycle ranking mode (recent → balanced → relevance → quality → newest → oldest).
+  - `Ctrl+B`: Toggle rounded/plain borders.
 - **Actions**:
-    - `Enter`: Open original log file in `$EDITOR`.
-    - `Ctrl+Enter`: Add current result to queue (multi-open).
-    - `Ctrl+O`: Open all queued results in editor.
-    - `m`: Toggle selection on current item.
-    - `A`: Bulk actions menu (when items selected).
-    - `y`: Copy file path or snippet to clipboard.
-    - `/`: Find text within detail pane.
-    - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
-    - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
+  - `Enter`: Open original log file in `$EDITOR`.
+  - `Ctrl+Enter`: Add current result to queue (multi-open).
+  - `Ctrl+O`: Open all queued results in editor.
+  - `m`: Toggle selection on current item.
+  - `A`: Bulk actions menu (when items selected).
+  - `y`: Copy file path or snippet to clipboard.
+  - `/`: Find text within detail pane.
+  - `Ctrl+Shift+R`: Trigger manual re-index (refresh search results).
+  - `Ctrl+Shift+Del`: Reset TUI state (clear history, filters, layout).
 
 ---
 
@@ -1211,21 +1237,21 @@ cass completions bash > ~/.bash_completion.d/cass
 
 ### Core Commands
 
-| Command | Purpose |
-|---------|---------|
-| `cass` (default) | Start TUI + background watcher |
-| `index --full` | Complete rebuild of DB and search index |
-| `index --watch` | Daemon mode: watch for file changes, reindex automatically |
-| `search --robot` | JSON output for automation pipelines |
-| `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
-| `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
-| `capabilities` | Discover features, versions, limits (for agent introspection) |
-| `introspect` | Full API schema: commands, arguments, response shapes |
-| `context <path>` | Find sessions related by workspace, day, or agent |
-| `view <path> -n N` | View source file at specific line (follow-up on search) |
-| `export <path>` | Export conversation to markdown/HTML/JSON |
-| `expand <path> -n N` | Show messages around a specific line number |
-| `timeline` | Activity timeline with grouping by hour/day |
+| Command              | Purpose                                                        |
+| -------------------- | -------------------------------------------------------------- |
+| `cass` (default)     | Start TUI + background watcher                                 |
+| `index --full`       | Complete rebuild of DB and search index                        |
+| `index --watch`      | Daemon mode: watch for file changes, reindex automatically     |
+| `search --robot`     | JSON output for automation pipelines                           |
+| `status` / `state`   | Health snapshot: index freshness, DB stats, recommended action |
+| `health`             | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy      |
+| `capabilities`       | Discover features, versions, limits (for agent introspection)  |
+| `introspect`         | Full API schema: commands, arguments, response shapes          |
+| `context <path>`     | Find sessions related by workspace, day, or agent              |
+| `view <path> -n N`   | View source file at specific line (follow-up on search)        |
+| `export <path>`      | Export conversation to markdown/HTML/JSON                      |
+| `expand <path> -n N` | Show messages around a specific line number                    |
+| `timeline`           | Activity timeline with grouping by hour/day                    |
 
 ---
 
@@ -1235,9 +1261,7 @@ cass completions bash > ~/.bash_completion.d/cass
 
 - **Sandboxed Data**: All indexes/DBs live in standard platform data directories (`~/.local/share/coding-agent-search` on Linux).
 
-- **Read-Only Source**: `cass` *never* modifies your agent log files. It only reads them.
-
-
+- **Read-Only Source**: `cass` _never_ modifies your agent log files. It only reads them.
 
 ## 📦 Installer Strategy
 
@@ -1250,8 +1274,6 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 - **Easy Mode**: `--easy-mode` automates installation to `~/.local/bin` without prompts.
 
 - **Platform Agnostic**: Detects OS/Arch (Linux/macOS/Windows, x86_64/arm64) and fetches the correct binary.
-
-
 
 ## ⚙️ Environment
 
@@ -1275,8 +1297,6 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 - **Watch testing (dev only)**: `cass index --watch --watch-once path1,path2` triggers a single reindex without filesystem notify (also respects `CASS_TEST_WATCH_PATHS` for backward compatibility); useful for deterministic tests/smoke runs.
 
-
-
 ## 🩺 Troubleshooting
 
 - **Checksum mismatch**: Ensure `.sha256` is reachable or pass `--checksum` explicitly. Check proxies/firewalls.
@@ -1288,8 +1308,6 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 - **Watch mode not triggering**: Confirm `watch_state.json` updates and that connector roots are accessible; `notify` relies on OS file events (inotify/FSEvents).
 
 - **Reset TUI state**: Run `cass tui --reset-state` (or press `Ctrl+Shift+Del` in the TUI) to delete `tui_state.json` and restore defaults.
-
-
 
 ## 🧪 Developer Workflow
 
@@ -1323,6 +1341,7 @@ opt-level = "z"         # Optimize for size over speed
 ```
 
 **Trade-offs**:
+
 - Build time is significantly longer (~3-5x)
 - Binary size is ~40-50% smaller
 - No stack traces on panic (use debug builds for development)
@@ -1335,16 +1354,16 @@ The TUI automatically saves your preferences to `tui_state.json` in the data dir
 
 ### What's Persisted
 
-| Setting | Description |
-|---------|-------------|
-| `match_mode` | Prefix vs standard matching |
-| `ranking` | Current ranking mode (recent/balanced/relevance/quality/newest/oldest) |
-| `density_mode` | Compact/Cozy/Spacious |
-| `context_window` | S/M/L/XL preview size |
-| `query_history` | Recent searches (deduplicated, max 100) |
-| `saved_views` | Filter/query snapshots for slots 1-9 |
-| `help_pinned` | Whether help strip is always visible |
-| `pane_limit` | Items per pane (overrides density default) |
+| Setting          | Description                                                            |
+| ---------------- | ---------------------------------------------------------------------- |
+| `match_mode`     | Prefix vs standard matching                                            |
+| `ranking`        | Current ranking mode (recent/balanced/relevance/quality/newest/oldest) |
+| `density_mode`   | Compact/Cozy/Spacious                                                  |
+| `context_window` | S/M/L/XL preview size                                                  |
+| `query_history`  | Recent searches (deduplicated, max 100)                                |
+| `saved_views`    | Filter/query snapshots for slots 1-9                                   |
+| `help_pinned`    | Whether help strip is always visible                                   |
+| `pane_limit`     | Items per pane (overrides density default)                             |
 
 ### State File Location
 
@@ -1367,34 +1386,42 @@ This deletes `tui_state.json` and restores all defaults.
 ## 🔍 Deep Dive: How Key Subsystems Work
 
 ### Tantivy schema & preview field (v4)
+
 - Schema v4 (hash `tantivy-schema-v4-edge-ngram-preview`) stores agent/workspace/source_path/msg_idx/created_at/title/content plus edge-ngrams (`title_prefix`, `content_prefix`) for type-ahead matching.
 - New `preview` field keeps a short, stored excerpt (~200 chars + ellipsis) so prefix-only queries can render snippets without pulling full content.
 - Rebuilds auto-trigger when the schema hash changes; index directory is recreated as needed. Tokenizer: `hyphen_normalize` to keep “cma-es” searchable while enabling prefix splits.
 
 ### Search pipeline (src/search/query.rs)
-- **Wildcard patterns**: `WildcardPattern` enum supports `Exact`, `Prefix` (foo*), `Suffix` (*foo), and `Substring` (*foo*). Prefix uses edge n-grams; suffix/substring use Tantivy `RegexQuery` with escaped special characters.
+
+- **Wildcard patterns**: `WildcardPattern` enum supports `Exact`, `Prefix` (foo*), `Suffix` (*foo), and `Substring` (_foo_). Prefix uses edge n-grams; suffix/substring use Tantivy `RegexQuery` with escaped special characters.
 - **Auto-fuzzy fallback**: `search_with_fallback()` wraps the base search; if results < threshold and query has no wildcards, retries with `*term*` patterns and sets `wildcard_fallback` flag for UI indicator.
 - Cache-first: per-agent + global LRU shards (env `CASS_CACHE_SHARD_CAP`, default 256). Cached hits store lowered content/title/snippet and a 64-bit bloom mask; bloom + substring keeps validation fast.
 - Fallback order: Tantivy (primary) → SQLite FTS (consistency) with deduping/noise filtering. Prefix-only snippet path tries cached prefix snippet, then a cheap local snippet, else Tantivy `SnippetGenerator`.
 - Warm worker: runtime-aware, debounced (env `CASS_WARM_DEBOUNCE_MS`, default 120 ms), runs a tiny 1-doc search to keep the reader hot; reloads are debounced (300 ms) and counted in metrics (cache hit/miss/shortfall/reloads tracked internally).
 
 ### Indexer (src/indexer/mod.rs)
+
 - Opens SQLite + Tantivy; `--full` clears tables/FTS and wipes Tantivy docs; `--force-rebuild` recreates index dir when schema changes.
 - Parallel connector loop: detect → scan runs concurrently across all connectors using rayon's parallel iterator, with atomic progress counters updating discovered agent count and conversation totals in real-time. Ingestion into SQLite and Tantivy happens sequentially after all scans complete. Watch mode: debounced filesystem watcher, path classification per connector, since_ts tracked in `watch_state.json`, incremental reindex of touched sources. TUI startup spawns a background indexer with watch enabled.
 
 ### Storage (src/storage/sqlite.rs)
+
 - Normalized relational model (agents, workspaces, conversations, messages, snippets, tags) with FTS mirror on messages. Single-transaction insert/upsert, append-only unless `--full`. `schema_version` guard; bundled modern SQLite.
 
 ### UI (src/ui/tui.rs)
+
 - Three-pane layout (agents → results → detail), responsive splits, focus model (Tab/Shift+Tab), mouse support. Detail tabs (Messages/Snippets/Raw) plus full-screen modal with role colors, code blocks, JSON pretty-print, highlights. Footer packs shortcuts + mode badges; state persisted in `tui_state.json`.
 
-### Connectors (src/connectors/*.rs)
+### Connectors (src/connectors/\*.rs)
+
 - Each connector implements `detect` (root discovery) and `scan` (since_ts-aware ingestion). External IDs preserved for dedupe; workspace/source paths carried through; roles normalized.
 
 ### Installers (install.sh / install.ps1)
+
 - Checksum-verified easy/normal modes, optional quickstart (index on first run), rustup bootstrap if needed. PATH hints appended with warnings; SHA256 required.
 
 ### Benchmarks & Tests
+
 - Benches: `index_perf` measures full index build; `runtime_perf` covers search latency + indexing micro-cases.
 - Tests: unit + integration + headless TUI e2e; installer checksum fixtures; watch-mode and index/search integration; cache/bloom UTF-8 safety and bloom gate tests.
 
@@ -1440,14 +1467,14 @@ Full reindexing is expensive. `cass` minimizes work through careful state tracki
 
 ### Architectural Decisions
 
-| Decision | Rationale | Trade-off |
-|----------|-----------|-----------|
-| **Rust** | Memory safety without GC pauses; excellent async/parallelism | Steeper learning curve; longer compile times |
-| **SQLite + Tantivy** | Best-in-class for each job (relational vs. FTS) | Data duplication; two systems to maintain |
-| **Edge N-grams** | Sub-60ms prefix search on 100K+ documents | 3-5x index size increase |
-| **Sharded LRU Cache** | Reduces mutex contention in async searcher | Memory overhead; cache coherence complexity |
-| **Connector Trait** | Clean abstraction for diverse agent formats | Each new agent requires dedicated connector code |
-| **Atomic Progress Counters** | Lock-free UI updates during indexing | Relaxed ordering may show slightly stale counts |
+| Decision                     | Rationale                                                    | Trade-off                                        |
+| ---------------------------- | ------------------------------------------------------------ | ------------------------------------------------ |
+| **Rust**                     | Memory safety without GC pauses; excellent async/parallelism | Steeper learning curve; longer compile times     |
+| **SQLite + Tantivy**         | Best-in-class for each job (relational vs. FTS)              | Data duplication; two systems to maintain        |
+| **Edge N-grams**             | Sub-60ms prefix search on 100K+ documents                    | 3-5x index size increase                         |
+| **Sharded LRU Cache**        | Reduces mutex contention in async searcher                   | Memory overhead; cache coherence complexity      |
+| **Connector Trait**          | Clean abstraction for diverse agent formats                  | Each new agent requires dedicated connector code |
+| **Atomic Progress Counters** | Lock-free UI updates during indexing                         | Relaxed ordering may show slightly stale counts  |
 
 ---
 
@@ -1465,12 +1492,14 @@ Generated n-grams: "au", "aut", "auth", "authe", "authen", "authent", "authenti"
 ```
 
 **Implementation** (`src/search/tantivy.rs:288-305`):
+
 - N-gram lengths: 2 to 20 characters
 - Stored in separate Tantivy fields: `title_prefix`, `content_prefix`
 - These fields are indexed but NOT stored (saves disk space)
-- Query "auth*" becomes a simple term lookup on the prefix field
+- Query "auth\*" becomes a simple term lookup on the prefix field
 
 **Performance Impact**:
+
 - Index build time: ~20% slower
 - Index size: ~3x larger
 - Query time for prefixes: O(1) instead of O(n) regex scan
@@ -1490,6 +1519,7 @@ fn hash_token(tok: &str) -> u64 {
 ```
 
 **How It Works**:
+
 1. During caching, compute `bloom64 = hash(token1) | hash(token2) | ...` for all content tokens
 2. On cache lookup, compute query bloom mask the same way
 3. If `(cached.bloom64 & query_bloom) != query_bloom`, the cached hit cannot match—skip expensive string comparison
@@ -1511,6 +1541,7 @@ Tantivy provides BM25 (Best Match 25) scoring out of the box. `cass` extends thi
 | Implicit Wildcard (fallback) | 0.6 |
 
 **Ranking Mode Formulas**:
+
 ```
 Recent Heavy:    score = bm25 × 0.3 + recency × 0.7
 Balanced:        score = bm25 × 0.5 + recency × 0.5
@@ -1536,6 +1567,7 @@ let pending_batches: Vec<_> = connector_factories
 ```
 
 **Why This Matters**:
+
 - 9 connectors × ~100ms average scan time = 900ms sequential
 - With 4 cores: ~250ms parallel (3.6x speedup)
 - Atomic counters provide lock-free progress updates to UI
@@ -1544,12 +1576,12 @@ let pending_batches: Vec<_> = connector_factories
 
 `cass` automatically selects the optimal query strategy based on pattern:
 
-| Pattern | Strategy | Implementation |
-|---------|----------|----------------|
-| `foo` (exact) | Term query + edge n-gram | Direct Tantivy lookup |
-| `foo*` (prefix) | Edge n-gram field query | Uses pre-computed prefixes |
-| `*foo` (suffix) | Regex query | `RegexQuery(".*foo")` |
-| `*foo*` (substring) | Regex query | `RegexQuery(".*foo.*")` |
+| Pattern             | Strategy                 | Implementation             |
+| ------------------- | ------------------------ | -------------------------- |
+| `foo` (exact)       | Term query + edge n-gram | Direct Tantivy lookup      |
+| `foo*` (prefix)     | Edge n-gram field query  | Uses pre-computed prefixes |
+| `*foo` (suffix)     | Regex query              | `RegexQuery(".*foo")`      |
+| `*foo*` (substring) | Regex query              | `RegexQuery(".*foo.*")`    |
 
 **Auto-Fallback Logic**: When exact search returns <3 results and query has 1-2 terms, automatically retry with `*term*` wildcards. Results are flagged with `wildcard_fallback: true`.
 
@@ -1559,46 +1591,46 @@ let pending_batches: Vec<_> = connector_factories
 
 ### Benchmarked Operations
 
-| Operation | Typical Latency | Conditions |
-|-----------|-----------------|------------|
-| Prefix search (cached) | 2-8ms | Warm cache, <1000 results |
-| Prefix search (cold) | 40-60ms | First query, index in page cache |
-| Substring search | 80-200ms | Regex fallback required |
-| Full reindex | 5-30s | Depending on total conversation count |
-| Incremental reindex | 50-500ms | Single conversation update |
-| TUI render frame | <16ms | 60 FPS target achieved |
+| Operation              | Typical Latency | Conditions                            |
+| ---------------------- | --------------- | ------------------------------------- |
+| Prefix search (cached) | 2-8ms           | Warm cache, <1000 results             |
+| Prefix search (cold)   | 40-60ms         | First query, index in page cache      |
+| Substring search       | 80-200ms        | Regex fallback required               |
+| Full reindex           | 5-30s           | Depending on total conversation count |
+| Incremental reindex    | 50-500ms        | Single conversation update            |
+| TUI render frame       | <16ms           | 60 FPS target achieved                |
 
 ### Memory Usage
 
-| Component | Typical Size | Notes |
-|-----------|--------------|-------|
-| Base process | ~30MB | Rust binary + runtime |
-| SQLite connection | ~5MB | WAL mode, shared cache |
-| Tantivy reader | ~20-50MB | Segment metadata + mmap overhead |
-| Search cache | ~10-50MB | 2048 entries × ~500 bytes + hit data |
-| TUI state | ~2MB | Result buffers, render state |
+| Component         | Typical Size | Notes                                |
+| ----------------- | ------------ | ------------------------------------ |
+| Base process      | ~30MB        | Rust binary + runtime                |
+| SQLite connection | ~5MB         | WAL mode, shared cache               |
+| Tantivy reader    | ~20-50MB     | Segment metadata + mmap overhead     |
+| Search cache      | ~10-50MB     | 2048 entries × ~500 bytes + hit data |
+| TUI state         | ~2MB         | Result buffers, render state         |
 
 **Total typical footprint**: 70-140MB for a 50K message corpus.
 
 ### Disk Usage
 
-| Component | Size Formula | Example (50K messages) |
-|-----------|--------------|------------------------|
-| SQLite database | ~200 bytes/message | ~10MB |
-| Tantivy index (base) | ~150 bytes/message | ~7.5MB |
-| Edge n-gram overhead | ~3x base index | ~22MB |
-| **Total** | ~600 bytes/message | ~30MB |
+| Component            | Size Formula       | Example (50K messages) |
+| -------------------- | ------------------ | ---------------------- |
+| SQLite database      | ~200 bytes/message | ~10MB                  |
+| Tantivy index (base) | ~150 bytes/message | ~7.5MB                 |
+| Edge n-gram overhead | ~3x base index     | ~22MB                  |
+| **Total**            | ~600 bytes/message | ~30MB                  |
 
 ### Scaling Characteristics
 
 `cass` is designed for individual developer use (1K-500K messages). Beyond that:
 
-| Message Count | Search Latency | Index Build | Recommendation |
-|---------------|----------------|-------------|----------------|
-| <10K | <20ms | <5s | Excellent performance |
-| 10K-100K | 20-60ms | 5-30s | Target operating range |
-| 100K-500K | 60-150ms | 30-120s | Consider periodic pruning |
-| >500K | >200ms | >2min | Archive old sessions |
+| Message Count | Search Latency | Index Build | Recommendation            |
+| ------------- | -------------- | ----------- | ------------------------- |
+| <10K          | <20ms          | <5s         | Excellent performance     |
+| 10K-100K      | 20-60ms        | 5-30s       | Target operating range    |
+| 100K-500K     | 60-150ms       | 30-120s     | Consider periodic pruning |
+| >500K         | >200ms         | >2min       | Archive old sessions      |
 
 ---
 
@@ -1607,11 +1639,13 @@ let pending_batches: Vec<_> = connector_factories
 ### Data Access Patterns
 
 **What `cass` Reads**:
+
 - Agent session files (JSONL, JSON, SQLite, Markdown)
 - File modification times (for incremental indexing)
 - Environment variables (configuration only)
 
 **What `cass` Writes**:
+
 - `~/.local/share/coding-agent-search/` (or platform equivalent):
   - `agent_search.db` - SQLite database
   - `tantivy_index/` - Full-text search index
@@ -1620,6 +1654,7 @@ let pending_batches: Vec<_> = connector_factories
   - `cass.log` - Rotating log file
 
 **What `cass` NEVER Does**:
+
 - Modify source agent files (strictly read-only)
 - Make network requests (except optional update checks)
 - Execute code from indexed content
@@ -1628,23 +1663,27 @@ let pending_batches: Vec<_> = connector_factories
 ### Encryption Handling
 
 **ChatGPT Encrypted Conversations**:
+
 - Versions 2 and 3 of the ChatGPT macOS app use AES-256-GCM encryption
 - Keys are stored in the macOS Keychain, accessible only to OpenAI-signed apps
 - `cass` detects encrypted files and gracefully skips them
 - Optional: Provide your own key via `CHATGPT_ENCRYPTION_KEY` (base64) or `~/.config/cass/chatgpt_key.bin`
 
 **No Sensitive Data in Logs**:
+
 - Log files contain operation traces, not message content
 - Error messages are sanitized to avoid leaking paths/content
 
 ### Threat Model
 
 `cass` assumes:
+
 - The local filesystem is trusted
 - The user running `cass` should have access to all indexed content
 - Network is untrusted (hence no network calls)
 
 `cass` does NOT protect against:
+
 - Root/admin access to the machine
 - Memory forensics while running
 - Physical access to the storage device
@@ -1655,27 +1694,27 @@ let pending_batches: Vec<_> = connector_factories
 
 ### Why Not Just `grep`/`ripgrep`?
 
-| Capability | grep/rg | cass |
-|------------|---------|------|
-| Raw text search | ✅ Excellent | ✅ Good |
-| Structured JSON parsing | ❌ Manual | ✅ Automatic |
-| Cross-format unification | ❌ No | ✅ 9 formats |
-| Relevance ranking | ❌ No | ✅ BM25 + recency |
-| Prefix search | ❌ Regex only | ✅ O(1) via n-grams |
-| Incremental indexing | ❌ N/A | ✅ Built-in |
-| Interactive TUI | ❌ No | ✅ Rich UI |
+| Capability               | grep/rg       | cass                |
+| ------------------------ | ------------- | ------------------- |
+| Raw text search          | ✅ Excellent  | ✅ Good             |
+| Structured JSON parsing  | ❌ Manual     | ✅ Automatic        |
+| Cross-format unification | ❌ No         | ✅ 9 formats        |
+| Relevance ranking        | ❌ No         | ✅ BM25 + recency   |
+| Prefix search            | ❌ Regex only | ✅ O(1) via n-grams |
+| Incremental indexing     | ❌ N/A        | ✅ Built-in         |
+| Interactive TUI          | ❌ No         | ✅ Rich UI          |
 
 **Verdict**: `grep` is better for one-off searches in known files. `cass` excels at exploring your entire coding history across agents.
 
 ### Why Not a Cloud Search Service?
 
-| Aspect | Cloud Search | cass |
-|--------|--------------|------|
-| Privacy | ❌ Data leaves your machine | ✅ 100% local |
-| Latency | ~100-500ms (network) | ~20-60ms (local) |
-| Cost | 💰 Usage-based pricing | ✅ Free |
-| Offline use | ❌ Requires internet | ✅ Always available |
-| Setup | Minutes (API keys, etc.) | `curl | bash` |
+| Aspect      | Cloud Search                | cass                |
+| ----------- | --------------------------- | ------------------- | ----- |
+| Privacy     | ❌ Data leaves your machine | ✅ 100% local       |
+| Latency     | ~100-500ms (network)        | ~20-60ms (local)    |
+| Cost        | 💰 Usage-based pricing      | ✅ Free             |
+| Offline use | ❌ Requires internet        | ✅ Always available |
+| Setup       | Minutes (API keys, etc.)    | `curl               | bash` |
 
 **Verdict**: Cloud search makes sense for team collaboration. `cass` is for individual developers who want speed and privacy.
 
@@ -1683,13 +1722,13 @@ let pending_batches: Vec<_> = connector_factories
 
 `cass` actually uses SQLite FTS5 as a fallback! But Tantivy provides:
 
-| Feature | SQLite FTS5 | Tantivy |
-|---------|-------------|---------|
-| BM25 scoring | ✅ Basic | ✅ Tunable |
-| Prefix queries | ❌ No native support | ✅ Via edge n-grams |
-| Concurrent reads | ⚠️ WAL helps | ✅ Designed for it |
-| Index compaction | ❌ Manual VACUUM | ✅ Automatic merges |
-| Memory mapping | ❌ No | ✅ Efficient mmap |
+| Feature          | SQLite FTS5          | Tantivy             |
+| ---------------- | -------------------- | ------------------- |
+| BM25 scoring     | ✅ Basic             | ✅ Tunable          |
+| Prefix queries   | ❌ No native support | ✅ Via edge n-grams |
+| Concurrent reads | ⚠️ WAL helps         | ✅ Designed for it  |
+| Index compaction | ❌ Manual VACUUM     | ✅ Automatic merges |
+| Memory mapping   | ❌ No                | ✅ Efficient mmap   |
 
 **Verdict**: SQLite FTS5 is great for simple search. Tantivy handles the sophisticated queries `cass` needs.
 

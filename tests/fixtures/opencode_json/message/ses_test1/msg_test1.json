@@ -1,0 +1,17 @@
+{
+  "id": "msg_test1",
+  "sessionID": "ses_test1",
+  "role": "user",
+  "time": {
+    "created": 1700000001000
+  },
+  "summary": {
+    "title": "User Request",
+    "body": "Hello, can you help me?"
+  },
+  "agent": "build",
+  "model": {
+    "providerID": "anthropic",
+    "modelID": "claude-opus-4-5"
+  }
+}

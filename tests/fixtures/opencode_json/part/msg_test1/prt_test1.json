@@ -1,0 +1,7 @@
+{
+  "id": "prt_test1",
+  "sessionID": "ses_test1",
+  "messageID": "msg_test1",
+  "type": "text",
+  "text": "Hello, can you help me with this code?"
+}
