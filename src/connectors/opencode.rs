@@ -145,16 +145,65 @@ struct OpenCodeCache {
     write: Option<i64>,
 }
 
-/// User message summary
-#[derive(Debug, Clone, Deserialize, Default)]
+/// User message summary - can be either a boolean or a struct
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 struct OpenCodeMessageSummary {
-    #[serde(default)]
     title: Option<String>,
-    #[serde(default)]
     body: Option<String>,
-    #[serde(default)]
     diffs: Option<Vec<serde_json::Value>>,
+}
+
+impl<'de> Deserialize<'de> for OpenCodeMessageSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+
+        struct SummaryVisitor;
+
+        impl<'de> Visitor<'de> for SummaryVisitor {
+            type Value = OpenCodeMessageSummary;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or a summary object")
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // When summary is just `true`, return an empty summary
+                Ok(OpenCodeMessageSummary::default())
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut title = None;
+                let mut body = None;
+                let mut diffs = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "title" => title = map.next_value()?,
+                        "body" => body = map.next_value()?,
+                        "diffs" => diffs = map.next_value()?,
+                        _ => {
+                            // Skip unknown fields
+                            let _ = map.next_value::<serde_json::Value>()?;
+                        }
+                    }
+                }
+
+                Ok(OpenCodeMessageSummary { title, body, diffs })
+            }
+        }
+
+        deserializer.deserialize_any(SummaryVisitor)
+    }
 }
 
 /// Model info (alternative location in user messages)
@@ -216,6 +265,15 @@ struct OpenCodePart {
     /// Metadata (for reasoning parts)
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    /// Filename (for file parts)
+    #[serde(default)]
+    filename: Option<String>,
+    /// URL (for file parts)
+    #[serde(default)]
+    url: Option<String>,
+    /// MIME type (for file parts)
+    #[serde(default)]
+    mime: Option<String>,
 }
 
 /// Tool state for tool parts
@@ -465,8 +523,14 @@ impl OpenCodeConnector {
                         content_parts.push(format!("[Patch: {file_list}]"));
                     }
                 }
-                "step-start" | "step-finish" => {
+                "step-start" | "step-finish" | "compaction" => {
                     // These are metadata parts, skip for content
+                }
+                "file" => {
+                    // File attachment - include filename if available
+                    if let Some(filename) = &part.filename {
+                        content_parts.push(format!("[File: {filename}]"));
+                    }
                 }
                 other => {
                     tracing::debug!("opencode: unknown part type: {other}");
