@@ -2142,8 +2142,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
-            "                      Presets: minimal (path,line,agent), summary (+title,score)".to_string(),
-            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type".to_string(),
+            "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
+            "                      Fields: score,agent,workspace,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -2983,6 +2983,12 @@ fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
                     "title".to_string(),
                     "score".to_string(),
                 ],
+                // Provenance preset (P3.4) - add source origin info to results
+                "provenance" => vec![
+                    "source_id".to_string(),
+                    "origin_kind".to_string(),
+                    "origin_host".to_string(),
+                ],
                 "*" | "all" => vec![], // Empty means include all - handled specially
                 other => vec![other.to_string()],
             })
@@ -3013,6 +3019,10 @@ fn filter_hit_fields(
                 "created_at",
                 "line_number",
                 "match_type",
+                // Provenance fields (P3.4)
+                "source_id",
+                "origin_kind",
+                "origin_host",
             ];
 
             for field in field_list {
@@ -3135,7 +3145,7 @@ fn output_robot_results(
     timed_out: bool,
     timeout_ms: Option<u64>,
 ) -> CliResult<()> {
-    // Expand presets (minimal, summary, all, *)
+    // Expand presets (minimal, summary, provenance, all, *)
     let resolved_fields = expand_field_presets(fields);
 
     // Filter hits to requested fields, then apply content truncation
@@ -4966,7 +4976,10 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                             "snippet": { "type": ["string", "null"] },
                             "score": { "type": ["number", "null"] },
                             "created_at": { "type": ["integer", "string", "null"] },
-                            "match_type": { "type": ["string", "null"] }
+                            "match_type": { "type": ["string", "null"] },
+                            "source_id": { "type": "string", "description": "Source identifier (e.g., 'local', 'work-laptop')" },
+                            "origin_kind": { "type": "string", "description": "Origin kind ('local' or 'ssh')" },
+                            "origin_host": { "type": ["string", "null"], "description": "Host label for remote sources" }
                         }
                     }
                 },
