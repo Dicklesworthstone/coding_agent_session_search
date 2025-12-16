@@ -103,6 +103,12 @@ pub struct Source {
     /// Optional stable machine identifier (can be hashed for privacy).
     pub machine_id: Option<String>,
 
+    /// Platform hint (macos, linux, windows).
+    pub platform: Option<String>,
+
+    /// Extra configuration as JSON (SSH params, path rewrites, etc.).
+    pub config_json: Option<serde_json::Value>,
+
     /// When this source was first registered.
     pub created_at: Option<i64>,
 
@@ -118,6 +124,8 @@ impl Source {
             kind: SourceKind::Local,
             host_label: None,
             machine_id: None,
+            platform: None,
+            config_json: None,
             created_at: None,
             updated_at: None,
         }
@@ -130,6 +138,8 @@ impl Source {
             kind: SourceKind::Ssh,
             host_label: Some(host_label.into()),
             machine_id: None,
+            platform: None,
+            config_json: None,
             created_at: None,
             updated_at: None,
         }

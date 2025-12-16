@@ -805,7 +805,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(msg_count, 0);
-        assert_eq!(storage.schema_version().unwrap(), 3);
+        assert_eq!(storage.schema_version().unwrap(), 4);
     }
 
     #[test]

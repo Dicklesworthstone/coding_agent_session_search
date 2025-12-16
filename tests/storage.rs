@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 
 fn sample_agent() -> Agent {
@@ -48,7 +49,7 @@ fn schema_version_created_on_open() {
     let db_path = tmp.path().join("store.db");
     let storage = SqliteStorage::open(&db_path).expect("open");
 
-    assert_eq!(storage.schema_version().unwrap(), 3);
+    assert_eq!(storage.schema_version().unwrap(), 4);
 
     // If meta row is removed, the getter surfaces an error.
     storage.raw().execute("DELETE FROM meta", []).unwrap();
@@ -325,6 +326,11 @@ fn fresh_db_creates_all_tables() {
         tables.contains(&"fts_messages".to_string()),
         "fts_messages virtual table exists"
     );
+    // Sources table (v4)
+    assert!(
+        tables.contains(&"sources".to_string()),
+        "sources table exists"
+    );
 }
 
 #[test]
@@ -550,11 +556,11 @@ fn migration_from_v1_applies_v2_and_v3() {
         .expect("create v1 schema");
     }
 
-    // Open with SqliteStorage - should apply v2 and v3 migrations
+    // Open with SqliteStorage - should apply v2, v3, and v4 migrations
     let storage = SqliteStorage::open(&db_path).expect("open v1 db");
 
     // Verify migration completed
-    assert_eq!(storage.schema_version().unwrap(), 3, "should migrate to v3");
+    assert_eq!(storage.schema_version().unwrap(), 4, "should migrate to v4");
 
     // Verify FTS5 table was created
     let tables: Vec<String> = storage
@@ -666,11 +672,11 @@ fn migration_from_v2_applies_v3() {
         .expect("create v2 schema");
     }
 
-    // Open with SqliteStorage - should apply v3 migration
+    // Open with SqliteStorage - should apply v3 and v4 migrations
     let storage = SqliteStorage::open(&db_path).expect("open v2 db");
 
     // Verify migration completed
-    assert_eq!(storage.schema_version().unwrap(), 3, "should migrate to v3");
+    assert_eq!(storage.schema_version().unwrap(), 4, "should migrate to v4");
 }
 
 #[test]
@@ -737,4 +743,306 @@ fn pragmas_are_applied() {
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
         .unwrap();
     assert_eq!(fk, 1, "foreign_keys should be ON");
+}
+
+// =============================================================================
+// Source CRUD Tests (tst.sto.sources)
+// Tests for source table operations
+// =============================================================================
+
+#[test]
+fn local_source_auto_created_on_init() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Local source should be auto-created
+    let local = storage.get_source(LOCAL_SOURCE_ID).expect("get_source");
+    assert!(local.is_some(), "local source should exist");
+
+    let local = local.unwrap();
+    assert_eq!(local.id, LOCAL_SOURCE_ID);
+    assert_eq!(local.kind, SourceKind::Local);
+    assert!(local.host_label.is_none());
+}
+
+#[test]
+fn list_sources_includes_local() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_list.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let sources = storage.list_sources().expect("list_sources");
+    assert!(!sources.is_empty(), "should have at least local source");
+    assert!(
+        sources.iter().any(|s| s.id == LOCAL_SOURCE_ID),
+        "local source should be in list"
+    );
+}
+
+#[test]
+fn upsert_and_get_source() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_upsert.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Create a new remote source
+    let source = Source {
+        id: "work-laptop".to_string(),
+        kind: SourceKind::Ssh,
+        host_label: Some("user@laptop.local".to_string()),
+        machine_id: Some("abc123".to_string()),
+        platform: Some("linux".to_string()),
+        config_json: Some(serde_json::json!({"port": 22})),
+        created_at: None,
+        updated_at: None,
+    };
+
+    storage.upsert_source(&source).expect("upsert_source");
+
+    // Retrieve it
+    let retrieved = storage
+        .get_source("work-laptop")
+        .expect("get_source")
+        .expect("source should exist");
+
+    assert_eq!(retrieved.id, "work-laptop");
+    assert_eq!(retrieved.kind, SourceKind::Ssh);
+    assert_eq!(retrieved.host_label, Some("user@laptop.local".to_string()));
+    assert_eq!(retrieved.machine_id, Some("abc123".to_string()));
+    assert_eq!(retrieved.platform, Some("linux".to_string()));
+    assert!(retrieved.config_json.is_some());
+    assert!(retrieved.created_at.is_some());
+    assert!(retrieved.updated_at.is_some());
+}
+
+#[test]
+fn upsert_updates_existing_source() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_update.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Create initial source
+    let source1 = Source {
+        id: "remote-1".to_string(),
+        kind: SourceKind::Ssh,
+        host_label: Some("old-label".to_string()),
+        machine_id: None,
+        platform: None,
+        config_json: None,
+        created_at: None,
+        updated_at: None,
+    };
+    storage.upsert_source(&source1).expect("first upsert");
+
+    let first = storage
+        .get_source("remote-1")
+        .expect("get")
+        .expect("exists");
+    let first_created = first.created_at;
+
+    // Update the source
+    let source2 = Source {
+        id: "remote-1".to_string(),
+        kind: SourceKind::Ssh,
+        host_label: Some("new-label".to_string()),
+        machine_id: Some("machine-id".to_string()),
+        platform: Some("macos".to_string()),
+        config_json: None,
+        created_at: first_created, // Preserve original created_at
+        updated_at: None,
+    };
+    storage.upsert_source(&source2).expect("second upsert");
+
+    let updated = storage
+        .get_source("remote-1")
+        .expect("get")
+        .expect("exists");
+
+    assert_eq!(updated.host_label, Some("new-label".to_string()));
+    assert_eq!(updated.machine_id, Some("machine-id".to_string()));
+    assert_eq!(updated.platform, Some("macos".to_string()));
+    // created_at should be preserved, updated_at should change
+    assert_eq!(updated.created_at, first_created);
+    assert!(updated.updated_at >= first.updated_at);
+}
+
+#[test]
+fn delete_source_removes_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_delete.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Create a source
+    let source = Source::remote("to-delete", "host.local");
+    storage.upsert_source(&source).expect("upsert");
+
+    // Verify it exists
+    assert!(storage.get_source("to-delete").unwrap().is_some());
+
+    // Delete it
+    let deleted = storage.delete_source("to-delete", false).expect("delete");
+    assert!(deleted, "should return true for successful deletion");
+
+    // Verify it's gone
+    assert!(storage.get_source("to-delete").unwrap().is_none());
+}
+
+#[test]
+fn delete_nonexistent_source_returns_false() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_delete_none.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let deleted = storage.delete_source("nonexistent", false).expect("delete");
+    assert!(!deleted, "should return false for nonexistent source");
+}
+
+#[test]
+fn cannot_delete_local_source() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_local_delete.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Try to delete local source
+    let result = storage.delete_source(LOCAL_SOURCE_ID, false);
+    assert!(result.is_err(), "should not be able to delete local source");
+
+    // Verify local source still exists
+    assert!(storage.get_source(LOCAL_SOURCE_ID).unwrap().is_some());
+}
+
+#[test]
+fn sources_table_has_correct_columns() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("sources_cols.db");
+    let storage = SqliteStorage::open(&db_path).expect("open");
+
+    let columns: Vec<String> = storage
+        .raw()
+        .prepare("PRAGMA table_info(sources)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert!(columns.contains(&"id".to_string()));
+    assert!(columns.contains(&"kind".to_string()));
+    assert!(columns.contains(&"host_label".to_string()));
+    assert!(columns.contains(&"machine_id".to_string()));
+    assert!(columns.contains(&"platform".to_string()));
+    assert!(columns.contains(&"config_json".to_string()));
+    assert!(columns.contains(&"created_at".to_string()));
+    assert!(columns.contains(&"updated_at".to_string()));
+}
+
+#[test]
+fn migration_from_v3_creates_sources_table() {
+    use rusqlite::Connection;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("migrate_v3.db");
+
+    // Manually create a v3 database (without sources table)
+    {
+        let conn = Connection::open(&db_path).expect("create v3 db");
+        conn.execute_batch(
+            r"
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES('schema_version', '3');
+
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                version TEXT,
+                kind TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                display_name TEXT
+            );
+
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                workspace_id INTEGER REFERENCES workspaces(id),
+                external_id TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                approx_tokens INTEGER,
+                metadata_json TEXT,
+                UNIQUE(agent_id, external_id)
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                author TEXT,
+                created_at INTEGER,
+                content TEXT NOT NULL,
+                extra_json TEXT,
+                UNIQUE(conversation_id, idx)
+            );
+
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT
+            );
+
+            CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+
+            CREATE TABLE conversation_tags (
+                conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (conversation_id, tag_id)
+            );
+
+            CREATE INDEX idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
+            CREATE INDEX idx_messages_conv_idx ON messages(conversation_id, idx);
+            CREATE INDEX idx_messages_created ON messages(created_at);
+
+            CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+            );
+            ",
+        )
+        .expect("create v3 schema");
+    }
+
+    // Open with SqliteStorage - should apply v4 migration
+    let storage = SqliteStorage::open(&db_path).expect("open v3 db");
+
+    // Verify migration completed
+    assert_eq!(storage.schema_version().unwrap(), 4, "should migrate to v4");
+
+    // Verify sources table was created with local source
+    let sources = storage.list_sources().expect("list_sources");
+    assert!(
+        sources.iter().any(|s| s.id == LOCAL_SOURCE_ID),
+        "local source should exist after migration"
+    );
 }

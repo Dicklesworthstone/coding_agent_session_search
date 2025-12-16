@@ -1,13 +1,14 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
+use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
@@ -141,6 +142,24 @@ FROM messages m
 JOIN conversations c ON m.conversation_id = c.id
 JOIN agents a ON c.agent_id = a.id
 LEFT JOIN workspaces w ON c.workspace_id = w.id;
+";
+
+const MIGRATION_V4: &str = r"
+-- Sources table for tracking where conversations come from
+CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,           -- source_id (e.g., 'local', 'work-laptop')
+    kind TEXT NOT NULL,            -- 'local', 'ssh', etc.
+    host_label TEXT,               -- display label
+    machine_id TEXT,               -- optional stable machine id
+    platform TEXT,                 -- 'macos', 'linux', 'windows'
+    config_json TEXT,              -- JSON blob for extra config (SSH params, path rewrites)
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Bootstrap: Insert the default 'local' source
+INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
+VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
 ";
 
 pub struct SqliteStorage {
@@ -473,6 +492,116 @@ impl SqliteStorage {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     }
+
+    // -------------------------------------------------------------------------
+    // Source CRUD operations
+    // -------------------------------------------------------------------------
+
+    /// Get a source by ID.
+    pub fn get_source(&self, id: &str) -> Result<Option<Source>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
+                 FROM sources WHERE id = ?",
+                params![id],
+                |row| {
+                    let kind_str: String = row.get(1)?;
+                    let config_json_str: Option<String> = row.get(5)?;
+                    Ok(Source {
+                        id: row.get(0)?,
+                        kind: SourceKind::parse(&kind_str).unwrap_or_default(),
+                        host_label: row.get(2)?,
+                        machine_id: row.get(3)?,
+                        platform: row.get(4)?,
+                        config_json: config_json_str
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .with_context(|| format!("fetching source with id '{id}'"))
+    }
+
+    /// List all sources.
+    pub fn list_sources(&self) -> Result<Vec<Source>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
+             FROM sources ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_str: String = row.get(1)?;
+            let config_json_str: Option<String> = row.get(5)?;
+            Ok(Source {
+                id: row.get(0)?,
+                kind: SourceKind::parse(&kind_str).unwrap_or_default(),
+                host_label: row.get(2)?,
+                machine_id: row.get(3)?,
+                platform: row.get(4)?,
+                config_json: config_json_str.and_then(|s| serde_json::from_str(&s).ok()),
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Create or update a source.
+    pub fn upsert_source(&self, source: &Source) -> Result<()> {
+        let now = Self::now_millis();
+        let config_json_str = source
+            .config_json
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        self.conn.execute(
+            "INSERT INTO sources(id, kind, host_label, machine_id, platform, config_json, created_at, updated_at)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                host_label = excluded.host_label,
+                machine_id = excluded.machine_id,
+                platform = excluded.platform,
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at",
+            params![
+                source.id,
+                source.kind.as_str(),
+                source.host_label,
+                source.machine_id,
+                source.platform,
+                config_json_str,
+                source.created_at.unwrap_or(now),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a source by ID.
+    ///
+    /// If `cascade` is true, also deletes all conversations from this source.
+    /// Note: Currently conversations don't have a source_id column, so cascade
+    /// is a no-op until P1.3 is implemented.
+    pub fn delete_source(&self, id: &str, _cascade: bool) -> Result<bool> {
+        // Prevent deletion of the local source
+        if id == LOCAL_SOURCE_ID {
+            return Err(anyhow!("cannot delete the local source"));
+        }
+
+        let rows_affected = self
+            .conn
+            .execute("DELETE FROM sources WHERE id = ?", params![id])?;
+
+        Ok(rows_affected > 0)
+    }
 }
 
 fn apply_pragmas(conn: &mut Connection) -> Result<()> {
@@ -543,13 +672,19 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V1)?;
             tx.execute_batch(MIGRATION_V2)?;
             tx.execute_batch(MIGRATION_V3)?;
+            tx.execute_batch(MIGRATION_V4)?;
         }
         1 => {
             tx.execute_batch(MIGRATION_V2)?;
             tx.execute_batch(MIGRATION_V3)?;
+            tx.execute_batch(MIGRATION_V4)?;
         }
         2 => {
             tx.execute_batch(MIGRATION_V3)?;
+            tx.execute_batch(MIGRATION_V4)?;
+        }
+        3 => {
+            tx.execute_batch(MIGRATION_V4)?;
         }
         v => return Err(anyhow!("unsupported schema version {v}")),
     }
