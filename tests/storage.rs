@@ -1592,3 +1592,269 @@ fn timeline_source_filter_specific_source() {
         "should not include server"
     );
 }
+
+// =============================================================================
+// Timeline JSON Provenance Fields Tests (P7.10)
+// Tests for provenance fields (source_id, origin_kind, origin_host) in timeline output
+// =============================================================================
+
+#[test]
+fn timeline_json_includes_source_id_field() {
+    // P7.10: Verify timeline SQL returns source_id field
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_json.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    storage
+        .upsert_source(&Source::local())
+        .expect("upsert local source");
+
+    let now = 1700000000i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("test-1", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+
+    // Query with source_id field selection (simulates timeline JSON output)
+    let result: Vec<(i64, String)> = storage
+        .raw()
+        .prepare(
+            "SELECT c.id, c.source_id FROM conversations c
+             WHERE c.source_id IS NOT NULL",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert!(!result.is_empty(), "should have at least one conversation");
+    let (_, source_id) = &result[0];
+    assert_eq!(source_id, "local", "source_id should be 'local'");
+}
+
+#[test]
+fn timeline_json_includes_origin_kind_field() {
+    // P7.10: Verify timeline SQL returns origin_kind from sources table
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_kind.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    // Create both local and remote sources
+    storage
+        .upsert_source(&Source::local())
+        .expect("upsert local source");
+    storage
+        .upsert_source(&Source::remote("laptop", "laptop.local"))
+        .expect("upsert remote source");
+
+    let now = 1700000000i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-conv", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("remote-conv", "laptop", now + 1000, vec![msg(0, now + 1000)]),
+        )
+        .unwrap();
+
+    // Query with origin_kind from sources table (matches timeline SQL)
+    let results: Vec<(String, String, String)> = storage
+        .raw()
+        .prepare(
+            "SELECT c.source_id, c.origin_host, s.kind as origin_kind
+             FROM conversations c
+             LEFT JOIN sources s ON c.source_id = s.id
+             ORDER BY c.source_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "local".into()),
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(results.len(), 2, "should have 2 conversations");
+
+    // Find local and remote results
+    let local = results.iter().find(|(id, _, _)| id == "local").expect("local conv");
+    let remote = results.iter().find(|(id, _, _)| id == "laptop").expect("remote conv");
+
+    // Verify origin_kind is correct
+    assert_eq!(local.2, "local", "local source should have kind 'local'");
+    assert_eq!(remote.2, "ssh", "remote source should have kind 'ssh'");
+}
+
+#[test]
+fn timeline_json_includes_origin_host_field() {
+    // P7.10: Verify timeline SQL returns origin_host for remote sessions
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_host.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    storage
+        .upsert_source(&Source::local())
+        .expect("upsert local source");
+    storage
+        .upsert_source(&Source::remote("work", "user@work.example.com"))
+        .expect("upsert remote source");
+
+    let now = 1700000000i64;
+
+    // Local conversation - origin_host should be null
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-conv", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+
+    // Remote conversation - origin_host set via sample_conv_with_source
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("remote-conv", "work", now + 1000, vec![msg(0, now + 1000)]),
+        )
+        .unwrap();
+
+    // Query origin_host field
+    let results: Vec<(String, Option<String>)> = storage
+        .raw()
+        .prepare(
+            "SELECT c.source_id, c.origin_host FROM conversations c ORDER BY c.source_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(results.len(), 2, "should have 2 conversations");
+
+    let local = results.iter().find(|(id, _)| id == "local").expect("local conv");
+    let remote = results.iter().find(|(id, _)| id == "work").expect("remote conv");
+
+    // Local should have null origin_host
+    assert!(
+        local.1.is_none(),
+        "local source should have null origin_host"
+    );
+
+    // Remote should have origin_host set
+    assert!(
+        remote.1.is_some(),
+        "remote source should have origin_host set"
+    );
+    assert_eq!(
+        remote.1.as_deref(),
+        Some("work.local"),
+        "origin_host should match the pattern from sample_conv_with_source"
+    );
+}
+
+#[test]
+fn timeline_json_grouped_output_includes_provenance() {
+    // P7.10: Verify provenance fields are present when timeline is grouped
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_grouped.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    storage.upsert_source(&Source::local()).expect("upsert local");
+    storage
+        .upsert_source(&Source::remote("server", "server.example.com"))
+        .expect("upsert remote");
+
+    let now = 1700000000i64;
+    // Same day, different sources
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-1", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("server-1", "server", now + 100, vec![msg(0, now + 100)]),
+        )
+        .unwrap();
+
+    // Query all provenance fields as timeline JSON would
+    let results: Vec<(i64, String, Option<String>, Option<String>)> = storage
+        .raw()
+        .prepare(
+            "SELECT c.id, c.source_id, c.origin_host, s.kind as origin_kind
+             FROM conversations c
+             LEFT JOIN sources s ON c.source_id = s.id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // All entries should have source_id
+    for (id, source_id, _, _) in &results {
+        assert!(
+            !source_id.is_empty(),
+            "Entry {} should have non-empty source_id",
+            id
+        );
+    }
+
+    // Verify we have both local and remote entries with correct kinds
+    let has_local = results
+        .iter()
+        .any(|(_, sid, _, kind)| sid == "local" && kind.as_deref() == Some("local"));
+    let has_remote = results
+        .iter()
+        .any(|(_, sid, _, kind)| sid == "server" && kind.as_deref() == Some("ssh"));
+
+    assert!(has_local, "should have local entry with kind='local'");
+    assert!(has_remote, "should have remote entry with kind='ssh'");
+}
