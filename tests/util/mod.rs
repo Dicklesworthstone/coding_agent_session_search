@@ -518,6 +518,170 @@ pub fn fixture_amp() -> ConversationFixtureBuilder {
         .external_id("amp-1")
 }
 
+// =============================================================================
+// Multi-Source Fixture Helpers (P7.6)
+// =============================================================================
+
+/// Create a conversation fixture with explicit provenance fields.
+#[allow(dead_code)]
+pub struct MultiSourceConversationBuilder {
+    inner: ConversationFixtureBuilder,
+    source_id: String,
+    origin_host: Option<String>,
+}
+
+#[allow(dead_code)]
+impl MultiSourceConversationBuilder {
+    pub fn local(agent_slug: impl Into<String>) -> Self {
+        Self {
+            inner: ConversationFixtureBuilder::new(agent_slug),
+            source_id: "local".to_string(),
+            origin_host: None,
+        }
+    }
+
+    pub fn remote(agent_slug: impl Into<String>, source_id: impl Into<String>, host: impl Into<String>) -> Self {
+        let sid = source_id.into();
+        Self {
+            inner: ConversationFixtureBuilder::new(agent_slug),
+            source_id: sid.clone(),
+            origin_host: Some(host.into()),
+        }
+    }
+
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.inner = self.inner.title(title);
+        self
+    }
+
+    pub fn external_id(mut self, id: impl Into<String>) -> Self {
+        self.inner = self.inner.external_id(id);
+        self
+    }
+
+    pub fn workspace(mut self, path: impl Into<PathBuf>) -> Self {
+        self.inner = self.inner.workspace(path);
+        self
+    }
+
+    pub fn source_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.inner = self.inner.source_path(path);
+        self
+    }
+
+    pub fn base_ts(mut self, ts: i64) -> Self {
+        self.inner = self.inner.base_ts(ts);
+        self
+    }
+
+    pub fn messages(mut self, count: usize) -> Self {
+        self.inner = self.inner.messages(count);
+        self
+    }
+
+    pub fn with_content(mut self, idx: usize, content: impl Into<String>) -> Self {
+        self.inner = self.inner.with_content(idx, content);
+        self
+    }
+
+    /// Build a Conversation with the specified provenance.
+    pub fn build(self) -> Conversation {
+        let mut conv = self.inner.build_conversation();
+        conv.source_id = self.source_id;
+        conv.origin_host = self.origin_host;
+        conv
+    }
+}
+
+/// Pre-built fixture scenarios for multi-source testing.
+#[allow(dead_code)]
+pub mod multi_source_fixtures {
+    use super::*;
+
+    /// Local Claude Code session on myapp project.
+    pub fn local_myapp_session1() -> MultiSourceConversationBuilder {
+        MultiSourceConversationBuilder::local("claude_code")
+            .title("Fix login authentication bug")
+            .external_id("local-cc-001")
+            .workspace("/Users/dev/projects/myapp")
+            .source_path("/Users/dev/.claude/projects/myapp/session-local-001.jsonl")
+            .base_ts(1_702_195_200_000) // 2025-12-10T09:00:00Z
+            .messages(4)
+            .with_content(0, "Fix the login authentication bug that causes the session to expire too early")
+            .with_content(1, "I'll investigate the authentication module. Let me look at the session management code.")
+    }
+
+    /// Local Claude Code session on myapp project (rate limiting).
+    pub fn local_myapp_session2() -> MultiSourceConversationBuilder {
+        MultiSourceConversationBuilder::local("claude_code")
+            .title("Add API rate limiting")
+            .external_id("local-cc-002")
+            .workspace("/Users/dev/projects/myapp")
+            .source_path("/Users/dev/.claude/projects/myapp/session-local-002.jsonl")
+            .base_ts(1_702_299_600_000) // 2025-12-11T14:00:00Z
+            .messages(3)
+            .with_content(0, "Add rate limiting to the API endpoints")
+            .with_content(1, "I'll implement rate limiting using a token bucket algorithm.")
+    }
+
+    /// Remote laptop session on myapp project (same workspace, different path).
+    pub fn laptop_myapp_session() -> MultiSourceConversationBuilder {
+        MultiSourceConversationBuilder::remote("claude_code", "laptop", "laptop.local")
+            .title("Add logout button to header")
+            .external_id("laptop-cc-001")
+            .workspace("/home/user/projects/myapp") // Different path, same logical project
+            .source_path("/home/user/.claude/projects/myapp/session-laptop-001.jsonl")
+            .base_ts(1_702_112_400_000) // 2025-12-09T10:00:00Z
+            .messages(3)
+            .with_content(0, "Add logout button to the header component")
+            .with_content(1, "I'll add a logout button to the header. Let me check the current header component structure.")
+    }
+
+    /// Remote workstation session on backend project.
+    pub fn workstation_backend_session() -> MultiSourceConversationBuilder {
+        MultiSourceConversationBuilder::remote("claude_code", "workstation", "work.example.com")
+            .title("Implement user registration with email verification")
+            .external_id("work-cc-001")
+            .workspace("/home/dev/backend")
+            .source_path("/home/dev/.claude/projects/backend/session-work-001.jsonl")
+            .base_ts(1_702_396_800_000) // 2025-12-12T16:00:00Z
+            .messages(5)
+            .with_content(0, "Implement the user registration endpoint with email verification")
+            .with_content(1, "I'll create the registration endpoint with proper validation and email verification flow.")
+    }
+
+    /// Generate a complete multi-source test set (4 sessions from 3 sources).
+    pub fn all_sessions() -> Vec<Conversation> {
+        vec![
+            local_myapp_session1().build(),
+            local_myapp_session2().build(),
+            laptop_myapp_session().build(),
+            workstation_backend_session().build(),
+        ]
+    }
+
+    /// Get sessions filtered by source.
+    pub fn sessions_by_source(source_id: &str) -> Vec<Conversation> {
+        all_sessions()
+            .into_iter()
+            .filter(|c| c.source_id == source_id)
+            .collect()
+    }
+
+    /// Get local sessions only.
+    pub fn local_sessions() -> Vec<Conversation> {
+        sessions_by_source("local")
+    }
+
+    /// Get remote sessions only.
+    pub fn remote_sessions() -> Vec<Conversation> {
+        all_sessions()
+            .into_iter()
+            .filter(|c| c.source_id != "local")
+            .collect()
+    }
+}
+
 /// Snippet specification for attaching code fragments to generated messages.
 #[derive(Debug, Clone)]
 pub struct SnippetSpec {
