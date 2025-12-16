@@ -1343,3 +1343,252 @@ fn open_or_rebuild_handles_corrupted_db() {
         Ok(_) => panic!("should have failed for corrupted db"),
     }
 }
+
+// =============================================================================
+// Timeline Source Filtering Tests (P7.8)
+// Tests for --source filtering in timeline command
+// =============================================================================
+
+/// Create a conversation with a specific source_id for testing timeline filtering
+fn sample_conv_with_source(
+    external_id: &str,
+    source_id: &str,
+    started_at: i64,
+    messages: Vec<Message>,
+) -> Conversation {
+    Conversation {
+        id: None,
+        agent_slug: "tester".into(),
+        workspace: Some(PathBuf::from("/workspace/demo")),
+        external_id: Some(external_id.to_string()),
+        title: Some(format!("Conv from {}", source_id)),
+        source_path: PathBuf::from(format!("/logs/{}.jsonl", external_id)),
+        started_at: Some(started_at),
+        ended_at: Some(started_at + 100),
+        approx_tokens: Some(42),
+        metadata_json: serde_json::json!({}),
+        messages,
+        source_id: source_id.to_string(),
+        origin_host: if source_id != "local" {
+            Some(format!("{}.local", source_id))
+        } else {
+            None
+        },
+    }
+}
+
+#[test]
+fn timeline_source_filter_local_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    // Setup: Create agent
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    // Ensure sources exist
+    storage
+        .upsert_source(&Source::local())
+        .expect("ensure local source");
+    storage
+        .upsert_source(&Source::remote("laptop", "laptop.local"))
+        .expect("ensure remote source");
+
+    // Insert conversations: 2 local, 1 remote
+    let now = 1700000000i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-1", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-2", "local", now + 1000, vec![msg(0, now + 1000)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("remote-1", "laptop", now + 2000, vec![msg(0, now + 2000)]),
+        )
+        .unwrap();
+
+    // Query with source_id = 'local' filter
+    let local_only: Vec<String> = storage
+        .raw()
+        .prepare(
+            "SELECT c.external_id FROM conversations c
+             WHERE c.source_id = 'local'
+             ORDER BY c.started_at DESC",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(local_only.len(), 2, "should return 2 local conversations");
+    assert!(local_only.contains(&"local-1".to_string()));
+    assert!(local_only.contains(&"local-2".to_string()));
+    assert!(
+        !local_only.contains(&"remote-1".to_string()),
+        "should not include remote"
+    );
+}
+
+#[test]
+fn timeline_source_filter_remote_only() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_remote.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    storage
+        .upsert_source(&Source::local())
+        .expect("ensure local source");
+    storage
+        .upsert_source(&Source::remote("laptop", "laptop.local"))
+        .expect("ensure remote source");
+    storage
+        .upsert_source(&Source::remote("server", "server.example.com"))
+        .expect("ensure second remote source");
+
+    let now = 1700000000i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-1", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("laptop-1", "laptop", now + 1000, vec![msg(0, now + 1000)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("server-1", "server", now + 2000, vec![msg(0, now + 2000)]),
+        )
+        .unwrap();
+
+    // Query with source_id != 'local' (remote filter)
+    let remote_only: Vec<String> = storage
+        .raw()
+        .prepare(
+            "SELECT c.external_id FROM conversations c
+             WHERE c.source_id != 'local'
+             ORDER BY c.started_at DESC",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(remote_only.len(), 2, "should return 2 remote conversations");
+    assert!(remote_only.contains(&"laptop-1".to_string()));
+    assert!(remote_only.contains(&"server-1".to_string()));
+    assert!(
+        !remote_only.contains(&"local-1".to_string()),
+        "should not include local"
+    );
+}
+
+#[test]
+fn timeline_source_filter_specific_source() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("timeline_specific.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let ws_id = storage
+        .ensure_workspace(PathBuf::from("/workspace/demo").as_path(), Some("Demo"))
+        .unwrap();
+
+    storage
+        .upsert_source(&Source::local())
+        .expect("ensure local source");
+    storage
+        .upsert_source(&Source::remote("laptop", "laptop.local"))
+        .expect("ensure remote source");
+    storage
+        .upsert_source(&Source::remote("server", "server.example.com"))
+        .expect("ensure second remote source");
+
+    let now = 1700000000i64;
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("local-1", "local", now, vec![msg(0, now)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("laptop-1", "laptop", now + 1000, vec![msg(0, now + 1000)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("laptop-2", "laptop", now + 2000, vec![msg(0, now + 2000)]),
+        )
+        .unwrap();
+    storage
+        .insert_conversation_tree(
+            agent_id,
+            Some(ws_id),
+            &sample_conv_with_source("server-1", "server", now + 3000, vec![msg(0, now + 3000)]),
+        )
+        .unwrap();
+
+    // Query with source_id = 'laptop' (specific source)
+    let laptop_only: Vec<String> = storage
+        .raw()
+        .prepare(
+            "SELECT c.external_id FROM conversations c
+             WHERE c.source_id = 'laptop'
+             ORDER BY c.started_at DESC",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        laptop_only.len(),
+        2,
+        "should return 2 laptop conversations"
+    );
+    assert!(laptop_only.contains(&"laptop-1".to_string()));
+    assert!(laptop_only.contains(&"laptop-2".to_string()));
+    assert!(
+        !laptop_only.contains(&"local-1".to_string()),
+        "should not include local"
+    );
+    assert!(
+        !laptop_only.contains(&"server-1".to_string()),
+        "should not include server"
+    );
+}
