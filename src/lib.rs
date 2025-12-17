@@ -479,6 +479,53 @@ pub enum SourcesCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Manage path mappings for a source (P6.3)
+    #[command(subcommand)]
+    Mappings(MappingsAction),
+}
+
+/// Subcommands for managing path mappings (P6.3)
+#[derive(Subcommand, Debug, Clone)]
+pub enum MappingsAction {
+    /// List path mappings for a source
+    List {
+        /// Source name
+        source: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a path mapping
+    Add {
+        /// Source name
+        source: String,
+        /// Remote path prefix to match
+        #[arg(long)]
+        from: String,
+        /// Local path prefix to replace with
+        #[arg(long)]
+        to: String,
+        /// Only apply to specific agents (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+    },
+    /// Remove a path mapping by index
+    Remove {
+        /// Source name
+        source: String,
+        /// Index of mapping to remove (from list output, 0-based)
+        index: usize,
+    },
+    /// Test how a path would be rewritten
+    Test {
+        /// Source name
+        source: String,
+        /// Path to test
+        path: String,
+        /// Optional agent to simulate (for agent-specific rules)
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -6954,6 +7001,9 @@ fn run_sources_command(cmd: SourcesCommand) -> CliResult<()> {
         } => {
             run_sources_sync(source, no_index, verbose, dry_run, json)?;
         }
+        SourcesCommand::Mappings(action) => {
+            run_mappings_command(action)?;
+        }
     }
     Ok(())
 }
@@ -7963,6 +8013,281 @@ fn run_sources_sync(
             );
         }
     }
+
+    Ok(())
+}
+
+/// Handle mappings subcommands (P6.3)
+fn run_mappings_command(action: MappingsAction) -> CliResult<()> {
+    match action {
+        MappingsAction::List { source, json } => {
+            run_mappings_list(&source, json)?;
+        }
+        MappingsAction::Add {
+            source,
+            from,
+            to,
+            agents,
+        } => {
+            run_mappings_add(&source, &from, &to, agents)?;
+        }
+        MappingsAction::Remove { source, index } => {
+            run_mappings_remove(&source, index)?;
+        }
+        MappingsAction::Test {
+            source,
+            path,
+            agent,
+        } => {
+            run_mappings_test(&source, &path, agent.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+/// List path mappings for a source (P6.3)
+fn run_mappings_list(source_name: &str, json_output: bool) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+
+    let config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source = config.find_source(source_name).ok_or_else(|| CliError {
+        code: 12,
+        kind: "source",
+        message: format!("Source '{}' not found", source_name),
+        hint: Some("Use 'cass sources list' to see available sources".into()),
+        retryable: false,
+    })?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": source_name,
+                "mappings": source.path_mappings,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("Path mappings for source '{}':", source_name);
+        println!();
+
+        if source.path_mappings.is_empty() {
+            println!("  No path mappings configured.");
+            println!();
+            println!("Add mappings with:");
+            println!("  cass sources mappings add {} --from /remote/path --to /local/path", source_name);
+        } else {
+            for (idx, mapping) in source.path_mappings.iter().enumerate() {
+                println!("  [{}] {} → {}", idx, mapping.from, mapping.to);
+                if let Some(ref agents) = mapping.agents {
+                    println!("      agents: {}", agents.join(", "));
+                }
+            }
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Add a path mapping to a source (P6.3)
+fn run_mappings_add(
+    source_name: &str,
+    from: &str,
+    to: &str,
+    agents: Option<Vec<String>>,
+) -> CliResult<()> {
+    use crate::sources::config::{PathMapping, SourcesConfig};
+
+    let mut config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source = config.find_source_mut(source_name).ok_or_else(|| CliError {
+        code: 12,
+        kind: "source",
+        message: format!("Source '{}' not found", source_name),
+        hint: Some("Use 'cass sources list' to see available sources".into()),
+        retryable: false,
+    })?;
+
+    // Create the mapping
+    let mapping = if let Some(agent_list) = agents {
+        PathMapping::with_agents(from, to, agent_list)
+    } else {
+        PathMapping::new(from, to)
+    };
+
+    // Check for duplicates
+    let already_exists = source.path_mappings.iter().any(|m| {
+        m.from == mapping.from && m.to == mapping.to && m.agents == mapping.agents
+    });
+
+    if already_exists {
+        return Err(CliError {
+            code: 13,
+            kind: "mapping",
+            message: "This mapping already exists".into(),
+            hint: None,
+            retryable: false,
+        });
+    }
+
+    source.path_mappings.push(mapping.clone());
+
+    config.save().map_err(|e| CliError {
+        code: 11,
+        kind: "config",
+        message: format!("Failed to save config: {e}"),
+        hint: Some("Check file permissions on config directory".into()),
+        retryable: false,
+    })?;
+
+    println!("Added mapping to source '{}':", source_name);
+    println!("  {} → {}", mapping.from, mapping.to);
+    if let Some(agents) = &mapping.agents {
+        println!("  agents: {}", agents.join(", "));
+    }
+    println!();
+    println!("Test with:");
+    println!("  cass sources mappings test {} {}", source_name, from);
+
+    Ok(())
+}
+
+/// Remove a path mapping from a source (P6.3)
+fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+
+    let mut config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source = config.find_source_mut(source_name).ok_or_else(|| CliError {
+        code: 12,
+        kind: "source",
+        message: format!("Source '{}' not found", source_name),
+        hint: Some("Use 'cass sources list' to see available sources".into()),
+        retryable: false,
+    })?;
+
+    if index >= source.path_mappings.len() {
+        return Err(CliError {
+            code: 14,
+            kind: "mapping",
+            message: format!(
+                "Invalid index {}. Source has {} mapping(s).",
+                index,
+                source.path_mappings.len()
+            ),
+            hint: Some("Use 'cass sources mappings list' to see valid indices".into()),
+            retryable: false,
+        });
+    }
+
+    let removed = source.path_mappings.remove(index);
+
+    config.save().map_err(|e| CliError {
+        code: 11,
+        kind: "config",
+        message: format!("Failed to save config: {e}"),
+        hint: Some("Check file permissions on config directory".into()),
+        retryable: false,
+    })?;
+
+    println!("Removed mapping from source '{}':", source_name);
+    println!("  {} → {}", removed.from, removed.to);
+
+    Ok(())
+}
+
+/// Test how a path would be rewritten for a source (P6.3)
+fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliResult<()> {
+    use crate::sources::config::{PathMapping, SourcesConfig};
+    use colored::Colorize;
+
+    let config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source = config.find_source(source_name).ok_or_else(|| CliError {
+        code: 12,
+        kind: "source",
+        message: format!("Source '{}' not found", source_name),
+        hint: Some("Use 'cass sources list' to see available sources".into()),
+        retryable: false,
+    })?;
+
+    // Find the matching mapping
+    let mut matching_mapping = None;
+    let rewritten = source.rewrite_path_for_agent(path, agent);
+
+    // Find which rule matched (if any)
+    if rewritten != path {
+        // Find the longest matching prefix
+        let mut best_match: Option<&PathMapping> = None;
+        for mapping in &source.path_mappings {
+            if !mapping.applies_to_agent(agent) {
+                continue;
+            }
+            if path.starts_with(&mapping.from) {
+                if best_match.is_none() || mapping.from.len() > best_match.as_ref().unwrap().from.len() {
+                    best_match = Some(mapping);
+                }
+            }
+        }
+        matching_mapping = best_match;
+    }
+
+    println!();
+    println!("Input:  {}", path);
+    println!("Output: {}", rewritten);
+
+    if let Some(mapping) = matching_mapping {
+        println!("Rule:   {} → {}", mapping.from, mapping.to);
+        if let Some(ref agents) = mapping.agents {
+            println!("        agents: {}", agents.join(", "));
+        }
+        println!("Status: {} mapped", "✓".green());
+    } else if rewritten == path {
+        println!("Status: {} no matching rule", "✗".yellow());
+
+        if !source.path_mappings.is_empty() {
+            println!();
+            println!("Available rules:");
+            for mapping in &source.path_mappings {
+                println!("  {} → {}", mapping.from, mapping.to);
+                if let Some(ref agents) = mapping.agents {
+                    println!("    agents: {}", agents.join(", "));
+                }
+            }
+        }
+    }
+
+    if let Some(a) = agent {
+        println!();
+        println!("(Tested with agent: {})", a);
+    }
+    println!();
 
     Ok(())
 }
