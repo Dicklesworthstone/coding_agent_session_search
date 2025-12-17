@@ -902,10 +902,11 @@ pub fn help_lines(palette: ThemePalette) -> Vec<Line<'static>> {
     lines.extend(add_section(
         "Filters",
         &[
-            format!("{} agent | {} workspace | {} from | {} to | {} clear all", 
+            format!("{} agent | {} workspace | {} from | {} to | {} clear all",
                 shortcuts::FILTER_AGENT, shortcuts::FILTER_WORKSPACE, shortcuts::FILTER_DATE_FROM, shortcuts::FILTER_DATE_TO, shortcuts::CLEAR_FILTERS),
             format!("{} scope to active agent | {} clear scope | {} cycle time presets (24h/7d/30d/all)",
                 shortcuts::SCOPE_AGENT, shortcuts::SCOPE_WORKSPACE, shortcuts::CYCLE_TIME_PRESETS),
+            "F11 cycle source filter (all → local → remote)".to_string(),
             "Chips in search bar; Backspace removes last; Enter (query empty) edits last chip".to_string(),
         ],
     ));
@@ -2295,6 +2296,7 @@ fn footer_shortcuts(max_width: usize) -> String {
         "F5/F6 time",
         "F7 ctx",
         "F9 match",
+        "F11 src",
         "F12 rank",
         "Ctrl+R hist",
         "Ctrl+Shift+R refresh",
@@ -5309,6 +5311,26 @@ pub fn run_tui(
                             );
                             status = format!("Density: {}", density_mode.label());
                             needs_draw = true;
+                        }
+                        // F11: Cycle through source filters (P4.3)
+                        KeyCode::F(11) => {
+                            use crate::sources::provenance::SourceFilter;
+                            filters.source_filter = match &filters.source_filter {
+                                SourceFilter::All => SourceFilter::Local,
+                                SourceFilter::Local => SourceFilter::Remote,
+                                SourceFilter::Remote => SourceFilter::All,
+                                SourceFilter::SourceId(_) => SourceFilter::All,
+                            };
+                            status = format!(
+                                "Source: {}",
+                                match &filters.source_filter {
+                                    SourceFilter::All => "all sources",
+                                    SourceFilter::Local => "local only",
+                                    SourceFilter::Remote => "remote only",
+                                    SourceFilter::SourceId(id) => id.as_str(),
+                                }
+                            );
+                            dirty_since = Some(Instant::now());
                         }
                         KeyCode::F(12) => {
                             ranking_mode = match ranking_mode {
