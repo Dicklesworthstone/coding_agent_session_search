@@ -2473,3 +2473,370 @@ fn introspect_lists_provenance_in_search_fields() {
         "Search should have fields argument for filtering"
     );
 }
+
+// =============================================================================
+// ege.10: Additional Robot-Docs Topic Tests
+// =============================================================================
+
+/// robot-docs paths topic lists data directories
+#[test]
+fn robot_docs_paths_lists_directories() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "paths"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs paths should not emit ANSI when color=never"
+    );
+    // Should contain path-related content
+    assert!(
+        stdout.contains("data") || stdout.contains("path") || stdout.contains("directory"),
+        "paths topic should describe data directories"
+    );
+}
+
+/// robot-docs guide topic provides comprehensive usage guide
+#[test]
+fn robot_docs_guide_provides_usage_info() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "guide"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs guide should not emit ANSI when color=never"
+    );
+    // Should contain guide content
+    assert!(
+        stdout.contains("search") || stdout.contains("cass") || stdout.contains("agent"),
+        "guide topic should provide usage information"
+    );
+}
+
+/// robot-docs exit-codes topic lists all exit codes
+#[test]
+fn robot_docs_exit_codes_lists_codes() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "exit-codes"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs exit-codes should not emit ANSI when color=never"
+    );
+    // Should list exit codes
+    assert!(
+        stdout.contains('0') && stdout.contains('2') && stdout.contains('3'),
+        "exit-codes topic should list standard exit codes (0, 2, 3)"
+    );
+}
+
+/// robot-docs examples topic provides practical examples
+#[test]
+fn robot_docs_examples_provides_practical_examples() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "examples"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs examples should not emit ANSI when color=never"
+    );
+    // Should contain example commands
+    assert!(
+        stdout.contains("cass") && stdout.contains("--"),
+        "examples topic should show cass command examples"
+    );
+}
+
+/// robot-docs contracts topic describes the API contract
+#[test]
+fn robot_docs_contracts_describes_api() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "contracts"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs contracts should not emit ANSI when color=never"
+    );
+    // Should describe contract/API info
+    assert!(
+        stdout.contains("contract") || stdout.contains("version") || stdout.contains("API"),
+        "contracts topic should describe API contract"
+    );
+}
+
+/// robot-docs wrap topic explains text wrapping
+#[test]
+fn robot_docs_wrap_explains_wrapping() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "wrap"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs wrap should not emit ANSI when color=never"
+    );
+    // Should explain wrapping
+    assert!(
+        stdout.contains("wrap") || stdout.contains("width") || stdout.contains("column"),
+        "wrap topic should explain text wrapping options"
+    );
+}
+
+// =============================================================================
+// ege.10: Golden Contract Tests
+// =============================================================================
+
+/// Introspect output should match golden contract (structure, not dynamic values)
+#[test]
+fn introspect_matches_golden_contract_structure() {
+    let mut cmd = base_cmd();
+    cmd.args(["introspect", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+    assert!(
+        output.stderr.is_empty(),
+        "introspect should not log to stderr"
+    );
+    let actual: Value = serde_json::from_slice(&output.stdout).expect("valid introspect json");
+
+    // Load expected structure
+    let expected = read_fixture("introspect.json");
+
+    // Check stable contract fields
+    assert_eq!(
+        actual["api_version"], expected["api_version"],
+        "api_version should match golden"
+    );
+    assert_eq!(
+        actual["contract_version"], expected["contract_version"],
+        "contract_version should match golden"
+    );
+
+    // Check that global_flags array has expected structure
+    let actual_globals = actual["global_flags"].as_array().expect("global_flags array");
+    let expected_globals = expected["global_flags"].as_array().expect("expected global_flags");
+    assert_eq!(
+        actual_globals.len(),
+        expected_globals.len(),
+        "global_flags count should match golden"
+    );
+
+    // Check that expected global flags exist
+    let actual_flag_names: HashSet<_> = actual_globals
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    for expected_flag in expected_globals {
+        let name = expected_flag["name"].as_str().expect("flag name");
+        assert!(
+            actual_flag_names.contains(name),
+            "Expected global flag '{}' not found",
+            name
+        );
+    }
+
+    // Check that commands array has expected commands
+    let actual_cmds = actual["commands"].as_array().expect("commands array");
+    let expected_cmds = expected["commands"].as_array().expect("expected commands");
+    let actual_cmd_names: HashSet<_> = actual_cmds
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    let expected_cmd_names: HashSet<_> = expected_cmds
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(
+        actual_cmd_names, expected_cmd_names,
+        "command names should match golden"
+    );
+}
+
+// =============================================================================
+// ege.10: Comprehensive Exit Code Contract Tests
+// =============================================================================
+
+/// Exit code 0: Success for valid search
+#[test]
+fn exit_code_0_success_search() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+    cmd.assert().code(0);
+}
+
+/// Exit code 0: Success for valid stats
+#[test]
+fn exit_code_0_success_stats() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "stats",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+    cmd.assert().code(0);
+}
+
+/// Exit code 0: Success for robot-docs
+#[test]
+fn exit_code_0_success_robot_docs() {
+    let mut cmd = base_cmd();
+    cmd.args(["robot-docs", "commands"]);
+    cmd.assert().code(0);
+}
+
+/// Exit code 0: Success for capabilities
+#[test]
+fn exit_code_0_success_capabilities() {
+    let mut cmd = base_cmd();
+    cmd.args(["capabilities", "--json"]);
+    cmd.assert().code(0);
+}
+
+/// Exit code 2: Usage/parsing error for invalid subcommand
+#[test]
+fn exit_code_2_invalid_subcommand() {
+    let mut cmd = base_cmd();
+    cmd.args(["--json", "nonexistent_command"]);
+    cmd.assert().code(2);
+}
+
+/// Exit code 2: TUI disabled in non-TTY environment
+#[test]
+fn exit_code_2_tui_disabled_non_tty() {
+    let mut cmd = base_cmd();
+    // No subcommand triggers TUI which should be disabled in test
+    cmd.assert().code(2);
+}
+
+/// Exit code 3: Missing index for search
+#[test]
+fn exit_code_3_missing_index_search() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "test",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    // Missing index should return code 3 or 9 depending on how error is classified
+    let output = cmd.assert().failure().get_output().clone();
+    let code = output.status.code().expect("exit code");
+    assert!(
+        code == 3 || code == 9,
+        "Missing index should return code 3 or 9, got {code}"
+    );
+}
+
+/// Exit code 3: Missing database for stats
+#[test]
+fn exit_code_3_missing_db_stats() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "stats",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+    cmd.assert().code(3);
+}
+
+/// Contract: All exit codes are documented in robot-docs exit-codes
+#[test]
+fn all_exit_codes_documented() {
+    let mut cmd = base_cmd();
+    cmd.args(["robot-docs", "exit-codes"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // All documented exit codes should be mentioned
+    for code in ["0", "2", "3", "9"] {
+        assert!(
+            stdout.contains(code),
+            "Exit code {} should be documented in robot-docs exit-codes",
+            code
+        );
+    }
+}
+
+// =============================================================================
+// ege.10: Trace Mode Contract Tests
+// =============================================================================
+
+/// Trace file includes required contract fields on success
+#[test]
+fn trace_includes_contract_fields_on_success() {
+    let tmp = TempDir::new().unwrap();
+    let trace_path = tmp.path().join("trace.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--trace-file",
+        trace_path.to_str().unwrap(),
+        "search",
+        "hello",
+        "--json",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    cmd.assert().success();
+
+    let trace = fs::read_to_string(&trace_path).expect("trace file exists");
+    let last_line = trace.lines().last().expect("trace has lines");
+    let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
+
+    // Required contract fields
+    assert_eq!(json["exit_code"], 0, "exit_code should be 0 for success");
+    assert_eq!(json["contract_version"], "1", "contract_version should be 1");
+    // Trace uses start_ts and end_ts for timestamps
+    assert!(
+        json["start_ts"].is_string() || json["end_ts"].is_string(),
+        "timestamp (start_ts/end_ts) should be present"
+    );
+    assert!(
+        json["duration_ms"].is_number(),
+        "duration_ms should be present"
+    );
+}
+
+/// Trace file includes error details on failure
+#[test]
+fn trace_includes_error_on_failure() {
+    let tmp = TempDir::new().unwrap();
+    let trace_path = tmp.path().join("trace.jsonl");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "--trace-file",
+        trace_path.to_str().unwrap(),
+        "search",
+        "test",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    cmd.assert().failure();
+
+    let trace = fs::read_to_string(&trace_path).expect("trace file exists");
+    let last_line = trace.lines().last().expect("trace has lines");
+    let json: Value = serde_json::from_str(last_line).expect("valid trace JSON");
+
+    // Error case should have non-zero exit code
+    let exit_code = json["exit_code"].as_i64().expect("exit_code");
+    assert_ne!(exit_code, 0, "exit_code should be non-zero for failure");
+    assert_eq!(json["contract_version"], "1");
+}

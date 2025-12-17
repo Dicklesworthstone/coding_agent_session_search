@@ -461,6 +461,13 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         }
       ],
       "has_json_output": true
@@ -479,6 +486,23 @@
         {
           "name": "json",
           "description": "Output as JSON",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "by-source",
+          "description": "Show breakdown by source",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -936,27 +960,43 @@
             "day",
             "none"
           ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "sources",
+      "description": "Manage remote sources (P5.x)",
+      "arguments": [],
+      "has_json_output": false
     }
   ],
   "response_schemas": {
-    "state": {
+    "diag": {
       "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
+        "connectors": {
+          "items": {
+            "properties": {
+              "found": {
+                "type": "boolean"
+              },
+              "name": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
             },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
+            "type": "object"
           },
-          "type": "object"
+          "type": "array"
         },
         "database": {
           "properties": {
@@ -969,106 +1009,50 @@
             "messages": {
               "type": "integer"
             },
-            "path": {
+            "size_bytes": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "index": {
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "size_bytes": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "paths": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "index_path": {
               "type": "string"
             }
           },
           "type": "object"
         },
-        "healthy": {
-          "type": "boolean"
-        },
-        "index": {
+        "platform": {
           "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
+            "arch": {
+              "type": "string"
             },
-            "exists": {
-              "type": "boolean"
-            },
-            "fresh": {
-              "type": "boolean"
-            },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
+            "os": {
+              "type": "string"
             }
           },
           "type": "object"
         },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "capabilities": {
-      "properties": {
-        "api_version": {
-          "type": "integer"
-        },
-        "connectors": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "contract_version": {
+        "version": {
           "type": "string"
-        },
-        "crate_version": {
-          "type": "string"
-        },
-        "features": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "limits": {
-          "properties": {
-            "max_agg_buckets": {
-              "type": "integer"
-            },
-            "max_content_length": {
-              "type": "integer"
-            },
-            "max_fields": {
-              "type": "integer"
-            },
-            "max_limit": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
         }
       },
       "type": "object"
@@ -1267,6 +1251,17 @@
                   "null"
                 ]
               },
+              "origin_host": {
+                "description": "Host label for remote sources",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "origin_kind": {
+                "description": "Origin kind ('local' or 'ssh')",
+                "type": "string"
+              },
               "score": {
                 "type": [
                   "number",
@@ -1278,6 +1273,10 @@
                   "string",
                   "null"
                 ]
+              },
+              "source_id": {
+                "description": "Source identifier (e.g., 'local', 'work-laptop')",
+                "type": "string"
               },
               "source_path": {
                 "type": "string"
@@ -1329,258 +1328,89 @@
       },
       "type": "object"
     },
-    "diag": {
+    "health": {
       "properties": {
-        "connectors": {
-          "items": {
-            "properties": {
-              "found": {
-                "type": "boolean"
-              },
-              "name": {
-                "type": "string"
-              },
-              "path": {
-                "type": "string"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "size_bytes": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "index": {
-          "properties": {
-            "exists": {
-              "type": "boolean"
-            },
-            "size_bytes": {
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "paths": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "index_path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "platform": {
-          "properties": {
-            "arch": {
-              "type": "string"
-            },
-            "os": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "view": {
-      "properties": {
-        "end_line": {
-          "type": "integer"
-        },
-        "highlight_line": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "lines": {
-          "items": {
-            "properties": {
-              "content": {
-                "type": "string"
-              },
-              "highlighted": {
-                "type": "boolean"
-              },
-              "number": {
-                "type": "integer"
-              }
-            },
-            "type": "object"
-          },
-          "type": "array"
-        },
-        "path": {
-          "type": "string"
-        },
-        "start_line": {
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "index": {
-      "properties": {
-        "conversations": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "data_dir": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "db_path": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "elapsed_ms": {
-          "type": "integer"
-        },
-        "error": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "force_rebuild": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "full": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "messages": {
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "success": {
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
-    "status": {
-      "properties": {
-        "_meta": {
-          "properties": {
-            "data_dir": {
-              "type": "string"
-            },
-            "db_path": {
-              "type": "string"
-            },
-            "timestamp": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "database": {
-          "properties": {
-            "conversations": {
-              "type": "integer"
-            },
-            "exists": {
-              "type": "boolean"
-            },
-            "messages": {
-              "type": "integer"
-            },
-            "path": {
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
         "healthy": {
           "type": "boolean"
         },
-        "index": {
+        "latency_ms": {
+          "type": "integer"
+        },
+        "state": {
           "properties": {
-            "age_seconds": {
-              "type": [
-                "integer",
-                "null"
-              ]
+            "_meta": {
+              "properties": {
+                "data_dir": {
+                  "type": "string"
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "type": "string"
+                }
+              },
+              "type": "object"
             },
-            "exists": {
-              "type": "boolean"
+            "database": {
+              "properties": {
+                "conversations": {
+                  "type": "integer"
+                },
+                "exists": {
+                  "type": "boolean"
+                },
+                "messages": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
             },
-            "fresh": {
-              "type": "boolean"
+            "index": {
+              "properties": {
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "exists": {
+                  "type": "boolean"
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stale": {
+                  "type": "boolean"
+                },
+                "stale_threshold_seconds": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
             },
-            "last_indexed_at": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "stale": {
-              "type": "boolean"
-            },
-            "stale_threshold_seconds": {
-              "type": "integer"
+            "pending": {
+              "properties": {
+                "sessions": {
+                  "type": "integer"
+                },
+                "watch_active": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "type": "object"
             }
           },
           "type": "object"
-        },
-        "pending": {
-          "properties": {
-            "sessions": {
-              "type": "integer"
-            },
-            "watch_active": {
-              "type": [
-                "boolean",
-                "null"
-              ]
-            }
-          },
-          "type": "object"
-        },
-        "recommended_action": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "type": "object"
@@ -1719,89 +1549,237 @@
       },
       "type": "object"
     },
-    "health": {
+    "index": {
       "properties": {
-        "healthy": {
-          "type": "boolean"
+        "conversations": {
+          "type": [
+            "integer",
+            "null"
+          ]
         },
-        "latency_ms": {
+        "data_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "db_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elapsed_ms": {
           "type": "integer"
         },
-        "state": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "force_rebuild": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "full": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "state": {
+      "properties": {
+        "_meta": {
           "properties": {
-            "_meta": {
-              "properties": {
-                "data_dir": {
-                  "type": "string"
-                },
-                "db_path": {
-                  "type": "string"
-                },
-                "timestamp": {
-                  "type": "string"
-                }
-              },
-              "type": "object"
+            "data_dir": {
+              "type": "string"
             },
-            "database": {
-              "properties": {
-                "conversations": {
-                  "type": "integer"
-                },
-                "exists": {
-                  "type": "boolean"
-                },
-                "messages": {
-                  "type": "integer"
-                }
-              },
-              "type": "object"
+            "db_path": {
+              "type": "string"
             },
-            "index": {
-              "properties": {
-                "age_seconds": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
-                "exists": {
-                  "type": "boolean"
-                },
-                "fresh": {
-                  "type": "boolean"
-                },
-                "last_indexed_at": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "stale": {
-                  "type": "boolean"
-                },
-                "stale_threshold_seconds": {
-                  "type": "integer"
-                }
-              },
-              "type": "object"
-            },
-            "pending": {
-              "properties": {
-                "sessions": {
-                  "type": "integer"
-                },
-                "watch_active": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
-                }
-              },
-              "type": "object"
+            "timestamp": {
+              "type": "string"
             }
           },
           "type": "object"
+        },
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "api-version": {
+      "properties": {
+        "api_version": {
+          "type": "integer"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "crate_version": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "capabilities": {
+      "properties": {
+        "api_version": {
+          "type": "integer"
+        },
+        "connectors": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "crate_version": {
+          "type": "string"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "limits": {
+          "properties": {
+            "max_agg_buckets": {
+              "type": "integer"
+            },
+            "max_content_length": {
+              "type": "integer"
+            },
+            "max_fields": {
+              "type": "integer"
+            },
+            "max_limit": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "view": {
+      "properties": {
+        "end_line": {
+          "type": "integer"
+        },
+        "highlight_line": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lines": {
+          "items": {
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "highlighted": {
+                "type": "boolean"
+              },
+              "number": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
+          "type": "integer"
         }
       },
       "type": "object"
@@ -1865,16 +1843,90 @@
       },
       "type": "object"
     },
-    "api-version": {
+    "status": {
       "properties": {
-        "api_version": {
-          "type": "integer"
+        "_meta": {
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string"
+            }
+          },
+          "type": "object"
         },
-        "contract_version": {
-          "type": "string"
+        "database": {
+          "properties": {
+            "conversations": {
+              "type": "integer"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "type": "object"
         },
-        "crate_version": {
-          "type": "string"
+        "healthy": {
+          "type": "boolean"
+        },
+        "index": {
+          "properties": {
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "pending": {
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
