@@ -666,11 +666,11 @@ fn pi_agent_connector_handles_empty_thinking_block() {
     let c = &convs[0];
     assert_eq!(c.messages.len(), 2);
 
-    // The assistant message should still be parsed, empty thinking should be included but empty
+    // The assistant message should still be parsed correctly
     let assistant = &c.messages[1];
     assert!(assistant.content.contains("Here is my response"));
-    // Empty thinking block should result in "[Thinking] " with nothing after
-    assert!(assistant.content.contains("[Thinking]") || !assistant.content.contains("[Thinking]"));
+    // Empty thinking blocks may be included as "[Thinking] " or omitted entirely
+    // depending on connector implementation - both are valid behaviors
 }
 
 #[test]
