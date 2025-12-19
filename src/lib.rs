@@ -7748,8 +7748,18 @@ fn check_rsync_available(host: &str) -> DiagnosticCheck {
     }
 }
 
+fn sh_quote(value: &str) -> String {
+    if value.is_empty() {
+        "''".to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
 /// Check if a remote path exists
 fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
+    let quoted = sh_quote(path);
+    let cmd = format!("test -d {quoted} && ls -1 {quoted} | wc -l");
     let output = std::process::Command::new("ssh")
         .args([
             "-o",
@@ -7757,16 +7767,9 @@ fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
             "-o",
             "BatchMode=yes",
             host,
-            "test",
-            "-d",
-            path,
-            "&&",
-            "ls",
-            "-1",
-            path,
-            "|",
-            "wc",
-            "-l",
+            "sh",
+            "-c",
+            &cmd,
         ])
         .output();
 
@@ -8079,14 +8082,26 @@ fn run_sources_sync(
             );
         }
 
-        // TODO: Call indexer for remote sources
-        // For now, just print instructions
-        if !json_output {
-            println!(
-                "{}",
-                "Run 'cass index' to include synced sessions in search.".dimmed()
-            );
-        }
+        // Call indexer to include synced sessions
+        let progress = if json_output {
+            ProgressResolved::None
+        } else if std::io::stdout().is_terminal() {
+            ProgressResolved::Bars
+        } else {
+            ProgressResolved::Plain
+        };
+
+        run_index_with_data(
+            None,           // db_override (uses data_dir default)
+            false,          // full
+            false,          // force_rebuild
+            false,          // watch
+            None,           // watch_once
+            Some(data_dir), // data_dir
+            progress,
+            json_output,
+            None, // idempotency_key
+        )?;
     }
 
     Ok(())
