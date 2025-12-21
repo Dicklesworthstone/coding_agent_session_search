@@ -830,13 +830,14 @@ thread_local! {
 }
 
 fn sanitize_query(raw: &str) -> String {
-    // Replace any character that is not alphanumeric or asterisk with a space.
+    // Replace any character that is not alphanumeric, asterisk, or double quote with a space.
     // Asterisks are preserved for wildcard query support (*foo, foo*, *bar*).
+    // Double quotes are preserved for phrase query support ("exact phrase").
     // This ensures that the input tokens match how SimpleTokenizer splits content.
     // e.g. "c++" -> "c  ", "foo.bar" -> "foo bar", "*config*" -> "*config*"
     raw.chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '*' {
+            if c.is_alphanumeric() || c == '*' || c == '"' {
                 c
             } else {
                 ' '
