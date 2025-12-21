@@ -13,4 +13,3 @@ pub mod embedder;
 pub mod hash_embedder;
 pub mod query;
 pub mod tantivy;
-pub mod vector_index;
