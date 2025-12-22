@@ -1512,6 +1512,7 @@ const KNOWN_AGENTS: &[&str] = &[
     "claude_code",
     "codex",
     "cline",
+    "factory",
     "gemini",
     "gemini_cli",
     "amp",
@@ -1576,6 +1577,7 @@ fn agent_color(agent: &str) -> Color {
         "claude" | "claude_code" => Color::Rgb(204, 119, 34), // Orange/Amber (Anthropic)
         "gemini" | "gemini_cli" => Color::Rgb(66, 133, 244), // Google Blue
         "cline" => Color::Rgb(138, 43, 226), // Blue-Violet (VS Code extension)
+        "factory" => Color::Rgb(99, 102, 241), // Indigo (Factory/Droid)
         "opencode" => Color::Rgb(50, 205, 50), // Lime Green
         "amp" => Color::Rgb(255, 99, 71),   // Tomato/Coral (Sourcegraph)
         "cursor" => Color::Rgb(147, 112, 219), // Medium Purple
@@ -6519,10 +6521,13 @@ pub fn run_tui(
                     // Use search_with_fallback for implicit wildcard expansion on sparse results
                     const SPARSE_THRESHOLD: usize = 3;
                     let search_started = Instant::now();
+                    // For empty queries, fetch more results to ensure all agents are represented
+                    // before sorting by recency. This prevents newer agents from being missed.
+                    let effective_page_size = if q.trim().is_empty() { 500 } else { page_size };
                     match client.search_with_fallback(
                         &q,
                         filters.clone(),
-                        page_size,
+                        effective_page_size,
                         page * page_size,
                         SPARSE_THRESHOLD,
                     ) {
@@ -6625,6 +6630,17 @@ pub fn run_tui(
                                 needs_draw = true;
                             } else {
                                 results = hits;
+                                // For empty queries, sort by recency to show newest sessions first
+                                // This ensures all agents with recent activity appear in the initial view
+                                if q.trim().is_empty() {
+                                    results.sort_by(|a, b| {
+                                        let ts_a = a.created_at.unwrap_or(0);
+                                        let ts_b = b.created_at.unwrap_or(0);
+                                        ts_b.cmp(&ts_a) // Newest first
+                                    });
+                                    // Truncate to page_size after sorting by recency
+                                    results.truncate(page_size);
+                                }
                                 let max_created = results
                                     .iter()
                                     .filter_map(|h| h.created_at)

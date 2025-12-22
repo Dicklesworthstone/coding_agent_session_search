@@ -12,6 +12,7 @@ pub mod claude_code;
 pub mod cline;
 pub mod codex;
 pub mod cursor;
+pub mod factory;
 pub mod gemini;
 pub mod opencode;
 pub mod pi_agent;
