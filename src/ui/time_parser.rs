@@ -116,7 +116,14 @@ mod tests {
         let today = parse_time_input("today").unwrap();
         let yesterday = parse_time_input("yesterday").unwrap();
         assert!(today > yesterday);
-        assert_eq!(today - yesterday, 86_400_000);
+        let diff = today - yesterday;
+        let min = 23 * 60 * 60 * 1000;
+        let max = 25 * 60 * 60 * 1000;
+        assert!(
+            diff >= min && diff <= max,
+            "expected 23-25h difference due to DST, got {} ms",
+            diff
+        );
     }
 
     #[test]
