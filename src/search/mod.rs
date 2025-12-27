@@ -17,4 +17,3 @@ pub mod hash_embedder;
 pub mod model_manager;
 pub mod query;
 pub mod tantivy;
-pub mod vector_index;
