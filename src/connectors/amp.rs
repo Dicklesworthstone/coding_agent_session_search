@@ -112,10 +112,6 @@ impl Connector for AmpConnector {
                 if !is_amp_log_file(path) {
                     continue;
                 }
-                // Skip files not modified since last scan (incremental indexing)
-                if !crate::connectors::file_modified_since(path, ctx.since_ts) {
-                    continue;
-                }
                 let text = match std::fs::read_to_string(path) {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -124,6 +120,20 @@ impl Connector for AmpConnector {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+
+                // For incremental indexing, check both file mtime AND message timestamps.
+                // amp files may not update their mtime when new messages are added,
+                // so we also check if any message in the file is newer than last scan.
+                let should_process = if let Some(ts) = ctx.since_ts {
+                    crate::connectors::file_modified_since(path, ctx.since_ts) 
+                        || has_message_since(&val, Some(ts))
+                } else {
+                    true
+                };
+
+                if !should_process {
+                    continue;
+                }
 
                 if let Some(messages) = extract_messages(&val, ctx.since_ts) {
                     if messages.is_empty() {
@@ -191,6 +201,50 @@ impl Connector for AmpConnector {
     }
 }
 
+/// Extract message timestamp from a message object.
+/// amp stores message timestamps in meta.sentAt.
+fn extract_message_timestamp(m: &Value) -> Option<i64> {
+    m.get("meta")
+        .and_then(|v| v.as_object())
+        .and_then(|meta| meta.get("sentAt"))
+        .and_then(crate::connectors::parse_timestamp)
+        .or_else(|| m.get("created_at").and_then(crate::connectors::parse_timestamp))
+        .or_else(|| m.get("createdAt").and_then(crate::connectors::parse_timestamp))
+        .or_else(|| m.get("timestamp").and_then(crate::connectors::parse_timestamp))
+        .or_else(|| m.get("ts").and_then(crate::connectors::parse_timestamp))
+}
+
+/// Check if a file contains any message with a timestamp newer than since_ts.
+/// This is used for incremental indexing when file mtime may not reflect content updates.
+fn has_message_since(val: &Value, since_ts: Option<i64>) -> bool {
+    let since_ts = match since_ts {
+        None => return true, // No filter
+        Some(ts) => ts,
+    };
+
+    let msgs = val
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .or_else(|| {
+            val.get("thread")
+                .and_then(|t| t.get("messages"))
+                .and_then(|m| m.as_array())
+        });
+
+    if let Some(messages) = msgs {
+        for m in messages {
+            if let Some(ts) = extract_message_timestamp(m) {
+                // Check with 1-second slack window like file_modified_since does
+                if ts >= (since_ts.saturating_sub(1_000)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<NormalizedMessage>> {
     let msgs = val
         .get("messages")
@@ -210,25 +264,36 @@ fn extract_messages(val: &Value, _since_ts: Option<i64>) -> Option<Vec<Normalize
             .and_then(|v| v.as_str())
             .unwrap_or("agent")
             .to_string();
-        let content = m
-            .get("content")
-            .or_else(|| m.get("text"))
-            .or_else(|| m.get("body"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        // Handle both array format (content: [{type: "text", text: "..."}]) and string format
+        let content = if let Some(content_array) = m.get("content").and_then(|v| v.as_array()) {
+            content_array
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type") == Some(&serde_json::Value::String("text".to_string())) {
+                        block
+                            .get("text")
+                            .or_else(|| block.get("body"))
+                            .and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        } else {
+            m.get("content")
+                .or_else(|| m.get("text"))
+                .or_else(|| m.get("body"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
 
         if content.trim().is_empty() {
             continue;
         }
 
-        // Use parse_timestamp to handle both i64 milliseconds and ISO-8601 strings
-        let created_at = m
-            .get("created_at")
-            .or_else(|| m.get("createdAt"))
-            .or_else(|| m.get("timestamp"))
-            .or_else(|| m.get("ts"))
-            .and_then(crate::connectors::parse_timestamp);
+        let created_at = extract_message_timestamp(&m);
         let author = m
             .get("author")
             .or_else(|| m.get("sender"))
@@ -572,6 +637,50 @@ mod tests {
     }
 
     #[test]
+    fn extract_messages_handles_content_array_format() {
+        let val = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Hello "},
+                    {"type": "text", "text": "World"}
+                ]
+            }]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs[0].content, "Hello World");
+    }
+
+    #[test]
+    fn extract_messages_handles_content_array_with_body_fallback() {
+        let val = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "body": "Text from body"}
+                ]
+            }]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs[0].content, "Text from body");
+    }
+
+    #[test]
+    fn extract_messages_skips_non_text_blocks_in_array() {
+        let val = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "code", "text": "ignored code"},
+                    {"type": "text", "text": "kept text"}
+                ]
+            }]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs[0].content, "kept text");
+    }
+
+    #[test]
     fn extract_messages_skips_empty_content() {
         let val = json!({
             "messages": [
@@ -583,6 +692,15 @@ mod tests {
         let msgs = extract_messages(&val, None).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Valid");
+    }
+
+    #[test]
+    fn extract_messages_parses_sent_at_from_meta() {
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": 1733000000}}]
+        });
+        let msgs = extract_messages(&val, None).unwrap();
+        assert_eq!(msgs[0].created_at, Some(1733000000));
     }
 
     #[test]
@@ -821,8 +939,8 @@ mod tests {
 
         let content = json!({
             "messages": [
-                {"role": "user", "content": "First", "timestamp": 1733000000},
-                {"role": "assistant", "content": "Last", "timestamp": 1733000100}
+                {"role": "user", "content": "First", "meta": {"sentAt": 1733000000}},
+                {"role": "assistant", "content": "Last", "meta": {"sentAt": 1733000100}}
             ]
         });
         fs::write(amp_dir.join("thread.json"), content.to_string()).unwrap();
@@ -980,5 +1098,115 @@ mod tests {
         let roots = AmpConnector::candidate_roots();
         let cache = AmpConnector::cache_root();
         assert!(roots.contains(&cache));
+    }
+
+    // =====================================================
+    // has_message_since() Tests
+    // =====================================================
+
+    #[test]
+    fn has_message_since_returns_true_when_no_filter() {
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "timestamp": 1000}]
+        });
+        assert!(has_message_since(&val, None));
+    }
+
+    #[test]
+    fn has_message_since_detects_newer_message() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": now}}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000))); // message is newer than filter
+    }
+
+    #[test]
+    fn has_message_since_ignores_older_messages() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": now - 100_000}}]
+        });
+        assert!(!has_message_since(&val, Some(now))); // message is older than filter
+    }
+
+    #[test]
+    fn has_message_since_with_slack_window() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": now - 500}}]
+        });
+        // Should return true due to 1-second slack window
+        assert!(has_message_since(&val, Some(now)));
+    }
+
+    #[test]
+    fn has_message_since_checks_sent_at_in_meta() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": now}}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_checks_created_at_field() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "created_at": now}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_checks_created_at_camel_case() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "createdAt": now}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_checks_timestamp_field() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "timestamp": now}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_checks_ts_field() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test", "ts": now}]
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_returns_false_for_empty_messages() {
+        let val = json!({"messages": []});
+        assert!(!has_message_since(&val, Some(1000)));
+    }
+
+    #[test]
+    fn has_message_since_handles_nested_thread_messages() {
+        let now = crate::storage::sqlite::SqliteStorage::now_millis();
+        let val = json!({
+            "thread": {
+                "messages": [{"role": "user", "content": "Test", "meta": {"sentAt": now}}]
+            }
+        });
+        assert!(has_message_since(&val, Some(now - 10_000)));
+    }
+
+    #[test]
+    fn has_message_since_returns_false_without_timestamp_fields() {
+        let val = json!({
+            "messages": [{"role": "user", "content": "Test"}]
+        });
+        assert!(!has_message_since(&val, Some(1000)));
     }
 }
