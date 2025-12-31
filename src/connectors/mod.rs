@@ -13,6 +13,7 @@ pub mod cline;
 pub mod codex;
 pub mod cursor;
 pub mod gemini;
+pub mod innerloop;
 pub mod opencode;
 pub mod pi_agent;
 
