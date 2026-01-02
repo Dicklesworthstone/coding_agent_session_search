@@ -273,6 +273,128 @@ impl CursorConnector {
         Some(PathBuf::from(decoded))
     }
 
+    /// Extract workspace path from file references in the conversation context.
+    ///
+    /// Looks at fileSelections, folderSelections, newlyCreatedFiles, and newlyCreatedFolders
+    /// to find file paths. Returns the common ancestor directory of all paths found.
+    fn extract_workspace_from_context(val: &Value) -> Option<PathBuf> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+
+        // Helper to extract paths from URI structures
+        let extract_from_uri = |uri: &Value| -> Option<PathBuf> {
+            // Try fsPath first (most reliable), then path
+            uri.get("fsPath")
+                .and_then(|v| v.as_str())
+                .or_else(|| uri.get("path").and_then(|v| v.as_str()))
+                .map(PathBuf::from)
+        };
+
+        // Extract from context.fileSelections
+        if let Some(context) = val.get("context") {
+            if let Some(selections) = context.get("fileSelections").and_then(|v| v.as_array()) {
+                for sel in selections {
+                    if let Some(uri) = sel.get("uri")
+                        && let Some(path) = extract_from_uri(uri)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+
+            // Extract from context.folderSelections
+            if let Some(selections) = context.get("folderSelections").and_then(|v| v.as_array()) {
+                for sel in selections {
+                    if let Some(uri) = sel.get("uri")
+                        && let Some(path) = extract_from_uri(uri)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+
+            // Extract from context.selections (code selections)
+            if let Some(selections) = context.get("selections").and_then(|v| v.as_array()) {
+                for sel in selections {
+                    if let Some(uri) = sel.get("uri")
+                        && let Some(path) = extract_from_uri(uri)
+                    {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+
+        // Extract from newlyCreatedFiles (string array)
+        if let Some(files) = val.get("newlyCreatedFiles").and_then(|v| v.as_array()) {
+            for file in files {
+                if let Some(path_str) = file.as_str() {
+                    paths.push(PathBuf::from(path_str));
+                }
+            }
+        }
+
+        // Extract from newlyCreatedFolders (string array)
+        if let Some(folders) = val.get("newlyCreatedFolders").and_then(|v| v.as_array()) {
+            for folder in folders {
+                if let Some(path_str) = folder.as_str() {
+                    paths.push(PathBuf::from(path_str));
+                }
+            }
+        }
+
+        // Find common ancestor of all paths
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Start with the first path's parent directory
+        let first_path = &paths[0];
+        let mut common = if first_path.is_file() || !first_path.exists() {
+            first_path.parent()?.to_path_buf()
+        } else {
+            first_path.clone()
+        };
+
+        // For each subsequent path, find the common ancestor
+        for path in paths.iter().skip(1) {
+            let path_to_check = if path.is_file() || !path.exists() {
+                path.parent().map(PathBuf::from)
+            } else {
+                Some(path.clone())
+            };
+
+            if let Some(p) = path_to_check {
+                // Find common ancestor between common and p
+                let common_components: Vec<_> = common.components().collect();
+                let path_components: Vec<_> = p.components().collect();
+
+                let mut new_common = PathBuf::new();
+                for (c1, c2) in common_components.iter().zip(path_components.iter()) {
+                    if c1 == c2 {
+                        new_common.push(c1.as_os_str());
+                    } else {
+                        break;
+                    }
+                }
+
+                // Don't go above home directory or root
+                if new_common.components().count() > 1 {
+                    common = new_common;
+                } else {
+                    // If we're down to just root, keep our best guess
+                    break;
+                }
+            }
+        }
+
+        // Ensure we have a meaningful path (not just "/" or empty)
+        if common.components().count() > 2 {
+            Some(common)
+        } else {
+            None
+        }
+    }
+
     /// Extract chat sessions from a SQLite database
     fn extract_from_db(
         db_path: &Path,
@@ -488,11 +610,16 @@ impl CursorConnector {
         // Append composer_id since multiple conversations share the same db file.
         let unique_source_path = db_path.join(&composer_id);
 
+        // Try workspace from db_path first, then from context file paths
+        let final_workspace = workspace
+            .cloned()
+            .or_else(|| Self::extract_workspace_from_context(&val));
+
         Some(NormalizedConversation {
             agent_slug: "cursor".to_string(),
             external_id: Some(composer_id),
             title,
-            workspace: workspace.cloned(),
+            workspace: final_workspace,
             source_path: unique_source_path,
             started_at: created_at,
             // Use lastUpdatedAt if available (most accurate), fall back to last message time, then createdAt
@@ -945,6 +1072,99 @@ mod tests {
             workspace,
             Some(PathBuf::from("/Users/test/my project name"))
         );
+    }
+
+    // =========================================================================
+    // extract_workspace_from_context tests
+    // =========================================================================
+
+    #[test]
+    fn extract_workspace_from_context_with_file_selections() {
+        let val = json!({
+            "context": {
+                "fileSelections": [
+                    {"uri": {"fsPath": "/Users/test/project/src/main.rs", "scheme": "file"}},
+                    {"uri": {"fsPath": "/Users/test/project/src/lib.rs", "scheme": "file"}}
+                ],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": [],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/project/src")));
+    }
+
+    #[test]
+    fn extract_workspace_from_context_with_newly_created_files() {
+        let val = json!({
+            "context": {
+                "fileSelections": [],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": ["/Users/test/myproject/new_file.rs"],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/myproject")));
+    }
+
+    #[test]
+    fn extract_workspace_from_context_finds_common_ancestor() {
+        let val = json!({
+            "context": {
+                "fileSelections": [
+                    {"uri": {"fsPath": "/Users/test/project/src/main.rs"}},
+                    {"uri": {"fsPath": "/Users/test/project/tests/test.rs"}}
+                ],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": [],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/project")));
+    }
+
+    #[test]
+    fn extract_workspace_from_context_empty_returns_none() {
+        let val = json!({
+            "context": {
+                "fileSelections": [],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": [],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert!(workspace.is_none());
+    }
+
+    #[test]
+    fn extract_workspace_from_context_uses_path_fallback() {
+        // Test that we use "path" field when "fsPath" is not available
+        let val = json!({
+            "context": {
+                "fileSelections": [
+                    {"uri": {"path": "/Users/test/project/src/main.rs"}}
+                ],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": [],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/project/src")));
     }
 
     // =========================================================================
