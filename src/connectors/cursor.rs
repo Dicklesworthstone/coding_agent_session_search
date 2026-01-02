@@ -207,6 +207,72 @@ impl CursorConnector {
         bubble_map
     }
 
+    /// Extract workspace path from the database path.
+    ///
+    /// For workspaceStorage databases, reads workspace.json to get the actual workspace path.
+    /// Returns None for globalStorage databases (no specific workspace).
+    fn extract_workspace_from_db_path(db_path: &Path) -> Option<PathBuf> {
+        // Check if this is a workspaceStorage database
+        // Path: .../workspaceStorage/{hash}/state.vscdb
+        let parent = db_path.parent()?; // {hash} directory
+        let grandparent = parent.parent()?;
+
+        if grandparent.file_name()?.to_str()? != "workspaceStorage" {
+            return None; // This is globalStorage or something else
+        }
+
+        // Try to read workspace.json in the same directory
+        let workspace_json_path = parent.join("workspace.json");
+        let content = std::fs::read_to_string(&workspace_json_path).ok()?;
+        let val: Value = serde_json::from_str(&content).ok()?;
+
+        // Try "folder" first (single folder workspace)
+        if let Some(folder) = val.get("folder").and_then(|v| v.as_str()) {
+            // folder is typically a file:// URI like "file:///Users/user/project"
+            return Self::parse_file_uri(folder);
+        }
+
+        // Try "workspace" (multi-root workspace file)
+        if let Some(workspace) = val.get("workspace").and_then(|v| v.as_str()) {
+            // For .code-workspace files, return the directory containing it
+            if let Some(path) = Self::parse_file_uri(workspace) {
+                return path.parent().map(PathBuf::from);
+            }
+        }
+
+        None
+    }
+
+    /// Parse a file:// URI into a PathBuf.
+    /// Handles basic percent-encoding (e.g., %20 for spaces).
+    fn parse_file_uri(uri: &str) -> Option<PathBuf> {
+        let path = uri.strip_prefix("file://")?;
+
+        // Simple percent-decoding for common cases
+        let mut decoded = String::with_capacity(path.len());
+        let mut chars = path.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                // Try to decode %XX
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() == 2
+                    && let Ok(byte) = u8::from_str_radix(&hex, 16)
+                {
+                    decoded.push(byte as char);
+                    continue;
+                }
+                // Failed to decode, keep original
+                decoded.push('%');
+                decoded.push_str(&hex);
+            } else {
+                decoded.push(c);
+            }
+        }
+
+        Some(PathBuf::from(decoded))
+    }
+
     /// Extract chat sessions from a SQLite database
     fn extract_from_db(
         db_path: &Path,
@@ -220,6 +286,9 @@ impl CursorConnector {
 
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
+
+        // Extract workspace from workspaceStorage path (if applicable)
+        let workspace = Self::extract_workspace_from_db_path(db_path);
 
         // Pre-fetch all bubbleId entries for new format support
         // Keys are like: bubbleId:{composerId}:{bubbleId}
@@ -245,6 +314,7 @@ impl CursorConnector {
                         since_ts,
                         &mut seen_ids,
                         &bubble_data,
+                        workspace.as_ref(),
                     ) {
                         convs.push(conv);
                     }
@@ -266,7 +336,7 @@ impl CursorConnector {
                 for row in rows.flatten() {
                     let (key, value) = row;
                     if let Some(conv) =
-                        Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids)
+                        Self::parse_aichat_data(&key, &value, db_path, since_ts, &mut seen_ids, workspace.as_ref())
                     {
                         convs.push(conv);
                     }
@@ -285,6 +355,7 @@ impl CursorConnector {
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
         bubble_data: &BubbleDataMap,
+        workspace: Option<&PathBuf>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
 
@@ -299,6 +370,7 @@ impl CursorConnector {
 
         // Extract timestamps
         let created_at = val.get("createdAt").and_then(|v| v.as_i64());
+        let last_updated_at = val.get("lastUpdatedAt").and_then(|v| v.as_i64());
 
         // NOTE: Do NOT filter conversations/messages by timestamp here!
         // The file-level check in file_modified_since() is sufficient.
@@ -420,10 +492,13 @@ impl CursorConnector {
             agent_slug: "cursor".to_string(),
             external_id: Some(composer_id),
             title,
-            workspace: None, // Could try to extract from db_path
+            workspace: workspace.cloned(),
             source_path: unique_source_path,
             started_at: created_at,
-            ended_at: messages.last().and_then(|m| m.created_at).or(created_at),
+            // Use lastUpdatedAt if available (most accurate), fall back to last message time, then createdAt
+            ended_at: last_updated_at
+                .or_else(|| messages.last().and_then(|m| m.created_at))
+                .or(created_at),
             metadata: serde_json::json!({
                 "source": "cursor",
                 "model": model_name,
@@ -518,6 +593,7 @@ impl CursorConnector {
         db_path: &Path,
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
+        workspace: Option<&PathBuf>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
 
@@ -579,7 +655,7 @@ impl CursorConnector {
             agent_slug: "cursor".to_string(),
             external_id: Some(id),
             title,
-            workspace: None,
+            workspace: workspace.cloned(),
             source_path: unique_source_path,
             started_at,
             ended_at,
@@ -766,6 +842,112 @@ mod tests {
     }
 
     // =========================================================================
+    // Workspace extraction tests
+    // =========================================================================
+
+    #[test]
+    fn parse_file_uri_basic() {
+        let result = CursorConnector::parse_file_uri("file:///Users/test/project");
+        assert_eq!(result, Some(PathBuf::from("/Users/test/project")));
+    }
+
+    #[test]
+    fn parse_file_uri_with_percent_encoding() {
+        let result = CursorConnector::parse_file_uri("file:///Users/test/my%20project");
+        assert_eq!(result, Some(PathBuf::from("/Users/test/my project")));
+    }
+
+    #[test]
+    fn parse_file_uri_with_special_chars() {
+        let result = CursorConnector::parse_file_uri("file:///Users/test/%23hash%26amp");
+        assert_eq!(result, Some(PathBuf::from("/Users/test/#hash&amp")));
+    }
+
+    #[test]
+    fn parse_file_uri_returns_none_without_prefix() {
+        let result = CursorConnector::parse_file_uri("/Users/test/project");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_workspace_from_workspace_storage() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("workspaceStorage").join("abc123");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        // Create workspace.json with folder
+        let workspace_json = json!({"folder": "file:///Users/test/my-project"});
+        fs::write(ws_dir.join("workspace.json"), workspace_json.to_string()).unwrap();
+
+        let db_path = ws_dir.join("state.vscdb");
+        let workspace = CursorConnector::extract_workspace_from_db_path(&db_path);
+
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/my-project")));
+    }
+
+    #[test]
+    fn extract_workspace_from_workspace_storage_with_workspace_file() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("workspaceStorage").join("def456");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        // Create workspace.json with .code-workspace reference
+        let workspace_json =
+            json!({"workspace": "file:///Users/test/my-project/app.code-workspace"});
+        fs::write(ws_dir.join("workspace.json"), workspace_json.to_string()).unwrap();
+
+        let db_path = ws_dir.join("state.vscdb");
+        let workspace = CursorConnector::extract_workspace_from_db_path(&db_path);
+
+        // Should return parent directory of .code-workspace file
+        assert_eq!(workspace, Some(PathBuf::from("/Users/test/my-project")));
+    }
+
+    #[test]
+    fn extract_workspace_returns_none_for_global_storage() {
+        let dir = TempDir::new().unwrap();
+        let global_dir = dir.path().join("globalStorage");
+        fs::create_dir_all(&global_dir).unwrap();
+
+        let db_path = global_dir.join("state.vscdb");
+        let workspace = CursorConnector::extract_workspace_from_db_path(&db_path);
+
+        assert!(workspace.is_none());
+    }
+
+    #[test]
+    fn extract_workspace_returns_none_when_workspace_json_missing() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("workspaceStorage").join("abc123");
+        fs::create_dir_all(&ws_dir).unwrap();
+        // Don't create workspace.json
+
+        let db_path = ws_dir.join("state.vscdb");
+        let workspace = CursorConnector::extract_workspace_from_db_path(&db_path);
+
+        assert!(workspace.is_none());
+    }
+
+    #[test]
+    fn extract_workspace_handles_percent_encoded_paths() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("workspaceStorage").join("xyz789");
+        fs::create_dir_all(&ws_dir).unwrap();
+
+        // Create workspace.json with percent-encoded path
+        let workspace_json = json!({"folder": "file:///Users/test/my%20project%20name"});
+        fs::write(ws_dir.join("workspace.json"), workspace_json.to_string()).unwrap();
+
+        let db_path = ws_dir.join("state.vscdb");
+        let workspace = CursorConnector::extract_workspace_from_db_path(&db_path);
+
+        assert_eq!(
+            workspace,
+            Some(PathBuf::from("/Users/test/my project name"))
+        );
+    }
+
+    // =========================================================================
     // parse_bubble tests
     // =========================================================================
 
@@ -918,6 +1100,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -953,6 +1136,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -978,6 +1162,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1004,6 +1189,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1028,6 +1214,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
         let conv2 = CursorConnector::parse_composer_data(
             key,
@@ -1036,6 +1223,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv1.is_some());
@@ -1056,6 +1244,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_none());
@@ -1081,11 +1270,69 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
         assert_eq!(conv.metadata["model"], "gpt-4-turbo");
+    }
+
+    #[test]
+    fn parse_composer_data_uses_last_updated_at_for_ended_at() {
+        let key = "composerData:timestamps-123";
+        let value = json!({
+            "text": "Test",
+            "createdAt": 1700000000000i64,
+            "lastUpdatedAt": 1700000999000i64
+        })
+        .to_string();
+
+        let mut seen = HashSet::new();
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+            None,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.started_at, Some(1700000000000));
+        // ended_at should use lastUpdatedAt (most accurate)
+        assert_eq!(conv.ended_at, Some(1700000999000));
+    }
+
+    #[test]
+    fn parse_composer_data_falls_back_to_created_at_without_last_updated() {
+        let key = "composerData:no-update-123";
+        let value = json!({
+            "text": "Test",
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        let mut seen = HashSet::new();
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+            None,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.started_at, Some(1700000000000));
+        // Without lastUpdatedAt, should fall back to createdAt
+        assert_eq!(conv.ended_at, Some(1700000000000));
     }
 
     #[test]
@@ -1102,6 +1349,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_none());
@@ -1165,6 +1413,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1220,6 +1469,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1264,6 +1514,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1305,6 +1556,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1406,6 +1658,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1449,6 +1702,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_some());
@@ -1550,8 +1804,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_aichat_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_aichat_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -1569,8 +1829,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_aichat_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv = CursorConnector::parse_aichat_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv.is_none());
     }
@@ -1586,10 +1852,22 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv1 =
-            CursorConnector::parse_aichat_data(key, &value, Path::new("/test"), None, &mut seen);
-        let conv2 =
-            CursorConnector::parse_aichat_data(key, &value, Path::new("/test"), None, &mut seen);
+        let conv1 = CursorConnector::parse_aichat_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
+        let conv2 = CursorConnector::parse_aichat_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            None,
+        );
 
         assert!(conv1.is_some());
         assert!(conv2.is_none());
@@ -1773,6 +2051,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         assert!(conv.is_none());
@@ -1811,6 +2090,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         let conv = conv.unwrap();
@@ -1836,6 +2116,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         );
 
         let conv = conv.unwrap();
@@ -1865,6 +2146,7 @@ mod tests {
             None,
             &mut seen,
             &bubble_data,
+            None,
         )
         .unwrap();
 
