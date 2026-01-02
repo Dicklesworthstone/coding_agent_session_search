@@ -45,8 +45,12 @@ use crate::connectors::{
 };
 
 /// Type alias for the bubble data lookup map.
-/// Keys are "{composerId}:{bubbleId}" for efficient O(1) lookup.
+/// Keys are "{bubbleId}" for efficient O(1) lookup within a composer.
 type BubbleDataMap = HashMap<String, Value>;
+
+/// Maximum number of file paths to collect for workspace detection.
+/// More paths don't meaningfully improve accuracy but increase processing time.
+const MAX_PATHS_FOR_WORKSPACE: usize = 20;
 
 /// Cursor v0.40+ bubble type constants (numeric encoding)
 mod bubble_type {
@@ -167,15 +171,21 @@ impl CursorConnector {
         dbs
     }
 
-    /// Fetch all bubble data from the database for new format support.
-    /// Returns a map keyed by "composerId:bubbleId" for efficient O(1) lookup.
-    fn fetch_bubble_data(conn: &Connection) -> BubbleDataMap {
+    /// Fetch bubble data for a specific composer from the database.
+    /// Returns a map keyed by "{bubbleId}" for efficient O(1) lookup.
+    /// This lazy-loads only the bubbles needed for one conversation, avoiding
+    /// loading all bubbles (~60MB for 1500 conversations) into memory.
+    fn fetch_bubble_data_for_composer(conn: &Connection, composer_id: &str) -> BubbleDataMap {
         let mut bubble_map = BubbleDataMap::new();
 
+        // Only fetch bubbles for this specific composer
+        let pattern = format!("bubbleId:{}:%", composer_id);
+        let prefix_len = format!("bubbleId:{}:", composer_id).len();
+
         if let Ok(mut stmt) =
-            conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+            conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE ?")
         {
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map([&pattern], |row| {
                 let key: String = row.get(0)?;
                 let value: String = row.get(1)?;
                 Ok((key, value))
@@ -185,19 +195,18 @@ impl CursorConnector {
                 for row in rows.flatten() {
                     let (key, value) = row;
                     // Key format: bubbleId:{composerId}:{bubbleId}
-                    // We store as "{composerId}:{bubbleId}" for easy lookup
-                    if let Some(rest) = key.strip_prefix("bubbleId:") {
-                        match serde_json::from_str::<Value>(&value) {
-                            Ok(parsed) => {
-                                bubble_map.insert(rest.to_string(), parsed);
-                            }
-                            Err(e) => {
-                                tracing::trace!(
-                                    key = %rest,
-                                    error = %e,
-                                    "skipping malformed bubble JSON"
-                                );
-                            }
+                    // We store just "{bubbleId}" since we already know the composerId
+                    let bubble_id = &key[prefix_len..];
+                    match serde_json::from_str::<Value>(&value) {
+                        Ok(parsed) => {
+                            bubble_map.insert(bubble_id.to_string(), parsed);
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                key = %bubble_id,
+                                error = %e,
+                                "skipping malformed bubble JSON"
+                            );
                         }
                     }
                 }
@@ -244,33 +253,11 @@ impl CursorConnector {
     }
 
     /// Parse a file:// URI into a PathBuf.
-    /// Handles basic percent-encoding (e.g., %20 for spaces).
+    /// Handles percent-encoding including multi-byte UTF-8 sequences.
     fn parse_file_uri(uri: &str) -> Option<PathBuf> {
         let path = uri.strip_prefix("file://")?;
-
-        // Simple percent-decoding for common cases
-        let mut decoded = String::with_capacity(path.len());
-        let mut chars = path.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '%' {
-                // Try to decode %XX
-                let hex: String = chars.by_ref().take(2).collect();
-                if hex.len() == 2
-                    && let Ok(byte) = u8::from_str_radix(&hex, 16)
-                {
-                    decoded.push(byte as char);
-                    continue;
-                }
-                // Failed to decode, keep original
-                decoded.push('%');
-                decoded.push_str(&hex);
-            } else {
-                decoded.push(c);
-            }
-        }
-
-        Some(PathBuf::from(decoded))
+        let decoded = urlencoding::decode(path).ok()?;
+        Some(PathBuf::from(decoded.into_owned()))
     }
 
     /// Extract workspace path from file references in the conversation context.
@@ -278,45 +265,54 @@ impl CursorConnector {
     /// Looks at fileSelections, folderSelections, newlyCreatedFiles, and newlyCreatedFolders
     /// to find file paths. Returns the common ancestor directory of all paths found.
     fn extract_workspace_from_context(val: &Value) -> Option<PathBuf> {
-        let mut paths: Vec<PathBuf> = Vec::new();
+        let paths = Self::collect_file_paths_from_context(val);
+        Self::find_common_ancestor(&paths)
+    }
 
-        // Helper to extract paths from URI structures
-        let extract_from_uri = |uri: &Value| -> Option<PathBuf> {
-            // Try fsPath first (most reliable), then path
+    /// Collect file paths from conversation context (fileSelections, newlyCreatedFiles, etc.)
+    /// Limited to MAX_PATHS_FOR_WORKSPACE to prevent pathological cases.
+    fn collect_file_paths_from_context(val: &Value) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // Helper to extract path from URI structure
+        let extract_uri_path = |uri: &Value| -> Option<PathBuf> {
             uri.get("fsPath")
                 .and_then(|v| v.as_str())
                 .or_else(|| uri.get("path").and_then(|v| v.as_str()))
                 .map(PathBuf::from)
         };
 
-        // Extract from context.fileSelections
+        // Extract from context.{fileSelections, folderSelections, selections}
         if let Some(context) = val.get("context") {
-            if let Some(selections) = context.get("fileSelections").and_then(|v| v.as_array()) {
-                for sel in selections {
-                    if let Some(uri) = sel.get("uri")
-                        && let Some(path) = extract_from_uri(uri)
-                    {
-                        paths.push(path);
+            for key in ["fileSelections", "folderSelections", "selections"] {
+                if paths.len() >= MAX_PATHS_FOR_WORKSPACE {
+                    break;
+                }
+                if let Some(arr) = context.get(key).and_then(|v| v.as_array()) {
+                    for sel in arr.iter().take(MAX_PATHS_FOR_WORKSPACE - paths.len()) {
+                        if let Some(uri) = sel.get("uri")
+                            && let Some(path) = extract_uri_path(uri)
+                        {
+                            paths.push(path);
+                        }
                     }
                 }
             }
+        }
 
-            // Extract from context.folderSelections
-            if let Some(selections) = context.get("folderSelections").and_then(|v| v.as_array()) {
-                for sel in selections {
-                    if let Some(uri) = sel.get("uri")
-                        && let Some(path) = extract_from_uri(uri)
-                    {
-                        paths.push(path);
-                    }
-                }
+        // Extract from newlyCreatedFiles and newlyCreatedFolders
+        // These can be string arrays or object arrays with uri
+        for key in ["newlyCreatedFiles", "newlyCreatedFolders"] {
+            if paths.len() >= MAX_PATHS_FOR_WORKSPACE {
+                break;
             }
-
-            // Extract from context.selections (code selections)
-            if let Some(selections) = context.get("selections").and_then(|v| v.as_array()) {
-                for sel in selections {
-                    if let Some(uri) = sel.get("uri")
-                        && let Some(path) = extract_from_uri(uri)
+            if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+                for item in arr.iter().take(MAX_PATHS_FOR_WORKSPACE - paths.len()) {
+                    // Try as string first, then as object with uri
+                    if let Some(path_str) = item.as_str() {
+                        paths.push(PathBuf::from(path_str));
+                    } else if let Some(uri) = item.get("uri")
+                        && let Some(path) = extract_uri_path(uri)
                     {
                         paths.push(path);
                     }
@@ -324,84 +320,42 @@ impl CursorConnector {
             }
         }
 
-        // Extract from newlyCreatedFiles (can be string array or object array with uri)
-        if let Some(files) = val.get("newlyCreatedFiles").and_then(|v| v.as_array()) {
-            for file in files {
-                // Try as string first
-                if let Some(path_str) = file.as_str() {
-                    paths.push(PathBuf::from(path_str));
-                // Then try as object with uri.fsPath
-                } else if let Some(uri) = file.get("uri")
-                    && let Some(path) = extract_from_uri(uri)
-                {
-                    paths.push(path);
-                }
-            }
-        }
+        paths
+    }
 
-        // Extract from newlyCreatedFolders (can be string array or object array with uri)
-        if let Some(folders) = val.get("newlyCreatedFolders").and_then(|v| v.as_array()) {
-            for folder in folders {
-                // Try as string first
-                if let Some(path_str) = folder.as_str() {
-                    paths.push(PathBuf::from(path_str));
-                // Then try as object with uri.fsPath
-                } else if let Some(uri) = folder.get("uri")
-                    && let Some(path) = extract_from_uri(uri)
-                {
-                    paths.push(path);
-                }
-            }
-        }
-
-        // Find common ancestor of all paths
+    /// Find the common ancestor directory of multiple paths.
+    /// Uses pure path component comparison (no filesystem calls).
+    fn find_common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
         if paths.is_empty() {
             return None;
         }
 
-        // Start with the first path's parent directory
-        let first_path = &paths[0];
-        let mut common = if first_path.is_file() || !first_path.exists() {
-            first_path.parent()?.to_path_buf()
-        } else {
-            first_path.clone()
-        };
+        // Get parent directory of first path (assume paths are files)
+        let first_parent = paths[0].parent()?;
+        let mut common: Vec<_> = first_parent.components().collect();
 
-        // For each subsequent path, find the common ancestor
+        // Find common prefix with each subsequent path
         for path in paths.iter().skip(1) {
-            let path_to_check = if path.is_file() || !path.exists() {
-                path.parent().map(PathBuf::from)
-            } else {
-                Some(path.clone())
-            };
+            let parent = path.parent().unwrap_or(path);
+            let components: Vec<_> = parent.components().collect();
 
-            if let Some(p) = path_to_check {
-                // Find common ancestor between common and p
-                let common_components: Vec<_> = common.components().collect();
-                let path_components: Vec<_> = p.components().collect();
+            // Truncate common to the matching prefix length
+            let match_len = common
+                .iter()
+                .zip(&components)
+                .take_while(|(a, b)| a == b)
+                .count();
 
-                let mut new_common = PathBuf::new();
-                for (c1, c2) in common_components.iter().zip(path_components.iter()) {
-                    if c1 == c2 {
-                        new_common.push(c1.as_os_str());
-                    } else {
-                        break;
-                    }
-                }
-
-                // Don't go above home directory or root
-                if new_common.components().count() > 1 {
-                    common = new_common;
-                } else {
-                    // If we're down to just root, keep our best guess
-                    break;
-                }
+            if match_len <= 1 {
+                // Down to just root, stop processing
+                break;
             }
+            common.truncate(match_len);
         }
 
-        // Ensure we have a meaningful path (not just "/" or empty)
-        if common.components().count() > 2 {
-            Some(common)
+        // Require at least 3 components (e.g., /Users/name/project)
+        if common.len() > 2 {
+            Some(common.into_iter().collect())
         } else {
             None
         }
@@ -424,10 +378,6 @@ impl CursorConnector {
         // Extract workspace from workspaceStorage path (if applicable)
         let workspace = Self::extract_workspace_from_db_path(db_path);
 
-        // Pre-fetch all bubbleId entries for new format support
-        // Keys are like: bubbleId:{composerId}:{bubbleId}
-        let bubble_data = Self::fetch_bubble_data(&conn);
-
         // Try cursorDiskKV table for composerData entries
         if let Ok(mut stmt) =
             conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
@@ -447,7 +397,7 @@ impl CursorConnector {
                         db_path,
                         since_ts,
                         &mut seen_ids,
-                        &bubble_data,
+                        &conn,
                         workspace.as_ref(),
                     ) {
                         convs.push(conv);
@@ -488,7 +438,7 @@ impl CursorConnector {
         db_path: &Path,
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
-        bubble_data: &BubbleDataMap,
+        conn: &Connection,
         workspace: Option<&PathBuf>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
@@ -519,12 +469,14 @@ impl CursorConnector {
             .get("fullConversationHeadersOnly")
             .and_then(|v| v.as_array())
         {
+            // Lazy-load bubble data only for this composer (avoids ~60MB memory spike)
+            let bubble_data = Self::fetch_bubble_data_for_composer(conn, &composer_id);
+
             // New format: headers contain bubbleId references
             for header in headers {
                 if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str()) {
-                    // Look up the full bubble data
-                    let lookup_key = format!("{}:{}", composer_id, bubble_id);
-                    if let Some(bubble) = bubble_data.get(&lookup_key)
+                    // Look up the full bubble data (key is just bubbleId, not composerId:bubbleId)
+                    if let Some(bubble) = bubble_data.get(bubble_id)
                         && let Some(msg) = Self::parse_bubble(bubble, messages.len())
                     {
                         messages.push(msg);
@@ -907,6 +859,31 @@ mod tests {
             [],
         )
         .unwrap();
+        conn
+    }
+
+    /// Create an in-memory SQLite database for parse_composer_data tests
+    fn create_in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Create an in-memory database with bubble data inserted
+    fn create_db_with_bubbles(composer_id: &str, bubbles: Vec<(&str, Value)>) -> Connection {
+        let conn = create_in_memory_db();
+        for (bubble_id, bubble_value) in bubbles {
+            let key = format!("bubbleId:{}:{}", composer_id, bubble_id);
+            conn.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                [&key, &bubble_value.to_string()],
+            )
+            .unwrap();
+        }
         conn
     }
 
@@ -1347,14 +1324,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1383,14 +1360,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1409,14 +1386,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1436,14 +1413,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1461,14 +1438,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv1 = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
         let conv2 = CursorConnector::parse_composer_data(
@@ -1477,7 +1454,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1491,14 +1468,14 @@ mod tests {
         let value = json!({}).to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1517,14 +1494,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1544,14 +1521,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1572,14 +1549,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1596,14 +1573,14 @@ mod tests {
         let value = json!({ "text": "Content" }).to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1636,28 +1613,32 @@ mod tests {
         })
         .to_string();
 
-        // Create bubble data map with actual message content
-        let mut bubble_data = HashMap::new();
-        bubble_data.insert(
-            format!("{}:{}", composer_id, bubble_id_1),
-            json!({
-                "_v": 3,
-                "type": 1,
-                "bubbleId": bubble_id_1,
-                "text": "What is the meaning of life?",
-                "rawText": "What is the meaning of life?"
-            }),
-        );
-        bubble_data.insert(
-            format!("{}:{}", composer_id, bubble_id_2),
-            json!({
-                "_v": 3,
-                "type": 2,
-                "bubbleId": bubble_id_2,
-                "text": "The meaning of life is a philosophical question...",
-                "rawText": "The meaning of life is a philosophical question...",
-                "modelType": "claude-4.5-opus"
-            }),
+        // Create database with bubble data
+        let conn = create_db_with_bubbles(
+            composer_id,
+            vec![
+                (
+                    bubble_id_1,
+                    json!({
+                        "_v": 3,
+                        "type": 1,
+                        "bubbleId": bubble_id_1,
+                        "text": "What is the meaning of life?",
+                        "rawText": "What is the meaning of life?"
+                    }),
+                ),
+                (
+                    bubble_id_2,
+                    json!({
+                        "_v": 3,
+                        "type": 2,
+                        "bubbleId": bubble_id_2,
+                        "text": "The meaning of life is a philosophical question...",
+                        "rawText": "The meaning of life is a philosophical question...",
+                        "modelType": "claude-4.5-opus"
+                    }),
+                ),
+            ],
         );
 
         let mut seen = HashSet::new();
@@ -1667,7 +1648,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1706,14 +1687,16 @@ mod tests {
         .to_string();
 
         // Bubble only has rawText, not text
-        let mut bubble_data = HashMap::new();
-        bubble_data.insert(
-            format!("{}:{}", composer_id, bubble_id),
-            json!({
-                "type": 1,
-                "bubbleId": bubble_id,
-                "rawText": "Content from rawText field"
-            }),
+        let conn = create_db_with_bubbles(
+            composer_id,
+            vec![(
+                bubble_id,
+                json!({
+                    "type": 1,
+                    "bubbleId": bubble_id,
+                    "rawText": "Content from rawText field"
+                }),
+            )],
         );
 
         let mut seen = HashSet::new();
@@ -1723,7 +1706,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1737,28 +1720,29 @@ mod tests {
     fn parse_composer_data_new_format_skips_missing_bubbles() {
         let composer_id = "test-composer-789";
         let existing_bubble = "existing-bubble";
-        let missing_bubble = "missing-bubble";
 
         let key = format!("composerData:{}", composer_id);
         let value = json!({
             "composerId": composer_id,
             "fullConversationHeadersOnly": [
                 {"bubbleId": existing_bubble, "type": 1},
-                {"bubbleId": missing_bubble, "type": 2}  // This one won't exist in bubble_data
+                {"bubbleId": "missing-bubble", "type": 2}  // This one won't exist in database
             ],
             "createdAt": 1700000000000i64
         })
         .to_string();
 
         // Only include one bubble
-        let mut bubble_data = HashMap::new();
-        bubble_data.insert(
-            format!("{}:{}", composer_id, existing_bubble),
-            json!({
-                "type": 1,
-                "bubbleId": existing_bubble,
-                "text": "I exist!"
-            }),
+        let conn = create_db_with_bubbles(
+            composer_id,
+            vec![(
+                existing_bubble,
+                json!({
+                    "type": 1,
+                    "bubbleId": existing_bubble,
+                    "text": "I exist!"
+                }),
+            )],
         );
 
         let mut seen = HashSet::new();
@@ -1768,7 +1752,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1794,13 +1778,15 @@ mod tests {
         })
         .to_string();
 
-        let mut bubble_data = HashMap::new();
-        bubble_data.insert(
-            format!("{}:{}", composer_id, bubble_id),
-            json!({
-                "type": 1,
-                "text": "This would be the title if name wasn't present"
-            }),
+        let conn = create_db_with_bubbles(
+            composer_id,
+            vec![(
+                bubble_id,
+                json!({
+                    "type": 1,
+                    "text": "This would be the title if name wasn't present"
+                }),
+            )],
         );
 
         let mut seen = HashSet::new();
@@ -1810,7 +1796,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1905,14 +1891,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -1940,13 +1926,15 @@ mod tests {
         })
         .to_string();
 
-        let mut bubble_data = HashMap::new();
-        bubble_data.insert(
-            format!("{}:{}", composer_id, valid_bubble),
-            json!({
-                "type": 1,
-                "text": "Valid message"
-            }),
+        let conn = create_db_with_bubbles(
+            composer_id,
+            vec![(
+                valid_bubble,
+                json!({
+                    "type": 1,
+                    "text": "Valid message"
+                }),
+            )],
         );
 
         let mut seen = HashSet::new();
@@ -1956,7 +1944,7 @@ mod tests {
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -2298,14 +2286,14 @@ mod tests {
         let value = "not valid json {{{";
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -2337,14 +2325,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -2363,14 +2351,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         );
 
@@ -2393,14 +2381,14 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let bubble_data = HashMap::new();
+        let conn = create_in_memory_db();
         let conv = CursorConnector::parse_composer_data(
             key,
             &value,
             Path::new("/test"),
             None,
             &mut seen,
-            &bubble_data,
+            &conn,
             None,
         )
         .unwrap();
