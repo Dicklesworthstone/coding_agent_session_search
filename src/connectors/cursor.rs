@@ -11,6 +11,26 @@
 //!
 //! And in the `ItemTable` with keys like:
 //! - `workbench.panel.aichat.view.aichat.chatdata` - Legacy chat data
+//!
+//! ## Data Format Evolution
+//!
+//! Cursor has evolved its data format over time. This connector supports:
+//!
+//! 1. **v0.40+ (New Format)**: `fullConversationHeadersOnly` with separate bubble entries
+//!    - `composerData:{uuid}` contains only headers with `bubbleId` references
+//!    - Actual message content stored in `bubbleId:{composerId}:{bubbleId}` keys
+//!    - Role encoded as numeric type: 1 = user, 2 = assistant
+//!
+//! 2. **v0.3x (Tabs Format)**: Inline `tabs` -> `bubbles` structure
+//!    - Full message content embedded in `composerData`
+//!    - Role encoded as string: "user", "assistant", "ai", "human"
+//!
+//! 3. **v0.2x (ConversationMap Format)**: `conversationMap` structure
+//!    - Similar to tabs format but different nesting
+//!
+//! 4. **Simple Text**: `text`/`richText` fields for basic composer sessions
+//!
+//! The connector tries formats in order (newest first) and uses the first that yields messages.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,6 +43,18 @@ use walkdir::WalkDir;
 use crate::connectors::{
     Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
 };
+
+/// Type alias for the bubble data lookup map.
+/// Keys are "{composerId}:{bubbleId}" for efficient O(1) lookup.
+type BubbleDataMap = HashMap<String, Value>;
+
+/// Cursor v0.40+ bubble type constants (numeric encoding)
+mod bubble_type {
+    /// User message type in new format
+    pub const USER: i64 = 1;
+    /// Assistant message type in new format
+    pub const ASSISTANT: i64 = 2;
+}
 
 pub struct CursorConnector;
 
@@ -135,10 +167,10 @@ impl CursorConnector {
         dbs
     }
 
-    /// Fetch all bubble data from the database for new format support
-    /// Returns a HashMap keyed by "composerId:bubbleId" for efficient lookup
-    fn fetch_bubble_data(conn: &Connection) -> HashMap<String, Value> {
-        let mut bubble_map = HashMap::new();
+    /// Fetch all bubble data from the database for new format support.
+    /// Returns a map keyed by "composerId:bubbleId" for efficient O(1) lookup.
+    fn fetch_bubble_data(conn: &Connection) -> BubbleDataMap {
+        let mut bubble_map = BubbleDataMap::new();
 
         if let Ok(mut stmt) =
             conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
@@ -154,10 +186,19 @@ impl CursorConnector {
                     let (key, value) = row;
                     // Key format: bubbleId:{composerId}:{bubbleId}
                     // We store as "{composerId}:{bubbleId}" for easy lookup
-                    if let Some(rest) = key.strip_prefix("bubbleId:")
-                        && let Ok(parsed) = serde_json::from_str::<Value>(&value)
-                    {
-                        bubble_map.insert(rest.to_string(), parsed);
+                    if let Some(rest) = key.strip_prefix("bubbleId:") {
+                        match serde_json::from_str::<Value>(&value) {
+                            Ok(parsed) => {
+                                bubble_map.insert(rest.to_string(), parsed);
+                            }
+                            Err(e) => {
+                                tracing::trace!(
+                                    key = %rest,
+                                    error = %e,
+                                    "skipping malformed bubble JSON"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -243,7 +284,7 @@ impl CursorConnector {
         db_path: &Path,
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
-        bubble_data: &HashMap<String, Value>,
+        bubble_data: &BubbleDataMap,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
 
@@ -278,7 +319,7 @@ impl CursorConnector {
                     // Look up the full bubble data
                     let lookup_key = format!("{}:{}", composer_id, bubble_id);
                     if let Some(bubble) = bubble_data.get(&lookup_key)
-                        && let Some(msg) = Self::parse_bubble_new_format(bubble, messages.len())
+                        && let Some(msg) = Self::parse_bubble(bubble, messages.len())
                     {
                         messages.push(msg);
                     }
@@ -371,12 +412,16 @@ impl CursorConnector {
             })
             .or_else(|| model_name.map(|m| format!("Cursor chat with {}", m)));
 
+        // source_path must be unique per conversation for proper lookup.
+        // Append composer_id since multiple conversations share the same db file.
+        let unique_source_path = db_path.join(&composer_id);
+
         Some(NormalizedConversation {
             agent_slug: "cursor".to_string(),
             external_id: Some(composer_id),
             title,
             workspace: None, // Could try to extract from db_path
-            source_path: db_path.to_path_buf(),
+            source_path: unique_source_path,
             started_at: created_at,
             ended_at: messages.last().and_then(|m| m.created_at).or(created_at),
             metadata: serde_json::json!({
@@ -388,30 +433,48 @@ impl CursorConnector {
         })
     }
 
-    /// Parse a bubble from the new Cursor format (v0.40+)
-    /// New format bubbles have: type (1=user, 2=assistant), text/rawText, bubbleId, etc.
-    fn parse_bubble_new_format(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
-        // Extract content - prefer 'text', fall back to 'rawText'
+    /// Parse a bubble (message) from Cursor's format.
+    ///
+    /// Handles both new format (v0.40+) and legacy formats by trying all known field names.
+    /// - Content: text > rawText > content > message
+    /// - Role: numeric type (1=user, 2=assistant) or string type/role
+    /// - Author: modelType (new) or model (legacy)
+    fn parse_bubble(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
+        // Extract content - try all known field names in priority order
         let content = bubble
             .get("text")
             .and_then(|v| v.as_str())
-            .or_else(|| bubble.get("rawText").and_then(|v| v.as_str()))?;
+            .or_else(|| bubble.get("rawText").and_then(|v| v.as_str()))
+            .or_else(|| bubble.get("content").and_then(|v| v.as_str()))
+            .or_else(|| bubble.get("message").and_then(|v| v.as_str()))?;
 
         if content.trim().is_empty() {
             return None;
         }
 
-        // In new format, type is numeric: 1 = user, 2 = assistant
+        // Extract role - try numeric type first (new format), then string type/role (legacy)
         let role = bubble
             .get("type")
-            .and_then(|v| v.as_i64())
-            .map(|t| {
-                match t {
-                    1 => "user",
-                    2 => "assistant",
-                    _ => "assistant",
-                }
-                .to_string()
+            .and_then(|v| {
+                // New format: numeric type (1=user, 2=assistant)
+                v.as_i64()
+                    .map(|t| {
+                        match t {
+                            bubble_type::USER => "user",
+                            bubble_type::ASSISTANT => "assistant",
+                            _ => "assistant",
+                        }
+                        .to_string()
+                    })
+                    // Legacy format: string type
+                    .or_else(|| v.as_str().map(Self::normalize_role))
+            })
+            .or_else(|| {
+                // Fallback: check "role" field (legacy format)
+                bubble
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .map(Self::normalize_role)
             })
             .unwrap_or_else(|| "assistant".to_string());
 
@@ -420,9 +483,10 @@ impl CursorConnector {
             .or_else(|| bubble.get("createdAt"))
             .and_then(crate::connectors::parse_timestamp);
 
-        // Extract model info if present
+        // Extract author - try both field names
         let author = bubble
             .get("modelType")
+            .or_else(|| bubble.get("model"))
             .and_then(|v| v.as_str())
             .map(String::from);
 
@@ -437,50 +501,14 @@ impl CursorConnector {
         })
     }
 
-    /// Parse a bubble (message) from Cursor's format
-    fn parse_bubble(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
-        // Cursor bubbles have different structures
-        let content = bubble
-            .get("text")
-            .and_then(|v| v.as_str())
-            .or_else(|| bubble.get("content").and_then(|v| v.as_str()))
-            .or_else(|| bubble.get("message").and_then(|v| v.as_str()))?;
-
-        if content.trim().is_empty() {
-            return None;
+    /// Normalize role string to standard values (user/assistant).
+    fn normalize_role(role: &str) -> String {
+        match role.to_lowercase().as_str() {
+            "user" | "human" => "user",
+            "assistant" | "ai" | "bot" => "assistant",
+            _ => role,
         }
-
-        let role = bubble
-            .get("type")
-            .and_then(|v| v.as_str())
-            .or_else(|| bubble.get("role").and_then(|v| v.as_str()))
-            .map(|r| {
-                match r.to_lowercase().as_str() {
-                    "user" | "human" => "user",
-                    "assistant" | "ai" | "bot" => "assistant",
-                    _ => r,
-                }
-                .to_string()
-            })
-            .unwrap_or_else(|| "assistant".to_string());
-
-        let created_at = bubble
-            .get("timestamp")
-            .or_else(|| bubble.get("createdAt"))
-            .and_then(crate::connectors::parse_timestamp);
-
-        Some(NormalizedMessage {
-            idx: idx as i64,
-            role,
-            author: bubble
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            created_at,
-            content: content.to_string(),
-            extra: bubble.clone(),
-            snippets: Vec::new(),
-        })
+        .to_string()
     }
 
     /// Parse legacy aichat data
@@ -544,12 +572,15 @@ impl CursorConnector {
                 .collect()
         });
 
+        // source_path must be unique per conversation for proper lookup.
+        let unique_source_path = db_path.join(&id);
+
         Some(NormalizedConversation {
             agent_slug: "cursor".to_string(),
             external_id: Some(id),
             title,
             workspace: None,
-            source_path: db_path.to_path_buf(),
+            source_path: unique_source_path,
             started_at,
             ended_at,
             metadata: serde_json::json!({"source": "cursor_aichat"}),
@@ -1150,14 +1181,9 @@ mod tests {
 
         // Check second message (assistant)
         assert_eq!(conv.messages[1].role, "assistant");
-        assert!(conv.messages[1]
-            .content
-            .contains("philosophical question"));
+        assert!(conv.messages[1].content.contains("philosophical question"));
         assert_eq!(conv.messages[1].idx, 1);
-        assert_eq!(
-            conv.messages[1].author,
-            Some("claude-4.5-opus".to_string())
-        );
+        assert_eq!(conv.messages[1].author, Some("claude-4.5-opus".to_string()));
     }
 
     #[test]
@@ -1287,21 +1313,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_bubble_new_format_type_mapping() {
-        // Test type 1 = user
+    fn parse_bubble_numeric_type_mapping() {
+        // Test type 1 = user (new format)
         let user_bubble = json!({
             "type": 1,
             "text": "User message"
         });
-        let msg = CursorConnector::parse_bubble_new_format(&user_bubble, 0).unwrap();
+        let msg = CursorConnector::parse_bubble(&user_bubble, 0).unwrap();
         assert_eq!(msg.role, "user");
 
-        // Test type 2 = assistant
+        // Test type 2 = assistant (new format)
         let assistant_bubble = json!({
             "type": 2,
             "text": "Assistant message"
         });
-        let msg = CursorConnector::parse_bubble_new_format(&assistant_bubble, 0).unwrap();
+        let msg = CursorConnector::parse_bubble(&assistant_bubble, 0).unwrap();
         assert_eq!(msg.role, "assistant");
 
         // Test unknown type defaults to assistant
@@ -1309,23 +1335,127 @@ mod tests {
             "type": 99,
             "text": "Unknown type message"
         });
-        let msg = CursorConnector::parse_bubble_new_format(&unknown_bubble, 0).unwrap();
+        let msg = CursorConnector::parse_bubble(&unknown_bubble, 0).unwrap();
         assert_eq!(msg.role, "assistant");
     }
 
     #[test]
-    fn parse_bubble_new_format_empty_content_returns_none() {
+    fn parse_bubble_uses_raw_text_fallback() {
+        // New format uses rawText when text is missing
         let bubble = json!({
             "type": 1,
-            "text": ""
+            "rawText": "Content from rawText"
         });
-        assert!(CursorConnector::parse_bubble_new_format(&bubble, 0).is_none());
+        let msg = CursorConnector::parse_bubble(&bubble, 0).unwrap();
+        assert_eq!(msg.content, "Content from rawText");
+    }
 
-        let bubble_whitespace = json!({
-            "type": 1,
-            "text": "   \n\t   "
+    #[test]
+    fn parse_bubble_extracts_model_type() {
+        // New format uses modelType field
+        let bubble = json!({
+            "type": 2,
+            "text": "Response",
+            "modelType": "claude-4.5-opus"
         });
-        assert!(CursorConnector::parse_bubble_new_format(&bubble_whitespace, 0).is_none());
+        let msg = CursorConnector::parse_bubble(&bubble, 0).unwrap();
+        assert_eq!(msg.author, Some("claude-4.5-opus".to_string()));
+
+        // Legacy format uses model field
+        let legacy_bubble = json!({
+            "type": "assistant",
+            "text": "Response",
+            "model": "gpt-4"
+        });
+        let msg = CursorConnector::parse_bubble(&legacy_bubble, 0).unwrap();
+        assert_eq!(msg.author, Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn parse_bubble_missing_type_defaults_to_assistant() {
+        // No type field at all should default to assistant
+        let bubble = json!({
+            "text": "Message without type"
+        });
+        let msg = CursorConnector::parse_bubble(&bubble, 0).unwrap();
+        assert_eq!(msg.role, "assistant");
+    }
+
+    #[test]
+    fn parse_composer_data_empty_headers_falls_back_to_tabs() {
+        // Empty fullConversationHeadersOnly array should fall back to tabs format
+        let key = "composerData:fallback-test";
+        let value = json!({
+            "composerId": "fallback-test",
+            "fullConversationHeadersOnly": [],
+            "tabs": [{
+                "bubbles": [
+                    {"text": "Fallback message", "type": "user"}
+                ]
+            }],
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        let mut seen = HashSet::new();
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "Fallback message");
+    }
+
+    #[test]
+    fn parse_composer_data_null_bubble_id_skipped() {
+        // Null bubbleId in header should be gracefully skipped
+        let composer_id = "null-bubble-test";
+        let valid_bubble = "valid-bubble";
+
+        let key = format!("composerData:{}", composer_id);
+        let value = json!({
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": null, "type": 1},  // null bubbleId
+                {"type": 2},  // missing bubbleId
+                {"bubbleId": valid_bubble, "type": 1}  // valid
+            ],
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        let mut bubble_data = HashMap::new();
+        bubble_data.insert(
+            format!("{}:{}", composer_id, valid_bubble),
+            json!({
+                "type": 1,
+                "text": "Valid message"
+            }),
+        );
+
+        let mut seen = HashSet::new();
+        let conv = CursorConnector::parse_composer_data(
+            &key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        // Only the valid bubble should be parsed
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "Valid message");
     }
 
     #[test]
