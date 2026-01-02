@@ -12,7 +12,7 @@
 //! And in the `ItemTable` with keys like:
 //! - `workbench.panel.aichat.view.aichat.chatdata` - Legacy chat data
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -135,6 +135,37 @@ impl CursorConnector {
         dbs
     }
 
+    /// Fetch all bubble data from the database for new format support
+    /// Returns a HashMap keyed by "composerId:bubbleId" for efficient lookup
+    fn fetch_bubble_data(conn: &Connection) -> HashMap<String, Value> {
+        let mut bubble_map = HashMap::new();
+
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+        {
+            let rows = stmt.query_map([], |row| {
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
+                Ok((key, value))
+            });
+
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let (key, value) = row;
+                    // Key format: bubbleId:{composerId}:{bubbleId}
+                    // We store as "{composerId}:{bubbleId}" for easy lookup
+                    if let Some(rest) = key.strip_prefix("bubbleId:")
+                        && let Ok(parsed) = serde_json::from_str::<Value>(&value)
+                    {
+                        bubble_map.insert(rest.to_string(), parsed);
+                    }
+                }
+            }
+        }
+
+        bubble_map
+    }
+
     /// Extract chat sessions from a SQLite database
     fn extract_from_db(
         db_path: &Path,
@@ -149,6 +180,10 @@ impl CursorConnector {
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
 
+        // Pre-fetch all bubbleId entries for new format support
+        // Keys are like: bubbleId:{composerId}:{bubbleId}
+        let bubble_data = Self::fetch_bubble_data(&conn);
+
         // Try cursorDiskKV table for composerData entries
         if let Ok(mut stmt) =
             conn.prepare("SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
@@ -162,9 +197,14 @@ impl CursorConnector {
             if let Ok(rows) = rows {
                 for row in rows.flatten() {
                     let (key, value) = row;
-                    if let Some(conv) =
-                        Self::parse_composer_data(&key, &value, db_path, since_ts, &mut seen_ids)
-                    {
+                    if let Some(conv) = Self::parse_composer_data(
+                        &key,
+                        &value,
+                        db_path,
+                        since_ts,
+                        &mut seen_ids,
+                        &bubble_data,
+                    ) {
                         convs.push(conv);
                     }
                 }
@@ -203,6 +243,7 @@ impl CursorConnector {
         db_path: &Path,
         _since_ts: Option<i64>, // File-level filtering done in scan(); message filtering not needed
         seen_ids: &mut HashSet<String>,
+        bubble_data: &HashMap<String, Value>,
     ) -> Option<NormalizedConversation> {
         let val: Value = serde_json::from_str(value).ok()?;
 
@@ -224,9 +265,32 @@ impl CursorConnector {
 
         let mut messages = Vec::new();
 
-        // Parse conversation from bubbles/tabs structure
+        // Check for new format with fullConversationHeadersOnly (Cursor v0.40+)
+        // This format stores only bubble IDs in composerData, with actual content
+        // in separate bubbleId:{composerId}:{bubbleId} keys
+        if let Some(headers) = val
+            .get("fullConversationHeadersOnly")
+            .and_then(|v| v.as_array())
+        {
+            // New format: headers contain bubbleId references
+            for header in headers {
+                if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str()) {
+                    // Look up the full bubble data
+                    let lookup_key = format!("{}:{}", composer_id, bubble_id);
+                    if let Some(bubble) = bubble_data.get(&lookup_key)
+                        && let Some(msg) = Self::parse_bubble_new_format(bubble, messages.len())
+                    {
+                        messages.push(msg);
+                    }
+                }
+            }
+        }
+
+        // Parse conversation from bubbles/tabs structure (legacy format)
         // Cursor uses different structures depending on version
-        if let Some(tabs) = val.get("tabs").and_then(|v| v.as_array()) {
+        if messages.is_empty()
+            && let Some(tabs) = val.get("tabs").and_then(|v| v.as_array())
+        {
             for tab in tabs {
                 if let Some(bubbles) = tab.get("bubbles").and_then(|v| v.as_array()) {
                     for (idx, bubble) in bubbles.iter().enumerate() {
@@ -238,8 +302,10 @@ impl CursorConnector {
             }
         }
 
-        // Also check fullConversation/conversationMap for newer format
-        if let Some(conv_map) = val.get("conversationMap").and_then(|v| v.as_object()) {
+        // Also check fullConversation/conversationMap for older format
+        if messages.is_empty()
+            && let Some(conv_map) = val.get("conversationMap").and_then(|v| v.as_object())
+        {
             for (_, conv_val) in conv_map {
                 if let Some(bubbles) = conv_val.get("bubbles").and_then(|v| v.as_array()) {
                     for (idx, bubble) in bubbles.iter().enumerate() {
@@ -286,16 +352,22 @@ impl CursorConnector {
             .and_then(|m| m.get("modelName"))
             .and_then(|v| v.as_str());
 
-        let title = messages
-            .first()
-            .map(|m| {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(100)
-                    .collect()
+        // Use explicit name field if available (new format), otherwise derive from first message
+        let title = val
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(100).collect())
+            .or_else(|| {
+                messages.first().map(|m| {
+                    m.content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(100)
+                        .collect()
+                })
             })
             .or_else(|| model_name.map(|m| format!("Cursor chat with {}", m)));
 
@@ -313,6 +385,55 @@ impl CursorConnector {
                 "unifiedMode": val.get("unifiedMode").and_then(|v| v.as_str()),
             }),
             messages,
+        })
+    }
+
+    /// Parse a bubble from the new Cursor format (v0.40+)
+    /// New format bubbles have: type (1=user, 2=assistant), text/rawText, bubbleId, etc.
+    fn parse_bubble_new_format(bubble: &Value, idx: usize) -> Option<NormalizedMessage> {
+        // Extract content - prefer 'text', fall back to 'rawText'
+        let content = bubble
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| bubble.get("rawText").and_then(|v| v.as_str()))?;
+
+        if content.trim().is_empty() {
+            return None;
+        }
+
+        // In new format, type is numeric: 1 = user, 2 = assistant
+        let role = bubble
+            .get("type")
+            .and_then(|v| v.as_i64())
+            .map(|t| {
+                match t {
+                    1 => "user",
+                    2 => "assistant",
+                    _ => "assistant",
+                }
+                .to_string()
+            })
+            .unwrap_or_else(|| "assistant".to_string());
+
+        let created_at = bubble
+            .get("timestamp")
+            .or_else(|| bubble.get("createdAt"))
+            .and_then(crate::connectors::parse_timestamp);
+
+        // Extract model info if present
+        let author = bubble
+            .get("modelType")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        Some(NormalizedMessage {
+            idx: idx as i64,
+            role,
+            author,
+            created_at,
+            content: content.to_string(),
+            extra: bubble.clone(),
+            snippets: Vec::new(),
         })
     }
 
@@ -758,8 +879,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -786,8 +914,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -804,8 +939,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -823,8 +965,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -840,10 +989,23 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv1 =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
-        let conv2 =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv1 = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+        let conv2 = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv1.is_some());
         assert!(conv2.is_none()); // Duplicate should return None
@@ -855,8 +1017,15 @@ mod tests {
         let value = json!({}).to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_none());
     }
@@ -873,8 +1042,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_some());
         let conv = conv.unwrap();
@@ -887,10 +1063,342 @@ mod tests {
         let value = json!({ "text": "Content" }).to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_none());
+    }
+
+    // =========================================================================
+    // New format (fullConversationHeadersOnly) tests
+    // =========================================================================
+
+    #[test]
+    fn parse_composer_data_new_format_with_bubble_refs() {
+        let composer_id = "000cb6ea-22c7-425c-b14d-eed4e4503879";
+        let bubble_id_1 = "0b9409fa-459c-40b9-af28-afdd72f8475d";
+        let bubble_id_2 = "082e7471-76af-4559-be44-ca3ca3a8d62e";
+
+        let key = format!("composerData:{}", composer_id);
+        let value = json!({
+            "_v": 10,
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": bubble_id_1, "type": 1},
+                {"bubbleId": bubble_id_2, "type": 2}
+            ],
+            "conversationMap": {},
+            "name": "Test Conversation",
+            "createdAt": 1766508972270i64,
+            "lastUpdatedAt": 1766508994755i64,
+            "modelConfig": {"modelName": "claude-4.5-opus-high-thinking", "maxMode": true}
+        })
+        .to_string();
+
+        // Create bubble data map with actual message content
+        let mut bubble_data = HashMap::new();
+        bubble_data.insert(
+            format!("{}:{}", composer_id, bubble_id_1),
+            json!({
+                "_v": 3,
+                "type": 1,
+                "bubbleId": bubble_id_1,
+                "text": "What is the meaning of life?",
+                "rawText": "What is the meaning of life?"
+            }),
+        );
+        bubble_data.insert(
+            format!("{}:{}", composer_id, bubble_id_2),
+            json!({
+                "_v": 3,
+                "type": 2,
+                "bubbleId": bubble_id_2,
+                "text": "The meaning of life is a philosophical question...",
+                "rawText": "The meaning of life is a philosophical question...",
+                "modelType": "claude-4.5-opus"
+            }),
+        );
+
+        let mut seen = HashSet::new();
+        let conv = CursorConnector::parse_composer_data(
+            &key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.agent_slug, "cursor");
+        assert_eq!(conv.external_id, Some(composer_id.to_string()));
+        assert_eq!(conv.title, Some("Test Conversation".to_string()));
+        assert_eq!(conv.messages.len(), 2);
+
+        // Check first message (user)
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[0].content, "What is the meaning of life?");
+        assert_eq!(conv.messages[0].idx, 0);
+
+        // Check second message (assistant)
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert!(conv.messages[1]
+            .content
+            .contains("philosophical question"));
+        assert_eq!(conv.messages[1].idx, 1);
+        assert_eq!(
+            conv.messages[1].author,
+            Some("claude-4.5-opus".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_composer_data_new_format_uses_raw_text_fallback() {
+        let composer_id = "test-composer-123";
+        let bubble_id = "test-bubble-456";
+
+        let key = format!("composerData:{}", composer_id);
+        let value = json!({
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": bubble_id, "type": 1}
+            ],
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        // Bubble only has rawText, not text
+        let mut bubble_data = HashMap::new();
+        bubble_data.insert(
+            format!("{}:{}", composer_id, bubble_id),
+            json!({
+                "type": 1,
+                "bubbleId": bubble_id,
+                "rawText": "Content from rawText field"
+            }),
+        );
+
+        let mut seen = HashSet::new();
+        let conv = CursorConnector::parse_composer_data(
+            &key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "Content from rawText field");
+    }
+
+    #[test]
+    fn parse_composer_data_new_format_skips_missing_bubbles() {
+        let composer_id = "test-composer-789";
+        let existing_bubble = "existing-bubble";
+        let missing_bubble = "missing-bubble";
+
+        let key = format!("composerData:{}", composer_id);
+        let value = json!({
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": existing_bubble, "type": 1},
+                {"bubbleId": missing_bubble, "type": 2}  // This one won't exist in bubble_data
+            ],
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        // Only include one bubble
+        let mut bubble_data = HashMap::new();
+        bubble_data.insert(
+            format!("{}:{}", composer_id, existing_bubble),
+            json!({
+                "type": 1,
+                "bubbleId": existing_bubble,
+                "text": "I exist!"
+            }),
+        );
+
+        let mut seen = HashSet::new();
+        let conv = CursorConnector::parse_composer_data(
+            &key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.messages.len(), 1);
+        assert_eq!(conv.messages[0].content, "I exist!");
+    }
+
+    #[test]
+    fn parse_composer_data_new_format_uses_name_for_title() {
+        let composer_id = "title-test-123";
+        let bubble_id = "bubble-456";
+
+        let key = format!("composerData:{}", composer_id);
+        let value = json!({
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": bubble_id, "type": 1}
+            ],
+            "name": "My Custom Conversation Title",
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+
+        let mut bubble_data = HashMap::new();
+        bubble_data.insert(
+            format!("{}:{}", composer_id, bubble_id),
+            json!({
+                "type": 1,
+                "text": "This would be the title if name wasn't present"
+            }),
+        );
+
+        let mut seen = HashSet::new();
+        let conv = CursorConnector::parse_composer_data(
+            &key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
+
+        assert!(conv.is_some());
+        let conv = conv.unwrap();
+        assert_eq!(conv.title, Some("My Custom Conversation Title".to_string()));
+    }
+
+    #[test]
+    fn parse_bubble_new_format_type_mapping() {
+        // Test type 1 = user
+        let user_bubble = json!({
+            "type": 1,
+            "text": "User message"
+        });
+        let msg = CursorConnector::parse_bubble_new_format(&user_bubble, 0).unwrap();
+        assert_eq!(msg.role, "user");
+
+        // Test type 2 = assistant
+        let assistant_bubble = json!({
+            "type": 2,
+            "text": "Assistant message"
+        });
+        let msg = CursorConnector::parse_bubble_new_format(&assistant_bubble, 0).unwrap();
+        assert_eq!(msg.role, "assistant");
+
+        // Test unknown type defaults to assistant
+        let unknown_bubble = json!({
+            "type": 99,
+            "text": "Unknown type message"
+        });
+        let msg = CursorConnector::parse_bubble_new_format(&unknown_bubble, 0).unwrap();
+        assert_eq!(msg.role, "assistant");
+    }
+
+    #[test]
+    fn parse_bubble_new_format_empty_content_returns_none() {
+        let bubble = json!({
+            "type": 1,
+            "text": ""
+        });
+        assert!(CursorConnector::parse_bubble_new_format(&bubble, 0).is_none());
+
+        let bubble_whitespace = json!({
+            "type": 1,
+            "text": "   \n\t   "
+        });
+        assert!(CursorConnector::parse_bubble_new_format(&bubble_whitespace, 0).is_none());
+    }
+
+    #[test]
+    fn extract_from_db_new_format() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+
+        let conn = create_test_db(&db_path);
+
+        let composer_id = "new-format-test-123";
+        let bubble_id_1 = "bubble-user-1";
+        let bubble_id_2 = "bubble-assistant-1";
+
+        // Insert composerData with new format
+        let composer_value = json!({
+            "composerId": composer_id,
+            "fullConversationHeadersOnly": [
+                {"bubbleId": bubble_id_1, "type": 1},
+                {"bubbleId": bubble_id_2, "type": 2}
+            ],
+            "name": "New Format Test",
+            "createdAt": 1700000000000i64
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [&format!("composerData:{}", composer_id), &composer_value],
+        )
+        .unwrap();
+
+        // Insert bubble data
+        let bubble1_value = json!({
+            "type": 1,
+            "bubbleId": bubble_id_1,
+            "text": "Hello from user"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                &format!("bubbleId:{}:{}", composer_id, bubble_id_1),
+                &bubble1_value,
+            ],
+        )
+        .unwrap();
+
+        let bubble2_value = json!({
+            "type": 2,
+            "bubbleId": bubble_id_2,
+            "text": "Hello from assistant"
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+            [
+                &format!("bubbleId:{}:{}", composer_id, bubble_id_2),
+                &bubble2_value,
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let convs = CursorConnector::extract_from_db(&db_path, None).unwrap();
+        assert_eq!(convs.len(), 1);
+
+        let conv = &convs[0];
+        assert_eq!(conv.title, Some("New Format Test".to_string()));
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, "user");
+        assert_eq!(conv.messages[0].content, "Hello from user");
+        assert_eq!(conv.messages[1].role, "assistant");
+        assert_eq!(conv.messages[1].content, "Hello from assistant");
     }
 
     // =========================================================================
@@ -1127,8 +1635,15 @@ mod tests {
         let value = "not valid json {{{";
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         assert!(conv.is_none());
     }
@@ -1158,8 +1673,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         let conv = conv.unwrap();
         // Title should be first line only
@@ -1176,8 +1698,15 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen);
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        );
 
         let conv = conv.unwrap();
         assert!(conv.title.as_ref().unwrap().len() <= 100);
@@ -1198,9 +1727,16 @@ mod tests {
         .to_string();
 
         let mut seen = HashSet::new();
-        let conv =
-            CursorConnector::parse_composer_data(key, &value, Path::new("/test"), None, &mut seen)
-                .unwrap();
+        let bubble_data = HashMap::new();
+        let conv = CursorConnector::parse_composer_data(
+            key,
+            &value,
+            Path::new("/test"),
+            None,
+            &mut seen,
+            &bubble_data,
+        )
+        .unwrap();
 
         assert_eq!(conv.messages[0].idx, 0);
         assert_eq!(conv.messages[1].idx, 1);
