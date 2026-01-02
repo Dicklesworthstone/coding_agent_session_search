@@ -324,20 +324,32 @@ impl CursorConnector {
             }
         }
 
-        // Extract from newlyCreatedFiles (string array)
+        // Extract from newlyCreatedFiles (can be string array or object array with uri)
         if let Some(files) = val.get("newlyCreatedFiles").and_then(|v| v.as_array()) {
             for file in files {
+                // Try as string first
                 if let Some(path_str) = file.as_str() {
                     paths.push(PathBuf::from(path_str));
+                // Then try as object with uri.fsPath
+                } else if let Some(uri) = file.get("uri")
+                    && let Some(path) = extract_from_uri(uri)
+                {
+                    paths.push(path);
                 }
             }
         }
 
-        // Extract from newlyCreatedFolders (string array)
+        // Extract from newlyCreatedFolders (can be string array or object array with uri)
         if let Some(folders) = val.get("newlyCreatedFolders").and_then(|v| v.as_array()) {
             for folder in folders {
+                // Try as string first
                 if let Some(path_str) = folder.as_str() {
                     paths.push(PathBuf::from(path_str));
+                // Then try as object with uri.fsPath
+                } else if let Some(uri) = folder.get("uri")
+                    && let Some(path) = extract_from_uri(uri)
+                {
+                    paths.push(path);
                 }
             }
         }
@@ -1098,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_workspace_from_context_with_newly_created_files() {
+    fn extract_workspace_from_context_with_newly_created_files_string() {
         let val = json!({
             "context": {
                 "fileSelections": [],
@@ -1111,6 +1123,29 @@ mod tests {
 
         let workspace = CursorConnector::extract_workspace_from_context(&val);
         assert_eq!(workspace, Some(PathBuf::from("/Users/test/myproject")));
+    }
+
+    #[test]
+    fn extract_workspace_from_context_with_newly_created_files_uri_object() {
+        // Real format from Cursor: newlyCreatedFiles is array of objects with uri.fsPath
+        let val = json!({
+            "context": {
+                "fileSelections": [],
+                "folderSelections": [],
+                "selections": []
+            },
+            "newlyCreatedFiles": [
+                {"uri": {"fsPath": "/Users/eric/src/Tasks/2025-11-05 Accounting/file1.md"}},
+                {"uri": {"fsPath": "/Users/eric/src/Tasks/2025-11-05 Accounting/file2.ps1"}}
+            ],
+            "newlyCreatedFolders": []
+        });
+
+        let workspace = CursorConnector::extract_workspace_from_context(&val);
+        assert_eq!(
+            workspace,
+            Some(PathBuf::from("/Users/eric/src/Tasks/2025-11-05 Accounting"))
+        );
     }
 
     #[test]
