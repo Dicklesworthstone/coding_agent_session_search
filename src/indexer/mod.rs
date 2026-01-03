@@ -13,8 +13,8 @@ use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
-    cursor::CursorConnector, gemini::GeminiConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector,
+    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir};
 use crate::sources::config::{Platform, SourcesConfig};
@@ -338,6 +338,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("cursor", || Box::new(CursorConnector::new())),
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
+        ("factory", || Box::new(FactoryConnector::new())),
     ]
 }
 
@@ -373,6 +374,7 @@ impl ConnectorKind {
             "cursor" => Some(Self::Cursor),
             "chatgpt" => Some(Self::ChatGpt),
             "pi_agent" => Some(Self::PiAgent),
+            "factory" => Some(Self::Factory),
             _ => None,
         }
     }
@@ -515,6 +517,7 @@ fn reindex_paths(
             ConnectorKind::Cursor => Box::new(CursorConnector::new()),
             ConnectorKind::ChatGpt => Box::new(ChatGptConnector::new()),
             ConnectorKind::PiAgent => Box::new(PiAgentConnector::new()),
+            ConnectorKind::Factory => Box::new(FactoryConnector::new()),
         };
         let detect = conn.detect();
         if !detect.detected {
@@ -602,6 +605,7 @@ enum ConnectorKind {
     Cursor,
     ChatGpt,
     PiAgent,
+    Factory,
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {

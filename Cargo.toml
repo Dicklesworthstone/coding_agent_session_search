@@ -51,6 +51,7 @@ syntect = "*"
 itertools = "*"
 crc32fast = "*"
 unicode-normalization = "*"
+urlencoding = "*"
 half = "*"
 memmap2 = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries"] }
