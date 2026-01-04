@@ -1,5 +1,5 @@
 Param(
-  [string]$Version = "v0.1.4",
+  [string]$Version = "",
   [string]$Dest = "$HOME/.local/bin",
   [string]$Owner = "Dicklesworthstone",
   [string]$Repo = "coding_agent_session_search",
@@ -11,6 +11,29 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Version) {
+  Write-Host "Resolving latest version..."
+  $latestUrl = "https://github.com/$Owner/$Repo/releases/latest"
+  $tag = ""
+  try {
+    $resp = Invoke-WebRequest -Uri $latestUrl -UseBasicParsing
+    if ($resp.BaseResponse -and $resp.BaseResponse.ResponseUri) {
+      $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri
+      $tag = Split-Path $finalUrl -Leaf
+    }
+  } catch {
+    $tag = ""
+  }
+
+  if ($tag -and $tag -ne "latest") {
+    $Version = $tag
+    Write-Host "Resolved latest version: $Version"
+  } else {
+    $Version = "v0.1.49"
+    Write-Warning "Could not resolve latest version; defaulting to $Version"
+  }
+}
+
 $os = "windows"
 $arch = if ([Environment]::Is64BitProcess) { "x86_64" } else { "x86" }
 $zip = "coding-agent-search-$Version-$arch-$os-msvc.zip"
