@@ -1,5 +1,5 @@
 Param(
-  [string]$Version = "v0.1.4",
+  [string]$Version = "",
   [string]$Dest = "$HOME/.local/bin",
   [string]$Owner = "Dicklesworthstone",
   [string]$Repo = "coding_agent_session_search",
@@ -11,6 +11,42 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $Version) {
+  Write-Host "Resolving latest version..."
+
+  # =========================================================================
+  # Redirect-Based Version Resolution (GitHub Issue #28)
+  # =========================================================================
+  # We use GitHub's redirect behavior instead of the API:
+  # - NO RATE LIMITING: API limits to 60/hr; redirects have no limit
+  # - NO JSON PARSING: API requires grep+sed which varies GNU/BSD
+  # - SIMPLER FAILURES: Only fails if GitHub is completely down
+  #
+  # How it works: GitHub redirects /releases/latest -> /releases/tag/{version}
+  # We capture the final URL and extract the tag with Split-Path
+  # =========================================================================
+
+  $releasesUrl = "https://github.com/$Owner/$Repo/releases/latest"
+  $finalUrl = ""
+  try {
+    $resp = Invoke-WebRequest -Uri $releasesUrl -UseBasicParsing -TimeoutSec 30 -UserAgent "cass-installer/1.0"
+    if ($resp.BaseResponse -and $resp.BaseResponse.ResponseUri) {
+      $finalUrl = $resp.BaseResponse.ResponseUri.AbsoluteUri
+    }
+  } catch {
+    $finalUrl = ""
+  }
+
+  $tag = if ($finalUrl) { Split-Path $finalUrl -Leaf } else { "" }
+  if ($tag -and ($finalUrl -like "*/releases/tag/*")) {
+    $Version = $tag
+    Write-Host "Resolved latest version: $Version"
+  } else {
+    $Version = "v0.1.49"
+    Write-Warning "Could not resolve latest version; defaulting to $Version"
+  }
+}
+
 $os = "windows"
 $arch = if ([Environment]::Is64BitProcess) { "x86_64" } else { "x86" }
 $zip = "coding-agent-search-$Version-$arch-$os-msvc.zip"

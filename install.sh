@@ -19,99 +19,171 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/coding-agent-search-install.lock"
 SYSTEM=0
 
-log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
+log() {
+	[ "$QUIET" -eq 1 ] && return 0
+	echo -e "$@"
+}
 info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
 warn() { log "\033[1;33m⚠\033[0m $*"; }
 err() { log "\033[0;31m✗\033[0m $*"; }
 
 resolve_version() {
-  if [ -n "$VERSION" ]; then return 0; fi
+	if [ -n "$VERSION" ]; then return 0; fi
 
-  info "Resolving latest version..."
-  local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-  local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
-    tag=""
-  fi
+	info "Resolving latest version..."
 
-  if [ -n "$tag" ]; then
-    VERSION="$tag"
-    info "Resolved latest version: $VERSION"
-  else
-    VERSION="v0.1.0"
-    warn "Could not resolve latest version from GitHub API; defaulting to $VERSION"
-  fi
+	# =========================================================================
+	# Redirect-Based Version Resolution (GitHub Issue #28)
+	# =========================================================================
+	# We use GitHub's redirect behavior instead of the API:
+	# - NO RATE LIMITING: API limits to 60/hr; redirects have no limit
+	# - NO JSON PARSING: API requires grep+sed which varies GNU/BSD
+	# - SIMPLER FAILURES: Only fails if GitHub is completely down
+	#
+	# How it works: GitHub redirects /releases/latest -> /releases/tag/{version}
+	# We capture the final URL and extract the tag with shell parameter expansion
+	# =========================================================================
+
+	local releases_url="https://github.com/${OWNER}/${REPO}/releases/latest"
+	local final_url
+
+	# Timeouts: 10s connect, 30s total (handles slow/flaky networks)
+	# User-Agent: Identifies installer (GitHub may block empty UA)
+	# -o /dev/null: Discard body, we only want the URL
+	# -w '%{url_effective}': Capture final URL after redirects
+	final_url="$(curl -fsSL \
+		--connect-timeout 10 \
+		--max-time 30 \
+		-A "cass-installer/1.0" \
+		-o /dev/null \
+		-w '%{url_effective}' \
+		"$releases_url" 2>/dev/null || true)"
+
+	# Extract tag: .../releases/tag/v0.1.49 -> v0.1.49
+	local tag="${final_url##*/}"
+
+	# Validate: URL must contain /releases/tag/ (proves redirect worked)
+	# This catches: network errors, no releases, unexpected redirects
+	if [ -n "$tag" ] && [[ "$final_url" == *"/releases/tag/"* ]]; then
+		VERSION="$tag"
+		info "Resolved latest version: $VERSION"
+	else
+		# Fallback to known-good version (update when releasing major versions)
+		VERSION="v0.1.49"
+		warn "Could not resolve latest version; defaulting to $VERSION"
+	fi
 }
 
 maybe_add_path() {
-  case ":$PATH:" in
-    *:"$DEST":*) return 0;;
-    *)
-      if [ "$EASY" -eq 1 ]; then
-        UPDATED=0
-        for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-          if [ -e "$rc" ] && [ -w "$rc" ]; then
-            if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
-              echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
-            fi
-            UPDATED=1
-          fi
-        done
-        if [ "$UPDATED" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use coding-agent-search"
-        else
-          warn "Add $DEST to PATH to use coding-agent-search"
-        fi
-      else
-        warn "Add $DEST to PATH to use coding-agent-search"
-      fi
-    ;;
-  esac
+	case ":$PATH:" in
+	*:"$DEST":*) return 0 ;;
+	*)
+		if [ "$EASY" -eq 1 ]; then
+			UPDATED=0
+			for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+				if [ -e "$rc" ] && [ -w "$rc" ]; then
+					if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
+						echo "export PATH=\"$DEST:\$PATH\"" >>"$rc"
+					fi
+					UPDATED=1
+				fi
+			done
+			if [ "$UPDATED" -eq 1 ]; then
+				warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use coding-agent-search"
+			else
+				warn "Add $DEST to PATH to use coding-agent-search"
+			fi
+		else
+			warn "Add $DEST to PATH to use coding-agent-search"
+		fi
+		;;
+	esac
 }
 
 ensure_rust() {
-  if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
-    info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
-    return 0
-  fi
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
-  if [ "$EASY" -ne 1 ]; then
-    if [ -t 0 ]; then
-      echo -n "Install Rust nightly via rustup? (y/N): "
-      read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
-    fi
-  fi
-  info "Installing rustup (nightly)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup component add rustfmt clippy || true
+	if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
+		info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
+		return 0
+	fi
+	if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
+	if [ "$EASY" -ne 1 ]; then
+		if [ -t 0 ]; then
+			echo -n "Install Rust nightly via rustup? (y/N): "
+			read -r ans
+			case "$ans" in y | Y) : ;; *)
+				warn "Skipping rustup install"
+				return 0
+				;;
+			esac
+		fi
+	fi
+	info "Installing rustup (nightly)"
+	curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+	export PATH="$HOME/.cargo/bin:$PATH"
+	rustup component add rustfmt clippy || true
 }
 
 usage() {
-  cat <<EOFU
+	cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] [--quickstart] \
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet]
 EOFU
 }
 
 while [ $# -gt 0 ]; do
-  case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
-    --easy-mode) EASY=1; shift;;
-    --verify) VERIFY=1; shift;;
-    --quickstart) QUICKSTART=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
-    --from-source) FROM_SOURCE=1; shift;;
-    --quiet|-q) QUIET=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) shift;;
-  esac
+	case "$1" in
+	--version)
+		VERSION="$2"
+		shift 2
+		;;
+	--dest)
+		DEST="$2"
+		shift 2
+		;;
+	--system)
+		SYSTEM=1
+		DEST="/usr/local/bin"
+		shift
+		;;
+	--easy-mode)
+		EASY=1
+		shift
+		;;
+	--verify)
+		VERIFY=1
+		shift
+		;;
+	--quickstart)
+		QUICKSTART=1
+		shift
+		;;
+	--artifact-url)
+		ARTIFACT_URL="$2"
+		shift 2
+		;;
+	--checksum)
+		CHECKSUM="$2"
+		shift 2
+		;;
+	--checksum-url)
+		CHECKSUM_URL="$2"
+		shift 2
+		;;
+	--from-source)
+		FROM_SOURCE=1
+		shift
+		;;
+	--quiet | -q)
+		QUIET=1
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*) shift ;;
+	esac
 done
 
 resolve_version
@@ -120,34 +192,34 @@ mkdir -p "$DEST"
 OS=$(uname -s | tr 'A-Z' 'a-z')
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) ARCH="x86_64" ;;
-  arm64|aarch64) ARCH="aarch64" ;;
-  *) warn "Unknown arch $ARCH, using as-is" ;;
+x86_64 | amd64) ARCH="x86_64" ;;
+arm64 | aarch64) ARCH="aarch64" ;;
+*) warn "Unknown arch $ARCH, using as-is" ;;
 esac
 
 TARGET=""
 case "${OS}-${ARCH}" in
-  linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-  linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-  darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-  darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-  *) :;;
+linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
+*) : ;;
 esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
 TAR=""
 URL=""
 if [ "$FROM_SOURCE" -eq 0 ]; then
-  if [ -n "$ARTIFACT_URL" ]; then
-    TAR=$(basename "$ARTIFACT_URL")
-    URL="$ARTIFACT_URL"
-  elif [ -n "$TARGET" ]; then
-    TAR="coding-agent-search-${TARGET}.tar.xz"
-    URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
-  else
-    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
-    FROM_SOURCE=1
-  fi
+	if [ -n "$ARTIFACT_URL" ]; then
+		TAR=$(basename "$ARTIFACT_URL")
+		URL="$ARTIFACT_URL"
+	elif [ -n "$TARGET" ]; then
+		TAR="coding-agent-search-${TARGET}.tar.xz"
+		URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+	else
+		warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
+		FROM_SOURCE=1
+	fi
 fi
 
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
@@ -155,105 +227,124 @@ fi
 LOCK_DIR="${LOCK_FILE}.d"
 LOCKED=0
 if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  # Store PID for stale lock detection
-  echo $$ > "$LOCK_DIR/pid"
+	LOCKED=1
+	# Store PID for stale lock detection
+	echo $$ >"$LOCK_DIR/pid"
 else
-  # Check if existing lock is stale (process no longer running)
-  if [ -f "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
-      # Stale lock, remove and retry
-      rm -rf "$LOCK_DIR"
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-      fi
-    fi
-  fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running (lock $LOCK_DIR)"
-    exit 1
-  fi
+	# Check if existing lock is stale (process no longer running)
+	if [ -f "$LOCK_DIR/pid" ]; then
+		OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+		if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+			# Stale lock, remove and retry
+			rm -rf "$LOCK_DIR"
+			if mkdir "$LOCK_DIR" 2>/dev/null; then
+				LOCKED=1
+				echo $$ >"$LOCK_DIR/pid"
+			fi
+		fi
+	fi
+	if [ "$LOCKED" -eq 0 ]; then
+		err "Another installer is running (lock $LOCK_DIR)"
+		exit 1
+	fi
 fi
 
 cleanup() {
-  rm -rf "$TMP"
-  if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
+	rm -rf "$TMP"
+	if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
 }
 
 TMP=$(mktemp -d)
 trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
-  info "Downloading $URL"
-  if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
-    warn "Artifact download failed; falling back to build-from-source"
-    FROM_SOURCE=1
-  fi
+	info "Downloading $URL"
+	if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+		warn "Artifact download failed; falling back to build-from-source"
+		FROM_SOURCE=1
+	fi
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git, rust nightly)"
-  ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
-  (cd "$TMP/src" && cargo build --release)
-  BIN="$TMP/src/target/release/cass"
-  [ -x "$BIN" ] || { err "Build failed"; exit 1; }
-  install -m 0755 "$BIN" "$DEST"
-  ok "Installed to $DEST/cass (source build)"
-  maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then "$DEST/cass" --version || true; ok "Self-test complete"; fi
-  if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/cass" index --full || warn "index --full failed"; fi
-  ok "Done. Run: cass"
-  exit 0
+	info "Building from source (requires git, rust nightly)"
+	ensure_rust
+	git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+	(cd "$TMP/src" && cargo build --release)
+	BIN="$TMP/src/target/release/cass"
+	[ -x "$BIN" ] || {
+		err "Build failed"
+		exit 1
+	}
+	install -m 0755 "$BIN" "$DEST"
+	ok "Installed to $DEST/cass (source build)"
+	maybe_add_path
+	if [ "$VERIFY" -eq 1 ]; then
+		"$DEST/cass" --version || true
+		ok "Self-test complete"
+	fi
+	if [ "$QUICKSTART" -eq 1 ]; then
+		info "Running index --full (quickstart)"
+		"$DEST/cass" index --full || warn "index --full failed"
+	fi
+	ok "Done. Run: cass"
+	exit 0
 fi
 
 if [ -z "$CHECKSUM" ]; then
-  [ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
-  info "Fetching checksum from ${CHECKSUM_URL}"
-  CHECKSUM_FILE="$TMP/checksum.sha256"
-  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    err "Checksum required and could not be fetched"; exit 1;
-  fi
-  # Extract just the hash (first field) from the file
-  CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-  if [ -z "$CHECKSUM" ]; then err "Empty checksum file"; exit 1; fi
+	[ -z "$CHECKSUM_URL" ] && CHECKSUM_URL="${URL}.sha256"
+	info "Fetching checksum from ${CHECKSUM_URL}"
+	CHECKSUM_FILE="$TMP/checksum.sha256"
+	if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+		err "Checksum required and could not be fetched"
+		exit 1
+	fi
+	# Extract just the hash (first field) from the file
+	CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+	if [ -z "$CHECKSUM" ]; then
+		err "Empty checksum file"
+		exit 1
+	fi
 fi
 
-echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
+echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || {
+	err "Checksum mismatch"
+	exit 1
+}
 ok "Checksum verified"
 
 info "Extracting"
 tar -xf "$TMP/$TAR" -C "$TMP"
 BIN="$TMP/cass"
 if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-  BIN="$TMP/coding-agent-search-${TARGET}/cass"
+	BIN="$TMP/coding-agent-search-${TARGET}/cass"
 fi
 if [ ! -x "$BIN" ]; then
-  BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
+	BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
 # Fallback for older versions or if name mismatch?
 if [ ! -x "$BIN" ]; then
-   BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
-      warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
-   fi
+	BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
+	if [ -x "$BIN" ]; then
+		warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
+	fi
 fi
 
-[ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
+[ -x "$BIN" ] || {
+	err "Binary not found in tar"
+	exit 1
+}
 install -m 0755 "$BIN" "$DEST/cass"
 ok "Installed to $DEST/cass"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/cass" --version || true
-  ok "Self-test complete"
+	"$DEST/cass" --version || true
+	ok "Self-test complete"
 fi
 
 if [ "$QUICKSTART" -eq 1 ]; then
-  info "Running index --full (quickstart)"
-  "$DEST/cass" index --full || warn "index --full failed"
+	info "Running index --full (quickstart)"
+	"$DEST/cass" index --full || warn "index --full failed"
 fi
 
 ok "Done. Run: cass"
