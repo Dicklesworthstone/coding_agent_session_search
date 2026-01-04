@@ -19,7 +19,10 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/coding-agent-search-install.lock"
 SYSTEM=0
 
-log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
+log() {
+  [ "$QUIET" -eq 1 ] && return 0
+  echo -e "$@"
+}
 info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
 warn() { log "\033[1;33m⚠\033[0m $*"; }
@@ -29,43 +32,42 @@ resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
 
   info "Resolving latest version..."
-  local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-  local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
-    tag=""
-  fi
+  local latest_url="https://github.com/${OWNER}/${REPO}/releases/latest"
+  local final_url
+  final_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url" || true)"
+  local tag="${final_url##*/}"
 
-  if [ -n "$tag" ]; then
+  if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
     VERSION="$tag"
     info "Resolved latest version: $VERSION"
   else
-    VERSION="v0.1.0"
-    warn "Could not resolve latest version from GitHub API; defaulting to $VERSION"
+    VERSION="v0.1.49"
+    warn "Could not resolve latest version; defaulting to $VERSION"
   fi
 }
 
 maybe_add_path() {
   case ":$PATH:" in
-    *:"$DEST":*) return 0;;
-    *)
-      if [ "$EASY" -eq 1 ]; then
-        UPDATED=0
-        for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-          if [ -e "$rc" ] && [ -w "$rc" ]; then
-            if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
-              echo "export PATH=\"$DEST:\$PATH\"" >> "$rc"
-            fi
-            UPDATED=1
+  *:"$DEST":*) return 0 ;;
+  *)
+    if [ "$EASY" -eq 1 ]; then
+      UPDATED=0
+      for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+        if [ -e "$rc" ] && [ -w "$rc" ]; then
+          if ! grep -F "$DEST" "$rc" >/dev/null 2>&1; then
+            echo "export PATH=\"$DEST:\$PATH\"" >>"$rc"
           fi
-        done
-        if [ "$UPDATED" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use coding-agent-search"
-        else
-          warn "Add $DEST to PATH to use coding-agent-search"
+          UPDATED=1
         fi
+      done
+      if [ "$UPDATED" -eq 1 ]; then
+        warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use coding-agent-search"
       else
         warn "Add $DEST to PATH to use coding-agent-search"
       fi
+    else
+      warn "Add $DEST to PATH to use coding-agent-search"
+    fi
     ;;
   esac
 }
@@ -80,7 +82,11 @@ ensure_rust() {
     if [ -t 0 ]; then
       echo -n "Install Rust nightly via rustup? (y/N): "
       read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
+      case "$ans" in y | Y) : ;; *)
+        warn "Skipping rustup install"
+        return 0
+        ;;
+      esac
     fi
   fi
   info "Installing rustup (nightly)"
@@ -98,19 +104,56 @@ EOFU
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
-    --easy-mode) EASY=1; shift;;
-    --verify) VERIFY=1; shift;;
-    --quickstart) QUICKSTART=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
-    --from-source) FROM_SOURCE=1; shift;;
-    --quiet|-q) QUIET=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) shift;;
+  --version)
+    VERSION="$2"
+    shift 2
+    ;;
+  --dest)
+    DEST="$2"
+    shift 2
+    ;;
+  --system)
+    SYSTEM=1
+    DEST="/usr/local/bin"
+    shift
+    ;;
+  --easy-mode)
+    EASY=1
+    shift
+    ;;
+  --verify)
+    VERIFY=1
+    shift
+    ;;
+  --quickstart)
+    QUICKSTART=1
+    shift
+    ;;
+  --artifact-url)
+    ARTIFACT_URL="$2"
+    shift 2
+    ;;
+  --checksum)
+    CHECKSUM="$2"
+    shift 2
+    ;;
+  --checksum-url)
+    CHECKSUM_URL="$2"
+    shift 2
+    ;;
+  --from-source)
+    FROM_SOURCE=1
+    shift
+    ;;
+  --quiet | -q)
+    QUIET=1
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *) shift ;;
   esac
 done
 
@@ -120,18 +163,18 @@ mkdir -p "$DEST"
 OS=$(uname -s | tr 'A-Z' 'a-z')
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) ARCH="x86_64" ;;
-  arm64|aarch64) ARCH="aarch64" ;;
-  *) warn "Unknown arch $ARCH, using as-is" ;;
+x86_64 | amd64) ARCH="x86_64" ;;
+arm64 | aarch64) ARCH="aarch64" ;;
+*) warn "Unknown arch $ARCH, using as-is" ;;
 esac
 
 TARGET=""
 case "${OS}-${ARCH}" in
-  linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-  linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-  darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-  darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
-  *) :;;
+linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
+*) : ;;
 esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
@@ -157,7 +200,7 @@ LOCKED=0
 if mkdir "$LOCK_DIR" 2>/dev/null; then
   LOCKED=1
   # Store PID for stale lock detection
-  echo $$ > "$LOCK_DIR/pid"
+  echo $$ >"$LOCK_DIR/pid"
 else
   # Check if existing lock is stale (process no longer running)
   if [ -f "$LOCK_DIR/pid" ]; then
@@ -167,7 +210,7 @@ else
       rm -rf "$LOCK_DIR"
       if mkdir "$LOCK_DIR" 2>/dev/null; then
         LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
+        echo $$ >"$LOCK_DIR/pid"
       fi
     fi
   fi
@@ -199,12 +242,21 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/cass"
-  [ -x "$BIN" ] || { err "Build failed"; exit 1; }
+  [ -x "$BIN" ] || {
+    err "Build failed"
+    exit 1
+  }
   install -m 0755 "$BIN" "$DEST"
   ok "Installed to $DEST/cass (source build)"
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then "$DEST/cass" --version || true; ok "Self-test complete"; fi
-  if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/cass" index --full || warn "index --full failed"; fi
+  if [ "$VERIFY" -eq 1 ]; then
+    "$DEST/cass" --version || true
+    ok "Self-test complete"
+  fi
+  if [ "$QUICKSTART" -eq 1 ]; then
+    info "Running index --full (quickstart)"
+    "$DEST/cass" index --full || warn "index --full failed"
+  fi
   ok "Done. Run: cass"
   exit 0
 fi
@@ -214,14 +266,21 @@ if [ -z "$CHECKSUM" ]; then
   info "Fetching checksum from ${CHECKSUM_URL}"
   CHECKSUM_FILE="$TMP/checksum.sha256"
   if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    err "Checksum required and could not be fetched"; exit 1;
+    err "Checksum required and could not be fetched"
+    exit 1
   fi
   # Extract just the hash (first field) from the file
   CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-  if [ -z "$CHECKSUM" ]; then err "Empty checksum file"; exit 1; fi
+  if [ -z "$CHECKSUM" ]; then
+    err "Empty checksum file"
+    exit 1
+  fi
 fi
 
-echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
+echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || {
+  err "Checksum mismatch"
+  exit 1
+}
 ok "Checksum verified"
 
 info "Extracting"
@@ -235,13 +294,16 @@ if [ ! -x "$BIN" ]; then
 fi
 # Fallback for older versions or if name mismatch?
 if [ ! -x "$BIN" ]; then
-   BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
-      warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
-   fi
+  BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
+  if [ -x "$BIN" ]; then
+    warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
+  fi
 fi
 
-[ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
+[ -x "$BIN" ] || {
+  err "Binary not found in tar"
+  exit 1
+}
 install -m 0755 "$BIN" "$DEST/cass"
 ok "Installed to $DEST/cass"
 maybe_add_path
