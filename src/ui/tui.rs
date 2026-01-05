@@ -1945,6 +1945,14 @@ fn semantic_unavailable_message(availability: &SemanticAvailability) -> String {
         }
         SemanticAvailability::LoadFailed { context } => context.clone(),
         SemanticAvailability::Ready { .. } => "ready".to_string(),
+        SemanticAvailability::UpdateAvailable {
+            current_revision,
+            latest_revision,
+            ..
+        } => format!("update available: {current_revision} -> {latest_revision}"),
+        SemanticAvailability::IndexBuilding { embedder_id } => {
+            format!("rebuilding index for {embedder_id}")
+        }
     }
 }
 
