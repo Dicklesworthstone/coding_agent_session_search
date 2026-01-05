@@ -422,6 +422,320 @@ fn assemble_content_from_parts(parts: &[PartInfo]) -> String {
     content_pieces.join("\n\n")
 }
 
+// ============================================================================
+// Export Adapter for cass export command
+// ============================================================================
+
+/// Result of attempting to load an OpenCode session for export.
+pub enum OpenCodeExportResult {
+    /// Successfully loaded messages
+    Messages(Vec<serde_json::Value>),
+    /// Path is an OpenCode session file but message directory is missing
+    MissingMessageDir {
+        session_id: String,
+        expected_path: PathBuf,
+    },
+    /// Path matches OpenCode layout but session JSON is invalid
+    InvalidSessionJson { path: PathBuf, error: String },
+    /// Path is not an OpenCode session file
+    NotOpenCode,
+}
+
+#[derive(Default)]
+struct ExportReadStats {
+    unreadable_messages: usize,
+    invalid_messages: usize,
+    unreadable_parts: usize,
+    invalid_parts: usize,
+    unreadable_part_dirs: usize,
+}
+
+impl ExportReadStats {
+    fn has_issues(&self) -> bool {
+        self.unreadable_messages > 0
+            || self.invalid_messages > 0
+            || self.unreadable_parts > 0
+            || self.invalid_parts > 0
+            || self.unreadable_part_dirs > 0
+    }
+}
+
+fn emit_export_warnings(stats: &ExportReadStats, session_msg_dir: &std::path::Path) {
+    if !stats.has_issues() {
+        return;
+    }
+    let skipped_messages = stats.unreadable_messages + stats.invalid_messages;
+    let skipped_parts = stats.unreadable_parts + stats.invalid_parts;
+    eprintln!(
+        "Warning: OpenCode export skipped {} message file(s) ({} unreadable, {} invalid JSON), {} part file(s) ({} unreadable, {} invalid JSON), and failed to read {} part directories under {}",
+        skipped_messages,
+        stats.unreadable_messages,
+        stats.invalid_messages,
+        skipped_parts,
+        stats.unreadable_parts,
+        stats.invalid_parts,
+        stats.unreadable_part_dirs,
+        session_msg_dir.display()
+    );
+}
+
+/// Attempt to load messages from an OpenCode session file for export.
+///
+/// This is the adapter between OpenCode's split storage layout and the export
+/// command's expected `Vec<serde_json::Value>` format.
+///
+/// # Arguments
+/// * `session_file` - Path to the session JSON file (e.g., `session/{projectID}/{sessionID}.json`)
+/// * `include_tools` - Whether to include tool outputs in the content
+///
+/// # Returns
+/// * `OpenCodeExportResult::Messages` - Successfully loaded messages
+/// * `OpenCodeExportResult::MissingMessageDir` - Session file found but no messages directory
+/// * `OpenCodeExportResult::InvalidSessionJson` - Session file exists but is invalid JSON
+/// * `OpenCodeExportResult::NotOpenCode` - Path doesn't look like an OpenCode session
+pub fn load_session_for_export(
+    session_file: &std::path::Path,
+    include_tools: bool,
+) -> OpenCodeExportResult {
+    // Derive storage root from session file path
+    // Expected: storage/session/{projectID}/{sessionID}.json
+    // We need: storage/message/{sessionID}/ and storage/part/
+    let session_dir = match session_file.parent().and_then(|p| p.parent()) {
+        Some(dir) => dir,
+        None => return OpenCodeExportResult::NotOpenCode,
+    };
+    if session_dir.file_name().and_then(|name| name.to_str()) != Some("session") {
+        return OpenCodeExportResult::NotOpenCode;
+    }
+    let storage_root = match session_dir.parent() {
+        Some(root) => root.to_path_buf(),
+        None => return OpenCodeExportResult::NotOpenCode,
+    };
+    if !looks_like_opencode_storage(&storage_root) {
+        return OpenCodeExportResult::NotOpenCode;
+    }
+
+    // Try to parse as OpenCode session file
+    let session_info = match parse_session_file(&session_file.to_path_buf()) {
+        Ok(s) => s,
+        Err(err) => {
+            return OpenCodeExportResult::InvalidSessionJson {
+                path: session_file.to_path_buf(),
+                error: err.to_string(),
+            };
+        }
+    };
+
+    let message_dir = storage_root.join("message").join(&session_info.id);
+    let part_dir = storage_root.join("part");
+
+    // Check if message directory exists
+    if !message_dir.exists() {
+        return OpenCodeExportResult::MissingMessageDir {
+            session_id: session_info.id,
+            expected_path: message_dir,
+        };
+    }
+
+    // Load messages using the internal function
+    let messages = match load_messages_for_export(&message_dir, &part_dir, include_tools) {
+        Ok(msgs) => msgs,
+        Err(_) => return OpenCodeExportResult::NotOpenCode,
+    };
+
+    OpenCodeExportResult::Messages(messages)
+}
+
+/// Load parts for a single message from the OpenCode part directory.
+fn load_parts_for_message(
+    part_dir: &std::path::Path,
+    message_id: &str,
+    stats: &mut ExportReadStats,
+) -> Vec<PartInfo> {
+    let message_part_dir = part_dir.join(message_id);
+    if !message_part_dir.exists() {
+        return Vec::new();
+    }
+    let entries = match fs::read_dir(&message_part_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            stats.unreadable_part_dirs += 1;
+            return Vec::new();
+        }
+    };
+
+    let mut part_files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "json").unwrap_or(false))
+        .collect();
+
+    part_files.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+
+    let mut parts = Vec::new();
+    for path in part_files {
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => {
+                stats.unreadable_parts += 1;
+                continue;
+            }
+        };
+        let part = match serde_json::from_str::<PartInfo>(&content) {
+            Ok(part) => part,
+            Err(_) => {
+                stats.invalid_parts += 1;
+                continue;
+            }
+        };
+        parts.push(part);
+    }
+
+    parts
+}
+
+/// Load messages for export, returning them as JSON values shaped for the exporter.
+fn load_messages_for_export(
+    session_msg_dir: &std::path::Path,
+    part_dir: &std::path::Path,
+    include_tools: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let mut messages = Vec::new();
+    let mut stats = ExportReadStats::default();
+
+    // Find all message files for this session
+    let mut msg_files: Vec<PathBuf> = WalkDir::new(session_msg_dir)
+        .max_depth(1)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    msg_files.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+
+    for (file_index, msg_file) in msg_files.into_iter().enumerate() {
+        let content = match fs::read_to_string(&msg_file) {
+            Ok(c) => c,
+            Err(_) => {
+                stats.unreadable_messages += 1;
+                continue;
+            }
+        };
+
+        let msg_info: MessageInfo = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => {
+                stats.invalid_messages += 1;
+                continue;
+            }
+        };
+
+        // Get parts for this message
+        let parts = load_parts_for_message(part_dir, &msg_info.id, &mut stats);
+        let has_tool_parts = parts
+            .iter()
+            .any(|part| part.part_type.as_deref() == Some("tool"));
+
+        // Assemble message content from parts (with tool filtering)
+        let content_text = assemble_content_for_export(&parts, include_tools);
+        if content_text.trim().is_empty() && (include_tools || !has_tool_parts) {
+            continue;
+        }
+
+        // Determine role
+        let role = msg_info
+            .role
+            .clone()
+            .unwrap_or_else(|| "assistant".to_string());
+
+        // Determine timestamp
+        let timestamp = msg_info.time.as_ref().and_then(|t| t.created);
+
+        // Build export-ready JSON value
+        let mut msg_json = serde_json::json!({
+            "role": role,
+            "content": content_text,
+        });
+
+        if let Some(ts) = timestamp {
+            msg_json["timestamp"] = serde_json::json!(ts);
+        }
+
+        if let Some(model) = &msg_info.model_id {
+            msg_json["model"] = serde_json::json!(model);
+        }
+
+        messages.push((timestamp.unwrap_or(i64::MAX), file_index, msg_json));
+    }
+
+    emit_export_warnings(&stats, session_msg_dir);
+
+    // Sort by timestamp, then by file order for stability
+    messages.sort_by_key(|(ts, file_index, _)| (*ts, *file_index));
+
+    Ok(messages.into_iter().map(|(_, _, msg)| msg).collect())
+}
+
+/// Assemble message content from parts for export, with tool filtering.
+fn assemble_content_for_export(parts: &[PartInfo], include_tools: bool) -> String {
+    let mut content_pieces: Vec<String> = Vec::new();
+
+    for part in parts {
+        match part.part_type.as_deref() {
+            Some("text") => {
+                if let Some(text) = &part.text
+                    && !text.trim().is_empty()
+                {
+                    content_pieces.push(text.clone());
+                }
+            }
+            Some("tool") => {
+                // Only include tool output if include_tools is true
+                if include_tools
+                    && let Some(state) = &part.state
+                    && let Some(output) = &state.output
+                    && !output.trim().is_empty()
+                {
+                    content_pieces.push(format!("[Tool Output]\n{}", output));
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = &part.text
+                    && !text.trim().is_empty()
+                {
+                    content_pieces.push(format!("[Reasoning]\n{}", text));
+                }
+            }
+            Some("patch") => {
+                if let Some(text) = &part.text
+                    && !text.trim().is_empty()
+                {
+                    content_pieces.push(format!("[Patch]\n{}", text));
+                }
+            }
+            // Ignore step-start, step-finish, and other control parts
+            _ => {}
+        }
+    }
+
+    content_pieces.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,5 +1627,371 @@ mod tests {
         assert_eq!(result.id, "minimal");
         assert!(result.title.is_none());
         assert!(result.directory.is_none());
+    }
+
+    // =====================================================
+    // load_session_for_export() Tests
+    // =====================================================
+
+    #[test]
+    fn export_loads_opencode_session_messages() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        // Create session
+        let session = json!({
+            "id": "sess-export",
+            "title": "Export Test",
+            "projectID": "proj-export",
+            "time": { "created": 1733000000, "updated": 1733000100 }
+        });
+        write_session(&storage, "proj-export", &session);
+
+        // Create message
+        let message = json!({
+            "id": "msg-export",
+            "role": "user",
+            "sessionID": "sess-export",
+            "time": { "created": 1733000000 }
+        });
+        write_message(&storage, "sess-export", &message);
+
+        // Create text part
+        let part = json!({
+            "id": "part-export",
+            "messageID": "msg-export",
+            "type": "text",
+            "text": "Hello from export!"
+        });
+        write_part(&storage, "msg-export", &part);
+
+        let session_path = storage
+            .join("session")
+            .join("proj-export")
+            .join("sess-export.json");
+
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0]["role"], "user");
+                assert!(
+                    messages[0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Hello from export!")
+                );
+                assert!(messages[0]["timestamp"].as_i64().is_some());
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_loads_session_without_project_id() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        // Create session with no projectID field
+        let session = json!({
+            "id": "sess-no-projid",
+            "title": "Export Test"
+        });
+        write_session(&storage, "proj-no-projid", &session);
+
+        // Create message
+        let message = json!({
+            "id": "msg-no-projid",
+            "role": "user",
+            "sessionID": "sess-no-projid",
+            "time": { "created": 1733000000 }
+        });
+        write_message(&storage, "sess-no-projid", &message);
+
+        // Create text part
+        let part = json!({
+            "id": "part-no-projid",
+            "messageID": "msg-no-projid",
+            "type": "text",
+            "text": "Hello without projectID!"
+        });
+        write_part(&storage, "msg-no-projid", &part);
+
+        let session_path = storage
+            .join("session")
+            .join("proj-no-projid")
+            .join("sess-no-projid.json");
+
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                assert!(
+                    messages[0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Hello without projectID!")
+                );
+                assert_eq!(messages[0]["timestamp"].as_i64(), Some(1733000000));
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_preserves_file_order_for_equal_timestamps() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        let session = json!({
+            "id": "sess-order",
+            "title": "Order Test",
+            "projectID": "proj-order"
+        });
+        write_session(&storage, "proj-order", &session);
+
+        let message_a = json!({
+            "id": "msg-a",
+            "role": "user",
+            "sessionID": "sess-order",
+            "time": { "created": 1733000000 }
+        });
+        let message_b = json!({
+            "id": "msg-b",
+            "role": "assistant",
+            "sessionID": "sess-order",
+            "time": { "created": 1733000000 }
+        });
+
+        // Write message_b first to ensure file order tie-break uses filename ordering.
+        write_message(&storage, "sess-order", &message_b);
+        write_message(&storage, "sess-order", &message_a);
+
+        let part_a = json!({
+            "id": "part-a",
+            "messageID": "msg-a",
+            "type": "text",
+            "text": "First"
+        });
+        let part_b = json!({
+            "id": "part-b",
+            "messageID": "msg-b",
+            "type": "text",
+            "text": "Second"
+        });
+        write_part(&storage, "msg-a", &part_a);
+        write_part(&storage, "msg-b", &part_b);
+
+        let session_path = storage
+            .join("session")
+            .join("proj-order")
+            .join("sess-order.json");
+
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::Messages(messages) => {
+                assert_eq!(messages.len(), 2);
+                let first = messages[0]["content"].as_str().unwrap();
+                let second = messages[1]["content"].as_str().unwrap();
+                assert_eq!(first, "First");
+                assert_eq!(second, "Second");
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_excludes_tools_when_include_tools_false() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        // Create session
+        let session = json!({
+            "id": "sess-tools",
+            "title": "Tools Test",
+            "projectID": "proj-tools"
+        });
+        write_session(&storage, "proj-tools", &session);
+
+        // Create assistant message
+        let message = json!({
+            "id": "msg-tools",
+            "role": "assistant",
+            "sessionID": "sess-tools",
+            "time": { "created": 1733000000 }
+        });
+        write_message(&storage, "sess-tools", &message);
+
+        // Create text part
+        let text_part = json!({
+            "id": "part-text",
+            "messageID": "msg-tools",
+            "type": "text",
+            "text": "Let me check that file."
+        });
+        write_part(&storage, "msg-tools", &text_part);
+
+        // Create tool part
+        let tool_part = json!({
+            "id": "part-tool",
+            "messageID": "msg-tools",
+            "type": "tool",
+            "state": { "output": "file.txt contents here" }
+        });
+        write_part(&storage, "msg-tools", &tool_part);
+
+        let session_path = storage
+            .join("session")
+            .join("proj-tools")
+            .join("sess-tools.json");
+
+        // With include_tools=false, tool output should be excluded
+        match load_session_for_export(&session_path, false) {
+            OpenCodeExportResult::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                let content = messages[0]["content"].as_str().unwrap();
+                assert!(content.contains("Let me check that file."));
+                assert!(!content.contains("Tool Output"));
+                assert!(!content.contains("file.txt contents here"));
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // With include_tools=true, tool output should be included
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::Messages(messages) => {
+                let content = messages[0]["content"].as_str().unwrap();
+                assert!(content.contains("Let me check that file."));
+                assert!(content.contains("[Tool Output]"));
+                assert!(content.contains("file.txt contents here"));
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_keeps_tool_only_message_when_tools_excluded() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        // Create session
+        let session = json!({
+            "id": "sess-tool-only",
+            "title": "Tool Only",
+            "projectID": "proj-tool-only"
+        });
+        write_session(&storage, "proj-tool-only", &session);
+
+        // Create assistant message
+        let message = json!({
+            "id": "msg-tool-only",
+            "role": "assistant",
+            "sessionID": "sess-tool-only",
+            "time": { "created": 1733000000 }
+        });
+        write_message(&storage, "sess-tool-only", &message);
+
+        // Create tool part only
+        let tool_part = json!({
+            "id": "part-tool-only",
+            "messageID": "msg-tool-only",
+            "type": "tool",
+            "state": { "output": "hidden output" }
+        });
+        write_part(&storage, "msg-tool-only", &tool_part);
+
+        let session_path = storage
+            .join("session")
+            .join("proj-tool-only")
+            .join("sess-tool-only.json");
+
+        match load_session_for_export(&session_path, false) {
+            OpenCodeExportResult::Messages(messages) => {
+                assert_eq!(messages.len(), 1);
+                let content = messages[0]["content"].as_str().unwrap_or("");
+                assert!(content.is_empty());
+            }
+            other => panic!(
+                "Expected Messages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_returns_invalid_session_json_for_opencode_layout() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+        let session_dir = storage.join("session").join("proj-invalid");
+        fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("sess-invalid.json");
+        fs::write(&session_path, "{not-json").unwrap();
+
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::InvalidSessionJson { path, .. } => {
+                assert_eq!(path, session_path);
+            }
+            other => panic!(
+                "Expected InvalidSessionJson, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_returns_not_opencode_for_non_session_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("random.json");
+        fs::write(&path, r#"{"some": "json"}"#).unwrap();
+
+        match load_session_for_export(&path, true) {
+            OpenCodeExportResult::NotOpenCode => {}
+            other => panic!(
+                "Expected NotOpenCode, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn export_returns_missing_message_dir_when_no_messages() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_opencode_storage(&dir);
+
+        // Create session but NO message directory for this session
+        let session = json!({
+            "id": "sess-nomsg",
+            "title": "No Messages",
+            "projectID": "proj-nomsg"
+        });
+        write_session(&storage, "proj-nomsg", &session);
+        // Don't create the message directory
+
+        let session_path = storage
+            .join("session")
+            .join("proj-nomsg")
+            .join("sess-nomsg.json");
+
+        match load_session_for_export(&session_path, true) {
+            OpenCodeExportResult::MissingMessageDir { session_id, .. } => {
+                assert_eq!(session_id, "sess-nomsg");
+            }
+            other => panic!(
+                "Expected MissingMessageDir, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
     }
 }

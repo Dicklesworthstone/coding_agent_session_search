@@ -6581,45 +6581,103 @@ fn run_export(
         });
     }
 
-    let file = File::open(path).map_err(|e| CliError {
-        code: 9,
-        kind: "file-open",
-        message: format!("Failed to open file: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let reader = BufReader::new(file);
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut session_title: Option<String> = None;
     let mut session_start: Option<i64> = None;
     let mut session_end: Option<i64> = None;
 
-    for line in reader.lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
-                if session_start.is_none() || ts < session_start.unwrap() {
-                    session_start = Some(ts);
-                }
-                if session_end.is_none() || ts > session_end.unwrap() {
-                    session_end = Some(ts);
+    // Try OpenCode split storage format first
+    use crate::connectors::opencode::{OpenCodeExportResult, load_session_for_export};
+    match load_session_for_export(path, include_tools) {
+        OpenCodeExportResult::Messages(opencode_messages) => {
+            if opencode_messages.is_empty() {
+                return Err(CliError {
+                    code: 9,
+                    kind: "empty-session",
+                    message: format!("No messages found in: {}", path.display()),
+                    hint: Some(
+                        "This appears to be an OpenCode session but contains no messages"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+            for msg in &opencode_messages {
+                if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
+                    if session_start.is_none() || ts < session_start.unwrap() {
+                        session_start = Some(ts);
+                    }
+                    if session_end.is_none() || ts > session_end.unwrap() {
+                        session_end = Some(ts);
+                    }
                 }
             }
-            messages.push(msg);
+            messages = opencode_messages;
         }
-    }
+        OpenCodeExportResult::MissingMessageDir {
+            session_id,
+            expected_path,
+        } => {
+            return Err(CliError {
+                code: 9,
+                kind: "missing-message-dir",
+                message: format!(
+                    "OpenCode session '{}' found but message directory is missing",
+                    session_id
+                ),
+                hint: Some(format!("Expected messages at: {}", expected_path.display())),
+                retryable: false,
+            });
+        }
+        OpenCodeExportResult::InvalidSessionJson { path, error } => {
+            return Err(CliError {
+                code: 9,
+                kind: "invalid-session-json",
+                message: format!("Failed to parse OpenCode session JSON: {}", path.display()),
+                hint: Some(error),
+                retryable: false,
+            });
+        }
+        OpenCodeExportResult::NotOpenCode => {
+            let file = File::open(path).map_err(|e| CliError {
+                code: 9,
+                kind: "file-open",
+                message: format!("Failed to open file: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
 
-    if messages.is_empty() {
-        return Err(CliError {
-            code: 9,
-            kind: "empty-session",
-            message: format!("No messages found in: {}", path.display()),
-            hint: None,
-            retryable: false,
-        });
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
+                        if session_start.is_none() || ts < session_start.unwrap() {
+                            session_start = Some(ts);
+                        }
+                        if session_end.is_none() || ts > session_end.unwrap() {
+                            session_end = Some(ts);
+                        }
+                    }
+                    messages.push(msg);
+                }
+            }
+
+            if messages.is_empty() {
+                return Err(CliError {
+                    code: 9,
+                    kind: "empty-session",
+                    message: format!("No messages found in: {}", path.display()),
+                    hint: Some(
+                        "File should be JSONL (one message per line) or an OpenCode session file"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+        }
     }
 
     // Find title from first user message
