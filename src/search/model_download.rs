@@ -160,18 +160,9 @@ impl ModelManifest {
                         .into(),
                     size: 612,
                 },
-                ModelFile {
-                    name: "special_tokens_map.json".into(),
-                    sha256: "e7b0375b8e9c88f72e2e3a5e3f2b0b8f3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9"
-                        .into(),
-                    size: 112,
-                },
-                ModelFile {
-                    name: "tokenizer_config.json".into(),
-                    sha256: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
-                        .into(),
-                    size: 350,
-                },
+                // Note: special_tokens_map.json and tokenizer_config.json are optional
+                // metadata files that FastEmbed can work without. We only require the
+                // three core files: model.onnx, tokenizer.json, and config.json.
             ],
             license: "Apache-2.0".into(),
         }
@@ -360,12 +351,20 @@ impl ModelDownloader {
             let file_path = self.temp_dir.join(&file.name);
             let url = manifest.download_url(file);
 
+            // Track bytes_downloaded at start of this file to reset on retry
+            let bytes_before_file = bytes_downloaded.load(Ordering::SeqCst);
+
             // Download with retries
             let mut last_error = None;
             for attempt in 0..self.max_retries {
                 if self.is_cancelled() {
                     self.cleanup_temp();
                     return Err(DownloadError::Cancelled);
+                }
+
+                // Reset byte counter to before this file on retry (avoid double-counting)
+                if attempt > 0 {
+                    bytes_downloaded.store(bytes_before_file, Ordering::SeqCst);
                 }
 
                 // Exponential backoff delay (except first attempt)
