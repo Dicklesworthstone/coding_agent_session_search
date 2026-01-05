@@ -624,6 +624,359 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
     hosts
 }
 
+// =============================================================================
+// Source Configuration Generator
+// =============================================================================
+
+use std::collections::HashSet;
+
+use chrono::Utc;
+use colored::Colorize;
+
+use super::probe::HostProbeResult;
+
+/// Result of merging a source into existing configuration.
+#[derive(Debug, Clone)]
+pub enum MergeResult {
+    /// Source was added successfully.
+    Added(SourceDefinition),
+    /// Source already exists with this name.
+    AlreadyExists(String),
+}
+
+/// Reason why a source was skipped during config generation.
+#[derive(Debug, Clone)]
+pub enum SkipReason {
+    /// Already configured in sources.toml.
+    AlreadyConfigured,
+    /// Probe failed (unreachable, timeout, etc.).
+    ProbeFailure(String),
+    /// User deselected this host.
+    UserDeselected,
+}
+
+/// Information about a backup created before config modification.
+#[derive(Debug, Clone)]
+pub struct BackupInfo {
+    /// Path to the backup file (None if no existing config).
+    pub backup_path: Option<PathBuf>,
+    /// Path to the config file.
+    pub config_path: PathBuf,
+}
+
+/// Preview of configuration changes before writing.
+#[derive(Debug, Clone)]
+pub struct ConfigPreview {
+    /// Sources that will be added.
+    pub sources_to_add: Vec<SourceDefinition>,
+    /// Sources that were skipped with reasons.
+    pub sources_skipped: Vec<(String, SkipReason)>,
+}
+
+impl ConfigPreview {
+    /// Create a new empty preview.
+    pub fn new() -> Self {
+        Self {
+            sources_to_add: Vec::new(),
+            sources_skipped: Vec::new(),
+        }
+    }
+
+    /// Display the preview to the user.
+    pub fn display(&self) {
+        println!();
+        println!("{}", "Configuration Preview".bold().underline());
+        println!("  The following will be added to sources.toml:\n");
+
+        for source in &self.sources_to_add {
+            println!("  {}:", source.name.cyan());
+            println!("    {}:", "Paths".dimmed());
+            for path in &source.paths {
+                println!("      {}", path);
+            }
+            if !source.path_mappings.is_empty() {
+                println!("    {}:", "Mappings".dimmed());
+                for mapping in &source.path_mappings {
+                    println!("      {} → {}", mapping.from, mapping.to);
+                }
+            }
+            println!();
+        }
+
+        if !self.sources_skipped.is_empty() {
+            println!("  {}:", "Skipped".dimmed());
+            for (name, reason) in &self.sources_skipped {
+                let reason_str = match reason {
+                    SkipReason::AlreadyConfigured => "already configured",
+                    SkipReason::ProbeFailure(e) => e.as_str(),
+                    SkipReason::UserDeselected => "not selected",
+                };
+                println!("    {} - {}", name.dimmed(), reason_str.dimmed());
+            }
+        }
+    }
+
+    /// Check if there are any sources to add.
+    pub fn has_changes(&self) -> bool {
+        !self.sources_to_add.is_empty()
+    }
+
+    /// Get the count of sources to add.
+    pub fn add_count(&self) -> usize {
+        self.sources_to_add.len()
+    }
+}
+
+impl Default for ConfigPreview {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Generator for creating source configurations from probe results.
+///
+/// Takes probe results and generates appropriate `SourceDefinition` objects
+/// with intelligent path and mapping defaults.
+pub struct SourceConfigGenerator {
+    /// Local home directory for mapping generation.
+    local_home: PathBuf,
+}
+
+impl SourceConfigGenerator {
+    /// Create a new config generator.
+    pub fn new() -> Self {
+        Self {
+            local_home: dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")),
+        }
+    }
+
+    /// Generate a complete SourceDefinition from a probe result.
+    ///
+    /// # Arguments
+    /// * `host_name` - The SSH config host alias
+    /// * `probe` - The probe result containing system and agent info
+    pub fn generate_source(&self, host_name: &str, probe: &HostProbeResult) -> SourceDefinition {
+        let paths = self.generate_paths(probe);
+        let path_mappings = self.generate_mappings(probe);
+        let platform = self.detect_platform(probe);
+
+        SourceDefinition {
+            name: host_name.to_string(),
+            source_type: SourceKind::Ssh,
+            host: Some(host_name.to_string()), // Use SSH alias
+            paths,
+            sync_schedule: SyncSchedule::Manual,
+            path_mappings,
+            platform,
+        }
+    }
+
+    /// Generate paths based on detected agent data.
+    ///
+    /// Only includes paths where agent data was actually detected,
+    /// rather than guessing all possible paths.
+    fn generate_paths(&self, probe: &HostProbeResult) -> Vec<String> {
+        let mut paths = Vec::new();
+
+        for agent in &probe.detected_agents {
+            // Use the detected path directly
+            paths.push(agent.path.clone());
+        }
+
+        // Deduplicate while preserving order
+        let mut seen = HashSet::new();
+        paths.retain(|p| seen.insert(p.clone()));
+
+        paths
+    }
+
+    /// Generate path mappings for workspace rewriting.
+    ///
+    /// Creates mappings from remote paths to local equivalents:
+    /// - Remote home/projects → Local home/projects
+    /// - /data/projects → Local home/projects (common server pattern)
+    fn generate_mappings(&self, probe: &HostProbeResult) -> Vec<PathMapping> {
+        let mut mappings = Vec::new();
+
+        // Get remote home from system info
+        if let Some(ref sys_info) = probe.system_info {
+            let remote_home = &sys_info.remote_home;
+
+            // Don't create mappings if remote_home is empty or root
+            if !remote_home.is_empty() && remote_home != "/" {
+                // Map remote home/projects to local home/projects
+                let remote_projects = format!("{}/projects", remote_home);
+                let local_projects = self.local_home.join("projects");
+
+                mappings.push(PathMapping::new(
+                    remote_projects,
+                    local_projects.to_string_lossy().to_string(),
+                ));
+
+                // Also map remote home directly (more general fallback)
+                mappings.push(PathMapping::new(
+                    remote_home.clone(),
+                    self.local_home.to_string_lossy().to_string(),
+                ));
+            }
+        }
+
+        // Check for /data/projects pattern (common on servers)
+        let has_data_projects = probe
+            .detected_agents
+            .iter()
+            .any(|a| a.path.starts_with("/data/"));
+
+        if has_data_projects {
+            let local_projects = self.local_home.join("projects");
+            mappings.push(PathMapping::new(
+                "/data/projects",
+                local_projects.to_string_lossy().to_string(),
+            ));
+        }
+
+        mappings
+    }
+
+    /// Detect platform from probe results.
+    fn detect_platform(&self, probe: &HostProbeResult) -> Option<Platform> {
+        probe.system_info.as_ref().and_then(|si| {
+            match si.os.to_lowercase().as_str() {
+                "darwin" => Some(Platform::Macos),
+                "linux" => Some(Platform::Linux),
+                "windows" => Some(Platform::Windows),
+                _ => None,
+            }
+        })
+    }
+
+    /// Generate a ConfigPreview from probe results.
+    ///
+    /// # Arguments
+    /// * `probes` - List of (host_name, probe_result) tuples for selected hosts
+    /// * `already_configured` - Set of host names already in sources.toml
+    pub fn generate_preview(
+        &self,
+        probes: &[(&str, &HostProbeResult)],
+        already_configured: &HashSet<String>,
+    ) -> ConfigPreview {
+        let mut preview = ConfigPreview::new();
+
+        for (host_name, probe) in probes {
+            // Skip if already configured
+            if already_configured.contains(*host_name) {
+                preview
+                    .sources_skipped
+                    .push((host_name.to_string(), SkipReason::AlreadyConfigured));
+                continue;
+            }
+
+            // Skip if probe failed
+            if !probe.reachable {
+                let reason = probe
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unreachable".to_string());
+                preview
+                    .sources_skipped
+                    .push((host_name.to_string(), SkipReason::ProbeFailure(reason)));
+                continue;
+            }
+
+            // Generate source definition
+            let source = self.generate_source(host_name, probe);
+            preview.sources_to_add.push(source);
+        }
+
+        preview
+    }
+}
+
+impl Default for SourceConfigGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SourcesConfig {
+    /// Write configuration with backup.
+    ///
+    /// Creates a timestamped backup of the existing config (if any)
+    /// before writing the new configuration atomically.
+    pub fn write_with_backup(&self) -> Result<BackupInfo, ConfigError> {
+        let config_path = Self::config_path()?;
+
+        // Create parent directories if needed
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Create backup if file exists
+        let backup_path = if config_path.exists() {
+            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+            let backup = config_path.with_extension(format!("toml.backup.{}", timestamp));
+            std::fs::copy(&config_path, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+
+        // Validate TOML before writing (round-trip check)
+        let toml_str = toml::to_string_pretty(self)?;
+        let _: SourcesConfig = toml::from_str(&toml_str)?; // Round-trip validation
+
+        // Write atomically (temp file + rename)
+        let temp_path = config_path.with_extension("toml.tmp");
+        std::fs::write(&temp_path, &toml_str)?;
+        std::fs::rename(&temp_path, &config_path)?;
+
+        Ok(BackupInfo {
+            backup_path,
+            config_path,
+        })
+    }
+
+    /// Merge a source into the configuration.
+    ///
+    /// Returns `MergeResult::Added` if the source was added,
+    /// or `MergeResult::AlreadyExists` if a source with the same name exists.
+    pub fn merge_source(&mut self, source: SourceDefinition) -> Result<MergeResult, ConfigError> {
+        // Validate the source first
+        source.validate()?;
+
+        // Check if already exists
+        if self.sources.iter().any(|s| s.name == source.name) {
+            return Ok(MergeResult::AlreadyExists(source.name));
+        }
+
+        let added = source.clone();
+        self.sources.push(source);
+        Ok(MergeResult::Added(added))
+    }
+
+    /// Merge multiple sources from a preview.
+    ///
+    /// Returns a tuple of (added_count, skipped_names).
+    pub fn merge_preview(&mut self, preview: &ConfigPreview) -> Result<(usize, Vec<String>), ConfigError> {
+        let mut added = 0;
+        let mut skipped = Vec::new();
+
+        for source in &preview.sources_to_add {
+            match self.merge_source(source.clone())? {
+                MergeResult::Added(_) => added += 1,
+                MergeResult::AlreadyExists(name) => skipped.push(name),
+            }
+        }
+
+        Ok((added, skipped))
+    }
+
+    /// Get set of configured source names.
+    pub fn configured_names(&self) -> HashSet<String> {
+        self.sources.iter().map(|s| s.name.clone()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,5 +1263,201 @@ mod tests {
         for host in hosts {
             assert!(!host.name.is_empty());
         }
+    }
+
+    // ==========================================================================
+    // Source Config Generator Tests
+    // ==========================================================================
+
+    use super::super::probe::{CassStatus, DetectedAgent, HostProbeResult, SystemInfo};
+
+    fn make_test_probe(
+        reachable: bool,
+        agents: Vec<DetectedAgent>,
+        sys_info: Option<SystemInfo>,
+    ) -> HostProbeResult {
+        HostProbeResult {
+            host_name: "test-host".into(),
+            reachable,
+            connection_time_ms: 100,
+            cass_status: CassStatus::NotFound,
+            detected_agents: agents,
+            system_info: sys_info,
+            resources: None,
+            error: if reachable {
+                None
+            } else {
+                Some("connection refused".into())
+            },
+        }
+    }
+
+    fn make_test_agent(agent_type: &str, path: &str) -> DetectedAgent {
+        DetectedAgent {
+            agent_type: agent_type.into(),
+            path: path.into(),
+            estimated_sessions: Some(100),
+            estimated_size_mb: Some(50),
+        }
+    }
+
+    fn make_test_sys_info(os: &str, remote_home: &str) -> SystemInfo {
+        SystemInfo {
+            os: os.into(),
+            arch: "x86_64".into(),
+            distro: Some("Ubuntu 22.04".into()),
+            has_cargo: true,
+            has_cargo_binstall: true,
+            has_curl: true,
+            has_wget: true,
+            remote_home: remote_home.into(),
+        }
+    }
+
+    #[test]
+    fn test_source_config_generator_new() {
+        let generator = SourceConfigGenerator::new();
+        assert!(!generator.local_home.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_generate_source_basic() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/ubuntu")),
+        );
+
+        let source = generator.generate_source("my-server", &probe);
+
+        assert_eq!(source.name, "my-server");
+        assert_eq!(source.source_type, SourceKind::Ssh);
+        assert_eq!(source.host, Some("my-server".into()));
+        assert_eq!(source.sync_schedule, SyncSchedule::Manual);
+        assert!(!source.paths.is_empty());
+        assert!(source.paths.contains(&"~/.claude/projects".to_string()));
+    }
+
+    #[test]
+    fn test_generate_source_deduplicates_paths() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![
+                make_test_agent("claude", "~/.claude/projects"),
+                make_test_agent("claude-2", "~/.claude/projects"), // Duplicate
+            ],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let source = generator.generate_source("server", &probe);
+        assert_eq!(source.paths.len(), 1);
+    }
+
+    #[test]
+    fn test_generate_source_path_mappings() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/ubuntu")),
+        );
+
+        let source = generator.generate_source("server", &probe);
+        assert!(!source.path_mappings.is_empty());
+        assert!(source.path_mappings.iter().any(|m| m.from.contains("/home/ubuntu")));
+    }
+
+    #[test]
+    fn test_generate_source_platform_detection() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(true, vec![], Some(make_test_sys_info("linux", "/home/user")));
+        let source = generator.generate_source("server", &probe);
+        assert_eq!(source.platform, Some(Platform::Linux));
+    }
+
+    #[test]
+    fn test_generate_preview_basic() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("server1", &probe)];
+        let preview = generator.generate_preview(&probes, &HashSet::new());
+
+        assert_eq!(preview.sources_to_add.len(), 1);
+        assert!(preview.sources_skipped.is_empty());
+        assert!(preview.has_changes());
+    }
+
+    #[test]
+    fn test_generate_preview_skips_already_configured() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("server1", &probe)];
+        let mut configured = HashSet::new();
+        configured.insert("server1".to_string());
+
+        let preview = generator.generate_preview(&probes, &configured);
+        assert!(preview.sources_to_add.is_empty());
+        assert_eq!(preview.sources_skipped.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_source() {
+        let mut config = SourcesConfig::default();
+        let source = SourceDefinition::ssh("new-server", "user@server");
+
+        let result = config.merge_source(source).unwrap();
+        assert!(matches!(result, MergeResult::Added(_)));
+        assert_eq!(config.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_source_already_exists() {
+        let mut config = SourcesConfig::default();
+        config.sources.push(SourceDefinition::ssh("server", "host"));
+
+        let source = SourceDefinition::ssh("server", "other-host");
+        let result = config.merge_source(source).unwrap();
+        assert!(matches!(result, MergeResult::AlreadyExists(_)));
+        assert_eq!(config.sources.len(), 1);
+    }
+
+    #[test]
+    fn test_configured_names() {
+        let mut config = SourcesConfig::default();
+        config.sources.push(SourceDefinition::ssh("server1", "h1"));
+        config.sources.push(SourceDefinition::ssh("server2", "h2"));
+
+        let names = config.configured_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("server1"));
+        assert!(names.contains("server2"));
+    }
+
+    #[test]
+    fn test_empty_remote_home_no_mappings() {
+        let generator = SourceConfigGenerator::new();
+        let mut sys_info = make_test_sys_info("linux", "");
+        sys_info.remote_home = "".into();
+
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(sys_info),
+        );
+
+        let source = generator.generate_source("server", &probe);
+        assert!(source.path_mappings.is_empty());
     }
 }
