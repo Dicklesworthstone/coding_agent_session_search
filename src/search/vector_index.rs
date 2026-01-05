@@ -1470,4 +1470,38 @@ mod tests {
         let err = parse_role_codes(["unknown"]);
         assert!(err.is_err());
     }
+
+    #[test]
+    fn search_respects_role_filter() -> Result<()> {
+        // Sample entries have: msg1=role 0 (user), msg2=role 1 (assistant), msg3=role 1 (assistant)
+        let entries = sample_entries();
+        let index = VectorIndex::build("hash-3", "rev", 3, Quantization::F32, entries)?;
+
+        // Filter to user role only (role 0)
+        let filter = SemanticFilter {
+            roles: Some(HashSet::from([ROLE_USER])),
+            ..Default::default()
+        };
+        let results = index.search_top_k(&[1.0, 0.0, 0.0], 5, Some(&filter))?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, 1); // Only message with role 0
+
+        // Filter to assistant role only (role 1)
+        let filter = SemanticFilter {
+            roles: Some(HashSet::from([ROLE_ASSISTANT])),
+            ..Default::default()
+        };
+        let results = index.search_top_k(&[0.0, 1.0, 0.0], 5, Some(&filter))?;
+        assert_eq!(results.len(), 2); // Messages 2 and 3 have role 1
+
+        // Filter to both roles - should get all 3
+        let filter = SemanticFilter {
+            roles: Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT])),
+            ..Default::default()
+        };
+        let results = index.search_top_k(&[0.5, 0.5, 0.0], 5, Some(&filter))?;
+        assert_eq!(results.len(), 3);
+
+        Ok(())
+    }
 }
