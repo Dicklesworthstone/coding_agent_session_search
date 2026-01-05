@@ -7330,11 +7330,6 @@ pub fn run_tui(
                     needs_draw = true;
                 }
             }
-            // Tick toast manager to expire old notifications (bead 2yg2)
-            toast_manager.tick();
-            if !toast_manager.is_empty() {
-                needs_draw = true; // Redraw while toasts are visible
-            }
             last_tick = Instant::now();
         }
     }
