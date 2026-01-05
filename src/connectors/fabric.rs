@@ -473,7 +473,7 @@ impl FabricConnector {
 impl Connector for FabricConnector {
     fn detect(&self) -> DetectionResult {
         let mut evidence = Vec::new();
-        let mut root_paths = Vec::new();
+        let mut project_set = HashSet::new();
 
         // Check app support directory
         if let Some(app_dir) = Self::app_support_dir()
@@ -487,24 +487,26 @@ impl Connector for FabricConnector {
             }
         }
 
-        // Discover projects from app support
+        // Discover projects from app support (window-projects.json)
         let discovered = Self::discover_projects_from_app_support();
-        for project in &discovered {
-            evidence.push(format!("Found Fabric project: {}", project.display()));
-            root_paths.push(project.clone());
+        for project in discovered {
+            evidence.push(format!("Found Fabric project (config): {}", project.display()));
+            project_set.insert(project);
         }
 
-        // Fallback: scan common directories if nothing found
-        if root_paths.is_empty() {
-            let scanned = Self::scan_common_directories();
-            for project in scanned {
+        // ALWAYS scan common directories to find additional projects
+        // This catches projects not listed in window-projects.json
+        let scanned = Self::scan_common_directories();
+        for project in scanned {
+            if project_set.insert(project.clone()) {
                 evidence.push(format!(
                     "Found Fabric project (scanned): {}",
                     project.display()
                 ));
-                root_paths.push(project);
             }
         }
+
+        let root_paths: Vec<PathBuf> = project_set.into_iter().collect();
 
         DetectionResult {
             detected: !root_paths.is_empty(),
@@ -518,12 +520,15 @@ impl Connector for FabricConnector {
 
         // Determine which roots to scan
         let roots: Vec<PathBuf> = if ctx.use_default_detection() {
-            // Use automatic detection
-            let mut roots = Self::discover_projects_from_app_support();
-            if roots.is_empty() {
-                roots = Self::scan_common_directories();
+            // Use automatic detection - combine BOTH methods
+            let mut project_set = HashSet::new();
+            for p in Self::discover_projects_from_app_support() {
+                project_set.insert(p);
             }
-            roots
+            for p in Self::scan_common_directories() {
+                project_set.insert(p);
+            }
+            project_set.into_iter().collect()
         } else {
             // Use explicit scan roots from config
             ctx.scan_roots.iter().map(|r| r.path.clone()).collect()
