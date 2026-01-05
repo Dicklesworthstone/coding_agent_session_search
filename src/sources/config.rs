@@ -161,6 +161,12 @@ pub struct SourceDefinition {
     /// Platform hint for default paths (macos, linux).
     #[serde(default)]
     pub platform: Option<Platform>,
+
+    /// Custom rsync path on remote machine.
+    /// If specified, uses --rsync-path flag to use a custom rsync binary.
+    /// Example: "/opt/homebrew/bin/rsync"
+    #[serde(default)]
+    pub rsync_path: Option<String>,
 }
 
 impl SourceDefinition {

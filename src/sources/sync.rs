@@ -327,7 +327,7 @@ impl SyncEngine {
         for remote_path in &source.paths {
             let result = match method {
                 SyncMethod::Rsync => {
-                    self.sync_path_rsync(host, remote_path, &mirror_dir, remote_home.as_deref())
+                    self.sync_path_rsync(host, remote_path, &mirror_dir, remote_home.as_deref(), source.rsync_path.as_deref())
                 }
                 SyncMethod::Sftp => self.sync_path_sftp(host, remote_path, &mirror_dir),
             };
@@ -360,12 +360,15 @@ impl SyncEngine {
     ///
     /// The `remote_home` parameter should be pre-fetched via `get_remote_home()` to avoid
     /// repeated SSH calls for each path.
+    ///
+    /// The `rsync_path` parameter specifies a custom rsync binary path on the remote machine.
     fn sync_path_rsync(
         &self,
         host: &str,
         remote_path: &str,
         dest_dir: &Path,
         remote_home: Option<&str>,
+        rsync_path: Option<&str>,
     ) -> PathSyncResult {
         let start = Instant::now();
 
@@ -412,6 +415,14 @@ impl SyncEngine {
             "--protect-args", // Preserve spaces/special chars in remote paths
             "--timeout",
             &self.transfer_timeout.to_string(),
+        ]);
+
+        // Add custom rsync path if specified
+        if let Some(path) = rsync_path {
+            cmd.arg("--rsync-path").arg(path);
+        }
+
+        cmd.args([
             "-e",
             &ssh_opts,
             "--",
