@@ -39,8 +39,17 @@ resolve_version() {
     VERSION="$tag"
     info "Resolved latest version: $VERSION"
   else
-    VERSION="v0.1.0"
-    warn "Could not resolve latest version from GitHub API; defaulting to $VERSION"
+    # Try redirect-based resolution as fallback
+    local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
+    if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
+      if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+        VERSION="$tag"
+        info "Resolved latest version via redirect: $VERSION"
+        return 0
+      fi
+    fi
+    VERSION="v0.1.51"
+    warn "Could not resolve latest version; defaulting to $VERSION"
   fi
 }
 

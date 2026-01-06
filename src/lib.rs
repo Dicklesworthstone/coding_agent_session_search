@@ -6561,6 +6561,218 @@ fn run_self_update(tag: &str) -> Result<bool> {
 // NEW COMMANDS: Export, Expand, Timeline
 // ============================================================================
 
+/// Detect if a path points to an OpenCode storage session file.
+/// OpenCode stores sessions in: storage/session/{projectID}/{sessionID}.json
+fn detect_opencode_session(path: &Path) -> bool {
+    // Check path components for opencode storage pattern
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str.contains("opencode") && path_str.contains("storage") && path_str.contains("session") {
+        return true;
+    }
+
+    // Check if sibling message/part directories exist (storage root)
+    if let Some(parent) = path.parent()
+        && let Some(session_dir) = parent.parent()
+        && session_dir.file_name().map(|n| n == "session").unwrap_or(false)
+        && let Some(storage_root) = session_dir.parent()
+    {
+        let message_dir = storage_root.join("message");
+        let part_dir = storage_root.join("part");
+        if message_dir.exists() || part_dir.exists() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Load an OpenCode session for export.
+/// Returns (title, start_ts, end_ts, messages as JSON values).
+#[allow(clippy::type_complexity)]
+fn load_opencode_session_for_export(
+    session_path: &Path,
+) -> anyhow::Result<(Option<String>, Option<i64>, Option<i64>, Vec<serde_json::Value>)> {
+    use anyhow::Context;
+    use std::collections::HashMap;
+    use walkdir::WalkDir;
+
+    // Parse session file
+    let session_content = std::fs::read_to_string(session_path)
+        .with_context(|| format!("read session file {}", session_path.display()))?;
+    let session: serde_json::Value = serde_json::from_str(&session_content)
+        .with_context(|| format!("parse session JSON {}", session_path.display()))?;
+
+    let session_id = session["id"]
+        .as_str()
+        .context("session missing 'id' field")?;
+    let session_title = session["title"].as_str().map(String::from);
+    let session_start = session["time"]["created"].as_i64();
+    let session_end = session["time"]["updated"].as_i64();
+
+    // Find storage root by going up from session file
+    // Path: storage/session/{projectID}/{sessionID}.json
+    let storage_root = session_path
+        .parent() // {projectID}/
+        .and_then(|p| p.parent()) // session/
+        .and_then(|p| p.parent()) // storage/
+        .context("cannot determine storage root from session path")?;
+
+    let message_dir = storage_root.join("message").join(session_id);
+    let part_dir = storage_root.join("part");
+
+    if !message_dir.exists() {
+        anyhow::bail!(
+            "message directory not found: {}",
+            message_dir.display()
+        );
+    }
+
+    // Build map of message_id -> parts
+    #[derive(serde::Deserialize, Clone)]
+    struct PartInfo {
+        #[serde(rename = "messageID")]
+        message_id: Option<String>,
+        #[serde(rename = "type")]
+        part_type: Option<String>,
+        text: Option<String>,
+        state: Option<PartState>,
+    }
+    #[derive(serde::Deserialize, Clone)]
+    struct PartState {
+        output: Option<String>,
+    }
+
+    let mut parts_by_msg: HashMap<String, Vec<PartInfo>> = HashMap::new();
+    if part_dir.exists() {
+        for entry in WalkDir::new(&part_dir).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let p = entry.path();
+            if p.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(content) = std::fs::read_to_string(p)
+                && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
+                && let Some(msg_id) = &part.message_id
+            {
+                parts_by_msg.entry(msg_id.clone()).or_default().push(part);
+            }
+        }
+    }
+
+    // Load messages
+    #[derive(serde::Deserialize)]
+    struct MsgInfo {
+        id: String,
+        role: Option<String>,
+        #[serde(rename = "modelID")]
+        model_id: Option<String>,
+        time: Option<MsgTime>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MsgTime {
+        created: Option<i64>,
+    }
+
+    let mut messages: Vec<(i64, serde_json::Value)> = Vec::new();
+
+    for entry in WalkDir::new(&message_dir)
+        .max_depth(1)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        if !p.extension().map(|e| e == "json").unwrap_or(false) {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(p) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let msg_info: MsgInfo = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Assemble content from parts
+        let parts = parts_by_msg.get(&msg_info.id).cloned().unwrap_or_default();
+        let mut content_pieces: Vec<String> = Vec::new();
+        for part in &parts {
+            match part.part_type.as_deref() {
+                Some("text") => {
+                    if let Some(text) = &part.text
+                        && !text.trim().is_empty()
+                    {
+                        content_pieces.push(text.clone());
+                    }
+                }
+                Some("tool") => {
+                    if let Some(state) = &part.state
+                        && let Some(output) = &state.output
+                        && !output.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Tool Output]\n{output}"));
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(text) = &part.text
+                        && !text.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Reasoning]\n{text}"));
+                    }
+                }
+                Some("patch") => {
+                    if let Some(text) = &part.text
+                        && !text.trim().is_empty()
+                    {
+                        content_pieces.push(format!("[Patch]\n{text}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let assembled_content = content_pieces.join("\n\n");
+        if assembled_content.trim().is_empty() {
+            continue;
+        }
+
+        let role = msg_info.role.unwrap_or_else(|| "assistant".to_string());
+        let timestamp = msg_info.time.as_ref().and_then(|t| t.created).unwrap_or(0);
+
+        // Build JSON value matching expected format for formatters
+        let msg_json = serde_json::json!({
+            "role": role,
+            "content": assembled_content,
+            "timestamp": timestamp,
+            "model": msg_info.model_id,
+        });
+
+        messages.push((timestamp, msg_json));
+    }
+
+    // Sort by timestamp
+    messages.sort_by_key(|(ts, _)| *ts);
+    let sorted_messages: Vec<serde_json::Value> = messages.into_iter().map(|(_, m)| m).collect();
+
+    // Compute timestamps from messages if not in session
+    let start = session_start.or_else(|| {
+        sorted_messages
+            .first()
+            .and_then(|m| m["timestamp"].as_i64())
+    });
+    let end = session_end.or_else(|| {
+        sorted_messages
+            .last()
+            .and_then(|m| m["timestamp"].as_i64())
+    });
+
+    Ok((session_title, start, end, sorted_messages))
+}
+
 /// Export a conversation to markdown or other formats
 fn run_export(
     path: &Path,
@@ -6581,34 +6793,63 @@ fn run_export(
         });
     }
 
-    let file = File::open(path).map_err(|e| CliError {
-        code: 9,
-        kind: "file-open",
-        message: format!("Failed to open file: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
-
-    let reader = BufReader::new(file);
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut session_title: Option<String> = None;
     let mut session_start: Option<i64> = None;
-    let mut session_end: Option<i64> = None;
+    let mut _session_end: Option<i64> = None;
 
-    for line in reader.lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
-                if session_start.is_none() || ts < session_start.unwrap() {
-                    session_start = Some(ts);
-                }
-                if session_end.is_none() || ts > session_end.unwrap() {
-                    session_end = Some(ts);
-                }
+    // Check if this is an OpenCode storage session file
+    // OpenCode stores sessions in: storage/session/{projectID}/{sessionID}.json
+    // with messages in: storage/message/{sessionID}/*.json
+    // and parts in: storage/part/{messageID}/*.json
+    let is_opencode = detect_opencode_session(path);
+
+    if is_opencode {
+        // Load OpenCode session using split storage format
+        match load_opencode_session_for_export(path) {
+            Ok((title, start, end, msgs)) => {
+                session_title = title;
+                session_start = start;
+                _session_end = end;
+                messages = msgs;
             }
-            messages.push(msg);
+            Err(e) => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "opencode-parse",
+                    message: format!("Failed to parse OpenCode session: {e}"),
+                    hint: Some("Ensure the session file is valid and message/part directories exist".into()),
+                    retryable: false,
+                });
+            }
+        }
+    } else {
+        // Standard JSONL format
+        let file = File::open(path).map_err(|e| CliError {
+            code: 9,
+            kind: "file-open",
+            message: format!("Failed to open file: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+        let reader = BufReader::new(file);
+
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
+                    if session_start.is_none() || ts < session_start.unwrap() {
+                        session_start = Some(ts);
+                    }
+                    if _session_end.is_none() || ts > _session_end.unwrap() {
+                        _session_end = Some(ts);
+                    }
+                }
+                messages.push(msg);
+            }
         }
     }
 
@@ -6617,7 +6858,11 @@ fn run_export(
             code: 9,
             kind: "empty-session",
             message: format!("No messages found in: {}", path.display()),
-            hint: None,
+            hint: if is_opencode {
+                Some("Check that storage/message/{sessionID}/ contains message files".into())
+            } else {
+                None
+            },
             retryable: false,
         });
     }

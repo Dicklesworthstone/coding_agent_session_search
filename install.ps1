@@ -1,5 +1,5 @@
 Param(
-  [string]$Version = "v0.1.4",
+  [string]$Version = "",
   [string]$Dest = "$HOME/.local/bin",
   [string]$Owner = "Dicklesworthstone",
   [string]$Repo = "coding_agent_session_search",
@@ -11,6 +11,35 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+$FallbackVersion = "v0.1.51"
+
+# Resolve latest version if not specified
+if (-not $Version) {
+  Write-Host "Resolving latest version..."
+  try {
+    # Try GitHub API first
+    $apiUrl = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
+    $release = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept"="application/vnd.github.v3+json"} -ErrorAction Stop
+    $Version = $release.tag_name
+    Write-Host "Resolved latest version: $Version"
+  } catch {
+    # Fallback: try redirect-based resolution
+    try {
+      $redirectUrl = "https://github.com/$Owner/$Repo/releases/latest"
+      $response = Invoke-WebRequest -Uri $redirectUrl -MaximumRedirection 0 -ErrorAction SilentlyContinue
+    } catch {
+      if ($_.Exception.Response.Headers.Location) {
+        $location = $_.Exception.Response.Headers.Location.ToString()
+        $Version = $location -replace ".*/tag/", ""
+        Write-Host "Resolved latest version via redirect: $Version"
+      }
+    }
+    if (-not $Version) {
+      $Version = $FallbackVersion
+      Write-Warning "Could not resolve latest version; defaulting to $Version"
+    }
+  }
+}
 $os = "windows"
 $arch = if ([Environment]::Is64BitProcess) { "x86_64" } else { "x86" }
 $zip = "coding-agent-search-$Version-$arch-$os-msvc.zip"
