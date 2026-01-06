@@ -11,16 +11,17 @@ jobs = -1
 CARGO_LLVM_COV_EXCLUDE = "tests/*,**/test*.rs,benches/*"
 
 [target.x86_64-unknown-linux-gnu]
-# Linux-specific settings (CI environment)
+# Linux x86_64: Use LLD for faster linking (available in CI)
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-[target.aarch64-apple-darwin]
-# Apple Silicon settings
+[target.aarch64-unknown-linux-gnu]
+# Linux ARM64: Use LLD for faster linking (available in CI)
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-[target.x86_64-apple-darwin]
-# Intel Mac settings
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+# macOS targets use the default ld64 linker from Xcode
+# LLD is not available by default on macOS and causes build failures
+# [target.aarch64-apple-darwin] - uses default linker
+# [target.x86_64-apple-darwin] - uses default linker
 
 # Alias for coverage command
 [alias]
