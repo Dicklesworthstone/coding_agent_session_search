@@ -4744,6 +4744,384 @@ fn run_health(
     }
 }
 
+fn ensure_cass_origin(
+    metadata: &mut serde_json::Value,
+    source_id: &str,
+    kind: crate::sources::provenance::SourceKind,
+    host: Option<&str>,
+) {
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+
+    let Some(obj) = metadata.as_object_mut() else {
+        return;
+    };
+
+    let cass = obj
+        .entry("cass".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(cass_obj) = cass.as_object_mut() else {
+        return;
+    };
+
+    let origin = cass_obj
+        .entry("origin".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(origin_obj) = origin.as_object_mut() {
+        origin_obj
+            .entry("source_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(source_id.to_string()));
+        origin_obj
+            .entry("kind".to_string())
+            .or_insert_with(|| serde_json::Value::String(kind.as_str().to_string()));
+        if let Some(host) = host {
+            origin_obj
+                .entry("host".to_string())
+                .or_insert_with(|| serde_json::Value::String(host.to_string()));
+        }
+    }
+}
+
+fn rebuild_tantivy_from_db(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
+) -> CliResult<usize> {
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
+    use crate::model::types::MessageRole;
+    use crate::search::tantivy::TantivyIndex;
+    use crate::sources::provenance::{LOCAL_SOURCE_ID, SourceKind};
+    use crate::storage::sqlite::SqliteStorage;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+
+    let storage = SqliteStorage::open_readonly(db_path).map_err(|e| CliError {
+        code: 5,
+        kind: "doctor",
+        message: format!("failed to open database for rebuild: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
+
+    let sources = storage.list_sources().unwrap_or_default();
+    let mut source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
+    for source in sources {
+        source_map.insert(source.id, (source.kind, source.host_label));
+    }
+
+    let index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| CliError {
+        code: 5,
+        kind: "doctor",
+        message: format!("failed to resolve index path: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
+
+    let _ = std::fs::remove_dir_all(&index_path);
+    std::fs::create_dir_all(&index_path).map_err(|e| CliError {
+        code: 5,
+        kind: "doctor",
+        message: format!("failed to create index directory: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
+
+    let mut t_index = TantivyIndex::open_or_create(&index_path).map_err(|e| CliError {
+        code: 5,
+        kind: "doctor",
+        message: format!("failed to create tantivy index: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
+
+    if let Some(p) = &progress {
+        p.phase.store(2, Ordering::Relaxed);
+        p.is_rebuilding.store(true, Ordering::Relaxed);
+        p.total.store(total_conversations, Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+    }
+
+    let page_size: i64 = 200;
+    let mut offset: i64 = 0;
+    let mut indexed_docs: usize = 0;
+
+    loop {
+        let batch = storage
+            .list_conversations(page_size, offset)
+            .map_err(|e| CliError::unknown(format!("failed to list conversations: {e}")))?;
+        if batch.is_empty() {
+            break;
+        }
+
+        for conv in batch {
+            let Some(conv_id) = conv.id else {
+                continue;
+            };
+
+            let messages = storage
+                .fetch_messages(conv_id)
+                .map_err(|e| CliError::unknown(format!("failed to fetch messages: {e}")))?;
+
+            let mut metadata = conv.metadata_json.clone();
+            let (kind, host_label) =
+                source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
+                    let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
+                        SourceKind::Local
+                    } else {
+                        SourceKind::Ssh
+                    };
+                    (fallback_kind, None)
+                });
+
+            let host = conv.origin_host.as_deref().or(host_label.as_deref());
+            ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
+
+            let normalized_messages: Vec<NormalizedMessage> = messages
+                .into_iter()
+                .map(|msg| {
+                    let role = match msg.role {
+                        MessageRole::User => "user".to_string(),
+                        MessageRole::Agent => "assistant".to_string(),
+                        MessageRole::Tool => "tool".to_string(),
+                        MessageRole::System => "system".to_string(),
+                        MessageRole::Other(other) => other,
+                    };
+
+                    NormalizedMessage {
+                        idx: msg.idx,
+                        role,
+                        author: msg.author,
+                        created_at: msg.created_at,
+                        content: msg.content,
+                        extra: msg.extra_json,
+                        snippets: Vec::new(),
+                    }
+                })
+                .collect();
+
+            let normalized = NormalizedConversation {
+                agent_slug: conv.agent_slug,
+                external_id: conv.external_id,
+                title: conv.title,
+                workspace: conv.workspace,
+                source_path: conv.source_path,
+                started_at: conv.started_at,
+                ended_at: conv.ended_at,
+                metadata,
+                messages: normalized_messages,
+            };
+
+            indexed_docs += normalized.messages.len();
+            t_index
+                .add_messages(&normalized, &normalized.messages)
+                .map_err(|e| CliError::unknown(format!("failed to index messages: {e}")))?;
+
+            if let Some(p) = &progress {
+                p.current.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        offset += page_size;
+    }
+
+    t_index
+        .commit()
+        .map_err(|e| CliError::unknown(format!("failed to commit index: {e}")))?;
+
+    if let Some(p) = &progress {
+        p.phase.store(0, Ordering::Relaxed);
+        p.is_rebuilding.store(false, Ordering::Relaxed);
+    }
+
+    Ok(indexed_docs)
+}
+
+fn wait_with_progress<T>(
+    handle: std::thread::JoinHandle<CliResult<T>>,
+    progress: std::sync::Arc<indexer::IndexingProgress>,
+    show_progress: bool,
+    show_plain: bool,
+    initial_message: &str,
+) -> CliResult<T> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    if show_progress {
+        use indicatif::{ProgressBar, ProgressStyle};
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.set_message(initial_message.to_string());
+        pb.enable_steady_tick(Duration::from_millis(80));
+
+        let mut last_phase = usize::MAX;
+        let mut last_current = usize::MAX;
+        let mut last_agents = usize::MAX;
+        let mut last_update = Instant::now();
+
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+
+            let phase = progress.phase.load(Ordering::Relaxed);
+            let total = progress.total.load(Ordering::Relaxed);
+            let current = progress.current.load(Ordering::Relaxed);
+            let agents = progress.discovered_agents.load(Ordering::Relaxed);
+            let is_rebuilding = progress.is_rebuilding.load(Ordering::Relaxed);
+
+            let agent_names: Vec<String> = progress
+                .discovered_agent_names
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default();
+
+            let phase_str = match phase {
+                1 => "Scanning",
+                2 => "Indexing",
+                _ => "Preparing",
+            };
+
+            let rebuild_indicator = if is_rebuilding { " (rebuilding)" } else { "" };
+
+            let msg = if phase == 1 {
+                let scan_progress = if total > 0 {
+                    format!("{current}/{total} connectors")
+                } else {
+                    "scanning connectors".to_string()
+                };
+                if agents > 0 {
+                    let names_preview = if agent_names.len() <= 3 {
+                        agent_names.join(", ")
+                    } else {
+                        format!(
+                            "{}, ... +{} more",
+                            agent_names[..3].join(", "),
+                            agent_names.len() - 3
+                        )
+                    };
+                    format!(
+                        "{}{}: {} · {} agent(s): {}",
+                        phase_str, rebuild_indicator, scan_progress, agents, names_preview
+                    )
+                } else {
+                    format!(
+                        "{}{}: {} · detecting agents...",
+                        phase_str, rebuild_indicator, scan_progress
+                    )
+                }
+            } else if phase == 2 {
+                if total > 0 {
+                    let pct = (current as f64 / total as f64 * 100.0).min(100.0);
+                    format!(
+                        "{}{}: {}/{} conversations ({:.0}%)",
+                        phase_str, rebuild_indicator, current, total, pct
+                    )
+                } else {
+                    format!("{}{}: Processing...", phase_str, rebuild_indicator)
+                }
+            } else {
+                format!("{}{}...", phase_str, rebuild_indicator)
+            };
+
+            let now = Instant::now();
+            let should_update = phase != last_phase
+                || current != last_current
+                || agents != last_agents
+                || now.duration_since(last_update).as_millis() > 500;
+
+            if should_update {
+                pb.set_message(msg);
+                last_phase = phase;
+                last_current = current;
+                last_agents = agents;
+                last_update = now;
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let total = progress.total.load(Ordering::Relaxed);
+        let current = progress.current.load(Ordering::Relaxed);
+        let agents = progress.discovered_agents.load(Ordering::Relaxed);
+        pb.finish_with_message(format!(
+            "Done: {} conversations from {} agent(s)",
+            current.max(total),
+            agents
+        ));
+    } else if show_plain {
+        eprintln!("Starting index...");
+        let mut last_phase = usize::MAX;
+        let mut last_agents = 0;
+        let mut last_current = 0;
+        let mut last_scan_current = 0;
+
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+
+            let phase = progress.phase.load(Ordering::Relaxed);
+            let total = progress.total.load(Ordering::Relaxed);
+            let current = progress.current.load(Ordering::Relaxed);
+            let agents = progress.discovered_agents.load(Ordering::Relaxed);
+
+            if phase != last_phase {
+                match phase {
+                    1 => eprintln!("Scanning for agents..."),
+                    2 => eprintln!("Indexing conversations..."),
+                    _ => {}
+                }
+                last_phase = phase;
+            }
+
+            if phase == 1 && current != last_scan_current {
+                if total > 0 {
+                    eprintln!("  Scanned {}/{} connectors", current, total);
+                } else {
+                    eprintln!("  Scanned {} connectors", current);
+                }
+                last_scan_current = current;
+            }
+
+            if agents > last_agents {
+                eprintln!("  Found {} agent(s)", agents);
+                last_agents = agents;
+            }
+
+            if phase == 2 && current > last_current && current.is_multiple_of(100) {
+                if total > 0 {
+                    eprintln!("  Indexed {}/{} conversations", current, total);
+                } else {
+                    eprintln!("  Indexed {} conversations", current);
+                }
+                last_current = current;
+            }
+
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        while !handle.is_finished() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    handle.join().map_err(|_| CliError {
+        code: 9,
+        kind: "doctor",
+        message: "doctor worker thread panicked".to_string(),
+        hint: None,
+        retryable: true,
+    })?
+}
+
 /// Comprehensive diagnostic and repair tool for cass installation.
 /// CRITICAL: This function NEVER deletes user data. It only rebuilds derived data (index, db)
 /// from source session files. This is essential because users may have only one copy of their
@@ -4763,7 +5141,13 @@ fn run_doctor(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_path = data_dir.join("tantivy_index");
+    let index_path = crate::search::tantivy::index_dir(&data_dir).map_err(|e| CliError {
+        code: 5,
+        kind: "doctor",
+        message: format!("failed to resolve index directory: {e}"),
+        hint: None,
+        retryable: true,
+    })?;
     let lock_path = data_dir.join(".index.lock");
 
     // Track all checks and their results
@@ -4778,6 +5162,11 @@ fn run_doctor(
 
     let mut checks: Vec<Check> = Vec::new();
     let mut needs_rebuild = force_rebuild;
+    let mut db_ok = false;
+    let mut db_conversations: Option<usize> = None;
+    let mut db_messages: Option<usize> = None;
+    let mut auto_fix_actions: Vec<String> = Vec::new();
+    let mut auto_fix_applied = false;
 
     // Helper macro to add a check (avoids closure borrow issues)
     macro_rules! add_check {
@@ -4813,7 +5202,7 @@ fn run_doctor(
             );
         }
     } else {
-        if fix && std::fs::create_dir_all(&data_dir).is_ok() {
+        if std::fs::create_dir_all(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
                 status: "pass".to_string(),
@@ -4821,6 +5210,8 @@ fn run_doctor(
                 fix_available: true,
                 fix_applied: true,
             });
+            auto_fix_actions.push("Created missing data directory".to_string());
+            auto_fix_applied = true;
         } else {
             add_check!(
                 "data_directory",
@@ -4840,7 +5231,7 @@ fn run_doctor(
             .unwrap_or(true);
 
         if is_stale {
-            if fix && std::fs::remove_file(&lock_path).is_ok() {
+            if std::fs::remove_file(&lock_path).is_ok() {
                 checks.push(Check {
                     name: "lock_file".to_string(),
                     status: "pass".to_string(),
@@ -4848,6 +5239,8 @@ fn run_doctor(
                     fix_available: true,
                     fix_applied: true,
                 });
+                auto_fix_actions.push("Removed stale lock file".to_string());
+                auto_fix_applied = true;
             } else {
                 add_check!(
                     "lock_file",
@@ -4872,26 +5265,31 @@ fn run_doctor(
     if db_path.exists() {
         match rusqlite::Connection::open(&db_path) {
             Ok(conn) => {
-                match conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| {
-                    r.get::<_, i64>(0)
-                }) {
-                    Ok(count) => {
-                        add_check!(
-                            "database",
-                            "pass",
-                            format!("Database OK ({} conversations)", count),
-                            false
-                        );
-                    }
-                    Err(e) => {
-                        add_check!(
-                            "database",
-                            "fail",
-                            format!("Database corrupted: {}", e),
-                            true
-                        );
-                        needs_rebuild = true;
-                    }
+                let conv_count = conn
+                    .query_row("SELECT COUNT(*) FROM conversations", [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .ok();
+                let msg_count = conn
+                    .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                    .ok();
+
+                if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
+                    db_ok = true;
+                    db_conversations = Some(conv_count.max(0) as usize);
+                    db_messages = Some(msg_count.max(0) as usize);
+                    add_check!(
+                        "database",
+                        "pass",
+                        format!(
+                            "Database OK ({} conversations, {} messages)",
+                            conv_count, msg_count
+                        ),
+                        false
+                    );
+                } else {
+                    add_check!("database", "fail", "Database query failed", true);
+                    needs_rebuild = true;
                 }
             }
             Err(e) => {
@@ -4910,7 +5308,7 @@ fn run_doctor(
     }
 
     // 4. Check Tantivy index exists and is readable
-    if index_path.exists() {
+    if index_path.join("meta.json").exists() {
         match tantivy::Index::open_in_dir(&index_path) {
             Ok(index) => {
                 match index.reader() {
@@ -4925,7 +5323,7 @@ fn run_doctor(
                         );
 
                         // Check if index is empty but database has data
-                        if num_docs == 0 && db_path.exists() {
+                        if num_docs == 0 && db_ok {
                             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                                 if let Ok(msg_count) =
                                     conn.query_row("SELECT COUNT(*) FROM messages", [], |r| {
@@ -5065,22 +5463,201 @@ fn run_doctor(
     }
 
     // Apply fix: rebuild index if needed
-    if fix && needs_rebuild {
-        // Note: We don't actually run the rebuild here - that would take too long.
-        // Instead we inform the user to run `cass index --full`
-        add_check!(
-            "rebuild",
-            "warn",
-            "Run 'cass index --full' to rebuild (preserves all source data)",
-            false
-        );
+    if needs_rebuild {
+        let stderr_is_tty = std::io::stderr().is_terminal();
+        let show_progress = !json && stderr_is_tty;
+        let show_plain = !json && !stderr_is_tty;
+
+        if !json {
+            println!();
+            if fix {
+                println!(
+                    "{} Rebuilding index (this may take a moment)...",
+                    "→".cyan()
+                );
+            } else {
+                println!(
+                    "{} Auto-repair: rebuilding index (this may take a moment)...",
+                    "→".cyan()
+                );
+            }
+        }
+
+        let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
+        let rebuild_from_db = db_ok && db_messages.unwrap_or(0) > 0;
+
+        if rebuild_from_db {
+            let total_convs = db_conversations.unwrap_or(0);
+            let rebuild_handle = std::thread::spawn({
+                let progress = progress.clone();
+                let db_path = db_path.clone();
+                let data_dir = data_dir.clone();
+                move || rebuild_tantivy_from_db(&db_path, &data_dir, total_convs, Some(progress))
+            });
+
+            let rebuild_result = wait_with_progress(
+                rebuild_handle,
+                progress,
+                show_progress,
+                show_plain,
+                "Rebuilding search index from database...",
+            );
+
+            match rebuild_result {
+                Ok(message_count) => {
+                    needs_rebuild = false;
+                    auto_fix_actions.push("Rebuilt search index from database".to_string());
+                    auto_fix_applied = true;
+                    for check in &mut checks {
+                        if check.name == "index" || check.name == "index_sync" {
+                            check.status = "pass".to_string();
+                            check.fix_applied = true;
+                            check.message = "Search index rebuilt from database".to_string();
+                        }
+                    }
+                    checks.push(Check {
+                        name: "rebuild".to_string(),
+                        status: "pass".to_string(),
+                        message: format!(
+                            "Index rebuilt from database ({} messages)",
+                            message_count
+                        ),
+                        fix_available: true,
+                        fix_applied: true,
+                    });
+                }
+                Err(e) => {
+                    checks.push(Check {
+                        name: "rebuild".to_string(),
+                        status: "fail".to_string(),
+                        message: format!("Index rebuild failed: {}", e),
+                        fix_available: true,
+                        fix_applied: false,
+                    });
+                }
+            }
+        } else {
+            // Preserve existing DB when possible; rebuild only derived data.
+            let mut can_rebuild = true;
+            let mut db_backup_done = false;
+            if db_path.exists() && !db_ok {
+                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+                let backup_path = db_path.with_extension(format!("corrupt.{ts}"));
+                match std::fs::rename(&db_path, &backup_path) {
+                    Ok(_) => {
+                        db_backup_done = true;
+                        checks.push(Check {
+                            name: "database_backup".to_string(),
+                            status: "pass".to_string(),
+                            message: format!(
+                                "Backed up corrupted database to {}",
+                                backup_path.display()
+                            ),
+                            fix_available: true,
+                            fix_applied: true,
+                        });
+                        auto_fix_actions.push(format!(
+                            "Backed up corrupted database to {}",
+                            backup_path.display()
+                        ));
+                        auto_fix_applied = true;
+                    }
+                    Err(e) => {
+                        checks.push(Check {
+                            name: "database_backup".to_string(),
+                            status: "fail".to_string(),
+                            message: format!("Failed to backup corrupted database: {}", e),
+                            fix_available: true,
+                            fix_applied: false,
+                        });
+                        can_rebuild = false;
+                    }
+                }
+            }
+
+            if !can_rebuild {
+                checks.push(Check {
+                    name: "rebuild".to_string(),
+                    status: "fail".to_string(),
+                    message: "Index rebuild skipped because database backup failed".to_string(),
+                    fix_available: true,
+                    fix_applied: false,
+                });
+                needs_rebuild = true;
+            } else {
+                let index_opts = indexer::IndexOptions {
+                    full: false,
+                    force_rebuild,
+                    watch: false,
+                    watch_once_paths: None,
+                    db_path: db_path.clone(),
+                    data_dir: data_dir.clone(),
+                    progress: Some(progress.clone()),
+                };
+
+                let rebuild_handle = std::thread::spawn(move || {
+                    indexer::run_index(index_opts, None)
+                        .map(|_| 0usize)
+                        .map_err(|e| CliError {
+                            code: 5,
+                            kind: "doctor",
+                            message: format!("index rebuild failed: {e}"),
+                            hint: None,
+                            retryable: true,
+                        })
+                });
+
+                let rebuild_result = wait_with_progress(
+                    rebuild_handle,
+                    progress,
+                    show_progress,
+                    show_plain,
+                    "Rebuilding index from source sessions...",
+                );
+
+                match rebuild_result {
+                    Ok(_) => {
+                        needs_rebuild = false;
+                        let rebuild_note = if db_backup_done {
+                            "Rebuilt index from source sessions (new database created)".to_string()
+                        } else {
+                            "Rebuilt index from source sessions (database preserved)".to_string()
+                        };
+                        auto_fix_actions.push(rebuild_note.clone());
+                        auto_fix_applied = true;
+                        for check in &mut checks {
+                            if check.name == "index" || check.name == "index_sync" {
+                                check.status = "pass".to_string();
+                                check.fix_applied = true;
+                                check.message = rebuild_note.clone();
+                            }
+                        }
+                        checks.push(Check {
+                            name: "rebuild".to_string(),
+                            status: "pass".to_string(),
+                            message: "Index rebuilt successfully".to_string(),
+                            fix_available: true,
+                            fix_applied: true,
+                        });
+                    }
+                    Err(e) => {
+                        checks.push(Check {
+                            name: "rebuild".to_string(),
+                            status: "fail".to_string(),
+                            message: format!("Index rebuild failed: {}", e),
+                            fix_available: true,
+                            fix_applied: false,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     // Count issues
-    let issues_found = checks
-        .iter()
-        .filter(|c| c.status == "fail" || c.status == "warn")
-        .count();
+    let fail_count = checks.iter().filter(|c| c.status == "fail").count();
+    let warn_count = checks.iter().filter(|c| c.status == "warn").count();
+    let issues_found = fail_count + warn_count;
     let issues_fixed = checks.iter().filter(|c| c.fix_applied).count();
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -5089,10 +5666,14 @@ fn run_doctor(
     // Output
     if json {
         let payload = serde_json::json!({
-            "healthy": all_pass,
+            "healthy": fail_count == 0,
             "issues_found": issues_found,
             "issues_fixed": issues_fixed,
+            "failures": fail_count,
+            "warnings": warn_count,
             "needs_rebuild": needs_rebuild,
+            "auto_fix_applied": auto_fix_applied,
+            "auto_fix_actions": auto_fix_actions,
             "checks": checks,
             "_meta": {
                 "elapsed_ms": elapsed_ms,
@@ -5144,37 +5725,43 @@ fn run_doctor(
         if all_pass {
             println!("{} All checks passed ({elapsed_ms}ms)", "✓".green());
         } else {
+            let summary_icon = if fail_count > 0 {
+                "✗".red()
+            } else {
+                "⚠".yellow()
+            };
             println!(
-                "{} {} issue(s) found, {} fixed ({elapsed_ms}ms)",
-                if issues_found > issues_fixed {
-                    "✗".red()
-                } else {
-                    "⚠".yellow()
-                },
-                issues_found,
-                issues_fixed
+                "{} {} failure(s), {} warning(s), {} fixed ({elapsed_ms}ms)",
+                summary_icon, fail_count, warn_count, issues_fixed
             );
 
-            if needs_rebuild && !fix {
+            if auto_fix_applied && !auto_fix_actions.is_empty() {
+                println!();
+                println!("{}", "Auto-repair actions:".bold());
+                for action in &auto_fix_actions {
+                    println!("  - {action}");
+                }
+            }
+
+            if needs_rebuild {
                 println!();
                 println!("{}", "Recommended action:".bold());
-                println!("  cass doctor --fix     # Apply safe fixes");
-                println!("  cass index --full     # Rebuild index from source data");
+                println!("  cass index --full     # Rebuild from source sessions");
                 println!();
                 println!("{}", "Note: Your source session files are SAFE. Only derived data (index/db) will be rebuilt.".dimmed());
             }
         }
     }
 
-    if all_pass || (fix && issues_found == issues_fixed) {
+    if fail_count == 0 {
         Ok(())
     } else {
         Err(CliError {
             code: 5, // Data corruption code
             kind: "doctor",
-            message: format!("{} issue(s) found", issues_found - issues_fixed),
+            message: format!("{} failure(s) remain", fail_count),
             hint: Some(
-                "Run 'cass doctor --fix' to apply safe fixes, then 'cass index --full' to rebuild."
+                "Automatic safe repairs were attempted. Run 'cass index --full' to rebuild from source sessions or check cass.log for details."
                     .to_string(),
             ),
             retryable: true,
@@ -6634,6 +7221,7 @@ fn spawn_background_indexer(
 ) -> Option<Sender<IndexerEvent>> {
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_clone = tx.clone();
+    let progress_for_error = progress.clone();
     std::thread::spawn(move || {
         let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
         let opts = IndexOptions {
@@ -6648,6 +7236,14 @@ fn spawn_background_indexer(
         // Pass the receiver to run_index so it can listen for commands
         if let Err(e) = indexer::run_index(opts, Some((tx_clone, rx))) {
             warn!("Background indexer failed: {}", e);
+            if let Some(p) = progress_for_error {
+                if let Ok(mut last_error) = p.last_error.lock() {
+                    *last_error = Some(e.to_string());
+                }
+                p.phase.store(0, std::sync::atomic::Ordering::Relaxed);
+                p.is_rebuilding
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     });
     Some(tx)
@@ -6843,7 +7439,11 @@ fn run_index_with_data(
             let rebuild_indicator = if is_rebuilding { " (rebuilding)" } else { "" };
 
             let msg = if phase == 1 {
-                // Scanning phase - show discovered agents
+                let scan_progress = if total > 0 {
+                    format!("{current}/{total} connectors")
+                } else {
+                    "scanning connectors".to_string()
+                };
                 if agents > 0 {
                     let names_preview = if agent_names.len() <= 3 {
                         agent_names.join(", ")
@@ -6855,11 +7455,14 @@ fn run_index_with_data(
                         )
                     };
                     format!(
-                        "{}{}: Found {} agent(s): {}",
-                        phase_str, rebuild_indicator, agents, names_preview
+                        "{}{}: {} · {} agent(s): {}",
+                        phase_str, rebuild_indicator, scan_progress, agents, names_preview
                     )
                 } else {
-                    format!("{}{}: Detecting agents...", phase_str, rebuild_indicator)
+                    format!(
+                        "{}{}: {} · detecting agents...",
+                        phase_str, rebuild_indicator, scan_progress
+                    )
                 }
             } else if phase == 2 {
                 // Indexing phase - show progress
@@ -6911,6 +7514,7 @@ fn run_index_with_data(
         let mut last_phase = usize::MAX;
         let mut last_agents = 0;
         let mut last_current = 0;
+        let mut last_scan_current = 0;
 
         loop {
             if index_handle.is_finished() {
@@ -6930,6 +7534,16 @@ fn run_index_with_data(
                     _ => {}
                 }
                 last_phase = phase;
+            }
+
+            // Print scan progress during discovery
+            if phase == 1 && current != last_scan_current {
+                if total > 0 {
+                    eprintln!("  Scanned {}/{} connectors", current, total);
+                } else {
+                    eprintln!("  Scanned {} connectors", current);
+                }
+                last_scan_current = current;
             }
 
             // Print agent discovery updates

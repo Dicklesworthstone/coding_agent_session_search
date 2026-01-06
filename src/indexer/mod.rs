@@ -44,6 +44,8 @@ pub struct IndexingProgress {
     pub discovered_agents: AtomicUsize,
     /// Names of discovered agents (protected by mutex for concurrent access)
     pub discovered_agent_names: Mutex<Vec<String>>,
+    /// Last error message from background indexer, if any
+    pub last_error: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -131,6 +133,24 @@ pub fn run_index(
     // Record scan start time before scanning
     let scan_start_ts = SqliteStorage::now_millis();
 
+    let connector_factories = get_connector_factories();
+
+    // First pass: Scan all to get counts if we have progress tracker
+    // Use parallel iteration for faster agent discovery
+    if let Some(p) = &opts.progress {
+        p.phase.store(1, Ordering::Relaxed); // Scanning
+        // Track connector scan progress during discovery.
+        p.total.store(connector_factories.len(), Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
+        if let Ok(mut names) = p.discovered_agent_names.lock() {
+            names.clear();
+        }
+        if let Ok(mut last_error) = p.last_error.lock() {
+            *last_error = None;
+        }
+    }
+
     // Keep sources table in sync with sources.toml for provenance integrity.
     sync_sources_config_to_db(&storage);
 
@@ -141,26 +161,11 @@ pub fn run_index(
         .cloned()
         .collect();
 
-    // First pass: Scan all to get counts if we have progress tracker
-    // Use parallel iteration for faster agent discovery
-    if let Some(p) = &opts.progress {
-        p.phase.store(1, Ordering::Relaxed); // Scanning
-        // Reset; totals will be populated during scanning.
-        p.total.store(0, Ordering::Relaxed);
-        p.current.store(0, Ordering::Relaxed);
-        p.discovered_agents.store(0, Ordering::Relaxed);
-        if let Ok(mut names) = p.discovered_agent_names.lock() {
-            names.clear();
-        }
-    }
-
     // Run connector detection and scanning in parallel using rayon
     use rayon::prelude::*;
 
     let progress_ref = opts.progress.as_ref();
     let data_dir = opts.data_dir.clone();
-
-    let connector_factories = get_connector_factories();
 
     let pending_batches: Vec<(&'static str, Vec<NormalizedConversation>)> = connector_factories
         .into_par_iter()
@@ -223,10 +228,6 @@ pub fn run_index(
                 }
             }
 
-            if convs.is_empty() {
-                return None;
-            }
-
             if !was_detected && let Some(p) = progress_ref {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut names) = p.discovered_agent_names.lock() {
@@ -234,9 +235,15 @@ pub fn run_index(
                 }
             }
 
+            // Mark this connector as scanned for discovery progress.
             if let Some(p) = progress_ref {
-                p.total.fetch_add(convs.len(), Ordering::Relaxed);
+                p.current.fetch_add(1, Ordering::Relaxed);
             }
+
+            if convs.is_empty() {
+                return None;
+            }
+
             tracing::info!(
                 connector = name,
                 conversations = convs.len(),
@@ -247,7 +254,10 @@ pub fn run_index(
         .collect();
 
     if let Some(p) = &opts.progress {
+        let total_conversations: usize = pending_batches.iter().map(|(_, convs)| convs.len()).sum();
         p.phase.store(2, Ordering::Relaxed); // Indexing
+        p.total.store(total_conversations, Ordering::Relaxed);
+        p.current.store(0, Ordering::Relaxed);
     }
 
     for (name, convs) in pending_batches {
