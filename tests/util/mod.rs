@@ -772,9 +772,11 @@ impl SeededRng {
         self.rng.r#gen::<f32>()
     }
 
-    /// Generate a random f32 in the given range.
+    /// Generate a random f32 in the given range [min, max).
+    /// If min > max, they are swapped.
     pub fn f32_range(&mut self, min: f32, max: f32) -> f32 {
-        min + self.rng.r#gen::<f32>() * (max - min)
+        let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
+        lo + self.rng.r#gen::<f32>() * (hi - lo)
     }
 
     /// Generate a random i64 in the given range [min, max).
