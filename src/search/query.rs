@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use lru::LruCache;
 use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +14,7 @@ use tantivy::collector::TopDocs;
 use tantivy::query::{
     AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
-use tantivy::schema::{IndexRecordOption, Term, Value};
+use tantivy::schema::{Field, IndexRecordOption, Term, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexReader, Searcher, TantivyDocument};
 use tokio::runtime::Handle;
@@ -30,6 +31,83 @@ use crate::search::vector_index::{
 };
 
 use crate::sources::provenance::SourceFilter;
+
+// ============================================================================
+// String Interner for Cache Keys (Opt 2.3)
+// ============================================================================
+//
+// Reduces memory usage and allocation overhead for repeated cache key patterns.
+// Uses LRU eviction to bound memory, Arc<str> for cheap cloning.
+
+/// Thread-safe string interner with bounded memory via LRU eviction.
+pub struct StringInterner {
+    cache: RwLock<LruCache<Arc<str>, ()>>,
+}
+
+impl StringInterner {
+    /// Create a new interner with the given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: RwLock::new(LruCache::new(
+                NonZeroUsize::new(capacity).expect("capacity must be > 0"),
+            )),
+        }
+    }
+
+    /// Intern a string, returning a shared Arc<str>.
+    /// If the string is already interned, returns the existing Arc.
+    /// Otherwise, creates a new Arc and caches it.
+    pub fn intern(&self, s: &str) -> Arc<str> {
+        // Fast path: read-only check for existing entry
+        {
+            let cache = self.cache.read();
+            // LruCache doesn't have a method to get the key itself, so we check if it exists
+            // and then look it up. We use peek to avoid updating LRU order on read path.
+            for (key, _) in cache.iter() {
+                if key.as_ref() == s {
+                    return Arc::clone(key);
+                }
+            }
+        }
+
+        // Slow path: acquire write lock and insert
+        let mut cache = self.cache.write();
+
+        // Double-check after acquiring write lock (another thread may have inserted)
+        for (key, _) in cache.iter() {
+            if key.as_ref() == s {
+                return Arc::clone(key);
+            }
+        }
+
+        // Create new Arc<str> and insert
+        let arc: Arc<str> = Arc::from(s);
+        cache.put(Arc::clone(&arc), ());
+        arc
+    }
+
+    /// Get the current number of interned strings.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.cache.read().len()
+    }
+
+    /// Check if the interner is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.cache.read().is_empty()
+    }
+}
+
+/// Global cache key interner with 10K entry limit (~1MB for typical keys).
+/// Uses Lazy initialization for thread-safe singleton.
+static CACHE_KEY_INTERNER: Lazy<StringInterner> = Lazy::new(|| StringInterner::new(10_000));
+
+/// Intern a cache key string, returning a shared Arc<str>.
+#[inline]
+fn intern_cache_key(s: &str) -> Arc<str> {
+    CACHE_KEY_INTERNER.intern(s)
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SearchFilters {
@@ -588,11 +666,67 @@ impl QuerySuggestion {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FieldMask {
+    flags: u8,
+}
+
+impl FieldMask {
+    const CONTENT: u8 = 1 << 0;
+    const SNIPPET: u8 = 1 << 1;
+    const TITLE: u8 = 1 << 2;
+    const CACHE: u8 = 1 << 3;
+
+    pub const FULL: Self = Self {
+        flags: Self::CONTENT | Self::SNIPPET | Self::TITLE | Self::CACHE,
+    };
+
+    pub fn new(
+        wants_content: bool,
+        wants_snippet: bool,
+        wants_title: bool,
+        allows_cache: bool,
+    ) -> Self {
+        let mut flags = 0;
+        if wants_content {
+            flags |= Self::CONTENT;
+        }
+        if wants_snippet {
+            flags |= Self::SNIPPET;
+        }
+        if wants_title {
+            flags |= Self::TITLE;
+        }
+        if allows_cache {
+            flags |= Self::CACHE;
+        }
+        Self { flags }
+    }
+
+    pub fn needs_content(self) -> bool {
+        self.flags & Self::CONTENT != 0
+    }
+
+    pub fn wants_snippet(self) -> bool {
+        self.flags & Self::SNIPPET != 0
+    }
+
+    pub fn wants_title(self) -> bool {
+        self.flags & Self::TITLE != 0
+    }
+
+    pub fn allows_cache(self) -> bool {
+        self.flags & Self::CACHE != 0
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
     pub content: String,
+    #[serde(skip_serializing)]
+    pub content_hash: u64,
     pub score: f32,
     pub source_path: String,
     pub agent: String,
@@ -618,12 +752,27 @@ pub struct SearchHit {
     pub origin_host: Option<String>,
 }
 
+static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
+    dotenvy::var("CASS_LAZY_FIELDS")
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+});
+
 fn default_source_id() -> String {
     "local".to_string()
 }
 
 fn default_origin_kind() -> String {
     "local".to_string()
+}
+
+fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
+    if *LAZY_FIELDS_ENABLED {
+        field_mask
+    } else {
+        FieldMask::FULL
+    }
 }
 
 /// Result of a search operation with metadata about how matches were found
@@ -655,7 +804,7 @@ impl SearchHitKey {
             source_path: hit.source_path.clone(),
             line_number: hit.line_number,
             created_at: hit.created_at,
-            content_hash: stable_content_hash(&hit.content),
+            content_hash: hit.content_hash,
         }
     }
 }
@@ -693,13 +842,48 @@ struct FusedHit {
     hit: SearchHit,
 }
 
-fn stable_content_hash(content: &str) -> u64 {
-    const FNV_OFFSET: u64 = 14695981039346656037;
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     const FNV_PRIME: u64 = 1099511628211;
-    let mut hash = FNV_OFFSET;
-    for byte in content.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+pub(crate) fn stable_content_hash(content: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    let mut hash = FNV_OFFSET;
+    let mut first = true;
+    for token in content.split_whitespace() {
+        if !first {
+            hash = hash_bytes(hash, b" ");
+        }
+        hash = hash_bytes(hash, token.as_bytes());
+        first = false;
+    }
+    hash
+}
+
+fn stable_hit_hash(
+    content: &str,
+    source_path: &str,
+    line_number: Option<usize>,
+    created_at: Option<i64>,
+) -> u64 {
+    if !content.is_empty() {
+        return stable_content_hash(content);
+    }
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    let mut hash = FNV_OFFSET;
+    hash = hash_bytes(hash, source_path.as_bytes());
+    hash = hash_bytes(hash, b"|");
+    if let Some(line) = line_number {
+        hash = hash_bytes(hash, line.to_string().as_bytes());
+    }
+    hash = hash_bytes(hash, b"|");
+    if let Some(ts) = created_at {
+        hash = hash_bytes(hash, ts.to_string().as_bytes());
     }
     hash
 }
@@ -890,6 +1074,50 @@ static WARM_DEBOUNCE_MS: Lazy<u64> = Lazy::new(|| {
         .unwrap_or(120)
 });
 
+const DEFAULT_REGEX_CACHE_SIZE: usize = 100;
+
+static REGEX_CACHE_ENABLED: Lazy<bool> = Lazy::new(|| {
+    dotenvy::var("CASS_REGEX_CACHE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+});
+
+static REGEX_CACHE_SIZE: Lazy<NonZeroUsize> = Lazy::new(|| {
+    let parsed = dotenvy::var("CASS_REGEX_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .and_then(NonZeroUsize::new);
+    parsed.unwrap_or_else(|| NonZeroUsize::new(DEFAULT_REGEX_CACHE_SIZE).unwrap())
+});
+
+type RegexCacheKey = (Field, String);
+
+struct RegexCache {
+    cache: RwLock<LruCache<RegexCacheKey, RegexQuery>>,
+}
+
+impl RegexCache {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            cache: RwLock::new(LruCache::new(capacity)),
+        }
+    }
+
+    fn get_or_insert(&self, field: Field, pattern: &str) -> Result<RegexQuery> {
+        let key = (field, pattern.to_string());
+        if let Some(cached) = self.cache.read().peek(&key) {
+            return Ok(cached.clone());
+        }
+        let query = RegexQuery::from_pattern(pattern, field)
+            .map_err(|e| anyhow!("regex query build failed: {e}"))?;
+        self.cache.write().put(key, query.clone());
+        Ok(query)
+    }
+}
+
+static REGEX_CACHE: Lazy<RegexCache> = Lazy::new(|| RegexCache::new(*REGEX_CACHE_SIZE));
+
 #[derive(Clone)]
 struct CachedHit {
     hit: SearchHit,
@@ -919,7 +1147,8 @@ impl CachedHit {
 }
 
 struct CacheShards {
-    shards: HashMap<String, LruCache<String, Vec<CachedHit>>>,
+    // Optimization 2.3: Use Arc<str> for cache keys to reduce memory via interning
+    shards: HashMap<Arc<str>, LruCache<Arc<str>, Vec<CachedHit>>>,
     total_cap: usize,
     total_cost: usize,
     /// Running count of evictions (for diagnostics)
@@ -942,21 +1171,25 @@ impl CacheShards {
         }
     }
 
-    fn shard_mut(&mut self, name: &str) -> &mut LruCache<String, Vec<CachedHit>> {
+    fn shard_mut(&mut self, name: &str) -> &mut LruCache<Arc<str>, Vec<CachedHit>> {
+        // Use interned shard names to reduce memory for repeated lookups
+        let interned_name = intern_cache_key(name);
         self.shards
-            .entry(name.to_string())
+            .entry(interned_name)
             .or_insert_with(|| LruCache::new(NonZeroUsize::new(*CACHE_SHARD_CAP).unwrap()))
     }
 
-    fn shard_opt(&self, name: &str) -> Option<&LruCache<String, Vec<CachedHit>>> {
+    fn shard_opt(&self, name: &str) -> Option<&LruCache<Arc<str>, Vec<CachedHit>>> {
+        // HashMap<Arc<str>, _> can be queried with &str via Borrow trait
         self.shards.get(name)
     }
 
-    fn put(&mut self, shard_name: &str, key: String, value: Vec<CachedHit>) {
+    fn put(&mut self, shard_name: &str, key: Arc<str>, value: Vec<CachedHit>) {
         let shard = self.shard_mut(shard_name);
         let new_cost = value.len();
         let new_bytes: usize = value.iter().map(CachedHit::approx_bytes).sum();
         // Subtract old entry's cost/bytes if replacing
+        // Note: LruCache.get() with Arc<str> key works via Borrow<str>
         let (old_cost, old_bytes) = shard.get(&key).map_or((0, 0), |v| {
             (v.len(), v.iter().map(CachedHit::approx_bytes).sum())
         });
@@ -1442,6 +1675,14 @@ fn dominant_match_type(query: &str) -> MatchType {
     worst
 }
 
+fn regex_query_for_pattern(field: Field, pattern: &str) -> Result<RegexQuery> {
+    if !*REGEX_CACHE_ENABLED {
+        return RegexQuery::from_pattern(pattern, field)
+            .map_err(|e| anyhow!("regex query build failed: {e}"));
+    }
+    REGEX_CACHE.get_or_insert(field, pattern)
+}
+
 /// Build query clauses for a single term based on its wildcard pattern.
 /// Returns a Vec of (`Occur::Should`, Query) for use in a `BooleanQuery`.
 fn build_term_query_clauses(
@@ -1493,11 +1734,11 @@ fn build_term_query_clauses(
             }
             if let Some(regex_pattern) = pattern.to_regex() {
                 // Try to create RegexQuery for content field
-                if let Ok(rq) = RegexQuery::from_pattern(&regex_pattern, fields.content) {
+                if let Ok(rq) = regex_query_for_pattern(fields.content, &regex_pattern) {
                     shoulds.push((Occur::Should, Box::new(rq)));
                 }
                 // Also try for title field
-                if let Ok(rq) = RegexQuery::from_pattern(&regex_pattern, fields.title) {
+                if let Ok(rq) = regex_query_for_pattern(fields.title, &regex_pattern) {
                     shoulds.push((Occur::Should, Box::new(rq)));
                 }
             }
@@ -1550,21 +1791,18 @@ fn snippet_from_content(content: &str) -> String {
 ///
 /// Also filters out tool invocation noise that isn't useful for search results.
 fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
-    // Key: (source_id, normalized_content) -> index in deduped
-    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    // Key: (source_id, content_hash) -> index in deduped
+    let mut seen: HashMap<(String, u64), usize> = HashMap::new();
     let mut deduped: Vec<SearchHit> = Vec::new();
 
     for hit in hits {
         // Skip tool invocation noise
-        if is_tool_invocation_noise(&hit.content) {
+        if !hit.content.is_empty() && is_tool_invocation_noise(&hit.content) {
             continue;
         }
 
-        // Normalize content for comparison (trim whitespace, collapse multiple spaces)
-        let normalized = hit.content.split_whitespace().collect::<Vec<_>>().join(" ");
-
         // Include source_id in the key so different sources keep their results
-        let key = (hit.source_id.clone(), normalized);
+        let key = (hit.source_id.clone(), hit.content_hash);
 
         if let Some(&existing_idx) = seen.get(&key) {
             // If existing hit has lower score, replace it
@@ -1640,8 +1878,11 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         offset: usize,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
         let sanitized = sanitize_query(query);
+        let field_mask = effective_field_mask(field_mask);
+        let can_use_cache = field_mask.allows_cache() && field_mask.needs_content();
 
         // Schedule warmup for likely prefixes when user pauses typing.
         if offset == 0
@@ -1657,7 +1898,7 @@ impl SearchClient {
         // Only use cache for simple queries (no wildcards, no boolean operators) because
         // the cache matching logic enforces strict prefix AND semantics which is incorrect
         // for suffixes, substrings, OR, NOT, or phrases.
-        if offset == 0 && !query.contains('*') && !has_boolean_operators(query) {
+        if can_use_cache && offset == 0 && !query.contains('*') && !has_boolean_operators(query) {
             if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
                 let mut filtered: Vec<SearchHit> = cached
                     .into_iter()
@@ -1692,10 +1933,12 @@ impl SearchClient {
             let hits = self.search_tantivy(
                 reader,
                 fields,
+                query,
                 &sanitized,
                 filters.clone(),
                 limit * 3,
                 offset,
+                field_mask,
             )?;
             if !hits.is_empty() {
                 let mut deduped = deduplicate_hits(hits);
@@ -1704,7 +1947,9 @@ impl SearchClient {
                     deduped.retain(|h| filters.session_paths.contains(&h.source_path));
                 }
                 deduped.truncate(limit);
-                self.put_cache(&sanitized, &filters, &deduped);
+                if can_use_cache {
+                    self.put_cache(&sanitized, &filters, &deduped);
+                }
                 return Ok(deduped);
             }
             // If Tantivy yields 0 results, we can optionally fall back to SQLite FTS
@@ -1732,14 +1977,23 @@ impl SearchClient {
                 offset = offset,
                 "search_start"
             );
-            let hits = self.search_sqlite(conn, &sanitized, filters.clone(), limit * 3, offset)?;
+            let hits = self.search_sqlite(
+                conn,
+                &sanitized,
+                filters.clone(),
+                limit * 3,
+                offset,
+                field_mask,
+            )?;
             let mut deduped = deduplicate_hits(hits);
             // Apply session_paths filter (post-search since source_path is not indexed)
             if !filters.session_paths.is_empty() {
                 deduped.retain(|h| filters.session_paths.contains(&h.source_path));
             }
             deduped.truncate(limit);
-            self.put_cache(&sanitized, &filters, &deduped);
+            if can_use_cache {
+                self.put_cache(&sanitized, &filters, &deduped);
+            }
             return Ok(deduped);
         }
 
@@ -1802,7 +2056,9 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         offset: usize,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
             return Ok(Vec::new());
@@ -1837,7 +2093,7 @@ impl SearchClient {
             results = results.into_iter().skip(offset).collect();
         }
 
-        let mut hits = self.hydrate_semantic_hits(&results)?;
+        let mut hits = self.hydrate_semantic_hits(&results, field_mask)?;
         // Apply session_paths filter (not supported at SemanticFilter level)
         if !filters.session_paths.is_empty() {
             hits.retain(|h| filters.session_paths.contains(&h.source_path));
@@ -1845,7 +2101,11 @@ impl SearchClient {
         Ok(hits)
     }
 
-    fn hydrate_semantic_hits(&self, results: &[VectorSearchResult]) -> Result<Vec<SearchHit>> {
+    fn hydrate_semantic_hits(
+        &self,
+        results: &[VectorSearchResult],
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
         if results.is_empty() {
             return Ok(Vec::new());
         }
@@ -1864,8 +2124,18 @@ impl SearchClient {
             params.push(i64::try_from(result.message_id)?);
         }
 
+        let content_expr = if field_mask.needs_content() {
+            "m.content"
+        } else {
+            "''"
+        };
+        let title_expr = if field_mask.wants_title() {
+            "c.title"
+        } else {
+            "''"
+        };
         let sql = format!(
-            "SELECT m.id, m.content, m.created_at, m.idx, m.role, c.title, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local')
+            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local')
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              JOIN agents a ON c.agent_id = a.id
@@ -1882,7 +2152,11 @@ impl SearchClient {
                 let content: String = row.get(1)?;
                 let created_at: Option<i64> = row.get(2)?;
                 let idx: Option<i64> = row.get(3)?;
-                let title: Option<String> = row.get(5)?;
+                let title: Option<String> = if field_mask.wants_title() {
+                    row.get(5)?
+                } else {
+                    None
+                };
                 let source_path: String = row.get(6)?;
                 let source_id: Option<String> = row.get(7)?;
                 let origin_host: Option<String> = row.get(8)?;
@@ -1891,12 +2165,22 @@ impl SearchClient {
                 let origin_kind: String = row.get(11)?;
 
                 let line_number = idx.map(|i| (i + 1) as usize);
-                let snippet = snippet_from_content(&content);
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&content)
+                } else {
+                    String::new()
+                };
+                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
 
                 let hit = SearchHit {
-                    title: title.unwrap_or_else(|| "Untitled".to_string()),
+                    title: if field_mask.wants_title() {
+                        title.unwrap_or_else(|| "Untitled".to_string())
+                    } else {
+                        String::new()
+                    },
                     snippet,
                     content,
+                    content_hash,
                     score: 0.0,
                     source_path,
                     agent,
@@ -1941,9 +2225,10 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         sparse_threshold: usize,
+        field_mask: FieldMask,
     ) -> Result<SearchResult> {
         // First, try the normal search
-        let hits = self.search(query, filters.clone(), limit, offset)?;
+        let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
 
         // Check if we should try wildcard fallback
@@ -1982,7 +2267,8 @@ impl SearchClient {
             "wildcard_fallback"
         );
 
-        let mut fallback_hits = self.search(&wildcard_query, filters.clone(), limit, offset)?;
+        let mut fallback_hits =
+            self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
         let fallback_stats = self.cache_stats();
 
         // Use fallback results if they're better
@@ -2021,6 +2307,7 @@ impl SearchClient {
     }
 
     /// Hybrid search that fuses lexical + semantic results with RRF.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid(
         &self,
         lexical_query: &str,
@@ -2029,6 +2316,7 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         sparse_threshold: usize,
+        field_mask: FieldMask,
     ) -> Result<SearchResult> {
         let fetch = limit.saturating_add(offset);
         if fetch == 0 {
@@ -2047,6 +2335,7 @@ impl SearchClient {
                 limit,
                 offset,
                 sparse_threshold,
+                field_mask,
             );
         }
 
@@ -2057,8 +2346,9 @@ impl SearchClient {
             candidate,
             0,
             sparse_threshold,
+            field_mask,
         )?;
-        let semantic = self.search_semantic(semantic_query, filters, candidate, 0)?;
+        let semantic = self.search_semantic(semantic_query, filters, candidate, 0, field_mask)?;
         let fused = rrf_fuse_hits(&lexical.hits, &semantic, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
@@ -2173,27 +2463,32 @@ impl SearchClient {
         *guard = Some(generation);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_tantivy(
         &self,
         reader: &IndexReader,
         fields: &crate::search::tantivy::Fields,
-        query: &str,
+        raw_query: &str,
+        sanitized_query: &str,
         filters: SearchFilters,
         limit: usize,
         offset: usize,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
         self.maybe_reload_reader(reader)?;
         let searcher = self.searcher_for_thread(reader);
         self.track_generation(searcher.generation().generation_id());
 
+        let needs_content = field_mask.needs_content() || field_mask.wants_snippet();
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-        // Parse query with boolean operator support (AND, OR, NOT, "phrases")
-        // Falls back to simple whitespace split for plain queries (implicit AND)
-        let tokens = parse_boolean_query(query);
+        // Parse query with boolean operator support (AND, OR, NOT, "phrases").
+        // Use the raw query so "-" and quotes are preserved for parsing, but
+        // normalize terms before building Tantivy clauses.
+        let tokens = parse_boolean_query(raw_query);
         if tokens.is_empty() {
             clauses.push((Occur::Must, Box::new(AllQuery)));
-        } else if has_boolean_operators(query) {
+        } else if has_boolean_operators(raw_query) {
             // Use boolean query builder for complex queries
             let bool_clauses = build_boolean_query_clauses(&tokens, fields);
             clauses.extend(bool_clauses);
@@ -2201,10 +2496,9 @@ impl SearchClient {
             // Simple query: treat each term as MUST (implicit AND)
             for token in tokens {
                 if let QueryToken::Term(term_str) = token {
-                    let pattern = WildcardPattern::parse(&term_str);
-                    let term_shoulds = build_term_query_clauses(&pattern, fields);
-                    if !term_shoulds.is_empty() {
-                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(term_shoulds))));
+                    let parts = normalize_term_parts(&term_str);
+                    if let Some(term_query) = build_compound_term_query(&parts, fields) {
+                        clauses.push((Occur::Must, term_query));
                     }
                 }
             }
@@ -2307,8 +2601,8 @@ impl SearchClient {
             Box::new(BooleanQuery::new(clauses))
         };
 
-        let prefix_only = is_prefix_only(query);
-        let snippet_generator = if prefix_only {
+        let prefix_only = is_prefix_only(sanitized_query);
+        let snippet_generator = if prefix_only || !field_mask.wants_snippet() {
             None
         } else {
             Some(SnippetGenerator::create(&searcher, &*q, fields.content)?)
@@ -2316,36 +2610,46 @@ impl SearchClient {
 
         let top_docs = searcher.search(&q, &TopDocs::with_limit(limit).and_offset(offset))?;
         // Compute match type once for all results (not per-hit)
-        let query_match_type = dominant_match_type(query);
+        let query_match_type = dominant_match_type(sanitized_query);
         let mut hits = Vec::new();
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
-            let title = doc
-                .get_first(fields.title)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let content = doc
-                .get_first(fields.content)
-                .or_else(|| doc.get_first(fields.preview))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let title = if field_mask.wants_title() {
+                doc.get_first(fields.title)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
+            let content = if needs_content {
+                doc.get_first(fields.content)
+                    .or_else(|| doc.get_first(fields.preview))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                String::new()
+            };
             let agent = doc
                 .get_first(fields.agent)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let snippet = if let Some(r#gen) = &snippet_generator {
-                r#gen
-                    .snippet_from_doc(&doc)
-                    .to_html()
-                    .replace("<b>", "**")
-                    .replace("</b>", "**")
-            } else if let Some(sn) = cached_prefix_snippet(&content, query, 160) {
-                sn
+            let snippet = if field_mask.wants_snippet() {
+                if let Some(r#gen) = &snippet_generator {
+                    r#gen
+                        .snippet_from_doc(&doc)
+                        .to_html()
+                        .replace("<b>", "**")
+                        .replace("</b>", "**")
+                } else if let Some(sn) = cached_prefix_snippet(&content, sanitized_query, 160) {
+                    sn
+                } else {
+                    quick_prefix_snippet(&content, sanitized_query, 160)
+                }
             } else {
-                quick_prefix_snippet(&content, query, 160)
+                String::new()
             };
             let source = doc
                 .get_first(fields.source_path)
@@ -2368,6 +2672,7 @@ impl SearchClient {
                 .get_first(fields.msg_idx)
                 .and_then(|v| v.as_u64())
                 .map(|i| (i + 1) as usize);
+            let content_hash = stable_hit_hash(&content, &source, line_number, created_at);
             // Provenance fields (P3.3)
             let source_id = doc
                 .get_first(fields.source_id)
@@ -2388,6 +2693,7 @@ impl SearchClient {
                 title,
                 snippet,
                 content,
+                content_hash,
                 score,
                 source_path: source,
                 agent,
@@ -2411,6 +2717,7 @@ impl SearchClient {
         filters: SearchFilters,
         limit: usize,
         offset: usize,
+        field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
         // FTS5 cannot handle empty queries
         if query.trim().is_empty() {
@@ -2426,11 +2733,26 @@ impl SearchClient {
             safe_query = safe_query.replace('"', "");
         }
 
-        let mut sql = String::from(
-            "SELECT f.title, f.content, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, snippet(fts_messages, 0, '**', '**', '...', 64) AS snippet, m.idx
+        let content_expr = if field_mask.needs_content() {
+            "f.content"
+        } else {
+            "''"
+        };
+        let title_expr = if field_mask.wants_title() {
+            "f.title"
+        } else {
+            "''"
+        };
+        let snippet_expr = if field_mask.wants_snippet() {
+            "snippet(fts_messages, 0, '**', '**', '...', 64)"
+        } else {
+            "''"
+        };
+        let mut sql = format!(
+            "SELECT {title_expr}, {content_expr}, f.agent, f.workspace, f.source_path, f.created_at, bm25(fts_messages) AS score, {snippet_expr} AS snippet, m.idx
              FROM fts_messages f
              LEFT JOIN messages m ON f.message_id = m.id
-             WHERE fts_messages MATCH ?",
+             WHERE fts_messages MATCH ?"
         );
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(safe_query)];
 
@@ -2484,11 +2806,13 @@ impl SearchClient {
                 // idx is 0-indexed message index; convert to 1-indexed line number for JSONL files
                 let idx: Option<i64> = row.get(8).ok();
                 let line_number = idx.map(|i| (i + 1) as usize);
+                let content_hash = stable_hit_hash(&content, &source_path, line_number, created_at);
                 // SQLite FTS doesn't have provenance or workspace_original - use defaults
                 Ok(SearchHit {
                     title,
                     snippet,
                     content,
+                    content_hash,
                     score,
                     source_path,
                     agent,
@@ -2854,13 +3178,16 @@ impl SearchClient {
         );
     }
 
-    fn cache_key(&self, query: &str, filters: &SearchFilters) -> String {
-        format!(
+    /// Generate an interned cache key for the given query and filters.
+    /// Returns Arc<str> to enable memory sharing for repeated queries.
+    fn cache_key(&self, query: &str, filters: &SearchFilters) -> Arc<str> {
+        let key_str = format!(
             "{}|{}::{}",
             self.cache_namespace,
             query,
             filters_fingerprint(filters)
-        )
+        );
+        intern_cache_key(&key_str)
     }
 
     fn shard_name(&self, filters: &SearchFilters) -> String {
@@ -2891,6 +3218,7 @@ impl SearchClient {
                 continue;
             }
             let key = self.cache_key(&query[..end], filters);
+            // LruCache.peek() accepts &Q where Arc<str>: Borrow<Q>, so &Arc<str> works
             if let Some(hits) = shard.peek(&key) {
                 return Some(hits.clone());
             }
@@ -2946,6 +3274,115 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use tempfile::TempDir;
 
+    // ==========================================================================
+    // StringInterner Tests (Opt 2.3)
+    // ==========================================================================
+
+    #[test]
+    fn interner_returns_same_arc_for_same_string() {
+        let interner = StringInterner::new(100);
+
+        let s1 = interner.intern("test_query");
+        let s2 = interner.intern("test_query");
+
+        // Should be the exact same Arc (pointer equality)
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "test_query");
+    }
+
+    #[test]
+    fn interner_different_strings_return_different_arcs() {
+        let interner = StringInterner::new(100);
+
+        let s1 = interner.intern("query1");
+        let s2 = interner.intern("query2");
+
+        assert!(!Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "query1");
+        assert_eq!(&*s2, "query2");
+    }
+
+    #[test]
+    fn interner_handles_empty_string() {
+        let interner = StringInterner::new(100);
+
+        let s1 = interner.intern("");
+        let s2 = interner.intern("");
+
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s1, "");
+    }
+
+    #[test]
+    fn interner_handles_unicode() {
+        let interner = StringInterner::new(100);
+
+        let s1 = interner.intern("测试查询");
+        let s2 = interner.intern("测试查询");
+        let s3 = interner.intern("emoji 🔍 search");
+
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert_eq!(&*s3, "emoji 🔍 search");
+    }
+
+    #[test]
+    fn interner_respects_lru_eviction() {
+        let interner = StringInterner::new(3);
+
+        let _s1 = interner.intern("query1");
+        let _s2 = interner.intern("query2");
+        let _s3 = interner.intern("query3");
+
+        assert_eq!(interner.len(), 3);
+
+        // This should evict query1 (LRU)
+        let _s4 = interner.intern("query4");
+
+        assert_eq!(interner.len(), 3);
+
+        // query1 should now get a NEW Arc (was evicted)
+        let s1_new = interner.intern("query1");
+        assert_eq!(&*s1_new, "query1");
+    }
+
+    #[test]
+    fn interner_concurrent_access() {
+        use std::thread;
+
+        let interner = Arc::new(StringInterner::new(1000));
+        let queries: Vec<String> = (0..100).map(|i| format!("query_{}", i)).collect();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let interner = Arc::clone(&interner);
+                let queries = queries.clone();
+
+                thread::spawn(move || {
+                    for _ in 0..10 {
+                        for query in &queries {
+                            let _ = interner.intern(query);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify all queries are interned correctly
+        for query in &queries {
+            let s1 = interner.intern(query);
+            let s2 = interner.intern(query);
+            assert!(Arc::ptr_eq(&s1, &s2));
+        }
+    }
+
+    // ==========================================================================
+    // Original Tests
+    // ==========================================================================
+
     #[test]
     fn cache_enforces_prefix_matching() {
         // Hit contains "arrow"
@@ -2953,6 +3390,7 @@ mod tests {
             title: "test".into(),
             snippet: "".into(),
             content: "arrow".into(),
+            content_hash: stable_content_hash("arrow"),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -3001,19 +3439,34 @@ mod tests {
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
-        let _ = client.search("foo*", SearchFilters::default(), 10, 0);
+        let _ = client.search("foo*", SearchFilters::default(), 10, 0, FieldMask::FULL);
         let stats = client.cache_stats();
-        assert_eq!(stats.cache_miss, 0, "Wildcard query should not trigger cache miss");
+        assert_eq!(
+            stats.cache_miss, 0,
+            "Wildcard query should not trigger cache miss"
+        );
 
         // Boolean query should skip cache
-        let _ = client.search("foo OR bar", SearchFilters::default(), 10, 0);
+        let _ = client.search(
+            "foo OR bar",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        );
         let stats = client.cache_stats();
-        assert_eq!(stats.cache_miss, 0, "Boolean query should not trigger cache miss");
+        assert_eq!(
+            stats.cache_miss, 0,
+            "Boolean query should not trigger cache miss"
+        );
 
         // Simple query should trigger miss
-        let _ = client.search("simple", SearchFilters::default(), 10, 0);
+        let _ = client.search("simple", SearchFilters::default(), 10, 0, FieldMask::FULL);
         let stats = client.cache_stats();
-        assert_eq!(stats.cache_miss, 1, "Simple query should trigger cache miss");
+        assert_eq!(
+            stats.cache_miss, 1,
+            "Simple query should trigger cache miss"
+        );
     }
 
     #[test]
@@ -3037,6 +3490,7 @@ mod tests {
             title: "こんにちは".into(),
             snippet: String::new(),
             content: "こんにちは 世界".into(),
+            content_hash: stable_content_hash("こんにちは 世界"),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -3065,6 +3519,7 @@ mod tests {
             title: "hello world".into(),
             snippet: "hello world".into(),
             content: "hello world".into(),
+            content_hash: stable_content_hash("hello world"),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -3126,7 +3581,7 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
 
-        let hits = client.search("hello", filters, 10, 0)?;
+        let hits = client.search("hello", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].agent, "codex");
         assert!(hits[0].snippet.contains("hello"));
@@ -3198,7 +3653,7 @@ mod tests {
         filters.created_from = Some(15);
         filters.created_to = Some(25);
 
-        let hits = client.search("needle", filters, 10, 0)?;
+        let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].workspace, "/ws/b");
         assert!(hits[0].snippet.contains("second line"));
@@ -3240,7 +3695,13 @@ mod tests {
         index.commit()?;
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
-        let hits = client.search("pagination", SearchFilters::default(), 1, 1)?;
+        let hits = client.search(
+            "pagination",
+            SearchFilters::default(),
+            1,
+            1,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
         Ok(())
     }
@@ -3278,7 +3739,7 @@ mod tests {
         index.commit()?;
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
-        let hits = client.search("cma-es", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("cma-es", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.to_lowercase().contains("cma"));
         Ok(())
@@ -3313,12 +3774,12 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "cal" should match "calculate"
-        let hits = client.search("cal", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("cal", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("calculate"));
 
         // "entr" should match "entropy"
-        let hits = client.search("entr", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("entr", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         Ok(())
@@ -3353,11 +3814,17 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "vari" should match "variable" inside "my_variable_name"
-        let hits = client.search("vari", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("vari", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         // "my_variable" should match "my_variable_name" (because it splits to "my variable")
-        let hits = client.search("my_variable", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "my_variable",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
 
         Ok(())
@@ -3392,11 +3859,11 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "c++" -> "c"
-        let hits = client.search("c++", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("c++", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         // "foo.bar" -> "foo", "bar"
-        let hits = client.search("foo.bar", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("foo.bar", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         Ok(())
@@ -3431,16 +3898,17 @@ mod tests {
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
-        let exact = client.search("handler", SearchFilters::default(), 10, 0)?;
+        let exact = client.search("handler", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(exact[0].match_type, MatchType::Exact);
 
-        let prefix = client.search("hand*", SearchFilters::default(), 10, 0)?;
+        let prefix = client.search("hand*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(prefix[0].match_type, MatchType::Prefix);
 
-        let suffix = client.search("*handler", SearchFilters::default(), 10, 0)?;
+        let suffix = client.search("*handler", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(suffix[0].match_type, MatchType::Suffix);
 
-        let substring = client.search("*andle*", SearchFilters::default(), 10, 0)?;
+        let substring =
+            client.search("*andle*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(substring[0].match_type, MatchType::Substring);
 
         Ok(())
@@ -3476,7 +3944,14 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // Base search for "andle" finds nothing; fallback "*andle*" should hit and mark implicit.
-        let result = client.search_with_fallback("andle", SearchFilters::default(), 10, 0, 2)?;
+        let result = client.search_with_fallback(
+            "andle",
+            SearchFilters::default(),
+            10,
+            0,
+            2,
+            FieldMask::FULL,
+        )?;
         assert!(result.wildcard_fallback);
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].match_type, MatchType::ImplicitWildcard);
@@ -3503,7 +3978,7 @@ mod tests {
             semantic: Mutex::new(None),
         };
 
-        let hits = client.search("*handler", SearchFilters::default(), 5, 0)?;
+        let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
         assert!(
             hits.is_empty(),
             "wildcard should skip sqlite fallback, not error"
@@ -3543,7 +4018,7 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // 2. Search "app" -> should hit "apple"
-        let hits = client.search("app", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].content, "apple banana");
 
@@ -3587,11 +4062,11 @@ mod tests {
 
         // 6. Search "ap" (prefix of apricot and apple)
         // The cache for "app" should be cleared if opstamp changed.
-        let _hits = client.search("app", SearchFilters::default(), 10, 0)?;
+        let _hits = client.search("app", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         // Should now find 1 doc still ("apple"), but cache should have been cleared first
 
         // Search "apr" -> should find "apricot"
-        let hits = client.search("apr", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("apr", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].content, "apricot");
 
@@ -3622,6 +4097,7 @@ mod tests {
             title: "hello world".into(),
             snippet: "hello".into(),
             content: "hello world".into(),
+            content_hash: stable_content_hash("hello world"),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -3676,6 +4152,7 @@ mod tests {
             title: "a".into(),
             snippet: "a".into(),
             content: "a".into(),
+            content_hash: stable_content_hash("a"),
             score: 1.0,
             source_path: "p".into(),
             agent: "agent1".into(),
@@ -3758,6 +4235,7 @@ mod tests {
             title: "test".into(),
             snippet: "snippet".into(),
             content: "content".into(),
+            content_hash: stable_content_hash("content"),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -3816,10 +4294,12 @@ mod tests {
         };
 
         // Large content to exceed byte cap quickly
+        let content = "c".repeat(100);
         let hit = SearchHit {
             title: "a".repeat(50),
             snippet: "b".repeat(50),
-            content: "c".repeat(100), // 200+ bytes per hit
+            content: content.clone(), // 200+ bytes per hit
+            content_hash: stable_content_hash(&content),
             score: 1.0,
             source_path: "p".into(),
             agent: "a".into(),
@@ -4115,6 +4595,7 @@ mod tests {
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
+                content_hash: stable_content_hash("hello world"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4131,7 +4612,8 @@ mod tests {
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(), // same content
-                score: 0.5,                    // lower score
+                content_hash: stable_content_hash("hello world"),
+                score: 0.5, // lower score
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
                 workspace: "ws".into(),
@@ -4158,6 +4640,7 @@ mod tests {
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello world".into(),
+                content_hash: stable_content_hash("hello world"),
                 score: 0.3, // lower score first
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4174,6 +4657,7 @@ mod tests {
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(),
+                content_hash: stable_content_hash("hello world"),
                 score: 0.9, // higher score second
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
@@ -4201,6 +4685,7 @@ mod tests {
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "hello    world".into(), // extra spaces
+                content_hash: stable_content_hash("hello    world"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4217,6 +4702,7 @@ mod tests {
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "hello world".into(), // normal spacing
+                content_hash: stable_content_hash("hello world"),
                 score: 0.5,
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
@@ -4242,6 +4728,7 @@ mod tests {
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "[Tool: Bash]".into(), // noise (short)
+                content_hash: stable_content_hash("[Tool: Bash]"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4258,6 +4745,7 @@ mod tests {
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "This is real content about testing".into(),
+                content_hash: stable_content_hash("This is real content about testing"),
                 score: 0.5,
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
@@ -4284,6 +4772,7 @@ mod tests {
                 title: "title1".into(),
                 snippet: "snip1".into(),
                 content: "first message".into(),
+                content_hash: stable_content_hash("first message"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4300,6 +4789,7 @@ mod tests {
                 title: "title2".into(),
                 snippet: "snip2".into(),
                 content: "second message".into(),
+                content_hash: stable_content_hash("second message"),
                 score: 0.8,
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
@@ -4316,6 +4806,7 @@ mod tests {
                 title: "title3".into(),
                 snippet: "snip3".into(),
                 content: "third message".into(),
+                content_hash: stable_content_hash("third message"),
                 score: 0.6,
                 source_path: "c.jsonl".into(),
                 agent: "agent".into(),
@@ -4343,6 +4834,7 @@ mod tests {
                 title: "local title".into(),
                 snippet: "snip".into(),
                 content: "hello world".into(),
+                content_hash: stable_content_hash("hello world"),
                 score: 1.0,
                 source_path: "a.jsonl".into(),
                 agent: "agent".into(),
@@ -4359,6 +4851,7 @@ mod tests {
                 title: "remote title".into(),
                 snippet: "snip".into(),
                 content: "hello world".into(), // same content
+                content_hash: stable_content_hash("hello world"),
                 score: 0.9,
                 source_path: "b.jsonl".into(),
                 agent: "agent".into(),
@@ -4423,6 +4916,7 @@ mod tests {
             10,
             0,
             3, // threshold of 3
+            FieldMask::FULL,
         )?;
 
         assert!(!result.wildcard_fallback);
@@ -4468,6 +4962,7 @@ mod tests {
             10,
             0,
             5, // high threshold
+            FieldMask::FULL,
         )?;
 
         // Since we have only 1 result and threshold is 5, it may trigger fallback
@@ -4513,6 +5008,7 @@ mod tests {
             10,
             0,
             10, // high threshold
+            FieldMask::FULL,
         )?;
 
         assert!(!result.wildcard_fallback); // shouldn't trigger fallback for wildcard queries
@@ -4558,7 +5054,14 @@ mod tests {
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
-        let result = client.search_with_fallback("bet", SearchFilters::default(), 10, 0, 2)?;
+        let result = client.search_with_fallback(
+            "bet",
+            SearchFilters::default(),
+            10,
+            0,
+            2,
+            FieldMask::FULL,
+        )?;
 
         assert!(
             result.wildcard_fallback,
@@ -4597,7 +5100,14 @@ mod tests {
             semantic: Mutex::new(None),
         };
 
-        let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 0, 3)?;
+        let result = client.search_with_fallback(
+            "ghost",
+            SearchFilters::default(),
+            5,
+            0,
+            3,
+            FieldMask::FULL,
+        )?;
 
         assert!(
             result.hits.is_empty(),
@@ -4648,7 +5158,14 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // Empty query - should not trigger fallback
-        let result = client.search_with_fallback("  ", SearchFilters::default(), 10, 0, 10)?;
+        let result = client.search_with_fallback(
+            "  ",
+            SearchFilters::default(),
+            10,
+            0,
+            10,
+            FieldMask::FULL,
+        )?;
 
         assert!(!result.wildcard_fallback);
         Ok(())
@@ -4672,7 +5189,14 @@ mod tests {
             semantic: Mutex::new(None),
         };
 
-        let result = client.search_with_fallback("ghost", SearchFilters::default(), 5, 10, 3)?;
+        let result = client.search_with_fallback(
+            "ghost",
+            SearchFilters::default(),
+            5,
+            10,
+            3,
+            FieldMask::FULL,
+        )?;
 
         assert!(
             !result.wildcard_fallback,
@@ -4710,7 +5234,7 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into()); // triggers remove-agent suggestion
 
-        let result = client.search_with_fallback("claud", filters, 5, 0, 3)?;
+        let result = client.search_with_fallback("claud", filters, 5, 0, 3, FieldMask::FULL)?;
 
         // Should cap at 3 suggestions with shortcuts 1..=3
         assert_eq!(
@@ -4936,7 +5460,7 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
 
-        let hits = client.search("findme", filters.clone(), 10, 0)?;
+        let hits = client.search("findme", filters.clone(), 10, 0, FieldMask::FULL)?;
 
         // Property: all results must have agent == "codex"
         for hit in &hits {
@@ -4949,7 +5473,7 @@ mod tests {
         assert!(!hits.is_empty(), "Should have found results");
 
         // Repeat search (should use cache) and verify same property
-        let cached_hits = client.search("findme", filters, 10, 0)?;
+        let cached_hits = client.search("findme", filters, 10, 0, FieldMask::FULL)?;
         for hit in &cached_hits {
             assert_eq!(hit.agent, "codex", "Cached search violated agent filter");
         }
@@ -5013,7 +5537,7 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/workspace/beta".into());
 
-        let hits = client.search("needle", filters.clone(), 10, 0)?;
+        let hits = client.search("needle", filters.clone(), 10, 0, FieldMask::FULL)?;
 
         // Property: all results must have workspace == "/workspace/beta"
         for hit in &hits {
@@ -5026,7 +5550,7 @@ mod tests {
         assert!(!hits.is_empty(), "Should have found results");
 
         // Repeat search (should use cache)
-        let cached_hits = client.search("needle", filters, 10, 0)?;
+        let cached_hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         for hit in &cached_hits {
             assert_eq!(
                 hit.workspace, "/workspace/beta",
@@ -5117,7 +5641,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hits = client.search("range", filters.clone(), 10, 0)?;
+        let hits = client.search("range", filters.clone(), 10, 0, FieldMask::FULL)?;
 
         // Property: all results must have created_at within [400, 600]
         for hit in &hits {
@@ -5132,7 +5656,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "Should find exactly 1 doc in range");
 
         // Repeat search (cache)
-        let cached_hits = client.search("range", filters, 10, 0)?;
+        let cached_hits = client.search("range", filters, 10, 0, FieldMask::FULL)?;
         for hit in &cached_hits {
             if let Some(ts) = hit.created_at {
                 assert!(
@@ -5192,7 +5716,7 @@ mod tests {
         filters.created_from = Some(400);
         filters.created_to = Some(600);
 
-        let hits = client.search("combotest", filters.clone(), 10, 0)?;
+        let hits = client.search("combotest", filters.clone(), 10, 0, FieldMask::FULL)?;
 
         // Should find exactly 1 doc (index 1 in combinations)
         assert_eq!(hits.len(), 1, "Combined filter should match exactly 1 doc");
@@ -5206,7 +5730,7 @@ mod tests {
         }
 
         // Cache hit
-        let cached = client.search("combotest", filters, 10, 0)?;
+        let cached = client.search("combotest", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(cached.len(), 1, "Cached result count mismatch");
 
         Ok(())
@@ -5251,7 +5775,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hits = client.search("source", filters.clone(), 10, 0)?;
+        let hits = client.search("source", filters.clone(), 10, 0, FieldMask::FULL)?;
 
         // Property: all results should have source_id == "local"
         for hit in &hits {
@@ -5269,7 +5793,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hits_id = client.search("source", filters_id, 10, 0)?;
+        let hits_id = client.search("source", filters_id, 10, 0, FieldMask::FULL)?;
         for hit in &hits_id {
             assert_eq!(
                 hit.source_id, "local",
@@ -5573,12 +6097,24 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "alpha AND beta" should only match doc1
-        let hits = client.search("alpha AND beta", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "alpha AND beta",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("gamma"));
 
         // "alpha AND delta" should only match doc2
-        let hits = client.search("alpha AND delta", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "alpha AND delta",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("delta"));
 
@@ -5635,7 +6171,13 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "xyzzy OR plugh" should match both docs
-        let hits = client.search("xyzzy OR plugh", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "xyzzy OR plugh",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 2);
 
         Ok(())
@@ -5691,7 +6233,13 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "nottest NOT exclude" should only match doc1 (has nottest but NOT exclude)
-        let hits = client.search("nottest NOT exclude", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "nottest NOT exclude",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
         // Verify we got the right doc by checking it doesn't contain "exclude"
         assert!(
@@ -5699,9 +6247,19 @@ mod tests {
             "NOT exclude should filter out doc with 'exclude'"
         );
 
-        // Note: The - prefix exclusion with "nottest -exclude" may have different behavior
-        // depending on how terms are ordered in the query. The important test is that
-        // "NOT" keyword exclusion works correctly, which was verified above.
+        // Prefix "-" exclusion should behave like NOT for simple queries.
+        let hits = client.search(
+            "nottest -exclude",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert!(
+            !hits[0].content.contains("exclude"),
+            "Prefix -exclude should filter out doc with 'exclude'"
+        );
 
         Ok(())
     }
@@ -5756,11 +6314,23 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // "quick brown" (without quotes) should match both (words just need to be present)
-        let hits = client.search("quick brown", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "quick brown",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 2);
 
         // "\"quick brown\"" should match exact order only
-        let hits = client.search("\"quick brown\"", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "\"quick brown\"",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("quick brown"));
 
@@ -5796,10 +6366,10 @@ mod tests {
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
-        let hits = client.search("foo.bar", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("foo.bar", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
-        let hits = client.search("foo-bar", SearchFilters::default(), 10, 0)?;
+        let hits = client.search("foo-bar", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         Ok(())
@@ -5993,7 +6563,7 @@ mod tests {
         filters.created_from = Some(50);
         filters.created_to = Some(250);
 
-        let hits = client.search("needle", filters, 10, 0)?;
+        let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(
             hits.len(),
             1,
@@ -6044,7 +6614,7 @@ mod tests {
         filters.agents.insert("codex".into());
         filters.agents.insert("claude".into());
 
-        let hits = client.search("needle", filters, 10, 0)?;
+        let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 2);
         let agents: Vec<_> = hits.iter().map(|h| h.agent.as_str()).collect();
         assert!(agents.contains(&"codex"));
@@ -6195,7 +6765,8 @@ mod tests {
         let mut filters = SearchFilters::default();
         filters.agents.insert("codex".into());
 
-        let result = client.search_with_fallback("unique", filters.clone(), 10, 0, 100)?;
+        let result =
+            client.search_with_fallback("unique", filters.clone(), 10, 0, 100, FieldMask::FULL)?;
         // Should only return the codex conversation, not claude
         assert!(result.hits.iter().all(|h| h.agent == "codex"));
 
@@ -6232,7 +6803,14 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // Short prefix "auth" should match "authentication" and "authorization"
-        let result = client.search_with_fallback("auth", SearchFilters::default(), 10, 0, 100)?;
+        let result = client.search_with_fallback(
+            "auth",
+            SearchFilters::default(),
+            10,
+            0,
+            100,
+            FieldMask::FULL,
+        )?;
         assert!(
             !result.hits.is_empty(),
             "Short prefix should match via prefix search"
@@ -6306,7 +6884,13 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // Search for various terms that should match
-        let hits = client.search("JWT authentication", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "JWT authentication",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert!(!hits.is_empty(), "Should find JWT authentication");
         assert!(hits.iter().any(|h| h.agent == "claude_code"));
         assert!(
@@ -6315,14 +6899,26 @@ mod tests {
         );
 
         // Search for assistant response content
-        let hits = client.search("required packages", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "required packages",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert!(
             !hits.is_empty(),
             "Should find 'required packages' in assistant response"
         );
 
         // Search for user question about refresh tokens
-        let hits = client.search("refresh token", SearchFilters::default(), 10, 0)?;
+        let hits = client.search(
+            "refresh token",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
         assert!(!hits.is_empty(), "Should find refresh token");
         assert!(hits.iter().any(|h| h.content.contains("refresh")));
 
@@ -6367,6 +6963,7 @@ mod tests {
             10,
             0,
             100,
+            FieldMask::FULL,
         )?;
 
         // Both should be returned (different source_paths mean different conversations)
@@ -6420,7 +7017,7 @@ mod tests {
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
 
         // First, search without filter - should get all 3
-        let hits_all = client.search("needle", SearchFilters::default(), 10, 0)?;
+        let hits_all = client.search("needle", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(hits_all.len(), 3, "Should find all 3 sessions");
 
         // Now filter to only sessions A and C
@@ -6432,7 +7029,7 @@ mod tests {
             .session_paths
             .insert(paths[2].to_string_lossy().to_string());
 
-        let hits_filtered = client.search("needle", filters, 10, 0)?;
+        let hits_filtered = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(
             hits_filtered.len(),
             2,
@@ -6485,7 +7082,7 @@ mod tests {
         let filters = SearchFilters::default();
         assert!(filters.session_paths.is_empty());
 
-        let hits = client.search("needle", filters, 10, 0)?;
+        let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
 
         Ok(())
@@ -6500,6 +7097,7 @@ mod tests {
             title: id.to_string(),
             snippet: String::new(),
             content: id.to_string(),
+            content_hash: stable_content_hash(id),
             score,
             source_path: format!("/path/{}.jsonl", id),
             agent: "test".to_string(),
