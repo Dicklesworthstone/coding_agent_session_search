@@ -5,5 +5,6 @@ pub mod encrypt;
 pub mod export;
 pub mod fts;
 pub mod qr;
+pub mod secret_scan;
 pub mod size;
 pub mod wizard;

@@ -1,15 +1,20 @@
-use anyhow::{bail, Context, Result};
-use console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
+use anyhow::{Context, Result, bail};
+use console::{Term, style};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use crate::pages::bundle::{BundleBuilder, BundleConfig};
 use crate::pages::encrypt::EncryptionEngine;
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
+use crate::pages::secret_scan::{
+    SecretScanConfig, SecretScanFilters, print_human_report, wizard_secret_scan,
+};
+use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::storage::sqlite::SqliteStorage;
 
 /// Deployment target for the export
@@ -60,9 +65,10 @@ pub struct WizardState {
 
 impl Default for WizardState {
     fn default() -> Self {
-        let db_path = directories::ProjectDirs::from("com", "dicklesworthstone", "coding-agent-search")
-            .map(|dirs| dirs.data_dir().join("agent_search.db"))
-            .expect("Could not determine data directory");
+        let db_path =
+            directories::ProjectDirs::from("com", "dicklesworthstone", "coding-agent-search")
+                .map(|dirs| dirs.data_dir().join("agent_search.db"))
+                .expect("Could not determine data directory");
 
         Self {
             agents: Vec::new(),
@@ -110,25 +116,28 @@ impl PagesWizard {
         // Step 1: Content Selection
         self.step_content_selection(&mut term, &theme)?;
 
-        // Step 2: Security Configuration
+        // Step 2: Secret Scan
+        self.step_secret_scan(&mut term, &theme)?;
+
+        // Step 3: Security Configuration
         self.step_security_config(&mut term, &theme)?;
 
-        // Step 3: Site Configuration
+        // Step 4: Site Configuration
         self.step_site_config(&mut term, &theme)?;
 
-        // Step 4: Deployment Target
+        // Step 5: Deployment Target
         self.step_deployment_target(&mut term, &theme)?;
 
-        // Step 5: Pre-Publish Summary
+        // Step 6: Pre-Publish Summary
         if !self.step_summary(&mut term, &theme)? {
             writeln!(term, "{}", style("Export cancelled.").yellow())?;
             return Ok(());
         }
 
-        // Step 6: Export Progress
+        // Step 7: Export Progress
         self.step_export(&mut term)?;
 
-        // Step 7: Deploy (if not local)
+        // Step 8: Deploy (if not local)
         self.step_deploy(&mut term)?;
 
         Ok(())
@@ -149,11 +158,7 @@ impl PagesWizard {
     }
 
     fn step_content_selection(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
-        writeln!(
-            term,
-            "\n{}",
-            style("Step 1 of 7: Content Selection").bold()
-        )?;
+        writeln!(term, "\n{}", style("Step 1 of 8: Content Selection").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         // Load agents dynamically from database
@@ -271,11 +276,64 @@ impl PagesWizard {
         Ok(())
     }
 
+    fn step_secret_scan(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
+        writeln!(term, "\n{}", style("Step 2 of 8: Secret Scan").bold())?;
+        writeln!(term, "{}", style("─".repeat(40)).dim())?;
+
+        let since_ts = self
+            .state
+            .time_range
+            .as_deref()
+            .and_then(crate::ui::time_parser::parse_time_input);
+
+        let filters = SecretScanFilters {
+            agents: if self.state.agents.is_empty() {
+                None
+            } else {
+                Some(self.state.agents.clone())
+            },
+            workspaces: self.state.workspaces.clone(),
+            since_ts,
+            until_ts: None,
+        };
+
+        let config = SecretScanConfig::from_inputs(&[], &[])?;
+        if !config.allowlist_raw.is_empty() || !config.denylist_raw.is_empty() {
+            writeln!(
+                term,
+                "  {} Allowlist patterns: {} | Denylist patterns: {}",
+                style("ℹ").blue(),
+                config.allowlist_raw.len(),
+                config.denylist_raw.len()
+            )?;
+        }
+
+        let report = wizard_secret_scan(&self.state.db_path, &filters, &config)?;
+        print_human_report(term, &report, 3)?;
+
+        if report.summary.has_critical {
+            writeln!(
+                term,
+                "  {} Critical secrets detected. Export is blocked without acknowledgement.",
+                style("✗").red()
+            )?;
+            let ack: String = Input::with_theme(theme)
+                .with_prompt("Type \"I UNDERSTAND\" to proceed")
+                .interact_text()?;
+            if ack.trim() != "I UNDERSTAND" {
+                bail!("Export cancelled due to critical secrets");
+            }
+            writeln!(term, "  {} Acknowledged", style("✓").green())?;
+        }
+
+        Ok(())
+    }
+
     fn step_security_config(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
         writeln!(
             term,
             "\n{}",
-            style("Step 2 of 7: Security Configuration").bold()
+            style("Step 3 of 8: Security Configuration").bold()
         )?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
@@ -326,11 +384,7 @@ impl PagesWizard {
             .interact()?;
 
         if self.state.generate_qr {
-            writeln!(
-                term,
-                "  {} QR code will be generated",
-                style("✓").green()
-            )?;
+            writeln!(term, "  {} QR code will be generated", style("✓").green())?;
         }
 
         Ok(())
@@ -340,7 +394,7 @@ impl PagesWizard {
         writeln!(
             term,
             "\n{}",
-            style("Step 3 of 7: Site Configuration").bold()
+            style("Step 4 of 8: Site Configuration").bold()
         )?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
@@ -350,12 +404,7 @@ impl PagesWizard {
             .default(self.state.title.clone())
             .interact_text()?;
 
-        writeln!(
-            term,
-            "  {} Title: {}",
-            style("✓").green(),
-            self.state.title
-        )?;
+        writeln!(term, "  {} Title: {}", style("✓").green(), self.state.title)?;
 
         // Description
         self.state.description = Input::with_theme(theme)
@@ -363,11 +412,7 @@ impl PagesWizard {
             .default(self.state.description.clone())
             .interact_text()?;
 
-        writeln!(
-            term,
-            "  {} Description set",
-            style("✓").green()
-        )?;
+        writeln!(term, "  {} Description set", style("✓").green())?;
 
         // Metadata privacy
         self.state.hide_metadata = Confirm::with_theme(theme)
@@ -376,22 +421,14 @@ impl PagesWizard {
             .interact()?;
 
         if self.state.hide_metadata {
-            writeln!(
-                term,
-                "  {} Metadata will be obfuscated",
-                style("✓").green()
-            )?;
+            writeln!(term, "  {} Metadata will be obfuscated", style("✓").green())?;
         }
 
         Ok(())
     }
 
     fn step_deployment_target(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
-        writeln!(
-            term,
-            "\n{}",
-            style("Step 4 of 7: Deployment Target").bold()
-        )?;
+        writeln!(term, "\n{}", style("Step 5 of 8: Deployment Target").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         let targets = vec![
@@ -436,10 +473,7 @@ impl PagesWizard {
 
         // Repository name for remote deployment
         if self.state.target != DeployTarget::Local {
-            let default_repo = format!(
-                "cass-archive-{}",
-                chrono::Utc::now().format("%Y%m%d")
-            );
+            let default_repo = format!("cass-archive-{}", chrono::Utc::now().format("%Y%m%d"));
             self.state.repo_name = Some(
                 Input::<String>::with_theme(theme)
                     .with_prompt("Repository/project name")
@@ -462,7 +496,7 @@ impl PagesWizard {
         writeln!(
             term,
             "\n{}",
-            style("Step 5 of 7: Pre-Publish Summary").bold()
+            style("Step 6 of 8: Pre-Publish Summary").bold()
         )?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
@@ -509,8 +543,64 @@ impl PagesWizard {
     }
 
     fn step_export(&mut self, term: &mut Term) -> Result<()> {
-        writeln!(term, "\n{}", style("Step 6 of 7: Export Progress").bold())?;
+        writeln!(term, "\n{}", style("Step 7 of 8: Export Progress").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
+
+        // Phase 0: Size estimation and limit checking
+        writeln!(term, "\n  Estimating export size...")?;
+
+        let since_ts = self
+            .state
+            .time_range
+            .as_deref()
+            .and_then(crate::ui::time_parser::parse_time_input);
+
+        let agents: Vec<String> = self.state.agents.to_vec();
+        let estimate = SizeEstimate::from_database(
+            &self.state.db_path,
+            if agents.is_empty() {
+                None
+            } else {
+                Some(&agents)
+            },
+            since_ts,
+            None,
+        )?;
+
+        // Display estimate
+        writeln!(term)?;
+        for line in estimate.format_display().lines() {
+            writeln!(term, "  {}", line)?;
+        }
+        writeln!(term)?;
+
+        // Check limits
+        match estimate.check_limits() {
+            SizeLimitResult::Ok => {
+                writeln!(term, "  {} Size within limits", style("✓").green())?;
+            }
+            SizeLimitResult::Warning(warning) => {
+                writeln!(term, "  {} {}", style("⚠").yellow(), warning)?;
+                writeln!(term)?;
+
+                let theme = ColorfulTheme::default();
+                if !Confirm::with_theme(&theme)
+                    .with_prompt("Continue with export?")
+                    .default(true)
+                    .interact()?
+                {
+                    bail!("Export cancelled due to size warning");
+                }
+            }
+            SizeLimitResult::ExceedsLimit(error) => {
+                writeln!(term)?;
+                writeln!(term, "  {} {}", style("✗").red(), error)?;
+                writeln!(term)?;
+                bail!("Export blocked: {}", error);
+            }
+        }
+
+        writeln!(term)?;
 
         // Create output directory
         if !self.state.output_dir.exists() {
@@ -554,10 +644,7 @@ impl PagesWizard {
         let stats = engine.execute(
             |current, total| {
                 if total > 0 {
-                    pb.set_message(format!(
-                        "Exporting... {}/{} conversations",
-                        current, total
-                    ));
+                    pb.set_message(format!("Exporting... {}/{} conversations", current, total));
                 }
             },
             Some(running),
@@ -604,7 +691,7 @@ impl PagesWizard {
 
         pb2.finish_with_message("✓ Encryption complete");
 
-        // Phase 3: Bundling (placeholder for now)
+        // Phase 3: Build static site bundle
         let pb3 = ProgressBar::new_spinner();
         pb3.set_style(
             ProgressStyle::default_spinner()
@@ -612,52 +699,55 @@ impl PagesWizard {
                 .unwrap(),
         );
         pb3.enable_steady_tick(Duration::from_millis(100));
-        pb3.set_message("Preparing static site bundle...");
+        pb3.set_message("Building static site bundle...");
 
-        // Write site metadata
-        let metadata = serde_json::json!({
-            "title": self.state.title,
-            "description": self.state.description,
-            "generated_at": chrono::Utc::now().to_rfc3339(),
-            "generator": "cass pages wizard",
-            "version": env!("CARGO_PKG_VERSION"),
-        });
-        std::fs::write(
-            self.state.output_dir.join("site.json"),
-            serde_json::to_string_pretty(&metadata)?,
-        )?;
+        // Create bundle configuration
+        let bundle_config = BundleConfig {
+            title: self.state.title.clone(),
+            description: self.state.description.clone(),
+            hide_metadata: self.state.hide_metadata,
+            recovery_secret: self.state.recovery_secret.clone(),
+            generate_qr: self.state.generate_qr,
+        };
 
-        // Write README with instructions
-        let readme = format!(
-            r#"# {}
+        // Build the bundle - creates site/ and private/ directories
+        let bundle_output_dir = self
+            .state
+            .output_dir
+            .parent()
+            .map(|p| {
+                p.join(format!(
+                    "{}-bundle",
+                    self.state
+                        .output_dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ))
+            })
+            .unwrap_or_else(|| self.state.output_dir.join("bundle"));
 
-{}
+        let builder = BundleBuilder::with_config(bundle_config);
+        let bundle_result =
+            builder.build(&self.state.output_dir, &bundle_output_dir, |phase, msg| {
+                pb3.set_message(format!("{}: {}", phase, msg));
+            })?;
 
-## Opening the Archive
+        pb3.finish_with_message(format!(
+            "✓ Bundle complete: {} files, fingerprint {}",
+            bundle_result.total_files,
+            &bundle_result.fingerprint[..8]
+        ));
 
-This archive requires the cass web viewer to function.
-Bundle generation will be completed in P4.1a.
-
-To preview locally after bundling:
-```
-npx serve {} --cors
-```
-
-Then open http://localhost:3000 in a modern browser.
-
-## Files
-
-- `config.json` - Encryption configuration
-- `payload/` - Encrypted database chunks
-- `site.json` - Site metadata
-"#,
-            self.state.title,
-            self.state.description,
-            self.state.output_dir.display()
-        );
-        std::fs::write(self.state.output_dir.join("README.md"), readme)?;
-
-        pb3.finish_with_message("✓ Bundle prepared (awaiting P4.1a for full static site)");
+        // Phase 4: Post-export verification
+        let warnings = BundleVerifier::verify(&bundle_result.site_dir)?;
+        if !warnings.is_empty() {
+            writeln!(term)?;
+            writeln!(term, "  {} Size warnings:", style("⚠").yellow())?;
+            for warning in &warnings {
+                writeln!(term, "    {}", warning)?;
+            }
+        }
 
         // Clean up temporary export.db (encrypted version is in payload/)
         std::fs::remove_file(&export_db_path).ok();
@@ -665,35 +755,50 @@ Then open http://localhost:3000 in a modern browser.
         writeln!(term)?;
         writeln!(
             term,
-            "  {} Encrypted archive: {}",
+            "  {} Site directory (deploy this): {}",
             style("✓").green(),
-            self.state.output_dir.join("payload").display()
+            style(bundle_result.site_dir.display()).cyan()
+        )?;
+        writeln!(
+            term,
+            "  {} Private directory (keep secure): {}",
+            style("✓").green(),
+            style(bundle_result.private_dir.display()).cyan()
+        )?;
+        writeln!(
+            term,
+            "  {} Integrity fingerprint: {}",
+            style("✓").green(),
+            style(&bundle_result.fingerprint).cyan()
         )?;
 
-        // Display recovery secret if generated
-        if let Some(recovery) = &self.state.recovery_secret {
-            use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-            let recovery_b64 = BASE64.encode(recovery);
+        // Display recovery secret location if generated
+        if self.state.recovery_secret.is_some() {
             writeln!(term)?;
             writeln!(
                 term,
-                "  {} Recovery secret (save this securely!):",
-                style("⚠").yellow().bold()
+                "  {} Recovery secret saved to: {}",
+                style("⚠").yellow().bold(),
+                style(
+                    bundle_result
+                        .private_dir
+                        .join("recovery-secret.txt")
+                        .display()
+                )
+                .cyan()
             )?;
-            writeln!(term, "    {}", style(&recovery_b64).cyan())?;
-            writeln!(term)?;
             writeln!(
                 term,
                 "  {}",
-                style("This secret can unlock your archive if you forget the password.").dim()
+                style("Store this file securely - it can unlock your archive if you forget the password.").dim()
             )?;
         }
 
         if self.state.generate_qr {
             writeln!(
                 term,
-                "  {} QR code generation not yet implemented (P4.1a)",
-                style("⚠").yellow()
+                "  {} QR codes saved to private directory",
+                style("✓").green()
             )?;
         }
 
@@ -701,17 +806,13 @@ Then open http://localhost:3000 in a modern browser.
     }
 
     fn step_deploy(&self, term: &mut Term) -> Result<()> {
-        writeln!(term, "\n{}", style("Step 7 of 7: Deployment").bold())?;
+        writeln!(term, "\n{}", style("Step 8 of 8: Deployment").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
         match self.state.target {
             DeployTarget::Local => {
                 writeln!(term)?;
-                writeln!(
-                    term,
-                    "{}",
-                    style("✓ Export complete!").green().bold()
-                )?;
+                writeln!(term, "{}", style("✓ Export complete!").green().bold())?;
                 writeln!(term)?;
                 writeln!(
                     term,
@@ -737,11 +838,7 @@ Then open http://localhost:3000 in a modern browser.
                 )?;
             }
             DeployTarget::GitHubPages => {
-                writeln!(
-                    term,
-                    "  {} GitHub Pages deployment...",
-                    style("→").cyan()
-                )?;
+                writeln!(term, "  {} GitHub Pages deployment...", style("→").cyan())?;
 
                 // TODO: Actually deploy using pages::deploy_github
                 writeln!(

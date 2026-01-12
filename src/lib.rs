@@ -463,6 +463,26 @@ pub enum Commands {
         /// Dry run (don't write files)
         #[arg(long)]
         dry_run: bool,
+
+        /// Scan for secrets and exit (no export)
+        #[arg(long)]
+        scan_secrets: bool,
+
+        /// Fail with non-zero exit if secrets are detected (for CI)
+        #[arg(long)]
+        fail_on_secrets: bool,
+
+        /// Allowlist regex patterns to suppress findings (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        secrets_allow: Vec<String>,
+
+        /// Denylist regex patterns to force findings (repeatable or comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        secrets_deny: Vec<String>,
+
+        /// Output secret scan results as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Manage remote sources (P5.x)
     #[command(subcommand)]
@@ -2034,8 +2054,65 @@ async fn execute_cli(
                     until,
                     path_mode,
                     dry_run,
+                    scan_secrets,
+                    fail_on_secrets,
+                    secrets_allow,
+                    secrets_deny,
+                    json,
                 } => {
-                    if let Some(output_path) = export_only {
+                    if scan_secrets {
+                        let db_path = cli.db.clone().unwrap_or_else(|| {
+                            directories::ProjectDirs::from(
+                                "com",
+                                "dicklesworthstone",
+                                "coding-agent-search",
+                            )
+                            .map(|dirs| dirs.data_dir().join("agent_search.db"))
+                            .unwrap_or_else(default_db_path)
+                        });
+
+                        let workspaces_path = workspaces
+                            .clone()
+                            .map(|ws| ws.into_iter().map(PathBuf::from).collect());
+
+                        let filters = crate::pages::secret_scan::SecretScanFilters {
+                            agents: agents.clone(),
+                            workspaces: workspaces_path,
+                            since_ts: since
+                                .as_deref()
+                                .and_then(crate::ui::time_parser::parse_time_input),
+                            until_ts: until
+                                .as_deref()
+                                .and_then(crate::ui::time_parser::parse_time_input),
+                        };
+
+                        let config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
+                            &secrets_allow,
+                            &secrets_deny,
+                        )
+                        .map_err(|e| CliError {
+                            code: 9,
+                            kind: "pages",
+                            message: format!("Secret scan config error: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
+
+                        crate::pages::secret_scan::run_secret_scan_cli(
+                            &db_path,
+                            &filters,
+                            &config,
+                            json,
+                            fail_on_secrets,
+                        )
+                        .map_err(|e| CliError {
+                            code: 9,
+                            kind: "pages",
+                            message: format!("Secret scan failed: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
+                    } else if let Some(output_path) = export_only {
                         crate::pages::export::run_pages_export(
                             cli.db.clone(),
                             output_path.clone(),
@@ -2965,20 +3042,27 @@ impl TimeFilter {
 fn parse_datetime_str(s: &str) -> Option<i64> {
     use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 
+    fn local_from_naive(dt: NaiveDateTime) -> i64 {
+        match Local.from_local_datetime(&dt) {
+            chrono::LocalResult::Single(local) => local.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(local, _) => local.timestamp_millis(),
+            chrono::LocalResult::None => Local.from_utc_datetime(&dt).timestamp_millis(),
+        }
+    }
+
+    fn local_midnight_ts(date: NaiveDate) -> Option<i64> {
+        let dt = date.and_hms_opt(0, 0, 0)?;
+        Some(local_from_naive(dt))
+    }
+
     // Try full datetime first: YYYY-MM-DDTHH:MM:SS
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Local
-            .from_local_datetime(&dt)
-            .single()
-            .map(|d| d.timestamp_millis());
+        return Some(local_from_naive(dt));
     }
 
     // Try date only: YYYY-MM-DD
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-            .single()
-            .map(|d| d.timestamp_millis());
+        return local_midnight_ts(date);
     }
 
     None
@@ -3198,6 +3282,7 @@ fn run_cli_search(
                 None
             }
         });
+    let field_mask = resolve_field_mask(&fields, effective_robot, display_format);
 
     // Parse aggregate fields if provided
     let agg_fields = aggregate
@@ -3265,7 +3350,14 @@ fn run_cli_search(
 
     let result = match effective_mode {
         SearchMode::Lexical => client
-            .search_with_fallback(query, filters.clone(), search_limit, search_offset, sparse_threshold)
+            .search_with_fallback(
+                query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                sparse_threshold,
+                field_mask,
+            )
             .map_err(|e| CliError {
                 code: 9,
                 kind: "search",
@@ -3275,7 +3367,7 @@ fn run_cli_search(
             })?,
         SearchMode::Semantic => {
             let hits = client
-                .search_semantic(query, filters.clone(), search_limit, search_offset)
+                .search_semantic(query, filters.clone(), search_limit, search_offset, field_mask)
                 .map_err(|e| {
                     let err_str = e.to_string();
                     if err_str.contains("unavailable") || err_str.contains("no embedder") {
@@ -3307,7 +3399,15 @@ fn run_cli_search(
             }
         }
         SearchMode::Hybrid => client
-            .search_hybrid(query, query, filters.clone(), search_limit, search_offset, sparse_threshold)
+            .search_hybrid(
+                query,
+                query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                sparse_threshold,
+                field_mask,
+            )
             .map_err(|e| {
                 let err_str = e.to_string();
                 if err_str.contains("unavailable") || err_str.contains("no embedder") {
@@ -3621,6 +3721,48 @@ fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
             })
             .collect()
     })
+}
+
+fn resolve_field_mask(
+    fields: &Option<Vec<String>>,
+    format: Option<RobotFormat>,
+    display_format: Option<DisplayFormat>,
+) -> crate::search::query::FieldMask {
+    use crate::search::query::FieldMask;
+
+    if matches!(format, Some(RobotFormat::Sessions)) {
+        return FieldMask::new(false, false, false, false);
+    }
+
+    if format.is_none() && display_format.is_none() {
+        return FieldMask::new(true, true, false, true);
+    }
+
+    if format.is_none() {
+        return FieldMask::new(true, true, false, true);
+    }
+
+    let resolved_fields = expand_field_presets(fields);
+    let wants_all = fields.is_none()
+        || resolved_fields
+            .as_ref()
+            .is_some_and(|field_list| field_list.is_empty());
+    let wants_snippet = wants_all
+        || resolved_fields
+            .as_ref()
+            .is_some_and(|field_list| field_list.iter().any(|f| f == "snippet"));
+    let wants_content = wants_all
+        || resolved_fields
+            .as_ref()
+            .is_some_and(|field_list| field_list.iter().any(|f| f == "content"));
+    let wants_title = wants_all
+        || resolved_fields
+            .as_ref()
+            .is_some_and(|field_list| field_list.iter().any(|f| f == "title"));
+
+    let needs_content = wants_content || wants_snippet;
+    let allows_cache = needs_content;
+    FieldMask::new(needs_content, wants_snippet, wants_title, allows_cache)
 }
 
 /// Filter a search hit to only include the requested fields
@@ -8782,7 +8924,11 @@ fn run_timeline(
     let now = Local::now();
     let (start_ts, end_ts) = if today {
         let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let local_start = Local.from_local_datetime(&start_of_day).single().unwrap();
+        let local_start = match Local.from_local_datetime(&start_of_day) {
+            chrono::LocalResult::Single(dt) => dt,
+            chrono::LocalResult::Ambiguous(dt, _) => dt,
+            chrono::LocalResult::None => Local.from_utc_datetime(&start_of_day),
+        };
         (local_start.timestamp_millis(), now.timestamp_millis())
     } else {
         let start = since
@@ -11276,7 +11422,20 @@ fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliR
 }
 
 fn parse_datetime_flexible(s: &str) -> Option<i64> {
-    use chrono::{Local, NaiveDate, TimeZone};
+    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+
+    fn local_from_naive(dt: NaiveDateTime) -> i64 {
+        match Local.from_local_datetime(&dt) {
+            chrono::LocalResult::Single(local) => local.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(local, _) => local.timestamp_millis(),
+            chrono::LocalResult::None => Local.from_utc_datetime(&dt).timestamp_millis(),
+        }
+    }
+
+    fn local_midnight_ts(date: NaiveDate) -> Option<i64> {
+        let dt = date.and_hms_opt(0, 0, 0)?;
+        Some(local_from_naive(dt))
+    }
 
     // Returns timestamp in milliseconds to match SQLite storage format
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
@@ -11284,28 +11443,20 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
     }
 
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        && let Some(dt) = date.and_hms_opt(0, 0, 0)
-        && let Some(local) = Local.from_local_datetime(&dt).single()
+        && let Some(ts) = local_midnight_ts(date)
     {
-        return Some(local.timestamp_millis());
+        return Some(ts);
     }
 
     let now = Local::now();
     match s.to_lowercase().as_str() {
         "today" => {
-            let start = now.date_naive().and_hms_opt(0, 0, 0)?;
-            Local
-                .from_local_datetime(&start)
-                .single()
-                .map(|d| d.timestamp_millis())
+            let date = now.date_naive();
+            local_midnight_ts(date)
         }
         "yesterday" => {
             let yesterday = (now - chrono::Duration::days(1)).date_naive();
-            let start = yesterday.and_hms_opt(0, 0, 0)?;
-            Local
-                .from_local_datetime(&start)
-                .single()
-                .map(|d| d.timestamp_millis())
+            local_midnight_ts(yesterday)
         }
         _ => {
             if let Some(days_str) = s.strip_suffix('d')
