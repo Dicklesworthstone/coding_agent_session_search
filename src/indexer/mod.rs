@@ -211,6 +211,12 @@ pub fn run_index(
                     );
                     match conn.scan(&ctx) {
                         Ok(mut remote_convs) => {
+                            tracing::info!(
+                                connector = name,
+                                source_id = %root.origin.source_id,
+                                count = remote_convs.len(),
+                                "scanned remote conversations"
+                            );
                             for conv in &mut remote_convs {
                                 inject_provenance(conv, &root.origin);
                                 apply_workspace_rewrite(conv, &root.workspace_rewrites);
@@ -803,11 +809,12 @@ pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoo
                     roots.push(scan_root);
                 }
             }
-            return roots;
+            // Don't return early - fall through to scan whole mirror directories
         }
     }
 
     // Fallback: remote mirror roots from registered sources
+    // This scans entire mirror directories without trying to match individual paths
     if let Ok(sources) = storage.list_sources() {
         for source in sources {
             // Skip local source - already handled above
@@ -853,58 +860,82 @@ pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoo
                 })
                 .unwrap_or_default();
 
-            if let Some(paths) = source
-                .config_json
-                .as_ref()
-                .and_then(|cfg| cfg.get("paths"))
-                .and_then(|arr| arr.as_array())
-            {
-                for path_val in paths {
-                    let Some(path) = path_val.as_str() else {
-                        continue;
-                    };
-                    let expanded_path = if path.starts_with("~/") {
-                        path.to_string()
-                    } else if path.starts_with('~') {
-                        path.replacen('~', "~/", 1)
-                    } else {
-                        path.to_string()
-                    };
-                    let safe_name = path_to_safe_dirname(&expanded_path);
-                    let mirror_path = data_dir
-                        .join("remotes")
-                        .join(&source.id)
-                        .join("mirror")
-                        .join(&safe_name);
-                    if !mirror_path.exists() {
-                        continue;
-                    }
-
-                    let origin = Origin {
-                        source_id: source.id.clone(),
-                        kind: source.kind,
-                        host: source.host_label.clone(),
-                    };
-                    let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
-                    scan_root.workspace_rewrites = workspace_rewrites.clone();
-                    roots.push(scan_root);
-                }
-                continue;
-            }
+            // Skip path-specific matching in fallback - it has the same tilde expansion issue.
+            // Instead, always scan the entire mirror directory below.
+            // if let Some(paths) = source
+            //     .config_json
+            //     .as_ref()
+            //     .and_then(|cfg| cfg.get("paths"))
+            //     .and_then(|arr| arr.as_array())
+            // {
+            //     for path_val in paths {
+            //         let Some(path) = path_val.as_str() else {
+            //             continue;
+            //         };
+            //         let expanded_path = if path.starts_with("~/") {
+            //             path.to_string()
+            //         } else if path.starts_with('~') {
+            //             path.replacen('~', "~/", 1)
+            //         } else {
+            //             path.to_string()
+            //         };
+            //         let safe_name = path_to_safe_dirname(&expanded_path);
+            //         let mirror_path = data_dir
+            //             .join("remotes")
+            //             .join(&source.id)
+            //             .join("mirror")
+            //             .join(&safe_name);
+            //         if !mirror_path.exists() {
+            //             continue;
+            //         }
+            //
+            //         let origin = Origin {
+            //             source_id: source.id.clone(),
+            //             kind: source.kind,
+            //             host: source.host_label.clone(),
+            //         };
+            //         let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
+            //         scan_root.workspace_rewrites = workspace_rewrites.clone();
+            //         roots.push(scan_root);
+            //     }
+            //     continue;
+            // }
 
             // Remote mirror directory: data_dir/remotes/<source_id>/mirror
             let mirror_path = data_dir.join("remotes").join(&source.id).join("mirror");
 
-            if mirror_path.exists() {
-                let origin = Origin {
-                    source_id: source.id.clone(),
-                    kind: source.kind,
-                    host: source.host_label.clone(),
-                };
-                let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
-                scan_root.workspace_rewrites = workspace_rewrites;
+            tracing::debug!(
+                source_id = %source.id,
+                mirror_path = %mirror_path.display(),
+                exists = mirror_path.exists(),
+                "checking remote mirror"
+            );
 
-                roots.push(scan_root);
+            if mirror_path.exists() {
+                // Scan each subdirectory in the mirror as a separate root
+                // This handles the case where rsync syncs full paths like
+                // "Users_raymondweitekamp_.claude_projects"
+                if let Ok(entries) = std::fs::read_dir(&mirror_path) {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir() {
+                            let origin = Origin {
+                                source_id: source.id.clone(),
+                                kind: source.kind,
+                                host: source.host_label.clone(),
+                            };
+                            let mut scan_root = ScanRoot::remote(entry.path(), origin.clone(), platform);
+                            scan_root.workspace_rewrites = workspace_rewrites.clone();
+
+                            tracing::info!(
+                                source_id = %origin.source_id,
+                                scan_path = %entry.path().display(),
+                                "added remote scan root"
+                            );
+
+                            roots.push(scan_root);
+                        }
+                    }
+                }
             }
         }
     }
