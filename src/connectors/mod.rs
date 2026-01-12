@@ -9,6 +9,7 @@ pub mod aider;
 pub mod amp;
 pub mod chatgpt;
 pub mod claude_code;
+pub mod clawdbot;
 pub mod cline;
 pub mod codex;
 pub mod cursor;

@@ -5429,7 +5429,7 @@ mod tests {
     // --- is_tool_invocation_noise tests ---
 
     #[test]
-    fn is_tool_invocation_noise_detects_tool_markers() {
+    fn is_tool_invocation_noise_detects_tool_markers_verbose() {
         assert!(is_tool_invocation_noise("[Tool: Bash - Check status]"));
         assert!(is_tool_invocation_noise("[Tool: Read]"));
         assert!(is_tool_invocation_noise("  [Tool: Write - description]  "));
