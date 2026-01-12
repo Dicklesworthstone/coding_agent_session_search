@@ -2,6 +2,7 @@ use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage}
 use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::search::query::SearchClient;
 use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::search::vector_index::{dot_product_scalar_bench, dot_product_simd_bench};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -97,10 +98,23 @@ fn bench_search(c: &mut Criterion) {
                     coding_agent_search::search::query::SearchFilters::default(),
                     20,
                     0,
+                    coding_agent_search::search::query::FieldMask::FULL,
                 )
                 .unwrap();
             black_box(hits.len());
         })
+    });
+}
+
+fn bench_dot_product(c: &mut Criterion) {
+    let a: Vec<f32> = (0..384).map(|i| i as f32 * 0.001).collect();
+    let b: Vec<f32> = (0..384).map(|i| i as f32 * 0.002).collect();
+
+    c.bench_function("dot_product_scalar", |bencher| {
+        bencher.iter(|| black_box(dot_product_scalar_bench(black_box(&a), black_box(&b))))
+    });
+    c.bench_function("dot_product_simd", |bencher| {
+        bencher.iter(|| black_box(dot_product_simd_bench(black_box(&a), black_box(&b))))
     });
 }
 
@@ -203,7 +217,13 @@ fn bench_wildcard_exact(c: &mut Criterion) {
     c.bench_function("wildcard_exact_match", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("handler"), filters.clone(), 20, 0)
+                .search(
+                    black_box("handler"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -218,7 +238,13 @@ fn bench_wildcard_prefix(c: &mut Criterion) {
     c.bench_function("wildcard_prefix_pattern", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("hand*"), filters.clone(), 20, 0)
+                .search(
+                    black_box("hand*"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -233,7 +259,13 @@ fn bench_wildcard_suffix(c: &mut Criterion) {
     c.bench_function("wildcard_suffix_pattern", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("*handler"), filters.clone(), 20, 0)
+                .search(
+                    black_box("*handler"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -248,7 +280,13 @@ fn bench_wildcard_substring(c: &mut Criterion) {
     c.bench_function("wildcard_substring_pattern", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("*config*"), filters.clone(), 20, 0)
+                .search(
+                    black_box("*config*"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -263,7 +301,13 @@ fn bench_wildcard_suffix_common(c: &mut Criterion) {
     c.bench_function("wildcard_suffix_common", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("*error"), filters.clone(), 20, 0)
+                .search(
+                    black_box("*error"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -281,7 +325,13 @@ fn bench_wildcard_large_dataset(c: &mut Criterion) {
     group.bench_function("exact", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("validation"), filters.clone(), 20, 0)
+                .search(
+                    black_box("validation"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -290,7 +340,13 @@ fn bench_wildcard_large_dataset(c: &mut Criterion) {
     group.bench_function("prefix", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("valid*"), filters.clone(), 20, 0)
+                .search(
+                    black_box("valid*"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -299,7 +355,13 @@ fn bench_wildcard_large_dataset(c: &mut Criterion) {
     group.bench_function("suffix", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("*tion"), filters.clone(), 20, 0)
+                .search(
+                    black_box("*tion"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -308,7 +370,13 @@ fn bench_wildcard_large_dataset(c: &mut Criterion) {
     group.bench_function("substring", |b| {
         b.iter(|| {
             let hits = client
-                .search(black_box("*valid*"), filters.clone(), 20, 0)
+                .search(
+                    black_box("*valid*"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -378,7 +446,13 @@ fn bench_rapid_sequential_search(c: &mut Criterion) {
         b.iter(|| {
             for q in &queries {
                 let hits = client
-                    .search(black_box(*q), filters.clone(), 20, 0)
+                    .search(
+                        black_box(*q),
+                        filters.clone(),
+                        20,
+                        0,
+                        coding_agent_search::search::query::FieldMask::FULL,
+                    )
                     .unwrap();
                 black_box(hits.len());
             }
@@ -391,7 +465,13 @@ fn bench_rapid_sequential_search(c: &mut Criterion) {
         b.iter(|| {
             for q in &queries {
                 let hits = client
-                    .search(black_box(*q), filters.clone(), 20, 0)
+                    .search(
+                        black_box(*q),
+                        filters.clone(),
+                        20,
+                        0,
+                        coding_agent_search::search::query::FieldMask::FULL,
+                    )
                     .unwrap();
                 black_box(hits.len());
             }
@@ -417,7 +497,13 @@ fn bench_search_scaling(c: &mut Criterion) {
     group.bench_function("50_convs", |b| {
         b.iter(|| {
             let hits = client_small
-                .search(black_box("lorem"), filters.clone(), 20, 0)
+                .search(
+                    black_box("lorem"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -428,7 +514,13 @@ fn bench_search_scaling(c: &mut Criterion) {
     group.bench_function("200_convs", |b| {
         b.iter(|| {
             let hits = client_med
-                .search(black_box("lorem"), filters.clone(), 20, 0)
+                .search(
+                    black_box("lorem"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -439,7 +531,13 @@ fn bench_search_scaling(c: &mut Criterion) {
     group.bench_function("500_convs", |b| {
         b.iter(|| {
             let hits = client_large
-                .search(black_box("lorem"), filters.clone(), 20, 0)
+                .search(
+                    black_box("lorem"),
+                    filters.clone(),
+                    20,
+                    0,
+                    coding_agent_search::search::query::FieldMask::FULL,
+                )
                 .unwrap();
             black_box(hits.len())
         })
@@ -452,6 +550,7 @@ criterion_group!(
     runtime_perf,
     bench_indexing,
     bench_search,
+    bench_dot_product,
     bench_wildcard_exact,
     bench_wildcard_prefix,
     bench_wildcard_suffix,

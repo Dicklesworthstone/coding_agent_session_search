@@ -63,6 +63,13 @@ fn create_query_vector() -> Vec<f32> {
         .collect()
 }
 
+/// Generate a deterministic query vector for a given seed.
+fn create_query_vector_seed(seed: usize) -> Vec<f32> {
+    (0..VECTOR_DIMENSION)
+        .map(|d| ((seed * 31 + d * 17) % 100) as f32 / 100.0)
+        .collect()
+}
+
 /// Run search and return results with timing.
 struct SearchResult {
     message_ids: Vec<u64>,
@@ -78,6 +85,15 @@ fn run_search(index: &VectorIndex, query: &[f32], k: usize) -> SearchResult {
         message_ids: results.iter().map(|r| r.message_id).collect(),
         duration,
     }
+}
+
+fn run_search_with_scores(index: &VectorIndex, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    index
+        .search_top_k(query, k, None)
+        .expect("Search failed")
+        .iter()
+        .map(|r| (r.message_id, r.score))
+        .collect()
 }
 
 /// Test that all optimizations work together correctly.
@@ -208,6 +224,40 @@ fn e2e_rollback_env_vars() {
     println!("  Parallel search env var correctly parsed");
 
     println!("\n=== Rollback Test PASSED ===");
+}
+
+/// Verify F16 pre-conversion yields identical results and scores.
+#[test]
+fn f16_preconvert_equivalence() {
+    let index = create_test_index();
+    let dir = tempdir().expect("Failed to create temp dir");
+    let path = dir.path().join("test.cvvi");
+    index.save(&path).expect("Failed to save index");
+
+    let preconvert = VectorIndex::load(&path).expect("Failed to load index");
+    // SAFETY: We're in a single-threaded test context.
+    unsafe { std::env::set_var("CASS_F16_PRECONVERT", "0") };
+    let mmap = VectorIndex::load(&path).expect("Failed to load index");
+    // SAFETY: We're in a single-threaded test context.
+    unsafe { std::env::remove_var("CASS_F16_PRECONVERT") };
+
+    let k = 25;
+    for seed in 0..5 {
+        let query = create_query_vector_seed(seed);
+        let pre = run_search_with_scores(&preconvert, &query, k);
+        let mm = run_search_with_scores(&mmap, &query, k);
+
+        let pre_ids: Vec<u64> = pre.iter().map(|r| r.0).collect();
+        let mm_ids: Vec<u64> = mm.iter().map(|r| r.0).collect();
+        assert_eq!(pre_ids, mm_ids, "message_id mismatch for seed {seed}");
+
+        for ((id, score_a), (_, score_b)) in pre.iter().zip(mm.iter()) {
+            assert!(
+                (score_a - score_b).abs() < 1e-6,
+                "score mismatch for message {id} (seed {seed}): {score_a} vs {score_b}"
+            );
+        }
+    }
 }
 
 /// Test that filtering works correctly with parallel search.

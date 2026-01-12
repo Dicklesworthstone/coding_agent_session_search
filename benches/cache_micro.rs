@@ -2,7 +2,7 @@ use coding_agent_search::connectors::{
     NormalizedConversation, NormalizedMessage, NormalizedSnippet,
 };
 use coding_agent_search::indexer::persist;
-use coding_agent_search::search::query::{SearchClient, SearchFilters};
+use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
 use coding_agent_search::search::tantivy::TantivyIndex;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -74,10 +74,12 @@ fn bench_cache_hits(c: &mut Criterion) {
 
     c.bench_function("cache_prefix_hit", |b| {
         // warm cache
-        let _ = client.search("alp", filters.clone(), 10, 0).unwrap();
+        let _ = client
+            .search("alp", filters.clone(), 10, 0, FieldMask::FULL)
+            .unwrap();
         b.iter(|| {
             client
-                .search("alp", filters.clone(), 10, 0)
+                .search("alp", filters.clone(), 10, 0, FieldMask::FULL)
                 .expect("search")
         });
     });
@@ -92,7 +94,7 @@ fn bench_typing_forward(c: &mut Criterion) {
     c.bench_function("typing_forward_5char", |b| {
         b.iter(|| {
             for prefix in &prefixes {
-                let _ = client.search(prefix, filters.clone(), 10, 0);
+                let _ = client.search(prefix, filters.clone(), 10, 0, FieldMask::FULL);
             }
         });
     });
@@ -106,13 +108,13 @@ fn bench_typing_backspace(c: &mut Criterion) {
 
     // Warm cache with forward pass first
     for prefix in &["a", "al", "alp", "alph", "alpha"] {
-        let _ = client.search(prefix, filters.clone(), 10, 0);
+        let _ = client.search(prefix, filters.clone(), 10, 0, FieldMask::FULL);
     }
 
     c.bench_function("typing_backspace_5char", |b| {
         b.iter(|| {
             for prefix in &prefixes {
-                let _ = client.search(prefix, filters.clone(), 10, 0);
+                let _ = client.search(prefix, filters.clone(), 10, 0, FieldMask::FULL);
             }
         });
     });
@@ -128,7 +130,7 @@ fn bench_rapid_keystroke_mixed(c: &mut Criterion) {
     c.bench_function("rapid_keystroke_mixed_7", |b| {
         b.iter(|| {
             for query in &sequence {
-                let _ = client.search(query, filters.clone(), 10, 0);
+                let _ = client.search(query, filters.clone(), 10, 0, FieldMask::FULL);
             }
         });
     });
@@ -145,7 +147,7 @@ fn bench_cache_miss(c: &mut Criterion) {
             // Each iteration uses a unique query to avoid cache hits
             counter += 1;
             let query = format!("unique{counter}");
-            let _ = client.search(&query, filters.clone(), 10, 0);
+            let _ = client.search(&query, filters.clone(), 10, 0, FieldMask::FULL);
         });
     });
 }
@@ -158,10 +160,12 @@ fn bench_filtered_search(c: &mut Criterion) {
 
     c.bench_function("search_with_agent_filter", |b| {
         // warm cache
-        let _ = client.search("alp", filters.clone(), 10, 0).unwrap();
+        let _ = client
+            .search("alp", filters.clone(), 10, 0, FieldMask::FULL)
+            .unwrap();
         b.iter(|| {
             client
-                .search("alp", filters.clone(), 10, 0)
+                .search("alp", filters.clone(), 10, 0, FieldMask::FULL)
                 .expect("search")
         });
     });
