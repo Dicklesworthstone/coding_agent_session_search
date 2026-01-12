@@ -25,7 +25,10 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔐</text></svg>">
 </head>
 <body>
-    <!-- Auth screen (shown initially) -->
+    <!-- COI status screen (shown during setup/reload check) -->
+    <div id="coi-status" class="coi-container hidden"></div>
+
+    <!-- Auth screen (shown after COI check passes) -->
     <div id="auth-screen" class="auth-container">
         <div class="auth-card">
             <div class="auth-header">
@@ -124,21 +127,46 @@
         </main>
     </div>
 
-    <!-- Register service worker for COOP/COEP headers and offline support -->
+    <!-- Initialize app with COI detection -->
     <script type="module">
-        import { registerServiceWorker, hasSharedArrayBuffer } from './sw-register.js';
+        import { registerServiceWorker } from './sw-register.js';
+        import { initCOIDetection, onServiceWorkerActivated, COI_STATE } from './coi-detector.js';
 
-        // Register service worker
+        // Get container references
+        const coiStatus = document.getElementById('coi-status');
+        const authScreen = document.getElementById('auth-screen');
+
+        // Initially hide auth screen until COI check passes
+        authScreen.classList.add('hidden');
+
+        // Start service worker registration
         registerServiceWorker().catch(err => {
             console.warn('Service worker registration failed:', err);
         });
 
-        // Check SharedArrayBuffer support after a delay (may need reload)
-        setTimeout(() => {
-            if (!hasSharedArrayBuffer()) {
-                console.warn('SharedArrayBuffer not available. First load may require a page refresh.');
+        // Initialize COI detection
+        initCOIDetection({
+            statusContainer: coiStatus,
+            authContainer: authScreen,
+            onReady: () => {
+                // COI ready - show auth screen
+                authScreen.classList.remove('hidden');
+            },
+            maxWaitMs: 3000,
+        }).then(state => {
+            console.log('[App] COI initialization complete, state:', state);
+        });
+
+        // Listen for SW activation in case we need to recheck
+        onServiceWorkerActivated(async () => {
+            // Recheck COI state when SW activates
+            const { getCOIState } = await import('./coi-detector.js');
+            const state = await getCOIState();
+            if (state === COI_STATE.READY && authScreen.classList.contains('hidden')) {
+                coiStatus.classList.add('hidden');
+                authScreen.classList.remove('hidden');
             }
-        }, 1000);
+        });
     </script>
 
     <!-- Main authentication module -->

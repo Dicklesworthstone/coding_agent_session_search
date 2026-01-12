@@ -140,9 +140,11 @@ async function loadConfig() {
 }
 
 /**
- * Display integrity fingerprint
+ * Display integrity fingerprint with TOFU verification
  */
 async function displayFingerprint() {
+    const tofuKey = `cass_fingerprint_${config?.export_id || 'default'}`;
+
     try {
         // Try to load integrity.json if it exists
         const response = await fetch('./integrity.json');
@@ -150,10 +152,17 @@ async function displayFingerprint() {
             const integrity = await response.json();
             const fingerprint = await computeFingerprint(JSON.stringify(integrity));
             elements.fingerprintValue.textContent = fingerprint;
+
+            // TOFU verification
+            const result = await verifyTofu(fingerprint, tofuKey);
+            displayTofuStatus(result);
         } else {
             // Fall back to config fingerprint
             const fingerprint = await computeFingerprint(JSON.stringify(config));
             elements.fingerprintValue.textContent = fingerprint;
+
+            const result = await verifyTofu(fingerprint, tofuKey);
+            displayTofuStatus(result);
         }
     } catch (error) {
         // Use export_id as fallback fingerprint
@@ -164,6 +173,137 @@ async function displayFingerprint() {
         } else {
             elements.fingerprintValue.textContent = 'unavailable';
         }
+    }
+}
+
+/**
+ * Verify fingerprint using TOFU (Trust On First Use)
+ * Returns: { valid: true, isFirstVisit: boolean } or { valid: false, reason: string, previousFingerprint: string }
+ */
+async function verifyTofu(currentFingerprint, storageKey) {
+    try {
+        const storedFingerprint = localStorage.getItem(storageKey);
+
+        if (!storedFingerprint) {
+            // First visit - store fingerprint
+            localStorage.setItem(storageKey, currentFingerprint);
+            return { valid: true, isFirstVisit: true };
+        }
+
+        if (storedFingerprint === currentFingerprint) {
+            // Fingerprint matches - all good
+            return { valid: true, isFirstVisit: false };
+        }
+
+        // Fingerprint changed - TOFU violation!
+        return {
+            valid: false,
+            reason: 'TOFU_VIOLATION',
+            previousFingerprint: storedFingerprint,
+            currentFingerprint: currentFingerprint
+        };
+    } catch (e) {
+        // LocalStorage may be disabled
+        console.warn('TOFU check unavailable:', e);
+        return { valid: true, isFirstVisit: true };
+    }
+}
+
+/**
+ * Display TOFU verification status
+ */
+function displayTofuStatus(result) {
+    const helpElement = elements.fingerprintHelp;
+    if (!helpElement) return;
+
+    if (!result.valid && result.reason === 'TOFU_VIOLATION') {
+        // Show warning for fingerprint change
+        helpElement.classList.add('tofu-warning');
+        helpElement.textContent = '⚠️';
+        helpElement.title = 'SECURITY WARNING: Archive fingerprint has changed since your last visit!\n' +
+            `Previous: ${result.previousFingerprint}\n` +
+            `Current: ${result.currentFingerprint}\n\n` +
+            'If you did not expect this change, DO NOT enter your password.';
+
+        // Also show a visible warning
+        showTofuWarning(result);
+    } else if (result.isFirstVisit) {
+        helpElement.title = 'First visit - fingerprint stored for future verification';
+    } else {
+        helpElement.classList.add('tofu-verified');
+        helpElement.title = 'Fingerprint verified - matches previous visit';
+    }
+}
+
+/**
+ * Show TOFU violation warning banner
+ */
+function showTofuWarning(result) {
+    // Create warning element if it doesn't exist
+    let warning = document.getElementById('tofu-warning');
+    if (!warning) {
+        warning = document.createElement('div');
+        warning.id = 'tofu-warning';
+        warning.className = 'tofu-warning-banner';
+
+        // Build DOM structure (without fingerprints to avoid XSS)
+        warning.innerHTML = `
+            <div class="tofu-warning-content">
+                <strong>⚠️ Security Warning</strong>
+                <p>The archive fingerprint has changed since your last visit.</p>
+                <p class="tofu-fingerprints">
+                    <span>Previous: <code id="tofu-prev-fp"></code></span>
+                    <span>Current: <code id="tofu-curr-fp"></code></span>
+                </p>
+                <p>If you did not expect this change, <strong>DO NOT enter your password</strong>.</p>
+                <div class="tofu-actions">
+                    <button type="button" id="tofu-accept-btn" class="tofu-accept">I trust this change</button>
+                    <button type="button" id="tofu-dismiss-btn" class="tofu-dismiss">Dismiss warning</button>
+                </div>
+            </div>
+        `;
+
+        // Set fingerprints safely using textContent (defense-in-depth)
+        warning.querySelector('#tofu-prev-fp').textContent = result.previousFingerprint;
+        warning.querySelector('#tofu-curr-fp').textContent = result.currentFingerprint;
+
+        // Insert before auth form
+        const authForm = document.querySelector('.auth-form');
+        if (authForm) {
+            authForm.parentNode.insertBefore(warning, authForm);
+        } else {
+            elements.authScreen?.appendChild(warning);
+        }
+
+        // Add event listeners
+        document.getElementById('tofu-accept-btn')?.addEventListener('click', () => {
+            acceptNewFingerprint(result.currentFingerprint);
+            warning.remove();
+        });
+
+        document.getElementById('tofu-dismiss-btn')?.addEventListener('click', () => {
+            warning.remove();
+        });
+    }
+}
+
+/**
+ * Accept new fingerprint (user acknowledges the change)
+ */
+function acceptNewFingerprint(newFingerprint) {
+    const tofuKey = `cass_fingerprint_${config?.export_id || 'default'}`;
+    try {
+        localStorage.setItem(tofuKey, newFingerprint);
+
+        // Update UI
+        const helpElement = elements.fingerprintHelp;
+        if (helpElement) {
+            helpElement.classList.remove('tofu-warning');
+            helpElement.classList.add('tofu-verified');
+            helpElement.title = 'Fingerprint updated - new fingerprint stored';
+        }
+    } catch (e) {
+        console.warn('Failed to store new fingerprint:', e);
     }
 }
 

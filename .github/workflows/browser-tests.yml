@@ -1,0 +1,241 @@
+name: Browser Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'src/pages_assets/**'
+      - '.github/workflows/browser-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'src/pages_assets/**'
+      - '.github/workflows/browser-tests.yml'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # Install dependencies and cache
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache node modules
+        uses: actions/cache@v3
+        id: cache-npm
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('web/package.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-npm.outputs.cache-hit != 'true'
+        working-directory: web
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install --with-deps
+
+  # Run tests on Chromium
+  test-chromium:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore node modules
+        uses: actions/cache@v3
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('web/package.json') }}
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install chromium --with-deps
+
+      - name: Run Chromium tests
+        working-directory: web
+        run: npm run test:chromium
+        env:
+          CI: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: chromium-test-results
+          path: web/test-results/
+          retention-days: 7
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: chromium-playwright-report
+          path: web/playwright-report/
+          retention-days: 7
+
+  # Run tests on Firefox
+  test-firefox:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore node modules
+        uses: actions/cache@v3
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('web/package.json') }}
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install firefox --with-deps
+
+      - name: Run Firefox tests
+        working-directory: web
+        run: npm run test:firefox
+        env:
+          CI: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: firefox-test-results
+          path: web/test-results/
+          retention-days: 7
+
+  # Run tests on WebKit (Safari)
+  test-webkit:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore node modules
+        uses: actions/cache@v3
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('web/package.json') }}
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install webkit --with-deps
+
+      - name: Run WebKit tests
+        working-directory: web
+        run: npm run test:webkit
+        env:
+          CI: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: webkit-test-results
+          path: web/test-results/
+          retention-days: 7
+
+  # Run mobile emulation tests
+  test-mobile:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore node modules
+        uses: actions/cache@v3
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('web/package.json') }}
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install chromium webkit --with-deps
+
+      - name: Run mobile tests
+        working-directory: web
+        run: npm run test:mobile
+        env:
+          CI: true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: mobile-test-results
+          path: web/test-results/
+          retention-days: 7
+
+  # Summary job
+  test-summary:
+    needs: [test-chromium, test-firefox, test-webkit, test-mobile]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check test results
+        run: |
+          if [[ "${{ needs.test-chromium.result }}" == "failure" ]]; then
+            echo "Chromium tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-firefox.result }}" == "failure" ]]; then
+            echo "Firefox tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-webkit.result }}" == "failure" ]]; then
+            echo "WebKit tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-mobile.result }}" == "failure" ]]; then
+            echo "Mobile tests failed"
+            exit 1
+          fi
+          echo "All browser tests passed!"

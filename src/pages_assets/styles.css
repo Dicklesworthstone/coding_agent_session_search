@@ -182,6 +182,91 @@ body {
     letter-spacing: 0.5px;
 }
 
+/* TOFU (Trust On First Use) Verification */
+.help-btn.tofu-warning {
+    background: var(--color-warning);
+    border-color: var(--color-warning);
+    color: white;
+    animation: tofu-pulse 2s infinite;
+}
+
+.help-btn.tofu-verified {
+    border-color: var(--color-success);
+    color: var(--color-success);
+}
+
+@keyframes tofu-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.tofu-warning-banner {
+    margin-bottom: var(--space-lg);
+    padding: var(--space-md);
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.15) 0%, rgba(220, 38, 38, 0.15) 100%);
+    border: 2px solid var(--color-warning);
+    border-radius: var(--radius-md);
+}
+
+.tofu-warning-content {
+    text-align: left;
+}
+
+.tofu-warning-content strong {
+    color: var(--color-warning);
+    display: block;
+    margin-bottom: var(--space-sm);
+}
+
+.tofu-warning-content p {
+    margin: var(--space-xs) 0;
+    font-size: 0.875rem;
+}
+
+.tofu-fingerprints {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    margin: var(--space-sm) 0;
+    font-size: 0.8125rem;
+}
+
+.tofu-fingerprints code {
+    font-family: var(--font-mono);
+    background: var(--color-bg-input);
+    padding: var(--space-xs) var(--space-sm);
+    border-radius: var(--radius-sm);
+}
+
+.tofu-actions {
+    display: flex;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+}
+
+.tofu-accept,
+.tofu-dismiss {
+    flex: 1;
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--color-text);
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: var(--transition-fast);
+}
+
+.tofu-accept:hover {
+    background: var(--color-success);
+    border-color: var(--color-success);
+    color: white;
+}
+
+.tofu-dismiss:hover {
+    background: var(--color-bg-hover);
+}
+
 .help-btn {
     width: 1.25rem;
     height: 1.25rem;
@@ -1124,10 +1209,3 @@ body:has(.coi-degraded-banner) .auth-container {
     padding-top: calc(var(--space-2xl) + 2rem);
 }
 
-/* Virtual scrolling indicator for conversation header */
-.virtual-indicator {
-    font-size: 0.875rem;
-    color: var(--color-success);
-    margin-left: var(--space-sm);
-    cursor: help;
-}
