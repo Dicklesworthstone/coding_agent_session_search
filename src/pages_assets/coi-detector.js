@@ -1,23 +1,21 @@
-/**
- * COI (Cross-Origin Isolation) detector utilities.
- *
- * This file is embedded into the static bundle at build time (see `src/pages/bundle.rs`).
- * It is intentionally side-effect free so it can be imported by any page/module that
- * wants to surface COI status UI.
- */
-
-export function hasSharedArrayBuffer() {
+// Placeholder COI detector.
+// This keeps the bundle build green until the upstream asset is provided.
+(() => {
   try {
-    // Some browsers throw when COOP/COEP is not enabled.
-    // eslint-disable-next-line no-new
-    new SharedArrayBuffer(1);
-    return true;
-  } catch {
-    return false;
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (window.crossOriginIsolated) {
+      return;
+    }
+
+    const banner = document.querySelector('.coi-degraded-banner');
+    if (banner) {
+      banner.classList.remove('hidden');
+    }
+  } catch (err) {
+    // No-op; avoid breaking the page if detection fails.
+    console.warn('coi-detector failed', err);
   }
-}
-
-export function isCrossOriginIsolated() {
-  return typeof crossOriginIsolated === "boolean" ? crossOriginIsolated : false;
-}
-
+})();
