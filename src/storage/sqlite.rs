@@ -1316,7 +1316,9 @@ impl SqliteStorage {
             sql.push_str(" AND c.started_at <= ?");
             params_vec.push(Box::new(end));
         }
-        if let Some(agent) = agent_slug {
+        if let Some(agent) = agent_slug
+            && agent != "all"
+        {
             sql.push_str(" AND a.slug = ?");
             params_vec.push(Box::new(agent.to_string()));
         }
