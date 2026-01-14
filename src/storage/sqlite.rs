@@ -454,9 +454,6 @@ const MIGRATION_V5: &str = r"
 -- Add provenance columns to conversations table
 -- SQLite cannot alter unique constraints, so we need to recreate the table
 
--- Temporarily disable foreign keys for table rewrite
-PRAGMA foreign_keys = OFF;
-
 -- Create new table with provenance columns and updated unique constraint
 CREATE TABLE conversations_new (
     id INTEGER PRIMARY KEY,
@@ -488,9 +485,6 @@ ALTER TABLE conversations_new RENAME TO conversations;
 -- Recreate indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_agent_started ON conversations(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversations_source_id ON conversations(source_id);
-
--- Re-enable foreign keys
-PRAGMA foreign_keys = ON;
 ";
 
 const MIGRATION_V6: &str = r"
@@ -1678,6 +1672,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
+    // Disable foreign keys for the migration transaction (needed for V5 table recreation).
+    // PRAGMA foreign_keys is a no-op inside a transaction, so we must set it before.
+    conn.execute("PRAGMA foreign_keys = OFF", [])?;
+
     let tx = conn.transaction()?;
 
     match current {
@@ -1742,6 +1740,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     )?;
 
     tx.commit()?;
+
+    // Re-enable foreign keys after migration
+    conn.execute("PRAGMA foreign_keys = ON", [])?;
+
     Ok(())
 }
 
