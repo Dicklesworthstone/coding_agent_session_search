@@ -612,7 +612,7 @@ fn encrypt_all_chunks(
     std::fs::create_dir_all(payload_dir)?;
 
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
-    let total_chunks = (plaintext.len() + chunk_size - 1) / chunk_size;
+    let total_chunks = plaintext.len().div_ceil(chunk_size);
     let mut chunk_index = 0u32;
 
     for (i, chunk) in plaintext.chunks(chunk_size).enumerate() {
