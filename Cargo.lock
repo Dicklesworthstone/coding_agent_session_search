@@ -580,20 +580,20 @@ dependencies = [
 
 [[package]]
 name = "coding-agent-search"
-version = "0.1.56"
+version = "0.1.57"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
  "arrayvec",
  "assert_cmd",
- "base64 0.22.1",
+ "base64 0.13.1",
  "chrono",
  "clap",
  "clap_complete",
  "clap_mangen",
  "colored",
- "console 0.16.2",
+ "console 0.15.11",
  "crc32fast",
  "criterion",
  "crossbeam-channel",
@@ -612,8 +612,8 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
- "lru 0.16.3",
+ "itertools 0.13.0",
+ "lru 0.12.5",
  "memmap2",
  "notify",
  "once_cell",
@@ -630,7 +630,7 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rusqlite",
- "security-framework 3.5.1",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
@@ -643,7 +643,7 @@ dependencies = [
  "syntect",
  "tantivy",
  "tempfile",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
@@ -697,6 +697,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
+ "unicode-width",
  "windows-sys 0.59.0",
 ]
 
@@ -727,16 +728,6 @@ name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
 dependencies = [
  "core-foundation-sys",
  "libc",
@@ -2345,7 +2336,7 @@ dependencies = [
  "openssl-probe",
  "openssl-sys",
  "schannel",
- "security-framework 2.11.1",
+ "security-framework",
  "security-framework-sys",
  "tempfile",
 ]
@@ -3585,20 +3576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
 dependencies = [
  "bitflags 2.10.0",
- "core-foundation 0.9.4",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
-]
-
-[[package]]
-name = "security-framework"
-version = "3.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3297343eaf830f66ede390ea39da1d462b6b0c1b000f420d0a83f898bbbe6ef"
-dependencies = [
- "bitflags 2.10.0",
- "core-foundation 0.10.1",
+ "core-foundation",
  "core-foundation-sys",
  "libc",
  "security-framework-sys",
