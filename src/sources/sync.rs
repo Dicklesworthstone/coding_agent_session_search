@@ -421,7 +421,19 @@ impl SyncEngine {
             &ssh_opts,
             "--",
             &remote_spec,
-            local_path.to_str().unwrap_or("."),
+            match local_path.to_str() {
+                Some(s) => s,
+                None => {
+                    return PathSyncResult {
+                        remote_path: remote_path.to_string(),
+                        local_path,
+                        success: false,
+                        error: Some("Local path contains invalid UTF-8".to_string()),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    };
+                }
+            },
         ]);
 
         tracing::debug!(
