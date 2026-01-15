@@ -12,7 +12,7 @@ pub mod ui;
 pub mod update_check;
 
 use anyhow::Result;
-use base64::{Engine, prelude::*};
+use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use indexer::IndexOptions;
@@ -3338,7 +3338,7 @@ fn run_cli_search(
             kind: "timeout",
             message: format!(
                 "Operation timed out after {}ms (before search started)",
-                timeout_ms.unwrap()
+                timeout.as_millis()
             ),
             hint: Some("Increase --timeout value or simplify query".to_string()),
             retryable: true,

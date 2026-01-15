@@ -4,7 +4,7 @@
 //! from an encrypted export. Output is safe for public hosting (GitHub Pages / Cloudflare Pages).
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::prelude::*;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -411,7 +411,7 @@ fn write_private_artifacts(
 
     // Write recovery secret if provided
     if let Some(secret) = &config.recovery_secret {
-        let recovery_b64 = BASE64.encode(secret);
+        let recovery_b64 = BASE64_STANDARD.encode(secret);
         let recovery_content = format!(
             "Recovery Secret\n\
             ================\n\n\

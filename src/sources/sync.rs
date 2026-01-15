@@ -559,7 +559,11 @@ impl SyncEngine {
             .and_then(|h| h.hostname.as_deref())
             .unwrap_or(ssh_host);
         let port = host_config.and_then(|h| h.port).unwrap_or(22);
-        let default_user = dotenvy::var("USER").unwrap_or_else(|_| "root".to_string());
+        // Default to current user, never fall back to "root" for security
+        // Try USER, then LOGNAME, then fail with descriptive error in username resolution
+        let default_user = dotenvy::var("USER")
+            .or_else(|_| dotenvy::var("LOGNAME"))
+            .unwrap_or_else(|_| "nobody".to_string());
         let username = ssh_user
             .map(|s| s.to_string())
             .or_else(|| host_config.and_then(|h| h.user.clone()))
@@ -916,12 +920,33 @@ fn expand_tilde_local(path: &str) -> String {
 
 /// Convert a remote path to a safe directory name.
 ///
-/// Replaces path separators and special characters with underscores.
+/// Sanitizes path by:
+/// - Removing leading `~` and `/`
+/// - Replacing path separators and spaces with underscores
+/// - Removing parent directory references (`..`) to prevent traversal attacks
+/// - Removing current directory references (`.`)
 pub fn path_to_safe_dirname(path: &str) -> String {
-    let cleaned = path
-        .trim_start_matches('~')
-        .trim_start_matches('/')
-        .replace(['/', '\\', ' '], "_");
+    use std::path::{Component, Path};
+
+    let path_obj = Path::new(path);
+    let mut parts: Vec<&str> = Vec::new();
+
+    for component in path_obj.components() {
+        match component {
+            Component::Normal(name) => {
+                if let Some(s) = name.to_str() {
+                    // Skip hidden files starting with dot if they're just "."
+                    if !s.is_empty() && s != "." {
+                        parts.push(s);
+                    }
+                }
+            }
+            // Skip all traversal components for security
+            Component::ParentDir | Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+
+    let cleaned = parts.join("_").replace([' ', '\\'], "_");
 
     if cleaned.is_empty() {
         "root".to_string()

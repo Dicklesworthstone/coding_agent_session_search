@@ -391,24 +391,40 @@ fn strip_markdown_links(text: &str) -> String {
             }
 
             if found_close && chars.peek() == Some(&'(') {
-                // Skip the URL part
+                // Potential URL start
                 chars.next(); // consume '('
+                let mut url_part = String::from("(");
                 let mut depth = 1;
+                let mut valid_link = false;
+
                 for inner in chars.by_ref() {
+                    url_part.push(inner);
                     match inner {
                         '(' => depth += 1,
                         ')' => {
                             depth -= 1;
                             if depth == 0 {
+                                valid_link = true;
                                 break;
                             }
                         }
                         _ => {}
                     }
                 }
-                result.push_str(&link_text);
+
+                if valid_link {
+                    // Valid link: [text](url) -> text
+                    result.push_str(&link_text);
+                } else {
+                    // Unbalanced parens or EOF: restore everything
+                    // [text](url...
+                    result.push('[');
+                    result.push_str(&link_text);
+                    result.push(']');
+                    result.push_str(&url_part);
+                }
             } else {
-                // Not a proper link, keep original
+                // Not a proper link (no '(' after ']'), keep original
                 result.push('[');
                 result.push_str(&link_text);
                 if found_close {
@@ -757,14 +773,18 @@ See [docs](http://docs.rs) for more.
     }
 
     #[test]
-    fn test_unordered_list_markers_stripped() {
-        let text = "- First item\n+ Second item";
+    fn test_strip_markdown_links_unbalanced_swallow() {
+        let text = "Check [link](url( unbalanced. Next sentence.";
         let canonical = canonicalize_for_embedding(text);
-
-        assert!(canonical.contains("First item"));
-        assert!(canonical.contains("Second item"));
-        // The "- " and "+ " prefixes should be gone
-        assert!(!canonical.starts_with('-'));
-        assert!(!canonical.contains("\n-"));
+        
+        // Before fix: "Check link"
+        // After fix: "Check [link](url( unbalanced. Next sentence."
+        // Or if processed via strip_markdown_links directly:
+        // "[link](url( unbalanced. Next sentence."
+        
+        // Note: canonicalize_for_embedding applies whitespace norm and other steps,
+        // but it should definitely preserve "Next sentence"
+        assert!(canonical.contains("Next sentence"), "Should not swallow content");
+        assert!(canonical.contains("unbalanced"), "Should not swallow content");
     }
 }

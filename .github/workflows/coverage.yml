@@ -42,8 +42,7 @@ jobs:
       - name: Generate coverage report
         run: |
           cargo llvm-cov --workspace \
-            --ignore-filename-regex "tests/" \
-            --ignore-filename-regex "benches/" \
+            --ignore-filename-regex "(tests/|benches/)" \
             --codecov \
             --output-path codecov.json
 
@@ -59,8 +58,7 @@ jobs:
       - name: Generate coverage summary
         run: |
           cargo llvm-cov --workspace \
-            --ignore-filename-regex "tests/" \
-            --ignore-filename-regex "benches/" \
+            --ignore-filename-regex "(tests/|benches/)" \
             --json \
             --output-path coverage.json
 

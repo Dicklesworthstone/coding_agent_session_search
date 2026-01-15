@@ -23,7 +23,7 @@
 #![allow(unexpected_cfgs)]
 
 use anyhow::{Context, Result, bail};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::prelude::*;
 use chrono::Utc;
 use rand::{RngCore, rngs::OsRng};
 use std::path::Path;
@@ -62,28 +62,29 @@ impl RecoverySecret {
     pub fn generate() -> Self {
         let mut bytes = vec![0u8; RECOVERY_SECRET_BYTES];
         OsRng.fill_bytes(&mut bytes);
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(&bytes);
         Self { bytes, encoded }
     }
 
     /// Create a recovery secret from existing bytes.
     ///
-    /// Returns None if the bytes are too short (< 16 bytes).
+    /// Returns None if the bytes are too short (< 24 bytes / 192 bits).
+    /// NIST recommends 192+ bits for long-term cryptographic material.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
-        if bytes.len() < 16 {
+        if bytes.len() < 24 {
             return None;
         }
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(&bytes);
         Some(Self { bytes, encoded })
     }
 
     /// Create a recovery secret from a base64url-encoded string.
     pub fn from_encoded(encoded: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
+        let bytes = BASE64_URL_SAFE_NO_PAD
             .decode(encoded)
             .context("Invalid base64url encoding")?;
-        if bytes.len() < 16 {
-            bail!("Recovery secret too short (minimum 128 bits)");
+        if bytes.len() < 24 {
+            bail!("Recovery secret too short (minimum 192 bits for long-term security)");
         }
         Ok(Self {
             bytes,

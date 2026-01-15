@@ -25,7 +25,7 @@ use aes_gcm::{
 };
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use hkdf::Hkdf;
@@ -286,7 +286,7 @@ pub fn key_rotate(
     let mut new_slots = vec![create_password_slot(
         new_password,
         &new_dek,
-        &BASE64.encode(new_export_id),
+        &BASE64_STANDARD.encode(new_export_id),
         0,
     )?];
 
@@ -296,7 +296,7 @@ pub fn key_rotate(
         new_slots.push(create_recovery_slot(
             secret.as_bytes(),
             &new_dek,
-            &BASE64.encode(new_export_id),
+            &BASE64_STANDARD.encode(new_export_id),
             1,
         )?);
         recovery_secret_encoded = Some(secret.encoded().to_string());
@@ -305,8 +305,8 @@ pub fn key_rotate(
     // 5. Write new config
     let new_config = EncryptionConfig {
         version: config.version,
-        export_id: BASE64.encode(new_export_id),
-        base_nonce: BASE64.encode(new_base_nonce),
+        export_id: BASE64_STANDARD.encode(new_export_id),
+        base_nonce: BASE64_STANDARD.encode(new_base_nonce),
         compression: config.compression,
         kdf_defaults: Argon2Params::default(),
         payload: crate::pages::encrypt::PayloadMeta {
@@ -345,16 +345,16 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
-    let export_id = BASE64.decode(&config.export_id)?;
+    let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
 
-        let salt = BASE64.decode(&slot.salt)?;
-        let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-        let nonce = BASE64.decode(&slot.nonce)?;
+        let salt = BASE64_STANDARD.decode(&slot.salt)?;
+        let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+        let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
         if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
@@ -370,16 +370,16 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
-    let export_id = BASE64.decode(&config.export_id)?;
+    let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
 
-        let salt = BASE64.decode(&slot.salt)?;
-        let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-        let nonce = BASE64.decode(&slot.nonce)?;
+        let salt = BASE64_STANDARD.decode(&slot.salt)?;
+        let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+        let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
         if let Ok(mut kek) = derive_kek_argon2id(password, &salt) {
             let result = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id);
@@ -458,7 +458,7 @@ fn create_password_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
-    let export_id = BASE64.decode(export_id_b64)?;
+    let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
     let mut salt = [0u8; 32];
@@ -479,9 +479,9 @@ fn create_password_slot(
         id: slot_id,
         slot_type: SlotType::Password,
         kdf: KdfAlgorithm::Argon2id,
-        salt: BASE64.encode(salt),
-        wrapped_dek: BASE64.encode(&wrapped_dek),
-        nonce: BASE64.encode(nonce),
+        salt: BASE64_STANDARD.encode(salt),
+        wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+        nonce: BASE64_STANDARD.encode(nonce),
         argon2_params: Some(Argon2Params::default()),
     })
 }
@@ -493,7 +493,7 @@ fn create_recovery_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
-    let export_id = BASE64.decode(export_id_b64)?;
+    let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
     let mut salt = [0u8; 16];
@@ -514,9 +514,9 @@ fn create_recovery_slot(
         id: slot_id,
         slot_type: SlotType::Recovery,
         kdf: KdfAlgorithm::HkdfSha256,
-        salt: BASE64.encode(salt),
-        wrapped_dek: BASE64.encode(&wrapped_dek),
-        nonce: BASE64.encode(nonce),
+        salt: BASE64_STANDARD.encode(salt),
+        wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+        nonce: BASE64_STANDARD.encode(nonce),
         argon2_params: None,
     })
 }
@@ -559,8 +559,8 @@ fn decrypt_all_chunks(
     progress: impl Fn(f32),
 ) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
-    let base_nonce = BASE64.decode(&config.base_nonce)?;
-    let export_id = BASE64.decode(&config.export_id)?;
+    let base_nonce = BASE64_STANDARD.decode(&config.base_nonce)?;
+    let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     let mut plaintext = Vec::new();
 

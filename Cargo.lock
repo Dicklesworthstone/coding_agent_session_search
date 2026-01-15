@@ -587,7 +587,7 @@ dependencies = [
  "argon2",
  "arrayvec",
  "assert_cmd",
- "base64 0.13.1",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "clap_complete",

@@ -13,7 +13,7 @@ use aes_gcm::{
 };
 use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version, password_hash::SaltString};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::prelude::*;
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
@@ -178,9 +178,9 @@ impl EncryptionEngine {
             id: slot_id,
             slot_type: SlotType::Password,
             kdf: KdfAlgorithm::Argon2id,
-            salt: BASE64.encode(salt_bytes),
-            wrapped_dek: BASE64.encode(&wrapped_dek),
-            nonce: BASE64.encode(nonce),
+            salt: BASE64_STANDARD.encode(salt_bytes),
+            wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+            nonce: BASE64_STANDARD.encode(nonce),
             argon2_params: Some(Argon2Params::default()),
         });
 
@@ -205,9 +205,9 @@ impl EncryptionEngine {
             id: slot_id,
             slot_type: SlotType::Recovery,
             kdf: KdfAlgorithm::HkdfSha256,
-            salt: BASE64.encode(salt),
-            wrapped_dek: BASE64.encode(&wrapped_dek),
-            nonce: BASE64.encode(nonce),
+            salt: BASE64_STANDARD.encode(salt),
+            wrapped_dek: BASE64_STANDARD.encode(&wrapped_dek),
+            nonce: BASE64_STANDARD.encode(nonce),
             argon2_params: None,
         });
 
@@ -299,14 +299,20 @@ impl EncryptionEngine {
 
             chunk_files.push(format!("payload/{}", chunk_filename));
             total_compressed += ciphertext.len() as u64;
-            chunk_index += 1;
+            chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "File too large: exceeds maximum of {} chunks ({} bytes with current chunk size)",
+                    u32::MAX,
+                    (u32::MAX as u64) * (self.chunk_size as u64)
+                )
+            })?;
         }
 
         // Build config
         let config = EncryptionConfig {
             version: SCHEMA_VERSION,
-            export_id: BASE64.encode(self.export_id),
-            base_nonce: BASE64.encode(self.base_nonce),
+            export_id: BASE64_STANDARD.encode(self.export_id),
+            base_nonce: BASE64_STANDARD.encode(self.base_nonce),
             compression: "deflate".to_string(),
             kdf_defaults: Argon2Params::default(),
             payload: PayloadMeta {
@@ -342,13 +348,13 @@ impl DecryptionEngine {
                 continue;
             }
 
-            let salt = BASE64.decode(&slot.salt)?;
-            let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-            let nonce = BASE64.decode(&slot.nonce)?;
+            let salt = BASE64_STANDARD.decode(&slot.salt)?;
+            let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+            let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
             let kek = derive_kek_argon2id(password, &salt)?;
 
-            let export_id = BASE64.decode(&config.export_id)?;
+            let export_id = BASE64_STANDARD.decode(&config.export_id)?;
             if let Ok(dek) = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id) {
                 return Ok(Self {
                     dek: SecretKey::from_bytes(dek),
@@ -367,13 +373,13 @@ impl DecryptionEngine {
                 continue;
             }
 
-            let salt = BASE64.decode(&slot.salt)?;
-            let wrapped_dek = BASE64.decode(&slot.wrapped_dek)?;
-            let nonce = BASE64.decode(&slot.nonce)?;
+            let salt = BASE64_STANDARD.decode(&slot.salt)?;
+            let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
+            let nonce = BASE64_STANDARD.decode(&slot.nonce)?;
 
             let kek = derive_kek_hkdf(secret, &salt)?;
 
-            let export_id = BASE64.decode(&config.export_id)?;
+            let export_id = BASE64_STANDARD.decode(&config.export_id)?;
             if let Ok(dek) = unwrap_key(&kek, &wrapped_dek, &nonce, &export_id, slot.id) {
                 return Ok(Self {
                     dek: SecretKey::from_bytes(dek),
@@ -397,8 +403,17 @@ impl DecryptionEngine {
 
         let cipher = Aes256Gcm::new_from_slice(self.dek.as_bytes()).expect("Invalid key length");
 
-        let base_nonce = BASE64.decode(&self.config.base_nonce)?;
-        let export_id = BASE64.decode(&self.config.export_id)?;
+        let base_nonce = BASE64_STANDARD.decode(&self.config.base_nonce)?;
+        let export_id = BASE64_STANDARD.decode(&self.config.export_id)?;
+
+        // Validate chunk count doesn't exceed u32 to prevent nonce truncation
+        if self.config.payload.files.len() > u32::MAX as usize {
+            bail!(
+                "Invalid config: chunk count {} exceeds maximum {}",
+                self.config.payload.files.len(),
+                u32::MAX
+            );
+        }
 
         let mut output_file = File::create(output_path)?;
         let mut writer = BufWriter::new(&mut output_file);
