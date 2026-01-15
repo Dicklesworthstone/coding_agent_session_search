@@ -191,7 +191,7 @@ impl ExportEngine {
         let total_convs: usize = src.query_row(
             &count_query,
             rusqlite::params_from_iter(params.iter()),
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
         )?;
 
         // Execute Main Query

@@ -98,7 +98,7 @@ impl SizeEstimate {
             .query_row(
                 &conv_sql,
                 rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0).map(|v| v as u64),
             )
             .unwrap_or(0);
 
@@ -114,7 +114,12 @@ impl SizeEstimate {
             .query_row(
                 &msg_sql,
                 rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| Ok((row.get(0).unwrap_or(0), row.get(1).unwrap_or(0))),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0).unwrap_or(0) as u64,
+                        row.get::<_, i64>(1).unwrap_or(0) as u64,
+                    ))
+                },
             )
             .unwrap_or((0, 0));
 
