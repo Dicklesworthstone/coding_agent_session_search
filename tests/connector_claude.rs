@@ -83,6 +83,32 @@ fn claude_connector_parses_jsonl_format() {
     );
 }
 
+/// Test JSONL format where type is "message" and role is stored on message.role
+#[test]
+fn claude_connector_parses_message_type() {
+    let dir = create_claude_temp();
+    let projects = dir.path().join("mock-claude/projects/test-proj");
+    fs::create_dir_all(&projects).unwrap();
+    let file = projects.join("session.jsonl");
+
+    let sample = r#"{"type":"message","message":{"role":"user","content":"Hello"},"timestamp":"2025-11-12T18:31:18.000Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Hi there"}]},"timestamp":"2025-11-12T18:31:20.000Z"}
+"#;
+    fs::write(&file, sample).unwrap();
+
+    let conn = ClaudeCodeConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().join("mock-claude"),
+        scan_roots: Vec::new(),
+        since_ts: None,
+    };
+    let convs = conn.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].messages.len(), 2);
+    assert_eq!(convs[0].messages[0].role, "user");
+    assert_eq!(convs[0].messages[1].role, "assistant");
+}
+
 /// Test that summary entries are filtered out
 #[test]
 fn claude_connector_filters_summary_entries() {
