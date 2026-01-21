@@ -7,6 +7,7 @@
 
 import {
     searchConversations,
+    detectSearchMode,
     getStatistics,
     getRecentConversations,
     getConversationsByAgent,
@@ -33,6 +34,7 @@ let currentFilters = {
     since: null,
     until: null,
 };
+let currentSearchMode = 'auto'; // 'auto', 'prose', or 'code'
 let currentResults = [];
 let currentPage = 0;
 let searchTimeout = null;
@@ -43,6 +45,8 @@ let virtualList = null; // Virtual list instance for large result sets
 let elements = {
     container: null,
     searchInput: null,
+    searchModeToggle: null,
+    searchModeIndicator: null,
     agentFilter: null,
     timeFilter: null,
     resultsContainer: null,
@@ -97,6 +101,15 @@ function renderSearchUI() {
             </div>
 
             <div class="search-filters">
+                <div class="filter-group search-mode-group">
+                    <label>Mode</label>
+                    <div id="search-mode-toggle" class="search-mode-toggle">
+                        <button type="button" class="search-mode-btn active" data-mode="auto" title="Auto-detect based on query">Auto</button>
+                        <button type="button" class="search-mode-btn" data-mode="prose" title="Natural language search with stemming">Prose</button>
+                        <button type="button" class="search-mode-btn" data-mode="code" title="Code search for identifiers and paths">Code</button>
+                    </div>
+                </div>
+
                 <div class="filter-group">
                     <label for="agent-filter">Agent</label>
                     <select id="agent-filter" class="filter-select">
@@ -117,7 +130,10 @@ function renderSearchUI() {
             </div>
 
             <div class="search-results">
-                <div id="result-count" class="result-count"></div>
+                <div class="search-results-header">
+                    <div id="result-count" class="result-count"></div>
+                    <div id="search-mode-indicator" class="search-mode-indicator hidden"></div>
+                </div>
                 <div id="loading-indicator" class="loading-indicator hidden">
                     <div class="spinner-small"></div>
                     <span>Searching...</span>

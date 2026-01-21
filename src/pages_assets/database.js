@@ -499,6 +499,17 @@ export function isDatabaseReady() {
     return isInitialized;
 }
 
+/**
+ * Detect which search mode would be used for a query
+ * Useful for showing the user which FTS table will be used
+ *
+ * @param {string} query - Search query
+ * @returns {'prose' | 'code'} Detected search mode
+ */
+export function detectSearchMode(query) {
+    return isCodeQuery(query) ? 'code' : 'prose';
+}
+
 // Export default instance
 export default {
     initDatabase,
@@ -513,6 +524,7 @@ export default {
     getConversation,
     getConversationMessages,
     searchConversations,
+    detectSearchMode,
     getConversationsByAgent,
     getConversationsByWorkspace,
     getConversationsByTimeRange,
