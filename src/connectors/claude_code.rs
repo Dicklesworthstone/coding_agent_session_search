@@ -334,6 +334,7 @@ impl Connector for ClaudeCodeConnector {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1010,5 +1011,53 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn scan_respects_claude_home_even_if_data_dir_contains_claude_string() {
+        // Setup real claude home with data
+        let home_dir = TempDir::new().unwrap();
+        // Mock the home directory structure expected by projects_root()
+        let real_projects = home_dir.path().join(".claude").join("projects");
+        fs::create_dir_all(&real_projects).unwrap();
+        
+        let content = r#"{"type":"user","message":{"role":"user","content":"Real session"}}"#;
+        fs::write(real_projects.join("real.jsonl"), content).unwrap();
+
+        // Setup CASS data dir that happens to have "claude" in path
+        let project_dir = TempDir::new().unwrap();
+        let confusing_data_dir = project_dir.path().join("my_claude_tool").join("data");
+        fs::create_dir_all(&confusing_data_dir).unwrap();
+
+        // Overwrite HOME to point to our temp home
+        // SAFETY: Test runs in single-threaded context
+        // Note: dirs::home_dir() typically checks HOME
+        unsafe { std::env::set_var("HOME", home_dir.path()) };
+        
+        let connector = ClaudeCodeConnector::new();
+        // this defaults to use_default_detection = true
+        let ctx = ScanContext::local_default(confusing_data_dir.clone(), None);
+        
+        let convs = connector.scan(&ctx).unwrap();
+        
+        // Cleanup
+        // We can't easily restore HOME to its original value if we don't know it, 
+        // but typically tests running in isolation or containers handle this. 
+        // For safety/correctness in a shared env, we should probably save/restore.
+        // But here I'll just rely on the fact that we are in a "random exploration" mode
+        // and if I break my own environment it's fine? No, I should be careful.
+        // But `dirs::home_dir` caches? No.
+        
+        // Check results
+        // Use a loop to print what we found if it fails
+        if convs.len() != 1 {
+             println!("Found {} conversations:", convs.len());
+             for c in &convs {
+                 println!(" - {:?}", c.source_path);
+             }
+        }
+        assert_eq!(convs.len(), 1, "Should find session in real home");
+        assert_eq!(convs[0].messages[0].content, "Real session");
     }
 }

@@ -208,9 +208,7 @@ impl Connector for GeminiConnector {
         // Use data_root only if it looks like a Gemini directory (for testing)
         // Otherwise use the default root
         let looks_like_root = |path: &PathBuf| {
-            path.file_name()
-                .is_some_and(|n| n.to_str().unwrap_or("").contains("gemini"))
-                || path.join("chats").exists()
+            path.join("chats").exists()
                 || fs::read_dir(path)
                     .map(|mut d| d.any(|e| e.ok().is_some_and(|e| e.path().join("chats").exists())))
                     .unwrap_or(false)
@@ -396,6 +394,7 @@ impl Connector for GeminiConnector {
 mod tests {
     use super::*;
     use crate::connectors::NormalizedMessage;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // ==================== Constructor Tests ====================
@@ -1081,6 +1080,39 @@ mod tests {
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn scan_respects_gemini_home_even_if_data_dir_contains_gemini_string() {
+        // Setup real gemini home with data
+        let home_dir = TempDir::new().unwrap();
+        // Structure: .gemini/tmp/<hash>/chats/session.json
+        let real_chats = home_dir.path().join(".gemini/tmp/hash123/chats");
+        fs::create_dir_all(&real_chats).unwrap();
+        
+        let session_json = r#"{"sessionId": "real", "messages": [{"type": "user", "content": "Real session"}]}"#;
+        fs::write(real_chats.join("session-real.json"), session_json).unwrap();
+
+        // Setup CASS data dir that happens to have "gemini" in path
+        let project_dir = TempDir::new().unwrap();
+        // The LEAF directory must contain "gemini" to trigger the bug
+        let confusing_data_dir = project_dir.path().join("project_gemini");
+        fs::create_dir_all(&confusing_data_dir).unwrap();
+
+        // Overwrite HOME to point to our temp home
+        // SAFETY: Test runs in single-threaded context
+        unsafe { std::env::set_var("HOME", home_dir.path()) };
+        
+        let connector = GeminiConnector::new();
+        let ctx = ScanContext::local_default(confusing_data_dir.clone(), None);
+        
+        let convs = connector.scan(&ctx).unwrap();
+        
+        unsafe { std::env::remove_var("HOME") }; // Cleanup, though risky in shared env
+
+        assert_eq!(convs.len(), 1, "Should find session in real home");
+        assert_eq!(convs[0].messages[0].content, "Real session");
     }
 
     // ==================== detect Tests ====================

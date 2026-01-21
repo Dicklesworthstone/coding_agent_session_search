@@ -77,12 +77,15 @@ impl Connector for CodexConnector {
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         // Use data_root only if it IS a Codex home directory (for testing).
         // Check for `.codex` in path OR explicit directory name ending in "codex".
-        // This avoids false positives from unrelated "sessions" directories.
+        // AND ensure it has a "sessions" subdirectory.
+        // This avoids false positives from unrelated directories that happen to have "codex" in the path.
         let is_codex_dir = ctx
             .data_dir
             .to_str()
             .map(|s| s.contains(".codex") || s.ends_with("/codex") || s.ends_with("\\codex"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && ctx.data_dir.join("sessions").exists();
+        
         let looks_like_root = |path: &PathBuf| {
             path.to_str()
                 .map(|s| s.contains(".codex") || s.contains("codex"))
@@ -1148,5 +1151,38 @@ not valid json at all
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].source_path, file_path);
+    }
+
+    #[test]
+    #[serial]
+    fn scan_respects_codex_home_even_if_data_dir_contains_codex_string() {
+        // Setup real codex home with data
+        let real_home = TempDir::new().unwrap();
+        let real_sessions = real_home.path().join("sessions");
+        fs::create_dir_all(&real_sessions).unwrap();
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Real session"}}"#;
+        fs::write(real_sessions.join("rollout-real.jsonl"), content).unwrap();
+
+        // Setup CASS data dir that happens to have ".codex" in path which triggers the heuristic
+        // e.g., /tmp/.../fake.codex/data
+        let project_dir = TempDir::new().unwrap();
+        let confusing_data_dir = project_dir.path().join("fake.codex").join("data");
+        fs::create_dir_all(&confusing_data_dir).unwrap();
+
+        // SAFETY: Test runs in single-threaded context
+        unsafe { std::env::set_var("CODEX_HOME", real_home.path()) };
+        
+        let connector = CodexConnector::new();
+        // this defaults to use_default_detection = true
+        let ctx = ScanContext::local_default(confusing_data_dir.clone(), None);
+        
+        let convs = connector.scan(&ctx).unwrap();
+        
+        // Cleanup
+        unsafe { std::env::remove_var("CODEX_HOME") };
+
+        // Should find the real session
+        assert_eq!(convs.len(), 1, "Should find session in CODEX_HOME, but found {}", convs.len());
+        assert_eq!(convs[0].messages[0].content, "Real session");
     }
 }
