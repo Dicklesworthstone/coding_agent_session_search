@@ -101,6 +101,7 @@ fn generate_conversation(
 
 /// Content size variants for testing.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum ContentSize {
     Small,
     Medium,
