@@ -5,10 +5,13 @@
  * CSP-safe: No inline event handlers, no eval.
  */
 
+import { createStrengthMeter } from './password-strength.js';
+
 // State
 let config = null;
 let worker = null;
 let qrScanner = null;
+let strengthMeter = null;
 
 // DOM Elements
 const elements = {
@@ -65,6 +68,15 @@ async function init() {
     // Check for existing session
     checkExistingSession();
 
+    // Initialize password strength meter
+    if (elements.passwordInput && elements.strengthMeter) {
+        strengthMeter = createStrengthMeter(elements.passwordInput, {
+            meterContainer: elements.strengthMeter,
+            labelElement: elements.strengthLabel,
+            suggestionsList: elements.strengthSuggestions,
+        });
+    }
+
     // Enable form
     elements.unlockBtn.disabled = false;
     elements.passwordInput.disabled = false;
@@ -91,6 +103,9 @@ function cacheElements() {
     elements.progressFill = elements.authProgress?.querySelector('.progress-fill');
     elements.progressText = elements.authProgress?.querySelector('.progress-text');
     elements.lockBtn = document.getElementById('lock-btn');
+    elements.strengthMeter = document.getElementById('strength-meter');
+    elements.strengthLabel = document.getElementById('strength-label');
+    elements.strengthSuggestions = document.getElementById('strength-suggestions');
 }
 
 /**

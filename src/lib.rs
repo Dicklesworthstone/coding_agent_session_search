@@ -499,6 +499,10 @@ pub enum Commands {
         /// Acknowledge unencrypted export risks (required in robot/JSON mode with --no-encryption)
         #[arg(long)]
         i_understand_unencrypted_risks: bool,
+
+        /// Include message attachments (images, PDFs, code snapshots)
+        #[arg(long)]
+        include_attachments: bool,
     },
     /// Manage remote sources (P5.x)
     #[command(subcommand)]
@@ -2079,6 +2083,7 @@ async fn execute_cli(
                     verbose,
                     no_encryption,
                     i_understand_unencrypted_risks,
+                    include_attachments,
                 } => {
                     // Check for unencrypted export in robot mode
                     if no_encryption && (json || robot_mode) && !i_understand_unencrypted_risks {
@@ -2266,10 +2271,13 @@ async fn execute_cli(
                             retryable: false,
                         })?;
                     } else {
-                        // Wizard mode: pass no_encryption flag
+                        // Wizard mode: pass flags
                         let mut wizard = crate::pages::wizard::PagesWizard::new();
                         if no_encryption {
                             wizard.set_no_encryption(true);
+                        }
+                        if include_attachments {
+                            wizard.set_include_attachments(true);
                         }
                         wizard.run()
                             .map_err(|e| CliError {

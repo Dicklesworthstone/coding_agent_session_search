@@ -460,11 +460,11 @@ fn concurrent_test_summary() {
     println!("║ Search during indexing  │ concurrent      │ Run by default    ║");
     println!("║ High thread stress      │ 32 threads      │ --ignored         ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
-    println!("");
+    println!();
     println!("Run all concurrent tests:");
     println!("  cargo test --test load_concurrent --release -- --nocapture");
-    println!("");
+    println!();
     println!("Include stress tests:");
     println!("  cargo test --test load_concurrent --release -- --nocapture --include-ignored");
-    println!("");
+    println!();
 }

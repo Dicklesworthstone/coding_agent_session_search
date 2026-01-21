@@ -232,20 +232,16 @@ fn test_migration_handles_corruption() {
         }
         Err(e) => {
             // Should indicate need for rebuild
-            match e {
-                MigrationError::RebuildRequired { reason, .. } => {
-                    let reason_lower = reason.to_lowercase();
-                    assert!(
-                        reason_lower.contains("rebuild")
-                            || reason_lower.contains("corrupt")
-                            || reason_lower.contains("migration")
-                            || reason_lower.contains("schema"),
-                        "Error should be migration-related: {}",
-                        reason
-                    );
-                }
-                // Database/IO/Other errors also acceptable for corrupted databases
-                _ => {}
+            if let MigrationError::RebuildRequired { reason, .. } = e {
+                let reason_lower = reason.to_lowercase();
+                assert!(
+                    reason_lower.contains("rebuild")
+                        || reason_lower.contains("corrupt")
+                        || reason_lower.contains("migration")
+                        || reason_lower.contains("schema"),
+                    "Error should be migration-related: {}",
+                    reason
+                );
             }
         }
     }

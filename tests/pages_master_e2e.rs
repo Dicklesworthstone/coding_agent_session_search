@@ -32,17 +32,16 @@ use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::key_management::{key_add_password, key_list, key_revoke};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tracing::{debug, error, info, instrument, span, Level};
+use tracing::{debug, info, instrument, Level};
 
 #[path = "util/mod.rs"]
 mod util;
 
-use util::{ConversationFixtureBuilder, PerfMeasurement, TestTracing};
+use util::{ConversationFixtureBuilder, PerfMeasurement};
 
 // =============================================================================
 // Test Configuration
@@ -51,8 +50,6 @@ use util::{ConversationFixtureBuilder, PerfMeasurement, TestTracing};
 const TEST_PASSWORD: &str = "master-e2e-test-password";
 const TEST_PASSWORD_2: &str = "secondary-password-for-multi-slot";
 const TEST_RECOVERY_SECRET: &[u8] = b"master-e2e-recovery-secret-32bytes!";
-const WEAK_PASSWORD: &str = "abc";
-const STRONG_PASSWORD: &str = "SuperStr0ng!P@ssw0rd#2024";
 
 /// Test configuration for the E2E suite.
 #[derive(Debug, Clone)]
@@ -82,49 +79,6 @@ impl Default for E2EConfig {
 }
 
 // =============================================================================
-// Test Result Tracking
-// =============================================================================
-
-#[derive(Debug, Clone)]
-struct TestResult {
-    name: String,
-    status: TestStatus,
-    duration: Duration,
-    logs: Vec<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TestStatus {
-    Passed,
-    Failed,
-    Skipped,
-    TimedOut,
-}
-
-impl TestResult {
-    fn passed(name: impl Into<String>, duration: Duration) -> Self {
-        Self {
-            name: name.into(),
-            status: TestStatus::Passed,
-            duration,
-            logs: Vec::new(),
-            error: None,
-        }
-    }
-
-    fn failed(name: impl Into<String>, duration: Duration, error: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            status: TestStatus::Failed,
-            duration,
-            logs: Vec::new(),
-            error: Some(error.into()),
-        }
-    }
-}
-
-// =============================================================================
 // Pipeline Artifacts
 // =============================================================================
 
@@ -132,7 +86,6 @@ impl TestResult {
 struct PipelineArtifacts {
     export_db_path: std::path::PathBuf,
     bundle: BundleResult,
-    source_db_path: std::path::PathBuf,
     temp_dir: TempDir,
 }
 
@@ -141,6 +94,10 @@ struct PipelineArtifacts {
 fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     info!("Created temp directory: {}", temp_dir.path().display());
+    debug!(
+        "E2E config: timeout_ms={} capture_screenshots={} verbose={}",
+        config.timeout_ms, config.capture_screenshots, config.verbose
+    );
 
     let data_dir = temp_dir.path().join("data");
     fs::create_dir_all(&data_dir).expect("Failed to create data directory");
@@ -229,7 +186,6 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
     PipelineArtifacts {
         export_db_path,
         bundle,
-        source_db_path,
         temp_dir,
     }
 }
@@ -667,7 +623,7 @@ fn test_performance_benchmarks() {
 // Test Utilities
 // =============================================================================
 
-fn setup_test_tracing(test_name: &str) -> tracing::subscriber::DefaultGuard {
+fn setup_test_tracing(_test_name: &str) -> tracing::subscriber::DefaultGuard {
     let subscriber = tracing_subscriber::fmt()
         .with_test_writer()
         .with_max_level(Level::DEBUG)
@@ -676,91 +632,4 @@ fn setup_test_tracing(test_name: &str) -> tracing::subscriber::DefaultGuard {
         .finish();
 
     tracing::subscriber::set_default(subscriber)
-}
-
-// =============================================================================
-// Test Report Generation
-// =============================================================================
-
-/// Generate an HTML test report.
-#[allow(dead_code)]
-fn generate_html_report(results: &[TestResult]) -> String {
-    let passed = results.iter().filter(|r| r.status == TestStatus::Passed).count();
-    let failed = results.iter().filter(|r| r.status == TestStatus::Failed).count();
-    let total_duration: Duration = results.iter().map(|r| r.duration).sum();
-
-    let test_rows: String = results
-        .iter()
-        .map(|r| {
-            let status_class = match r.status {
-                TestStatus::Passed => "passed",
-                TestStatus::Failed => "failed",
-                TestStatus::Skipped => "skipped",
-                TestStatus::TimedOut => "timeout",
-            };
-            let error_msg = r.error.as_deref().unwrap_or("");
-            format!(
-                r#"<tr class="{}">
-                    <td>{}</td>
-                    <td>{:?}</td>
-                    <td>{:.2}ms</td>
-                    <td class="error">{}</td>
-                </tr>"#,
-                status_class,
-                r.name,
-                r.status,
-                r.duration.as_secs_f64() * 1000.0,
-                error_msg
-            )
-        })
-        .collect();
-
-    format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Master E2E Test Report</title>
-    <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 2rem; }}
-        .summary {{ font-size: 1.5rem; margin-bottom: 2rem; padding: 1rem; background: #f5f5f5; border-radius: 8px; }}
-        .passed {{ color: #22c55e; }}
-        .failed {{ color: #ef4444; }}
-        .skipped {{ color: #f59e0b; }}
-        .timeout {{ color: #6366f1; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th, td {{ padding: 0.75rem; text-align: left; border-bottom: 1px solid #e5e7eb; }}
-        th {{ background: #f9fafb; }}
-        tr.passed {{ background: #f0fdf4; }}
-        tr.failed {{ background: #fef2f2; }}
-        .error {{ color: #dc2626; font-size: 0.875rem; }}
-    </style>
-</head>
-<body>
-    <h1>Master E2E Test Report</h1>
-    <div class="summary">
-        <span class="passed">{} passed</span> /
-        <span class="failed">{} failed</span> /
-        {} total ({:.2}s)
-    </div>
-    <table>
-        <thead>
-            <tr>
-                <th>Test Name</th>
-                <th>Status</th>
-                <th>Duration</th>
-                <th>Error</th>
-            </tr>
-        </thead>
-        <tbody>
-            {}
-        </tbody>
-    </table>
-</body>
-</html>"#,
-        passed,
-        failed,
-        results.len(),
-        total_duration.as_secs_f64(),
-        test_rows
-    )
 }

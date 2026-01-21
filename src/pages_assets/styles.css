@@ -1291,3 +1291,220 @@ body:has(.coi-degraded-banner) .auth-container {
     padding-top: calc(var(--space-2xl) + 2rem);
 }
 
+/* Password Strength Meter */
+.strength-meter {
+    height: 4px;
+    background: var(--color-border);
+    border-radius: 2px;
+    margin-top: var(--space-sm);
+    overflow: hidden;
+}
+
+.strength-bar {
+    height: 100%;
+    border-radius: 2px;
+    width: 0;
+    transition: width 0.3s ease, background-color 0.3s ease;
+}
+
+.strength-bar[data-strength="weak"] {
+    width: 25%;
+    background: #ef4444;
+}
+
+.strength-bar[data-strength="fair"] {
+    width: 50%;
+    background: #f59e0b;
+}
+
+.strength-bar[data-strength="good"] {
+    width: 75%;
+    background: #3b82f6;
+}
+
+.strength-bar[data-strength="strong"] {
+    width: 100%;
+    background: #22c55e;
+}
+
+.strength-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: var(--space-xs);
+    font-size: 0.75rem;
+}
+
+.strength-label {
+    font-weight: 500;
+    transition: color 0.3s ease;
+}
+
+.strength-label[data-strength="weak"] { color: #ef4444; }
+.strength-label[data-strength="fair"] { color: #f59e0b; }
+.strength-label[data-strength="good"] { color: #3b82f6; }
+.strength-label[data-strength="strong"] { color: #22c55e; }
+
+.strength-suggestions {
+    list-style: none;
+    margin: var(--space-xs) 0 0 0;
+    padding: 0;
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+}
+
+.strength-suggestions li {
+    padding: var(--space-xs) 0;
+}
+
+.strength-suggestions li::before {
+    content: "•";
+    margin-right: var(--space-xs);
+    color: var(--color-text-dim);
+}
+
+/* ========================================
+   Attachment Styles
+   ======================================== */
+.attachment {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-md);
+    background: var(--color-bg-alt);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    margin: var(--space-md) 0;
+    max-width: 100%;
+}
+
+.attachment-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: var(--space-lg);
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.attachment-placeholder:hover {
+    background: var(--color-hover);
+    border-radius: var(--radius-sm);
+}
+
+.attachment-icon {
+    font-size: 2rem;
+}
+
+.attachment-name {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--color-text);
+    word-break: break-all;
+    text-align: center;
+}
+
+.attachment-size {
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+}
+
+.attachment-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-lg);
+}
+
+.attachment-img {
+    max-width: 100%;
+    max-height: 500px;
+    border-radius: var(--radius-sm);
+    object-fit: contain;
+}
+
+.attachment-caption {
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    text-align: center;
+    padding-top: var(--space-xs);
+}
+
+.attachment-download {
+    padding: var(--space-xs) var(--space-md);
+    font-size: 0.875rem;
+    background: var(--color-primary);
+    color: white;
+    border: none;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: var(--transition-fast);
+}
+
+.attachment-download:hover {
+    background: var(--color-primary-hover);
+}
+
+.attachment-error {
+    color: var(--color-error);
+    font-size: 0.875rem;
+}
+
+.attachment-image {
+    background: transparent;
+    border: none;
+}
+
+.attachment-image.loaded {
+    background: var(--color-bg-alt);
+    border: 1px solid var(--color-border);
+}
+
+.attachment-pdf,
+.attachment-file {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+/* Message attachments container */
+.message-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+    margin-top: var(--space-md);
+    padding-top: var(--space-md);
+    border-top: 1px solid var(--color-border);
+}
+
+.message-attachments-label {
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: var(--space-xs);
+    width: 100%;
+}
+
+/* Inline attachment thumbnail for message list */
+.attachment-thumb {
+    width: 60px;
+    height: 60px;
+    border-radius: var(--radius-sm);
+    object-fit: cover;
+    border: 1px solid var(--color-border);
+}
+
+.attachment-count {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    font-size: 0.75rem;
+    color: var(--color-text-dim);
+    background: var(--color-bg-alt);
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+}
+

@@ -18,9 +18,9 @@
 //! | Chunked encrypt 10MB | < 1s |
 
 use coding_agent_search::encryption::{
-    aes_gcm_decrypt, aes_gcm_encrypt, argon2id_hash, hkdf_expand, hkdf_extract, Argon2Params,
+    Argon2Params, aes_gcm_decrypt, aes_gcm_encrypt, argon2id_hash, hkdf_expand, hkdf_extract,
 };
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::Rng;
 use std::hint::black_box;
 

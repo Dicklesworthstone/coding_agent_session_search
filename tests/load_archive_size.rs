@@ -465,8 +465,8 @@ fn load_test_summary() {
     println!("║ Memory bounded          │ < 100MB growth  │ Run by default    ║");
     println!("║ Resource cleanup        │ < 50MB retained │ Run by default    ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
-    println!("");
+    println!();
     println!("Run all tests (including expensive):");
     println!("  cargo test --test archive_size --release -- --nocapture --include-ignored");
-    println!("");
+    println!();
 }

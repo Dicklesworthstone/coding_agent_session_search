@@ -9,17 +9,9 @@
 //! Note: Full axe-core testing requires a browser environment.
 //! These tests validate the generated HTML structure for accessibility.
 
-use std::collections::HashSet;
-
 /// WCAG 2.1 Level AA color contrast requirements
 const MIN_CONTRAST_NORMAL_TEXT: f64 = 4.5;
 const MIN_CONTRAST_LARGE_TEXT: f64 = 3.0;
-
-/// ARIA landmark roles that should be present
-const REQUIRED_LANDMARKS: &[&str] = &["main", "banner", "navigation", "contentinfo"];
-
-/// Interactive elements that must be keyboard accessible
-const INTERACTIVE_ELEMENTS: &[&str] = &["button", "a", "input", "select", "textarea"];
 
 /// Accessibility audit result
 #[derive(Debug, Clone)]
@@ -335,10 +327,8 @@ fn check_aria_usage(html: &str, audit: &mut AccessibilityAudit) {
     }
 
     // Check for aria-label on icon-only buttons
-    if html.contains("class=\"btn-icon\"") {
-        if html.contains("aria-label=") {
-            audit.add_pass("button-name: Icon buttons have aria-label");
-        }
+    if html.contains("class=\"btn-icon\"") && html.contains("aria-label=") {
+        audit.add_pass("button-name: Icon buttons have aria-label");
     }
 }
 

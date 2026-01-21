@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod attachments;
 pub mod bundle;
 pub mod confirmation;
 pub mod deploy_cloudflare;
@@ -9,6 +10,7 @@ pub mod errors;
 pub mod export;
 pub mod fts;
 pub mod key_management;
+pub mod password;
 pub mod patterns;
 pub mod profiles;
 pub mod qr;

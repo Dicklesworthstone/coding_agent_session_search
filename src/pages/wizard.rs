@@ -11,9 +11,9 @@ use std::time::Duration;
 use crate::pages::bundle::{BundleBuilder, BundleConfig};
 use crate::pages::confirmation::{
     ConfirmationConfig, ConfirmationFlow, ConfirmationStep, PasswordStrengthAction, StepValidation,
-    estimate_password_entropy, password_strength_label, validate_unencrypted_ack,
-    unencrypted_warning_lines, UNENCRYPTED_ACK_PHRASE,
+    validate_unencrypted_ack, unencrypted_warning_lines, UNENCRYPTED_ACK_PHRASE,
 };
+use crate::pages::password::{validate_password, format_strength_inline, PasswordStrength};
 use crate::pages::docs::{DocConfig, DocumentationGenerator};
 use crate::pages::encrypt::EncryptionEngine;
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
@@ -87,6 +87,9 @@ pub struct WizardState {
     // Unencrypted export mode (DANGEROUS)
     pub no_encryption: bool,
     pub unencrypted_confirmed: bool,
+
+    // Attachment support
+    pub include_attachments: bool,
 }
 
 impl Default for WizardState {
@@ -119,6 +122,7 @@ impl Default for WizardState {
             password_entropy_bits: 0.0,
             no_encryption: false,
             unencrypted_confirmed: false,
+            include_attachments: false,
         }
     }
 }
@@ -146,6 +150,11 @@ impl PagesWizard {
     pub fn set_no_encryption(&mut self, no_encryption: bool) {
         self.no_encryption_mode = no_encryption;
         self.state.no_encryption = no_encryption;
+    }
+
+    /// Set whether to include attachments in the export.
+    pub fn set_include_attachments(&mut self, include: bool) {
+        self.state.include_attachments = include;
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -472,27 +481,34 @@ impl PagesWizard {
             })
             .interact()?;
 
-        self.state.password = Some(password);
+        self.state.password = Some(password.clone());
         writeln!(term, "  {} Password set", style("✓").green())?;
 
-        // Calculate and save password entropy for confirmation flow
-        self.state.password_entropy_bits =
-            estimate_password_entropy(self.state.password.as_ref().unwrap());
+        // Validate password using new password strength module
+        let validation = validate_password(&password);
 
-        // Show password strength indicator using entropy-based assessment
-        let entropy_label = password_strength_label(self.state.password_entropy_bits);
-        let strength_color = match entropy_label {
-            "Very Strong" => style(entropy_label).green().bold(),
-            "Strong" => style(entropy_label).green(),
-            "Fair" => style(entropy_label).yellow(),
-            "Weak" => style(entropy_label).red(),
-            _ => style(entropy_label).red().bold(),
-        };
+        // Calculate and save password entropy for confirmation flow
+        self.state.password_entropy_bits = validation.entropy_bits;
+
+        // Show password strength indicator with visual bar
         writeln!(
             term,
-            "    Password strength: {} ({:.0} bits)",
-            strength_color, self.state.password_entropy_bits
+            "    Password strength: {}",
+            format_strength_inline(&validation)
         )?;
+        writeln!(
+            term,
+            "    Entropy: {:.0} bits",
+            validation.entropy_bits
+        )?;
+
+        // Show improvement suggestions if not strong
+        if validation.strength != PasswordStrength::Strong && !validation.suggestions.is_empty() {
+            writeln!(term, "    {}", style("Suggestions:").dim())?;
+            for suggestion in &validation.suggestions {
+                writeln!(term, "      {} {}", style("•").dim(), style(suggestion).dim())?;
+            }
+        }
 
         // Recovery secret
         self.state.generate_recovery = Confirm::with_theme(theme)

@@ -12,6 +12,14 @@ use rusqlite::Connection;
 use serde_json::json;
 use tempfile::TempDir;
 
+const _: () = {
+    assert!(CURRENT_SCHEMA_VERSION > 0, "Schema version should be positive");
+    assert!(
+        CURRENT_SCHEMA_VERSION < 100,
+        "Schema version should be reasonable"
+    );
+};
+
 // =============================================================================
 // Schema Version Tests
 // =============================================================================
@@ -19,12 +27,7 @@ use tempfile::TempDir;
 /// Test that schema version constant is accessible and reasonable.
 #[test]
 fn test_schema_version_exists() {
-    // Schema version should be positive and reasonable
-    assert!(CURRENT_SCHEMA_VERSION > 0, "Schema version should be positive");
-    assert!(
-        CURRENT_SCHEMA_VERSION < 100,
-        "Schema version should be reasonable"
-    );
+    let _ = CURRENT_SCHEMA_VERSION;
 }
 
 /// Test creating database and verifying schema version.
@@ -84,15 +87,11 @@ fn test_detects_older_schema() {
         }
         Err(e) => {
             // Migration error is acceptable for very old schemas
-            match e {
-                MigrationError::RebuildRequired { reason, .. } => {
-                    assert!(
-                        !reason.is_empty(),
-                        "Rebuild reason should not be empty"
-                    );
-                }
-                // Other errors (Database, Io, Other) are also acceptable for incomplete schemas
-                _ => {}
+            if let MigrationError::RebuildRequired { reason, .. } = e {
+                assert!(
+                    !reason.is_empty(),
+                    "Rebuild reason should not be empty"
+                );
             }
         }
     }
@@ -353,8 +352,7 @@ fn test_parse_config_with_unknown_fields() {
     // which ignores unknown fields for forward compatibility.
     let config: Result<EncryptionConfig, _> = serde_json::from_value(future_config);
     // This might fail depending on serde config - that's okay, we're testing the behavior
-    if config.is_ok() {
-        let config = config.unwrap();
+    if let Ok(config) = config {
         assert_eq!(config.version, 2);
     }
 }
