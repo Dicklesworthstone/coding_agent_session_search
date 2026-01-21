@@ -142,3 +142,19 @@ harness = false
 [[bench]]
 name = "search_perf"
 harness = false
+
+[[bench]]
+name = "crypto_perf"
+harness = false
+
+[[bench]]
+name = "db_perf"
+harness = false
+
+[[bench]]
+name = "export_perf"
+harness = false
+
+[[bench]]
+name = "cache_micro"
+harness = false
