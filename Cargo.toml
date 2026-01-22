@@ -83,6 +83,7 @@ rand = "0.8"  # Pin to 0.8.x for rand_core 0.6.x compatibility with argon2/aes-g
 # QR code generation (optional, for recovery secret QR codes)
 qrcode = { version = "*", optional = true }
 image = { version = "*", optional = true, default-features = false, features = ["png"] }
+tempfile = "*"
 
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
