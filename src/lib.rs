@@ -124,6 +124,14 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         watch_once: Option<Vec<PathBuf>>,
 
+        /// Build semantic vector index after text indexing
+        #[arg(long, default_value_t = false)]
+        semantic: bool,
+
+        /// Embedder to use for semantic indexing (hash, fastembed)
+        #[arg(long, default_value = "fastembed")]
+        embedder: String,
+
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -1969,6 +1977,8 @@ async fn execute_cli(
                     watch,
                     watch_once,
                     data_dir,
+                    semantic,
+                    embedder,
                     json,
                     idempotency_key,
                 } => {
@@ -1979,6 +1989,8 @@ async fn execute_cli(
                         watch,
                         watch_once,
                         data_dir,
+                        semantic,
+                        embedder,
                         progress,
                         json,
                         idempotency_key,
@@ -6193,6 +6205,8 @@ fn run_doctor(
                     watch_once_paths: None,
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
+                    semantic: false,
+                    embedder: "fastembed".to_string(),
                     progress: Some(progress.clone()),
                 };
 
@@ -7139,7 +7153,8 @@ fn run_config_based_export(
         #[cfg(feature = "qr")]
         if wizard_state.generate_qr {
             let qr_path = output_dir.join("password-qr.png");
-            crate::pages::qr::generate_qr_png(password, &qr_path)?;
+            let qr_bytes = crate::pages::qr::generate_qr_png(password)?;
+            std::fs::write(&qr_path, qr_bytes)?;
         }
     } else {
         // No encryption - just copy the database
@@ -7983,6 +7998,8 @@ fn spawn_background_indexer(
             watch_once_paths: read_watch_once_paths_env(),
             db_path,
             data_dir,
+            semantic: false,
+            embedder: "fastembed".to_string(),
             progress,
         };
         // Pass the receiver to run_index so it can listen for commands
@@ -8009,6 +8026,8 @@ fn run_index_with_data(
     watch: bool,
     watch_once: Option<Vec<PathBuf>>,
     data_dir_override: Option<PathBuf>,
+    semantic: bool,
+    embedder: String,
     progress: ProgressResolved,
     json: bool,
     idempotency_key: Option<String>,
@@ -8026,6 +8045,8 @@ fn run_index_with_data(
         full.hash(&mut hasher);
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
+        semantic.hash(&mut hasher);
+        embedder.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
         hasher.finish()
     };
@@ -8113,6 +8134,8 @@ fn run_index_with_data(
         watch_once_paths: watch_once_paths.clone(),
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
+        semantic,
+        embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
     };
 
@@ -10768,6 +10791,8 @@ fn run_sources_sync(
             false,          // watch
             None,           // watch_once
             Some(data_dir), // data_dir
+            false,          // semantic
+            "fastembed".to_string(),
             progress,
             json_output,
             None, // idempotency_key

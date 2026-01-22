@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+use clap::Parser;
+use coding_agent_search::{Cli, Commands};
 use predicates::str::contains;
 use std::fs;
 use tempfile::TempDir;
@@ -24,7 +26,43 @@ fn index_help_prints_usage() {
         .success()
         .stdout(contains("Run indexer"))
         .stdout(contains("--full"))
-        .stdout(contains("--watch"));
+        .stdout(contains("--watch"))
+        .stdout(contains("--semantic"))
+        .stdout(contains("--embedder"));
+}
+
+#[test]
+fn index_parses_semantic_flags() {
+    let cli = Cli::try_parse_from([
+        "cass",
+        "index",
+        "--semantic",
+        "--embedder",
+        "fastembed",
+    ])
+    .expect("parse index flags");
+
+    match cli.command {
+        Some(Commands::Index {
+            semantic, embedder, ..
+        }) => {
+            assert!(semantic, "semantic flag should be true");
+            assert_eq!(embedder, "fastembed");
+        }
+        other => panic!("expected index command, got {other:?}"),
+    }
+}
+
+#[test]
+fn index_default_embedder_is_fastembed() {
+    let cli = Cli::try_parse_from(["cass", "index", "--semantic"]).expect("parse index flags");
+
+    match cli.command {
+        Some(Commands::Index { embedder, .. }) => {
+            assert_eq!(embedder, "fastembed");
+        }
+        other => panic!("expected index command, got {other:?}"),
+    }
 }
 
 #[test]

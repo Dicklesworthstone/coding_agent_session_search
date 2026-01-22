@@ -58,6 +58,10 @@ pub struct IndexOptions {
     pub watch_once_paths: Option<Vec<PathBuf>>,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
+    /// Build semantic vector index after text indexing.
+    pub semantic: bool,
+    /// Embedder ID to use for semantic indexing (hash, fastembed).
+    pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
 }
 
@@ -1994,6 +1998,8 @@ mod tests {
             force_rebuild: false,
             db_path: data_dir.join("agent_search.db"),
             data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
             progress: None,
             watch_once_paths: None,
         };
@@ -2106,6 +2112,8 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
             watch_once_paths: None,
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
         };
 

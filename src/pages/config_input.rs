@@ -679,12 +679,14 @@ mod tests {
 
     #[test]
     fn test_env_var_resolution() {
-        std::env::set_var("TEST_PASSWORD_VAR", "secret123");
+        // SAFETY: This test runs in isolation and the env var is cleaned up after use
+        unsafe { std::env::set_var("TEST_PASSWORD_VAR", "secret123") };
         let mut config = PagesConfig::default();
         config.encryption.password = Some("env:TEST_PASSWORD_VAR".to_string());
         config.resolve_env_vars().unwrap();
         assert_eq!(config.encryption.password, Some("secret123".to_string()));
-        std::env::remove_var("TEST_PASSWORD_VAR");
+        // SAFETY: Cleanup of test env var
+        unsafe { std::env::remove_var("TEST_PASSWORD_VAR") };
     }
 
     #[test]

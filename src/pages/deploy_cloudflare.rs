@@ -170,6 +170,8 @@ impl CloudflareDeployer {
             wrangler_version,
             wrangler_authenticated,
             account_email,
+            api_credentials_present: false,
+            account_id: None,
             disk_space_mb,
         })
     }
@@ -553,6 +555,8 @@ mod tests {
             wrangler_version: Some("wrangler 3.0.0".to_string()),
             wrangler_authenticated: true,
             account_email: Some("test@example.com".to_string()),
+            api_credentials_present: false,
+            account_id: None,
             disk_space_mb: 1000,
         };
 
@@ -566,6 +570,8 @@ mod tests {
             wrangler_version: None,
             wrangler_authenticated: false,
             account_email: None,
+            api_credentials_present: false,
+            account_id: None,
             disk_space_mb: 1000,
         };
 
