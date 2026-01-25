@@ -147,10 +147,7 @@ mod tests {
                 return Err(RerankerError::Unavailable("mock unavailable".to_string()));
             }
             // Mock scoring: longer documents score higher
-            Ok(documents
-                .iter()
-                .map(|d| d.len() as f32 / 100.0)
-                .collect())
+            Ok(documents.iter().map(|d| d.len() as f32 / 100.0).collect())
         }
 
         fn id(&self) -> &str {
@@ -166,7 +163,11 @@ mod tests {
     fn test_reranker_trait_basic() {
         let reranker = MockReranker { available: true };
 
-        let docs = ["short", "medium length doc", "this is a much longer document"];
+        let docs = [
+            "short",
+            "medium length doc",
+            "this is a much longer document",
+        ];
         let scores = reranker.rerank("test query", &docs).unwrap();
 
         assert_eq!(scores.len(), 3);
@@ -190,7 +191,10 @@ mod tests {
 
         let result = reranker.rerank("", &["doc"]);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), RerankerError::InvalidInput(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            RerankerError::InvalidInput(_)
+        ));
     }
 
     #[test]

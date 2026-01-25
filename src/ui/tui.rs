@@ -2606,7 +2606,11 @@ pub fn run_tui(
     let known_workspaces: Vec<String> = db_reader
         .as_ref()
         .and_then(|db| db.list_workspaces().ok())
-        .map(|wss| wss.into_iter().map(|w| w.path.to_string_lossy().to_string()).collect())
+        .map(|wss| {
+            wss.into_iter()
+                .map(|w| w.path.to_string_lossy().to_string())
+                .collect()
+        })
         .unwrap_or_default();
 
     let index_ready = search_client.is_some();
@@ -5033,8 +5037,7 @@ pub fn run_tui(
                                 toast_manager.push(Toast::info("Using hash fallback"));
                             } else {
                                 search_mode = SearchMode::Lexical;
-                                let reason =
-                                    semantic_unavailable_message(&semantic_availability);
+                                let reason = semantic_unavailable_message(&semantic_availability);
                                 status = format!(
                                     "Hash fallback unavailable: {reason}. Staying in lexical."
                                 );
@@ -5043,8 +5046,8 @@ pub fn run_tui(
                         } else {
                             semantic_availability = SemanticAvailability::NotInstalled;
                             search_mode = SearchMode::Lexical;
-                            status = "Search client unavailable; staying in lexical mode."
-                                .to_string();
+                            status =
+                                "Search client unavailable; staying in lexical mode.".to_string();
                             toast_manager.push(Toast::warning(
                                 "Search client unavailable; cannot enable hash fallback",
                             ));
@@ -6875,7 +6878,8 @@ pub fn run_tui(
                     }
                     KeyCode::Tab => {
                         // Tab completes to first matching workspace suggestion
-                        let ws_suggestions = workspace_suggestions(&input_buffer, &known_workspaces);
+                        let ws_suggestions =
+                            workspace_suggestions(&input_buffer, &known_workspaces);
                         if let Some(first) = ws_suggestions.first() {
                             input_buffer = first.clone();
                             status = format!("Completed to '{}'. Press Enter to apply.", first);
@@ -8228,11 +8232,7 @@ mod tests {
 
     #[test]
     fn workspace_suggestions_empty_returns_all() {
-        let known = vec![
-            "/a".to_string(),
-            "/b".to_string(),
-            "/c".to_string(),
-        ];
+        let known = vec!["/a".to_string(), "/b".to_string(), "/c".to_string()];
         let suggestions = workspace_suggestions("", &known);
         assert_eq!(suggestions.len(), 3);
     }

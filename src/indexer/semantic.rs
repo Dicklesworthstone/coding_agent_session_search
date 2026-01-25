@@ -8,7 +8,9 @@ use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::vector_index::{Quantization, ROLE_USER, VectorEntry, VectorIndex, vector_index_path};
+use crate::search::vector_index::{
+    Quantization, ROLE_USER, VectorEntry, VectorIndex, vector_index_path,
+};
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingInput {

@@ -75,6 +75,20 @@ E2E tests often require `--test-threads=1`:
 cargo test --test e2e_index_tui -- --test-threads=1
 ```
 
+### Browser E2E (Playwright)
+
+Playwright-based tests validate web viewer and HTML export flows.
+
+Install dependencies (one-time):
+```bash
+npx playwright install --with-deps
+```
+
+Run HTML export WebCrypto decryption tests:
+```bash
+npx playwright test tests/html_export/html_export_encryption.test.js
+```
+
 ### CLI/Robot Tests
 
 Test robot mode and CLI contracts:

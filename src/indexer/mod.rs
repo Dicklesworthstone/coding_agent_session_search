@@ -1336,8 +1336,7 @@ pub fn build_scan_roots(storage: &SqliteStorage, data_dir: &Path) -> Vec<ScanRoo
 
                     // Try the direct path first
                     if mirror_path.exists() {
-                        let mut scan_root =
-                            ScanRoot::remote(mirror_path, origin.clone(), platform);
+                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
                         scan_root.workspace_rewrites = workspace_rewrites.clone();
                         roots.push(scan_root);
                         continue;

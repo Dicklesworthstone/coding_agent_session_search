@@ -106,8 +106,9 @@ impl FastEmbedReranker {
         let model = UserDefinedRerankingModel::new(model_file, tokenizer_files);
         let init_options = RerankInitOptionsUserDefined::default();
 
-        let model = TextRerank::try_new_from_user_defined(model, init_options)
-            .map_err(|e| RerankerError::RerankFailed(format!("fastembed reranker init failed: {e}")))?;
+        let model = TextRerank::try_new_from_user_defined(model, init_options).map_err(|e| {
+            RerankerError::RerankFailed(format!("fastembed reranker init failed: {e}"))
+        })?;
 
         Ok(Self {
             model: Mutex::new(model),
@@ -123,10 +124,7 @@ impl FastEmbedReranker {
 
     fn read_required(path: PathBuf, label: &str) -> RerankerResult<Vec<u8>> {
         fs::read(&path).map_err(|e| {
-            RerankerError::Unavailable(format!(
-                "unable to read {label} at {}: {e}",
-                path.display()
-            ))
+            RerankerError::Unavailable(format!("unable to read {label} at {}: {e}", path.display()))
         })
     }
 }
@@ -137,7 +135,9 @@ impl Reranker for FastEmbedReranker {
             return Err(RerankerError::InvalidInput("empty query".to_string()));
         }
         if documents.is_empty() {
-            return Err(RerankerError::InvalidInput("empty documents list".to_string()));
+            return Err(RerankerError::InvalidInput(
+                "empty documents list".to_string(),
+            ));
         }
         for (i, doc) in documents.iter().enumerate() {
             if doc.is_empty() {

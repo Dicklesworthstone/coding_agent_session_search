@@ -11,7 +11,7 @@
 //! | Name | ID | Dimension | Type | Notes |
 //! |------|-----|-----------|------|-------|
 //! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
-//! | hash | fnv1a-384 | 256 | Hash | Always available fallback |
+//! | hash | fnv1a-384 | 384 | Hash | Always available fallback |
 //!
 //! # Example
 //!
@@ -184,8 +184,7 @@ impl EmbedderRegistry {
             }
         }
         // Fall back to hash
-        self.get(HASH_EMBEDDER)
-            .expect("hash embedder must exist")
+        self.get(HASH_EMBEDDER).expect("hash embedder must exist")
     }
 
     /// Validate that an embedder is ready to use.
@@ -269,7 +268,7 @@ pub fn get_embedder_info(data_dir: &Path, name: Option<&str>) -> Option<Embedder
 
     let embedder_info = match name {
         Some(n) => registry.get(n)?,
-        None => Some(registry.best_available())?,
+        None => registry.best_available(),
     };
 
     Some(EmbedderInfo {

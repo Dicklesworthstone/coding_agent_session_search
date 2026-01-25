@@ -2670,7 +2670,10 @@ async fn execute_cli(
                             code: 70,
                             kind: "runtime",
                             message: format!("models command panicked: {err}"),
-                            hint: Some("Retry the command; if it persists, report the panic output.".into()),
+                            hint: Some(
+                                "Retry the command; if it persists, report the panic output."
+                                    .into(),
+                            ),
                             retryable: true,
                         })?;
                     result?;
@@ -3682,16 +3685,16 @@ fn run_cli_search(
         let requested_model = semantic_opts.model.as_deref();
 
         // Validate requested model if specified
-        if let Some(model_name) = requested_model {
-            if let Err(e) = registry.validate(model_name) {
-                return Err(CliError {
-                    code: 15,
-                    kind: "embedder-unavailable",
-                    message: format!("Embedder validation failed: {e}"),
-                    hint: Some("Run 'cass models list' to see available embedders".to_string()),
-                    retryable: false,
-                });
-            }
+        if let Some(model_name) = requested_model
+            && let Err(e) = registry.validate(model_name)
+        {
+            return Err(CliError {
+                code: 15,
+                kind: "embedder-unavailable",
+                message: format!("Embedder validation failed: {e}"),
+                hint: Some("Run 'cass models list' to see available embedders".to_string()),
+                retryable: false,
+            });
         }
 
         // Determine which embedder to use
@@ -4019,7 +4022,7 @@ fn run_cli_search(
                             let mut scored_hits: Vec<_> = result
                                 .hits
                                 .into_iter()
-                                .zip(scores.into_iter())
+                                .zip(scores)
                                 .map(|(mut hit, score)| {
                                     hit.score = score;
                                     hit
