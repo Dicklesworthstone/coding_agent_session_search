@@ -104,7 +104,7 @@ impl FastEmbedReranker {
         };
 
         let model = UserDefinedRerankingModel::new(model_file, tokenizer_files);
-        let init_options = RerankInitOptionsUserDefined::new();
+        let init_options = RerankInitOptionsUserDefined::default();
 
         let model = TextRerank::try_new_from_user_defined(model, init_options)
             .map_err(|e| RerankerError::RerankFailed(format!("fastembed reranker init failed: {e}")))?;
@@ -147,7 +147,7 @@ impl Reranker for FastEmbedReranker {
             }
         }
 
-        let model = self
+        let mut model = self
             .model
             .lock()
             .map_err(|_| RerankerError::Internal("fastembed reranker lock poisoned".to_string()))?;
