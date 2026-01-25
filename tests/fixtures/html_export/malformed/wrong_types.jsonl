@@ -1,0 +1,7 @@
+{"sessionId":12345,"workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":"sessionId is number instead of string"},"uuid":"msg-001","timestamp":"2026-01-15T10:00:00.000Z"}
+{"sessionId":"wrong-001","workspace":true,"agent":"claude_code","type":"user","message":{"role":"user","content":"workspace is boolean instead of string"},"uuid":"msg-002","timestamp":"2026-01-15T10:00:15.000Z"}
+{"sessionId":"wrong-001","workspace":"/home/dev/project","agent":["claude","code"],"type":"user","message":{"role":"user","content":"agent is array instead of string"},"uuid":"msg-003","timestamp":"2026-01-15T10:00:30.000Z"}
+{"sessionId":"wrong-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":"string instead of object","uuid":"msg-004","timestamp":"2026-01-15T10:00:45.000Z"}
+{"sessionId":"wrong-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":12345},"uuid":"msg-005","timestamp":"2026-01-15T10:01:00.000Z"}
+{"sessionId":"wrong-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":"timestamp is number"},"uuid":"msg-006","timestamp":1705315200}
+{"sessionId":"wrong-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":null},"uuid":"msg-007","timestamp":"2026-01-15T10:01:30.000Z"}

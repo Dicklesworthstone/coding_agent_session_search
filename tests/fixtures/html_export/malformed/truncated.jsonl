@@ -1,0 +1,3 @@
+{"sessionId":"truncated-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":"This is a complete message"},"uuid":"msg-001","timestamp":"2026-01-15T10:00:00.000Z"}
+{"sessionId":"truncated-001","workspace":"/home/dev/project","agent":"claude_code","type":"assistant","message":{"role":"assistant","content":"This message is complete too"},"uuid":"msg-002","timestamp":"2026-01-15T10:00:15.000Z"}
+{"sessionId":"truncated-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":"This message will be truncat

@@ -39,10 +39,14 @@ mod template;
 
 // Re-export public API
 pub use encryption::{EncryptedContent, EncryptionError, EncryptionParams, encrypt_content};
-pub use filename::{FilenameMetadata, FilenameOptions, generate_filename, normalize_topic};
+pub use filename::{
+    FilenameMetadata, FilenameOptions, agent_slug, datetime_slug, extract_topic, generate_filename,
+    generate_filepath, generate_full_filename, get_downloads_dir, is_valid_filename,
+    normalize_topic, unique_filename, workspace_slug,
+};
 pub use renderer::{
-    Message, RenderError, RenderOptions, ToolCall, ToolStatus,
-    agent_css_class, agent_display_name, render_conversation, render_message,
+    Message, RenderError, RenderOptions, ToolCall, ToolStatus, agent_css_class, agent_display_name,
+    render_conversation, render_message,
 };
 pub use scripts::{ScriptBundle, generate_scripts};
 pub use styles::{StyleBundle, generate_styles};

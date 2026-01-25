@@ -35,8 +35,10 @@ pub struct EncryptedContent {
     pub salt: String,
     /// Base64-encoded IV/nonce (12 bytes for AES-GCM)
     pub iv: String,
-    /// Base64-encoded ciphertext
+    /// Base64-encoded ciphertext (includes GCM tag)
     pub ciphertext: String,
+    /// PBKDF2 iteration count used for key derivation
+    pub iterations: u32,
 }
 
 impl EncryptedContent {
@@ -46,10 +48,11 @@ impl EncryptedContent {
     /// JSON escaping is applied defensively in case of unexpected input.
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"salt":"{}","iv":"{}","ciphertext":"{}"}}"#,
+            r#"{{"salt":"{}","iv":"{}","ciphertext":"{}","iterations":{}}}"#,
             json_escape_string(&self.salt),
             json_escape_string(&self.iv),
-            json_escape_string(&self.ciphertext)
+            json_escape_string(&self.ciphertext),
+            self.iterations
         )
     }
 }
@@ -78,7 +81,7 @@ fn json_escape_string(s: &str) -> String {
 /// Encryption parameters matching Web Crypto API defaults.
 #[derive(Debug, Clone)]
 pub struct EncryptionParams {
-    /// PBKDF2 iterations (100,000 recommended)
+    /// PBKDF2 iterations (600,000 recommended)
     pub iterations: u32,
     /// Salt length in bytes
     pub salt_len: usize,
@@ -89,7 +92,7 @@ pub struct EncryptionParams {
 impl Default for EncryptionParams {
     fn default() -> Self {
         Self {
-            iterations: 100_000,
+            iterations: 600_000,
             salt_len: 16,
             iv_len: 12,
         }
@@ -111,12 +114,31 @@ pub fn encrypt_content(
     params: &EncryptionParams,
 ) -> Result<EncryptedContent, EncryptionError> {
     use aes_gcm::{
-        aead::{Aead, KeyInit, OsRng},
         Aes256Gcm, Nonce,
+        aead::{Aead, KeyInit, OsRng},
     };
     use pbkdf2::pbkdf2_hmac;
     use rand::RngCore;
     use sha2::Sha256;
+
+    if password.is_empty() {
+        return Err(EncryptionError::InvalidPassword);
+    }
+    if params.iterations == 0 {
+        return Err(EncryptionError::KeyDerivation(
+            "iterations must be greater than zero".to_string(),
+        ));
+    }
+    if params.salt_len == 0 {
+        return Err(EncryptionError::KeyDerivation(
+            "salt length must be greater than zero".to_string(),
+        ));
+    }
+    if params.iv_len != 12 {
+        return Err(EncryptionError::KeyDerivation(
+            "iv length must be 12 bytes for AES-GCM".to_string(),
+        ));
+    }
 
     // Generate random salt and IV
     let mut salt = vec![0u8; params.salt_len];
@@ -141,6 +163,7 @@ pub fn encrypt_content(
         salt: base64_encode(&salt),
         iv: base64_encode(&iv),
         ciphertext: base64_encode(&ciphertext),
+        iterations: params.iterations,
     })
 }
 
@@ -157,10 +180,11 @@ pub fn encrypt_content(
 }
 
 /// Base64 encode bytes (standard alphabet).
+#[cfg(feature = "encryption")]
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut result = Vec::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = Vec::with_capacity(data.len().div_ceil(3) * 4);
 
     for chunk in data.chunks(3) {
         let mut buf = [0u8; 3];
@@ -224,6 +248,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn test_base64_encode() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
@@ -240,12 +265,14 @@ mod tests {
             salt: "abc123".to_string(),
             iv: "xyz789".to_string(),
             ciphertext: "encrypted_data".to_string(),
+            iterations: 123_456,
         };
 
         let json = content.to_json();
         assert!(json.contains("\"salt\":\"abc123\""));
         assert!(json.contains("\"iv\":\"xyz789\""));
         assert!(json.contains("\"ciphertext\":\"encrypted_data\""));
+        assert!(json.contains("\"iterations\":123456"));
     }
 
     #[test]
@@ -269,9 +296,88 @@ mod tests {
     #[test]
     fn test_encryption_params_default() {
         let params = EncryptionParams::default();
-        assert_eq!(params.iterations, 100_000);
+        assert_eq!(params.iterations, 600_000);
         assert_eq!(params.salt_len, 16);
         assert_eq!(params.iv_len, 12);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypt_content_roundtrip() {
+        use aes_gcm::{
+            Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit},
+        };
+        use base64::Engine; // Required for decode() method
+        use base64::prelude::BASE64_STANDARD;
+        use pbkdf2::pbkdf2_hmac;
+        use sha2::Sha256;
+
+        let params = EncryptionParams {
+            iterations: 1_000,
+            salt_len: 16,
+            iv_len: 12,
+        };
+        let plaintext = "Hello 🌍";
+        let password = "p@ssw0rd";
+
+        let encrypted = encrypt_content(plaintext, password, &params).expect("encrypt");
+        assert_eq!(encrypted.iterations, params.iterations);
+
+        let salt = BASE64_STANDARD
+            .decode(encrypted.salt.as_bytes())
+            .expect("salt b64");
+        let iv = BASE64_STANDARD
+            .decode(encrypted.iv.as_bytes())
+            .expect("iv b64");
+        let ciphertext = BASE64_STANDARD
+            .decode(encrypted.ciphertext.as_bytes())
+            .expect("ciphertext b64");
+
+        let mut key = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut key);
+
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
+        let nonce = Nonce::from_slice(&iv);
+        let decrypted = cipher.decrypt(nonce, ciphertext.as_ref()).expect("decrypt");
+
+        assert_eq!(plaintext, String::from_utf8(decrypted).expect("utf8"));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypt_rejects_empty_password() {
+        let params = EncryptionParams {
+            iterations: 1_000,
+            salt_len: 16,
+            iv_len: 12,
+        };
+        let result = encrypt_content("hello", "", &params);
+        assert!(matches!(result, Err(EncryptionError::InvalidPassword)));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_encrypt_rejects_invalid_params() {
+        let mut params = EncryptionParams {
+            iterations: 1_000,
+            salt_len: 16,
+            iv_len: 12,
+        };
+
+        params.iterations = 0;
+        let result = encrypt_content("hello", "pw", &params);
+        assert!(matches!(result, Err(EncryptionError::KeyDerivation(_))));
+
+        params.iterations = 1_000;
+        params.salt_len = 0;
+        let result = encrypt_content("hello", "pw", &params);
+        assert!(matches!(result, Err(EncryptionError::KeyDerivation(_))));
+
+        params.salt_len = 16;
+        params.iv_len = 8;
+        let result = encrypt_content("hello", "pw", &params);
+        assert!(matches!(result, Err(EncryptionError::KeyDerivation(_))));
     }
 
     #[test]

@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use super::{encryption, filename, renderer, scripts, styles};
+
 /// Errors that can occur during template generation.
 #[derive(Debug)]
 pub enum TemplateError {
@@ -27,7 +29,9 @@ impl fmt::Display for TemplateError {
         match self {
             TemplateError::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
             TemplateError::RenderFailed(msg) => write!(f, "render failed: {}", msg),
-            TemplateError::EncryptionRequired => write!(f, "encryption required but no key provided"),
+            TemplateError::EncryptionRequired => {
+                write!(f, "encryption required but no key provided")
+            }
         }
     }
 }
@@ -67,6 +71,134 @@ pub struct ExportOptions {
     /// Include tool call details (collapsed by default)
     pub show_tool_calls: bool,
 }
+
+const SCREEN_ONLY_CSS: &str = r#"
+.print-only {
+    display: none !important;
+}
+"#;
+
+const CDN_FALLBACK_CSS: &str = r#"
+/* CDN fallback hooks */
+.no-tailwind .toolbar,
+.no-tailwind .header,
+.no-tailwind .conversation {
+    backdrop-filter: none !important;
+}
+
+.no-prism pre code[class*="language-"] {
+    color: #c0caf5;
+}
+
+.no-prism pre code[class*="language-"] .token {
+    color: inherit;
+}
+"#;
+
+const TAILWIND_CDN_URL: &str =
+    "https://cdn.jsdelivr.net/npm/tailwindcss@3.4.1/dist/tailwind.min.css";
+const TAILWIND_CDN_SRI: &str =
+    "sha384-wAkE1abywdsF0VP/+RDLxHADng231vt6gsqcjBzQFUoAQNkuN63+cJ4XDiE7LVjx";
+const PRISM_THEME_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css";
+const PRISM_THEME_SRI: &str =
+    "sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A";
+const PRISM_CORE_URL: &str = "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js";
+const PRISM_CORE_SRI: &str =
+    "sha384-ZM8fDxYm+GXOWeJcxDetoRImNnEAS7XwVFH5kv0pT6RXNy92Nemw/Sj7NfciXpqg";
+const PRISM_RUST_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-rust.min.js";
+const PRISM_RUST_SRI: &str =
+    "sha384-JyDgFjMbyrE/TGiEUSXW3CLjQOySrsoiUNAlXTFdIsr/XUfaB7E+eYlR+tGQ9bCO";
+const PRISM_PYTHON_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-python.min.js";
+const PRISM_PYTHON_SRI: &str =
+    "sha384-WJdEkJKrbsqw0evQ4GB6mlsKe5cGTxBOw4KAEIa52ZLB7DDpliGkwdme/HMa5n1m";
+const PRISM_JS_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-javascript.min.js";
+const PRISM_JS_SRI: &str =
+    "sha384-D44bgYYKvaiDh4cOGlj1dbSDpSctn2FSUj118HZGmZEShZcO2v//Q5vvhNy206pp";
+const PRISM_TS_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-typescript.min.js";
+const PRISM_TS_SRI: &str =
+    "sha384-PeOqKNW/piETaCg8rqKFy+Pm6KEk7e36/5YZE5XO/OaFdO+/Aw3O8qZ9qDPKVUgx";
+const PRISM_BASH_URL: &str =
+    "https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js";
+const PRISM_BASH_SRI: &str =
+    "sha384-9WmlN8ABpoFSSHvBGGjhvB3E/D8UkNB9HpLJjBQFC2VSQsM1odiQDv4NbEo+7l15";
+
+const PRINT_EXTRA_CSS: &str = r#"
+.print-only {
+    display: block !important;
+}
+
+.print-footer {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.2in 0.6in 0.1in;
+    border-top: 1px solid #ccc;
+    font-size: 9pt;
+    color: #666;
+    background: #fff;
+}
+
+.print-footer-title {
+    font-weight: 600;
+    color: #1a1b26;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.print-footer-page {
+    flex: 0 0 auto;
+}
+
+.print-footer-page::after {
+    content: "Page " counter(page) " of " counter(pages);
+}
+
+body {
+    padding-bottom: 0.7in;
+}
+
+/* Ensure printed layout is clean and unclipped */
+* {
+    box-shadow: none !important;
+    text-shadow: none !important;
+}
+
+.conversation,
+.message-content,
+.tool-call-body,
+pre,
+code {
+    overflow: visible !important;
+    max-height: none !important;
+}
+
+img,
+svg,
+video,
+canvas {
+    max-width: 100% !important;
+    height: auto !important;
+}
+
+/* Avoid sticky/fixed UI elements in print, except footer */
+.toolbar,
+.theme-toggle {
+    position: static !important;
+}
+"#;
 
 impl Default for ExportOptions {
     fn default() -> Self {
@@ -133,26 +265,85 @@ pub struct TemplateMetadata {
 impl HtmlTemplate {
     /// Generate the complete HTML document.
     pub fn render(&self, options: &ExportOptions) -> String {
+        let critical_css = format!(
+            "{}\n{}\n{}",
+            self.critical_css, SCREEN_ONLY_CSS, CDN_FALLBACK_CSS
+        );
         let cdn_scripts = if options.include_cdn {
-            r#"
-    <!-- CDN enhancement (Tailwind) - degrades gracefully if offline -->
-    <script src="https://cdn.tailwindcss.com" defer></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism-tomorrow.min.css" crossorigin="anonymous">
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/prism.min.js" defer crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-rust.min.js" defer crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-python.min.js" defer crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-javascript.min.js" defer crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-typescript.min.js" defer crossorigin="anonymous"></script>
-    <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-bash.min.js" defer crossorigin="anonymous"></script>"#
+            let mut tags = Vec::new();
+            tags.push(
+                r#"<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="anonymous">"#
+                    .to_string(),
+            );
+            tags.push(format!(
+                r#"<link rel="stylesheet" href="{url}" integrity="{sri}" crossorigin="anonymous" media="print" onload="this.media='all'" onerror="document.documentElement.classList.add('no-tailwind')">"#,
+                url = TAILWIND_CDN_URL,
+                sri = TAILWIND_CDN_SRI
+            ));
+
+            if options.syntax_highlighting {
+                tags.push(format!(
+                    r#"<link rel="stylesheet" href="{url}" integrity="{sri}" crossorigin="anonymous" media="print" onload="this.media='all'" onerror="document.documentElement.classList.add('no-prism')">"#,
+                    url = PRISM_THEME_URL,
+                    sri = PRISM_THEME_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_CORE_URL,
+                    sri = PRISM_CORE_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_RUST_URL,
+                    sri = PRISM_RUST_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_PYTHON_URL,
+                    sri = PRISM_PYTHON_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_JS_URL,
+                    sri = PRISM_JS_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_TS_URL,
+                    sri = PRISM_TS_SRI
+                ));
+                tags.push(format!(
+                    r#"<script src="{url}" integrity="{sri}" crossorigin="anonymous" defer onerror="document.documentElement.classList.add('no-prism')"></script>"#,
+                    url = PRISM_BASH_URL,
+                    sri = PRISM_BASH_SRI
+                ));
+            }
+
+            format!(
+                r#"
+    <!-- CDN enhancement (optional) - degrades gracefully if offline -->
+    {}"#,
+                tags.join("\n    ")
+            )
         } else {
-            ""
+            String::new()
         };
 
         let print_styles = if options.print_styles {
-            format!(r#"
+            format!(
+                r#"
     <style media="print">
 {}
-    </style>"#, self.print_css)
+{}
+    </style>"#,
+                self.print_css, PRINT_EXTRA_CSS
+            )
+        } else {
+            String::new()
+        };
+
+        let print_footer = if options.print_styles {
+            self.render_print_footer()
         } else {
             String::new()
         };
@@ -162,13 +353,19 @@ impl HtmlTemplate {
         <!-- Password modal for encrypted content -->
         <div id="password-modal" class="modal" role="dialog" aria-labelledby="modal-title" aria-modal="true">
             <div class="modal-content">
-                <h2 id="modal-title">Enter Password</h2>
-                <p>This conversation is encrypted. Enter the password to view.</p>
+                <div class="modal-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="10" rx="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                </div>
+                <h2 id="modal-title" class="modal-title">Enter Password</h2>
+                <p class="modal-text">This conversation is encrypted. Enter the password to view.</p>
                 <form id="password-form">
-                    <input type="password" id="password-input" placeholder="Password" autocomplete="current-password" required>
-                    <button type="submit">Decrypt</button>
+                    <input type="password" id="password-input" class="modal-input" placeholder="Password" autocomplete="current-password" required>
+                    <button type="submit" class="modal-btn">Decrypt</button>
                 </form>
-                <p id="decrypt-error" class="error" hidden></p>
+                <p id="decrypt-error" class="modal-error" hidden></p>
             </div>
         </div>"#
         } else {
@@ -193,6 +390,7 @@ impl HtmlTemplate {
     </style>{cdn_scripts}{print_styles}
 </head>
 <body>
+{print_footer}
     <div id="app">
 {header}
 {toolbar}
@@ -209,7 +407,7 @@ impl HtmlTemplate {
 </body>
 </html>"#,
             title = html_escape(&self.title),
-            critical_css = self.critical_css,
+            critical_css = critical_css,
             cdn_scripts = cdn_scripts,
             print_styles = print_styles,
             header = header,
@@ -217,6 +415,7 @@ impl HtmlTemplate {
             content = self.content,
             password_modal = password_modal,
             inline_js = self.inline_js,
+            print_footer = print_footer,
         )
     }
 
@@ -225,30 +424,48 @@ impl HtmlTemplate {
 
         if let Some(ts) = &self.metadata.timestamp {
             let escaped_ts = html_escape(ts);
-            meta_items.push(format!(r#"<span class="meta-item"><time datetime="{}">{}</time></span>"#, escaped_ts, escaped_ts));
+            meta_items.push(format!(
+                r#"<span class="meta-item"><time datetime="{}">{}</time></span>"#,
+                escaped_ts, escaped_ts
+            ));
         }
 
         if let Some(agent) = &self.metadata.agent {
-            meta_items.push(format!(r#"<span class="meta-item meta-agent">{}</span>"#, html_escape(agent)));
+            meta_items.push(format!(
+                r#"<span class="meta-item meta-agent">{}</span>"#,
+                html_escape(agent)
+            ));
         }
 
         if self.metadata.message_count > 0 {
-            meta_items.push(format!(r#"<span class="meta-item">{} messages</span>"#, self.metadata.message_count));
+            meta_items.push(format!(
+                r#"<span class="meta-item">{} messages</span>"#,
+                self.metadata.message_count
+            ));
         }
 
         if let Some(duration) = &self.metadata.duration {
-            meta_items.push(format!(r#"<span class="meta-item">{}</span>"#, html_escape(duration)));
+            meta_items.push(format!(
+                r#"<span class="meta-item">{}</span>"#,
+                html_escape(duration)
+            ));
         }
 
         if let Some(project) = &self.metadata.project {
-            meta_items.push(format!(r#"<span class="meta-item meta-project">{}</span>"#, html_escape(project)));
+            meta_items.push(format!(
+                r#"<span class="meta-item meta-project">{}</span>"#,
+                html_escape(project)
+            ));
         }
 
         let meta_html = if meta_items.is_empty() {
             String::new()
         } else {
-            format!(r#"
-            <div class="meta">{}</div>"#, meta_items.join("\n                "))
+            format!(
+                r#"
+            <div class="meta">{}</div>"#,
+                meta_items.join("\n                ")
+            )
         };
 
         format!(
@@ -302,6 +519,16 @@ impl HtmlTemplate {
             toolbar_items.join("\n            ")
         )
     }
+
+    fn render_print_footer(&self) -> String {
+        format!(
+            r#"    <div class="print-footer print-only" aria-hidden="true">
+        <span class="print-footer-title">{}</span>
+        <span class="print-footer-page"></span>
+    </div>"#,
+            html_escape(&self.title)
+        )
+    }
 }
 
 /// Main exporter for generating HTML from sessions.
@@ -329,11 +556,8 @@ impl HtmlExporter {
 
     /// Generate an empty template for testing.
     pub fn create_template(&self, title: &str) -> HtmlTemplate {
-        use super::scripts::generate_scripts;
-        use super::styles::generate_styles;
-
-        let styles = generate_styles(&self.options);
-        let scripts = generate_scripts(&self.options);
+        let styles = styles::generate_styles(&self.options);
+        let scripts = scripts::generate_scripts(&self.options);
 
         HtmlTemplate {
             title: title.to_string(),
@@ -344,6 +568,58 @@ impl HtmlExporter {
             encrypted: self.options.encrypt,
             metadata: TemplateMetadata::default(),
         }
+    }
+
+    /// Generate a full HTML export for a set of messages.
+    pub fn export_messages(
+        &self,
+        title: &str,
+        messages: &[renderer::Message],
+        metadata: TemplateMetadata,
+        password: Option<&str>,
+    ) -> Result<String, TemplateError> {
+        let render_options = renderer::RenderOptions {
+            show_timestamps: self.options.show_timestamps,
+            show_tool_calls: self.options.show_tool_calls,
+            syntax_highlighting: self.options.syntax_highlighting,
+            agent_slug: self
+                .options
+                .agent_name
+                .as_ref()
+                .map(|name| filename::agent_slug(name)),
+            ..renderer::RenderOptions::default()
+        };
+
+        let rendered = renderer::render_conversation(messages, &render_options)
+            .map_err(|e| TemplateError::RenderFailed(e.to_string()))?;
+
+        let content = if self.options.encrypt {
+            let password = password.ok_or(TemplateError::EncryptionRequired)?;
+            let encrypted = encryption::encrypt_content(
+                &rendered,
+                password,
+                &encryption::EncryptionParams::default(),
+            )
+            .map_err(|e| TemplateError::RenderFailed(e.to_string()))?;
+            encryption::render_encrypted_placeholder(&encrypted)
+        } else {
+            rendered
+        };
+
+        let styles = styles::generate_styles(&self.options);
+        let scripts = scripts::generate_scripts(&self.options);
+
+        let template = HtmlTemplate {
+            title: title.to_string(),
+            critical_css: styles.critical_css,
+            print_css: styles.print_css,
+            inline_js: scripts.inline_js,
+            content,
+            encrypted: self.options.encrypt,
+            metadata,
+        };
+
+        Ok(template.render(&self.options))
     }
 }
 
@@ -382,6 +658,48 @@ mod tests {
     }
 
     #[test]
+    fn test_cdn_resources_include_integrity() {
+        let template = HtmlTemplate {
+            title: "CDN Test".to_string(),
+            critical_css: String::new(),
+            print_css: String::new(),
+            inline_js: String::new(),
+            content: "<p>ok</p>".to_string(),
+            encrypted: false,
+            metadata: TemplateMetadata::default(),
+        };
+        let opts = ExportOptions::default();
+        let html = template.render(&opts);
+
+        assert!(html.contains(TAILWIND_CDN_URL));
+        assert!(html.contains(TAILWIND_CDN_SRI));
+        assert!(html.contains(PRISM_CORE_URL));
+        assert!(html.contains(PRISM_CORE_SRI));
+        assert!(html.contains("document.documentElement.classList.add('no-tailwind')"));
+        assert!(html.contains("document.documentElement.classList.add('no-prism')"));
+    }
+
+    #[test]
+    fn test_no_cdn_removes_external_tags() {
+        let template = HtmlTemplate {
+            title: "No CDN".to_string(),
+            critical_css: String::new(),
+            print_css: String::new(),
+            inline_js: String::new(),
+            content: "<p>ok</p>".to_string(),
+            encrypted: false,
+            metadata: TemplateMetadata::default(),
+        };
+        let opts = ExportOptions {
+            include_cdn: false,
+            ..ExportOptions::default()
+        };
+        let html = template.render(&opts);
+
+        assert!(!html.contains("cdn.jsdelivr.net"));
+    }
+
+    #[test]
     fn test_template_renders_valid_html() {
         let template = HtmlTemplate {
             title: "Test Session".to_string(),
@@ -417,5 +735,80 @@ mod tests {
         let html = template.render(&ExportOptions::default());
         assert!(html.contains("password-modal"));
         assert!(html.contains("Enter Password"));
+    }
+
+    #[test]
+    fn test_export_messages_plain() {
+        let exporter = HtmlExporter::with_options(ExportOptions::default());
+        let messages = vec![renderer::Message {
+            role: "user".to_string(),
+            content: "Hello world".to_string(),
+            timestamp: None,
+            tool_call: None,
+            index: None,
+            author: None,
+        }];
+
+        let html = exporter
+            .export_messages("Test Export", &messages, TemplateMetadata::default(), None)
+            .expect("export");
+
+        assert!(html.contains("Hello world"));
+        assert!(html.contains("conversation"));
+    }
+
+    #[test]
+    fn test_export_messages_requires_password_when_encrypted() {
+        let exporter = HtmlExporter::with_options(ExportOptions {
+            encrypt: true,
+            ..Default::default()
+        });
+        let messages = vec![renderer::Message {
+            role: "assistant".to_string(),
+            content: "Secret".to_string(),
+            timestamp: None,
+            tool_call: None,
+            index: None,
+            author: None,
+        }];
+
+        let result = exporter.export_messages(
+            "Encrypted Export",
+            &messages,
+            TemplateMetadata::default(),
+            None,
+        );
+
+        assert!(matches!(result, Err(TemplateError::EncryptionRequired)));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_export_messages_encrypted_payload() {
+        let exporter = HtmlExporter::with_options(ExportOptions {
+            encrypt: true,
+            ..Default::default()
+        });
+        let messages = vec![renderer::Message {
+            role: "assistant".to_string(),
+            content: "Top secret".to_string(),
+            timestamp: None,
+            tool_call: None,
+            index: None,
+            author: None,
+        }];
+
+        let html = exporter
+            .export_messages(
+                "Encrypted Export",
+                &messages,
+                TemplateMetadata::default(),
+                Some("password"),
+            )
+            .expect("export");
+
+        assert!(html.contains("encrypted-content"));
+        assert!(html.contains("\"iterations\":600000"));
+        assert!(!html.contains("Top secret"));
     }
 }

@@ -1,0 +1,8 @@
+{
+  "name": "cass-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "^1.50.0"
+  }
+}

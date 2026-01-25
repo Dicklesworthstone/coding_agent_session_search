@@ -65,9 +65,10 @@ wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
 
-# Crypto for ChatGPT encrypted conversations
+# Crypto for ChatGPT encrypted conversations and HTML export encryption
 aes-gcm = "*"
 ring = "*"
+pbkdf2 = "*"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
 
 # SHA256 hashing for model verification
 sha2 = "*"
@@ -93,8 +94,9 @@ image = { version = "*", optional = true, default-features = false, features = [
 security-framework = "*"
 
 [features]
-default = ["qr"]
+default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]
+encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 
 [build-dependencies]
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }

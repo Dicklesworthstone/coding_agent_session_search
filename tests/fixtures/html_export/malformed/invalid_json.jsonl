@@ -1,0 +1,5 @@
+{"sessionId":"invalid-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user","content":"Valid first message"},"uuid":"msg-001","timestamp":"2026-01-15T10:00:00.000Z"}
+{this is not valid json at all - missing quotes around keys}
+{"sessionId":"invalid-001","workspace":"/home/dev/project","agent":"claude_code","type":"assistant","message":{"role":"assistant","content":"Valid third message after invalid one"},"uuid":"msg-003","timestamp":"2026-01-15T10:00:30.000Z"}
+{"sessionId":"invalid-001","workspace":"/home/dev/project","agent":"claude_code","type":"user","message":{"role":"user",content:"missing quote before content key"},"uuid":"msg-004","timestamp":"2026-01-15T10:00:45.000Z"}
+{"sessionId":"invalid-001","workspace":"/home/dev/project","agent":"claude_code","type":"assistant","message":{"role":"assistant","content":"Final valid message"},"uuid":"msg-005","timestamp":"2026-01-15T10:01:00.000Z"}

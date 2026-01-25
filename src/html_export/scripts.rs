@@ -41,6 +41,9 @@ pub fn generate_scripts(options: &ExportOptions) -> ScriptBundle {
         scripts.push(generate_decryption_js());
     }
 
+    // World-class UI/UX enhancements (always included)
+    scripts.push(generate_world_class_js());
+
     // Initialize on load
     scripts.push(generate_init_js(options));
 
@@ -262,7 +265,7 @@ const Search = {
         this.countEl.hidden = true;
     }
 };"#
-        .to_string()
+    .to_string()
 }
 
 fn generate_theme_js() -> String {
@@ -297,7 +300,7 @@ const Theme = {
         localStorage.setItem('cass-theme', next);
     }
 };"#
-        .to_string()
+    .to_string()
 }
 
 fn generate_tool_toggle_js() -> String {
@@ -312,7 +315,279 @@ const ToolCalls = {
         });
     }
 };"#
-        .to_string()
+    .to_string()
+}
+
+fn generate_world_class_js() -> String {
+    r#"// World-class UI/UX enhancements
+const WorldClass = {
+    scrollProgress: null,
+    floatingNav: null,
+    gradientMesh: null,
+    lastScrollY: 0,
+    ticking: false,
+    currentMessageIndex: -1,
+    messages: [],
+
+    init() {
+        this.messages = Array.from($$('.message'));
+        this.createScrollProgress();
+        this.createFloatingNav();
+        this.createGradientMesh();
+        this.initIntersectionObserver();
+        this.initKeyboardNav();
+        this.initMessageLinks();
+        this.initScrollHandler();
+        this.initShareButton();
+    },
+
+    createScrollProgress() {
+        this.scrollProgress = document.createElement('div');
+        this.scrollProgress.className = 'scroll-progress';
+        document.body.appendChild(this.scrollProgress);
+    },
+
+    createGradientMesh() {
+        this.gradientMesh = document.createElement('div');
+        this.gradientMesh.className = 'gradient-mesh';
+        document.body.insertBefore(this.gradientMesh, document.body.firstChild);
+    },
+
+    createFloatingNav() {
+        this.floatingNav = document.createElement('div');
+        this.floatingNav.className = 'floating-nav';
+        this.floatingNav.innerHTML = `
+            <button class="floating-btn" id="scroll-top-btn" aria-label="Scroll to top" title="Scroll to top">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M18 15l-6-6-6 6"/>
+                </svg>
+            </button>
+            <button class="floating-btn" id="scroll-bottom-btn" aria-label="Scroll to bottom" title="Scroll to bottom">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M6 9l6 6 6-6"/>
+                </svg>
+            </button>
+        `;
+        document.body.appendChild(this.floatingNav);
+
+        $('#scroll-top-btn').onclick = () => {
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+        $('#scroll-bottom-btn').onclick = () => {
+            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        };
+    },
+
+    initScrollHandler() {
+        const toolbar = $('.toolbar');
+        let lastScrollY = window.scrollY;
+        let scrollDirection = 'up';
+
+        const updateScroll = () => {
+            const scrollY = window.scrollY;
+            const scrollHeight = document.documentElement.scrollHeight - window.innerHeight;
+            const progress = scrollHeight > 0 ? (scrollY / scrollHeight) * 100 : 0;
+
+            // Update progress bar
+            if (this.scrollProgress) {
+                this.scrollProgress.style.width = `${progress}%`;
+            }
+
+            // Show/hide floating nav
+            if (this.floatingNav) {
+                if (scrollY > 300) {
+                    this.floatingNav.classList.add('visible');
+                } else {
+                    this.floatingNav.classList.remove('visible');
+                }
+            }
+
+            // Mobile: hide toolbar on scroll down (only if wide enough scroll)
+            if (toolbar && window.innerWidth < 768) {
+                scrollDirection = scrollY > lastScrollY ? 'down' : 'up';
+                if (scrollDirection === 'down' && scrollY > 200) {
+                    toolbar.classList.add('toolbar-hidden');
+                } else {
+                    toolbar.classList.remove('toolbar-hidden');
+                }
+            }
+
+            lastScrollY = scrollY;
+            this.ticking = false;
+        };
+
+        window.addEventListener('scroll', () => {
+            if (!this.ticking) {
+                requestAnimationFrame(updateScroll);
+                this.ticking = true;
+            }
+        }, { passive: true });
+    },
+
+    initIntersectionObserver() {
+        if (!('IntersectionObserver' in window)) return;
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('in-view');
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        });
+
+        // Initially hide messages for animation
+        this.messages.forEach((msg, i) => {
+            msg.style.opacity = '0';
+            msg.style.transform = 'translateY(24px)';
+            setTimeout(() => observer.observe(msg), i * 30);
+        });
+    },
+
+    initKeyboardNav() {
+        document.addEventListener('keydown', (e) => {
+            // Ignore if in input/textarea
+            if (e.target.matches('input, textarea')) return;
+
+            switch(e.key) {
+                case 'j':
+                    e.preventDefault();
+                    this.navigateMessage(1);
+                    break;
+                case 'k':
+                    e.preventDefault();
+                    this.navigateMessage(-1);
+                    break;
+                case 'g':
+                    if (e.shiftKey) {
+                        e.preventDefault();
+                        this.navigateToMessage(this.messages.length - 1);
+                    } else {
+                        e.preventDefault();
+                        this.navigateToMessage(0);
+                    }
+                    break;
+                case '/':
+                    if (!e.ctrlKey && !e.metaKey) {
+                        e.preventDefault();
+                        const searchInput = $('#search-input');
+                        if (searchInput) {
+                            searchInput.focus();
+                            searchInput.select();
+                        }
+                    }
+                    break;
+                case '?':
+                    e.preventDefault();
+                    this.showShortcutsHint();
+                    break;
+            }
+        });
+    },
+
+    navigateMessage(direction) {
+        const newIndex = Math.max(0, Math.min(this.messages.length - 1, this.currentMessageIndex + direction));
+        this.navigateToMessage(newIndex);
+    },
+
+    navigateToMessage(index) {
+        // Remove focus from current
+        if (this.currentMessageIndex >= 0 && this.messages[this.currentMessageIndex]) {
+            this.messages[this.currentMessageIndex].classList.remove('keyboard-focus');
+        }
+
+        this.currentMessageIndex = index;
+        const msg = this.messages[index];
+        if (msg) {
+            msg.classList.add('keyboard-focus');
+            msg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    },
+
+    showShortcutsHint() {
+        let hint = $('.shortcuts-hint');
+        if (!hint) {
+            hint = document.createElement('div');
+            hint.className = 'shortcuts-hint';
+            hint.innerHTML = '<kbd>j</kbd>/<kbd>k</kbd> navigate • <kbd>g</kbd> first • <kbd>G</kbd> last • <kbd>/</kbd> search • <kbd>?</kbd> help';
+            document.body.appendChild(hint);
+        }
+        hint.classList.add('visible');
+        setTimeout(() => hint.classList.remove('visible'), 3000);
+    },
+
+    initMessageLinks() {
+        this.messages.forEach((msg, i) => {
+            const btn = document.createElement('button');
+            btn.className = 'message-link-btn';
+            btn.title = 'Copy link to message';
+            btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>';
+            btn.onclick = (e) => {
+                e.stopPropagation();
+                const id = msg.id || `msg-${i}`;
+                if (!msg.id) msg.id = id;
+                const url = `${window.location.href.split('#')[0]}#${id}`;
+                copyToClipboard(url);
+                btn.classList.add('copied');
+                setTimeout(() => btn.classList.remove('copied'), 1500);
+            };
+            msg.style.position = 'relative';
+            msg.appendChild(btn);
+        });
+    },
+
+    initShareButton() {
+        if (!navigator.share) return;
+
+        const toolbar = $('.toolbar');
+        if (!toolbar) return;
+
+        const shareBtn = document.createElement('button');
+        shareBtn.className = 'toolbar-btn share-btn';
+        shareBtn.title = 'Share';
+        shareBtn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 002 2h12a2 2 0 002-2v-8"/><polyline points="16,6 12,2 8,6"/><line x1="12" y1="2" x2="12" y2="15"/></svg><span>Share</span>';
+        shareBtn.onclick = async () => {
+            try {
+                await navigator.share({
+                    title: document.title,
+                    url: window.location.href
+                });
+            } catch (e) {
+                if (e.name !== 'AbortError') {
+                    Toast.show('Share failed', 'error');
+                }
+            }
+        };
+        toolbar.appendChild(shareBtn);
+    }
+};
+
+// Touch ripple effect for mobile
+function createRipple(event) {
+    const button = event.currentTarget;
+    const rect = button.getBoundingClientRect();
+    const ripple = document.createElement('span');
+    const size = Math.max(rect.width, rect.height);
+    ripple.style.width = ripple.style.height = `${size}px`;
+    ripple.style.left = `${event.clientX - rect.left - size/2}px`;
+    ripple.style.top = `${event.clientY - rect.top - size/2}px`;
+    ripple.className = 'ripple';
+    button.appendChild(ripple);
+    setTimeout(() => ripple.remove(), 600);
+}
+
+// Add ripple to touch devices
+if ('ontouchstart' in window) {
+    document.addEventListener('DOMContentLoaded', () => {
+        $$('.toolbar-btn, .floating-btn').forEach(btn => {
+            btn.addEventListener('touchstart', createRipple);
+        });
+    });
+}"#
+    .to_string()
 }
 
 fn generate_decryption_js() -> String {
@@ -347,7 +622,10 @@ const Crypto = {
             if (!encryptedEl) throw new Error('No encrypted content found');
 
             const encryptedData = JSON.parse(encryptedEl.textContent);
-            const { salt, iv, ciphertext } = encryptedData;
+            const { salt, iv, ciphertext, iterations } = encryptedData;
+            if (!salt || !iv || !ciphertext || !Number.isInteger(iterations) || iterations <= 0) {
+                throw new Error('Invalid encryption parameters');
+            }
 
             // Derive key from password
             const enc = new TextEncoder();
@@ -362,8 +640,8 @@ const Crypto = {
             const key = await crypto.subtle.deriveKey(
                 {
                     name: 'PBKDF2',
-                    salt: this.base64ToBuffer(salt),
-                    iterations: 100000,
+                    salt: this.base64ToBytes(salt),
+                    iterations: iterations,
                     hash: 'SHA-256'
                 },
                 keyMaterial,
@@ -376,10 +654,10 @@ const Crypto = {
             const decrypted = await crypto.subtle.decrypt(
                 {
                     name: 'AES-GCM',
-                    iv: this.base64ToBuffer(iv)
+                    iv: this.base64ToBytes(iv)
                 },
                 key,
-                this.base64ToBuffer(ciphertext)
+                this.base64ToBytes(ciphertext)
             );
 
             // Replace content
@@ -390,9 +668,12 @@ const Crypto = {
 
             // Hide modal
             this.modal.hidden = true;
+            this.form.reset();
 
             // Re-initialize tool calls
-            ToolCalls.init();
+            if (typeof ToolCalls !== 'undefined') {
+                ToolCalls.init();
+            }
 
         } catch (e) {
             this.errorEl.textContent = 'Decryption failed. Wrong password?';
@@ -400,16 +681,16 @@ const Crypto = {
         }
     },
 
-    base64ToBuffer(base64) {
+    base64ToBytes(base64) {
         const binary = atob(base64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) {
             bytes[i] = binary.charCodeAt(i);
         }
-        return bytes.buffer;
+        return bytes;
     }
 };"#
-        .to_string()
+    .to_string()
 }
 
 fn generate_init_js(options: &ExportOptions) -> String {
@@ -430,6 +711,9 @@ fn generate_init_js(options: &ExportOptions) -> String {
     if options.encrypt {
         inits.push("Crypto.init();");
     }
+
+    // World-class UI/UX enhancements (always init)
+    inits.push("WorldClass.init();");
 
     // Always add code block copy buttons and print button handler
     inits.push(r#"// Add copy buttons to code blocks
@@ -474,8 +758,10 @@ mod tests {
 
     #[test]
     fn test_generate_scripts_includes_search() {
-        let mut opts = ExportOptions::default();
-        opts.include_search = true;
+        let opts = ExportOptions {
+            include_search: true,
+            ..Default::default()
+        };
         let bundle = generate_scripts(&opts);
 
         assert!(bundle.inline_js.contains("const Search"));
@@ -484,8 +770,10 @@ mod tests {
 
     #[test]
     fn test_generate_scripts_excludes_search_when_disabled() {
-        let mut opts = ExportOptions::default();
-        opts.include_search = false;
+        let opts = ExportOptions {
+            include_search: false,
+            ..Default::default()
+        };
         let bundle = generate_scripts(&opts);
 
         assert!(!bundle.inline_js.contains("const Search"));
@@ -493,8 +781,10 @@ mod tests {
 
     #[test]
     fn test_generate_scripts_includes_theme_toggle() {
-        let mut opts = ExportOptions::default();
-        opts.include_theme_toggle = true;
+        let opts = ExportOptions {
+            include_theme_toggle: true,
+            ..Default::default()
+        };
         let bundle = generate_scripts(&opts);
 
         assert!(bundle.inline_js.contains("const Theme"));
@@ -503,8 +793,10 @@ mod tests {
 
     #[test]
     fn test_generate_scripts_includes_encryption() {
-        let mut opts = ExportOptions::default();
-        opts.encrypt = true;
+        let opts = ExportOptions {
+            encrypt: true,
+            ..Default::default()
+        };
         let bundle = generate_scripts(&opts);
 
         assert!(bundle.inline_js.contains("const Crypto"));
@@ -539,8 +831,10 @@ mod tests {
 
     #[test]
     fn test_generate_scripts_includes_keyboard_shortcuts() {
-        let mut opts = ExportOptions::default();
-        opts.include_search = true;
+        let opts = ExportOptions {
+            include_search: true,
+            ..Default::default()
+        };
         let bundle = generate_scripts(&opts);
 
         // Ctrl+F for search
@@ -558,5 +852,62 @@ mod tests {
 
         assert!(bundle.inline_js.contains("copy-code-btn"));
         assert!(bundle.inline_js.contains("copyCodeBlock"));
+    }
+
+    #[test]
+    fn test_generate_scripts_includes_world_class_enhancements() {
+        let opts = ExportOptions::default();
+        let bundle = generate_scripts(&opts);
+
+        // WorldClass object and initialization
+        assert!(bundle.inline_js.contains("const WorldClass"));
+        assert!(bundle.inline_js.contains("WorldClass.init()"));
+
+        // Scroll progress indicator
+        assert!(bundle.inline_js.contains("createScrollProgress"));
+        assert!(bundle.inline_js.contains("scroll-progress"));
+
+        // Floating navigation
+        assert!(bundle.inline_js.contains("createFloatingNav"));
+        assert!(bundle.inline_js.contains("scroll-top-btn"));
+
+        // Keyboard navigation (vim-style j/k)
+        assert!(bundle.inline_js.contains("initKeyboardNav"));
+        assert!(bundle.inline_js.contains("case 'j':"));
+        assert!(bundle.inline_js.contains("case 'k':"));
+
+        // Message link copying
+        assert!(bundle.inline_js.contains("initMessageLinks"));
+        assert!(bundle.inline_js.contains("message-link-btn"));
+
+        // Intersection observer for animations
+        assert!(bundle.inline_js.contains("IntersectionObserver"));
+        assert!(bundle.inline_js.contains("in-view"));
+
+        // Native share API support
+        assert!(bundle.inline_js.contains("navigator.share"));
+
+        // Touch ripple effect
+        assert!(bundle.inline_js.contains("createRipple"));
+    }
+
+    #[test]
+    fn test_world_class_keyboard_shortcuts() {
+        let opts = ExportOptions::default();
+        let bundle = generate_scripts(&opts);
+
+        // Vim-style navigation
+        assert!(bundle.inline_js.contains("navigateMessage(1)")); // j - next
+        assert!(bundle.inline_js.contains("navigateMessage(-1)")); // k - previous
+
+        // Jump to first/last (g/G)
+        assert!(bundle.inline_js.contains("case 'g':"));
+
+        // Search shortcut (/)
+        assert!(bundle.inline_js.contains("case '/':"));
+
+        // Help shortcut (?)
+        assert!(bundle.inline_js.contains("case '?':"));
+        assert!(bundle.inline_js.contains("showShortcutsHint"));
     }
 }

@@ -412,11 +412,11 @@ fn render_code_block(content: &str, lang: &str, options: &RenderOptions) -> Stri
 /// Render inline code (backticks).
 fn render_inline_code(text: &str) -> String {
     let mut result = String::new();
-    let mut chars = text.chars().peekable();
+    let chars = text.chars();
     let mut in_code = false;
     let mut code = String::new();
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         if c == '`' {
             if in_code {
                 result.push_str("<code>");
@@ -594,10 +594,10 @@ fn render_tool_call(tool_call: &ToolCall, options: &RenderOptions) -> String {
 /// Try to format as pretty JSON, otherwise return raw.
 fn format_json_or_raw(s: &str) -> String {
     // Try to parse as JSON and pretty print
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
-        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
-            return pretty;
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s)
+        && let Ok(pretty) = serde_json::to_string_pretty(&value)
+    {
+        return pretty;
     }
     s.to_string()
 }
@@ -657,8 +657,10 @@ mod tests {
     #[test]
     fn test_render_message_with_code() {
         let msg = test_message("assistant", "Here's code:\n```rust\nfn main() {}\n```");
-        let mut opts = RenderOptions::default();
-        opts.syntax_highlighting = true;
+        let opts = RenderOptions {
+            syntax_highlighting: true,
+            ..Default::default()
+        };
         let html = render_message(&msg, &opts).unwrap();
 
         assert!(html.contains("<pre>"));
@@ -781,8 +783,10 @@ mod tests {
     #[test]
     fn test_conversation_with_agent_class() {
         let messages = vec![test_message("user", "Hello")];
-        let mut opts = RenderOptions::default();
-        opts.agent_slug = Some("claude_code".to_string());
+        let opts = RenderOptions {
+            agent_slug: Some("claude_code".to_string()),
+            ..Default::default()
+        };
 
         let html = render_conversation(&messages, &opts).unwrap();
         assert!(html.contains("agent-claude"));
@@ -805,8 +809,10 @@ mod tests {
     fn test_long_message_collapse() {
         let long_content = "x".repeat(2000);
         let msg = test_message("user", &long_content);
-        let mut opts = RenderOptions::default();
-        opts.collapse_threshold = 1000;
+        let opts = RenderOptions {
+            collapse_threshold: 1000,
+            ..Default::default()
+        };
 
         let html = render_message(&msg, &opts).unwrap();
         assert!(html.contains("message-collapsed"));
@@ -865,8 +871,10 @@ mod tests {
         // Create a message with multi-byte UTF-8 content that would panic if sliced incorrectly
         let content_with_emoji = "This is a message with emoji 🎉🎊🎈 ".repeat(50);
         let msg = test_message("user", &content_with_emoji);
-        let mut opts = RenderOptions::default();
-        opts.collapse_threshold = 100; // Will trigger collapse
+        let opts = RenderOptions {
+            collapse_threshold: 100,
+            ..Default::default()
+        };
 
         // Should not panic even though the emoji may be at the slice boundary
         let html = render_message(&msg, &opts).unwrap();
