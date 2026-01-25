@@ -131,18 +131,37 @@ mod tests {
     fn test_colors_are_valid_hex() {
         // Verify all color constants are valid 7-char hex colors
         let all_colors = [
+            // Backgrounds
             colors::BG_DEEP,
             colors::BG_SURFACE,
             colors::BG_HIGHLIGHT,
+            // Borders
             colors::BORDER,
+            colors::BORDER_FOCUS,
+            // Text
             colors::TEXT_PRIMARY,
             colors::TEXT_SECONDARY,
             colors::TEXT_MUTED,
+            colors::TEXT_DISABLED,
+            // Accents
             colors::ACCENT_PRIMARY,
+            colors::ACCENT_SECONDARY,
+            colors::ACCENT_TERTIARY,
+            // Roles
             colors::ROLE_USER,
             colors::ROLE_AGENT,
             colors::ROLE_TOOL,
             colors::ROLE_SYSTEM,
+            // Role backgrounds
+            colors::ROLE_USER_BG,
+            colors::ROLE_AGENT_BG,
+            colors::ROLE_TOOL_BG,
+            colors::ROLE_SYSTEM_BG,
+            // Status
+            colors::STATUS_SUCCESS,
+            colors::STATUS_WARNING,
+            colors::STATUS_ERROR,
+            colors::STATUS_INFO,
         ];
 
         for color in all_colors {

@@ -41,15 +41,42 @@ pub struct EncryptedContent {
 
 impl EncryptedContent {
     /// Convert to JSON for embedding in HTML.
+    ///
+    /// Note: Values are expected to be base64-encoded (safe characters only).
+    /// JSON escaping is applied defensively in case of unexpected input.
     pub fn to_json(&self) -> String {
         format!(
             r#"{{"salt":"{}","iv":"{}","ciphertext":"{}"}}"#,
-            self.salt, self.iv, self.ciphertext
+            json_escape_string(&self.salt),
+            json_escape_string(&self.iv),
+            json_escape_string(&self.ciphertext)
         )
     }
 }
 
+/// Escape a string for safe inclusion in JSON.
+/// Handles quotes, backslashes, and control characters.
+fn json_escape_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                // Escape other control characters as \uXXXX
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
 /// Encryption parameters matching Web Crypto API defaults.
+#[derive(Debug, Clone)]
 pub struct EncryptionParams {
     /// PBKDF2 iterations (100,000 recommended)
     pub iterations: u32,
@@ -199,6 +226,24 @@ mod tests {
         assert!(json.contains("\"salt\":\"abc123\""));
         assert!(json.contains("\"iv\":\"xyz789\""));
         assert!(json.contains("\"ciphertext\":\"encrypted_data\""));
+    }
+
+    #[test]
+    fn test_json_escape_string() {
+        use super::json_escape_string;
+
+        // Normal strings pass through unchanged
+        assert_eq!(json_escape_string("hello"), "hello");
+        assert_eq!(json_escape_string("abc123+/="), "abc123+/=");
+
+        // Quotes and backslashes are escaped
+        assert_eq!(json_escape_string(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(json_escape_string(r"path\to\file"), r"path\\to\\file");
+
+        // Control characters are escaped
+        assert_eq!(json_escape_string("line1\nline2"), "line1\\nline2");
+        assert_eq!(json_escape_string("col1\tcol2"), "col1\\tcol2");
+        assert_eq!(json_escape_string("cr\rhere"), "cr\\rhere");
     }
 
     #[test]

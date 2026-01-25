@@ -271,9 +271,11 @@ fn render_links(text: &str) -> String {
                 url.push(chars.next().unwrap());
             }
 
+            // Escape URL for safe inclusion in href attribute
+            let escaped_url = html_escape(&url);
             result.push_str(&format!(
                 r#"<a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a>"#,
-                url = url
+                url = escaped_url
             ));
 
             buffer.clear();
