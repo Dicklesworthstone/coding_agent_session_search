@@ -1573,6 +1573,23 @@ fn agent_suggestions(prefix: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Returns workspace suggestions matching the given substring (case-insensitive)
+/// Unlike agents which use prefix matching, workspaces use substring/contains matching
+/// since workspace paths are long and users often search for middle parts.
+fn workspace_suggestions<'a>(query: &str, known_workspaces: &'a [String]) -> Vec<&'a str> {
+    if query.is_empty() {
+        // Return all workspaces (up to a limit) when query is empty
+        return known_workspaces.iter().take(10).map(|s| s.as_str()).collect();
+    }
+    let query_lower = query.to_lowercase();
+    known_workspaces
+        .iter()
+        .filter(|ws| ws.to_lowercase().contains(&query_lower))
+        .take(10) // Limit suggestions to avoid UI overflow
+        .map(|s| s.as_str())
+        .collect()
+}
+
 /// Suggests a correction for a query based on history.
 /// Uses Levenshtein distance to find close matches (max edit distance 2).
 /// Only suggests if the history item is different from the query.
@@ -2587,6 +2604,13 @@ pub fn run_tui(
     // If DB doesn't exist yet (first run), this will be None, which is fine as we can't view details anyway.
     let db_reader = crate::storage::sqlite::SqliteStorage::open_readonly(&db_path).ok();
 
+    // Load known workspaces for autocomplete suggestions (F4 filter)
+    let known_workspaces: Vec<String> = db_reader
+        .as_ref()
+        .and_then(|reader| reader.list_workspaces().ok())
+        .map(|ws_list| ws_list.into_iter().map(|w| w.path.display().to_string()).collect())
+        .unwrap_or_default();
+
     let index_ready = search_client.is_some();
     let mut status = if index_ready {
         format!(
@@ -3028,7 +3052,7 @@ pub fn run_tui(
                     .margin(1)
                     .constraints(
                         [
-                            Constraint::Length(3), // search bar (includes filter chips)
+                            Constraint::Length(6), // search bar: input(4) + pills(1) + breadcrumbs(1)
                             Constraint::Min(0),    // results + detail
                             Constraint::Length(3), // footer (query display + status + help strip)
                         ]
@@ -3053,7 +3077,7 @@ pub fn run_tui(
                     .direction(Direction::Vertical)
                     .constraints(
                         [
-                            Constraint::Length(2), // input
+                            Constraint::Length(4), // input: borders(2) + input line(1) + hints line(1)
                             Constraint::Length(1), // pills
                             Constraint::Length(1), // breadcrumbs
                         ]
@@ -4228,7 +4252,7 @@ pub fn run_tui(
                     if !suggestions.is_empty() {
                         let area = Rect::new(
                             chunks[0].x + 14, // Align with " Filter: Agent " prompt
-                            chunks[0].y + 2,  // Below title line
+                            chunks[0].y + 4,  // Below search bar content (title + input + hints + bottom border)
                             30,
                             (suggestions.len().min(5) as u16) + 2,
                         );
@@ -4243,6 +4267,41 @@ pub fn run_tui(
                                     .borders(Borders::ALL)
                                     .border_style(palette.border_focus_style())
                                     .title("Suggestions"),
+                            )
+                            .highlight_style(Style::default().bg(palette.accent));
+                        f.render_widget(list, area);
+                    }
+                }
+
+                // Render autocomplete dropdown for Workspace Filter
+                if input_mode == InputMode::Workspace {
+                    let suggestions = workspace_suggestions(&input_buffer, &known_workspaces);
+                    if !suggestions.is_empty() {
+                        // Calculate width based on longest suggestion (max 60 chars)
+                        let max_width = suggestions
+                            .iter()
+                            .map(|s| s.len())
+                            .max()
+                            .unwrap_or(30)
+                            .min(60) as u16
+                            + 4; // padding for borders
+                        let area = Rect::new(
+                            chunks[0].x + 18, // Align with " Filter: Workspace " prompt
+                            chunks[0].y + 4,  // Below search bar content
+                            max_width,
+                            (suggestions.len().min(8) as u16) + 2, // Show up to 8 suggestions
+                        );
+                        f.render_widget(ratatui::widgets::Clear, area);
+                        let items: Vec<ListItem> = suggestions
+                            .iter()
+                            .map(|s| ListItem::new(Span::raw(*s)))
+                            .collect();
+                        let list = List::new(items)
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(palette.border_focus_style())
+                                    .title("Workspaces (substring match)"),
                             )
                             .highlight_style(Style::default().bg(palette.accent));
                         f.render_widget(list, area);
@@ -6824,25 +6883,54 @@ pub fn run_tui(
                         input_buffer.clear();
                         status = "Workspace filter cancelled".to_string();
                     }
+                    KeyCode::Tab => {
+                        // Tab completes to first matching workspace
+                        let suggestions = workspace_suggestions(&input_buffer, &known_workspaces);
+                        if let Some(first) = suggestions.first() {
+                            input_buffer = first.to_string();
+                            status = format!("Completed to '{}'. Press Enter to apply.", first);
+                        }
+                    }
                     KeyCode::Enter => {
                         filters.workspaces.clear();
                         if !input_buffer.trim().is_empty() {
-                            filters.workspaces.insert(input_buffer.trim().to_string());
+                            // Expand substring to matching full workspace paths
+                            let matching: Vec<String> = workspace_suggestions(
+                                input_buffer.trim(),
+                                &known_workspaces,
+                            )
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
+
+                            if matching.is_empty() {
+                                // No matches - use input as-is (may not match anything)
+                                filters.workspaces.insert(input_buffer.trim().to_string());
+                                status = format!(
+                                    "Workspace filter '{}' (no known workspaces match)",
+                                    input_buffer.trim()
+                                );
+                            } else if matching.len() == 1 {
+                                // Exactly one match - use it
+                                filters.workspaces.insert(matching[0].clone());
+                                status = format!("Workspace filter: {}", matching[0]);
+                            } else {
+                                // Multiple matches - add all of them
+                                for ws in &matching {
+                                    filters.workspaces.insert(ws.clone());
+                                }
+                                status = format!(
+                                    "Workspace filter: {} workspaces matching '{}'",
+                                    matching.len(),
+                                    input_buffer.trim()
+                                );
+                            }
                         }
                         page = 0;
                         input_mode = InputMode::Query;
                         active_pane = 0;
                         cached_detail = None;
                         detail_scroll = 0;
-                        status = format!(
-                            "Workspace filter set to {}",
-                            filters
-                                .workspaces
-                                .iter()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
                         input_buffer.clear();
                         dirty_since = Some(Instant::now());
                         focus_region = FocusRegion::Results;
