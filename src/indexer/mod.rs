@@ -20,9 +20,7 @@ use crate::connectors::{
     opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
-use crate::search::vector_index::{
-    Quantization, ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, VectorIndex, vector_index_path,
-};
+use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source};
@@ -734,25 +732,8 @@ pub fn run_index(
         );
 
         if !embedded_messages.is_empty() {
-            // Convert to VectorEntry and build index
-            let entries = embedded_messages
-                .into_iter()
-                .map(|em| em.into_vector_entry());
-
-            let vector_index = VectorIndex::build(
-                semantic_indexer.embedder_id(),
-                "1.0", // revision
-                semantic_indexer.embedder_dimension(),
-                Quantization::F32,
-                entries,
-            )?;
-
-            // Save to disk
-            let index_path = vector_index_path(&opts.data_dir, semantic_indexer.embedder_id());
-            if let Some(parent) = index_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            vector_index.save(&index_path)?;
+            let vector_index = semantic_indexer.build_index(embedded_messages)?;
+            let index_path = semantic_indexer.save_index(&vector_index, &opts.data_dir)?;
             tracing::info!(
                 path = %index_path.display(),
                 embedder = semantic_indexer.embedder_id(),

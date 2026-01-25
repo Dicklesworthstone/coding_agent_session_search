@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -8,7 +8,7 @@ use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::vector_index::{ROLE_USER, VectorEntry};
+use crate::search::vector_index::{Quantization, ROLE_USER, VectorEntry, VectorIndex, vector_index_path};
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingInput {
@@ -212,11 +212,54 @@ impl SemanticIndexer {
         pb.finish_with_message("Embedding complete");
         Ok(embeddings)
     }
+
+    pub fn build_index<I>(&self, embedded_messages: I) -> Result<VectorIndex>
+    where
+        I: IntoIterator<Item = EmbeddedMessage>,
+    {
+        let entries = embedded_messages
+            .into_iter()
+            .map(|embedded| embedded.into_vector_entry());
+
+        VectorIndex::build(
+            self.embedder_id(),
+            "1.0",
+            self.embedder_dimension(),
+            Quantization::F32,
+            entries,
+        )
+    }
+
+    pub fn save_index(&self, index: &VectorIndex, data_dir: &Path) -> Result<PathBuf> {
+        let header = index.header();
+        if header.embedder_id != self.embedder_id() {
+            bail!(
+                "embedder_id mismatch: index header '{}' vs indexer '{}'",
+                header.embedder_id,
+                self.embedder_id()
+            );
+        }
+        if header.dimension as usize != self.embedder_dimension() {
+            bail!(
+                "dimension mismatch: index header {} vs indexer {}",
+                header.dimension,
+                self.embedder_dimension()
+            );
+        }
+
+        let index_path = vector_index_path(data_dir, header.embedder_id.as_str());
+        if let Some(parent) = index_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        index.save(&index_path)?;
+        Ok(index_path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_batch_embedding() {
@@ -243,5 +286,28 @@ mod tests {
 
         let embeddings = indexer.embed_messages(&messages).unwrap();
         assert_eq!(embeddings.len(), messages.len());
+    }
+
+    #[test]
+    fn test_build_and_save_index() {
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let messages = vec![
+            EmbeddingInput::new(1, "Hello world"),
+            EmbeddingInput::new(2, "Goodbye world"),
+        ];
+
+        let embeddings = indexer.embed_messages(&messages).unwrap();
+        let index = indexer.build_index(embeddings).unwrap();
+
+        let tmp = tempdir().unwrap();
+        let path = indexer.save_index(&index, tmp.path()).unwrap();
+        assert!(path.is_file());
+
+        let loaded = VectorIndex::load(&path).unwrap();
+        assert_eq!(loaded.header().embedder_id, indexer.embedder_id());
+        assert_eq!(
+            loaded.header().dimension,
+            indexer.embedder_dimension() as u32
+        );
     }
 }

@@ -2661,7 +2661,17 @@ async fn execute_cli(
                     run_sources_command(subcmd)?;
                 }
                 Commands::Models(subcmd) => {
-                    run_models_command(subcmd)?;
+                    let subcmd = subcmd.clone();
+                    let result = tokio::task::spawn_blocking(move || run_models_command(subcmd))
+                        .await
+                        .map_err(|err| CliError {
+                            code: 70,
+                            kind: "runtime",
+                            message: format!("models command panicked: {err}"),
+                            hint: Some("Retry the command; if it persists, report the panic output.".into()),
+                            retryable: true,
+                        })?;
+                    result?;
                 }
                 _ => {}
             }
@@ -3621,6 +3631,7 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
+    use crate::search::model_manager::{load_hash_semantic_context, load_semantic_context};
     use crate::search::query::{QueryExplanation, SearchClient, SearchFilters, SearchMode};
     use crate::search::tantivy::index_dir;
     use crate::sources::provenance::SourceFilter;
@@ -3657,6 +3668,63 @@ fn run_cli_search(
             hint: None,
             retryable: true,
         })?;
+
+    // Determine effective search mode (default to Lexical)
+    let effective_mode = mode.unwrap_or(SearchMode::Lexical);
+
+    if matches!(effective_mode, SearchMode::Semantic | SearchMode::Hybrid) {
+        let prefer_hash = semantic_opts.model.as_deref().is_some_and(|model| {
+            let model = model.to_ascii_lowercase();
+            model == "hash" || model == "fnv1a" || model.starts_with("fnv1a-")
+        });
+
+        let setup = if prefer_hash {
+            load_hash_semantic_context(&data_dir, &db_path)
+        } else {
+            load_semantic_context(&data_dir, &db_path)
+        };
+
+        if let Some(context) = setup.context {
+            if let Err(err) = client.set_semantic_context(
+                context.embedder,
+                context.index,
+                context.filter_maps,
+                context.roles,
+            ) {
+                let hint = if prefer_hash {
+                    "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or use --mode lexical"
+                        .to_string()
+                } else {
+                    "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
+                        .to_string()
+                };
+                return Err(CliError {
+                    code: 15,
+                    kind: "semantic-unavailable",
+                    message: format!("Semantic search not available: {err}"),
+                    hint: Some(hint),
+                    retryable: false,
+                });
+            }
+        } else {
+            let _ = client.clear_semantic_context();
+            let summary = setup.availability.summary();
+            let hint = if prefer_hash {
+                "Run 'cass index --semantic --embedder hash' to build the hash vector index, or use --mode lexical"
+                    .to_string()
+            } else {
+                "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
+                    .to_string()
+            };
+            return Err(CliError {
+                code: 15,
+                kind: "semantic-unavailable",
+                message: format!("Semantic search not available: {summary}"),
+                hint: Some(hint),
+                retryable: false,
+            });
+        }
+    }
 
     let mut filters = SearchFilters::default();
     if !agents.is_empty() {
@@ -3787,9 +3855,6 @@ fn run_cli_search(
             retryable: true,
         });
     }
-
-    // Determine effective search mode (default to Lexical)
-    let effective_mode = mode.unwrap_or(SearchMode::Lexical);
 
     // Log semantic options if any are set (bd-3bbv: flags are wired, infra pending)
     if semantic_opts.model.is_some()

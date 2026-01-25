@@ -32,7 +32,7 @@ use crate::default_data_dir;
 use crate::model::types::MessageRole;
 use crate::search::model_download::{DownloadProgress, ModelDownloader, ModelManifest};
 use crate::search::model_manager::{
-    SemanticAvailability, default_model_dir, load_semantic_context,
+    SemanticAvailability, default_model_dir, load_hash_semantic_context, load_semantic_context,
 };
 use crate::search::query::{
     CacheStats, QuerySuggestion, SearchClient, SearchFilters, SearchHit, SearchMode,
@@ -2733,7 +2733,7 @@ pub fn run_tui(
         None => SearchMode::Lexical,
     };
     if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid)
-        && !semantic_availability.is_ready()
+        && !semantic_availability.can_search()
     {
         let reason = semantic_unavailable_message(&semantic_availability);
         status = format!("Semantic unavailable: {reason}. Using lexical search.");
@@ -4957,13 +4957,49 @@ pub fn run_tui(
                     }
                     KeyCode::Char('h' | 'H') => {
                         show_consent_dialog = false;
-                        // Enable hash fallback mode
-                        semantic_availability = SemanticAvailability::HashFallback;
-                        search_mode = SearchMode::Semantic;
-                        status =
-                            "Using hash-based semantic search (approximate but fast).".to_string();
-                        // Toast: using hash fallback
-                        toast_manager.push(Toast::info("Using hash fallback"));
+                        if let Some(client) = &search_client {
+                            let setup = load_hash_semantic_context(&data_dir, &db_path);
+                            let mut availability = setup.availability;
+                            if let Some(context) = setup.context {
+                                if let Err(err) = client.set_semantic_context(
+                                    context.embedder,
+                                    context.index,
+                                    context.filter_maps,
+                                    context.roles,
+                                ) {
+                                    availability = SemanticAvailability::LoadFailed {
+                                        context: format!("hash context: {err}"),
+                                    };
+                                }
+                            } else {
+                                let _ = client.clear_semantic_context();
+                            }
+
+                            semantic_availability = availability;
+                            if semantic_availability.can_search() {
+                                search_mode = SearchMode::Semantic;
+                                status = "Using hash-based semantic search (approximate but fast)."
+                                    .to_string();
+                                // Toast: using hash fallback
+                                toast_manager.push(Toast::info("Using hash fallback"));
+                            } else {
+                                search_mode = SearchMode::Lexical;
+                                let reason =
+                                    semantic_unavailable_message(&semantic_availability);
+                                status = format!(
+                                    "Hash fallback unavailable: {reason}. Staying in lexical."
+                                );
+                                toast_manager.push(Toast::warning("Hash fallback unavailable"));
+                            }
+                        } else {
+                            semantic_availability = SemanticAvailability::NotInstalled;
+                            search_mode = SearchMode::Lexical;
+                            status = "Search client unavailable; staying in lexical mode."
+                                .to_string();
+                            toast_manager.push(Toast::warning(
+                                "Search client unavailable; cannot enable hash fallback",
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -5589,12 +5625,12 @@ pub fn run_tui(
                 search_mode = search_mode.next();
                 if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid) {
                     if let Some(client) = &search_client
-                        && !semantic_availability.is_ready()
+                        && !semantic_availability.can_search()
                     {
                         semantic_availability =
                             initialize_semantic_context(client, &data_dir, &db_path);
                     }
-                    if !semantic_availability.is_ready() {
+                    if !semantic_availability.can_search() {
                         // Check if model needs to be installed - show consent dialog
                         if semantic_availability.is_not_installed() {
                             show_consent_dialog = true;
@@ -7061,9 +7097,9 @@ pub fn run_tui(
                     let search_started = Instant::now();
                     let use_semantic =
                         matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid)
-                            && semantic_availability.is_ready();
+                            && semantic_availability.can_search();
                     if matches!(search_mode, SearchMode::Semantic | SearchMode::Hybrid)
-                        && !semantic_availability.is_ready()
+                        && !semantic_availability.can_search()
                     {
                         let reason = semantic_unavailable_message(&semantic_availability);
                         status = format!("Semantic unavailable: {reason}. Using lexical.");

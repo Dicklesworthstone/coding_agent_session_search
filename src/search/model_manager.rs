@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_download::{ModelManifest, ModelState, check_version_mismatch};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
@@ -280,6 +281,68 @@ pub struct SemanticSetup {
 /// model version matches the manifest and return `UpdateAvailable` if they differ.
 pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_inner(data_dir, db_path, true)
+}
+
+/// Load hash-based semantic context (no model download required).
+pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    let embedder = HashEmbedder::default();
+    let index_path = vector_index_path(data_dir, embedder.id());
+    if !index_path.is_file() {
+        return SemanticSetup {
+            availability: SemanticAvailability::IndexMissing { index_path },
+            context: None,
+        };
+    }
+
+    let storage = match SqliteStorage::open_readonly(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::DatabaseUnavailable {
+                    db_path: db_path.to_path_buf(),
+                    error: err.to_string(),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let filter_maps = match SemanticFilterMaps::from_storage(&storage) {
+        Ok(maps) => maps,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("filter maps: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let index = match VectorIndex::load(&index_path) {
+        Ok(index) => index,
+        Err(err) => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!("vector index: {err}"),
+                },
+                context: None,
+            };
+        }
+    };
+
+    let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
+    let embedder = Arc::new(embedder) as Arc<dyn Embedder>;
+
+    SemanticSetup {
+        availability: SemanticAvailability::HashFallback,
+        context: Some(SemanticContext {
+            embedder,
+            index,
+            filter_maps,
+            roles,
+        }),
+    }
 }
 
 /// Load semantic context without version checking.
