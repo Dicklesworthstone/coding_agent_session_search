@@ -431,6 +431,64 @@ pub enum Commands {
         #[arg(long)]
         include_tools: bool,
     },
+    /// Export session as beautiful, self-contained HTML (with optional encryption)
+    #[command(name = "export-html")]
+    ExportHtml {
+        /// Path to session file
+        session: PathBuf,
+
+        /// Output directory (default: downloads folder)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+
+        /// Custom filename (default: auto-generated from session metadata)
+        #[arg(long)]
+        filename: Option<String>,
+
+        /// Enable password encryption (Web Crypto compatible)
+        #[arg(long)]
+        encrypt: bool,
+
+        /// Password for encryption (required if --encrypt)
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Read password from stdin (secure, no echo)
+        #[arg(long)]
+        password_stdin: bool,
+
+        /// Include tool calls in export (default: true)
+        #[arg(long, default_value_t = true)]
+        include_tools: bool,
+
+        /// Show message timestamps
+        #[arg(long, default_value_t = true)]
+        show_timestamps: bool,
+
+        /// Disable CDN references (fully offline, larger file)
+        #[arg(long)]
+        no_cdns: bool,
+
+        /// Default theme (dark or light)
+        #[arg(long, default_value = "dark")]
+        theme: String,
+
+        /// Validate without writing file
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Show export plan without executing
+        #[arg(long)]
+        explain: bool,
+
+        /// Open file in browser after export
+        #[arg(long)]
+        open: bool,
+
+        /// JSON output (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Show messages around a specific line in a session file
     Expand {
         /// Path to session file
@@ -2629,6 +2687,39 @@ async fn execute_cli(
                 } => {
                     run_export(&path, format, output.as_deref(), include_tools)?;
                 }
+                Commands::ExportHtml {
+                    session,
+                    output_dir,
+                    filename,
+                    encrypt,
+                    password,
+                    password_stdin,
+                    include_tools,
+                    show_timestamps,
+                    no_cdns,
+                    theme,
+                    dry_run,
+                    explain,
+                    open,
+                    json,
+                } => {
+                    run_export_html(
+                        &session,
+                        output_dir.as_deref(),
+                        filename.as_deref(),
+                        encrypt,
+                        password.as_deref(),
+                        password_stdin,
+                        include_tools,
+                        show_timestamps,
+                        !no_cdns,
+                        &theme,
+                        dry_run,
+                        explain,
+                        open,
+                        json,
+                    )?;
+                }
                 Commands::Expand {
                     path,
                     line,
@@ -2836,6 +2927,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Export { .. }) => "export".to_string(),
+        Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
@@ -2871,6 +2963,7 @@ fn is_robot_mode(command: &Commands) -> bool {
         Commands::Introspect { json, .. } => *json || env_robot_mode,
         Commands::Context { json, .. } => *json || env_robot_mode,
         Commands::Expand { json, .. } => *json || env_robot_mode,
+        Commands::ExportHtml { json, .. } => *json || env_robot_mode,
         Commands::Timeline { json, .. } => *json || env_robot_mode,
         Commands::Sources(cmd) => match cmd {
             // Only `sources list` honors env-based structured output today.
@@ -9575,6 +9668,487 @@ fn run_export(
     }
 
     Ok(())
+}
+
+/// Export a session as a beautiful, self-contained HTML file with optional encryption.
+#[allow(clippy::too_many_arguments)]
+fn run_export_html(
+    session_path: &Path,
+    output_dir: Option<&Path>,
+    filename: Option<&str>,
+    encrypt: bool,
+    password: Option<&str>,
+    password_stdin: bool,
+    include_tools: bool,
+    show_timestamps: bool,
+    enable_cdns: bool,
+    theme: &str,
+    dry_run: bool,
+    explain: bool,
+    open: bool,
+    json_output: bool,
+) -> CliResult<()> {
+    use chrono::TimeZone;
+    use html_export::{
+        ExportOptions as HtmlExportOptions, HtmlExporter, Message, TemplateMetadata,
+        generate_full_filename, get_downloads_dir, is_valid_filename,
+    };
+    use std::fs::File;
+    use std::io::{self, BufRead, BufReader, Write};
+
+    // --- Validate session exists ---
+    if !session_path.exists() {
+        let err = CliError {
+            code: 3,
+            kind: "session_not_found",
+            message: format!("Session file not found: {}", session_path.display()),
+            hint: Some("Use 'cass search' to find session paths".to_string()),
+            retryable: false,
+        };
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "success": false,
+                    "error": {
+                        "code": err.code,
+                        "kind": err.kind,
+                        "message": err.message,
+                        "hint": err.hint,
+                        "retryable": err.retryable
+                    }
+                })
+            );
+            return Err(err);
+        }
+        return Err(err);
+    }
+
+    // --- Get password if encryption requested ---
+    let final_password: Option<String> = if encrypt {
+        if let Some(p) = password {
+            Some(p.to_string())
+        } else if password_stdin {
+            let mut pwd = String::new();
+            io::stdin().read_line(&mut pwd).map_err(|e| CliError {
+                code: 6,
+                kind: "password_read_error",
+                message: format!("Failed to read password from stdin: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+            Some(pwd.trim().to_string())
+        } else {
+            let err = CliError {
+                code: 6,
+                kind: "password_required",
+                message: "Password required for encryption".to_string(),
+                hint: Some("Use --password <pwd> or --password-stdin".to_string()),
+                retryable: false,
+            };
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": false,
+                        "error": {
+                            "code": err.code,
+                            "kind": err.kind,
+                            "message": err.message,
+                            "hint": err.hint,
+                            "retryable": err.retryable
+                        }
+                    })
+                );
+            }
+            return Err(err);
+        }
+    } else {
+        None
+    };
+
+    // --- Load session messages ---
+    let mut raw_messages: Vec<serde_json::Value> = Vec::new();
+    let mut session_title: Option<String> = None;
+    let mut session_start: Option<i64> = None;
+    let mut session_end: Option<i64> = None;
+    let mut agent_name: Option<String> = None;
+    let mut workspace: Option<String> = None;
+
+    // Detect agent from path
+    let path_str = session_path.to_string_lossy();
+    if path_str.contains(".claude") {
+        agent_name = Some("claude_code".to_string());
+    } else if path_str.contains(".codex") {
+        agent_name = Some("codex".to_string());
+    } else if path_str.contains("cursor") {
+        agent_name = Some("cursor".to_string());
+    } else if path_str.contains(".gemini") {
+        agent_name = Some("gemini".to_string());
+    }
+
+    // Extract workspace from path
+    if let Some(parent) = session_path.parent() {
+        workspace = Some(parent.display().to_string());
+    }
+
+    let is_opencode = detect_opencode_session(session_path);
+
+    if is_opencode {
+        match load_opencode_session_for_export(session_path) {
+            Ok((title, start, end, msgs)) => {
+                session_title = title;
+                session_start = start;
+                session_end = end;
+                raw_messages = msgs;
+                agent_name = Some("opencode".to_string());
+            }
+            Err(e) => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "opencode_parse",
+                    message: format!("Failed to parse OpenCode session: {e}"),
+                    hint: Some("Ensure the session file is valid".into()),
+                    retryable: false,
+                });
+            }
+        }
+    } else {
+        let file = File::open(session_path).map_err(|e| CliError {
+            code: 9,
+            kind: "file_open",
+            message: format!("Failed to open file: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(ts) = msg.get("timestamp").and_then(|t| t.as_i64()) {
+                    if session_start.is_none() || ts < session_start.unwrap() {
+                        session_start = Some(ts);
+                    }
+                    if session_end.is_none() || ts > session_end.unwrap() {
+                        session_end = Some(ts);
+                    }
+                }
+                raw_messages.push(msg);
+            }
+        }
+    }
+
+    if raw_messages.is_empty() {
+        return Err(CliError {
+            code: 9,
+            kind: "empty_session",
+            message: format!("No messages found in: {}", session_path.display()),
+            hint: None,
+            retryable: false,
+        });
+    }
+
+    // Find title from first user message
+    if session_title.is_none() {
+        for msg in &raw_messages {
+            let role = extract_role(msg);
+            if role == "user" {
+                let content = extract_text_content(msg);
+                if !content.is_empty() {
+                    session_title = Some(
+                        content
+                            .lines()
+                            .next()
+                            .unwrap_or("Untitled Session")
+                            .chars()
+                            .take(80)
+                            .collect(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- Convert to renderer::Message format ---
+    let messages: Vec<Message> = raw_messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let role = extract_role(msg);
+            let content = extract_text_content(msg);
+            let ts = msg.get("timestamp").and_then(|t| t.as_i64());
+            let timestamp = ts
+                .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
+                .map(|dt| dt.to_rfc3339());
+
+            // Extract tool call info if present
+            let tool_call = if include_tools {
+                extract_tool_call(msg)
+            } else {
+                None
+            };
+
+            Message {
+                role,
+                content,
+                timestamp,
+                tool_call,
+                index: Some(i),
+                author: None,
+            }
+        })
+        .collect();
+
+    // --- Build metadata ---
+    let duration = match (session_start, session_end) {
+        (Some(start), Some(end)) if end > start => {
+            let mins = (end - start) / 60_000;
+            if mins >= 60 {
+                Some(format!("{}h {}m", mins / 60, mins % 60))
+            } else if mins > 0 {
+                Some(format!("{}m", mins))
+            } else {
+                Some("< 1m".to_string())
+            }
+        }
+        _ => None,
+    };
+
+    let metadata = TemplateMetadata {
+        timestamp: session_start.map(|ts| {
+            chrono::Utc
+                .timestamp_millis_opt(ts)
+                .single()
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_default()
+        }),
+        agent: agent_name.clone(),
+        message_count: messages.len(),
+        duration,
+        project: workspace.clone(),
+    };
+
+    // --- Generate output path ---
+    let output_directory = output_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| get_downloads_dir());
+
+    let workspace_path = workspace.as_deref().map(Path::new);
+
+    let mut final_filename = if let Some(name) = filename {
+        name.to_string()
+    } else {
+        generate_full_filename(
+            agent_name.as_deref().unwrap_or("cass"),
+            workspace_path,
+            session_start,
+            session_title.as_deref(),
+            session_title.as_deref(),
+        )
+    };
+
+    if Path::new(&final_filename).extension().is_none() {
+        final_filename.push_str(".html");
+    }
+
+    if filename.is_some() && !is_valid_filename(&final_filename) {
+        return Err(CliError {
+            code: 4,
+            kind: "invalid_filename",
+            message: format!("Invalid output filename: {final_filename}"),
+            hint: Some("Avoid path separators and reserved characters".to_string()),
+            retryable: false,
+        });
+    }
+
+    let output_path = output_directory.join(final_filename);
+
+    // Estimate file size (rough: 200 bytes per message + overhead)
+    let estimated_size = messages.len() * 200 + 15000;
+
+    // --- Explain mode ---
+    if explain {
+        let plan = serde_json::json!({
+            "plan": {
+                "session_path": session_path.display().to_string(),
+                "agent": agent_name,
+                "messages": messages.len(),
+                "output_path": output_path.display().to_string(),
+                "estimated_size_bytes": estimated_size,
+                "options": {
+                    "encrypted": encrypt,
+                    "include_tools": include_tools,
+                    "show_timestamps": show_timestamps,
+                    "cdns_enabled": enable_cdns,
+                    "default_theme": theme
+                }
+            },
+            "warnings": []
+        });
+        println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+        return Ok(());
+    }
+
+    // --- Dry run mode ---
+    if dry_run {
+        let result = serde_json::json!({
+            "dry_run": true,
+            "valid": true,
+            "session_path": session_path.display().to_string(),
+            "output_path": output_path.display().to_string(),
+            "messages": messages.len(),
+            "encrypted": encrypt,
+            "estimated_size_bytes": estimated_size
+        });
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        return Ok(());
+    }
+
+    // --- Build export options ---
+    let export_options = HtmlExportOptions {
+        title: session_title.clone(),
+        include_cdn: enable_cdns,
+        syntax_highlighting: true,
+        include_search: true,
+        include_theme_toggle: true,
+        encrypt,
+        print_styles: true,
+        agent_name: agent_name.clone(),
+        show_timestamps,
+        show_tool_calls: include_tools,
+    };
+
+    // --- Export ---
+    let exporter = HtmlExporter::with_options(export_options);
+    let title = session_title.as_deref().unwrap_or("Conversation Export");
+
+    let html = exporter
+        .export_messages(title, &messages, metadata, final_password.as_deref())
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "export_failed",
+            message: format!("Failed to export HTML: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+    // --- Write file ---
+    std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new("."))).ok();
+    let mut file = File::create(&output_path).map_err(|e| CliError {
+        code: 4,
+        kind: "output_not_writable",
+        message: format!("Could not create output file: {e}"),
+        hint: Some(format!(
+            "Check permissions for {}",
+            output_directory.display()
+        )),
+        retryable: false,
+    })?;
+    file.write_all(html.as_bytes()).map_err(|e| CliError {
+        code: 4,
+        kind: "write_failed",
+        message: format!("Failed to write file: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let file_size = html.len();
+
+    // --- Open in browser if requested ---
+    if open {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&output_path).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&output_path)
+                .spawn();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer")
+                .arg(&output_path)
+                .spawn();
+        }
+    }
+
+    // --- Output result ---
+    if json_output {
+        let result = serde_json::json!({
+            "success": true,
+            "exported": {
+                "session_path": session_path.display().to_string(),
+                "output_path": output_path.display().to_string(),
+                "filename": output_path.file_name().map(|n| n.to_string_lossy().to_string()),
+                "size_bytes": file_size,
+                "encrypted": encrypt,
+                "messages_count": messages.len(),
+                "agent": agent_name,
+                "workspace": workspace,
+                "title": session_title
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    } else {
+        println!("✓ Exported to {}", output_path.display());
+        if encrypt {
+            println!("  🔒 Encrypted with Web Crypto (AES-256-GCM)");
+        }
+        println!("  {} messages, {} bytes", messages.len(), file_size);
+    }
+
+    Ok(())
+}
+
+/// Extract tool call information from a message for HTML export.
+fn extract_tool_call(msg: &serde_json::Value) -> Option<html_export::ToolCall> {
+    let content = msg
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| msg.get("content"));
+
+    if let Some(arr) = content.and_then(|c| c.as_array()) {
+        for block in arr {
+            if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
+                match block_type {
+                    "tool_use" => {
+                        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        let input = block.get("input");
+                        return Some(html_export::ToolCall {
+                            name: name.to_string(),
+                            input: input.map(|i| i.to_string()).unwrap_or_default(),
+                            output: None,
+                            status: Some(html_export::ToolStatus::Pending),
+                        });
+                    }
+                    "tool_result" => {
+                        let content = block.get("content").map(|c| {
+                            if let Some(s) = c.as_str() {
+                                s.to_string()
+                            } else {
+                                c.to_string()
+                            }
+                        });
+                        return Some(html_export::ToolCall {
+                            name: "tool_result".to_string(),
+                            input: String::new(),
+                            output: content,
+                            status: Some(html_export::ToolStatus::Success),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn format_as_markdown(
