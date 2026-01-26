@@ -10,8 +10,8 @@
 //! without locking in a protocol prematurely.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -48,25 +48,25 @@ impl DaemonRetryConfig {
     /// Load retry config from env if present; fall back to defaults.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(val) = dotenvy::var("CASS_DAEMON_RETRY_MAX") {
-            if let Ok(parsed) = val.parse::<u32>() {
-                cfg.max_attempts = parsed.max(1);
-            }
+        if let Ok(val) = dotenvy::var("CASS_DAEMON_RETRY_MAX")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            cfg.max_attempts = parsed.max(1);
         }
-        if let Ok(val) = dotenvy::var("CASS_DAEMON_BACKOFF_BASE_MS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                cfg.base_delay = Duration::from_millis(parsed.max(1));
-            }
+        if let Ok(val) = dotenvy::var("CASS_DAEMON_BACKOFF_BASE_MS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            cfg.base_delay = Duration::from_millis(parsed.max(1));
         }
-        if let Ok(val) = dotenvy::var("CASS_DAEMON_BACKOFF_MAX_MS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                cfg.max_delay = Duration::from_millis(parsed.max(1));
-            }
+        if let Ok(val) = dotenvy::var("CASS_DAEMON_BACKOFF_MAX_MS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            cfg.max_delay = Duration::from_millis(parsed.max(1));
         }
-        if let Ok(val) = dotenvy::var("CASS_DAEMON_JITTER_PCT") {
-            if let Ok(parsed) = val.parse::<f64>() {
-                cfg.jitter_pct = parsed.clamp(0.0, 1.0);
-            }
+        if let Ok(val) = dotenvy::var("CASS_DAEMON_JITTER_PCT")
+            && let Ok(parsed) = val.parse::<f64>()
+        {
+            cfg.jitter_pct = parsed.clamp(0.0, 1.0);
         }
         cfg
     }
@@ -76,10 +76,7 @@ impl DaemonRetryConfig {
             return explicit.min(self.max_delay);
         }
         let exp = 2u32.saturating_pow(attempt.saturating_sub(1));
-        let base = self
-            .base_delay
-            .checked_mul(exp)
-            .unwrap_or(self.max_delay);
+        let base = self.base_delay.checked_mul(exp).unwrap_or(self.max_delay);
         apply_jitter(base.min(self.max_delay), self.jitter_pct)
     }
 }
@@ -88,7 +85,10 @@ impl DaemonRetryConfig {
 pub enum DaemonError {
     Unavailable(String),
     Timeout(String),
-    Overloaded { retry_after: Option<Duration>, message: String },
+    Overloaded {
+        retry_after: Option<Duration>,
+        message: String,
+    },
     Failed(String),
     InvalidInput(String),
 }
@@ -122,6 +122,54 @@ pub trait DaemonClient: Send + Sync {
     ) -> Result<Vec<f32>, DaemonError>;
 }
 
+/// No-op daemon client used when daemon config is missing.
+pub struct NoopDaemonClient {
+    id: String,
+}
+
+impl NoopDaemonClient {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+impl DaemonClient for NoopDaemonClient {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn embed(&self, _text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
+        Err(DaemonError::Unavailable(
+            "daemon not configured".to_string(),
+        ))
+    }
+
+    fn embed_batch(
+        &self,
+        _texts: &[&str],
+        _request_id: &str,
+    ) -> Result<Vec<Vec<f32>>, DaemonError> {
+        Err(DaemonError::Unavailable(
+            "daemon not configured".to_string(),
+        ))
+    }
+
+    fn rerank(
+        &self,
+        _query: &str,
+        _documents: &[&str],
+        _request_id: &str,
+    ) -> Result<Vec<f32>, DaemonError> {
+        Err(DaemonError::Unavailable(
+            "daemon not configured".to_string(),
+        ))
+    }
+}
+
 #[derive(Debug)]
 struct DaemonState {
     consecutive_failures: u32,
@@ -137,7 +185,7 @@ impl DaemonState {
     }
 
     fn can_attempt(&self, now: Instant) -> bool {
-        self.next_retry_at.map_or(true, |at| now >= at)
+        self.next_retry_at.is_none_or(|at| now >= at)
     }
 
     fn record_success(&mut self) {
@@ -154,6 +202,13 @@ impl DaemonState {
         let backoff = config.backoff_for_attempt(self.consecutive_failures, retry_after);
         self.next_retry_at = Some(Instant::now() + backoff);
     }
+}
+
+#[derive(Debug)]
+struct DaemonFailure {
+    error: DaemonError,
+    attempts: u32,
+    backoff: bool,
 }
 
 /// Embedder wrapper that uses the daemon when available and falls back to a local embedder.
@@ -179,7 +234,10 @@ impl DaemonFallbackEmbedder {
     }
 
     fn should_retry(err: &DaemonError) -> bool {
-        !matches!(err, DaemonError::InvalidInput(_) | DaemonError::Overloaded { .. })
+        !matches!(
+            err,
+            DaemonError::InvalidInput(_) | DaemonError::Overloaded { .. }
+        )
     }
 
     fn fallback_reason(err: &DaemonError, backoff_active: bool) -> &'static str {
@@ -205,15 +263,23 @@ impl DaemonFallbackEmbedder {
         );
     }
 
-    fn try_embed(&self, request_id: &str, text: &str) -> Result<Vec<f32>, DaemonError> {
+    fn try_embed(&self, request_id: &str, text: &str) -> Result<Vec<f32>, DaemonFailure> {
         if !self.daemon.is_available() {
-            return Err(DaemonError::Unavailable("daemon not available".to_string()));
+            return Err(DaemonFailure {
+                error: DaemonError::Unavailable("daemon not available".to_string()),
+                attempts: 0,
+                backoff: false,
+            });
         }
         let now = Instant::now();
         {
             let state = self.state.lock();
             if !state.can_attempt(now) {
-                return Err(DaemonError::Unavailable("backoff active".to_string()));
+                return Err(DaemonFailure {
+                    error: DaemonError::Unavailable("backoff active".to_string()),
+                    attempts: 0,
+                    backoff: true,
+                });
             }
         }
         let mut attempts = 0;
@@ -235,24 +301,35 @@ impl DaemonFallbackEmbedder {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            DaemonError::Unavailable("daemon embed failed".to_string())
-        }))
+        Err(DaemonFailure {
+            error: last_err
+                .unwrap_or_else(|| DaemonError::Unavailable("daemon embed failed".to_string())),
+            attempts,
+            backoff: false,
+        })
     }
 
     fn try_embed_batch(
         &self,
         request_id: &str,
         texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, DaemonError> {
+    ) -> Result<Vec<Vec<f32>>, DaemonFailure> {
         if !self.daemon.is_available() {
-            return Err(DaemonError::Unavailable("daemon not available".to_string()));
+            return Err(DaemonFailure {
+                error: DaemonError::Unavailable("daemon not available".to_string()),
+                attempts: 0,
+                backoff: false,
+            });
         }
         let now = Instant::now();
         {
             let state = self.state.lock();
             if !state.can_attempt(now) {
-                return Err(DaemonError::Unavailable("backoff active".to_string()));
+                return Err(DaemonFailure {
+                    error: DaemonError::Unavailable("backoff active".to_string()),
+                    attempts: 0,
+                    backoff: true,
+                });
             }
         }
         let mut attempts = 0;
@@ -274,9 +351,12 @@ impl DaemonFallbackEmbedder {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            DaemonError::Unavailable("daemon embed failed".to_string())
-        }))
+        Err(DaemonFailure {
+            error: last_err
+                .unwrap_or_else(|| DaemonError::Unavailable("daemon embed failed".to_string())),
+            attempts,
+            backoff: false,
+        })
     }
 }
 
@@ -285,13 +365,10 @@ impl Embedder for DaemonFallbackEmbedder {
         let request_id = next_request_id();
         match self.try_embed(&request_id, text) {
             Ok(vector) => Ok(vector),
-            Err(err) => {
-                let backoff_active = matches!(
-                    err,
-                    DaemonError::Unavailable(ref msg) if msg.contains("backoff")
-                );
-                let reason = Self::fallback_reason(&err, backoff_active);
-                self.log_fallback(&request_id, self.config.max_attempts.saturating_sub(1), reason);
+            Err(failure) => {
+                let retries = failure.attempts.saturating_sub(1);
+                let reason = Self::fallback_reason(&failure.error, failure.backoff);
+                self.log_fallback(&request_id, retries, reason);
                 self.fallback.embed(text)
             }
         }
@@ -301,13 +378,10 @@ impl Embedder for DaemonFallbackEmbedder {
         let request_id = next_request_id();
         match self.try_embed_batch(&request_id, texts) {
             Ok(vectors) => Ok(vectors),
-            Err(err) => {
-                let backoff_active = matches!(
-                    err,
-                    DaemonError::Unavailable(ref msg) if msg.contains("backoff")
-                );
-                let reason = Self::fallback_reason(&err, backoff_active);
-                self.log_fallback(&request_id, self.config.max_attempts.saturating_sub(1), reason);
+            Err(failure) => {
+                let retries = failure.attempts.saturating_sub(1);
+                let reason = Self::fallback_reason(&failure.error, failure.backoff);
+                self.log_fallback(&request_id, retries, reason);
                 self.fallback.embed_batch(texts)
             }
         }
@@ -363,15 +437,23 @@ impl DaemonFallbackReranker {
         request_id: &str,
         query: &str,
         documents: &[&str],
-    ) -> Result<Vec<f32>, DaemonError> {
+    ) -> Result<Vec<f32>, DaemonFailure> {
         if !self.daemon.is_available() {
-            return Err(DaemonError::Unavailable("daemon not available".to_string()));
+            return Err(DaemonFailure {
+                error: DaemonError::Unavailable("daemon not available".to_string()),
+                attempts: 0,
+                backoff: false,
+            });
         }
         let now = Instant::now();
         {
             let state = self.state.lock();
             if !state.can_attempt(now) {
-                return Err(DaemonError::Unavailable("backoff active".to_string()));
+                return Err(DaemonFailure {
+                    error: DaemonError::Unavailable("backoff active".to_string()),
+                    attempts: 0,
+                    backoff: true,
+                });
             }
         }
         let mut attempts = 0;
@@ -393,9 +475,12 @@ impl DaemonFallbackReranker {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            DaemonError::Unavailable("daemon rerank failed".to_string())
-        }))
+        Err(DaemonFailure {
+            error: last_err
+                .unwrap_or_else(|| DaemonError::Unavailable("daemon rerank failed".to_string())),
+            attempts,
+            backoff: false,
+        })
     }
 }
 
@@ -404,13 +489,11 @@ impl Reranker for DaemonFallbackReranker {
         let request_id = next_request_id();
         match self.try_rerank(&request_id, query, documents) {
             Ok(scores) => Ok(scores),
-            Err(err) => {
-                let backoff_active = matches!(
-                    err,
-                    DaemonError::Unavailable(ref msg) if msg.contains("backoff")
-                );
-                let reason = DaemonFallbackEmbedder::fallback_reason(&err, backoff_active);
-                self.log_fallback(&request_id, self.config.max_attempts.saturating_sub(1), reason);
+            Err(failure) => {
+                let retries = failure.attempts.saturating_sub(1);
+                let reason =
+                    DaemonFallbackEmbedder::fallback_reason(&failure.error, failure.backoff);
+                self.log_fallback(&request_id, retries, reason);
                 match &self.fallback {
                     Some(reranker) => reranker.rerank(query, documents),
                     None => Err(RerankerError::Unavailable(
@@ -460,9 +543,7 @@ fn next_jitter_unit() -> f64 {
     static SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
     let mut current = SEED.load(Ordering::Relaxed);
     loop {
-        let next = current
-            .wrapping_mul(6364136223846793005u64)
-            .wrapping_add(1);
+        let next = current.wrapping_mul(6364136223846793005u64).wrapping_add(1);
         match SEED.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => {
                 // Use top 53 bits for a uniform f64 in [0, 1)
@@ -587,8 +668,10 @@ mod tests {
     fn daemon_embedder_falls_back_on_failure() {
         let daemon = Arc::new(MockDaemon::new(10));
         let fallback = Arc::new(MockEmbedder { dim: 4 });
-        let mut cfg = DaemonRetryConfig::default();
-        cfg.max_attempts = 1;
+        let cfg = DaemonRetryConfig {
+            max_attempts: 1,
+            ..DaemonRetryConfig::default()
+        };
 
         let embedder = DaemonFallbackEmbedder::new(daemon, fallback, cfg);
         let result = embedder.embed("hello").unwrap();
@@ -600,8 +683,10 @@ mod tests {
     fn daemon_reranker_falls_back_on_failure() {
         let daemon = Arc::new(MockDaemon::new(10));
         let fallback = Arc::new(MockReranker);
-        let mut cfg = DaemonRetryConfig::default();
-        cfg.max_attempts = 1;
+        let cfg = DaemonRetryConfig {
+            max_attempts: 1,
+            ..DaemonRetryConfig::default()
+        };
 
         let reranker = DaemonFallbackReranker::new(daemon, Some(fallback), cfg);
         let result = reranker.rerank("q", &["a", "b"]).unwrap();
@@ -612,10 +697,12 @@ mod tests {
     fn daemon_backoff_skips_until_ready() {
         let daemon = Arc::new(MockDaemon::new(1));
         let fallback = Arc::new(MockEmbedder { dim: 4 });
-        let mut cfg = DaemonRetryConfig::default();
-        cfg.max_attempts = 1;
-        cfg.base_delay = Duration::from_millis(10);
-        cfg.max_delay = Duration::from_millis(10);
+        let cfg = DaemonRetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+            ..DaemonRetryConfig::default()
+        };
 
         let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg);
         let _ = embedder.embed("first").unwrap();
