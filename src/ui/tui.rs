@@ -19,7 +19,7 @@ use ratatui::widgets::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -58,6 +58,17 @@ enum DetailTab {
     Messages,
     Snippets,
     Raw,
+}
+
+#[derive(Debug, Clone)]
+enum ExportTaskEvent {
+    Progress(ExportProgress),
+    Completed {
+        output_path: PathBuf,
+        file_size: usize,
+        encrypted: bool,
+    },
+    Failed(String),
 }
 
 /// Format a timestamp as a short human-readable date for filter chips.

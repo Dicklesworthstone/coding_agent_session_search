@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-01-25
+**Date:** 2026-01-26
 **Project:** coding-agent-search
 **Language:** Rust
 **Manifest:** Cargo.toml
@@ -11,155 +11,115 @@
 
 | Metric | Count |
 |--------|-------|
-| **Total dependencies** | X |
-| **Updated** | X |
-| **Skipped** | X |
-| **Failed (rolled back)** | X |
-| **Requires attention** | X |
+| **Total dependencies reviewed** | 11 |
+| **Updated** | 0 |
+| **Skipped** | 8 |
+| **Failed (blocked by constraints)** | 3 |
+| **Requires attention** | 0 |
 
 ---
 
-## Successfully Updated
+## Failed / Blocked Updates
 
-### package-name: 1.0.0 → 1.2.0
+### thiserror: 1.0.69 → 2.0.18
 
-**Changelog:** [GitHub Release](URL)
+**Changelog:** https://github.com/dtolnay/thiserror/releases/tag/2.0.0
 
-**Breaking changes:** None
+**Breaking changes (2.0.0):**
+- `{r#field}` raw identifiers in format strings are no longer accepted
+- Trait bounds no longer inferred when explicit named args shadow fields
+- Tuple field indices cannot be mixed with extra positional args
 
-**Notable changes:**
-- New feature X
-- Performance improvement Y
-
-**Deprecations fixed:** None
-
-**Tests:** ✓ Passed
-
----
-
-### another-package: 2.1.0 → 2.3.0
-
-**Changelog:** [CHANGELOG.md](URL)
-
-**Breaking changes:**
-- `old_function()` renamed to `new_function()`
-
-**Migration applied:**
-```diff
-- old_function(args)
-+ new_function(args)
+**Attempted update:**
+```
+cargo update -p thiserror@1.0.69 --precise 2.0.18
 ```
 
-**Files modified:** 3
-- `src/main.rs`
-- `src/lib.rs`
-- `tests/integration.rs`
+**Blocked by:** `termwiz v0.23.3` (via `ratatui-termwiz v0.1.0` → `ratatui 0.30.0`) requiring `thiserror ^1.0`.
 
-**Tests:** ✓ Passed after fix
+**Action:** Skipped (no lockfile change).
 
 ---
 
-## Skipped
+### rand: 0.8.5 → 0.9.2
 
-### pinned-package: =1.5.0
-**Reason:** Exact version pinned (intentional)
+**Changelog:** https://github.com/rust-random/rand/blob/master/CHANGELOG.md
 
-### nightly-package: 0.0.0-nightly
-**Reason:** Using nightly channel (preserved)
+**Breaking changes (0.9.0):**
+- `Rng::gen` → `random`, `Rng::gen_range` → `random_range`
+- `rand::thread_rng()` → `rand::rng()`
+- `rand::distributions` → `rand::distr`
 
-### already-latest: 3.0.0
-**Reason:** Already on latest stable
-
----
-
-## Failed Updates (Rolled Back)
-
-### problematic-package: 1.0.0 → 2.0.0
-
-**Reason:** Test failures could not be resolved
-
-**Error:**
+**Attempted update:**
 ```
-error[E0599]: no method named `removed_method` found
+cargo update -p rand@0.8.5 --precise 0.9.2
 ```
 
-**Attempted fixes:**
-1. Searched for migration guide - none found
-2. Web search for similar issues - found GitHub issue #123
-3. Attempted workaround from issue - did not apply
+**Blocked by:** `rand_distr v0.4.3` (via `tantivy-stacker v0.6.0` → `tantivy 0.25.0`) requiring `rand ^0.8`.
 
-**Recommendation:** Wait for upstream fix or community migration guide
-
-**Rolled back to:** 1.0.0
+**Action:** Skipped (no lockfile change).
 
 ---
 
-## Requires Attention
+### security-framework: 2.11.1 → 3.5.1
 
-### major-upgrade: 1.0.0 → 2.0.0
+**Attempted update:**
+```
+cargo update -p security-framework@2.11.1 --precise 3.5.1
+```
 
-**Issue:** Major API redesign affecting ~25 files
+**Blocked by:** `native-tls v0.2.14` (via `ureq 3.1.4` → `ort 2.0.0-rc.11` → `fastembed 5.8.1`) requiring `security-framework ^2.0`.
 
-**Breaking changes:**
-- Complete module restructure
-- New error handling pattern
-- Removed deprecated functions
-
-**Estimated effort:** Significant refactoring required
-
-**Migration guide:** [Link](URL)
-
-**Recommendation:** Schedule dedicated session for this upgrade
-
-**User decision needed:** Proceed with refactoring? (y/n)
+**Action:** Skipped (no lockfile change).
 
 ---
 
-## Deprecation Warnings Fixed
+## Skipped (Blocked or Already Latest)
 
-| Package | Warning | Fix Applied |
-|---------|---------|-------------|
-| some-lib | `deprecated_fn()` | Replaced with `new_fn()` |
-| other-lib | `OldType` | Replaced with `NewType` |
+### rand_chacha: 0.3.1 → 0.9.0
+**Reason:** Blocked by `rand` staying on 0.8.x; upgrading would cause rand_core trait mismatches.
+
+### rand_core: 0.6.4 → 0.9.5
+**Reason:** Blocked by `rand` staying on 0.8.x.
+
+### getrandom: 0.2.17 → 0.3.4
+**Reason:** Blocked by `rand_core 0.6.x` in `rand 0.8.x`.
+
+### core-foundation: 0.9.4 → 0.10.1
+**Reason:** Blocked by `security-framework 2.x` dependency chain.
+
+### thiserror-impl: 1.0.69 → 2.0.18
+**Reason:** Blocked by `thiserror` staying on 1.0.x.
+
+### libc: 0.2.180 → Removed
+**Reason:** Reported as Removed by `cargo outdated`; transitive dependency with no update path.
+
+### wasi: 0.11.1+wasi-snapshot-preview1 → Removed
+**Reason:** Reported as Removed by `cargo outdated`; transitive dependency with no update path.
+
+### reqwest: 0.13.1 → 0.13.1
+**Reason:** Already on latest stable (not listed by `cargo outdated`).
 
 ---
 
-## Security Notes
+## Tests
 
-**Vulnerabilities resolved:**
-- CVE-XXXX-YYYY in package-a (1.0.0 → 1.0.1)
-
-**New advisories:** None detected
-
-**Audit command:** `cargo audit` / `npm audit` / etc.
-
----
-
-## Post-Upgrade Checklist
-
-- [ ] All tests passing
-- [ ] No deprecation warnings
-- [ ] Manual smoke test performed
-- [ ] Documentation updated (if needed)
-- [ ] Changes committed
+- Not run yet (no dependency updates applied).
 
 ---
 
 ## Commands Used
 
 ```bash
-# Update commands
-COMMAND_USED
-
-# Test commands
-TEST_COMMAND
-
-# Audit commands
-AUDIT_COMMAND
+cargo outdated -w
+cargo update -p thiserror@1.0.69 --precise 2.0.18
+cargo update -p rand@0.8.5 --precise 0.9.2
+cargo update -p security-framework@2.11.1 --precise 3.5.1
 ```
 
 ---
 
 ## Notes
 
-Additional observations, edge cases encountered, or recommendations for future upgrades.
+- Upgrades are blocked by upstream dependencies that already appear to be at their latest stable versions.
+- Revisit when `ratatui`/`termwiz`, `tantivy`, or `native-tls` move to newer major versions that lift these constraints.

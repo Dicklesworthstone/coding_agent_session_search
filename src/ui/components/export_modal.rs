@@ -161,8 +161,14 @@ impl ExportModalState {
             .first()
             .map(|m| {
                 let content = m.content.trim();
-                if content.len() > 60 {
-                    format!("{}...", &content[..57])
+                // Use char_indices to safely truncate at UTF-8 boundary (57 chars + "...")
+                if content.chars().count() > 60 {
+                    let end_idx = content
+                        .char_indices()
+                        .nth(56)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(content.len());
+                    format!("{}...", &content[..end_idx])
                 } else {
                     content.to_string()
                 }
