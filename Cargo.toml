@@ -175,3 +175,7 @@ path = "tests/docs/mod.rs"
 [[test]]
 name = "upgrade"
 path = "tests/upgrade/mod.rs"
+
+[[test]]
+name = "recovery"
+path = "tests/recovery/mod.rs"
