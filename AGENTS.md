@@ -139,6 +139,24 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
+## E2E Browser Tests
+
+**IMPORTANT:** E2E browser tests (Playwright) should only be run on GitHub Actions CI, NOT locally.
+
+Running browser tests locally:
+- Consumes significant system resources (spawns browser instances)
+- Can freeze or slow down the development machine
+- May have different results than CI due to environment differences
+
+**Push to a branch and let GitHub Actions run the tests.** The CI workflow in `.github/workflows/browser-tests.yml` handles:
+- Installing browsers
+- Running tests in parallel across Chromium, Firefox, and WebKit
+- Uploading test artifacts and reports
+
+If you need to debug a specific test, use `test.only()` and run a single spec file, but prefer CI for full test runs.
+
+---
+
 ## Third-Party Library Usage
 
 If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and mid-2025 best practices.
