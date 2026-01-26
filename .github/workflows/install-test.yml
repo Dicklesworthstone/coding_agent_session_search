@@ -121,13 +121,6 @@ jobs:
           echo "" | tee -a install-test.log
           echo "=== All verification checks passed ===" | tee -a install-test.log
 
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: install-test-linux-logs
-          path: install-test.log
-
       - name: Output repro command on failure
         if: failure()
         run: |
@@ -143,6 +136,13 @@ jobs:
           echo "  CHECKSUM=\$(cat /tmp/test-artifacts/cass-vtest-linux-x86_64.tar.gz.sha256 | cut -d' ' -f1) \\" | tee -a install-test.log
           echo "  RUSTUP_INIT_SKIP=1 \\" | tee -a install-test.log
           echo "  bash install.sh --version vtest --easy-mode --verify --dest /tmp/cass-install" | tee -a install-test.log
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-test-linux-logs
+          path: install-test.log
 
   # Real install E2E test on macOS
   install-macos:
@@ -236,13 +236,6 @@ jobs:
           echo "" | tee -a install-test.log
           echo "=== All verification checks passed ===" | tee -a install-test.log
 
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: install-test-macos-logs
-          path: install-test.log
-
       - name: Output repro command on failure
         if: failure()
         run: |
@@ -258,3 +251,10 @@ jobs:
           echo "  CHECKSUM=\$(cat /tmp/test-artifacts/cass-vtest-macos-arm64.tar.gz.sha256 | cut -d' ' -f1) \\" | tee -a install-test.log
           echo "  RUSTUP_INIT_SKIP=1 \\" | tee -a install-test.log
           echo "  bash install.sh --version vtest --easy-mode --verify --dest /tmp/cass-install" | tee -a install-test.log
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-test-macos-logs
+          path: install-test.log
