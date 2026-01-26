@@ -1920,14 +1920,27 @@ fn update_daily_stats_in_tx(
         .unwrap_or(0);
     let now = SqliteStorage::now_millis();
 
-    let updates = [
-        (agent_slug, source_id),
-        ("all", source_id),
-        (agent_slug, "all"),
-        ("all", "all"),
-    ];
+    let mut unique_updates = Vec::with_capacity(4);
 
-    for (agent, source) in updates {
+    // Add specific entry if neither is "all"
+    if agent_slug != "all" && source_id != "all" {
+        unique_updates.push((agent_slug, source_id));
+    }
+
+    // Add "all agents" entry for this source
+    if source_id != "all" {
+        unique_updates.push(("all", source_id));
+    }
+
+    // Add "all sources" entry for this agent
+    if agent_slug != "all" {
+        unique_updates.push((agent_slug, "all"));
+    }
+
+    // Always add global total
+    unique_updates.push(("all", "all"));
+
+    for (agent, source) in unique_updates {
         tx.execute(
             "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
              VALUES (?, ?, ?, ?, ?, ?, ?)
