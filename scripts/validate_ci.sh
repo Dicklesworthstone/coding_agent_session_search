@@ -3,7 +3,114 @@
 
 set -e
 
+# Parse arguments
+NO_MOCK_ONLY=false
+for arg in "$@"; do
+    case $arg in
+        --no-mock-only)
+            NO_MOCK_ONLY=true
+            shift
+            ;;
+    esac
+done
+
 echo "=== Validating CI Pipeline ==="
+
+# ============================================================
+# No-Mock Policy Check
+# ============================================================
+echo "0. Checking no-mock policy compliance..."
+
+if [ "$SKIP_NO_MOCK_CHECK" = "1" ]; then
+    echo "  (Skipping no-mock check: SKIP_NO_MOCK_CHECK=1)"
+elif command -v rg &> /dev/null && command -v jq &> /dev/null; then
+    ALLOWLIST_FILE="test-results/no_mock_allowlist.json"
+    VIOLATIONS_FILE=$(mktemp)
+
+    # Search for mock/fake/stub patterns
+    # Use explicit patterns to avoid false positives with -i flag
+    # - CamelCase: MockFoo, FakeBar, StubBaz (without -i, exact case)
+    # - snake_case: mock_, fake_, stub_ (case insensitive)
+    # Exclude node_modules, target, .git, and fixture files
+    rg -n "(Mock[A-Z][a-z]|Fake[A-Z][a-z]|Stub[A-Z][a-z]|mock_|fake_|stub_)" \
+        --glob '!node_modules/**' \
+        --glob '!target/**' \
+        --glob '!.git/**' \
+        --glob '!tests/fixtures/**' \
+        --glob '!test-results/**' \
+        --glob '!*.md' \
+        --glob '!*.json' \
+        src/ tests/ 2>/dev/null > "$VIOLATIONS_FILE" || true
+
+    # Count violations
+    VIOLATION_COUNT=$(wc -l < "$VIOLATIONS_FILE" | tr -d ' ')
+
+    if [ "$VIOLATION_COUNT" -gt 0 ]; then
+        echo "  Found $VIOLATION_COUNT mock/fake/stub pattern(s)"
+
+        # Check if allowlist exists
+        if [ -f "$ALLOWLIST_FILE" ]; then
+            ALLOWLIST_ENTRIES=$(jq -r '.entries[] | "\(.path):\(.pattern)"' "$ALLOWLIST_FILE" 2>/dev/null || echo "")
+            UNALLOWED_COUNT=0
+
+            while IFS= read -r line; do
+                FILE=$(echo "$line" | cut -d: -f1)
+                PATTERN=$(echo "$line" | grep -oiE "(Mock[A-Z][a-zA-Z]*|Fake[A-Z][a-zA-Z]*|Stub[A-Z][a-zA-Z]*|mock_[a-z_]+|fake_[a-z_]+|stub_[a-z_]+)" | head -1)
+
+                # Check if this file:pattern combination is allowlisted
+                ALLOWED=false
+                for entry in $ALLOWLIST_ENTRIES; do
+                    ENTRY_PATH=$(echo "$entry" | cut -d: -f1)
+                    ENTRY_PATTERN=$(echo "$entry" | cut -d: -f2)
+
+                    if [[ "$FILE" == *"$ENTRY_PATH"* ]] && [[ "$PATTERN" == *"$ENTRY_PATTERN"* || "$ENTRY_PATTERN" == *"$PATTERN"* ]]; then
+                        ALLOWED=true
+                        break
+                    fi
+                done
+
+                if [ "$ALLOWED" = false ]; then
+                    echo "  VIOLATION: $line"
+                    UNALLOWED_COUNT=$((UNALLOWED_COUNT + 1))
+                fi
+            done < "$VIOLATIONS_FILE"
+
+            if [ "$UNALLOWED_COUNT" -gt 0 ]; then
+                echo ""
+                echo "  ERROR: $UNALLOWED_COUNT unapproved mock/fake/stub pattern(s) found!"
+                echo "  See TESTING.md 'No-Mock Policy' for how to request an exception."
+                echo ""
+                rm -f "$VIOLATIONS_FILE"
+                if [ "$NO_MOCK_ONLY" = true ]; then
+                    exit 1
+                else
+                    # Continue with other checks but mark as failed
+                    NO_MOCK_FAILED=true
+                fi
+            else
+                echo "  All patterns are allowlisted - OK"
+            fi
+        else
+            echo "  WARNING: Allowlist file not found at $ALLOWLIST_FILE"
+            echo "  Run 'br show bd-28iz' for setup instructions"
+        fi
+    else
+        echo "  No mock/fake/stub patterns found - OK"
+    fi
+
+    rm -f "$VIOLATIONS_FILE"
+else
+    echo "  (Skipping no-mock check: rg or jq not found)"
+fi
+
+# Exit early if --no-mock-only flag was passed
+if [ "$NO_MOCK_ONLY" = true ]; then
+    if [ "$NO_MOCK_FAILED" = true ]; then
+        exit 1
+    fi
+    echo "  No-mock check passed"
+    exit 0
+fi
 
 echo "1. Checking workflow syntax..."
 # Requires 'yq' or similar, skipping strict syntax check for now if not present
@@ -28,5 +135,29 @@ cargo test --all-features
 
 echo "  - Running Crypto Vector tests..."
 cargo test --test crypto_vectors
+
+echo "  - Running cargo audit (if installed)..."
+if cargo audit --version >/dev/null 2>&1; then
+    cargo audit
+else
+    echo "    (Skipping cargo audit: cargo-audit not installed)"
+fi
+
+if [ -f "web/package.json" ]; then
+    echo "  - Running web tests (if npm is available)..."
+    if command -v npm >/dev/null 2>&1; then
+        (cd web && npm ci && npm test)
+    else
+        echo "    (Skipping web tests: npm not found)"
+    fi
+fi
+
+# Final check for deferred no-mock failures
+if [ "$NO_MOCK_FAILED" = true ]; then
+    echo ""
+    echo "=== CI Validation FAILED ==="
+    echo "No-mock policy violations found. See output above."
+    exit 1
+fi
 
 echo "=== CI Validation Complete ==="

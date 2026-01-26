@@ -668,10 +668,10 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     // Try direct i64 first (legacy format)
     if let Some(ts) = val.as_i64() {
         // Heuristic:
-        // - Values in the typical Unix-seconds range (>= 1e9 and < 1e10) are treated as seconds
-        //   and converted to millis.
-        // - Negative values are treated as millis (ambiguous, but preserves pre-1970 ms inputs).
-        let ts = if (1_000_000_000..10_000_000_000).contains(&ts) {
+        // - timestamps < 100_000_000_000 (year 5138 in seconds) are treated as seconds
+        // - timestamps >= 100_000_000_000 (year 1973 in millis) are treated as millis
+        // - Negative values are treated as millis (pre-1970)
+        let ts = if (0..100_000_000_000).contains(&ts) {
             ts.saturating_mul(1000)
         } else {
             ts
@@ -682,7 +682,7 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
     if let Some(s) = val.as_str() {
         // Numeric strings (seconds or milliseconds)
         if let Ok(num) = s.parse::<i64>() {
-            let ts = if (1_000_000_000..10_000_000_000).contains(&num) {
+            let ts = if (0..100_000_000_000).contains(&num) {
                 num.saturating_mul(1000)
             } else {
                 num
@@ -690,7 +690,7 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {
             return Some(ts);
         }
         if let Ok(num) = s.parse::<f64>() {
-            let ts = if (1_000_000_000.0..10_000_000_000.0).contains(&num) {
+            let ts = if (0.0..100_000_000_000.0).contains(&num) {
                 (num * 1000.0).round() as i64
             } else {
                 num.round() as i64
@@ -731,8 +731,10 @@ pub fn flatten_content(val: &serde_json::Value) -> String {
     if let Some(arr) = val.as_array() {
         let mut result = String::new();
         for item in arr {
-            let part = extract_content_part(item);
-            if let Some(text) = part {
+            if let Some(text) = extract_content_part(item) {
+                if text.is_empty() {
+                    continue;
+                }
                 if !result.is_empty() {
                     result.push('\n');
                 }

@@ -108,7 +108,7 @@ const STREAMING_CHANNEL_SIZE: usize = 32;
 /// Streaming is enabled by default.
 pub fn streaming_index_enabled() -> bool {
     dotenvy::var("CASS_STREAMING_INDEX")
-        .map(|v| v != "0")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true)
 }
 
@@ -1174,17 +1174,41 @@ fn reindex_paths(
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConnectorKind {
+    #[serde(rename = "cx", alias = "Codex")]
     Codex,
+    #[serde(rename = "cl", alias = "Cline")]
     Cline,
+    #[serde(rename = "gm", alias = "Gemini")]
     Gemini,
+    #[serde(rename = "cd", alias = "Claude")]
     Claude,
+    #[serde(rename = "am", alias = "Amp")]
     Amp,
+    #[serde(rename = "oc", alias = "OpenCode")]
     OpenCode,
+    #[serde(rename = "ai", alias = "Aider")]
     Aider,
+    #[serde(rename = "cu", alias = "Cursor")]
     Cursor,
+    #[serde(rename = "cg", alias = "ChatGpt")]
     ChatGpt,
+    #[serde(rename = "pi", alias = "PiAgent")]
     PiAgent,
+    #[serde(rename = "fa", alias = "Factory")]
     Factory,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct WatchState {
+    #[serde(rename = "v", default, skip_serializing_if = "is_zero_u8")]
+    version: u8,
+    #[serde(rename = "m", default, skip_serializing_if = "HashMap::is_empty")]
+    map: HashMap<ConnectorKind, i64>,
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 fn state_path(data_dir: &Path) -> PathBuf {
@@ -1193,9 +1217,15 @@ fn state_path(data_dir: &Path) -> PathBuf {
 
 fn load_watch_state(data_dir: &Path) -> HashMap<ConnectorKind, i64> {
     let path = state_path(data_dir);
-    if let Ok(bytes) = fs::read(&path)
-        && let Ok(map) = serde_json::from_slice(&bytes)
-    {
+    let Ok(bytes) = fs::read(&path) else {
+        return HashMap::new();
+    };
+
+    if let Ok(state) = serde_json::from_slice::<WatchState>(&bytes) {
+        return state.map;
+    }
+
+    if let Ok(map) = serde_json::from_slice::<HashMap<ConnectorKind, i64>>(&bytes) {
         return map;
     }
     HashMap::new()
@@ -1206,7 +1236,11 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_vec_pretty(state)?;
+    let watch_state = WatchState {
+        version: 1,
+        map: state.clone(),
+    };
+    let json = serde_json::to_vec(&watch_state)?;
     fs::write(path, json)?;
     Ok(())
 }
@@ -2050,6 +2084,37 @@ mod tests {
         let loaded = load_watch_state(&data_dir);
         assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+    }
+
+    #[test]
+    fn watch_state_loads_legacy_map_format() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let legacy = r#"{"Codex":123,"Gemini":456}"#;
+        std::fs::write(data_dir.join("watch_state.json"), legacy).unwrap();
+
+        let loaded = load_watch_state(&data_dir);
+        assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
+        assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+    }
+
+    #[test]
+    fn watch_state_saves_compact_keys() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut state = HashMap::new();
+        state.insert(ConnectorKind::Codex, 123);
+
+        save_watch_state(&data_dir, &state).unwrap();
+
+        let raw = std::fs::read_to_string(data_dir.join("watch_state.json")).unwrap();
+        assert!(raw.contains("\"m\""));
+        assert!(raw.contains("\"cx\""));
+        assert!(!raw.contains("Codex"));
     }
 
     #[test]

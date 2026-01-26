@@ -1,286 +1,277 @@
 # Testing Guide
 
-This document describes the test infrastructure for `cass` (Coding Agent Session Search).
+> Guidelines for testing in the cass (Coding Agent Session Search) codebase.
 
-## Test Matrix
+---
 
-### Unit Tests (in-source)
+## No-Mock Policy
 
-Located within `src/**/*.rs` in `#[cfg(test)]` modules:
+### Philosophy
 
-| Module | Coverage | Description |
-|--------|----------|-------------|
-| `src/connectors/*.rs` | High | Session parsing for each agent type |
-| `src/search/query.rs` | High | Query parsing, boolean operators, wildcards |
-| `src/search/tantivy.rs` | Medium | Tantivy schema and indexing |
-| `src/indexer/mod.rs` | High | Indexer orchestration, provenance injection |
-| `src/sources/config.rs` | High | Source configuration, path mappings |
-| `src/ui/*.rs` | Medium | TUI rendering, themes, components |
+This project adheres to a **strict no-mock policy** for testing. Instead of mocking external dependencies, we use:
 
-Run unit tests:
-```bash
-cargo test --lib
-```
+1. **Real implementations** with test configurations
+2. **Fixture data** from actual sessions and real scenarios
+3. **Integration test harnesses** that exercise real code paths
+4. **E2E tests** that validate complete workflows
 
-### Integration Tests
+### Why No Mocks?
 
-Located in `tests/*.rs`:
+Mocks are problematic because they:
 
-| File | Type | Description |
-|------|------|-------------|
-| `connector_aider.rs` | Integration | Aider session parsing (39 tests) |
-| `connector_amp.rs` | Integration | AMP session parsing (24 tests) |
-| `connector_claude.rs` | Integration | Claude Code parsing (21 tests) |
-| `connector_cline.rs` | Integration | Cline parsing (25 tests) |
-| `connector_codex.rs` | Integration | Codex parsing (26 tests) |
-| `connector_gemini.rs` | Integration | Gemini parsing (17 tests) |
-| `connector_opencode.rs` | Integration | OpenCode parsing (15 tests) |
-| `connector_pi_agent.rs` | Integration | Pi-Agent parsing (17 tests) |
-| `fs_errors.rs` | Integration | Filesystem error handling (18 tests) |
-| `parse_errors.rs` | Integration | Parser error handling (18 tests) |
-| `storage.rs` | Integration | SQLite storage (44 tests) |
-| `indexer_tantivy.rs` | Integration | Tantivy indexing (5 tests) |
-| `search_caching.rs` | Integration | Search result caching (2 tests) |
-| `search_filters.rs` | Integration | Filter application (3 tests) |
-| `search_wildcard_fallback.rs` | Integration | Wildcard fallback (2 tests) |
-| `logging.rs` | Integration | Log configuration (3 tests) |
-| `ranking.rs` | Integration | Search ranking algorithms (7 tests) |
-| `concurrent_search.rs` | Integration | Concurrent search operations (6 tests) |
+- **Hide bugs**: Mocks don't catch when real implementations change behavior
+- **Create maintenance burden**: Mock implementations drift from reality
+- **Reduce confidence**: Passing tests don't prove the real system works
+- **Encourage poor design**: Mocks make it easy to test tightly-coupled code
 
-Run integration tests:
-```bash
-cargo test --test <test_name>
-# Example: cargo test --test connector_claude
-```
+### What We Use Instead
 
-### End-to-End Tests
+| Instead of... | Use... |
+|---------------|--------|
+| Mock connectors | Real session fixtures in `tests/fixtures/connectors/` |
+| Mock databases | Real SQLite with test data |
+| Mock Tantivy | Real index with small fixture corpus |
+| Mock embedders | Hash embedder (fast, deterministic) |
+| Mock daemon | Channel-based test harness |
+| Mock filesystem | Tempdir with real fixture files |
 
-Test full CLI workflows with real I/O:
+### Allowlist: True Boundaries
 
-| File | Type | Description |
-|------|------|-------------|
-| `e2e_cli_flows.rs` | E2E | CLI command flows (20 tests) |
-| `e2e_filters.rs` | E2E | Filter combinations (8 tests) |
-| `e2e_index_tui.rs` | E2E | Index + TUI headless (1 test) |
-| `e2e_install_easy.rs` | E2E | Easy installation (1 test) |
-| `e2e_multi_connector.rs` | E2E | Multi-connector indexing (8 tests) |
-| `e2e_search_index.rs` | E2E | Search/index integration (15 tests) |
-| `e2e_sources.rs` | E2E | Remote sources workflow (22 tests) |
-| `multi_source_integration.rs` | E2E | Multi-source integration (14 tests) |
-| `install_scripts.rs` | E2E | Install script validation (4 tests) |
-| `watch_e2e.rs` | E2E | Watch mode behavior (4 tests) |
+Some test scenarios require mock implementations. These are explicitly allowlisted:
 
-E2E tests often require `--test-threads=1`:
-```bash
-cargo test --test e2e_index_tui -- --test-threads=1
-```
+**Allowlisted patterns** (see `test-results/no_mock_allowlist.json`):
 
-### Browser E2E (Playwright)
+1. **Trait abstraction tests** (`#[cfg(test)]` only):
+   - `MockEmbedder` in `src/search/embedder.rs` - tests Embedder trait contract
+   - `MockReranker` in `src/search/reranker.rs` - tests Reranker trait contract
+   - `MockDaemon` in `src/search/daemon_client.rs` - tests daemon retry logic
 
-Playwright-based tests validate web viewer and HTML export flows.
+2. **Integration test harnesses**:
+   - `ChannelDaemonClient` - real channel communication, not a mock
 
-Install dependencies (one-time):
-```bash
-cd tests
-npm install
-npx playwright install --with-deps
-```
+3. **Feature functionality** (not test infrastructure):
+   - `src/pages/redact.rs` - privacy feature that replaces usernames
 
-Run HTML export WebCrypto decryption tests:
-```bash
-cd tests
-npx playwright test html_export/html_export_encryption.test.js
-```
+### CI Enforcement
 
-### CLI/Robot Tests
-
-Test robot mode and CLI contracts:
-
-| File | Type | Description |
-|------|------|-------------|
-| `cli_index.rs` | CLI | Index command tests (6 tests) |
-| `cli_robot.rs` | CLI | Robot mode output (137 tests) |
-| `robot_perf.rs` | Perf | Robot mode performance |
-| `regression_behavioral.rs` | Regression | Behavioral contracts (21 tests) |
-
-### UI/Snapshot Tests
-
-| File | Type | Description |
-|------|------|-------------|
-| `ui_snap.rs` | Snapshot | TUI rendering snapshots (50 tests) |
-| `ui_components.rs` | Unit | Component behavior (3 tests) |
-| `ui_footer.rs` | Unit | Footer rendering (1 test) |
-| `ui_help.rs` | Unit | Help display (1 test) |
-| `ui_hotkeys.rs` | Unit | Hotkey handling (2 tests) |
-
-## Running Tests
-
-### All Tests
-```bash
-cargo test
-```
-
-### Specific Test File
-```bash
-cargo test --test <filename_without_rs>
-# Example: cargo test --test e2e_filters
-```
-
-### Specific Test Function
-```bash
-cargo test <test_name>
-# Example: cargo test parse_boolean_query
-```
-
-### Tests Matching Pattern
-```bash
-cargo test <pattern>
-# Example: cargo test connector_  # All connector tests
-# Example: cargo test e2e_        # All e2e tests
-```
-
-### With Output
-```bash
-cargo test -- --nocapture
-```
-
-### Single-Threaded (for E2E)
-```bash
-cargo test --test <test_name> -- --test-threads=1
-```
-
-## Coverage
-
-Generate coverage report using `cargo-llvm-cov`:
+The CI pipeline enforces the no-mock policy:
 
 ```bash
-# Install (one-time)
-cargo install cargo-llvm-cov
+# Run the no-mock check
+./scripts/validate_ci.sh --no-mock-only
 
-# Generate text summary
-cargo llvm-cov --all-features --workspace --text
-
-# Generate lcov.info (for codecov/coveralls)
-cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
-
-# Generate HTML report
-cargo llvm-cov --all-features --workspace --html
-# Open target/llvm-cov/html/index.html
-
-# Ignore test files in coverage
-cargo llvm-cov --all-features --workspace \
-  --ignore-filename-regex='(tests/|benches/|\.cargo/)' \
-  --text
+# Skip locally (for development iteration)
+SKIP_NO_MOCK_CHECK=1 ./scripts/validate_ci.sh
 ```
 
-## Trace Files & Logs
+The check:
+1. Searches for `Mock*`, `Fake*`, `Stub*`, `mock_`, `fake_`, `stub_` patterns
+2. Compares against the allowlist in `test-results/no_mock_allowlist.json`
+3. Fails if unapproved patterns are found
 
-### Trace File Location
-Tests that use `--trace-file` write to:
-- `/tmp/cass-trace-*.json` (temporary)
-- `test-artifacts/traces/` (CI artifacts)
+### Requesting an Allowlist Exception
 
-### Enabling Trace Output
-```bash
-# Run with tracing enabled
-RUST_LOG=debug cargo test <test_name> -- --nocapture
-```
+To request a new allowlist entry:
 
-### CI Artifacts
-CI uploads these artifacts:
-- `test-artifacts-e2e/traces/` - Trace files from E2E runs
-- `test-artifacts-e2e/logs/` - Run summaries
-- `coverage-report/lcov.info` - Coverage data
-- `coverage-report/coverage-summary.txt` - Human-readable coverage
+1. Create a bead explaining why a real implementation is impossible
+2. Add an entry to `test-results/no_mock_allowlist.json`:
+   ```json
+   {
+     "path": "src/your/file.rs",
+     "pattern": "MockThing",
+     "rationale": "Why real implementation is impossible",
+     "owner": "your-team",
+     "review_date": "YYYY-MM-DD (max 6 months)",
+     "downstream_task": "bd-xxxx (to remove this entry)",
+     "cfg_test_only": true
+   }
+   ```
+3. Get approval via code review
+4. Entries expire after 6 months and require re-justification
 
-## Robot Mode / Introspect-Contract Tests
+---
 
-Tests in `cli_robot.rs` verify the robot mode contract:
+## Test Structure
 
-```bash
-# Run all robot contract tests
-cargo test --test cli_robot
+### Unit Tests (`#[cfg(test)]` modules)
 
-# Run specific introspect tests
-cargo test --test cli_robot introspect
+In-file unit tests for isolated function/trait behavior:
 
-# Run capability contract tests
-cargo test --test cli_robot capabilities
-```
-
-Key test categories:
-- `test_robot_search_*` - Search output format
-- `test_robot_help_*` - Help text contracts
-- `test_capabilities_*` - Capability discovery
-- `test_introspect_*` - Internal state inspection
-
-## Fixture Files
-
-Test fixtures are in `tests/fixtures/`:
-- Session files for connector tests
-- Golden output files for regression tests
-
-## Adding New Tests
-
-### Unit Test (in module)
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_feature() {
-        // ...
+    fn test_parse_message() {
+        // Test with real JSONL content, not mocked data
+        let content = include_str!("../tests/fixtures/messages/sample.jsonl");
+        let result = parse_message(content);
+        assert!(result.is_ok());
     }
 }
 ```
 
-### Integration Test (tests/*.rs)
-```rust
-// tests/my_feature.rs
-use coding_agent_search::*;
+### Integration Tests (`tests/`)
 
-#[test]
-fn test_integration() {
-    // ...
-}
+Tests that exercise multiple components together:
+
+- `tests/connector_*.rs` - Connector parsing with fixture files
+- `tests/search_*.rs` - Search pipeline with real indexes
+- `tests/semantic_*.rs` - Embedding with hash embedder
+- `tests/daemon_client_integration.rs` - Daemon client with channel harness
+
+### E2E Tests
+
+**Rust E2E** (`tests/e2e_*.rs`):
+- Full CLI invocation tests
+- Real fixtures, real binaries, real outputs
+
+**Browser E2E** (`tests/e2e/`):
+- Playwright tests for HTML exports
+- Run on CI only (see AGENTS.md "E2E Browser Tests")
+
+---
+
+## Fixtures
+
+### Location
+
+All fixture data lives under `tests/fixtures/`:
+
+```
+tests/fixtures/
+├── connectors/           # Real session files per agent
+│   ├── claude/
+│   ├── codex/
+│   ├── cursor/
+│   └── ...
+├── html_export/          # Real exported sessions
+│   └── real_sessions/
+├── messages/             # Sample JSONL messages
+├── models/               # Small valid ONNX models (if needed)
+└── sources/              # Multi-machine sync fixtures
 ```
 
-### E2E Test
-```rust
-// tests/e2e_my_flow.rs
-use assert_cmd::Command;
+### Creating Fixtures
 
-#[test]
-fn test_e2e_flow() {
-    let mut cmd = Command::cargo_bin("cass").unwrap();
-    cmd.arg("search").arg("test").arg("--robot");
-    cmd.assert().success();
-}
+1. Use real data from actual agent sessions
+2. Anonymize sensitive content (usernames, paths, secrets)
+3. Keep fixtures small but representative
+4. Document the fixture's purpose in a README
+
+### Loading Fixtures in Tests
+
+```rust
+// Good: Load real fixture
+let fixture = include_str!("fixtures/connectors/claude/session.jsonl");
+
+// Bad: Create mock data inline
+let mock_session = r#"{"fake": "data"}"#;  // NO!
 ```
 
-## Beads (Issue Tracking)
+---
 
-Test-related beads for reference:
+## Running Tests
 
-| Bead | Description |
-|------|-------------|
-| `tst` | Test Coverage Epic |
-| `tst.cli` | CLI Command Tests |
-| `tst.idx` | Indexer/Tantivy Tests |
-| `tst.err` | Error Handling Tests |
-| `tst.inf` | Test Infrastructure |
-| `tst.e2e.*` | E2E Test subtasks |
-| `tst.con.*` | Connector test subtasks |
-| `bs8` | CI wiring: coverage + logs |
-| `ke5` | Test documentation (this doc) |
+### Local Development
 
-## CI Pipeline
+```bash
+# Run all tests
+cargo test
 
-The CI (`.github/workflows/ci.yml`) runs:
+# Run specific test file
+cargo test --test connector_claude
 
-1. **check** job: fmt, clippy, tests, benches, UBS
-2. **e2e** job: E2E tests, artifact collection
-3. **coverage** job: llvm-cov coverage report
+# Run with logging
+RUST_LOG=debug cargo test
 
-See README.md "CI Pipeline & Artifacts" section for artifact details.
+# Skip expensive tests
+cargo test --lib  # Unit tests only
+```
+
+### CI Pipeline
+
+The full CI pipeline runs:
+
+```bash
+./scripts/validate_ci.sh
+```
+
+Which includes:
+1. No-mock policy check
+2. `cargo fmt --check`
+3. `cargo clippy`
+4. `cargo test`
+5. Crypto vector tests
+6. `cargo audit` (if installed)
+
+### Browser E2E Tests
+
+**Do not run locally** - they consume significant resources.
+
+Push to a branch and let GitHub Actions run them:
+- Workflow: `.github/workflows/browser-tests.yml`
+- Runs on: Chromium, Firefox, WebKit
+- Uploads: Test artifacts and reports
+
+---
+
+## Logging and Reports
+
+### Structured Test Output
+
+Tests that produce output should use JSON format:
+
+```bash
+# E2E scripts should output JSONL
+./scripts/daemon/cass_daemon_e2e.sh 2>&1 | tee test-results/daemon_e2e.jsonl
+```
+
+### Test Reports
+
+Generated reports go in `test-results/`:
+
+- `no_mock_audit.md` - Mock pattern audit
+- `no_mock_allowlist.json` - Approved exceptions
+- `e2e/*.jsonl` - E2E run logs
+- `e2e/summary.md` - Human-readable summary
+
+---
+
+## Adding New Tests
+
+### Checklist
+
+When adding tests:
+
+- [ ] Uses real fixtures, not mock data
+- [ ] Follows existing test patterns
+- [ ] Runs fast (< 1s for unit, < 10s for integration)
+- [ ] Has clear failure messages
+- [ ] Documented if non-obvious
+
+### Test Naming
+
+```rust
+// Good: Descriptive and specific
+#[test]
+fn parse_claude_session_with_tool_calls_extracts_all_snippets() { }
+
+// Bad: Vague
+#[test]
+fn test_parsing() { }
+```
+
+---
+
+## Related Documentation
+
+- `AGENTS.md` - Agent guidelines (E2E browser test policy)
+- `test-results/no_mock_audit.md` - Current mock audit
+- `test-results/no_mock_allowlist.json` - Approved exceptions
+- `.github/workflows/` - CI workflow definitions
+
+---
+
+*Last updated: 2026-01-26*

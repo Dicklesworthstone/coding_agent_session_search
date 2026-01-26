@@ -227,33 +227,8 @@ pub fn encrypt_content(
 /// Base64 encode bytes (standard alphabet).
 #[cfg(feature = "encryption")]
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut result = Vec::with_capacity(data.len().div_ceil(3) * 4);
-
-    for chunk in data.chunks(3) {
-        let mut buf = [0u8; 3];
-        buf[..chunk.len()].copy_from_slice(chunk);
-
-        let n = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | (buf[2] as u32);
-
-        result.push(ALPHABET[((n >> 18) & 0x3F) as usize]);
-        result.push(ALPHABET[((n >> 12) & 0x3F) as usize]);
-
-        if chunk.len() > 1 {
-            result.push(ALPHABET[((n >> 6) & 0x3F) as usize]);
-        } else {
-            result.push(b'=');
-        }
-
-        if chunk.len() > 2 {
-            result.push(ALPHABET[(n & 0x3F) as usize]);
-        } else {
-            result.push(b'=');
-        }
-    }
-
-    String::from_utf8(result).unwrap()
+    use base64::Engine;
+    base64::prelude::BASE64_STANDARD.encode(data)
 }
 
 /// Generate HTML for encrypted content display.

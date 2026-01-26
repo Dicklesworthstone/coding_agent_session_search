@@ -46,6 +46,8 @@ tests/performance/node_modules/
 # Node.js test dependencies
 tests/node_modules/
 
-# Test output
-test-results/
+# Test output (except policy files)
+test-results/*
+!test-results/no_mock_allowlist.json
+!test-results/no_mock_audit.md
 claude-upgrade-progress.json
