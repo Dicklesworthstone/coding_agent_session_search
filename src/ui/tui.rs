@@ -89,6 +89,14 @@ fn html_role_slug(role: &MessageRole) -> String {
     }
 }
 
+fn is_tool_role(role: &MessageRole) -> bool {
+    match role {
+        MessageRole::Tool => true,
+        MessageRole::Other(value) => value.trim().eq_ignore_ascii_case("tool"),
+        _ => false,
+    }
+}
+
 /// Format a timestamp as a short human-readable date for filter chips.
 /// Shows "Nov 25" for same year, "Nov 25, 2023" for other years.
 pub fn format_time_short(ms: i64) -> String {
@@ -5825,9 +5833,7 @@ pub fn run_tui(
                                     let messages: Vec<HtmlMessage> = detail
                                         .messages
                                         .iter()
-                                        .filter(|m| {
-                                            include_tools || !matches!(&m.role, MessageRole::Tool)
-                                        })
+                                        .filter(|m| include_tools || !is_tool_role(&m.role))
                                         .map(|m| {
                                             let timestamp = m
                                                 .created_at

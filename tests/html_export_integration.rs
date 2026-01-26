@@ -89,7 +89,10 @@ fn test_export_pipeline_complete_success() {
     let output_path = json["exported"]["output_path"].as_str().unwrap();
     let html = fs::read_to_string(output_path).expect("Should be able to read output file");
 
-    assert!(html.starts_with("<!DOCTYPE html>"), "Should start with doctype");
+    assert!(
+        html.starts_with("<!DOCTYPE html>"),
+        "Should start with doctype"
+    );
     assert!(html.contains("</html>"), "Should be complete HTML");
     assert!(html.contains("<title>"), "Should have title element");
 }
@@ -404,11 +407,7 @@ fn test_cli_export_explain() {
     let session_path = fixture_path("real_sessions", "claude_code_auth_fix.jsonl");
 
     let output = base_cmd()
-        .args([
-            "export-html",
-            session_path.to_str().unwrap(),
-            "--explain",
-        ])
+        .args(["export-html", session_path.to_str().unwrap(), "--explain"])
         .output()
         .unwrap();
 
@@ -425,11 +424,7 @@ fn test_cli_export_explain() {
 #[test]
 fn test_cli_export_session_not_found() {
     let output = base_cmd()
-        .args([
-            "export-html",
-            "/nonexistent/path/session.jsonl",
-            "--robot",
-        ])
+        .args(["export-html", "/nonexistent/path/session.jsonl", "--robot"])
         .output()
         .unwrap();
 
@@ -865,10 +860,7 @@ fn test_export_has_print_styles() {
     let html = fs::read_to_string(output_path).unwrap();
 
     // Print media query should be present
-    assert!(
-        html.contains("@media print"),
-        "Should have print styles"
-    );
+    assert!(html.contains("@media print"), "Should have print styles");
 }
 
 // =============================================================================
@@ -914,7 +906,10 @@ fn test_export_multiple_sessions_sequentially() {
     }
 
     // Verify at least some exports succeeded
-    assert!(!output_paths.is_empty(), "At least one export should succeed");
+    assert!(
+        !output_paths.is_empty(),
+        "At least one export should succeed"
+    );
 
     // Verify all output files are distinct
     let unique_paths: std::collections::HashSet<_> = output_paths.iter().collect();

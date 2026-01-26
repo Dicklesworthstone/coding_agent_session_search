@@ -1,3 +1,4 @@
+pub mod bakeoff;
 pub mod bookmarks;
 pub mod connectors;
 pub mod encryption;

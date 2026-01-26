@@ -610,6 +610,31 @@ mod tests {
         calls: AtomicUsize,
         fail_first: usize,
         available: bool,
+        mode: FailureMode,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FailureMode {
+        Unavailable,
+        Timeout,
+        Overloaded { retry_after: Duration },
+        Failed,
+        InvalidInput,
+    }
+
+    impl FailureMode {
+        fn error(&self) -> DaemonError {
+            match self {
+                FailureMode::Unavailable => DaemonError::Unavailable("daemon down".to_string()),
+                FailureMode::Timeout => DaemonError::Timeout("daemon timeout".to_string()),
+                FailureMode::Overloaded { retry_after } => DaemonError::Overloaded {
+                    retry_after: Some(*retry_after),
+                    message: "queue full".to_string(),
+                },
+                FailureMode::Failed => DaemonError::Failed("daemon error".to_string()),
+                FailureMode::InvalidInput => DaemonError::InvalidInput("invalid input".to_string()),
+            }
+        }
     }
 
     impl MockDaemon {
@@ -618,6 +643,16 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 fail_first,
                 available: true,
+                mode: FailureMode::Unavailable,
+            }
+        }
+
+        fn new_with_mode(fail_first: usize, mode: FailureMode) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail_first,
+                available: true,
+                mode,
             }
         }
     }
@@ -634,7 +669,7 @@ mod tests {
         fn embed(&self, _text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call < self.fail_first {
-                Err(DaemonError::Unavailable("boom".to_string()))
+                Err(self.mode.error())
             } else {
                 Ok(vec![2.0; 4])
             }
@@ -647,7 +682,7 @@ mod tests {
         ) -> Result<Vec<Vec<f32>>, DaemonError> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call < self.fail_first {
-                Err(DaemonError::Unavailable("boom".to_string()))
+                Err(self.mode.error())
             } else {
                 Ok(texts.iter().map(|_| vec![2.0; 4]).collect())
             }
@@ -661,7 +696,7 @@ mod tests {
         ) -> Result<Vec<f32>, DaemonError> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed);
             if call < self.fail_first {
-                Err(DaemonError::Unavailable("boom".to_string()))
+                Err(self.mode.error())
             } else {
                 Ok(documents.iter().map(|_| 1.0).collect())
             }
@@ -695,6 +730,105 @@ mod tests {
         let reranker = DaemonFallbackReranker::new(daemon, Some(fallback), cfg);
         let result = reranker.rerank("q", &["a", "b"]).unwrap();
         assert_eq!(result, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn daemon_embedder_retries_then_succeeds() {
+        let daemon = Arc::new(MockDaemon::new(1));
+        let fallback = Arc::new(MockEmbedder { dim: 4 });
+        let cfg = DaemonRetryConfig {
+            max_attempts: 2,
+            ..DaemonRetryConfig::default()
+        };
+
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg);
+        let result = embedder.embed("hello").unwrap();
+        assert_eq!(result[0], 2.0);
+        assert_eq!(daemon.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn daemon_timeout_retries_then_falls_back() {
+        let daemon = Arc::new(MockDaemon::new_with_mode(2, FailureMode::Timeout));
+        let fallback = Arc::new(MockEmbedder { dim: 4 });
+        let cfg = DaemonRetryConfig {
+            max_attempts: 2,
+            ..DaemonRetryConfig::default()
+        };
+
+        let embedder = DaemonFallbackEmbedder::new(daemon, fallback, cfg);
+        let result = embedder.embed("hello").unwrap();
+        assert_eq!(result[0], 1.0);
+    }
+
+    #[test]
+    fn daemon_invalid_input_does_not_retry() {
+        let daemon = Arc::new(MockDaemon::new_with_mode(1, FailureMode::InvalidInput));
+        let fallback = Arc::new(MockEmbedder { dim: 4 });
+        let cfg = DaemonRetryConfig {
+            max_attempts: 3,
+            ..DaemonRetryConfig::default()
+        };
+
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg);
+        let result = embedder.embed("hello").unwrap();
+        assert_eq!(result[0], 1.0);
+        assert_eq!(daemon.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn daemon_failed_retries_then_falls_back() {
+        let daemon = Arc::new(MockDaemon::new_with_mode(2, FailureMode::Failed));
+        let fallback = Arc::new(MockEmbedder { dim: 4 });
+        let cfg = DaemonRetryConfig {
+            max_attempts: 2,
+            ..DaemonRetryConfig::default()
+        };
+
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg);
+        let result = embedder.embed("hello").unwrap();
+        assert_eq!(result[0], 1.0);
+        assert_eq!(daemon.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn daemon_overload_sets_backoff() {
+        let daemon = Arc::new(MockDaemon::new_with_mode(
+            1,
+            FailureMode::Overloaded {
+                retry_after: Duration::from_millis(25),
+            },
+        ));
+        let fallback = Arc::new(MockEmbedder { dim: 4 });
+        let cfg = DaemonRetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(50),
+            ..DaemonRetryConfig::default()
+        };
+
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, cfg);
+        let _ = embedder.embed("first").unwrap();
+        let calls_after_first = daemon.calls.load(Ordering::Relaxed);
+
+        let _ = embedder.embed("second").unwrap();
+        let calls_after_second = daemon.calls.load(Ordering::Relaxed);
+        assert_eq!(calls_after_first, calls_after_second);
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds() {
+        let base = Duration::from_millis(100);
+        let jitter_pct = 0.2;
+        let min_ms = (base.as_millis() as f64 * (1.0 - jitter_pct)) as u64;
+        let max_ms = (base.as_millis() as f64 * (1.0 + jitter_pct)) as u64;
+
+        for _ in 0..100 {
+            let jittered = apply_jitter(base, jitter_pct);
+            let ms = jittered.as_millis() as u64;
+            assert!(ms >= min_ms, "jitter too low: {ms} < {min_ms}");
+            assert!(ms <= max_ms, "jitter too high: {ms} > {max_ms}");
+        }
     }
 
     #[test]

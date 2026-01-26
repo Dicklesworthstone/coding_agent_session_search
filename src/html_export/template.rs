@@ -906,7 +906,10 @@ mod tests {
         );
         // If completion log is present, verify its format
         if logs.contains("export_messages_complete") {
-            assert!(logs.contains("duration_ms"), "completion log should include duration");
+            assert!(
+                logs.contains("duration_ms"),
+                "completion log should include duration"
+            );
         }
     }
 

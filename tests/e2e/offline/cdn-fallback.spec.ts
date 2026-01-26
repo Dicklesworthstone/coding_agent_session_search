@@ -51,15 +51,17 @@ test.describe('CDN Fallback - No-CDN Mode', () => {
     await page.goto(`file://${noCdnExportPath}`);
     await waitForPageReady(page);
 
-    const codeBlock = page.locator('pre code').first();
-    const codeExists = (await codeBlock.count()) > 0;
+    const preBlock = page.locator('pre').first();
+    const preExists = (await preBlock.count()) > 0;
 
-    if (codeExists) {
-      await expect(codeBlock).toBeVisible();
+    if (preExists) {
+      await expect(preBlock).toBeVisible();
 
-      // Should have fallback styling
-      const styles = await codeBlock.evaluate((el) => {
-        const computed = window.getComputedStyle(el);
+      // Should have fallback styling - check pre or its code child
+      const styles = await preBlock.evaluate((el) => {
+        const code = el.querySelector('code');
+        const target = code || el;
+        const computed = window.getComputedStyle(target);
         return {
           fontFamily: computed.fontFamily,
           backgroundColor: computed.backgroundColor,
@@ -67,7 +69,7 @@ test.describe('CDN Fallback - No-CDN Mode', () => {
       });
 
       // Should have monospace font
-      expect(styles.fontFamily.toLowerCase()).toMatch(/mono|courier|consolas/);
+      expect(styles.fontFamily.toLowerCase()).toMatch(/mono|courier|consolas|ui-monospace|sfmono/);
     }
   });
 });
