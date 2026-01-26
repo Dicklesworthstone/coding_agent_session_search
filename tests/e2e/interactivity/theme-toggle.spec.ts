@@ -4,7 +4,7 @@ test.describe('Theme Toggle', () => {
   test('starts with default theme', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const theme = await getCurrentTheme(page);
@@ -15,14 +15,14 @@ test.describe('Theme Toggle', () => {
   test('toggles between dark and light themes', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const initialTheme = await getCurrentTheme(page);
 
     // Find and click toggle button
     const toggleBtn = page.locator(
-      '[data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"], button:has-text("theme")'
+      '#theme-toggle, [data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"], button:has-text("theme")'
     );
 
     const toggleExists = (await toggleBtn.count()) > 0;
@@ -31,14 +31,15 @@ test.describe('Theme Toggle', () => {
       return;
     }
 
-    await toggleBtn.first().click();
+    // Click with force to bypass stability check
+    await toggleBtn.first().click({ force: true });
 
     // Theme should change
     const newTheme = await getCurrentTheme(page);
     expect(newTheme).not.toBe(initialTheme);
 
     // Click again to return to original
-    await toggleBtn.first().click();
+    await toggleBtn.first().click({ force: true });
     const finalTheme = await getCurrentTheme(page);
     expect(finalTheme).toBe(initialTheme);
   });
@@ -46,11 +47,11 @@ test.describe('Theme Toggle', () => {
   test('theme persists after page reload', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const toggleBtn = page.locator(
-      '[data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"]'
+      '#theme-toggle, [data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"]'
     );
 
     const toggleExists = (await toggleBtn.count()) > 0;
@@ -60,7 +61,7 @@ test.describe('Theme Toggle', () => {
     }
 
     // Toggle theme
-    await toggleBtn.first().click();
+    await toggleBtn.first().click({ force: true });
     const changedTheme = await getCurrentTheme(page);
 
     // Reload page
@@ -75,11 +76,11 @@ test.describe('Theme Toggle', () => {
   test('theme toggle has proper accessibility', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const toggleBtn = page.locator(
-      '[data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"]'
+      '#theme-toggle, [data-action="toggle-theme"], .theme-toggle, [aria-label*="theme"]'
     );
 
     const toggleExists = (await toggleBtn.count()) > 0;

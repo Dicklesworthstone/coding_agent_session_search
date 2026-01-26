@@ -1,10 +1,10 @@
-import { test, expect, waitForPageReady } from '../setup/test-utils';
+import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
 
 test.describe('Print Styles', () => {
   test('print styles hide interactive elements', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Emulate print media
@@ -12,8 +12,8 @@ test.describe('Print Styles', () => {
 
     // Interactive elements should be hidden in print
     const searchControls = page.locator('.search-controls, #search-input, [data-testid="search"]');
-    const copyButtons = page.locator('.copy-btn, [data-action="copy"]');
-    const themeToggle = page.locator('.theme-toggle, [data-action="toggle-theme"]');
+    const copyButtons = page.locator('.copy-code-btn, .copy-btn, [data-action="copy"]');
+    const themeToggle = page.locator('#theme-toggle, .theme-toggle, [data-action="toggle-theme"]');
 
     // These should not be visible in print mode
     if ((await searchControls.count()) > 0) {
@@ -30,7 +30,7 @@ test.describe('Print Styles', () => {
   test('print uses light background', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Emulate print media
@@ -57,7 +57,7 @@ test.describe('Print Styles', () => {
   test('print text is dark/readable', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });
@@ -80,7 +80,7 @@ test.describe('Print Styles', () => {
   test('all content visible in print (no scroll containers)', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });
@@ -99,7 +99,7 @@ test.describe('Print Styles', () => {
   test('collapsible sections expanded in print', async ({ page, toolCallsExportPath }) => {
     test.skip(!toolCallsExportPath, 'Tool calls export path not available');
 
-    await page.goto(`file://${toolCallsExportPath}`);
+    await gotoFile(page, toolCallsExportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });
@@ -126,7 +126,7 @@ test.describe('Print Styles', () => {
   test('code blocks preserve formatting in print', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });
@@ -162,7 +162,7 @@ test.describe('Print Layout', () => {
   test('no horizontal overflow in print', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });
@@ -186,7 +186,7 @@ test.describe('Print Layout', () => {
     // Set longer timeout for large file
     test.setTimeout(60000);
 
-    await page.goto(`file://${largeExportPath}`, { timeout: 30000 });
+    await gotoFile(page, largeExportPath);
     await waitForPageReady(page);
 
     await page.emulateMedia({ media: 'print' });

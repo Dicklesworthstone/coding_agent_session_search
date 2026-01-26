@@ -4,7 +4,7 @@ test.describe('Search Functionality', () => {
   test('search input exists and is functional', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const searchInput = page.locator(
@@ -25,7 +25,7 @@ test.describe('Search Functionality', () => {
   test('search highlights matching text', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const searchInput = page.locator(
@@ -57,7 +57,7 @@ test.describe('Search Functionality', () => {
   test('Ctrl+F focuses search input', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const searchInput = page.locator(
@@ -85,7 +85,7 @@ test.describe('Search Functionality', () => {
   test('Escape clears search', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const searchInput = page.locator(
@@ -113,7 +113,7 @@ test.describe('Search Functionality', () => {
   test('search shows result count', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const searchInput = page.locator(

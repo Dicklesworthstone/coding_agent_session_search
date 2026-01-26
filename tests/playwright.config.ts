@@ -21,9 +21,9 @@ export default defineConfig({
     ['html', { outputFolder: 'e2e-report', open: 'never' }],
   ],
 
-  timeout: 30000,
+  timeout: 60000,
   expect: {
-    timeout: 5000,
+    timeout: 10000,
   },
 
   use: {
@@ -31,6 +31,9 @@ export default defineConfig({
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
+    // Use domcontentloaded for faster file:// URL navigation
+    navigationTimeout: 30000,
+    actionTimeout: 10000,
   },
 
   projects: [

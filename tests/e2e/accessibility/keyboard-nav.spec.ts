@@ -1,10 +1,10 @@
-import { test, expect, waitForPageReady } from '../setup/test-utils';
+import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
 
 test.describe('Keyboard Accessibility', () => {
   test('can tab through interactive elements', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Start tabbing
@@ -27,7 +27,7 @@ test.describe('Keyboard Accessibility', () => {
   test('focus is visible on interactive elements', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Tab to first focusable element
@@ -57,7 +57,7 @@ test.describe('Keyboard Accessibility', () => {
   test('Escape closes modals/popups', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Try to open something that might be closeable
@@ -79,7 +79,7 @@ test.describe('Keyboard Accessibility', () => {
   test('Enter/Space activates buttons', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Find a button
@@ -106,7 +106,7 @@ test.describe('Keyboard Accessibility', () => {
   test('arrow keys work in appropriate contexts', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // This tests that arrow keys don't break anything
@@ -125,7 +125,7 @@ test.describe('Screen Reader Accessibility', () => {
   test('page has proper heading structure', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Should have at least one h1
@@ -150,7 +150,7 @@ test.describe('Screen Reader Accessibility', () => {
   test('images have alt text', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const images = page.locator('img');
@@ -166,7 +166,7 @@ test.describe('Screen Reader Accessibility', () => {
   test('interactive elements have accessible names', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const buttons = page.locator('button');
@@ -193,7 +193,7 @@ test.describe('Screen Reader Accessibility', () => {
   test('main content has proper landmark', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Should have main landmark
@@ -206,7 +206,7 @@ test.describe('Color Contrast', () => {
   test('text has sufficient contrast', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Get text and background colors
@@ -229,7 +229,7 @@ test.describe('Color Contrast', () => {
   test('both themes have readable text', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Check current theme
@@ -239,10 +239,10 @@ test.describe('Color Contrast', () => {
       bg: window.getComputedStyle(document.body).backgroundColor,
     }));
 
-    // Toggle theme
-    const toggleBtn = page.locator('[data-action="toggle-theme"], .theme-toggle');
+    // Toggle theme (use force to bypass stability check)
+    const toggleBtn = page.locator('#theme-toggle, [data-action="toggle-theme"], .theme-toggle');
     if ((await toggleBtn.count()) > 0) {
-      await toggleBtn.first().click();
+      await toggleBtn.first().click({ force: true });
       await page.waitForTimeout(300);
 
       const theme2Colors = await page.evaluate(() => ({

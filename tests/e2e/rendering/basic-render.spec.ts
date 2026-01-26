@@ -4,7 +4,7 @@ test.describe('Basic HTML Rendering', () => {
   test('renders complete HTML document structure', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Document structure
@@ -21,7 +21,7 @@ test.describe('Basic HTML Rendering', () => {
     test.skip(!exportPath, 'Export path not available');
 
     const errors = await collectConsoleErrors(page);
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Filter out expected warnings (like CDN failures in offline mode or MIME type issues)
@@ -39,7 +39,7 @@ test.describe('Basic HTML Rendering', () => {
   test('displays messages in correct order', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const messages = page.locator('.message');
@@ -63,7 +63,7 @@ test.describe('Basic HTML Rendering', () => {
   test('renders code blocks with syntax highlighting', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Wait a bit for Prism.js to process
@@ -96,7 +96,7 @@ test.describe('Basic HTML Rendering', () => {
   test('displays timestamps in valid format', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     const timestamps = page.locator('time[datetime], .timestamp, [data-timestamp]');
@@ -111,7 +111,7 @@ test.describe('Basic HTML Rendering', () => {
   test('renders all message roles correctly', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Check for user messages
@@ -132,7 +132,7 @@ test.describe('Large Session Rendering', () => {
     test.skip(!largeExportPath, 'Large export path not available');
 
     const start = Date.now();
-    await page.goto(`file://${largeExportPath}`);
+    await page.goto(`file://${largeExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
     const elapsed = Date.now() - start;
 
@@ -147,7 +147,7 @@ test.describe('Large Session Rendering', () => {
   test('page remains responsive with large content', async ({ page, largeExportPath }) => {
     test.skip(!largeExportPath, 'Large export path not available');
 
-    await page.goto(`file://${largeExportPath}`);
+    await page.goto(`file://${largeExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Test that we can interact with the page
@@ -168,7 +168,7 @@ test.describe('Unicode Content Rendering', () => {
   test('renders unicode content correctly', async ({ page, unicodeExportPath }) => {
     test.skip(!unicodeExportPath, 'Unicode export path not available');
 
-    await page.goto(`file://${unicodeExportPath}`);
+    await page.goto(`file://${unicodeExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Page should load without errors
@@ -184,7 +184,7 @@ test.describe('Unicode Content Rendering', () => {
   test('emoji and special characters display properly', async ({ page, unicodeExportPath }) => {
     test.skip(!unicodeExportPath, 'Unicode export path not available');
 
-    await page.goto(`file://${unicodeExportPath}`);
+    await page.goto(`file://${unicodeExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Check that unicode content is present in the page

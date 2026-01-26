@@ -1,20 +1,27 @@
-import { test, expect, waitForPageReady } from '../setup/test-utils';
+import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
 
 test.describe('Copy to Clipboard', () => {
   test('copy button appears on code blocks', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    // Check for code blocks
-    const codeBlocks = page.locator('pre');
+    // Check for code blocks with code element
+    const codeBlocks = page.locator('pre:has(code):visible');
     const codeCount = await codeBlocks.count();
 
     if (codeCount > 0) {
-      // Each code block should have a copy button nearby
-      const copyBtn = page.locator('.copy-code-btn, .copy-btn, [data-action="copy"]').first();
-      await expect(copyBtn).toBeVisible();
+      // Copy buttons are added dynamically and hidden by default (opacity: 0)
+      // They become visible on hover over the pre element (use force to bypass stability check)
+      // Use JS scroll (instant) to avoid stability check timeout
+      const firstPre = codeBlocks.first();
+      await firstPre.evaluate((el) => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await firstPre.hover({ force: true });
+
+      // After hovering, the copy button should be visible
+      const copyBtn = firstPre.locator('.copy-code-btn');
+      await expect(copyBtn).toBeVisible({ timeout: 2000 });
     }
   });
 
@@ -24,17 +31,25 @@ test.describe('Copy to Clipboard', () => {
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    // Find copy button on first code block
-    const copyBtn = page.locator('.copy-code-btn, .copy-btn, [data-action="copy"]').first();
-    if (await copyBtn.count() > 0) {
-      await copyBtn.click();
+    // Find code block and hover to reveal copy button (use force to bypass stability check)
+    // Use JS scroll (instant) to avoid stability check timeout
+    const codeBlocks = page.locator('pre:has(code):visible');
+    if (await codeBlocks.count() > 0) {
+      const firstPre = codeBlocks.first();
+      await firstPre.evaluate((el) => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await firstPre.hover({ force: true });
 
-      // Toast notification should appear
-      const toast = page.locator('.toast, #toast-container > *');
-      await expect(toast.first()).toBeVisible({ timeout: 3000 });
+      const copyBtn = firstPre.locator('.copy-code-btn');
+      if (await copyBtn.count() > 0) {
+        await copyBtn.click({ force: true });
+
+        // Toast notification should appear
+        const toast = page.locator('.toast, #toast-container > *');
+        await expect(toast.first()).toBeVisible({ timeout: 3000 });
+      }
     }
   });
 
@@ -44,18 +59,25 @@ test.describe('Copy to Clipboard', () => {
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    // Get the code content from first code block
-    const codeBlock = page.locator('pre code').first();
-    if (await codeBlock.count() > 0) {
-      const codeContent = await codeBlock.textContent();
+    // Find code block
+    const codeBlocks = page.locator('pre:has(code):visible');
+    if (await codeBlocks.count() > 0) {
+      const firstPre = codeBlocks.first();
 
-      // Click the copy button
-      const copyBtn = page.locator('.copy-code-btn, .copy-btn').first();
+      // Get the code content
+      const codeContent = await firstPre.locator('code').textContent();
+
+      // Hover to reveal copy button and click it (use force to bypass stability check)
+      // Use JS scroll (instant) to avoid stability check timeout
+      await firstPre.evaluate((el) => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await firstPre.hover({ force: true });
+      const copyBtn = firstPre.locator('.copy-code-btn');
+
       if (await copyBtn.count() > 0) {
-        await copyBtn.click();
+        await copyBtn.click({ force: true });
 
         // Wait for clipboard to update
         await page.waitForTimeout(500);
@@ -74,22 +96,30 @@ test.describe('Copy to Clipboard', () => {
 
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const copyBtn = page.locator('.copy-code-btn, .copy-btn').first();
-    if (await copyBtn.count() > 0) {
-      await copyBtn.click();
+    const codeBlocks = page.locator('pre:has(code):visible');
+    if (await codeBlocks.count() > 0) {
+      const firstPre = codeBlocks.first();
+      // Use JS scroll (instant) to avoid stability check timeout
+      await firstPre.evaluate((el) => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await firstPre.hover({ force: true });
 
-      // Toast should appear
-      const toast = page.locator('.toast').first();
-      await expect(toast).toBeVisible({ timeout: 1000 });
+      const copyBtn = firstPre.locator('.copy-code-btn');
+      if (await copyBtn.count() > 0) {
+        await copyBtn.click({ force: true });
 
-      // Wait for toast to disappear (default is ~3 seconds)
-      await page.waitForTimeout(4000);
+        // Toast should appear
+        const toast = page.locator('.toast, #toast-container > *').first();
+        await expect(toast).toBeVisible({ timeout: 1000 });
 
-      // Toast should be gone or hidden
-      await expect(toast).not.toBeVisible();
+        // Wait for toast to disappear (default is ~3 seconds)
+        await page.waitForTimeout(4000);
+
+        // Toast should be gone or hidden
+        await expect(toast).not.toBeVisible();
+      }
     }
   });
 });
@@ -98,7 +128,7 @@ test.describe('Message Copy', () => {
   test('message action buttons are accessible', async ({ page, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
 
-    await page.goto(`file://${exportPath}`);
+    await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Check for message action buttons

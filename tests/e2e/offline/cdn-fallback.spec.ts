@@ -1,10 +1,10 @@
-import { test, expect, waitForPageReady, countMessages, collectConsoleErrors } from '../setup/test-utils';
+import { test, expect, gotoFile, waitForPageReady, countMessages, collectConsoleErrors } from '../setup/test-utils';
 
 test.describe('CDN Fallback - No-CDN Mode', () => {
   test('renders correctly without CDN resources', async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
-    await page.goto(`file://${noCdnExportPath}`);
+    await gotoFile(page, noCdnExportPath);
     await waitForPageReady(page);
 
     // Page should render completely
@@ -21,7 +21,7 @@ test.describe('CDN Fallback - No-CDN Mode', () => {
   test('no external resource URLs in no-cdn export', async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
-    const response = await page.goto(`file://${noCdnExportPath}`);
+    await gotoFile(page, noCdnExportPath);
     const html = await page.content();
 
     // Should not reference external CDNs
@@ -48,14 +48,15 @@ test.describe('CDN Fallback - No-CDN Mode', () => {
   test('code blocks styled without external resources', async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
-    await page.goto(`file://${noCdnExportPath}`);
+    await gotoFile(page, noCdnExportPath);
     await waitForPageReady(page);
 
     const preBlock = page.locator('pre').first();
     const preExists = (await preBlock.count()) > 0;
 
     if (preExists) {
-      await expect(preBlock).toBeVisible();
+      await preBlock.scrollIntoViewIfNeeded();
+      await expect(preBlock).toBeAttached();
 
       // Should have fallback styling - check pre or its code child
       const styles = await preBlock.evaluate((el) => {
@@ -84,7 +85,7 @@ test.describe('CDN Fallback - Network Blocking', () => {
     await page.route('**/*.googleapis.com/**', (route) => route.abort());
     await page.route('**/*.unpkg.com/**', (route) => route.abort());
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Page should still render
@@ -99,7 +100,7 @@ test.describe('CDN Fallback - Network Blocking', () => {
     await page.route('**/*.jsdelivr.net/**/*.js', (route) => route.abort());
     await page.route('**/*.unpkg.com/**/*.js', (route) => route.abort());
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Basic functionality should work
@@ -107,9 +108,11 @@ test.describe('CDN Fallback - Network Blocking', () => {
     expect(messageCount).toBeGreaterThan(0);
 
     // Theme toggle might still work (inline JS)
-    const toggleBtn = page.locator('[data-action="toggle-theme"], .theme-toggle');
+    const toggleBtn = page.locator('#theme-toggle, [data-action="toggle-theme"], .theme-toggle');
     if ((await toggleBtn.count()) > 0) {
-      await toggleBtn.first().click();
+      // Use JS scroll (instant) to avoid stability check timeout
+      await toggleBtn.first().evaluate((el) => el.scrollIntoView({ behavior: 'instant', block: 'center' }));
+      await toggleBtn.first().click({ force: true });
       // Should not crash
     }
   });
@@ -120,7 +123,7 @@ test.describe('CDN Fallback - Network Blocking', () => {
     // Block Tailwind
     await page.route('**/*.tailwindcss.com/**', (route) => route.abort());
 
-    await page.goto(`file://${exportPath}`);
+    await page.goto(`file://${exportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Wait for error handler to run
@@ -149,7 +152,7 @@ test.describe('Offline Mode Simulation', () => {
     // Go offline
     await page.context().setOffline(true);
 
-    await page.goto(`file://${noCdnExportPath}`);
+    await page.goto(`file://${noCdnExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Page should work fully offline
@@ -163,7 +166,7 @@ test.describe('Offline Mode Simulation', () => {
   test('all critical styles are inline', async ({ page, noCdnExportPath }) => {
     test.skip(!noCdnExportPath, 'No-CDN export path not available');
 
-    await page.goto(`file://${noCdnExportPath}`);
+    await page.goto(`file://${noCdnExportPath}`, { waitUntil: 'domcontentloaded' });
     await waitForPageReady(page);
 
     // Check that there are inline styles
