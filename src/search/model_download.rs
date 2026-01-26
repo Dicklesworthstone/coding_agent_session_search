@@ -599,7 +599,16 @@ impl ModelDownloader {
     /// 2. Rename temp to target
     /// 3. Remove backup on success, or restore on failure
     fn atomic_install(&self) -> Result<(), DownloadError> {
-        let backup_dir = self.target_dir.with_extension("bak");
+        // Fix: Use safer backup path construction that appends .bak instead of replacing extension.
+        // This handles cases like "model.v2" correctly (-> "model.v2.bak", not "model.bak").
+        let backup_dir = if let Some(name) = self.target_dir.file_name() {
+            let mut p = self.target_dir.clone();
+            let new_name = format!("{}.bak", name.to_string_lossy());
+            p.set_file_name(new_name);
+            p
+        } else {
+            self.target_dir.with_extension("bak")
+        };
 
         // Clean up any stale backup from previous failed install
         if backup_dir.exists() {
@@ -734,6 +743,32 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
 mod tests {
     use super::*;
 
+    /// Copy model fixtures from tests/fixtures/models/ to the target directory.
+    /// Returns the list of files copied.
+    fn copy_model_fixtures(target_dir: &Path) -> std::io::Result<()> {
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
+        fs::create_dir_all(target_dir)?;
+
+        // Copy model.onnx from placeholder
+        fs::copy(
+            fixture_dir.join("model.onnx.placeholder"),
+            target_dir.join("model.onnx"),
+        )?;
+
+        // Copy config files
+        for file in &[
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ] {
+            fs::copy(fixture_dir.join(file), target_dir.join(file))?;
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_model_state_summary() {
         assert_eq!(ModelState::NotInstalled.summary(), "not installed");
@@ -791,8 +826,15 @@ mod tests {
     fn test_check_model_installed_no_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path().join("model");
+        // Use fixture files instead of fake content - only copy model.onnx
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
         fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("model.onnx"), b"fake").unwrap();
+        fs::copy(
+            fixture_dir.join("model.onnx.placeholder"),
+            model_dir.join("model.onnx"),
+        )
+        .unwrap();
         assert_eq!(check_model_installed(&model_dir), ModelState::NotInstalled);
     }
 
@@ -800,12 +842,8 @@ mod tests {
     fn test_check_model_installed_ready() {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path().join("model");
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("model.onnx"), b"fake").unwrap();
-        fs::write(model_dir.join("tokenizer.json"), b"{}").unwrap();
-        fs::write(model_dir.join("config.json"), b"{}").unwrap();
-        fs::write(model_dir.join("special_tokens_map.json"), b"{}").unwrap();
-        fs::write(model_dir.join("tokenizer_config.json"), b"{}").unwrap();
+        // Use fixture files instead of fake content
+        copy_model_fixtures(&model_dir).unwrap();
         fs::write(model_dir.join(".verified"), "revision=test\n").unwrap();
         assert_eq!(check_model_installed(&model_dir), ModelState::Ready);
     }

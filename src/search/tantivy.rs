@@ -365,17 +365,15 @@ fn generate_edge_ngrams(text: &str) -> String {
             .take(MAX_NGRAM_INDICES)
             .collect();
 
-        // Need at least 3 indices (start, char 2, end/char 3) for length 2 ngram
+        // Need at least 2 indices (start, end/char 1) for length 1 ngram
         // indices[0] is always 0.
-        // indices[1] is start of char 1.
-        // indices[2] is start of char 2 (or len).
-        // &word[..indices[2]] gives first 2 chars.
-        if indices.len() < 3 {
+        // indices[1] is start of char 1 (or len).
+        if indices.len() < 2 {
             continue;
         }
 
-        // Generate edge ngrams of length 2..=21 (or word length if shorter)
-        for &end_idx in &indices[2..] {
+        // Generate edge ngrams of length 1..=21 (or word length if shorter)
+        for &end_idx in &indices[1..] {
             if !ngrams.is_empty() {
                 ngrams.push(' ');
             }

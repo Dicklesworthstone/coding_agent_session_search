@@ -2232,7 +2232,7 @@ impl SearchClient {
             "''"
         };
         let sql = format!(
-            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local')
+            "SELECT m.id, {content_expr}, m.created_at, m.idx, m.role, {title_expr}, c.source_path, c.source_id, c.origin_host, a.slug, w.path, COALESCE(s.kind, 'local'), c.started_at
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
              JOIN agents a ON c.agent_id = a.id
@@ -2247,7 +2247,7 @@ impl SearchClient {
             |row: &rusqlite::Row| -> rusqlite::Result<(u64, SearchHit)> {
                 let message_id: i64 = row.get(0)?;
                 let content: String = row.get(1)?;
-                let created_at: Option<i64> = row.get(2)?;
+                let msg_created_at: Option<i64> = row.get(2)?;
                 let idx: Option<i64> = row.get(3)?;
                 let title: Option<String> = if field_mask.wants_title() {
                     row.get(5)?
@@ -2260,7 +2260,9 @@ impl SearchClient {
                 let agent: String = row.get(9)?;
                 let workspace: Option<String> = row.get(10)?;
                 let origin_kind: String = row.get(11)?;
+                let started_at: Option<i64> = row.get(12)?;
 
+                let created_at = msg_created_at.or(started_at);
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let snippet = if field_mask.wants_snippet() {
                     snippet_from_content(&content)
