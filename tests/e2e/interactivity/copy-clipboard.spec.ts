@@ -30,9 +30,8 @@ test.describe('Copy to Clipboard', () => {
     }
   });
 
-  test('clicking copy button shows toast notification', async ({ page, context, exportPath, browserName }) => {
+  test('clicking copy button shows toast notification', async ({ page, context, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
-    test.skip(browserName === 'firefox' || browserName === 'webkit', 'Clipboard API not fully supported');
 
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
@@ -59,9 +58,8 @@ test.describe('Copy to Clipboard', () => {
     }
   });
 
-  test('copies code content to clipboard', async ({ page, context, exportPath, browserName }) => {
+  test('copies code content to clipboard', async ({ page, context, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
-    test.skip(browserName === 'firefox' || browserName === 'webkit', 'Clipboard API not fully supported');
 
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
@@ -92,15 +90,18 @@ test.describe('Copy to Clipboard', () => {
         // Verify clipboard content
         const clipboardText = await page.evaluate(() => navigator.clipboard.readText());
 
-        // Clipboard should contain the code (trim whitespace for comparison)
+        // Clipboard should contain the code (compare trimmed content)
         expect(clipboardText.trim().length).toBeGreaterThan(0);
+        // Verify clipboard content matches original code
+        if (codeContent) {
+          expect(clipboardText.trim()).toBe(codeContent.trim());
+        }
       }
     }
   });
 
-  test('toast notification disappears after timeout', async ({ page, context, exportPath, browserName }) => {
+  test('toast notification disappears after timeout', async ({ page, context, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
-    test.skip(browserName === 'firefox' || browserName === 'webkit', 'Clipboard API not fully supported');
 
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 

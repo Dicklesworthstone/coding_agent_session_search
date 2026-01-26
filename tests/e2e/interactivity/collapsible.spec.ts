@@ -140,7 +140,7 @@ test.describe('Collapsible Sections', () => {
 
     const afterEnterOpen = await firstDetails.getAttribute('open');
     // State should have changed
-    expect(afterEnterOpen !== initiallyOpen).toBe(true);
+    expect(afterEnterOpen).not.toEqual(initiallyOpen);
   });
 });
 
@@ -175,9 +175,8 @@ test.describe('Copy to Clipboard', () => {
     await expect(copyBtn).toBeVisible({ timeout: 2000 });
   });
 
-  test('copy button shows feedback', async ({ page, context, exportPath, browserName }) => {
+  test('copy button shows feedback', async ({ page, context, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
-    test.skip(browserName === 'firefox' || browserName === 'webkit', 'Clipboard API not fully supported');
 
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
@@ -218,9 +217,8 @@ test.describe('Copy to Clipboard', () => {
     expect(hasToast || btnHasCopiedClass).toBe(true);
   });
 
-  test('clipboard contains code content', async ({ page, context, exportPath, browserName }) => {
+  test('clipboard contains code content', async ({ page, context, exportPath }) => {
     test.skip(!exportPath, 'Export path not available');
-    test.skip(browserName === 'firefox' || browserName === 'webkit', 'Clipboard API not fully supported');
 
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);
 
