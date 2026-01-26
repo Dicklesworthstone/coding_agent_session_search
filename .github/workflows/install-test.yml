@@ -72,7 +72,10 @@ jobs:
           echo "CHECKSUM: $CHECKSUM" | tee -a install-test.log
           echo "" | tee -a install-test.log
 
-          # Run the installer
+          # Run the installer with env vars set inline (like macOS job)
+          ARTIFACT_URL="file://$ARTIFACT_PATH" \
+          CHECKSUM="$CHECKSUM" \
+          RUSTUP_INIT_SKIP=1 \
           timeout 60s bash install.sh \
             --version vtest \
             --easy-mode \
@@ -82,10 +85,6 @@ jobs:
 
           echo "" | tee -a install-test.log
           echo "=== Install completed ===" | tee -a install-test.log
-        env:
-          ARTIFACT_URL: file://${{ github.workspace }}/test-artifacts/cass-vtest-linux-x86_64.tar.gz
-          CHECKSUM: ${{ steps.install.outputs.checksum }}
-          RUSTUP_INIT_SKIP: 1  # Skip rustup since we already have Rust
 
       - name: Verify installation
         run: |
