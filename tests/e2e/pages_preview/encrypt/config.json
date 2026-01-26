@@ -1,7 +1,7 @@
 {
   "version": 2,
-  "export_id": "qBVrGXKbLLHR99AiC05ghw==",
-  "base_nonce": "MDXqsQR4sWi/hegX",
+  "export_id": "6dlB11GRhZLb5p0TZHlgaA==",
+  "base_nonce": "Y9wGXvDEWRkA1r/P",
   "compression": "deflate",
   "kdf_defaults": {
     "memory_kb": 65536,
@@ -22,9 +22,9 @@
       "id": 0,
       "slot_type": "password",
       "kdf": "argon2id",
-      "salt": "aXJIdEJhVTRQcnp0ckZFTkw1Nll0dw==",
-      "wrapped_dek": "picHtmHMnTlRHgdaiTS6YU8XUHaHJ4/fB62C00UuwTvWnpOzQDUviLUN43qpifHX",
-      "nonce": "rDgfSA5FXwMs5Q7A",
+      "salt": "OUFRZXRJZ3JRY2s4UGREblRFMnE5Zw==",
+      "wrapped_dek": "VZ83TxRpGltsrJqWfjb1vne7U1xry6Q2JenkfXH2xcYBGXY4pv7pn5q6iUPtIfp6",
+      "nonce": "VyP/XOwImyeG3J1A",
       "argon2_params": {
         "memory_kb": 65536,
         "iterations": 3,

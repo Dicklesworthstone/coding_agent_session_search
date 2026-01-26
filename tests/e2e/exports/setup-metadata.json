@@ -1,7 +1,7 @@
 {
-  "startedAt": "2026-01-26T06:14:07.502Z",
-  "finishedAt": "2026-01-26T06:15:26.548Z",
-  "durationMs": 79046,
+  "startedAt": "2026-01-26T16:24:51.368Z",
+  "finishedAt": "2026-01-26T16:25:00.453Z",
+  "durationMs": 9085,
   "node": "v24.12.0",
   "platform": "linux",
   "arch": "x64",
@@ -17,7 +17,7 @@
       "args": [],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/real_sessions/claude_code_auth_fix.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-basic.html",
       "success": true,
-      "durationMs": 794,
+      "durationMs": 19,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-basic.html\n  21 messages, 136572 bytes\n"
     },
     {
@@ -31,7 +31,7 @@
       ],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/real_sessions/claude_code_auth_fix.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-encrypted.html --encrypt --password test-password-123",
       "success": true,
-      "durationMs": 904,
+      "durationMs": 276,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-encrypted.html\n  🔒 Encrypted with Web Crypto (AES-256-GCM)\n  21 messages, 154402 bytes\n"
     },
     {
@@ -41,7 +41,7 @@
       "args": [],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/real_sessions/cursor_refactoring.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-tool-calls.html",
       "success": true,
-      "durationMs": 433,
+      "durationMs": 15,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-tool-calls.html\n  20 messages, 145020 bytes\n"
     },
     {
@@ -51,7 +51,7 @@
       "args": [],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/edge_cases/large_session.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-large.html",
       "success": true,
-      "durationMs": 769,
+      "durationMs": 29,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-large.html\n  1001 messages, 762406 bytes\n"
     },
     {
@@ -61,7 +61,7 @@
       "args": [],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/edge_cases/unicode_heavy.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-unicode.html",
       "success": true,
-      "durationMs": 395,
+      "durationMs": 15,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-unicode.html\n  9 messages, 113772 bytes\n"
     },
     {
@@ -73,7 +73,7 @@
       ],
       "command": "/data/tmp/cargo-target/release/cass export-html /data/projects/coding_agent_session_search/tests/fixtures/html_export/real_sessions/claude_code_auth_fix.jsonl --output-dir /data/projects/coding_agent_session_search/tests/e2e/exports --filename test-no-cdn.html --no-cdns",
       "success": true,
-      "durationMs": 347,
+      "durationMs": 15,
       "stdout": "✓ Exported to /data/projects/coding_agent_session_search/tests/e2e/exports/test-no-cdn.html\n  21 messages, 134127 bytes\n"
     }
   ],
@@ -81,7 +81,7 @@
     "port": 8090,
     "siteDir": "/data/projects/coding_agent_session_search/tests/e2e/pages_preview/bundle",
     "url": "",
-    "pid": "3993883",
+    "pid": "1576899",
     "log": "/data/projects/coding_agent_session_search/tests/e2e/pages_preview/preview-server.log"
   }
 }
