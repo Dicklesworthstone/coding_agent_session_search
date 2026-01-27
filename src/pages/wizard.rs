@@ -92,6 +92,9 @@ pub struct WizardState {
 
     // Attachment support
     pub include_attachments: bool,
+
+    // Final site directory after bundle (for deployment step)
+    pub final_site_dir: Option<PathBuf>,
 }
 
 impl Default for WizardState {
@@ -1783,6 +1786,14 @@ impl PagesWizard {
         writeln!(term, "\n{}", style("Step 9 of 9: Deployment").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
 
+        // Use the final site directory (e.g. cass-export-bundle/site) if available,
+        // otherwise fallback to output_dir (intermediate) which is likely wrong but safe fallback.
+        let deploy_dir = self
+            .state
+            .final_site_dir
+            .as_ref()
+            .unwrap_or(&self.state.output_dir);
+
         match self.state.target {
             DeployTarget::Local => {
                 writeln!(term)?;
@@ -1791,7 +1802,7 @@ impl PagesWizard {
                 writeln!(
                     term,
                     "Your archive has been exported to: {}",
-                    style(self.state.output_dir.display()).cyan()
+                    style(deploy_dir.display()).cyan()
                 )?;
                 writeln!(term)?;
                 writeln!(term, "To preview locally, run:")?;
@@ -1800,7 +1811,7 @@ impl PagesWizard {
                     "  {}",
                     style(format!(
                         "cd {} && python -m http.server 8080",
-                        self.state.output_dir.display()
+                        deploy_dir.display()
                     ))
                     .dim()
                 )?;
@@ -1828,7 +1839,7 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&self.state.output_dir, |_phase, msg| {
+                        match deployer.deploy(deploy_dir, |_phase, msg| {
                             let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                         }) {
                             Ok(result) => {
@@ -1853,7 +1864,7 @@ impl PagesWizard {
                                 writeln!(
                                     term,
                                     "To deploy manually, push the {} directory to a gh-pages branch.",
-                                    self.state.output_dir.display()
+                                    deploy_dir.display()
                                 )?;
                             }
                         }
@@ -1873,7 +1884,7 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually after fixing prerequisites, push the {} directory to a gh-pages branch.",
-                            self.state.output_dir.display()
+                            deploy_dir.display()
                         )?;
                     }
                     Err(e) => {
@@ -1888,7 +1899,7 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually, push the {} directory to a gh-pages branch.",
-                            self.state.output_dir.display()
+                            deploy_dir.display()
                         )?;
                     }
                 }
@@ -1921,7 +1932,7 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&self.state.output_dir, |_phase, msg| {
+                        match deployer.deploy(deploy_dir, |_phase, msg| {
                             let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                         }) {
                             Ok(result) => {
@@ -1948,14 +1959,14 @@ impl PagesWizard {
                                 writeln!(
                                     term,
                                     "To deploy manually, use wrangler to deploy the {} directory:",
-                                    self.state.output_dir.display()
+                                    deploy_dir.display()
                                 )?;
                                 writeln!(
                                     term,
                                     "  {}",
                                     style(format!(
                                         "wrangler pages deploy {} --project-name {}",
-                                        self.state.output_dir.display(),
+                                        deploy_dir.display(),
                                         project_name
                                     ))
                                     .dim()
@@ -1977,7 +1988,7 @@ impl PagesWizard {
                             "  {}",
                             style(format!(
                                 "wrangler pages deploy {} --project-name {}",
-                                self.state.output_dir.display(),
+                                deploy_dir.display(),
                                 project_name
                             ))
                             .dim()
@@ -1995,14 +2006,14 @@ impl PagesWizard {
                         writeln!(
                             term,
                             "To deploy manually, use wrangler to deploy the {} directory:",
-                            self.state.output_dir.display()
+                            deploy_dir.display()
                         )?;
                         writeln!(
                             term,
                             "  {}",
                             style(format!(
                                 "wrangler pages deploy {} --project-name {}",
-                                self.state.output_dir.display(),
+                                deploy_dir.display(),
                                 project_name
                             ))
                             .dim()
