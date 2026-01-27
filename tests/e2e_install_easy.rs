@@ -12,7 +12,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 mod util;
-use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
+
+fn truncate_output(bytes: &[u8], max_len: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if s.len() > max_len {
+        format!("{}... [truncated {} bytes]", &s[..max_len], s.len() - max_len)
+    } else {
+        s.to_string()
+    }
+}
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_install_easy", test_name)
@@ -66,10 +75,16 @@ fn install_easy_mode_end_to_end() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        output.status.success(),
-        "installer should succeed.\nstdout: {stdout}\nstderr: {stderr}"
-    );
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("bash install.sh --version vtest --easy-mode --verify")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("install.sh failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("install.sh failed (exit {:?})\nstdout: {stdout}\nstderr: {stderr}", output.status.code());
+    }
     tracker.end("run_install", Some("Run install.sh with real toolchain"), phase_start);
 
     // Phase: Verify installation artifacts and checksums

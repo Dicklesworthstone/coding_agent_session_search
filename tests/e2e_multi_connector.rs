@@ -12,10 +12,19 @@ use std::path::Path;
 
 mod util;
 use util::EnvGuard;
-use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_multi_connector", test_name)
+}
+
+fn truncate_output(bytes: &[u8], max_len: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if s.len() > max_len {
+        format!("{}... [truncated {} bytes]", &s[..max_len], s.len() - max_len)
+    } else {
+        s.to_string()
+    }
 }
 
 fn make_codex_fixture(root: &Path) {
@@ -119,7 +128,7 @@ fn multi_connector_pipeline() {
 
     // Phase: Full index
     let phase_start = tracker.start("run_index_full", Some("Run full index across all connectors"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -128,8 +137,18 @@ fn multi_connector_pipeline() {
         .env("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref())
         .env("CODEX_HOME", dot_codex.to_string_lossy().as_ref())
         .env("GEMINI_HOME", dot_gemini.to_string_lossy().as_ref())
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (multi_connector_pipeline)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index_full", Some("Run full index across all connectors"), phase_start);
 
     // Phase: Search all connectors
@@ -147,7 +166,16 @@ fn multi_connector_pipeline() {
         .expect("failed to execute search");
     let search_duration = search_start.elapsed().as_millis() as u64;
 
-    assert!(output.status.success());
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search user --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let json_out: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json_out
@@ -192,7 +220,7 @@ fn multi_connector_pipeline() {
     );
     fs::write(sessions.join("rollout-2.jsonl"), content).unwrap();
 
-    cargo_bin_cmd!("cass")
+    let incr_idx_output = cargo_bin_cmd!("cass")
         .arg("index")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -200,8 +228,18 @@ fn multi_connector_pipeline() {
         .env("XDG_DATA_HOME", xdg_data.to_string_lossy().as_ref())
         .env("CODEX_HOME", dot_codex.to_string_lossy().as_ref())
         .env("GEMINI_HOME", dot_gemini.to_string_lossy().as_ref())
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index (incremental)");
+    if !incr_idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index (incremental)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(incr_idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&incr_idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&incr_idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index (incremental) failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index (incremental) failed (exit {:?}): {}", incr_idx_output.status.code(), truncate_output(&incr_idx_output.stderr, 500));
+    }
 
     let output_inc = cargo_bin_cmd!("cass")
         .arg("search")
@@ -336,13 +374,23 @@ fn multi_connector_codex_and_claude() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (codex_and_claude)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Run full index"), phase_start);
 
     // Phase: Search and verify
@@ -356,7 +404,16 @@ fn multi_connector_codex_and_claude() {
         .expect("search command");
     let search_duration = search_start.elapsed().as_millis() as u64;
 
-    assert!(output.status.success());
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search multitest --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")
@@ -416,13 +473,23 @@ fn multi_connector_agent_filter_isolation() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (agent_filter_isolation)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Run full index"), phase_start);
 
     // Phase: Filter by codex
@@ -438,7 +505,16 @@ fn multi_connector_agent_filter_isolation() {
         .expect("search command");
     let codex_duration = codex_start.elapsed().as_millis() as u64;
 
-    assert!(codex_output.status.success());
+    if !codex_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search isolationtest --agent codex --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(codex_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&codex_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&codex_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search --agent codex failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search --agent codex failed (exit {:?}): {}", codex_output.status.code(), truncate_output(&codex_output.stderr, 500));
+    }
     let codex_json: serde_json::Value =
         serde_json::from_slice(&codex_output.stdout).expect("valid json");
     let codex_hits = codex_json
@@ -472,7 +548,16 @@ fn multi_connector_agent_filter_isolation() {
         .expect("search command");
     let claude_duration = claude_start.elapsed().as_millis() as u64;
 
-    assert!(claude_output.status.success());
+    if !claude_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search isolationtest --agent claude_code --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(claude_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&claude_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&claude_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search --agent claude_code failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search --agent claude_code failed (exit {:?}): {}", claude_output.status.code(), truncate_output(&claude_output.stderr, 500));
+    }
     let claude_json: serde_json::Value =
         serde_json::from_slice(&claude_output.stdout).expect("valid json");
     let claude_hits = claude_json
@@ -530,13 +615,23 @@ fn multi_connector_unique_content() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (unique_content)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Run full index"), phase_start);
 
     // Phase: Search codex-specific content
@@ -548,7 +643,16 @@ fn multi_connector_unique_content() {
         .output()
         .expect("search command");
 
-    assert!(codex_output.status.success());
+    if !codex_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search codexonly_xyzzy --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(codex_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&codex_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&codex_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search codexonly_xyzzy failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search failed (exit {:?}): {}", codex_output.status.code(), truncate_output(&codex_output.stderr, 500));
+    }
     let codex_json: serde_json::Value =
         serde_json::from_slice(&codex_output.stdout).expect("valid json");
     let codex_hits = codex_json
@@ -572,7 +676,16 @@ fn multi_connector_unique_content() {
         .output()
         .expect("search command");
 
-    assert!(claude_output.status.success());
+    if !claude_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search claudeonly_plugh --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(claude_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&claude_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&claude_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search claudeonly_plugh failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search failed (exit {:?}): {}", claude_output.status.code(), truncate_output(&claude_output.stderr, 500));
+    }
     let claude_json: serde_json::Value =
         serde_json::from_slice(&claude_output.stdout).expect("valid json");
     let claude_hits = claude_json
@@ -638,13 +751,23 @@ fn multi_connector_aggregation() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (aggregation)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Run full index"), phase_start);
 
     // Phase: Aggregation search
@@ -660,7 +783,16 @@ fn multi_connector_aggregation() {
         .expect("search command");
     let agg_duration = agg_start.elapsed().as_millis() as u64;
 
-    assert!(output.status.success());
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search aggtest --aggregate agent --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search --aggregate failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search --aggregate failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
     let aggregations = json.get("aggregations").and_then(|a| a.as_object());
@@ -729,13 +861,23 @@ fn multi_connector_incremental_index() {
 
     // Phase: Full index
     let phase_start = tracker.start("run_full_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (incremental_index)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_full_index", Some("Run full index"), phase_start);
 
     // Phase: Verify initial index
@@ -782,13 +924,23 @@ fn multi_connector_incremental_index() {
     );
 
     let incr_start = std::time::Instant::now();
-    cargo_bin_cmd!("cass")
+    let incr_idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index (incremental)");
+    if !incr_idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index (incremental)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(incr_idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&incr_idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&incr_idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index (incremental) failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index (incremental) failed (exit {:?}): {}", incr_idx_output.status.code(), truncate_output(&incr_idx_output.stderr, 500));
+    }
     let incr_duration = incr_start.elapsed().as_millis() as u64;
     tracker.end("incremental_index", Some("Add new sessions and run incremental index"), phase_start);
 
@@ -875,13 +1027,23 @@ fn multi_connector_multiple_agent_filter() {
 
     // Phase: Index
     let phase_start = tracker.start("run_index", Some("Run full index"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (multiple_agent_filter)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Run full index"), phase_start);
 
     // Phase: Multi-agent filter search
@@ -898,7 +1060,16 @@ fn multi_connector_multiple_agent_filter() {
         .expect("search command");
     let search_duration = search_start.elapsed().as_millis() as u64;
 
-    assert!(output.status.success());
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search multiagent --agent codex --agent claude_code --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search --agent multi failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search --agent multi failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let json: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
@@ -953,13 +1124,23 @@ fn multi_connector_empty_connector() {
 
     // Phase: Index with missing connector
     let phase_start = tracker.start("run_index", Some("Index with non-existent claude_home"));
-    cargo_bin_cmd!("cass")
+    let idx_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index --full");
+    if !idx_output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full (empty_connector)")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(idx_output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&idx_output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&idx_output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", idx_output.status.code(), truncate_output(&idx_output.stderr, 500));
+    }
     tracker.end("run_index", Some("Index with non-existent claude_home"), phase_start);
 
     // Phase: Search and verify
@@ -971,7 +1152,16 @@ fn multi_connector_empty_connector() {
         .output()
         .expect("search command");
 
-    assert!(output.status.success());
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass search singleconnector --robot")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass search singleconnector failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass search failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
     let hits = json
         .get("hits")

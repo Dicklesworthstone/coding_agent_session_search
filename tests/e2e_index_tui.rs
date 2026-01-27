@@ -4,7 +4,16 @@ use std::path::Path;
 
 mod util;
 use util::EnvGuard;
-use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTracker};
+
+fn truncate_output(bytes: &[u8], max_len: usize) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if s.len() > max_len {
+        format!("{}... [truncated {} bytes]", &s[..max_len], s.len() - max_len)
+    } else {
+        s.to_string()
+    }
+}
 
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_index_tui", test_name)
@@ -46,15 +55,24 @@ fn index_then_tui_once_headless() {
 
     // Phase: run index
     let index_start = tracker.start("run_index", Some("Running cass index --full"));
-    cargo_bin_cmd!("cass")
+    let output = cargo_bin_cmd!("cass")
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
         .arg(&data_dir)
-        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
         .current_dir(&home)
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass index");
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass index --full failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass index --full failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let index_ms = index_start.elapsed().as_millis() as u64;
     tracker.end("run_index", Some("Index complete"), index_start);
     tracker.metrics(
@@ -67,16 +85,25 @@ fn index_then_tui_once_headless() {
 
     // Phase: run TUI in headless mode
     let tui_start = tracker.start("run_tui", Some("Smoke-testing TUI in headless mode"));
-    cargo_bin_cmd!("cass")
+    let output = cargo_bin_cmd!("cass")
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
         .arg("--once")
-        // Avoid connector detection from the repository CWD (e.g. `.aider.chat.history.md`).
         .current_dir(&home)
         .env("TUI_HEADLESS", "1")
-        .assert()
-        .success();
+        .output()
+        .expect("failed to spawn cass tui");
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass tui --once")
+            .capture_cwd()
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state("stdout_tail", serde_json::json!(truncate_output(&output.stdout, 1000)))
+            .add_state("stderr_tail", serde_json::json!(truncate_output(&output.stderr, 1000)));
+        tracker.fail(E2eError::with_type("cass tui --once failed", "COMMAND_FAILED").with_context(ctx));
+        panic!("cass tui --once failed (exit {:?}): {}", output.status.code(), truncate_output(&output.stderr, 500));
+    }
     let tui_ms = tui_start.elapsed().as_millis() as u64;
     tracker.end("run_tui", Some("TUI headless smoke test passed"), tui_start);
     tracker.metrics(
