@@ -9335,6 +9335,16 @@ fn run_index_with_data(
             "messages": messages,
         });
 
+        // Add structured indexing stats if available (T7.4)
+        if let Ok(stats) = index_progress.stats.lock() {
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "indexing_stats".to_string(),
+                    serde_json::to_value(&*stats).unwrap_or_default(),
+                );
+            }
+        }
+
         // Store idempotency key if provided
         if let Some(key) = &idempotency_key {
             payload["idempotency_key"] = serde_json::json!(key);
