@@ -295,6 +295,9 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
     }
 
     // Validate chunk_size
+    if config.payload.chunk_size == 0 {
+        errors.push("chunk_size cannot be zero".to_string());
+    }
     if config.payload.chunk_size > MAX_CONFIG_CHUNK_SIZE {
         errors.push(format!(
             "chunk_size {} exceeds maximum {}",
@@ -314,6 +317,26 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
             config.payload.files.len(),
             config.payload.chunk_count
         ));
+    }
+
+    // Validate payload file paths (relative, under payload/, no parent traversal)
+    for (i, file) in config.payload.files.iter().enumerate() {
+        let path = Path::new(file);
+        if path.is_absolute() {
+            errors.push(format!("payload.files[{}] must be relative", i));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            errors.push(format!("payload.files[{}] must not contain '..'", i));
+        }
+        if !path.starts_with("payload") {
+            errors.push(format!(
+                "payload.files[{}] must reside under payload/",
+                i
+            ));
+        }
     }
 
     // Validate key_slots
@@ -479,21 +502,55 @@ fn check_payload_manifest(site_dir: &Path) -> CheckResult {
 
 /// Check size limits for chunk files
 fn check_size_limits(site_dir: &Path) -> CheckResult {
-    let payload_dir = site_dir.join("payload");
     let mut errors = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&payload_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "bin").unwrap_or(false)
-                && let Ok(meta) = path.metadata()
-                && meta.len() > MAX_CHUNK_SIZE
-            {
+    let config_path = site_dir.join("config.json");
+    let config: ArchiveConfig = match File::open(&config_path)
+        .context("Failed to open config.json")
+        .and_then(|f| serde_json::from_reader(BufReader::new(f)).context("Failed to parse JSON"))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckResult::fail(format!("Failed to parse config.json: {}", e));
+        }
+    };
+
+    match &config {
+        ArchiveConfig::Encrypted(_) => {
+            let payload_dir = site_dir.join("payload");
+            if !payload_dir.is_dir() {
+                errors.push("payload/ directory not found for size check".to_string());
+            } else if let Ok(entries) = fs::read_dir(&payload_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "bin").unwrap_or(false)
+                        && let Ok(meta) = path.metadata()
+                        && meta.len() > MAX_CHUNK_SIZE
+                    {
+                        errors.push(format!(
+                            "{} exceeds 100MB limit ({} bytes)",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            meta.len()
+                        ));
+                    }
+                }
+            }
+        }
+        ArchiveConfig::Unencrypted(unenc) => {
+            let payload_path = site_dir.join(&unenc.payload.path);
+            if !payload_path.exists() {
                 errors.push(format!(
-                    "{} exceeds 100MB limit ({} bytes)",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    meta.len()
+                    "payload file not found for size check: {}",
+                    unenc.payload.path
                 ));
+            } else if let Ok(meta) = payload_path.metadata() {
+                if meta.len() > MAX_CHUNK_SIZE {
+                    errors.push(format!(
+                        "{} exceeds 100MB limit ({} bytes)",
+                        unenc.payload.path,
+                        meta.len()
+                    ));
+                }
             }
         }
     }
