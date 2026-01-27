@@ -4219,6 +4219,7 @@ fn run_cli_search(
                 wildcard_fallback: false,
                 cache_stats: crate::search::query::CacheStats::default(),
                 suggestions: Vec::new(),
+                ann_stats: None,
             }
         }
         SearchMode::Hybrid => client
@@ -5380,6 +5381,15 @@ fn output_robot_results(
                     if timed_out {
                         m.insert("partial_results".to_string(), serde_json::json!(true));
                     }
+                }
+                // Add ANN stats to _meta if approximate search was used
+                if let Some(ref ann_stats) = result.ann_stats
+                    && let serde_json::Value::Object(ref mut m) = meta
+                {
+                    m.insert(
+                        "ann_stats".to_string(),
+                        serde_json::to_value(ann_stats).unwrap_or_default(),
+                    );
                 }
                 map.insert("_meta".to_string(), meta);
                 if let Some(warn) = &warning {

@@ -1704,6 +1704,9 @@ impl PagesWizard {
                 pb3.set_message(format!("{}: {}", phase, msg));
             })?;
 
+        // Save final site directory for deployment step
+        self.state.final_site_dir = Some(bundle_result.site_dir.clone());
+
         pb3.finish_with_message(format!(
             "✓ Bundle complete: {} files, fingerprint {}",
             bundle_result.total_files,

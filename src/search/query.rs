@@ -2777,6 +2777,7 @@ impl SearchClient {
             wildcard_fallback: lexical.wildcard_fallback,
             cache_stats: lexical.cache_stats,
             suggestions,
+            ann_stats: None,
         })
     }
 
