@@ -115,7 +115,7 @@ pub enum Commands {
         full: bool,
 
         /// Force Tantivy index rebuild even if schema matches
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, visible_alias = "force")]
         force_rebuild: bool,
 
         /// Watch for changes and reindex automatically
@@ -139,7 +139,7 @@ pub enum Commands {
         data_dir: Option<PathBuf>,
 
         /// Output as JSON (for automation)
-        #[arg(long)]
+        #[arg(long, visible_alias = "robot")]
         json: bool,
 
         /// Idempotency key for safe retries. If the same key is used with identical parameters,
@@ -392,7 +392,7 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Output as JSON
-        #[arg(long)]
+        #[arg(long, visible_alias = "robot")]
         json: bool,
         /// Apply safe fixes automatically (rebuilds index/db from source data)
         #[arg(long)]
@@ -401,7 +401,7 @@ pub enum Commands {
         #[arg(long, short)]
         verbose: bool,
         /// Force index rebuild even if index appears healthy
-        #[arg(long)]
+        #[arg(long, visible_alias = "force")]
         force_rebuild: bool,
     },
     /// Find related sessions for a given source path
