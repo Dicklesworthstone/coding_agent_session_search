@@ -1927,7 +1927,11 @@ pub fn update_baseline(name: &str, value: f64, unit: &str) -> std::io::Result<()
 ///
 /// Returns a comparison result indicating whether this is a regression (>20% worse).
 #[allow(dead_code)]
-pub fn compare_to_baseline(name: &str, value: f64, unit: &str) -> std::io::Result<BaselineComparison> {
+pub fn compare_to_baseline(
+    name: &str,
+    value: f64,
+    unit: &str,
+) -> std::io::Result<BaselineComparison> {
     let baselines = load_baselines()?;
 
     let baseline = baselines.get(name).map(|b| b.value).unwrap_or(value);
@@ -1962,7 +1966,11 @@ pub fn compare_to_baseline(name: &str, value: f64, unit: &str) -> std::io::Resul
 /// check_metric_regression("search_latency_p50_ms", latency, "ms")?;
 /// ```
 #[allow(dead_code)]
-pub fn check_metric_regression(name: &str, value: f64, unit: &str) -> std::io::Result<BaselineComparison> {
+pub fn check_metric_regression(
+    name: &str,
+    value: f64,
+    unit: &str,
+) -> std::io::Result<BaselineComparison> {
     // Emit the metric
     emit_metric(name, value, unit)?;
 
@@ -2849,9 +2857,18 @@ mod tests {
     #[test]
     fn test_standard_metrics_constants() {
         // Verify standard metric names are defined
-        assert_eq!(standard_metrics::INDEXING_DURATION_MS, "indexing_duration_ms");
-        assert_eq!(standard_metrics::SEARCH_LATENCY_P50_MS, "search_latency_p50_ms");
-        assert_eq!(standard_metrics::SEARCH_LATENCY_P99_MS, "search_latency_p99_ms");
+        assert_eq!(
+            standard_metrics::INDEXING_DURATION_MS,
+            "indexing_duration_ms"
+        );
+        assert_eq!(
+            standard_metrics::SEARCH_LATENCY_P50_MS,
+            "search_latency_p50_ms"
+        );
+        assert_eq!(
+            standard_metrics::SEARCH_LATENCY_P99_MS,
+            "search_latency_p99_ms"
+        );
         assert_eq!(standard_metrics::MEMORY_PEAK_KB, "memory_peak_kb");
         assert_eq!(standard_metrics::INDEX_SIZE_BYTES, "index_size_bytes");
         assert_eq!(standard_metrics::FILES_PROCESSED, "files_processed");
