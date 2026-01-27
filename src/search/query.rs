@@ -2758,7 +2758,7 @@ impl SearchClient {
             sparse_threshold,
             field_mask,
         )?;
-        let semantic = self.search_semantic(
+        let (semantic_hits, semantic_ann_stats) = self.search_semantic(
             semantic_query,
             filters,
             candidate,
@@ -2766,7 +2766,7 @@ impl SearchClient {
             field_mask,
             approximate,
         )?;
-        let fused = rrf_fuse_hits(&lexical.hits, &semantic, limit, offset);
+        let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
         } else {
@@ -2777,7 +2777,7 @@ impl SearchClient {
             wildcard_fallback: lexical.wildcard_fallback,
             cache_stats: lexical.cache_stats,
             suggestions,
-            ann_stats: None,
+            ann_stats: semantic_ann_stats,
         })
     }
 

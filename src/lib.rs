@@ -4343,6 +4343,7 @@ fn run_cli_search(
                             wildcard_fallback: result.wildcard_fallback,
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
+                            ann_stats: result.ann_stats,
                         }
                     }
                     Err(e) => {

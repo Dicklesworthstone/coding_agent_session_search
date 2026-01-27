@@ -7515,13 +7515,14 @@ pub fn run_tui(
                                 crate::search::query::FieldMask::FULL,
                                 false,
                             ) {
-                                Ok(hits) => {
+                                Ok((hits, ann_stats)) => {
                                     effective_search_mode = SearchMode::Semantic;
                                     Ok(crate::search::query::SearchResult {
                                         hits,
                                         wildcard_fallback: false,
                                         cache_stats: CacheStats::default(),
                                         suggestions: Vec::new(),
+                                        ann_stats,
                                     })
                                 }
                                 Err(err) => {
