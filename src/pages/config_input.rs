@@ -574,6 +574,7 @@ impl PagesConfig {
             no_encryption: self.encryption.no_encryption,
             unencrypted_confirmed: self.encryption.i_understand_risks,
             include_attachments: self.bundle.include_attachments,
+            final_site_dir: None,
         })
     }
 

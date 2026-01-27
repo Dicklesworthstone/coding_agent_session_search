@@ -1,5 +1,5 @@
 use crate::ui::time_parser::parse_time_input;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use rusqlite::{Connection, params};
@@ -50,6 +50,21 @@ impl ExportEngine {
     where
         F: Fn(usize, usize),
     {
+        let src_canon = std::fs::canonicalize(&self.source_db_path)
+            .unwrap_or_else(|_| self.source_db_path.clone());
+        let out_canon =
+            std::fs::canonicalize(&self.output_path).unwrap_or_else(|_| self.output_path.clone());
+        if src_canon == out_canon {
+            bail!("output path must be different from source database path");
+        }
+
+        if self.output_path.exists() && self.output_path.is_dir() {
+            bail!(
+                "output path points to a directory, expected a file: {}",
+                self.output_path.display()
+            );
+        }
+
         // 1. Open source DB
         let src = Connection::open_with_flags(
             &self.source_db_path,
