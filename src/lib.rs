@@ -4401,6 +4401,7 @@ fn run_cli_search(
             wildcard_fallback: result.wildcard_fallback,
             cache_stats: result.cache_stats,
             suggestions: result.suggestions.clone(),
+            ann_stats: result.ann_stats.clone(),
         };
         (aggs, display, total)
     } else {
