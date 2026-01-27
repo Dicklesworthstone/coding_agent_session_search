@@ -305,371 +305,394 @@ fn make_claude_session(
 /// Test: Multiple connectors can be indexed and searched together
 #[test]
 fn multi_connector_codex_and_claude() {
-    logged_test!("multi_connector_codex_and_claude", "e2e_multi_connector", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
-        let codex_home = home.join(".codex");
-        let claude_home = home.join(".claude");
-        let data_dir = home.join("cass_data");
-        fs::create_dir_all(&data_dir).unwrap();
+    let tracker = tracker_for("multi_connector_codex_and_claude");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let claude_home = home.join(".claude");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
 
-        let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-        let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-        // Create sessions for both connectors with shared search term
-        make_codex_session(
-            &codex_home,
-            "2024/11/20",
-            "rollout-multi.jsonl",
-            "multitest codex_unique_content",
-            1732118400000,
-        );
-        make_claude_session(
-            &claude_home,
-            "multi-project",
-            "session-multi.jsonl",
-            "multitest claude_unique_content",
-            "2024-11-20T10:00:00Z",
-        );
+    // Phase: Create fixtures
+    let phase_start = tracker.start("setup_fixtures", Some("Create Codex and Claude sessions"));
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-multi.jsonl",
+        "multitest codex_unique_content",
+        1732118400000,
+    );
+    make_claude_session(
+        &claude_home,
+        "multi-project",
+        "session-multi.jsonl",
+        "multitest claude_unique_content",
+        "2024-11-20T10:00:00Z",
+    );
+    tracker.end("setup_fixtures", Some("Create Codex and Claude sessions"), phase_start);
 
-        // Index all connectors
-        cargo_bin_cmd!("cass")
-            .args(["index", "--full", "--data-dir"])
-            .arg(&data_dir)
-            .env("CODEX_HOME", &codex_home)
-            .env("HOME", home)
-            .assert()
-            .success();
+    // Phase: Index
+    let phase_start = tracker.start("run_index", Some("Run full index"));
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+    tracker.end("run_index", Some("Run full index"), phase_start);
 
-        // Search for shared term - should find results from both connectors
-        let output = cargo_bin_cmd!("cass")
-            .args(["search", "multitest", "--robot", "--data-dir"])
-            .arg(&data_dir)
-            .env("HOME", home)
-            .output()
-            .expect("search command");
+    // Phase: Search and verify
+    let phase_start = tracker.start("search_multi_connector", Some("Search shared term across connectors"));
+    let search_start = std::time::Instant::now();
+    let output = cargo_bin_cmd!("cass")
+        .args(["search", "multitest", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
+    let search_duration = search_start.elapsed().as_millis() as u64;
 
-        assert!(output.status.success());
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
-        let hits = json
-            .get("hits")
-            .and_then(|h| h.as_array())
-            .expect("hits array");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    let hits = json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
 
-        // Should have hits from both connectors
-        let agents: std::collections::HashSet<_> =
-            hits.iter().filter_map(|h| h["agent"].as_str()).collect();
+    let agents: std::collections::HashSet<_> =
+        hits.iter().filter_map(|h| h["agent"].as_str()).collect();
 
-        assert!(
-            agents.contains("codex"),
-            "Should find codex results. Agents found: {agents:?}"
-        );
-        assert!(
-            agents.contains("claude_code"),
-            "Should find claude_code results. Agents found: {agents:?}"
-        );
-        assert!(
-            hits.len() >= 2,
-            "Should have at least 2 hits from different connectors"
-        );
-    });
+    assert!(agents.contains("codex"), "Should find codex results. Agents found: {agents:?}");
+    assert!(agents.contains("claude_code"), "Should find claude_code results. Agents found: {agents:?}");
+    assert!(hits.len() >= 2, "Should have at least 2 hits from different connectors");
+    tracker.end("search_multi_connector", Some("Search shared term across connectors"), phase_start);
+
+    tracker.metrics(
+        "search_multi_connector",
+        &E2ePerformanceMetrics::new()
+            .with_duration(search_duration)
+            .with_custom("hit_count", serde_json::json!(hits.len()))
+            .with_custom("agent_count", serde_json::json!(agents.len())),
+    );
+
+    tracker.complete();
 }
 
 /// Test: Agent filter isolates results to specific connector
 #[test]
 fn multi_connector_agent_filter_isolation() {
-    logged_test!(
-        "multi_connector_agent_filter_isolation",
-        "e2e_multi_connector",
-        {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let home = tmp.path();
-            let codex_home = home.join(".codex");
-            let claude_home = home.join(".claude");
-            let data_dir = home.join("cass_data");
-            fs::create_dir_all(&data_dir).unwrap();
+    let tracker = tracker_for("multi_connector_agent_filter_isolation");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let claude_home = home.join(".claude");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
 
-            let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-            let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-            // Create sessions with shared search term
-            make_codex_session(
-                &codex_home,
-                "2024/11/20",
-                "rollout-iso.jsonl",
-                "isolationtest codex_data",
-                1732118400000,
-            );
-            make_claude_session(
-                &claude_home,
-                "iso-project",
-                "session-iso.jsonl",
-                "isolationtest claude_data",
-                "2024-11-20T10:00:00Z",
-            );
-
-            cargo_bin_cmd!("cass")
-                .args(["index", "--full", "--data-dir"])
-                .arg(&data_dir)
-                .env("CODEX_HOME", &codex_home)
-                .env("HOME", home)
-                .assert()
-                .success();
-
-            // Filter by codex only
-            let codex_output = cargo_bin_cmd!("cass")
-                .args([
-                    "search",
-                    "isolationtest",
-                    "--agent",
-                    "codex",
-                    "--robot",
-                    "--data-dir",
-                ])
-                .arg(&data_dir)
-                .env("HOME", home)
-                .output()
-                .expect("search command");
-
-            assert!(codex_output.status.success());
-            let codex_json: serde_json::Value =
-                serde_json::from_slice(&codex_output.stdout).expect("valid json");
-            let codex_hits = codex_json
-                .get("hits")
-                .and_then(|h| h.as_array())
-                .expect("hits array");
-
-            assert!(!codex_hits.is_empty(), "Should find codex hits");
-            for hit in codex_hits {
-                assert_eq!(
-                    hit["agent"], "codex",
-                    "All hits should be from codex when filtering"
-                );
-            }
-
-            // Filter by claude_code only
-            let claude_output = cargo_bin_cmd!("cass")
-                .args([
-                    "search",
-                    "isolationtest",
-                    "--agent",
-                    "claude_code",
-                    "--robot",
-                    "--data-dir",
-                ])
-                .arg(&data_dir)
-                .env("HOME", home)
-                .output()
-                .expect("search command");
-
-            assert!(claude_output.status.success());
-            let claude_json: serde_json::Value =
-                serde_json::from_slice(&claude_output.stdout).expect("valid json");
-            let claude_hits = claude_json
-                .get("hits")
-                .and_then(|h| h.as_array())
-                .expect("hits array");
-
-            assert!(!claude_hits.is_empty(), "Should find claude_code hits");
-            for hit in claude_hits {
-                assert_eq!(
-                    hit["agent"], "claude_code",
-                    "All hits should be from claude_code when filtering"
-                );
-            }
-        }
+    // Phase: Setup
+    let phase_start = tracker.start("setup_fixtures", Some("Create sessions with shared search term"));
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-iso.jsonl",
+        "isolationtest codex_data",
+        1732118400000,
     );
+    make_claude_session(
+        &claude_home,
+        "iso-project",
+        "session-iso.jsonl",
+        "isolationtest claude_data",
+        "2024-11-20T10:00:00Z",
+    );
+    tracker.end("setup_fixtures", Some("Create sessions with shared search term"), phase_start);
+
+    // Phase: Index
+    let phase_start = tracker.start("run_index", Some("Run full index"));
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+    tracker.end("run_index", Some("Run full index"), phase_start);
+
+    // Phase: Filter by codex
+    let phase_start = tracker.start("filter_codex", Some("Search with agent=codex filter"));
+    let codex_start = std::time::Instant::now();
+    let codex_output = cargo_bin_cmd!("cass")
+        .args([
+            "search", "isolationtest", "--agent", "codex", "--robot", "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
+    let codex_duration = codex_start.elapsed().as_millis() as u64;
+
+    assert!(codex_output.status.success());
+    let codex_json: serde_json::Value =
+        serde_json::from_slice(&codex_output.stdout).expect("valid json");
+    let codex_hits = codex_json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
+
+    assert!(!codex_hits.is_empty(), "Should find codex hits");
+    for hit in codex_hits {
+        assert_eq!(hit["agent"], "codex", "All hits should be from codex when filtering");
+    }
+    tracker.end("filter_codex", Some("Search with agent=codex filter"), phase_start);
+
+    tracker.metrics(
+        "filter_codex",
+        &E2ePerformanceMetrics::new()
+            .with_duration(codex_duration)
+            .with_custom("hit_count", serde_json::json!(codex_hits.len())),
+    );
+
+    // Phase: Filter by claude_code
+    let phase_start = tracker.start("filter_claude", Some("Search with agent=claude_code filter"));
+    let claude_start = std::time::Instant::now();
+    let claude_output = cargo_bin_cmd!("cass")
+        .args([
+            "search", "isolationtest", "--agent", "claude_code", "--robot", "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
+    let claude_duration = claude_start.elapsed().as_millis() as u64;
+
+    assert!(claude_output.status.success());
+    let claude_json: serde_json::Value =
+        serde_json::from_slice(&claude_output.stdout).expect("valid json");
+    let claude_hits = claude_json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
+
+    assert!(!claude_hits.is_empty(), "Should find claude_code hits");
+    for hit in claude_hits {
+        assert_eq!(hit["agent"], "claude_code", "All hits should be from claude_code when filtering");
+    }
+    tracker.end("filter_claude", Some("Search with agent=claude_code filter"), phase_start);
+
+    tracker.metrics(
+        "filter_claude",
+        &E2ePerformanceMetrics::new()
+            .with_duration(claude_duration)
+            .with_custom("hit_count", serde_json::json!(claude_hits.len())),
+    );
+
+    tracker.complete();
 }
 
 /// Test: Each connector's unique content is properly indexed
 #[test]
 fn multi_connector_unique_content() {
-    logged_test!("multi_connector_unique_content", "e2e_multi_connector", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
-        let codex_home = home.join(".codex");
-        let claude_home = home.join(".claude");
-        let data_dir = home.join("cass_data");
-        fs::create_dir_all(&data_dir).unwrap();
+    let tracker = tracker_for("multi_connector_unique_content");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let claude_home = home.join(".claude");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
 
-        let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-        let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-        // Create sessions with unique content per connector
-        make_codex_session(
-            &codex_home,
-            "2024/11/20",
-            "rollout-unique.jsonl",
-            "codexonly_xyzzy uniqueterm",
-            1732118400000,
-        );
-        make_claude_session(
-            &claude_home,
-            "unique-project",
-            "session-unique.jsonl",
-            "claudeonly_plugh uniqueterm",
-            "2024-11-20T10:00:00Z",
-        );
+    // Phase: Setup
+    let phase_start = tracker.start("setup_fixtures", Some("Create sessions with unique content per connector"));
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-unique.jsonl",
+        "codexonly_xyzzy uniqueterm",
+        1732118400000,
+    );
+    make_claude_session(
+        &claude_home,
+        "unique-project",
+        "session-unique.jsonl",
+        "claudeonly_plugh uniqueterm",
+        "2024-11-20T10:00:00Z",
+    );
+    tracker.end("setup_fixtures", Some("Create sessions with unique content per connector"), phase_start);
 
-        cargo_bin_cmd!("cass")
-            .args(["index", "--full", "--data-dir"])
-            .arg(&data_dir)
-            .env("CODEX_HOME", &codex_home)
-            .env("HOME", home)
-            .assert()
-            .success();
+    // Phase: Index
+    let phase_start = tracker.start("run_index", Some("Run full index"));
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+    tracker.end("run_index", Some("Run full index"), phase_start);
 
-        // Search for codex-specific term
-        let codex_output = cargo_bin_cmd!("cass")
-            .args(["search", "codexonly_xyzzy", "--robot", "--data-dir"])
-            .arg(&data_dir)
-            .env("HOME", home)
-            .output()
-            .expect("search command");
+    // Phase: Search codex-specific content
+    let phase_start = tracker.start("search_codex_unique", Some("Search for codex-specific term"));
+    let codex_output = cargo_bin_cmd!("cass")
+        .args(["search", "codexonly_xyzzy", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
 
-        assert!(codex_output.status.success());
-        let codex_json: serde_json::Value =
-            serde_json::from_slice(&codex_output.stdout).expect("valid json");
-        let codex_hits = codex_json
-            .get("hits")
-            .and_then(|h| h.as_array())
-            .expect("hits array");
+    assert!(codex_output.status.success());
+    let codex_json: serde_json::Value =
+        serde_json::from_slice(&codex_output.stdout).expect("valid json");
+    let codex_hits = codex_json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
 
-        assert!(!codex_hits.is_empty(), "Should find codex-specific content");
-        assert!(
-            codex_hits.iter().all(|h| h["agent"] == "codex"),
-            "Codex-specific search should only return codex results"
-        );
+    assert!(!codex_hits.is_empty(), "Should find codex-specific content");
+    assert!(
+        codex_hits.iter().all(|h| h["agent"] == "codex"),
+        "Codex-specific search should only return codex results"
+    );
+    tracker.end("search_codex_unique", Some("Search for codex-specific term"), phase_start);
 
-        // Search for claude-specific term
-        let claude_output = cargo_bin_cmd!("cass")
-            .args(["search", "claudeonly_plugh", "--robot", "--data-dir"])
-            .arg(&data_dir)
-            .env("HOME", home)
-            .output()
-            .expect("search command");
+    // Phase: Search claude-specific content
+    let phase_start = tracker.start("search_claude_unique", Some("Search for claude-specific term"));
+    let claude_output = cargo_bin_cmd!("cass")
+        .args(["search", "claudeonly_plugh", "--robot", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
 
-        assert!(claude_output.status.success());
-        let claude_json: serde_json::Value =
-            serde_json::from_slice(&claude_output.stdout).expect("valid json");
-        let claude_hits = claude_json
-            .get("hits")
-            .and_then(|h| h.as_array())
-            .expect("hits array");
+    assert!(claude_output.status.success());
+    let claude_json: serde_json::Value =
+        serde_json::from_slice(&claude_output.stdout).expect("valid json");
+    let claude_hits = claude_json
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .expect("hits array");
 
-        assert!(
-            !claude_hits.is_empty(),
-            "Should find claude-specific content"
-        );
-        assert!(
-            claude_hits.iter().all(|h| h["agent"] == "claude_code"),
-            "Claude-specific search should only return claude_code results"
-        );
-    });
+    assert!(!claude_hits.is_empty(), "Should find claude-specific content");
+    assert!(
+        claude_hits.iter().all(|h| h["agent"] == "claude_code"),
+        "Claude-specific search should only return claude_code results"
+    );
+    tracker.end("search_claude_unique", Some("Search for claude-specific term"), phase_start);
+
+    tracker.complete();
 }
 
 /// Test: Aggregation by agent works with multiple connectors
 #[test]
 fn multi_connector_aggregation() {
-    logged_test!("multi_connector_aggregation", "e2e_multi_connector", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let home = tmp.path();
-        let codex_home = home.join(".codex");
-        let claude_home = home.join(".claude");
-        let data_dir = home.join("cass_data");
-        fs::create_dir_all(&data_dir).unwrap();
+    let tracker = tracker_for("multi_connector_aggregation");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let claude_home = home.join(".claude");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
 
-        let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-        let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
 
-        // Create multiple sessions per connector
-        make_codex_session(
-            &codex_home,
-            "2024/11/20",
-            "rollout-agg1.jsonl",
-            "aggtest codex_first",
-            1732118400000,
-        );
-        make_codex_session(
-            &codex_home,
-            "2024/11/21",
-            "rollout-agg2.jsonl",
-            "aggtest codex_second",
-            1732204800000,
-        );
-        make_claude_session(
-            &claude_home,
-            "agg-project1",
-            "session-agg1.jsonl",
-            "aggtest claude_first",
-            "2024-11-20T10:00:00Z",
-        );
-        make_claude_session(
-            &claude_home,
-            "agg-project2",
-            "session-agg2.jsonl",
-            "aggtest claude_second",
-            "2024-11-21T10:00:00Z",
-        );
+    // Phase: Setup
+    let phase_start = tracker.start("setup_fixtures", Some("Create multiple sessions per connector"));
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-agg1.jsonl",
+        "aggtest codex_first",
+        1732118400000,
+    );
+    make_codex_session(
+        &codex_home,
+        "2024/11/21",
+        "rollout-agg2.jsonl",
+        "aggtest codex_second",
+        1732204800000,
+    );
+    make_claude_session(
+        &claude_home,
+        "agg-project1",
+        "session-agg1.jsonl",
+        "aggtest claude_first",
+        "2024-11-20T10:00:00Z",
+    );
+    make_claude_session(
+        &claude_home,
+        "agg-project2",
+        "session-agg2.jsonl",
+        "aggtest claude_second",
+        "2024-11-21T10:00:00Z",
+    );
+    tracker.end("setup_fixtures", Some("Create multiple sessions per connector"), phase_start);
 
-        cargo_bin_cmd!("cass")
-            .args(["index", "--full", "--data-dir"])
-            .arg(&data_dir)
-            .env("CODEX_HOME", &codex_home)
-            .env("HOME", home)
-            .assert()
-            .success();
+    // Phase: Index
+    let phase_start = tracker.start("run_index", Some("Run full index"));
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+    tracker.end("run_index", Some("Run full index"), phase_start);
 
-        // Search with aggregation by agent
-        let output = cargo_bin_cmd!("cass")
-            .args([
-                "search",
-                "aggtest",
-                "--aggregate",
-                "agent",
-                "--robot",
-                "--data-dir",
-            ])
-            .arg(&data_dir)
-            .env("HOME", home)
-            .output()
-            .expect("search command");
+    // Phase: Aggregation search
+    let phase_start = tracker.start("search_aggregate", Some("Search with agent aggregation"));
+    let agg_start = std::time::Instant::now();
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "search", "aggtest", "--aggregate", "agent", "--robot", "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .output()
+        .expect("search command");
+    let agg_duration = agg_start.elapsed().as_millis() as u64;
 
-        assert!(output.status.success());
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
 
-        // Check aggregations exist
-        let aggregations = json.get("aggregations").and_then(|a| a.as_object());
-        assert!(
-            aggregations.is_some(),
-            "Should have aggregations in response"
-        );
+    let aggregations = json.get("aggregations").and_then(|a| a.as_object());
+    assert!(aggregations.is_some(), "Should have aggregations in response");
 
-        let aggs = aggregations.unwrap();
-        let agent_agg = aggs.get("agent").and_then(|a| a.as_object());
-        assert!(agent_agg.is_some(), "Should have agent aggregation");
+    let aggs = aggregations.unwrap();
+    let agent_agg = aggs.get("agent").and_then(|a| a.as_object());
+    assert!(agent_agg.is_some(), "Should have agent aggregation");
 
-        // Aggregations use buckets format: { "buckets": [{"key": "codex", "count": N}, ...] }
-        let buckets = agent_agg
-            .unwrap()
-            .get("buckets")
-            .and_then(|b| b.as_array())
-            .expect("Should have buckets array");
+    let buckets = agent_agg
+        .unwrap()
+        .get("buckets")
+        .and_then(|b| b.as_array())
+        .expect("Should have buckets array");
 
-        let agent_keys: std::collections::HashSet<_> = buckets
-            .iter()
-            .filter_map(|b| b.get("key").and_then(|k| k.as_str()))
-            .collect();
+    let agent_keys: std::collections::HashSet<_> = buckets
+        .iter()
+        .filter_map(|b| b.get("key").and_then(|k| k.as_str()))
+        .collect();
 
-        assert!(
-            agent_keys.contains("codex"),
-            "Agent aggregation should include codex. Keys: {agent_keys:?}"
-        );
-        assert!(
-            agent_keys.contains("claude_code"),
-            "Agent aggregation should include claude_code. Keys: {agent_keys:?}"
-        );
-    });
+    assert!(agent_keys.contains("codex"), "Agent aggregation should include codex. Keys: {agent_keys:?}");
+    assert!(agent_keys.contains("claude_code"), "Agent aggregation should include claude_code. Keys: {agent_keys:?}");
+    tracker.end("search_aggregate", Some("Search with agent aggregation"), phase_start);
+
+    tracker.metrics(
+        "aggregation_query",
+        &E2ePerformanceMetrics::new()
+            .with_duration(agg_duration)
+            .with_custom("bucket_count", serde_json::json!(buckets.len())),
+    );
+
+    tracker.complete();
 }
 
 /// Test: Incremental indexing works across multiple connectors

@@ -493,14 +493,16 @@ fn sources_add_auto_name() {
 /// Test: sources remove removes a configured source.
 #[test]
 fn sources_remove_basic() {
-    logged_test!("sources_remove_basic", "e2e_sources", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        fs::create_dir_all(&config_dir).unwrap();
+    let tracker = tracker_for("sources_remove_basic");
 
-        create_sources_config(
-            &config_dir,
-            r#"
+    let start = tracker.start("setup", Some("Create config with two sources"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    create_sources_config(
+        &config_dir,
+        r#"
 [[sources]]
 name = "laptop"
 type = "ssh"
@@ -513,121 +515,143 @@ type = "ssh"
 host = "dev@work.local"
 paths = ["~/.claude/projects"]
 "#,
-        );
+    );
 
-        let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    tracker.end("setup", Some("Create config with two sources"), start);
 
-        let output = cargo_bin_cmd!("cass")
-            .args(["sources", "remove", "laptop", "-y"])
-            .env("XDG_CONFIG_HOME", &config_dir)
-            .output()
-            .expect("sources remove command");
+    let start = tracker.start("run_sources_remove", Some("Remove laptop source"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "remove", "laptop", "-y"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources remove command");
+    tracker.end("run_sources_remove", Some("Remove laptop source"), start);
 
-        assert!(
-            output.status.success(),
-            "sources remove failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let start = tracker.start("verify_removal", Some("Verify laptop removed and workstation kept"));
+    assert!(
+        output.status.success(),
+        "sources remove failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        // Verify config was updated
-        let config_content = read_sources_config(&config_dir);
-        assert!(
-            !config_content.contains("name = \"laptop\""),
-            "Removed source still in config"
-        );
-        assert!(
-            config_content.contains("workstation"),
-            "Other source incorrectly removed"
-        );
-    });
+    // Verify config was updated
+    let config_content = read_sources_config(&config_dir);
+    assert!(
+        !config_content.contains("name = \"laptop\""),
+        "Removed source still in config"
+    );
+    assert!(
+        config_content.contains("workstation"),
+        "Other source incorrectly removed"
+    );
+    tracker.end("verify_removal", Some("Verify laptop removed and workstation kept"), start);
+
+    tracker.complete();
 }
 
 /// Test: sources remove with nonexistent source.
 #[test]
 fn sources_remove_nonexistent() {
-    logged_test!("sources_remove_nonexistent", "e2e_sources", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        fs::create_dir_all(&config_dir).unwrap();
+    let tracker = tracker_for("sources_remove_nonexistent");
 
-        create_sources_config(
-            &config_dir,
-            r#"
+    let start = tracker.start("setup", Some("Create config with one source"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    create_sources_config(
+        &config_dir,
+        r#"
 [[sources]]
 name = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 "#,
-        );
+    );
 
-        let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    tracker.end("setup", Some("Create config with one source"), start);
 
-        let output = cargo_bin_cmd!("cass")
-            .args(["sources", "remove", "nonexistent", "-y"])
-            .env("XDG_CONFIG_HOME", &config_dir)
-            .output()
-            .expect("sources remove command");
+    let start = tracker.start("run_sources_remove", Some("Remove nonexistent source"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "remove", "nonexistent", "-y"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources remove command");
+    tracker.end("run_sources_remove", Some("Remove nonexistent source"), start);
 
-        // Should fail gracefully
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("not found") || stderr.contains("does not exist"),
-            "Expected not found error, got: {stderr}"
-        );
-    });
+    let start = tracker.start("verify_error", Some("Verify not found error"));
+    // Should fail gracefully
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found") || stderr.contains("does not exist"),
+        "Expected not found error, got: {stderr}"
+    );
+    tracker.end("verify_error", Some("Verify not found error"), start);
+
+    tracker.complete();
 }
 
 /// Test: sources remove with --purge flag.
 #[test]
 fn sources_remove_with_purge() {
-    logged_test!("sources_remove_with_purge", "e2e_sources", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        let data_dir = tmp.path().join("data");
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::create_dir_all(&data_dir).unwrap();
+    let tracker = tracker_for("sources_remove_with_purge");
 
-        // Create source data directory
-        let source_data = data_dir.join("cass").join("remotes").join("laptop");
-        fs::create_dir_all(&source_data).unwrap();
-        fs::write(source_data.join("session.jsonl"), "test data").unwrap();
+    let start = tracker.start("setup", Some("Create config and data directory for purge test"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
 
-        create_sources_config(
-            &config_dir,
-            r#"
+    // Create source data directory
+    let source_data = data_dir.join("cass").join("remotes").join("laptop");
+    fs::create_dir_all(&source_data).unwrap();
+    fs::write(source_data.join("session.jsonl"), "test data").unwrap();
+
+    create_sources_config(
+        &config_dir,
+        r#"
 [[sources]]
 name = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 "#,
-        );
+    );
 
-        let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
-        let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
+    tracker.end("setup", Some("Create config and data directory for purge test"), start);
 
-        let output = cargo_bin_cmd!("cass")
-            .args(["sources", "remove", "laptop", "--purge", "-y"])
-            .env("XDG_CONFIG_HOME", &config_dir)
-            .env("XDG_DATA_HOME", &data_dir)
-            .output()
-            .expect("sources remove --purge command");
+    let start = tracker.start("run_sources_remove_purge", Some("Remove source with --purge"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "remove", "laptop", "--purge", "-y"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_DATA_HOME", &data_dir)
+        .output()
+        .expect("sources remove --purge command");
+    tracker.end("run_sources_remove_purge", Some("Remove source with --purge"), start);
 
-        assert!(
-            output.status.success(),
-            "sources remove --purge failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let start = tracker.start("verify_removal", Some("Verify source removed from config"));
+    assert!(
+        output.status.success(),
+        "sources remove --purge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-        // Verify config was updated
-        let config_content = read_sources_config(&config_dir);
-        assert!(
-            !config_content.contains("laptop"),
-            "Removed source still in config"
-        );
-    });
+    // Verify config was updated
+    let config_content = read_sources_config(&config_dir);
+    assert!(
+        !config_content.contains("laptop"),
+        "Removed source still in config"
+    );
+    tracker.end("verify_removal", Some("Verify source removed from config"), start);
+
+    tracker.complete();
 }
 
 // =============================================================================
@@ -637,27 +661,35 @@ paths = ["~/.claude/projects"]
 /// Test: sources doctor with no sources configured.
 #[test]
 fn sources_doctor_no_sources() {
-    logged_test!("sources_doctor_no_sources", "e2e_sources", {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        fs::create_dir_all(&config_dir).unwrap();
+    let tracker = tracker_for("sources_doctor_no_sources");
 
-        let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let start = tracker.start("setup", Some("Create empty config directory"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
 
-        let output = cargo_bin_cmd!("cass")
-            .args(["sources", "doctor"])
-            .env("XDG_CONFIG_HOME", &config_dir)
-            .output()
-            .expect("sources doctor command");
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    tracker.end("setup", Some("Create empty config directory"), start);
 
-        // Should succeed but indicate no sources
-        assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("No") && stdout.contains("sources"),
-            "Expected no sources message, got: {stdout}"
-        );
-    });
+    let start = tracker.start("run_sources_doctor", Some("Run sources doctor with no sources"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "doctor"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources doctor command");
+    tracker.end("run_sources_doctor", Some("Run sources doctor with no sources"), start);
+
+    let start = tracker.start("verify_output", Some("Verify no sources message"));
+    // Should succeed but indicate no sources
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No") && stdout.contains("sources"),
+        "Expected no sources message, got: {stdout}"
+    );
+    tracker.end("verify_output", Some("Verify no sources message"), start);
+
+    tracker.complete();
 }
 
 /// Test: sources doctor --json outputs valid JSON.
