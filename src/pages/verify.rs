@@ -332,10 +332,7 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
             errors.push(format!("payload.files[{}] must not contain '..'", i));
         }
         if !path.starts_with("payload") {
-            errors.push(format!(
-                "payload.files[{}] must reside under payload/",
-                i
-            ));
+            errors.push(format!("payload.files[{}] must reside under payload/", i));
         }
     }
 

@@ -4882,14 +4882,12 @@ fn output_robot_results(
     let resolved_fields = expand_field_presets(fields);
 
     // Filter hits to requested fields, then apply content truncation
-    let filtered_hits: Vec<serde_json::Value> = if resolved_fields
-        .as_ref()
-        .is_some_and(|fields| {
-            fields.len() == 3
-                && fields[0] == "source_path"
-                && fields[1] == "line_number"
-                && fields[2] == "agent"
-        }) {
+    let filtered_hits: Vec<serde_json::Value> = if resolved_fields.as_ref().is_some_and(|fields| {
+        fields.len() == 3
+            && fields[0] == "source_path"
+            && fields[1] == "line_number"
+            && fields[2] == "agent"
+    }) {
         result
             .hits
             .iter()
