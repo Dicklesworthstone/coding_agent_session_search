@@ -1,0 +1,10 @@
+{
+  "encrypted": false,
+  "version": "1.0.0",
+  "payload": {
+    "path": "payload/data.db",
+    "format": "sqlite",
+    "size_bytes": 17
+  },
+  "warning": "UNENCRYPTED - All content is publicly readable"
+}
