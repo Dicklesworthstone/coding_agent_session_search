@@ -13,7 +13,8 @@ export default defineConfig({
   testDir: './e2e',
   // Explicitly ignore test files outside e2e/ that use Playwright imports
   // but are meant to be run separately or are legacy tests
-  testIgnore: ['**/html_export/**', '**/performance/**', '**/accessibility/**'],
+  // Note: accessibility tests previously ignored are now enabled (T4.5)
+  testIgnore: ['**/html_export/**', '**/performance/**'],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -54,14 +55,53 @@ export default defineConfig({
       name: 'webkit',
       use: { ...devices['Desktop Safari'] },
     },
-    // Mobile devices (P6.2 cross-browser testing)
+    // Mobile devices - iOS (various screen sizes)
+    {
+      name: 'iphone-12',
+      use: { ...devices['iPhone 12'] },
+    },
+    {
+      name: 'iphone-13',
+      use: { ...devices['iPhone 13'] },
+    },
+    {
+      name: 'iphone-14',
+      use: { ...devices['iPhone 14'] },
+    },
+    // Mobile devices - Android
+    {
+      name: 'pixel-5',
+      use: { ...devices['Pixel 5'] },
+    },
+    {
+      name: 'pixel-7',
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'galaxy-s9',
+      use: { ...devices['Galaxy S9+'] },
+    },
+    // Low-end Android (320px width for edge case testing)
+    {
+      name: 'low-end-android',
+      use: {
+        viewport: { width: 320, height: 568 },
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0; SM-G930F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Mobile Safari/537.36',
+        deviceScaleFactor: 2,
+        isMobile: true,
+        hasTouch: true,
+      },
+    },
+    // Mobile-specific test projects (for targeted mobile testing)
     {
       name: 'mobile-chrome',
       use: { ...devices['Pixel 5'] },
+      testMatch: /mobile\/.*.spec.ts/,
     },
     {
       name: 'mobile-safari',
       use: { ...devices['iPhone 12'] },
+      testMatch: /mobile\/.*.spec.ts/,
     },
   ],
 

@@ -1,11 +1,12 @@
 # Model Test Fixtures
 
 These files are used by tests that check model installation state.
-They are NOT valid ONNX models but serve as presence-check fixtures.
+`model.onnx` is a minimal valid ONNX identity model (see source below).
 
 ## Files
 
-- `model.onnx.placeholder` - Binary placeholder for model.onnx presence tests
+- `model.onnx` - Minimal valid ONNX identity model fixture
+- `model.onnx.placeholder` - Legacy placeholder (retained for backwards compatibility)
 - `tokenizer.json` - Minimal valid tokenizer config
 - `config.json` - Minimal valid model config
 - `special_tokens_map.json` - Standard BERT special tokens
@@ -15,6 +16,11 @@ They are NOT valid ONNX models but serve as presence-check fixtures.
 
 Tests should copy these fixtures to temp directories rather than
 creating synthetic "fake" content dynamically.
+
+## Source
+
+- `model.onnx` is sourced from ONNX test data:
+  `onnx/backend/test/data/node/test_identity/model.onnx` (Apache-2.0)
 
 ## No-Mock Policy
 

@@ -103,7 +103,14 @@
       "source": "tests/fixtures/aider",
       "capture_date": "2025-12-01",
       "redaction_policy": "paths_sanitized",
-      "files": []
+      "files": [
+        {
+          "path": ".aider.chat.history.md",
+          "description": "Aider chat history fixture with /add command and refactoring request",
+          "message_count": 4,
+          "sha256": "898dd3f625a8a19b92315c2dea8794e81010368536b0bc5c702f14378cdb0e6e"
+        }
+      ]
     }
   },
   "synthetic_fixtures": {

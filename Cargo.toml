@@ -97,6 +97,7 @@ security-framework = "*"
 default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
+backtrace = []
 
 [build-dependencies]
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }

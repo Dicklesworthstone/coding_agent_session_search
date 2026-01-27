@@ -153,24 +153,6 @@
       "note": "This is a comment, not mock infrastructure"
     },
     {
-      "path": "tests/connector_claude.rs",
-      "pattern": "mock_claude",
-      "rationale": "TRANSITIONAL: Mock directory structure for connector testing (variable name)",
-      "owner": "connectors-team",
-      "review_date": "2026-03-26",
-      "downstream_task": "bd-1dfc",
-      "transitional": true
-    },
-    {
-      "path": "tests/fs_errors.rs",
-      "pattern": "mock_claude",
-      "rationale": "TRANSITIONAL: Mock directory for filesystem error testing (variable name)",
-      "owner": "connectors-team",
-      "review_date": "2026-03-26",
-      "downstream_task": "bd-1dfc",
-      "transitional": true
-    },
-    {
       "path": "tests/e2e_cli_flows.rs",
       "pattern": "no mocks",
       "rationale": "Documentation comment stating tests use no mocks (false positive)",
@@ -214,15 +196,6 @@
       "review_date": "2026-07-26",
       "permanent": true,
       "note": "Comment in test fixture, not mock infrastructure"
-    },
-    {
-      "path": "tests/pages_bundle.rs",
-      "pattern": "fake_config",
-      "rationale": "TRANSITIONAL: Fake configuration for bundle testing",
-      "owner": "pages-team",
-      "review_date": "2026-03-26",
-      "downstream_task": "bd-1dfc",
-      "transitional": true
     },
     {
       "path": "src/connectors/chatgpt.rs",

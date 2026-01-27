@@ -131,6 +131,16 @@ Tests that exercise multiple components together:
 - Playwright tests for HTML exports
 - Run on CI only (see AGENTS.md "E2E Browser Tests")
 
+#### Scenario Coverage (T4.*)
+
+The following scenario-focused E2E suites are complete and tracked:
+
+- Error recovery: `tests/e2e_error_recovery.rs`
+- Large datasets: `tests/e2e_large_dataset.rs`
+- Mobile devices: `tests/e2e/mobile/*.spec.ts`
+- Offline mode: `tests/e2e/offline/*.spec.ts`
+- Accessibility: `tests/e2e/accessibility/*.spec.ts`
+
 ---
 
 ## Fixtures
@@ -266,6 +276,63 @@ Push to a branch and let GitHub Actions run them:
 
 ---
 
+## Coverage Policy
+
+### Threshold Requirements
+
+| Metric | Threshold | Enforcement |
+|--------|-----------|-------------|
+| Line coverage | **60%** minimum | Required on PR merge |
+| Target coverage | **80%** | Recommended, shown in CI summary |
+
+### CI Enforcement
+
+Coverage is enforced via `.github/workflows/coverage.yml`:
+
+- **On PRs**: Coverage below 60% **blocks merge**
+- **On main**: Coverage is reported to Codecov for tracking
+- **Summary**: Each run shows coverage status in GitHub Actions summary
+
+### Running Coverage Locally
+
+```bash
+# Install cargo-llvm-cov (requires nightly)
+rustup install nightly
+cargo +nightly install cargo-llvm-cov
+
+# Generate coverage report
+cargo +nightly llvm-cov --workspace --lib \
+  --ignore-filename-regex "(tests/|benches/)"
+
+# Generate HTML report for detailed analysis
+cargo +nightly llvm-cov --workspace --lib \
+  --ignore-filename-regex "(tests/|benches/)" \
+  --html --open
+```
+
+### Coverage Exclusions
+
+The following are excluded from coverage calculation:
+- `tests/` directory (test code itself)
+- `benches/` directory (benchmark code)
+
+### Improving Coverage
+
+When adding new code:
+
+1. **Write tests first** (TDD) or alongside implementation
+2. **Focus on branches**: Cover error paths, not just happy paths
+3. **Use fixtures**: Real data from `tests/fixtures/` over synthetic data
+4. **Check locally**: Run coverage before pushing to catch gaps early
+
+When coverage drops on a PR:
+
+1. Identify uncovered lines in the HTML report
+2. Add targeted tests for new code paths
+3. Consider if untested code is dead code (remove it)
+
+---
+
 ## E2E Logging Infrastructure
 
 ### Unified JSONL Schema
@@ -357,6 +424,37 @@ jq -r 'select(.event == "test_end" and .result.status == "fail") | .test.name' \
 # Duration by runner
 jq -s 'group_by(.runner) | map({runner: .[0].runner, total_ms: [.[] | select(.event == "run_end") | .summary.duration_ms] | add})' \
   test-results/e2e/*.jsonl
+```
+
+### JSONL Schema Validator
+
+The `validate-e2e-jsonl.sh` script validates E2E log files conform to the expected schema:
+
+```bash
+# Validate all E2E JSONL logs
+./scripts/validate-e2e-jsonl.sh test-results/e2e/*.jsonl
+
+# Validate a specific file
+./scripts/validate-e2e-jsonl.sh test-results/e2e/rust_20260127_044815.jsonl
+```
+
+**Validation checks:**
+- Required fields: `ts`, `run_id`, `runner` on all events
+- Event-specific fields:
+  - `run_start`: requires `env`
+  - `test_start`/`test_end`: requires `test.name`
+  - `test_end`: requires `result.status`
+  - `run_end`: requires `summary`
+  - `phase_start`/`phase_end`: requires `phase.name`
+  - `metrics`: requires `metrics`
+- Structural checks:
+  - `test_start` count matches `test_end` count
+  - `run_start` present if tests exist
+
+**CI Integration:**
+The validator runs automatically in CI after E2E tests. Schema violations fail the build with actionable error messages like:
+```
+file.jsonl:15: Event 'test_end' missing required field 'result.status'
 ```
 
 ---

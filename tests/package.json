@@ -9,6 +9,11 @@
     "test:e2e:firefox": "playwright test --project=firefox",
     "test:e2e:webkit": "playwright test --project=webkit",
     "test:e2e:debug": "playwright test --debug",
+    "test:e2e:mobile": "playwright test --project=mobile-chrome --project=mobile-safari",
+    "test:e2e:mobile:all": "playwright test --project=iphone-12 --project=iphone-13 --project=iphone-14 --project=pixel-5 --project=pixel-7 --project=galaxy-s9 --project=low-end-android",
+    "test:e2e:mobile:ios": "playwright test --project=iphone-12 --project=iphone-13 --project=iphone-14",
+    "test:e2e:mobile:android": "playwright test --project=pixel-5 --project=pixel-7 --project=galaxy-s9 --project=low-end-android",
+    "test:e2e:mobile:tests": "playwright test e2e/mobile/",
     "report": "playwright show-report e2e-report"
   },
   "devDependencies": {

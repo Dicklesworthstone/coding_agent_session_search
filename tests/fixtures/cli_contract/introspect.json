@@ -929,6 +929,141 @@
       "has_json_output": false
     },
     {
+      "name": "export-html",
+      "description": "Export session as beautiful, self-contained HTML (with optional encryption)",
+      "arguments": [
+        {
+          "name": "session",
+          "description": "Path to session file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "output-dir",
+          "description": "Output directory (default: downloads folder)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "filename",
+          "description": "Custom filename (default: auto-generated from session metadata)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "encrypt",
+          "description": "Enable password encryption (Web Crypto compatible)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "password",
+          "description": "Password for encryption (required if --encrypt)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "password-stdin",
+          "description": "Read password from stdin (secure, no echo)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-tools",
+          "description": "Include tool calls in export (default: true)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "true",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "show-timestamps",
+          "description": "Show message timestamps",
+          "arg_type": "flag",
+          "required": false,
+          "default": "true",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-cdns",
+          "description": "Disable CDN references (fully offline, larger file)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "theme",
+          "description": "Default theme (dark or light)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "dark"
+        },
+        {
+          "name": "dry-run",
+          "description": "Validate without writing file",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "explain",
+          "description": "Show export plan without executing",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "open",
+          "description": "Open file in browser after export",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "JSON output (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "expand",
       "description": "Show messages around a specific line in a session file",
       "arguments": [
