@@ -4882,12 +4882,33 @@ fn output_robot_results(
     let resolved_fields = expand_field_presets(fields);
 
     // Filter hits to requested fields, then apply content truncation
-    let filtered_hits: Vec<serde_json::Value> = result
-        .hits
-        .iter()
-        .map(|hit| filter_hit_fields(hit, &resolved_fields))
-        .map(|hit| apply_content_truncation(hit, truncation_budgets))
-        .collect();
+    let filtered_hits: Vec<serde_json::Value> = if resolved_fields
+        .as_ref()
+        .is_some_and(|fields| {
+            fields.len() == 3
+                && fields[0] == "source_path"
+                && fields[1] == "line_number"
+                && fields[2] == "agent"
+        }) {
+        result
+            .hits
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "source_path": hit.source_path.as_str(),
+                    "line_number": hit.line_number,
+                    "agent": hit.agent.as_str(),
+                })
+            })
+            .collect()
+    } else {
+        result
+            .hits
+            .iter()
+            .map(|hit| filter_hit_fields(hit, &resolved_fields))
+            .map(|hit| apply_content_truncation(hit, truncation_budgets))
+            .collect()
+    };
 
     // Clamp hits to token budget if provided (approx 4 chars per token)
     let (filtered_hits, tokens_estimated, hits_clamped) =
