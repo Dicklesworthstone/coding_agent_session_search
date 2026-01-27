@@ -152,11 +152,62 @@ if [ -f "web/package.json" ]; then
     fi
 fi
 
+# ============================================================
+# E2E Logging Compliance Check
+# ============================================================
+echo "3. Checking E2E logging compliance..."
+
+E2E_ERRORS=0
+E2E_WARNINGS=0
+
+# Check that all e2e_*.rs files import e2e_log module
+for f in tests/e2e_*.rs; do
+    if [ ! -f "$f" ]; then
+        continue
+    fi
+    name=$(basename "$f")
+
+    # Check for e2e_log import or PhaseTracker usage
+    if ! grep -q "use.*e2e_log\|mod.*e2e_log\|PhaseTracker\|E2eLogger" "$f"; then
+        echo "  WARNING: $name not using E2E logging infrastructure"
+        ((E2E_WARNINGS++)) || true
+    fi
+done
+
+# Check shell scripts source e2e_log.sh
+for f in scripts/e2e/*.sh; do
+    if [ -f "$f" ] && [ -s "$f" ]; then
+        name=$(basename "$f")
+        if ! grep -q "e2e_log.sh" "$f"; then
+            echo "  WARNING: $name not sourcing e2e_log.sh"
+            ((E2E_WARNINGS++)) || true
+        fi
+    fi
+done
+
+if [ $E2E_ERRORS -gt 0 ]; then
+    echo "  FAILED: $E2E_ERRORS E2E logging compliance error(s)"
+    E2E_COMPLIANCE_FAILED=true
+else
+    if [ $E2E_WARNINGS -gt 0 ]; then
+        echo "  OK with $E2E_WARNINGS warning(s) (non-blocking)"
+    else
+        echo "  OK: E2E logging compliance checks passed"
+    fi
+fi
+
 # Final check for deferred no-mock failures
 if [ "$NO_MOCK_FAILED" = true ]; then
     echo ""
     echo "=== CI Validation FAILED ==="
     echo "No-mock policy violations found. See output above."
+    exit 1
+fi
+
+if [ "$E2E_COMPLIANCE_FAILED" = true ]; then
+    echo ""
+    echo "=== CI Validation FAILED ==="
+    echo "E2E logging compliance violations found. See output above."
     exit 1
 fi
 
