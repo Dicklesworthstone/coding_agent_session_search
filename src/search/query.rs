@@ -2364,6 +2364,7 @@ impl SearchClient {
         Ok(())
     }
 
+    /// Semantic search result containing hits and optional ANN statistics.
     pub fn search_semantic(
         &self,
         query: &str,
@@ -2372,11 +2373,11 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
         approximate: bool,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<(Vec<SearchHit>, Option<crate::search::ann_index::AnnSearchStats>)> {
         let field_mask = effective_field_mask(field_mask);
         let canonical = canonicalize_for_embedding(query);
         if canonical.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let mut guard = self
             .semantic
@@ -2397,8 +2398,11 @@ impl SearchClient {
 
         let fetch = limit.saturating_add(offset);
         if fetch == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
+
+        // Track ANN stats if approximate search is used
+        let mut ann_stats: Option<crate::search::ann_index::AnnSearchStats> = None;
 
         let mut results = if approximate {
             if state.ann_index.is_none() {
@@ -2438,7 +2442,8 @@ impl SearchClient {
                 .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
             let candidate = fetch.saturating_mul(ANN_CANDIDATE_MULTIPLIER).max(fetch);
             let ef = DEFAULT_EF_SEARCH.max(candidate);
-            let ann_results = ann.search(&embedding, candidate, ef)?;
+            let (ann_results, search_stats) = ann.search_with_stats(&embedding, candidate, ef)?;
+            ann_stats = Some(search_stats);
 
             let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
             for ann_hit in ann_results {
@@ -2494,7 +2499,7 @@ impl SearchClient {
         if !filters.session_paths.is_empty() {
             hits.retain(|h| filters.session_paths.contains(&h.source_path));
         }
-        Ok(hits)
+        Ok((hits, ann_stats))
     }
 
     fn hydrate_semantic_hits(
