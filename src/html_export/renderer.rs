@@ -1886,7 +1886,7 @@ mod tests {
         let html = render_message_groups(&groups, &opts).unwrap();
 
         // Should just have the wrapper if agent class is set
-        assert!(html.is_empty() || html.contains("conversation-messages") == false);
+        assert!(html.is_empty() || !html.contains("conversation-messages"));
     }
 
     #[test]

@@ -335,6 +335,206 @@ const ToolCalls = {
             });
         });
     }
+};
+
+// Tool badge popover controller
+const ToolPopovers = {
+    activePopover: null,
+    activeBadge: null,
+
+    init() {
+        this.initBadges();
+        this.initOverflowBadges();
+        this.initOutsideClick();
+    },
+
+    initBadges() {
+        $$('.tool-badge:not(.tool-overflow)').forEach(badge => {
+            const popover = badge.querySelector('.tool-popover');
+
+            // Show on hover (desktop)
+            badge.addEventListener('mouseenter', () => this.show(badge, popover));
+            badge.addEventListener('mouseleave', () => this.hide(badge, popover));
+
+            // Show on focus (keyboard accessibility)
+            badge.addEventListener('focus', () => this.show(badge, popover));
+            badge.addEventListener('blur', (e) => {
+                // Don't hide if focus moves within the popover
+                if (!popover || !popover.contains(e.relatedTarget)) {
+                    this.hide(badge, popover);
+                }
+            });
+
+            // Toggle on click (mobile support)
+            badge.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.toggle(badge, popover);
+            });
+
+            // Keyboard support
+            badge.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    this.toggle(badge, popover);
+                } else if (e.key === 'Escape') {
+                    this.hide(badge, popover);
+                    badge.focus();
+                }
+            });
+        });
+    },
+
+    initOverflowBadges() {
+        $$('.tool-overflow').forEach(btn => {
+            // Store original text
+            btn.dataset.originalText = btn.textContent.trim();
+
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const container = btn.closest('.message-header-right');
+                if (!container) return;
+
+                const isExpanded = container.classList.toggle('expanded');
+                btn.textContent = isExpanded ? 'Less' : btn.dataset.originalText;
+                btn.setAttribute('aria-expanded', isExpanded);
+            });
+        });
+    },
+
+    initOutsideClick() {
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.tool-badge')) {
+                this.hideAll();
+            }
+        });
+    },
+
+    show(badge, popover) {
+        if (!popover) {
+            // Build popover from data attributes if not present
+            popover = this.buildPopover(badge);
+            if (!popover) return;
+        }
+
+        // Hide any other active popover first
+        if (this.activeBadge && this.activeBadge !== badge) {
+            this.hide(this.activeBadge, this.activePopover);
+        }
+
+        popover.classList.add('visible');
+        badge.setAttribute('aria-expanded', 'true');
+        this.position(badge, popover);
+
+        this.activePopover = popover;
+        this.activeBadge = badge;
+    },
+
+    hide(badge, popover) {
+        if (popover) {
+            popover.classList.remove('visible');
+        }
+        if (badge) {
+            badge.setAttribute('aria-expanded', 'false');
+        }
+        if (this.activeBadge === badge) {
+            this.activePopover = null;
+            this.activeBadge = null;
+        }
+    },
+
+    hideAll() {
+        $$('.tool-popover.visible').forEach(p => {
+            p.classList.remove('visible');
+        });
+        $$('.tool-badge[aria-expanded="true"]').forEach(b => {
+            b.setAttribute('aria-expanded', 'false');
+        });
+        this.activePopover = null;
+        this.activeBadge = null;
+    },
+
+    toggle(badge, popover) {
+        const isVisible = popover && popover.classList.contains('visible');
+        if (isVisible) {
+            this.hide(badge, popover);
+        } else {
+            this.show(badge, popover);
+        }
+    },
+
+    buildPopover(badge) {
+        // Build a popover from data attributes if no inline popover exists
+        const name = badge.dataset.toolName;
+        const input = badge.dataset.toolInput;
+        const output = badge.dataset.toolOutput;
+
+        if (!name) return null;
+
+        const popover = document.createElement('div');
+        popover.className = 'tool-popover';
+        popover.setAttribute('role', 'tooltip');
+
+        let html = '<div class="tool-popover-header"><strong>' + this.escapeHtml(name) + '</strong></div>';
+
+        if (input && input.trim()) {
+            html += '<div class="tool-popover-section"><span class="tool-popover-label">Input</span><pre><code>' + this.escapeHtml(input) + '</code></pre></div>';
+        }
+
+        if (output && output.trim()) {
+            html += '<div class="tool-popover-section"><span class="tool-popover-label">Output</span><pre><code>' + this.escapeHtml(output) + '</code></pre></div>';
+        }
+
+        popover.innerHTML = html;
+        badge.appendChild(popover);
+        return popover;
+    },
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    },
+
+    position(badge, popover) {
+        // Reset any previous positioning
+        popover.style.position = 'absolute';
+        popover.style.top = '';
+        popover.style.left = '';
+        popover.style.right = '';
+        popover.style.bottom = '';
+
+        const badgeRect = badge.getBoundingClientRect();
+        const popoverRect = popover.getBoundingClientRect();
+        const viewportWidth = window.innerWidth;
+        const viewportHeight = window.innerHeight;
+        const scrollY = window.scrollY;
+        const scrollX = window.scrollX;
+        const margin = 8;
+
+        // Default: position below and align left edge
+        let top = badgeRect.bottom + margin + scrollY;
+        let left = badgeRect.left + scrollX;
+
+        // Flip up if would overflow bottom
+        if (badgeRect.bottom + popoverRect.height + margin > viewportHeight) {
+            top = badgeRect.top - popoverRect.height - margin + scrollY;
+        }
+
+        // Flip to align right edge if would overflow right
+        if (left + popoverRect.width > viewportWidth - margin) {
+            left = badgeRect.right - popoverRect.width + scrollX;
+        }
+
+        // Ensure not off left edge
+        if (left < margin) {
+            left = margin;
+        }
+
+        popover.style.top = top + 'px';
+        popover.style.left = left + 'px';
+    }
 };"#
     .to_string()
 }
@@ -676,9 +876,12 @@ const Crypto = {
             this.modal.hidden = true;
             this.form.reset();
 
-            // Re-initialize tool calls
+            // Re-initialize tool calls and popovers
             if (typeof ToolCalls !== 'undefined') {
                 ToolCalls.init();
+            }
+            if (typeof ToolPopovers !== 'undefined') {
+                ToolPopovers.init();
             }
 
         } catch (e) {
@@ -712,6 +915,7 @@ fn generate_init_js(options: &ExportOptions) -> String {
 
     if options.show_tool_calls {
         inits.push("ToolCalls.init();");
+        inits.push("ToolPopovers.init();");
     }
 
     if options.encrypt {
@@ -913,5 +1117,62 @@ mod tests {
         // Help shortcut (?)
         assert!(bundle.inline_js.contains("case '?':"));
         assert!(bundle.inline_js.contains("showShortcutsHint"));
+    }
+
+    #[test]
+    fn test_tool_popovers_functionality() {
+        let opts = ExportOptions {
+            show_tool_calls: true,
+            ..Default::default()
+        };
+        let bundle = generate_scripts(&opts);
+
+        // ToolPopovers object exists
+        assert!(bundle.inline_js.contains("const ToolPopovers"));
+        assert!(bundle.inline_js.contains("ToolPopovers.init()"));
+
+        // Hover support (desktop)
+        assert!(bundle.inline_js.contains("mouseenter"));
+        assert!(bundle.inline_js.contains("mouseleave"));
+
+        // Focus support (keyboard accessibility)
+        assert!(bundle.inline_js.contains("addEventListener('focus'"));
+        assert!(bundle.inline_js.contains("addEventListener('blur'"));
+
+        // Click support (mobile/touch)
+        assert!(bundle.inline_js.contains("this.toggle(badge, popover)"));
+
+        // Escape key support
+        assert!(bundle.inline_js.contains("e.key === 'Escape'"));
+
+        // aria-expanded updates
+        assert!(bundle.inline_js.contains("setAttribute('aria-expanded'"));
+
+        // Viewport positioning
+        assert!(bundle.inline_js.contains("getBoundingClientRect"));
+        assert!(bundle.inline_js.contains("viewportWidth"));
+        assert!(bundle.inline_js.contains("viewportHeight"));
+
+        // Overflow badge expansion
+        assert!(bundle.inline_js.contains("initOverflowBadges"));
+        assert!(bundle.inline_js.contains("tool-overflow"));
+
+        // Outside click to close
+        assert!(bundle.inline_js.contains("initOutsideClick"));
+        assert!(bundle.inline_js.contains("hideAll"));
+    }
+
+    #[test]
+    fn test_tool_popovers_reinit_after_decryption() {
+        let opts = ExportOptions {
+            encrypt: true,
+            show_tool_calls: true,
+            ..Default::default()
+        };
+        let bundle = generate_scripts(&opts);
+
+        // After decryption, both ToolCalls and ToolPopovers should be reinitialized
+        assert!(bundle.inline_js.contains("ToolCalls.init()"));
+        assert!(bundle.inline_js.contains("ToolPopovers.init()"));
     }
 }
