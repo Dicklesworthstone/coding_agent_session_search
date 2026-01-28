@@ -614,7 +614,7 @@ impl EvaluationHarness {
             candidate_reports.push(report);
         }
 
-        // Find the winner
+        // Build initial comparison
         let mut comparison = BakeoffComparison {
             corpus_hash,
             baseline: baseline_report.clone(),
@@ -623,14 +623,24 @@ impl EvaluationHarness {
             recommendation_reason: String::new(),
         };
 
-        if let Some(winner) = comparison.find_winner() {
-            comparison.recommendation = Some(winner.model_id.clone());
+        // Find the winner and extract data before mutating
+        let winner_data = comparison.find_winner().map(|w| {
+            (
+                w.model_id.clone(),
+                w.ndcg_at_10,
+                w.latency_ms_p99,
+                w.memory_mb,
+            )
+        });
+
+        if let Some((model_id, ndcg, p99, memory)) = winner_data {
+            comparison.recommendation = Some(model_id.clone());
             comparison.recommendation_reason = format!(
                 "Best eligible candidate with NDCG@10={:.3} ({}% of baseline), p99={}ms, memory={}MB",
-                winner.ndcg_at_10,
-                (winner.ndcg_at_10 / baseline_report.ndcg_at_10 * 100.0) as u32,
-                winner.latency_ms_p99,
-                winner.memory_mb
+                ndcg,
+                (ndcg / baseline_report.ndcg_at_10 * 100.0) as u32,
+                p99,
+                memory
             );
         } else {
             comparison.recommendation_reason =
