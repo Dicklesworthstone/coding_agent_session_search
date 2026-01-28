@@ -16,6 +16,7 @@
 //! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
 //! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
+//! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
 
 pub mod ann_index;
 pub mod canonicalize;
@@ -31,4 +32,5 @@ pub mod query;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod tantivy;
+pub mod two_tier_search;
 pub mod vector_index;

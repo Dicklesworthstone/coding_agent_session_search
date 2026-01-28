@@ -293,6 +293,26 @@ pub enum Commands {
         /// Disable daemon usage even if available (force direct inference).
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
+
+        // ==========================================================================
+        // Two-tier progressive search flags (bd-3dcw)
+        // ==========================================================================
+        /// Enable two-tier progressive search: fast results immediately, refined via daemon.
+        /// Returns initial results from fast embedder (~1ms), then refines with quality
+        /// embedder via daemon (~130ms). Best of both worlds for interactive search.
+        #[arg(long, default_value_t = false)]
+        two_tier: bool,
+
+        /// Fast-only search: use lightweight embedder for instant results, no refinement.
+        /// Ideal for real-time search-as-you-type scenarios where latency is critical.
+        #[arg(long, default_value_t = false)]
+        fast_only: bool,
+
+        /// Quality-only search: wait for full transformer model results.
+        /// Higher latency (~130ms) but most accurate semantic matching.
+        /// Requires daemon to be available; falls back to fast if unavailable.
+        #[arg(long, default_value_t = false)]
+        quality_only: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -2242,7 +2262,25 @@ async fn execute_cli(
                     reranker,
                     daemon,
                     no_daemon,
+                    two_tier,
+                    fast_only,
+                    quality_only,
                 } => {
+                    // Validate mutually exclusive two-tier flags
+                    let tier_count = [two_tier, fast_only, quality_only]
+                        .iter()
+                        .filter(|&&b| b)
+                        .count();
+                    if tier_count > 1 {
+                        return Err(CliError::usage(
+                            "Cannot specify multiple tier flags",
+                            Some(
+                                "Use only one of --two-tier, --fast-only, or --quality-only"
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
                         return Err(CliError::usage(
