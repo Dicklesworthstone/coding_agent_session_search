@@ -1,6 +1,7 @@
 pub mod bakeoff;
 pub mod bookmarks;
 pub mod connectors;
+pub mod daemon;
 pub mod encryption;
 pub mod export;
 pub mod html_export;
