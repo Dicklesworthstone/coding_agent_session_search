@@ -17,7 +17,7 @@ use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, cline::ClineConnector, codex::CodexConnector,
     cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
-    opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, vibe::VibeConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
@@ -975,6 +975,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("chatgpt", || Box::new(ChatGptConnector::new())),
         ("pi_agent", || Box::new(PiAgentConnector::new())),
         ("factory", || Box::new(FactoryConnector::new())),
+        ("vibe", || Box::new(VibeConnector::new())),
     ]
 }
 
@@ -1025,6 +1026,7 @@ impl ConnectorKind {
             "chatgpt" => Some(Self::ChatGpt),
             "pi_agent" => Some(Self::PiAgent),
             "factory" => Some(Self::Factory),
+            "vibe" => Some(Self::Vibe),
             _ => None,
         }
     }
@@ -1044,6 +1046,7 @@ impl ConnectorKind {
             Self::ChatGpt => Box::new(ChatGptConnector::new()),
             Self::PiAgent => Box::new(PiAgentConnector::new()),
             Self::Factory => Box::new(FactoryConnector::new()),
+            Self::Vibe => Box::new(VibeConnector::new()),
         }
     }
 }
@@ -1299,6 +1302,8 @@ enum ConnectorKind {
     PiAgent,
     #[serde(rename = "fa", alias = "Factory")]
     Factory,
+    #[serde(rename = "vb", alias = "Vibe")]
+    Vibe,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

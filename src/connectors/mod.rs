@@ -399,6 +399,7 @@ pub mod factory;
 pub mod gemini;
 pub mod opencode;
 pub mod pi_agent;
+pub mod vibe;
 
 /// High-level detection status for a connector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
