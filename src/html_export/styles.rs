@@ -1740,4 +1740,81 @@ mod tests {
         assert!(bundle.critical_css.contains("oklch(0.11 0.015 260)"));
         assert!(bundle.critical_css.contains("oklch(0.75 0.18 195)"));
     }
+
+    #[test]
+    fn test_styles_include_tool_badge_styling() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // Tool badge base styles
+        assert!(bundle.critical_css.contains(".tool-badge"));
+        assert!(bundle.critical_css.contains("min-width: 28px"));
+        assert!(bundle.critical_css.contains("height: 28px"));
+
+        // Status variants
+        assert!(bundle.critical_css.contains(".tool-status-success"));
+        assert!(bundle.critical_css.contains(".tool-status-error"));
+
+        // Overflow badge
+        assert!(bundle.critical_css.contains(".tool-overflow"));
+    }
+
+    #[test]
+    fn test_styles_include_glassmorphism_popover() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // Glassmorphic popover
+        assert!(bundle.critical_css.contains(".tool-popover"));
+        assert!(bundle.critical_css.contains("backdrop-filter: blur(16px)"));
+        assert!(bundle.critical_css.contains("-webkit-backdrop-filter: blur(16px)"));
+
+        // Fixed positioning
+        assert!(bundle.critical_css.contains("position: fixed"));
+
+        // Visibility states
+        assert!(bundle.critical_css.contains(".tool-popover.visible"));
+    }
+
+    #[test]
+    fn test_styles_include_mobile_bottom_sheet() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // Mobile popover becomes bottom sheet
+        assert!(bundle.critical_css.contains("max-height: 60vh"));
+        assert!(bundle.critical_css.contains("border-radius: var(--radius-xl) var(--radius-xl) 0 0"));
+    }
+
+    #[test]
+    fn test_styles_include_high_contrast() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // High contrast mode
+        assert!(bundle.critical_css.contains("prefers-contrast: high"));
+        assert!(bundle.critical_css.contains("border-width: 2px"));
+    }
+
+    #[test]
+    fn test_styles_include_glow_effects() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // Glow shadow variables
+        assert!(bundle.critical_css.contains("--shadow-glow"));
+        assert!(bundle.critical_css.contains("--shadow-glow-amber"));
+
+        // Hover glow on tool badges
+        assert!(bundle.critical_css.contains("box-shadow: var(--shadow-glow-amber)"));
+    }
+
+    #[test]
+    fn test_print_styles_hide_popovers() {
+        let opts = ExportOptions::default();
+        let bundle = generate_styles(&opts);
+
+        // Print mode hides popovers
+        assert!(bundle.critical_css.contains(".tool-popover { display: none"));
+    }
 }
