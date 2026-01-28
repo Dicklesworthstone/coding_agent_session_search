@@ -65,28 +65,26 @@ fn test_wizard_state_default() {
 fn test_wizard_state_with_custom_config() {
     let _tracker = PhaseTracker::new("pages_wizard", "state_custom_config");
 
-    let mut state = WizardState::default();
-
-    // Configure content selection
-    state.agents = vec!["claude_code".to_string(), "codex".to_string()];
-    state.time_range = Some("last_week".to_string());
-    state.workspaces = Some(vec![PathBuf::from("/projects/myapp")]);
-
-    // Configure security
-    state.password = Some("test-password-123".to_string());
-    state.generate_recovery = true;
-    state.generate_qr = true;
-    state.password_entropy_bits = 48.0;
-
-    // Configure site
-    state.title = "My Archive".to_string();
-    state.description = "My custom archive".to_string();
-    state.hide_metadata = true;
-
-    // Configure deployment
-    state.target = DeployTarget::GitHubPages;
-    state.output_dir = PathBuf::from("/tmp/export");
-    state.repo_name = Some("my-archive".to_string());
+    let state = WizardState {
+        // Content selection
+        agents: vec!["claude_code".to_string(), "codex".to_string()],
+        time_range: Some("last_week".to_string()),
+        workspaces: Some(vec![PathBuf::from("/projects/myapp")]),
+        // Security
+        password: Some("test-password-123".to_string()),
+        generate_recovery: true,
+        generate_qr: true,
+        password_entropy_bits: 48.0,
+        // Site
+        title: "My Archive".to_string(),
+        description: "My custom archive".to_string(),
+        hide_metadata: true,
+        // Deployment
+        target: DeployTarget::GitHubPages,
+        output_dir: PathBuf::from("/tmp/export"),
+        repo_name: Some("my-archive".to_string()),
+        ..WizardState::default()
+    };
 
     // Verify
     assert_eq!(state.agents.len(), 2);
@@ -102,16 +100,16 @@ fn test_wizard_state_with_custom_config() {
 fn test_wizard_state_no_encryption_mode() {
     let _tracker = PhaseTracker::new("pages_wizard", "state_no_encryption");
 
-    let mut state = WizardState::default();
-
-    // Enable no encryption mode
-    state.no_encryption = true;
-    state.unencrypted_confirmed = true;
-
-    // When unencrypted, recovery options should be disabled
-    state.generate_recovery = false;
-    state.generate_qr = false;
-    state.password = None;
+    let state = WizardState {
+        // Enable no encryption mode
+        no_encryption: true,
+        unencrypted_confirmed: true,
+        // When unencrypted, recovery options should be disabled
+        generate_recovery: false,
+        generate_qr: false,
+        password: None,
+        ..WizardState::default()
+    };
 
     assert!(state.no_encryption);
     assert!(state.unencrypted_confirmed);
@@ -230,8 +228,10 @@ fn test_wizard_state_validation_output_dir() {
     let _tracker = PhaseTracker::new("pages_wizard", "validation_output_dir");
 
     let tmp = TempDir::new().unwrap();
-    let mut state = WizardState::default();
-    state.output_dir = tmp.path().to_path_buf();
+    let state = WizardState {
+        output_dir: tmp.path().to_path_buf(),
+        ..WizardState::default()
+    };
 
     // Validate output directory exists
     assert!(
@@ -248,8 +248,10 @@ fn test_wizard_state_validation_output_dir() {
 fn test_wizard_state_with_attachments() {
     let _tracker = PhaseTracker::new("pages_wizard", "state_with_attachments");
 
-    let mut state = WizardState::default();
-    state.include_attachments = true;
+    let state = WizardState {
+        include_attachments: true,
+        ..WizardState::default()
+    };
 
     assert!(state.include_attachments);
 }
@@ -273,12 +275,13 @@ fn test_wizard_state_secret_scan_no_findings() {
 fn test_wizard_state_secret_scan_with_findings() {
     let _tracker = PhaseTracker::new("pages_wizard", "secret_scan_with_findings");
 
-    let mut state = WizardState::default();
-
-    // Simulate secret scan results
-    state.secret_scan_has_findings = true;
-    state.secret_scan_has_critical = false;
-    state.secret_scan_count = 3;
+    let state = WizardState {
+        // Simulate secret scan results
+        secret_scan_has_findings: true,
+        secret_scan_has_critical: false,
+        secret_scan_count: 3,
+        ..WizardState::default()
+    };
 
     assert!(state.secret_scan_has_findings);
     assert!(!state.secret_scan_has_critical);
@@ -289,12 +292,13 @@ fn test_wizard_state_secret_scan_with_findings() {
 fn test_wizard_state_secret_scan_critical_findings() {
     let _tracker = PhaseTracker::new("pages_wizard", "secret_scan_critical");
 
-    let mut state = WizardState::default();
-
-    // Simulate critical secret scan results
-    state.secret_scan_has_findings = true;
-    state.secret_scan_has_critical = true;
-    state.secret_scan_count = 5;
+    let state = WizardState {
+        // Simulate critical secret scan results
+        secret_scan_has_findings: true,
+        secret_scan_has_critical: true,
+        secret_scan_count: 5,
+        ..WizardState::default()
+    };
 
     assert!(state.secret_scan_has_findings);
     assert!(state.secret_scan_has_critical);
@@ -309,9 +313,11 @@ fn test_wizard_state_secret_scan_critical_findings() {
 fn test_wizard_state_to_export_filter() {
     let _tracker = PhaseTracker::new("pages_wizard", "state_to_export_filter");
 
-    let mut state = WizardState::default();
-    state.agents = vec!["claude_code".to_string(), "codex".to_string()];
-    state.workspaces = Some(vec![PathBuf::from("/projects/myapp")]);
+    let state = WizardState {
+        agents: vec!["claude_code".to_string(), "codex".to_string()],
+        workspaces: Some(vec![PathBuf::from("/projects/myapp")]),
+        ..WizardState::default()
+    };
 
     // Verify state can be used to construct export filters
     assert_eq!(state.agents.len(), 2);
@@ -376,8 +382,10 @@ fn test_wizard_with_real_fixture_database() {
     );
 
     // Create wizard state pointing to real fixture database
-    let mut state = WizardState::default();
-    state.db_path = db_path.clone();
+    let state = WizardState {
+        db_path: db_path.clone(),
+        ..WizardState::default()
+    };
 
     // Verify we can open and query the database
     let conn = Connection::open(&db_path).expect("Should open fixture database");
@@ -619,13 +627,15 @@ fn test_wizard_state_with_fixture_export_flow() {
     let tmp = TempDir::new().unwrap();
 
     // Create wizard state configured for export
-    let mut state = WizardState::default();
-    state.db_path = db_path.clone();
-    state.agents = vec!["claude_code".to_string()];
-    state.output_dir = tmp.path().to_path_buf();
-    state.no_encryption = true;
-    state.unencrypted_confirmed = true;
-    state.title = "Fixture Test".to_string();
+    let state = WizardState {
+        db_path: db_path.clone(),
+        agents: vec!["claude_code".to_string()],
+        output_dir: tmp.path().to_path_buf(),
+        no_encryption: true,
+        unencrypted_confirmed: true,
+        title: "Fixture Test".to_string(),
+        ..WizardState::default()
+    };
 
     // Build export filter from wizard state
     let filter = ExportFilter {

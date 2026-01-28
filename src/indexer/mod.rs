@@ -28,6 +28,9 @@ use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::SqliteStorage;
 use semantic::{EmbeddingInput, SemanticIndexer};
 
+/// Type alias for batch classification map: (ConnectorKind, Path) -> (ScanRoot, MinTS, MaxTS)
+type BatchClassificationMap = HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
+
 #[derive(Debug, Clone)]
 pub enum ReindexCommand {
     Full,
@@ -1353,8 +1356,7 @@ fn classify_paths(
     roots: &[(ConnectorKind, ScanRoot)],
 ) -> Vec<(ConnectorKind, ScanRoot, Option<i64>, Option<i64>)> {
     // Key -> (Root, MinTS, MaxTS)
-    let mut batch_map: HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)> =
-        HashMap::new();
+    let mut batch_map: BatchClassificationMap = HashMap::new();
 
     for p in paths {
         if let Ok(meta) = std::fs::metadata(&p)

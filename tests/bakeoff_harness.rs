@@ -121,9 +121,9 @@ impl QualityMockEmbedder {
         let hash = text
             .bytes()
             .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        for i in 11..self.dimension {
+        for (i, feature) in features.iter_mut().enumerate().skip(11) {
             let seed = hash.wrapping_add(i as u64);
-            features[i] = ((seed % 1000) as f32 / 1000.0) - 0.5;
+            *feature = ((seed % 1000) as f32 / 1000.0) - 0.5;
         }
 
         // Normalize

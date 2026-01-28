@@ -243,12 +243,7 @@ impl RerankerRegistry {
     /// Get the best available reranker.
     pub fn best_available(&self) -> Option<&'static RegisteredReranker> {
         // Try to find an available reranker (prefer baseline first for stability)
-        for r in RERANKERS.iter() {
-            if r.is_available(&self.data_dir) {
-                return Some(r);
-            }
-        }
-        None
+        RERANKERS.iter().find(|r| r.is_available(&self.data_dir))
     }
 
     /// Get all bake-off eligible rerankers.

@@ -987,10 +987,10 @@ MEM_AVAIL_KB=4194304
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Ensure HOME is set for the probe script (may not be set in some test environments)
-        if std::env::var("HOME").is_err() {
-            if let Some(dirs) = directories::BaseDirs::new() {
-                cmd.env("HOME", dirs.home_dir());
-            }
+        if std::env::var("HOME").is_err()
+            && let Some(dirs) = directories::BaseDirs::new()
+        {
+            cmd.env("HOME", dirs.home_dir());
         }
         let mut child = cmd.spawn().expect("bash should be available");
         if let Some(mut stdin) = child.stdin.take() {

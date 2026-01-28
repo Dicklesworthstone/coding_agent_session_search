@@ -1846,13 +1846,10 @@ fn build_boolean_query_clauses(
                     if pending_or_group.is_empty() {
                         // Pull last Must clause into OR group if exists
                         // Fix: Check if last clause is Must BEFORE popping to avoid dropping MustNot clauses
-                        let can_group =
-                            clauses.last().map_or(false, |(occ, _)| *occ == Occur::Must);
-
-                        if can_group {
-                            if let Some((_, last_q)) = clauses.pop() {
-                                pending_or_group.push(last_q);
-                            }
+                        if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
+                            && let Some((_, last_q)) = clauses.pop()
+                        {
+                            pending_or_group.push(last_q);
                         }
                     }
                     pending_or_group.push(term_query);
@@ -1874,13 +1871,10 @@ fn build_boolean_query_clauses(
                     if pending_or_group.is_empty() {
                         // Pull last Must clause into OR group if exists
                         // Fix: Check if last clause is Must BEFORE popping to avoid dropping MustNot clauses
-                        let can_group =
-                            clauses.last().map_or(false, |(occ, _)| *occ == Occur::Must);
-
-                        if can_group {
-                            if let Some((_, last_q)) = clauses.pop() {
-                                pending_or_group.push(last_q);
-                            }
+                        if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
+                            && let Some((_, last_q)) = clauses.pop()
+                        {
+                            pending_or_group.push(last_q);
                         }
                     }
                     pending_or_group.push(phrase_query);
@@ -3341,14 +3335,12 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 };
 
                 if in_or_sequence {
-                    if pending_or_group.is_empty() {
-                        // Try to pull last clause if it was AND (Must)
-                        if let Some((op, _)) = fts_clauses.last() {
-                            if *op == "AND" {
-                                let (_, val) = fts_clauses.pop().unwrap();
-                                pending_or_group.push(val);
-                            }
-                        }
+                    if pending_or_group.is_empty()
+                        && let Some((op, _)) = fts_clauses.last()
+                        && *op == "AND"
+                    {
+                        let (_, val) = fts_clauses.pop().unwrap();
+                        pending_or_group.push(val);
                     }
                     pending_or_group.push(fts_term);
                     in_or_sequence = true;
@@ -3365,13 +3357,12 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
 
                 if in_or_sequence {
-                    if pending_or_group.is_empty() {
-                        if let Some((op, _)) = fts_clauses.last() {
-                            if *op == "AND" {
-                                let (_, val) = fts_clauses.pop().unwrap();
-                                pending_or_group.push(val);
-                            }
-                        }
+                    if pending_or_group.is_empty()
+                        && let Some((op, _)) = fts_clauses.last()
+                        && *op == "AND"
+                    {
+                        let (_, val) = fts_clauses.pop().unwrap();
+                        pending_or_group.push(val);
                     }
                     pending_or_group.push(fts_phrase);
                     in_or_sequence = true;
