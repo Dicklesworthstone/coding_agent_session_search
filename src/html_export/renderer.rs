@@ -462,6 +462,7 @@ fn render_code_block(content: &str, lang: &str, options: &RenderOptions) -> Stri
 }
 
 /// Render inline code (backticks).
+#[allow(dead_code)]
 fn render_inline_code(text: &str) -> String {
     let mut result = String::new();
     let chars = text.chars();
@@ -500,6 +501,7 @@ fn render_inline_code(text: &str) -> String {
 /// NOTE: This function expects already HTML-escaped text as input (from render_content).
 /// The URL is NOT re-escaped since it's already safe. The browser will decode HTML
 /// entities in href attributes after parsing, so `&amp;` becomes `&` in the actual URL.
+#[allow(dead_code)]
 fn render_links(text: &str) -> String {
     // Simple URL detection - matches http:// and https://
     let mut result = String::new();
