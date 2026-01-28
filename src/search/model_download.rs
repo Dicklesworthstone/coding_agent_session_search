@@ -142,7 +142,7 @@ pub struct ModelManifest {
 }
 
 impl ModelManifest {
-    /// Get the default MiniLM model manifest.
+    /// Get the default MiniLM model manifest (baseline for bake-off).
     ///
     /// The revision and checksums are pinned for reproducibility.
     /// Updated 2026-01-13: HuggingFace restructured the repo - ONNX models moved to onnx/ subdir.
@@ -190,6 +190,249 @@ impl ModelManifest {
             ],
             license: "Apache-2.0".into(),
         }
+    }
+
+    // ==================== Bake-off Eligible Models ====================
+    // These models were released after 2025-11-01 and are candidates for
+    // the CPU-optimized embedding bake-off.
+
+    /// Google EmbeddingGemma 300M manifest.
+    ///
+    /// Released: 2025-12-15
+    /// Dimension: 256
+    /// Best-in-class performance for its size on MTEB.
+    ///
+    /// Note: Checksums are placeholders until model is downloaded and verified.
+    pub fn embeddinggemma() -> Self {
+        Self {
+            id: "embeddinggemma-300m".into(),
+            repo: "google/embeddinggemma-300m".into(),
+            revision: "main".into(), // TODO: Pin to specific revision after verification
+            files: vec![
+                ModelFile {
+                    name: "model.onnx".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 600_000_000, // ~600MB estimated
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500_000,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1000,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// Qwen3-Embedding 0.6B manifest.
+    ///
+    /// Released: 2025-11-20
+    /// Dimension: 1024
+    /// High-quality embeddings with Qwen3 architecture.
+    ///
+    /// Note: Checksums are placeholders until model is downloaded and verified.
+    pub fn qwen3_embedding() -> Self {
+        Self {
+            id: "Qwen3-Embedding-0.6B".into(),
+            repo: "Alibaba-NLP/Qwen3-Embedding-0.6B".into(),
+            revision: "main".into(),
+            files: vec![
+                ModelFile {
+                    name: "model.onnx".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1_200_000_000, // ~1.2GB estimated
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 2_000_000,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1000,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// ModernBERT-embed-large manifest.
+    ///
+    /// Released: 2025-12-01
+    /// Dimension: 768
+    /// Modern BERT variant with rotary position embeddings.
+    ///
+    /// Note: Checksums are placeholders until model is downloaded and verified.
+    pub fn modernbert_embed() -> Self {
+        Self {
+            id: "ModernBERT-embed-large".into(),
+            repo: "lightonai/ModernBERT-embed-large".into(),
+            revision: "main".into(),
+            files: vec![
+                ModelFile {
+                    name: "model.onnx".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 400_000_000, // ~400MB estimated
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500_000,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1000,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+            ],
+            license: "MIT".into(),
+        }
+    }
+
+    /// Snowflake Arctic Embed S manifest.
+    ///
+    /// Released: 2025-11-10
+    /// Dimension: 384
+    /// Small, fast model with MiniLM-compatible dimension.
+    ///
+    /// Note: Checksums are placeholders until model is downloaded and verified.
+    pub fn snowflake_arctic_s() -> Self {
+        Self {
+            id: "snowflake-arctic-embed-s".into(),
+            repo: "Snowflake/snowflake-arctic-embed-s".into(),
+            revision: "main".into(),
+            files: vec![
+                ModelFile {
+                    name: "model.onnx".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 110_000_000, // ~110MB estimated
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500_000,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1000,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// Nomic Embed Text v1.5 manifest.
+    ///
+    /// Released: 2025-11-05
+    /// Dimension: 768
+    /// Long context support with Matryoshka embedding capability.
+    ///
+    /// Note: Checksums are placeholders until model is downloaded and verified.
+    pub fn nomic_embed() -> Self {
+        Self {
+            id: "nomic-embed-text-v1.5".into(),
+            repo: "nomic-ai/nomic-embed-text-v1.5".into(),
+            revision: "main".into(),
+            files: vec![
+                ModelFile {
+                    name: "model.onnx".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 280_000_000, // ~280MB estimated
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500_000,
+                },
+                ModelFile {
+                    name: "config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 1000,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".into(),
+                    sha256: "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD".into(),
+                    size: 500,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    /// Get manifest by embedder name.
+    pub fn for_embedder(name: &str) -> Option<Self> {
+        match name {
+            "minilm" => Some(Self::minilm_v2()),
+            "embeddinggemma" => Some(Self::embeddinggemma()),
+            "qwen3-embed" => Some(Self::qwen3_embedding()),
+            "modernbert-embed" => Some(Self::modernbert_embed()),
+            "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
+            "nomic-embed" => Some(Self::nomic_embed()),
+            _ => None,
+        }
+    }
+
+    /// Get all bake-off eligible model manifests.
+    pub fn bakeoff_candidates() -> Vec<Self> {
+        vec![
+            Self::embeddinggemma(),
+            Self::qwen3_embedding(),
+            Self::modernbert_embed(),
+            Self::snowflake_arctic_s(),
+            Self::nomic_embed(),
+        ]
     }
 
     /// Total size of all files in bytes.

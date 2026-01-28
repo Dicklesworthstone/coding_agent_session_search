@@ -57,7 +57,27 @@ pub struct RegisteredEmbedder {
     pub description: &'static str,
     /// Whether the model files are required (false = always available).
     pub requires_model_files: bool,
+    /// Release/update date (YYYY-MM-DD format) for bake-off eligibility.
+    pub release_date: &'static str,
+    /// HuggingFace model ID for download/reference.
+    pub huggingface_id: &'static str,
+    /// Approximate model size in bytes.
+    pub size_bytes: u64,
+    /// Whether this is a baseline model (not eligible for bake-off).
+    pub is_baseline: bool,
 }
+
+/// Files required for any ONNX-based embedder.
+pub const REQUIRED_ONNX_FILES: &[&str] = &[
+    "model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+
+/// Eligibility cutoff for bake-off (models must be released on/after this date).
+pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
 
 impl RegisteredEmbedder {
     /// Check if this embedder is available in the given data directory.
@@ -66,24 +86,41 @@ impl RegisteredEmbedder {
             return true;
         }
 
-        // Check if model files exist
-        match self.name {
-            "minilm" => {
-                let model_dir = FastEmbedder::default_model_dir(data_dir);
-                FastEmbedder::required_model_files()
-                    .iter()
-                    .all(|f| model_dir.join(f).is_file())
-            }
-            _ => false,
+        if let Some(model_dir) = self.model_dir(data_dir) {
+            self.required_files()
+                .iter()
+                .all(|f| model_dir.join(f).is_file())
+        } else {
+            false
         }
     }
 
     /// Get the model directory path for this embedder (if applicable).
     pub fn model_dir(&self, data_dir: &Path) -> Option<PathBuf> {
-        match self.name {
-            "minilm" => Some(FastEmbedder::default_model_dir(data_dir)),
-            _ => None,
+        if !self.requires_model_files {
+            return None;
         }
+
+        // Map embedder names to their model directory names
+        let dir_name = match self.name {
+            "minilm" => "all-MiniLM-L6-v2",
+            "embeddinggemma" => "embeddinggemma-300m",
+            "qwen3-embed" => "Qwen3-Embedding-0.6B",
+            "modernbert-embed" => "ModernBERT-embed-large",
+            "snowflake-arctic-s" => "snowflake-arctic-embed-s",
+            "nomic-embed" => "nomic-embed-text-v1.5",
+            _ => return None,
+        };
+        Some(data_dir.join("models").join(dir_name))
+    }
+
+    /// Get required model files for this embedder.
+    pub fn required_files(&self) -> &'static [&'static str] {
+        if !self.requires_model_files {
+            return &[];
+        }
+        // All ONNX-based embedders use the same file structure
+        REQUIRED_ONNX_FILES
     }
 
     /// Get missing model files for this embedder.
@@ -92,30 +129,123 @@ impl RegisteredEmbedder {
             return Vec::new();
         }
 
-        match self.name {
-            "minilm" => {
-                let model_dir = FastEmbedder::default_model_dir(data_dir);
-                FastEmbedder::required_model_files()
-                    .iter()
-                    .filter(|f| !model_dir.join(*f).is_file())
-                    .map(|f| (*f).to_string())
-                    .collect()
-            }
-            _ => Vec::new(),
+        if let Some(model_dir) = self.model_dir(data_dir) {
+            self.required_files()
+                .iter()
+                .filter(|f| !model_dir.join(*f).is_file())
+                .map(|f| (*f).to_string())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Check if this embedder is eligible for the bake-off.
+    pub fn is_bakeoff_eligible(&self) -> bool {
+        if self.is_baseline {
+            return false;
+        }
+        self.release_date >= BAKEOFF_ELIGIBILITY_CUTOFF
+    }
+
+    /// Convert to bakeoff ModelMetadata.
+    pub fn to_model_metadata(&self) -> crate::bakeoff::ModelMetadata {
+        crate::bakeoff::ModelMetadata {
+            id: self.id.to_string(),
+            name: self.name.to_string(),
+            source: self.huggingface_id.to_string(),
+            release_date: self.release_date.to_string(),
+            dimension: Some(self.dimension),
+            size_bytes: if self.size_bytes > 0 {
+                Some(self.size_bytes)
+            } else {
+                None
+            },
+            is_baseline: self.is_baseline,
         }
     }
 }
 
 /// Static registry of all supported embedders.
+///
+/// Models marked with `bakeoff_eligible: true` are candidates for the embedding bake-off
+/// (released after 2025-11-01). The baseline (minilm) is not eligible but used for comparison.
 pub static EMBEDDERS: &[RegisteredEmbedder] = &[
+    // === Baseline (not eligible for bake-off) ===
     RegisteredEmbedder {
         name: "minilm",
         id: "minilm-384",
         dimension: 384,
         is_semantic: true,
-        description: "MiniLM L6 v2 - fast, high-quality semantic embeddings",
+        description: "MiniLM L6 v2 - fast, high-quality semantic embeddings (baseline)",
         requires_model_files: true,
+        release_date: "2022-08-01",
+        huggingface_id: "sentence-transformers/all-MiniLM-L6-v2",
+        size_bytes: 90_000_000,
+        is_baseline: true,
     },
+    // === Bake-off Eligible Models (released >= 2025-11-01) ===
+    RegisteredEmbedder {
+        name: "embeddinggemma",
+        id: "embeddinggemma-256",
+        dimension: 256,
+        is_semantic: true,
+        description: "Google EmbeddingGemma 300M - best-in-class for size, MTEB leader",
+        requires_model_files: true,
+        release_date: "2025-09-04",
+        huggingface_id: "onnx-community/embeddinggemma-300m-ONNX",
+        size_bytes: 600_000_000,
+        is_baseline: false,
+    },
+    RegisteredEmbedder {
+        name: "qwen3-embed",
+        id: "qwen3-embed-1024",
+        dimension: 1024,
+        is_semantic: true,
+        description: "Qwen3-Embedding 0.6B - Qwen3 architecture, high quality",
+        requires_model_files: true,
+        release_date: "2025-11-20",
+        huggingface_id: "Alibaba-NLP/Qwen3-Embedding-0.6B",
+        size_bytes: 1_200_000_000,
+        is_baseline: false,
+    },
+    RegisteredEmbedder {
+        name: "modernbert-embed",
+        id: "modernbert-embed-768",
+        dimension: 768,
+        is_semantic: true,
+        description: "ModernBERT-embed-large - Modern BERT with rotary embeddings",
+        requires_model_files: true,
+        release_date: "2025-12-01",
+        huggingface_id: "lightonai/ModernBERT-embed-large",
+        size_bytes: 400_000_000,
+        is_baseline: false,
+    },
+    RegisteredEmbedder {
+        name: "snowflake-arctic-s",
+        id: "snowflake-arctic-s-384",
+        dimension: 384,
+        is_semantic: true,
+        description: "Snowflake Arctic Embed S - small, fast, MiniLM-compatible dimension",
+        requires_model_files: true,
+        release_date: "2025-11-10",
+        huggingface_id: "Snowflake/snowflake-arctic-embed-s",
+        size_bytes: 110_000_000,
+        is_baseline: false,
+    },
+    RegisteredEmbedder {
+        name: "nomic-embed",
+        id: "nomic-embed-768",
+        dimension: 768,
+        is_semantic: true,
+        description: "Nomic Embed Text v1.5 - long context, Matryoshka support",
+        requires_model_files: true,
+        release_date: "2025-11-05",
+        huggingface_id: "nomic-ai/nomic-embed-text-v1.5",
+        size_bytes: 280_000_000,
+        is_baseline: false,
+    },
+    // === Fallback (always available) ===
     RegisteredEmbedder {
         name: "hash",
         id: "fnv1a-384",
@@ -123,6 +253,10 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         is_semantic: false,
         description: "FNV-1a feature hashing - lexical fallback, always available",
         requires_model_files: false,
+        release_date: "2020-01-01",
+        huggingface_id: "",
+        size_bytes: 0,
+        is_baseline: false,
     },
 ];
 
@@ -187,6 +321,24 @@ impl EmbedderRegistry {
         self.get(HASH_EMBEDDER).expect("hash embedder must exist")
     }
 
+    /// Get all bake-off eligible embedders.
+    pub fn bakeoff_eligible(&self) -> Vec<&'static RegisteredEmbedder> {
+        EMBEDDERS.iter().filter(|e| e.is_bakeoff_eligible()).collect()
+    }
+
+    /// Get available bake-off eligible embedders (model files present).
+    pub fn available_bakeoff_candidates(&self) -> Vec<&'static RegisteredEmbedder> {
+        EMBEDDERS
+            .iter()
+            .filter(|e| e.is_bakeoff_eligible() && e.is_available(&self.data_dir))
+            .collect()
+    }
+
+    /// Get the baseline embedder for bake-off comparison.
+    pub fn baseline_embedder(&self) -> Option<&'static RegisteredEmbedder> {
+        EMBEDDERS.iter().find(|e| e.is_baseline)
+    }
+
     /// Validate that an embedder is ready to use.
     ///
     /// Returns `Ok(())` if available, or an error with details about what's missing.
@@ -246,13 +398,14 @@ pub fn get_embedder(data_dir: &Path, name: Option<&str>) -> EmbedderResult<Arc<d
 /// Load an embedder by registered name.
 fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn Embedder>> {
     match name {
-        "minilm" => {
-            let model_dir = FastEmbedder::default_model_dir(data_dir);
-            let embedder = FastEmbedder::load_from_dir(&model_dir)?;
-            Ok(Arc::new(embedder))
-        }
         "hash" => {
             let embedder = HashEmbedder::default();
+            Ok(Arc::new(embedder))
+        }
+        // All ONNX-based embedders (baseline and bake-off candidates)
+        "minilm" | "embeddinggemma" | "qwen3-embed" | "modernbert-embed" | "snowflake-arctic-s"
+        | "nomic-embed" => {
+            let embedder = FastEmbedder::load_by_name(data_dir, name)?;
             Ok(Arc::new(embedder))
         }
         _ => Err(EmbedderError::Unavailable(format!(
@@ -405,5 +558,162 @@ mod tests {
         let minilm_info = get_embedder_info(tmp.path(), Some("minilm")).unwrap();
         assert_eq!(minilm_info.id, "minilm-384");
         assert!(minilm_info.is_semantic);
+    }
+
+    // ==================== Bake-off Tests ====================
+
+    #[test]
+    fn test_bakeoff_eligible_count() {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+
+        let eligible = registry.bakeoff_eligible();
+        // Should have at least 4 eligible models (qwen3, modernbert, snowflake, nomic)
+        // Note: embeddinggemma was released 2025-09-04, before the 2025-11-01 cutoff
+        assert!(
+            eligible.len() >= 4,
+            "Expected at least 4 eligible models, got {}",
+            eligible.len()
+        );
+
+        // MiniLM should NOT be in the eligible list (it's the baseline)
+        assert!(
+            !eligible.iter().any(|e| e.name == "minilm"),
+            "minilm should not be in eligible list"
+        );
+
+        // Hash should NOT be in the eligible list (not semantic)
+        assert!(
+            !eligible.iter().any(|e| e.name == "hash"),
+            "hash should not be in eligible list"
+        );
+
+        // embeddinggemma should NOT be eligible (released before cutoff)
+        assert!(
+            !eligible.iter().any(|e| e.name == "embeddinggemma"),
+            "embeddinggemma should not be in eligible list (released before cutoff)"
+        );
+    }
+
+    #[test]
+    fn test_baseline_embedder() {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+
+        let baseline = registry.baseline_embedder();
+        assert!(baseline.is_some());
+        let baseline = baseline.unwrap();
+        assert_eq!(baseline.name, "minilm");
+        assert!(baseline.is_baseline);
+        assert!(!baseline.is_bakeoff_eligible());
+    }
+
+    #[test]
+    fn test_bakeoff_eligibility_by_date() {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+
+        // MiniLM was released before cutoff (2022-08-01)
+        let minilm = registry.get("minilm").unwrap();
+        assert!(
+            minilm.release_date < BAKEOFF_ELIGIBILITY_CUTOFF,
+            "minilm should be released before cutoff"
+        );
+
+        // All eligible models should be released after cutoff
+        for e in registry.bakeoff_eligible() {
+            assert!(
+                e.release_date >= BAKEOFF_ELIGIBILITY_CUTOFF,
+                "{} should be released after cutoff (date: {})",
+                e.name,
+                e.release_date
+            );
+        }
+    }
+
+    #[test]
+    fn test_bakeoff_model_metadata_conversion() {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+
+        let minilm = registry.get("minilm").unwrap();
+        let metadata = minilm.to_model_metadata();
+
+        assert_eq!(metadata.id, "minilm-384");
+        assert_eq!(metadata.name, "minilm");
+        assert!(metadata.source.contains("MiniLM"));
+        assert_eq!(metadata.release_date, "2022-08-01");
+        assert_eq!(metadata.dimension, Some(384));
+        assert!(metadata.is_baseline);
+        assert!(!metadata.is_eligible());
+    }
+
+    #[test]
+    fn test_eligible_embedder_metadata() {
+        let tmp = tempdir().unwrap();
+        let registry = EmbedderRegistry::new(tmp.path());
+
+        // Check modernbert (eligible candidate)
+        let modernbert = registry.get("modernbert-embed").unwrap();
+        assert!(modernbert.is_bakeoff_eligible());
+        let metadata = modernbert.to_model_metadata();
+        assert!(!metadata.is_baseline);
+        assert!(metadata.is_eligible());
+        assert_eq!(metadata.dimension, Some(768));
+
+        // Check snowflake (same dimension as minilm)
+        let snowflake = registry.get("snowflake-arctic-s").unwrap();
+        assert!(snowflake.is_bakeoff_eligible());
+        assert_eq!(snowflake.dimension, 384);
+
+        // embeddinggemma is NOT eligible (released 2025-09-04, before cutoff)
+        let gemma = registry.get("embeddinggemma").unwrap();
+        assert!(!gemma.is_bakeoff_eligible());
+    }
+
+    #[test]
+    fn test_all_embedders_have_required_fields() {
+        for e in EMBEDDERS.iter() {
+            // All should have valid release dates
+            assert!(
+                !e.release_date.is_empty(),
+                "{} should have a release date",
+                e.name
+            );
+
+            // All semantic embedders should have HuggingFace IDs
+            if e.is_semantic && e.requires_model_files {
+                assert!(
+                    !e.huggingface_id.is_empty(),
+                    "{} should have a huggingface_id",
+                    e.name
+                );
+            }
+
+            // Dimensions should be reasonable
+            assert!(e.dimension >= 256 && e.dimension <= 2048);
+        }
+    }
+
+    #[test]
+    fn test_model_dir_for_all_embedders() {
+        let tmp = tempdir().unwrap();
+
+        for e in EMBEDDERS.iter() {
+            if e.requires_model_files {
+                let dir = e.model_dir(tmp.path());
+                assert!(
+                    dir.is_some(),
+                    "{} should have a model directory",
+                    e.name
+                );
+                let dir = dir.unwrap();
+                assert!(
+                    dir.starts_with(tmp.path().join("models")),
+                    "{} model dir should be under models/",
+                    e.name
+                );
+            }
+        }
     }
 }
