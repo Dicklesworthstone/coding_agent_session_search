@@ -829,46 +829,62 @@ fn render_single_tool_badge(tool: &ToolCallWithResult) -> String {
     let status_label = status.label();
     let status_icon = status.icon_svg();
 
-    // Escape input for data attribute
-    let input_preview = if tool.call.input.len() > 200 {
-        let safe_len = truncate_to_char_boundary(&tool.call.input, 200);
-        format!("{}...", &tool.call.input[..safe_len])
-    } else {
-        tool.call.input.clone()
-    };
-
-    // Build output preview for popover
-    let output_preview = tool
+    // Format input/output for popover (full content, pretty-printed if JSON)
+    let formatted_input = format_json_or_raw(&tool.call.input);
+    let formatted_output = tool
         .result
         .as_ref()
-        .map(|r| {
-            if r.content.len() > 200 {
-                let safe_len = truncate_to_char_boundary(&r.content, 200);
-                format!("{}...", &r.content[..safe_len])
-            } else {
-                r.content.clone()
-            }
-        })
+        .map(|r| format_json_or_raw(&r.content))
         .unwrap_or_default();
+
+    let popover_input = if !formatted_input.trim().is_empty() {
+        format!(
+            r#"<div class="tool-popover-section"><span class="tool-popover-label">Input</span><pre><code>{}</code></pre></div>"#,
+            super::template::html_escape(&formatted_input)
+        )
+    } else {
+        String::new()
+    };
+
+    let popover_output = if !formatted_output.trim().is_empty() {
+        format!(
+            r#"<div class="tool-popover-section"><span class="tool-popover-label">Output</span><pre><code>{}</code></pre></div>"#,
+            super::template::html_escape(&formatted_output)
+        )
+    } else {
+        String::new()
+    };
+
+    let status_badge = if !status_label.is_empty() {
+        format!(
+            r#"<span class="tool-badge-status {}">{}</span>"#,
+            status_label, status_icon
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"<button class="tool-badge {status_class}"
                 aria-label="{name}: {status_label}"
                 aria-expanded="false"
-                data-tool-name="{name}"
-                data-tool-input="{input}"
-                data-tool-output="{output}">
+                data-tool-name="{name}">
             <span class="tool-badge-icon">{icon}</span>
             <span class="tool-badge-name">{name}</span>
             <span class="tool-badge-status">{status_icon}</span>
+            <div class="tool-popover" role="tooltip">
+                <div class="tool-popover-header">{icon} <span>{name}</span> {status_badge}</div>
+                {input}{output}
+            </div>
         </button>"#,
         status_class = status_class,
         name = super::template::html_escape(&tool.call.name),
         status_label = status_label,
         icon = icon,
-        input = super::template::html_escape(&input_preview),
-        output = super::template::html_escape(&output_preview),
         status_icon = status_icon,
+        status_badge = status_badge,
+        input = popover_input,
+        output = popover_output,
     )
 }
 
@@ -1117,22 +1133,11 @@ fn render_tool_badge(tool_call: &ToolCall, options: &RenderOptions) -> String {
     // Suppress unused warning for options - may be used for future customization
     let _ = options;
 
-    // Truncate input/output for popover display
-    let input_preview = if formatted_input.len() > 500 {
-        let safe_len = truncate_to_char_boundary(&formatted_input, 500);
-        format!("{}…", &formatted_input[..safe_len])
-    } else {
-        formatted_input.clone()
-    };
+    // Preserve full input/output for popover display (no truncation)
+    let input_preview = formatted_input.clone();
 
     let output_preview = if let Some(output) = &tool_call.output {
-        let formatted = format_json_or_raw(output);
-        if formatted.len() > 500 {
-            let safe_len = truncate_to_char_boundary(&formatted, 500);
-            format!("{}…", &formatted[..safe_len])
-        } else {
-            formatted
-        }
+        format_json_or_raw(output)
     } else {
         String::new()
     };
@@ -1649,13 +1654,13 @@ mod tests {
     }
 
     #[test]
-    fn test_render_single_tool_badge_with_data_attributes() {
+    fn test_render_single_tool_badge_with_inline_popover() {
         let tool = test_tool_call_with_result("Read", ToolStatus::Success);
         let html = render_single_tool_badge(&tool);
 
         assert!(html.contains(r#"data-tool-name="Read""#));
-        assert!(html.contains("data-tool-input="));
-        assert!(html.contains("data-tool-output="));
+        assert!(html.contains("tool-popover"));
+        assert!(html.contains("tool-popover-label"));
     }
 
     #[test]
