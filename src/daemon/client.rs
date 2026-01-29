@@ -207,12 +207,12 @@ impl UdsDaemonClient {
             if let Some(stream) = conn.take() {
                 // Check if connection is still valid
                 if stream.peer_addr().is_ok() {
-                    *conn = Some(stream.try_clone().map_err(|e| {
+                    // Clone once: put clone back in cache, return original
+                    let clone = stream.try_clone().map_err(|e| {
                         DaemonError::Unavailable(format!("connection clone failed: {}", e))
-                    })?);
-                    return stream.try_clone().map_err(|e| {
-                        DaemonError::Unavailable(format!("connection clone failed: {}", e))
-                    });
+                    })?;
+                    *conn = Some(clone);
+                    return Ok(stream);
                 }
                 // Connection is stale, drop it and reconnect
             }
