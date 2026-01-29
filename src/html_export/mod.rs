@@ -47,7 +47,7 @@ pub use filename::{
 pub use renderer::{
     Message, MessageGroup, MessageGroupType, RenderError, RenderOptions, ToolCall,
     ToolCallWithResult, ToolResult, ToolStatus, agent_css_class, agent_display_name,
-    render_conversation, render_message, render_message_groups,
+    render_message, render_message_groups,
 };
 pub use scripts::{ScriptBundle, generate_scripts};
 pub use styles::{StyleBundle, generate_styles};

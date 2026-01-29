@@ -172,16 +172,6 @@ pub enum MessageGroupType {
 }
 
 impl MessageGroupType {
-    /// Get the CSS class for this group type.
-    pub fn css_class(&self) -> &'static str {
-        match self {
-            MessageGroupType::User => "message-group-user",
-            MessageGroupType::Assistant => "message-group-assistant",
-            MessageGroupType::System => "message-group-system",
-            MessageGroupType::ToolOnly => "message-group-tool",
-        }
-    }
-
     /// Get the role icon for this group type.
     pub fn role_icon(&self) -> &'static str {
         match self {
@@ -533,65 +523,6 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "grok" => "Grok",
         _ => "AI Assistant",
     }
-}
-
-/// Render a list of messages to HTML.
-pub fn render_conversation(
-    messages: &[Message],
-    options: &RenderOptions,
-) -> Result<String, RenderError> {
-    let started = Instant::now();
-    let mut html = String::with_capacity(messages.len() * 2000);
-
-    // Add agent-specific class to conversation wrapper if specified
-    let agent_class = options
-        .agent_slug
-        .as_ref()
-        .map(|s| agent_css_class(s))
-        .unwrap_or("");
-
-    info!(
-        component = "renderer",
-        operation = "render_conversation",
-        message_count = messages.len(),
-        agent_slug = options.agent_slug.as_deref().unwrap_or(""),
-        "Rendering conversation"
-    );
-
-    if !agent_class.is_empty() {
-        html.push_str(&format!(
-            r#"<div class="conversation-messages {}">"#,
-            agent_class
-        ));
-        html.push('\n');
-    }
-
-    for (idx, message) in messages.iter().enumerate() {
-        // Allow message to have its own index, or use enumeration
-        let msg_with_index = if message.index.is_some() {
-            message.clone()
-        } else {
-            let mut m = message.clone();
-            m.index = Some(idx);
-            m
-        };
-        html.push_str(&render_message(&msg_with_index, options)?);
-        html.push('\n');
-    }
-
-    if !agent_class.is_empty() {
-        html.push_str("</div>\n");
-    }
-
-    debug!(
-        component = "renderer",
-        operation = "render_conversation_complete",
-        duration_ms = started.elapsed().as_millis(),
-        bytes = html.len(),
-        "Conversation rendered"
-    );
-
-    Ok(html)
 }
 
 // ============================================================================
@@ -1148,123 +1079,6 @@ fn render_content(content: &str, _options: &RenderOptions) -> String {
     html_output
 }
 
-/// Render a code block with optional syntax highlighting.
-#[allow(dead_code)] // Used in tests; kept as utility for future non-markdown rendering paths
-fn render_code_block(content: &str, lang: &str, options: &RenderOptions) -> String {
-    trace!(
-        component = "renderer",
-        operation = "render_code_block",
-        language = lang,
-        lines = content.lines().count(),
-        content_len = content.len(),
-        "Rendering code block"
-    );
-    let lang_class = if options.syntax_highlighting && !lang.is_empty() {
-        format!(r#" class="language-{}""#, html_escape(lang))
-    } else {
-        String::new()
-    };
-
-    let wrap_class = if options.wrap_code {
-        r#" style="white-space: pre-wrap;""#
-    } else {
-        ""
-    };
-
-    format!(
-        r#"<pre{wrap}><code{lang}>{}</code></pre>"#,
-        html_escape(content),
-        wrap = wrap_class,
-        lang = lang_class,
-    )
-}
-
-/// Render inline code (backticks).
-#[allow(dead_code)] // Used in tests; kept as utility for future non-markdown rendering paths
-fn render_inline_code(text: &str) -> String {
-    let mut result = String::new();
-    let chars = text.chars();
-    let mut in_code = false;
-    let mut code = String::new();
-
-    for c in chars {
-        if c == '`' {
-            if in_code {
-                result.push_str("<code>");
-                result.push_str(&code);
-                result.push_str("</code>");
-                code.clear();
-                in_code = false;
-            } else {
-                in_code = true;
-            }
-        } else if in_code {
-            code.push(c);
-        } else {
-            result.push(c);
-        }
-    }
-
-    // Handle unclosed inline code
-    if in_code {
-        result.push('`');
-        result.push_str(&code);
-    }
-
-    result
-}
-
-/// Render URLs as clickable links.
-///
-/// NOTE: This function expects already HTML-escaped text as input (from render_content).
-/// The URL is NOT re-escaped since it's already safe. The browser will decode HTML
-/// entities in href attributes after parsing, so `&amp;` becomes `&` in the actual URL.
-#[allow(dead_code)] // Used in tests; kept as utility for future non-markdown rendering paths
-fn render_links(text: &str) -> String {
-    // Simple URL detection - matches http:// and https://
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-    let mut buffer = String::new();
-
-    while let Some(c) = chars.next() {
-        buffer.push(c);
-
-        // Check for URL pattern
-        if buffer.ends_with("http://") || buffer.ends_with("https://") {
-            // Found URL start, capture the rest
-            let prefix = if buffer.ends_with("https://") {
-                "https://"
-            } else {
-                "http://"
-            };
-
-            result.push_str(&buffer[..buffer.len() - prefix.len()]);
-
-            let mut url = prefix.to_string();
-            while let Some(&next) = chars.peek() {
-                // Stop at whitespace. Note: raw <, >, " would already be escaped
-                // to &lt;, &gt;, &quot; at this point, so we only check whitespace.
-                if next.is_whitespace() {
-                    break;
-                }
-                url.push(chars.next().unwrap());
-            }
-
-            // URL is already HTML-escaped (from the earlier html_escape call in render_content).
-            // Do NOT re-escape, or &amp; becomes &amp;amp; (broken links).
-            result.push_str(&format!(
-                r#"<a href="{url}" target="_blank" rel="noopener noreferrer">{url}</a>"#,
-                url = url
-            ));
-
-            buffer.clear();
-        }
-    }
-
-    result.push_str(&buffer);
-    result
-}
-
 /// Render a compact tool badge with hover popover for the message header.
 fn render_tool_badge(tool_call: &ToolCall, options: &RenderOptions) -> String {
     let started = Instant::now();
@@ -1460,19 +1274,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_inline_code() {
-        let result = render_inline_code("Use `println!` to print");
-        assert!(result.contains("<code>println!</code>"));
-    }
-
-    #[test]
-    fn test_render_links() {
-        let result = render_links("Visit https://example.com for more");
-        assert!(result.contains(r#"<a href="https://example.com""#));
-        assert!(result.contains("target=\"_blank\""));
-    }
-
-    #[test]
     fn test_url_with_query_params_not_double_escaped() {
         // Test that URLs with & in query params are correctly escaped once, not twice.
         // The render_content function HTML-escapes first, then render_links processes.
@@ -1569,18 +1370,6 @@ mod tests {
 
         let html = render_message(&msg, &RenderOptions::default()).unwrap();
         assert!(html.contains("Alice"));
-    }
-
-    #[test]
-    fn test_conversation_with_agent_class() {
-        let messages = vec![test_message("user", "Hello")];
-        let opts = RenderOptions {
-            agent_slug: Some("claude_code".to_string()),
-            ..Default::default()
-        };
-
-        let html = render_conversation(&messages, &opts).unwrap();
-        assert!(html.contains("agent-claude"));
     }
 
     #[test]
