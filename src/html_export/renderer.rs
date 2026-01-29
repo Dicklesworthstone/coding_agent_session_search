@@ -326,13 +326,14 @@ pub struct MessageGroup {
 impl MessageGroup {
     /// Create a new message group with a primary message.
     pub fn new(primary: Message, group_type: MessageGroupType) -> Self {
+        let end_timestamp = primary.timestamp.clone();
         let start_timestamp = primary.timestamp.clone();
         Self {
             group_type,
             primary,
             tool_calls: Vec::new(),
-            start_timestamp: start_timestamp.clone(),
-            end_timestamp: start_timestamp,
+            start_timestamp,
+            end_timestamp,
         }
     }
 

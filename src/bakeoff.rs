@@ -533,25 +533,22 @@ impl EvaluationHarness {
                 .map(|j| (j.doc_id.as_str(), j.relevance))
                 .collect();
 
-            // Time the query embedding (average over iterations)
-            let mut query_latencies = Vec::new();
+            // Time the query embedding (average over iterations, minimum 1)
+            let iterations = self.config.timing_iterations.max(1);
+            let mut query_latencies = Vec::with_capacity(iterations);
             let mut query_embedding = Vec::new();
-            for _ in 0..self.config.timing_iterations {
+            for _ in 0..iterations {
                 let start = Instant::now();
                 query_embedding = embedder
                     .embed(&query_with_judgments.query)
                     .map_err(|e| e.to_string())?;
                 query_latencies.push(start.elapsed());
             }
-            let avg_latency = if query_latencies.is_empty() {
-                0
-            } else {
-                query_latencies
-                    .iter()
-                    .map(|d| d.as_millis() as u64)
-                    .sum::<u64>()
-                    / query_latencies.len() as u64
-            };
+            let avg_latency = query_latencies
+                .iter()
+                .map(|d| d.as_millis() as u64)
+                .sum::<u64>()
+                / query_latencies.len() as u64;
             latencies.push(Duration::from_millis(avg_latency));
 
             // Rank documents by similarity

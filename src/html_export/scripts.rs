@@ -1149,7 +1149,11 @@ mod tests {
         assert!(bundle.inline_js.contains("addEventListener('blur'"));
 
         // Click support (mobile/touch)
-        assert!(bundle.inline_js.contains("this.toggle(badge, getPopover())"));
+        assert!(
+            bundle
+                .inline_js
+                .contains("this.toggle(badge, getPopover())")
+        );
 
         // Escape key support
         assert!(bundle.inline_js.contains("e.key === 'Escape'"));

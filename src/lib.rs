@@ -10871,9 +10871,7 @@ pub fn group_messages_for_export(
             MessageClassification::UserContent => {
                 // User messages start a new group
                 flush_group(&mut groups, &mut current_group);
-                let mut group = html_export::MessageGroup::user(msg.clone());
-                group.start_timestamp = msg.timestamp.clone();
-                group.end_timestamp = msg.timestamp.clone();
+                let group = html_export::MessageGroup::user(msg.clone());
                 current_group = Some(group);
             }
 
@@ -10881,8 +10879,6 @@ pub fn group_messages_for_export(
                 // Assistant content starts a new group
                 flush_group(&mut groups, &mut current_group);
                 let mut group = html_export::MessageGroup::assistant(msg.clone());
-                group.start_timestamp = msg.timestamp.clone();
-                group.end_timestamp = msg.timestamp.clone();
 
                 // If assistant has embedded tool calls, add them
                 if let Some(ref tc) = msg.tool_call {
@@ -10906,8 +10902,6 @@ pub fn group_messages_for_export(
                 } else {
                     // Create a new tool-only group
                     let mut group = html_export::MessageGroup::tool_only(msg.clone());
-                    group.start_timestamp = msg.timestamp.clone();
-                    group.end_timestamp = msg.timestamp.clone();
                     if let Some(ref tc) = msg.tool_call {
                         let corr_id = extract_correlation_id(msg, format);
                         group.add_tool_call(tc.clone(), corr_id);
@@ -10961,9 +10955,7 @@ pub fn group_messages_for_export(
             MessageClassification::System => {
                 // System messages are standalone groups
                 flush_group(&mut groups, &mut current_group);
-                let mut group = html_export::MessageGroup::system(msg.clone());
-                group.start_timestamp = msg.timestamp.clone();
-                group.end_timestamp = msg.timestamp.clone();
+                let group = html_export::MessageGroup::system(msg.clone());
                 groups.push(group);
                 trace!("Added standalone system group");
             }
