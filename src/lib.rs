@@ -3658,7 +3658,7 @@ fn write_trace_line(
 ) -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let request_id = extract_request_id(cli);
-    let trace_id = std::env::var("CASS_TRACE_ID").ok();
+    let trace_id = dotenvy::var("CASS_TRACE_ID").ok();
     let payload = serde_json::json!({
         "start_ts": start_ts.to_rfc3339(),
         "end_ts": (*start_ts
