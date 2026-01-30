@@ -2489,6 +2489,46 @@ Update check state is stored in the data directory:
 
 - **Reset TUI state**: Run `cass tui --reset-state` (or press `Ctrl+Shift+Del` in the TUI) to delete `tui_state.json` and restore defaults.
 
+- **Building on Intel Mac (x86_64)**: The `ort` crate doesn't ship prebuilt ONNX Runtime binaries for `x86_64-apple-darwin`. To build from source:
+
+  ```bash
+  # 1. Download official ONNX Runtime x86_64 binaries
+  mkdir -p ~/Downloads/onnxruntime && cd ~/Downloads/onnxruntime
+  curl -L -o onnxruntime-osx-x86_64-1.23.2.tgz \
+    "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-osx-x86_64-1.23.2.tgz"
+  tar xzf onnxruntime-osx-x86_64-1.23.2.tgz
+
+  # 2. Build with dynamic linking
+  export ORT_LIB_LOCATION="$HOME/Downloads/onnxruntime/onnxruntime-osx-x86_64-1.23.2/lib"
+  export ORT_PREFER_DYNAMIC_LINK=1
+  cargo build --release
+
+  # 3. Run with library path (required for dynamic linking)
+  export DYLD_LIBRARY_PATH="$HOME/Downloads/onnxruntime/onnxruntime-osx-x86_64-1.23.2/lib:$DYLD_LIBRARY_PATH"
+  ./target/release/cass --version
+  ```
+
+- **Model download fails (404)**: If `cass models install` fails, manually download model files:
+
+  ```bash
+  MODEL_DIR="$HOME/Library/Application Support/com.coding-agent-search.coding-agent-search/models/all-MiniLM-L6-v2"
+  # Linux: MODEL_DIR="$HOME/.local/share/coding-agent-search/models/all-MiniLM-L6-v2"
+  mkdir -p "$MODEL_DIR/onnx"
+
+  curl -sL -o "$MODEL_DIR/onnx/model.onnx" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+  curl -sL -o "$MODEL_DIR/tokenizer.json" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+  curl -sL -o "$MODEL_DIR/config.json" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/config.json"
+  curl -sL -o "$MODEL_DIR/special_tokens_map.json" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/special_tokens_map.json"
+  curl -sL -o "$MODEL_DIR/tokenizer_config.json" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer_config.json"
+
+  # Use hash embedder for semantic search (faster, no ML model verification required)
+  cass index --semantic --embedder hash
+  ```
 
 
 ## 🧪 Developer Workflow
