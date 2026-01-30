@@ -41,7 +41,7 @@ lru = "*"
 fxhash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3)
 smallvec = "*"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "*"
-reqwest = { version = "*", default-features = false, features = ["json", "rustls", "blocking"] }
+reqwest = { version = "*", default-features = false, features = ["json", "rustls", "blocking", "multipart"] }
 ratatui = { version = "*", features = ["crossterm"] }
 crossterm = "*"
 dirs = "*"

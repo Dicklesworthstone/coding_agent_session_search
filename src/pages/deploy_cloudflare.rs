@@ -7,9 +7,9 @@ use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use blake3::Hasher;
 use mime_guess::MimeGuess;
-use reqwest::blocking::multipart::{Form, Part};
-use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use reqwest::blocking::Client;
+use reqwest::blocking::multipart::{Form, Part};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,7 +48,6 @@ impl Prerequisites {
     pub fn is_ready(&self) -> bool {
         self.api_credentials_present
             || (self.wrangler_version.is_some() && self.wrangler_authenticated)
-            || (self.wrangler_version.is_some() && self.api_credentials_present)
     }
 
     /// Get a list of missing prerequisites
@@ -277,7 +276,6 @@ impl CloudflareDeployer {
         }
         let can_use_wrangler = prereqs.wrangler_version.is_some()
             && (prereqs.wrangler_authenticated || prereqs.api_credentials_present);
-        let can_use_api = prereqs.api_credentials_present;
 
         // Step 2: Copy bundle to temp directory and add Cloudflare files
         progress("prepare", "Preparing deployment...");
@@ -296,11 +294,7 @@ impl CloudflareDeployer {
             let exists = if can_use_wrangler {
                 check_project_exists(&self.config.project_name, account_id_ref, api_token_ref)
             } else if let (Some(account_id), Some(api_token)) = (account_id_ref, api_token_ref) {
-                check_project_exists_api(
-                    &self.config.project_name,
-                    account_id,
-                    api_token,
-                )?
+                check_project_exists_api(&self.config.project_name, account_id, api_token)?
             } else {
                 false
             };
@@ -620,6 +614,471 @@ fn deploy_with_wrangler(
 
         Ok((pages_url, deployment_id))
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEnvelope<T> {
+    success: bool,
+    #[serde(default)]
+    errors: Vec<ApiError>,
+    result: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadTokenResult {
+    jwt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentResult {
+    id: String,
+    url: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AssetFile {
+    path: PathBuf,
+    content_type: String,
+    size_bytes: u64,
+    hash: String,
+}
+
+const MAX_ASSET_COUNT_DEFAULT: usize = 20_000;
+const MAX_ASSET_SIZE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_BUCKET_SIZE_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_BUCKET_FILE_COUNT: usize = if cfg!(windows) { 1000 } else { 2000 };
+
+fn api_base_url() -> String {
+    dotenvy::var("CLOUDFLARE_API_BASE_URL")
+        .or_else(|_| dotenvy::var("CF_API_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string())
+}
+
+fn parse_api_response<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    context_label: &str,
+) -> Result<T> {
+    let status = response.status();
+    let body = response
+        .text()
+        .context("Failed to read Cloudflare API response body")?;
+    let envelope: ApiEnvelope<T> = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "Failed to parse Cloudflare API response for {} (status {})",
+            context_label, status
+        )
+    })?;
+    if !envelope.success {
+        let detail = if envelope.errors.is_empty() {
+            body
+        } else {
+            envelope
+                .errors
+                .iter()
+                .map(|err| format!("{} ({})", err.message, err.code))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        bail!(
+            "Cloudflare API error for {} (status {}): {}",
+            context_label,
+            status,
+            detail
+        );
+    }
+    envelope.result.ok_or_else(|| {
+        anyhow::anyhow!("Cloudflare API response missing result for {context_label}")
+    })
+}
+
+fn check_project_exists_api(project_name: &str, account_id: &str, api_token: &str) -> Result<bool> {
+    let client = Client::new();
+    let url = format!(
+        "{}/accounts/{}/pages/projects/{}",
+        api_base_url(),
+        account_id,
+        project_name
+    );
+    let response = client
+        .get(url)
+        .bearer_auth(api_token)
+        .send()
+        .context("Failed to query Cloudflare Pages project")?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    parse_api_response::<serde_json::Value>(response, "project lookup")?;
+    Ok(true)
+}
+
+fn create_project_api(
+    project_name: &str,
+    branch: &str,
+    account_id: &str,
+    api_token: &str,
+) -> Result<()> {
+    let client = Client::new();
+    let url = format!("{}/accounts/{}/pages/projects", api_base_url(), account_id);
+    let body = json!({
+        "name": project_name,
+        "production_branch": branch,
+        "deployment_configs": {
+            "production": {},
+            "preview": {}
+        }
+    });
+    let response = client
+        .post(url)
+        .bearer_auth(api_token)
+        .json(&body)
+        .send()
+        .context("Failed to create Cloudflare Pages project")?;
+    parse_api_response::<serde_json::Value>(response, "project create")?;
+    Ok(())
+}
+
+fn deploy_with_api(
+    deploy_dir: &Path,
+    project_name: &str,
+    branch: &str,
+    account_id: &str,
+    api_token: &str,
+    progress: &mut impl FnMut(&str, &str),
+) -> Result<(String, String)> {
+    let client = Client::new();
+    let base_url = api_base_url();
+
+    progress("api-token", "Requesting Pages upload token...");
+    let upload_jwt = fetch_upload_token(&client, &base_url, account_id, project_name, api_token)?;
+    let max_file_count = jwt_max_file_count(&upload_jwt).unwrap_or(MAX_ASSET_COUNT_DEFAULT);
+
+    progress("scan", "Scanning static assets...");
+    let file_map = collect_asset_files(deploy_dir, max_file_count)?;
+
+    progress("upload", "Uploading Pages assets via API...");
+    upload_assets(&client, &base_url, &upload_jwt, &file_map, false)?;
+
+    progress("deploy", "Creating Pages deployment via API...");
+    let manifest = build_manifest(&file_map);
+    let manifest_json =
+        serde_json::to_string(&manifest).context("Failed to serialize Pages asset manifest")?;
+
+    let mut form = Form::new().text("manifest", manifest_json);
+    if !branch.is_empty() {
+        form = form.text("branch", branch.to_string());
+    }
+    let headers_path = deploy_dir.join("_headers");
+    if headers_path.exists() {
+        let bytes = std::fs::read(&headers_path).context("Failed to read _headers")?;
+        form = form.part(
+            "_headers",
+            Part::bytes(bytes).file_name("_headers".to_string()),
+        );
+    }
+    let redirects_path = deploy_dir.join("_redirects");
+    if redirects_path.exists() {
+        let bytes = std::fs::read(&redirects_path).context("Failed to read _redirects")?;
+        form = form.part(
+            "_redirects",
+            Part::bytes(bytes).file_name("_redirects".to_string()),
+        );
+    }
+
+    let deploy_url = format!(
+        "{}/accounts/{}/pages/projects/{}/deployments",
+        base_url, account_id, project_name
+    );
+    let response = client
+        .post(deploy_url)
+        .bearer_auth(api_token)
+        .multipart(form)
+        .send()
+        .context("Failed to create Pages deployment via API")?;
+    let deployment = parse_api_response::<DeploymentResult>(response, "deployment create")?;
+
+    let pages_url = deployment
+        .url
+        .or_else(|| deployment.aliases.first().cloned())
+        .unwrap_or_else(|| format!("https://{}.pages.dev", project_name));
+
+    Ok((pages_url, deployment.id))
+}
+
+fn fetch_upload_token(
+    client: &Client,
+    base_url: &str,
+    account_id: &str,
+    project_name: &str,
+    api_token: &str,
+) -> Result<String> {
+    let url = format!(
+        "{}/accounts/{}/pages/projects/{}/upload-token",
+        base_url, account_id, project_name
+    );
+    let response = client
+        .get(url)
+        .bearer_auth(api_token)
+        .send()
+        .context("Failed to request Pages upload token")?;
+    let result = parse_api_response::<UploadTokenResult>(response, "upload token")?;
+    Ok(result.jwt)
+}
+
+fn jwt_max_file_count(jwt: &str) -> Option<usize> {
+    let claims_b64 = jwt.split('.').nth(1)?;
+    let decoded = BASE64_URL_SAFE_NO_PAD.decode(claims_b64).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    value
+        .get("max_file_count_allowed")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+}
+
+fn collect_asset_files(root: &Path, max_files: usize) -> Result<HashMap<String, AssetFile>> {
+    let mut files = HashMap::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.context("Failed to read Pages asset entry")?;
+        let metadata = entry.metadata().context("Failed to read asset metadata")?;
+        if metadata.is_dir() {
+            continue;
+        }
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        let rel_path = entry
+            .path()
+            .strip_prefix(root)
+            .context("Failed to compute asset relative path")?;
+        if should_ignore_path(rel_path) {
+            continue;
+        }
+        let rel_string = normalize_rel_path(rel_path)?;
+        let size_bytes = metadata.len();
+        if size_bytes > MAX_ASSET_SIZE_BYTES {
+            bail!(
+                "Cloudflare Pages supports files up to {} bytes; '{}' is {} bytes",
+                MAX_ASSET_SIZE_BYTES,
+                rel_string,
+                size_bytes
+            );
+        }
+        let content_type = MimeGuess::from_path(entry.path())
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let hash = hash_asset_file(entry.path())?;
+        files.insert(
+            rel_string.clone(),
+            AssetFile {
+                path: entry.path().to_path_buf(),
+                content_type,
+                size_bytes,
+                hash,
+            },
+        );
+        if files.len() > max_files {
+            bail!(
+                "Cloudflare Pages supports up to {} files for this deployment",
+                max_files
+            );
+        }
+    }
+    Ok(files)
+}
+
+fn should_ignore_path(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+        && matches!(
+            name,
+            "_worker.js" | "_redirects" | "_headers" | "_routes.json" | ".DS_Store"
+        )
+    {
+        return true;
+    }
+    for component in path.components() {
+        if let std::path::Component::Normal(os) = component
+            && let Some(part) = os.to_str()
+            && matches!(part, "node_modules" | ".git" | "functions")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_rel_path(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                parts.push(
+                    part.to_str()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 path segment"))?
+                        .to_string(),
+                );
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                bail!("Parent directory segments are not allowed in Pages asset paths");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn hash_asset_file(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).context("Failed to read asset for hashing")?;
+    let base64_contents = BASE64_STANDARD.encode(&bytes);
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let mut hasher = Hasher::new();
+    hasher.update(base64_contents.as_bytes());
+    hasher.update(extension.as_bytes());
+    let hash = hasher.finalize().to_hex().to_string();
+    Ok(hash[..32].to_string())
+}
+
+fn build_manifest(file_map: &HashMap<String, AssetFile>) -> HashMap<String, String> {
+    file_map
+        .iter()
+        .map(|(name, file)| (format!("/{}", name), file.hash.clone()))
+        .collect()
+}
+
+fn upload_assets(
+    client: &Client,
+    base_url: &str,
+    jwt: &str,
+    file_map: &HashMap<String, AssetFile>,
+    skip_caching: bool,
+) -> Result<()> {
+    let hashes: Vec<String> = file_map.values().map(|file| file.hash.clone()).collect();
+    let missing_hashes = if skip_caching {
+        hashes.clone()
+    } else {
+        check_missing_hashes(client, base_url, jwt, &hashes)?
+    };
+    let missing_set: std::collections::HashSet<String> = missing_hashes.into_iter().collect();
+    let mut missing_files: Vec<&AssetFile> = file_map
+        .values()
+        .filter(|file| missing_set.contains(&file.hash))
+        .collect();
+    missing_files.sort_by_key(|file| std::cmp::Reverse(file.size_bytes));
+
+    let buckets = build_upload_buckets(&missing_files);
+    for bucket in buckets {
+        upload_bucket(client, base_url, jwt, &bucket)?;
+    }
+
+    upsert_hashes(client, base_url, jwt, &hashes)?;
+    Ok(())
+}
+
+fn check_missing_hashes(
+    client: &Client,
+    base_url: &str,
+    jwt: &str,
+    hashes: &[String],
+) -> Result<Vec<String>> {
+    let url = format!("{}/pages/assets/check-missing", base_url);
+    let response = client
+        .post(url)
+        .bearer_auth(jwt)
+        .json(&json!({ "hashes": hashes }))
+        .send()
+        .context("Failed to check missing Pages assets")?;
+    parse_api_response::<Vec<String>>(response, "asset check-missing")
+}
+
+fn build_upload_buckets<'a>(files: &[&'a AssetFile]) -> Vec<Vec<&'a AssetFile>> {
+    #[derive(Default)]
+    struct Bucket<'a> {
+        files: Vec<&'a AssetFile>,
+        remaining: u64,
+    }
+
+    let mut buckets: Vec<Bucket<'a>> = (0..3)
+        .map(|_| Bucket {
+            files: Vec::new(),
+            remaining: MAX_BUCKET_SIZE_BYTES,
+        })
+        .collect();
+    let mut offset = 0usize;
+
+    for file in files {
+        let mut inserted = false;
+        for i in 0..buckets.len() {
+            let idx = (i + offset) % buckets.len();
+            let bucket = &mut buckets[idx];
+            if bucket.remaining >= file.size_bytes && bucket.files.len() < MAX_BUCKET_FILE_COUNT {
+                bucket.remaining -= file.size_bytes;
+                bucket.files.push(*file);
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            buckets.push(Bucket {
+                files: vec![*file],
+                remaining: MAX_BUCKET_SIZE_BYTES.saturating_sub(file.size_bytes),
+            });
+        }
+        offset = offset.saturating_add(1);
+    }
+
+    buckets
+        .into_iter()
+        .filter(|bucket| !bucket.files.is_empty())
+        .map(|bucket| bucket.files)
+        .collect()
+}
+
+fn upload_bucket(client: &Client, base_url: &str, jwt: &str, bucket: &[&AssetFile]) -> Result<()> {
+    if bucket.is_empty() {
+        return Ok(());
+    }
+    let payload: Vec<serde_json::Value> = bucket
+        .iter()
+        .map(|file| {
+            let bytes = std::fs::read(&file.path)?;
+            Ok(json!({
+                "key": file.hash,
+                "value": BASE64_STANDARD.encode(&bytes),
+                "metadata": { "contentType": file.content_type },
+                "base64": true
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let url = format!("{}/pages/assets/upload", base_url);
+    let response = client
+        .post(url)
+        .bearer_auth(jwt)
+        .json(&payload)
+        .send()
+        .context("Failed to upload Pages asset bucket")?;
+    parse_api_response::<serde_json::Value>(response, "asset upload")?;
+    Ok(())
+}
+
+fn upsert_hashes(client: &Client, base_url: &str, jwt: &str, hashes: &[String]) -> Result<()> {
+    let url = format!("{}/pages/assets/upsert-hashes", base_url);
+    let response = client
+        .post(url)
+        .bearer_auth(jwt)
+        .json(&json!({ "hashes": hashes }))
+        .send()
+        .context("Failed to upsert Pages asset hashes")?;
+    parse_api_response::<serde_json::Value>(response, "asset upsert-hashes")?;
+    Ok(())
 }
 
 /// Configure custom domain for project
