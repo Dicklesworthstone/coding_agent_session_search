@@ -170,7 +170,8 @@ impl EncryptionEngine {
             anyhow::bail!("Password cannot be whitespace-only");
         }
 
-        let slot_id = self.key_slots.len() as u8;
+        let slot_id = u8::try_from(self.key_slots.len())
+            .map_err(|_| anyhow::anyhow!("maximum of 256 key slots exceeded"))?;
 
         // Generate salt
         let salt = SaltString::generate(&mut OsRng);

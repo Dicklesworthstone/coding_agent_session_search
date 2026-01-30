@@ -200,7 +200,8 @@ impl<T> FramedMessage<T> {
 /// Encode a message to MessagePack bytes with length prefix.
 pub fn encode_message<T: Serialize>(msg: &FramedMessage<T>) -> Result<Vec<u8>, EncodeError> {
     let payload = rmp_serde::to_vec(msg).map_err(|e| EncodeError(e.to_string()))?;
-    let len = payload.len() as u32;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| EncodeError("payload exceeds maximum size of 4GB".to_string()))?;
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&payload);
