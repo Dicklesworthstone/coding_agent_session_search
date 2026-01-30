@@ -2529,15 +2529,19 @@ async fn execute_cli(
                             pages_config.deployment.api_token = Some(api_token.to_string());
                         }
 
+                        let cli_cf_creds_provided = account_id.is_some() || api_token.is_some();
+                        if target.is_none() && cli_cf_creds_provided {
+                            pages_config.deployment.target = "cloudflare".to_string();
+                        }
+
                         let target_name = pages_config.deployment.target.to_lowercase();
-                        let cf_creds_provided = pages_config.deployment.account_id.is_some()
-                            || pages_config.deployment.api_token.is_some();
-                        if cf_creds_provided && target_name != "cloudflare" {
+                        if target.is_some() && cli_cf_creds_provided && target_name != "cloudflare"
+                        {
                             return Err(CliError {
                                 code: 2,
                                 kind: "pages",
                                 message: format!(
-                                    "Cloudflare credentials provided but deployment.target is '{target_name}'"
+                                    "Cloudflare credentials provided via CLI but deployment.target is '{target_name}'"
                                 ),
                                 hint: Some(
                                     "Set deployment.target to \"cloudflare\" or remove Cloudflare credentials."
