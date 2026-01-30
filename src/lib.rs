@@ -2939,7 +2939,6 @@ async fn execute_cli(
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
 fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> serde_json::Value {
-    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Use the actual versioned index path (index/v4, not tantivy_index)
@@ -2958,21 +2957,25 @@ fn state_meta_json(data_dir: &Path, db_path: &Path, stale_threshold: u64) -> ser
     let mut message_count: i64 = 0;
     let mut last_indexed_at: Option<i64> = None;
 
-    if db_exists && let Ok(conn) = Connection::open(db_path) {
-        conversation_count = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap_or(0);
-        message_count = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .unwrap_or(0);
-        last_indexed_at = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok());
+    // Use LazyDb to get timing/logging for state snapshot DB access
+    let lazy = crate::storage::sqlite::LazyDb::new(db_path.to_path_buf());
+    if db_exists {
+        if let Ok(conn) = lazy.get("state-meta") {
+            conversation_count = conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                .unwrap_or(0);
+            message_count = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap_or(0);
+            last_indexed_at = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok());
+        }
     }
 
     let pending_sessions = if watch_state_path.exists() {
@@ -3064,6 +3067,30 @@ fn resolve_progress(mode: ProgressMode, stdout_is_tty: bool) -> ProgressResolved
                 ProgressResolved::Plain
             }
         }
+    }
+}
+
+/// Convert [`LazyDbError`] to the CLI-appropriate [`CliError`].
+fn lazy_db_to_cli_error(e: crate::storage::sqlite::LazyDbError) -> CliError {
+    use crate::storage::sqlite::LazyDbError;
+    match e {
+        LazyDbError::NotFound(path) => CliError {
+            code: 3,
+            kind: "missing-db",
+            message: format!(
+                "Database not found at {}. Run 'cass index --full' first.",
+                path.display()
+            ),
+            hint: Some("Run 'cass index --full' to create the database.".into()),
+            retryable: true,
+        },
+        LazyDbError::OpenFailed { path, source } => CliError {
+            code: 9,
+            kind: "db-open",
+            message: format!("Failed to open database at {}: {source}", path.display()),
+            hint: None,
+            retryable: false,
+        },
     }
 }
 
@@ -5483,31 +5510,9 @@ fn run_stats(
     by_source: bool,
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
-    use rusqlite::Connection;
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-
-    if !db_path.exists() {
-        return Err(CliError {
-            code: 3,
-            kind: "missing-db",
-            message: format!(
-                "Database not found at {}. Run 'cass index --full' first.",
-                db_path.display()
-            ),
-            hint: None,
-            retryable: true,
-        });
-    }
-
-    let conn = Connection::open(&db_path).map_err(|e| CliError {
-        code: 9,
-        kind: "db-open",
-        message: format!("Failed to open database: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
+    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
+    let conn = lazy.get("stats").map_err(lazy_db_to_cli_error)?;
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
@@ -7344,28 +7349,8 @@ fn run_context(
     json: bool,
     limit: usize,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
-
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-
-    if !db_path.exists() {
-        return Err(CliError {
-            code: 3,
-            kind: "missing_index",
-            message: "Database not found".to_string(),
-            hint: Some("Run 'cass index --full' to create the database.".to_string()),
-            retryable: true,
-        });
-    }
-
-    let conn = Connection::open(&db_path).map_err(|e| CliError {
-        code: 9,
-        kind: "db-open",
-        message: format!("Failed to open database: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
+    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir_override, db_override);
+    let conn = lazy.get("context").map_err(lazy_db_to_cli_error)?;
 
     // Find the source conversation by path (normalized to string)
     let path_str = path.to_string_lossy().to_string();
@@ -11947,32 +11932,13 @@ fn run_timeline(
 ) -> CliResult<()> {
     use crate::sources::provenance::SourceFilter;
     use chrono::{Local, TimeZone, Utc};
-    use rusqlite::Connection;
     use std::collections::HashMap;
 
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
-    let data_root = data_dir.clone().unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_root.join("agent_search.db"));
-
-    if !db_path.exists() {
-        return Err(CliError {
-            code: 3,
-            kind: "db-not-found",
-            message: "No database found. Run 'cass index' first.".to_string(),
-            hint: Some(format!("Expected: {}", db_path.display())),
-            retryable: true,
-        });
-    }
-
-    let conn = Connection::open(&db_path).map_err(|e| CliError {
-        code: 9,
-        kind: "db-open",
-        message: format!("Failed to open database: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
+    let lazy = crate::storage::sqlite::LazyDb::from_overrides(data_dir, db_override);
+    let conn = lazy.get("timeline").map_err(lazy_db_to_cli_error)?;
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {

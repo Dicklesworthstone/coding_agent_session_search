@@ -2454,6 +2454,34 @@ pub fn footer_legend(show_help: bool) -> &'static str {
     }
 }
 
+fn ensure_db_reader<'a>(
+    db_reader: &'a mut Option<crate::storage::sqlite::SqliteStorage>,
+    db_path: &Path,
+) -> Option<&'a crate::storage::sqlite::SqliteStorage> {
+    if db_reader.is_none() {
+        *db_reader = crate::storage::sqlite::SqliteStorage::open_readonly(db_path).ok();
+    }
+    db_reader.as_ref()
+}
+
+fn ensure_known_workspaces(
+    db_reader: &mut Option<crate::storage::sqlite::SqliteStorage>,
+    db_path: &Path,
+    known_workspaces: &mut Option<Vec<String>>,
+) {
+    if known_workspaces.is_none() {
+        let workspaces = ensure_db_reader(db_reader, db_path)
+            .and_then(|db| db.list_workspaces().ok())
+            .map(|wss| {
+                wss.into_iter()
+                    .map(|w| w.path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        *known_workspaces = Some(workspaces);
+    }
+}
+
 /// Helper to prepare a file path for opening in an editor.
 ///
 /// For standard files, returns the path as-is.
@@ -2570,20 +2598,12 @@ pub fn run_tui(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(false);
 
-    // Open a read-only connection for the UI to fetch details efficiently.
-    // If DB doesn't exist yet (first run), this will be None, which is fine as we can't view details anyway.
-    let db_reader = crate::storage::sqlite::SqliteStorage::open_readonly(&db_path).ok();
+    // Lazy-readonly DB handle for detail loading and workspace/source discovery.
+    // Open only when a feature needs it to keep TUI startup fast.
+    let mut db_reader: Option<crate::storage::sqlite::SqliteStorage> = None;
 
-    // Load known workspaces for autocomplete suggestions
-    let known_workspaces: Vec<String> = db_reader
-        .as_ref()
-        .and_then(|db| db.list_workspaces().ok())
-        .map(|wss| {
-            wss.into_iter()
-                .map(|w| w.path.to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Lazy-loaded workspace list for autocomplete (loaded on first workspace filter use).
+    let mut known_workspaces: Option<Vec<String>> = None;
 
     let index_ready = search_client.is_some();
     let mut status = if index_ready {
@@ -4253,7 +4273,8 @@ pub fn run_tui(
 
                 // Render autocomplete dropdown for Workspace Filter
                 if input_mode == InputMode::Workspace {
-                    let ws_suggestions = workspace_suggestions(&input_buffer, &known_workspaces);
+                    let ws_suggestions =
+                        workspace_suggestions(&input_buffer, known_workspaces.as_deref().unwrap_or(&[]));
                     if !ws_suggestions.is_empty() {
                         let area = Rect::new(
                             chunks[0].x + 14, // Align with " Filter: Workspace " prompt
@@ -4602,6 +4623,11 @@ pub fn run_tui(
                                     "ws" => {
                                         input_mode = InputMode::Workspace;
                                         input_buffer = pill.value.clone();
+                                        ensure_known_workspaces(
+                                            &mut db_reader,
+                                            &db_path,
+                                            &mut known_workspaces,
+                                        );
                                         status = "Edit workspace filter".to_string();
                                         dirty_since = None;
                                     }
@@ -4849,6 +4875,11 @@ pub fn run_tui(
                                 PaletteAction::FilterWorkspace => {
                                     input_mode = InputMode::Workspace;
                                     input_buffer.clear();
+                                    ensure_known_workspaces(
+                                        &mut db_reader,
+                                        &db_path,
+                                        &mut known_workspaces,
+                                    );
                                 }
                                 PaletteAction::FilterToday => {
                                     if let Some((start, _)) = quick_date_range_today() {
@@ -6412,6 +6443,11 @@ pub fn run_tui(
                         KeyCode::F(4) => {
                             input_mode = InputMode::Workspace;
                             input_buffer.clear();
+                            ensure_known_workspaces(
+                                &mut db_reader,
+                                &db_path,
+                                &mut known_workspaces,
+                            );
                             status =
                                 "Workspace filter: type path fragment, Enter=apply, Esc=cancel"
                                     .to_string();
@@ -7131,8 +7167,10 @@ pub fn run_tui(
                     }
                     KeyCode::Tab => {
                         // Tab completes to first matching workspace suggestion
-                        let ws_suggestions =
-                            workspace_suggestions(&input_buffer, &known_workspaces);
+                        let ws_suggestions = workspace_suggestions(
+                            &input_buffer,
+                            known_workspaces.as_deref().unwrap_or(&[]),
+                        );
                         if let Some(first) = ws_suggestions.first() {
                             input_buffer = first.clone();
                             status = format!("Completed to '{}'. Press Enter to apply.", first);

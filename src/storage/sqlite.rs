@@ -5,9 +5,107 @@ use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::fs;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::info;
+
+// -------------------------------------------------------------------------
+// Lazy SQLite Connection (bd-1ueu)
+// -------------------------------------------------------------------------
+// Defers opening the database until first use, cutting startup cost for
+// commands that may not need the DB at all.  Thread-safe via parking_lot
+// Mutex; logs the reason and duration of the open on first access.
+
+/// Error from lazy database initialization.
+#[derive(Debug, Error)]
+pub enum LazyDbError {
+    #[error("Database not found at {0}")]
+    NotFound(PathBuf),
+    #[error("Failed to open database at {path}: {source}")]
+    OpenFailed {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+}
+
+/// A lazily-initialized, thread-safe SQLite connection handle.
+///
+/// Constructing a `LazyDb` is cheap (no I/O).  The underlying
+/// `rusqlite::Connection` is opened on the first call to [`get`].
+/// Subsequent calls return the cached connection.
+pub struct LazyDb {
+    path: PathBuf,
+    conn: parking_lot::Mutex<Option<Connection>>,
+}
+
+/// RAII guard that dereferences to the inner `Connection`.
+pub struct LazyDbGuard<'a>(parking_lot::MutexGuard<'a, Option<Connection>>);
+
+impl std::ops::Deref for LazyDbGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("LazyDb connection must be initialized before access")
+    }
+}
+
+impl LazyDb {
+    /// Create a lazy handle pointing at `path`.  No I/O is performed.
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            conn: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Resolve path from optional CLI overrides.
+    ///
+    /// Uses `data_dir / agent_search.db` as fallback.
+    pub fn from_overrides(data_dir: &Option<PathBuf>, db_override: Option<PathBuf>) -> Self {
+        let data_dir = data_dir.clone().unwrap_or_else(crate::default_data_dir);
+        let path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+        Self::new(path)
+    }
+
+    /// Get the connection, opening the database on first access.
+    ///
+    /// `reason` is logged alongside the open duration so callers can
+    /// identify which command triggered the open.
+    pub fn get(&self, reason: &str) -> std::result::Result<LazyDbGuard<'_>, LazyDbError> {
+        let mut guard = self.conn.lock();
+        if guard.is_none() {
+            if !self.path.exists() {
+                return Err(LazyDbError::NotFound(self.path.clone()));
+            }
+            let start = Instant::now();
+            let conn = Connection::open(&self.path).map_err(|e| LazyDbError::OpenFailed {
+                path: self.path.clone(),
+                source: e,
+            })?;
+            let elapsed_ms = start.elapsed().as_millis();
+            info!(
+                path = %self.path.display(),
+                elapsed_ms = elapsed_ms,
+                reason = reason,
+                "lazily opened SQLite database"
+            );
+            *guard = Some(conn);
+        }
+        Ok(LazyDbGuard(guard))
+    }
+
+    /// Path to the database file (even if not yet opened).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether the connection has been opened.
+    pub fn is_open(&self) -> bool {
+        self.conn.lock().is_some()
+    }
+}
 
 // -------------------------------------------------------------------------
 // Binary Metadata Serialization (Opt 3.1)
