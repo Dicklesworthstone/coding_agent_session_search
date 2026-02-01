@@ -162,12 +162,22 @@ impl ModelDaemon {
     /// Initialize the background embedding worker thread.
     fn init_worker(&self) {
         let (worker, handle) = EmbeddingWorker::new();
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("embedding-worker".into())
             .spawn(move || worker.run())
-            .expect("failed to spawn embedding worker thread");
-        *self.worker_handle.lock() = Some(handle);
-        info!("Embedding worker initialized");
+        {
+            Ok(_) => {
+                *self.worker_handle.lock() = Some(handle);
+                info!("Embedding worker initialized");
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Failed to spawn embedding worker - background jobs will be unavailable"
+                );
+                // Continue without worker - daemon can still handle other requests
+            }
+        }
     }
 
     /// Start the daemon server.

@@ -136,8 +136,14 @@ fn deserialize_msgpack_to_json(bytes: &[u8]) -> serde_json::Value {
     if bytes.is_empty() {
         return serde_json::Value::Object(serde_json::Map::new());
     }
-    rmp_serde::from_slice(bytes)
-        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+    rmp_serde::from_slice(bytes).unwrap_or_else(|e| {
+        tracing::debug!(
+            error = %e,
+            bytes_len = bytes.len(),
+            "Failed to deserialize metadata - returning empty object"
+        );
+        serde_json::Value::Object(serde_json::Map::new())
+    })
 }
 
 /// Read metadata from row, preferring binary column, falling back to JSON.

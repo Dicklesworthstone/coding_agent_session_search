@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::protocol::{
     EmbeddingJobInfo, ErrorCode, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
@@ -261,11 +261,17 @@ impl UdsDaemonClient {
         })?;
 
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 100 * 1024 * 1024 {
-            // 100MB sanity limit
+        // 10MB sanity limit - typical embedding responses are well under 1MB
+        const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+        if len > MAX_RESPONSE_SIZE {
+            warn!(
+                response_size = len,
+                max_size = MAX_RESPONSE_SIZE,
+                "Rejecting oversized daemon response"
+            );
             return Err(DaemonError::Failed(format!(
-                "response too large: {} bytes",
-                len
+                "response too large: {} bytes (max {})",
+                len, MAX_RESPONSE_SIZE
             )));
         }
 
@@ -402,9 +408,9 @@ impl DaemonClient for UdsDaemonClient {
             return false;
         }
 
-        // Check if health was recently verified
+        // Check if health was recently verified (5 second cache for faster failure detection)
         if let Some(last) = *self.last_health_check.lock()
-            && last.elapsed() < Duration::from_secs(30)
+            && last.elapsed() < Duration::from_secs(5)
         {
             return true;
         }

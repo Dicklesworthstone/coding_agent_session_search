@@ -132,7 +132,7 @@ impl EmbeddingWorker {
         // Open storage and fetch messages
         let storage = SqliteStorage::open(db_path)?;
         let messages = storage.fetch_messages_for_embedding()?;
-        let total_docs = messages.len() as i64;
+        let total_docs = i64::try_from(messages.len()).unwrap_or(i64::MAX);
 
         if total_docs == 0 {
             info!(db_path = %config.db_path, "No messages to embed");
@@ -254,11 +254,16 @@ impl EmbeddingWorker {
                 continue;
             }
 
+            // Use saturating casts to handle edge cases gracefully
+            let message_id = u64::try_from(msg.message_id).unwrap_or(0);
+            let agent_id = u32::try_from(msg.agent_id).unwrap_or(0);
+            let workspace_id = u32::try_from(msg.workspace_id.unwrap_or(0)).unwrap_or(0);
+
             inputs.push(EmbeddingInput {
-                message_id: msg.message_id as u64,
+                message_id,
                 created_at_ms: msg.created_at.unwrap_or(0),
-                agent_id: msg.agent_id as u32,
-                workspace_id: msg.workspace_id.unwrap_or(0) as u32,
+                agent_id,
+                workspace_id,
                 source_id: msg.source_id_hash,
                 role,
                 chunk_idx: 0,
