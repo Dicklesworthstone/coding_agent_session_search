@@ -85,16 +85,16 @@ ensure_rust() {
     info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
+  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -qE '1\.(8[5-9]|9[0-9]|[1-9][0-9]{2,})'; then return 0; fi
   if [ "$EASY" -ne 1 ]; then
     if [ -t 0 ]; then
-      echo -n "Install Rust nightly via rustup? (y/N): "
+      echo -n "Install Rust stable via rustup? (y/N): "
       read -r ans
       case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
     fi
   fi
-  info "Installing rustup (nightly)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+  info "Installing rustup (stable)"
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
   export PATH="$HOME/.cargo/bin:$PATH"
   rustup component add rustfmt clippy || true
 }
