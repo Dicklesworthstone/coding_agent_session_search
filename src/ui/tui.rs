@@ -1495,14 +1495,23 @@ fn active_hit(panes: &[AgentPane], active_idx: usize) -> Option<&SearchHit> {
 }
 
 /// Known agent slugs for autocomplete suggestions
+/// Keep in sync with connectors in src/connectors/mod.rs
 const KNOWN_AGENTS: &[&str] = &[
+    "aider",
+    "amp",
+    "chatgpt",
     "claude_code",
-    "codex",
+    "clawdbot",
     "cline",
+    "codex",
+    "cursor",
+    "factory",
     "gemini",
     "gemini_cli",
-    "amp",
+    "openclaw",
     "opencode",
+    "pi_agent",
+    "vibe",
 ];
 
 /// Returns agent suggestions matching the given prefix (case-insensitive)
