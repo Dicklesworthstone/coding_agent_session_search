@@ -109,9 +109,7 @@ impl Connector for OpenClawConnector {
             }
         } else {
             // Also check parent dir in case sessions dir hasn't been created yet
-            let parent = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".openclaw");
+            let parent = dirs::home_dir().unwrap_or_default().join(".openclaw");
             if parent.exists() {
                 DetectionResult {
                     detected: true,
@@ -213,18 +211,12 @@ impl Connector for OpenClawConnector {
                         Err(_) => continue,
                     };
 
-                    let line_type = val
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let line_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                     match line_type {
                         "session" => {
                             // Extract session metadata
-                            session_cwd = val
-                                .get("cwd")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
+                            session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(String::from);
                             if let Some(ts) = val.get("timestamp").and_then(parse_timestamp) {
                                 started_at = Some(ts);
                             }
@@ -262,10 +254,7 @@ impl Connector for OpenClawConnector {
                             messages.push(NormalizedMessage {
                                 idx: messages.len() as i64,
                                 role: role.to_string(),
-                                author: msg
-                                    .get("model")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from),
+                                author: msg.get("model").and_then(|v| v.as_str()).map(String::from),
                                 created_at: created,
                                 content,
                                 extra: val,
