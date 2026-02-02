@@ -398,6 +398,7 @@ pub mod codex;
 pub mod cursor;
 pub mod factory;
 pub mod gemini;
+pub mod openclaw;
 pub mod opencode;
 pub mod pi_agent;
 pub mod vibe;
