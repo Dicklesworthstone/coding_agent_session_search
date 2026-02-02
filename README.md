@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, and Factory (Droid) into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenClaw, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, and Factory (Droid) into a single, searchable timeline.
 
 <div align="center">
 
@@ -279,6 +279,7 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **Claude Code**: `~/.claude/projects` (Session JSONL)
 - **Clawdbot**: `~/.clawdbot/sessions` (Session JSONL)
 - **Vibe (Mistral)**: `~/.vibe/logs/session/*/messages.jsonl` (Session JSONL)
+- **OpenClaw**: `~/.openclaw/agents/openclaw/sessions/*.jsonl` (Session JSONL)
 - **OpenCode**: `.opencode` directories (SQLite)
 - **Amp**: `~/.local/share/amp` & VS Code storage
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
