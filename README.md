@@ -2466,7 +2466,8 @@ Update check state is stored in the data directory:
 | `EDITOR` | `$VISUAL` or `vi` | External editor command |
 | `EDITOR_LINE_FLAG` | `+` | Line number flag (e.g., `+42`) |
 | **Updates** | | |
-| `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications |
+| `CODING_AGENT_SEARCH_NO_UPDATE_PROMPT` | unset | Disable update notifications
+| `CASS_SKIP_UPDATE` | unset | Disable update notifications |
 | **Connector Overrides** | | |
 | `CASS_AIDER_DATA_ROOT` | `~/.aider.chat.history.md` | Aider history location |
 | `PI_CODING_AGENT_DIR` | `~/.pi/agent/sessions` | Pi-Agent sessions |
