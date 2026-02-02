@@ -141,7 +141,38 @@ pub struct ModelManifest {
     pub license: String,
 }
 
+/// Placeholder checksum value used for unverified manifests.
+///
+/// When a manifest file has this checksum, it means the model has not been
+/// downloaded and verified yet. The download system will reject such files.
+pub const PLACEHOLDER_CHECKSUM: &str = "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD";
+
 impl ModelManifest {
+    /// Check if this manifest has verified checksums for all files.
+    ///
+    /// Returns `false` if any file has the placeholder checksum, indicating
+    /// the model has not been downloaded and verified yet.
+    pub fn has_verified_checksums(&self) -> bool {
+        self.files.iter().all(|f| f.sha256 != PLACEHOLDER_CHECKSUM)
+    }
+
+    /// Check if this manifest has a pinned revision (not "main").
+    ///
+    /// Unpinned revisions ("main") are not reproducible since the content
+    /// can change at any time on HuggingFace.
+    pub fn has_pinned_revision(&self) -> bool {
+        self.revision != "main"
+    }
+
+    /// Check if this manifest is production-ready.
+    ///
+    /// A manifest is production-ready if it has:
+    /// - All checksums verified (no placeholders)
+    /// - A pinned revision (not "main")
+    pub fn is_production_ready(&self) -> bool {
+        self.has_verified_checksums() && self.has_pinned_revision()
+    }
+
     /// Get the default MiniLM model manifest (baseline for bake-off).
     ///
     /// The revision and checksums are pinned for reproducibility.
@@ -629,6 +660,28 @@ impl ModelManifest {
         candidates
     }
 
+    /// Get only production-ready bake-off candidates.
+    ///
+    /// These are models that have verified checksums and pinned revisions,
+    /// and can be safely downloaded and used.
+    pub fn bakeoff_candidates_ready() -> Vec<Self> {
+        Self::bakeoff_candidates()
+            .into_iter()
+            .filter(|m| m.is_production_ready())
+            .collect()
+    }
+
+    /// Get bake-off candidates that are NOT production-ready.
+    ///
+    /// These models have placeholder checksums or unpinned revisions and
+    /// cannot be downloaded until they are properly verified.
+    pub fn bakeoff_candidates_pending() -> Vec<Self> {
+        Self::bakeoff_candidates()
+            .into_iter()
+            .filter(|m| !m.is_production_ready())
+            .collect()
+    }
+
     /// Total size of all files in bytes.
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
@@ -686,6 +739,17 @@ pub enum DownloadError {
     Timeout,
     /// HTTP error response.
     HttpError { status: u16, message: String },
+    /// Manifest has placeholder checksums and is not production-ready.
+    ///
+    /// This error is returned when attempting to download a bake-off candidate
+    /// model that has not yet been verified. The model files need to be:
+    /// 1. Downloaded manually to compute SHA256 checksums
+    /// 2. Revision pinned to a specific commit (not "main")
+    ManifestNotVerified {
+        model_id: String,
+        unverified_files: Vec<String>,
+        revision_unpinned: bool,
+    },
 }
 
 impl std::fmt::Display for DownloadError {
@@ -707,6 +771,23 @@ impl std::fmt::Display for DownloadError {
             DownloadError::Timeout => write!(f, "download timed out"),
             DownloadError::HttpError { status, message } => {
                 write!(f, "HTTP error {status}: {message}")
+            }
+            DownloadError::ManifestNotVerified {
+                model_id,
+                unverified_files,
+                revision_unpinned,
+            } => {
+                write!(
+                    f,
+                    "model '{}' is not production-ready: {} file(s) have placeholder checksums{}",
+                    model_id,
+                    unverified_files.len(),
+                    if *revision_unpinned {
+                        " and revision is not pinned"
+                    } else {
+                        ""
+                    }
+                )
             }
         }
     }
@@ -804,6 +885,22 @@ impl ModelDownloader {
         manifest: &ModelManifest,
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), DownloadError> {
+        // Validate manifest is production-ready before downloading
+        // This prevents downloading models with placeholder checksums that can't be verified
+        if !manifest.is_production_ready() {
+            let unverified_files: Vec<String> = manifest
+                .files
+                .iter()
+                .filter(|f| f.sha256 == PLACEHOLDER_CHECKSUM)
+                .map(|f| f.name.clone())
+                .collect();
+            return Err(DownloadError::ManifestNotVerified {
+                model_id: manifest.id.clone(),
+                unverified_files,
+                revision_unpinned: !manifest.has_pinned_revision(),
+            });
+        }
+
         // Reset cancellation flag
         self.cancelled.store(false, Ordering::SeqCst);
 
@@ -1360,6 +1457,58 @@ mod tests {
         };
         assert!(err.to_string().contains("verification failed"));
         assert!(err.to_string().contains("test.onnx"));
+
+        let err = DownloadError::ManifestNotVerified {
+            model_id: "test-model".into(),
+            unverified_files: vec!["model.onnx".into(), "config.json".into()],
+            revision_unpinned: true,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("test-model"));
+        assert!(msg.contains("not production-ready"));
+        assert!(msg.contains("2 file(s)"));
+        assert!(msg.contains("revision is not pinned"));
+    }
+
+    #[test]
+    fn test_manifest_production_ready_minilm() {
+        // MiniLM should be production-ready (verified checksums + pinned revision)
+        let manifest = ModelManifest::minilm_v2();
+        assert!(manifest.has_verified_checksums());
+        assert!(manifest.has_pinned_revision());
+        assert!(manifest.is_production_ready());
+    }
+
+    #[test]
+    fn test_manifest_not_production_ready_bakeoff() {
+        // Bake-off candidates should NOT be production-ready (placeholder checksums)
+        let manifest = ModelManifest::embeddinggemma();
+        assert!(!manifest.has_verified_checksums());
+        assert!(!manifest.has_pinned_revision());
+        assert!(!manifest.is_production_ready());
+
+        // Check that at least one file has the placeholder
+        let has_placeholder = manifest
+            .files
+            .iter()
+            .any(|f| f.sha256 == super::PLACEHOLDER_CHECKSUM);
+        assert!(has_placeholder);
+    }
+
+    #[test]
+    fn test_bakeoff_candidates_separation() {
+        // All bake-off candidates should have placeholder checksums currently
+        let pending = ModelManifest::bakeoff_candidates_pending();
+        let ready = ModelManifest::bakeoff_candidates_ready();
+
+        // Currently all bake-off models are pending (none have real checksums)
+        assert!(!pending.is_empty());
+        // When models get verified, they'll move to the ready list
+        assert!(ready.is_empty()); // All bake-off candidates have placeholders
+
+        // Total should equal all candidates
+        let all = ModelManifest::bakeoff_candidates();
+        assert_eq!(pending.len() + ready.len(), all.len());
     }
 
     #[test]
