@@ -612,7 +612,7 @@ fn missing_required_arg_returns_error() {
 // =============================================================================
 
 use clap::Parser;
-use coding_agent_search::{Cli, Commands};
+use coding_agent_search::{AnalyticsBucketing, AnalyticsCommand, Cli, Commands};
 
 #[test]
 fn parse_completions_bash() {
@@ -753,5 +753,464 @@ fn parse_export_html_with_encrypt() {
             assert!(password_stdin);
         }
         other => panic!("expected export-html command, got {other:?}"),
+    }
+}
+
+// =============================================================================
+// Analytics CLI scaffolding tests (br-z9fse.3.1)
+// =============================================================================
+
+#[test]
+fn analytics_help_lists_expected_subcommands() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "--help"]);
+    cmd.assert()
+        .success()
+        .stdout(contains("status"))
+        .stdout(contains("tokens"))
+        .stdout(contains("tools"))
+        .stdout(contains("models"))
+        .stdout(contains("cost"))
+        .stdout(contains("rebuild"))
+        .stdout(contains("validate"));
+}
+
+#[test]
+fn analytics_tokens_help_lists_shared_flags_and_group_by() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--help"]);
+    cmd.assert()
+        .success()
+        .stdout(contains("--since"))
+        .stdout(contains("--until"))
+        .stdout(contains("--days"))
+        .stdout(contains("--agent"))
+        .stdout(contains("--workspace"))
+        .stdout(contains("--source"))
+        .stdout(contains("--json"))
+        .stdout(contains("--group-by"));
+}
+
+#[test]
+fn analytics_subcommands_emit_uniform_json_envelope() {
+    let shared = [
+        "--json",
+        "--since",
+        "2026-01-01",
+        "--until",
+        "2026-01-31",
+        "--days",
+        "7",
+        "--agent",
+        "claude",
+        "--workspace",
+        "/tmp/project-a",
+        "--source",
+        "local",
+    ];
+
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("analytics/status", vec!["analytics", "status"]),
+        (
+            "analytics/tokens",
+            vec!["analytics", "tokens", "--group-by", "day"],
+        ),
+        (
+            "analytics/tools",
+            vec!["analytics", "tools", "--group-by", "week"],
+        ),
+        (
+            "analytics/models",
+            vec!["analytics", "models", "--group-by", "month"],
+        ),
+        (
+            "analytics/cost",
+            vec!["analytics", "cost", "--group-by", "hour"],
+        ),
+        ("analytics/rebuild", vec!["analytics", "rebuild", "--force"]),
+        ("analytics/validate", vec!["analytics", "validate", "--fix"]),
+    ];
+
+    for (expected_command, mut args) in cases {
+        args.extend_from_slice(&shared);
+        let mut cmd = simple_cmd();
+        cmd.args(&args);
+        let output = cmd.assert().success().get_output().clone();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.trim().is_empty(),
+            "analytics robot mode should keep stderr clean for {expected_command}, got stderr: {stderr}"
+        );
+
+        let json: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("invalid JSON for {expected_command}: {e}\nstdout={stdout}")
+        });
+
+        assert_eq!(json["command"], expected_command);
+        if expected_command == "analytics/status" {
+            assert!(
+                json["data"]["tables"].is_array(),
+                "analytics/status should expose table stats: {json}"
+            );
+            assert!(
+                json["data"]["coverage"].is_object(),
+                "analytics/status should expose coverage block: {json}"
+            );
+            assert!(
+                json["data"]["drift"].is_object(),
+                "analytics/status should expose drift block: {json}"
+            );
+        } else if expected_command == "analytics/tokens" {
+            assert!(
+                json["data"]["buckets"].is_array(),
+                "analytics/tokens should expose bucketed rows: {json}"
+            );
+            assert!(
+                json["data"]["_meta"].is_object(),
+                "analytics/tokens should include _meta block: {json}"
+            );
+        } else {
+            assert_eq!(json["data"]["status"], "not_implemented");
+        }
+        assert!(
+            json["_meta"]["elapsed_ms"].as_u64().is_some(),
+            "missing numeric elapsed_ms for {expected_command}: {json}"
+        );
+
+        let filters = json["_meta"]["filters_applied"]
+            .as_array()
+            .expect("filters_applied array");
+        assert!(
+            !filters.is_empty(),
+            "filters_applied should include shared filters for {expected_command}"
+        );
+    }
+}
+
+#[test]
+fn parse_analytics_tokens_with_shared_flags() {
+    let cli = Cli::try_parse_from([
+        "cass",
+        "analytics",
+        "tokens",
+        "--group-by",
+        "week",
+        "--since",
+        "2026-01-01",
+        "--until",
+        "2026-01-31",
+        "--days",
+        "7",
+        "--agent",
+        "claude",
+        "--agent",
+        "codex",
+        "--workspace",
+        "/tmp/ws-a",
+        "--workspace",
+        "/tmp/ws-b",
+        "--source",
+        "remote",
+        "--json",
+    ])
+    .expect("parse analytics tokens with shared flags");
+
+    match cli.command {
+        Some(Commands::Analytics(AnalyticsCommand::Tokens { common, group_by })) => {
+            assert_eq!(group_by, AnalyticsBucketing::Week);
+            assert_eq!(common.since.as_deref(), Some("2026-01-01"));
+            assert_eq!(common.until.as_deref(), Some("2026-01-31"));
+            assert_eq!(common.days, Some(7));
+            assert_eq!(common.agent, vec!["claude", "codex"]);
+            assert_eq!(common.workspace, vec!["/tmp/ws-a", "/tmp/ws-b"]);
+            assert_eq!(common.source.as_deref(), Some("remote"));
+            assert!(common.json);
+        }
+        other => panic!("expected analytics tokens command, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_analytics_models_subcommand_name_maps_to_variant() {
+    let cli = Cli::try_parse_from(["cass", "analytics", "models", "--group-by", "day", "--json"])
+        .expect("parse analytics models");
+    match cli.command {
+        Some(Commands::Analytics(AnalyticsCommand::AnalyticsModels { common, group_by })) => {
+            assert_eq!(group_by, AnalyticsBucketing::Day);
+            assert!(common.json);
+        }
+        other => panic!("expected analytics models command variant, got {other:?}"),
+    }
+}
+
+#[test]
+fn analytics_group_by_invalid_value_returns_actionable_error() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--group-by", "fortnight", "--json"]);
+    let output = cmd.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+
+    assert!(
+        stderr.contains("possible values")
+            || stderr.contains("possible value")
+            || stderr.contains("invalid value"),
+        "invalid --group-by should report actionable enum guidance, stderr={stderr}"
+    );
+}
+
+// =============================================================================
+// Analytics tokens data tests (br-z9fse.3.3)
+// =============================================================================
+
+#[test]
+fn analytics_tokens_json_returns_buckets_and_totals() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert_eq!(json["command"], "analytics/tokens");
+
+    let data = &json["data"];
+    assert!(
+        data["buckets"].is_array(),
+        "analytics/tokens must expose buckets array: {data}"
+    );
+    assert!(
+        data["bucket_count"].is_number(),
+        "analytics/tokens must expose bucket_count: {data}"
+    );
+
+    // _meta must include path and group_by
+    let meta = &data["_meta"];
+    assert!(meta.is_object(), "missing _meta in data: {data}");
+    assert!(
+        meta["elapsed_ms"].is_number(),
+        "missing elapsed_ms in _meta: {meta}"
+    );
+    assert!(
+        meta["group_by"].is_string(),
+        "missing group_by in _meta: {meta}"
+    );
+    assert_eq!(meta["group_by"], "day", "default group_by should be day");
+}
+
+#[test]
+fn analytics_tokens_group_by_hour() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--group-by", "hour", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    let meta = &json["data"]["_meta"];
+    assert_eq!(meta["group_by"], "hour");
+    assert_eq!(meta["source_table"], "usage_hourly");
+}
+
+#[test]
+fn analytics_tokens_group_by_week() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--group-by", "week", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    let meta = &json["data"]["_meta"];
+    assert_eq!(meta["group_by"], "week");
+    assert_eq!(meta["source_table"], "usage_daily");
+}
+
+#[test]
+fn analytics_tokens_group_by_month() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--group-by", "month", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    let meta = &json["data"]["_meta"];
+    assert_eq!(meta["group_by"], "month");
+    assert_eq!(meta["source_table"], "usage_daily");
+}
+
+#[test]
+fn analytics_tokens_with_time_filter() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--days", "7", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    // Should still have valid structure even if no data in range
+    assert!(json["data"]["buckets"].is_array());
+    assert!(json["data"]["bucket_count"].is_number());
+
+    // Totals should always be present
+    let totals = &json["data"]["totals"];
+    assert!(
+        totals.is_object(),
+        "totals should be present even with empty results: {json}"
+    );
+    assert!(totals["counts"].is_object());
+    assert!(totals["api_tokens"].is_object());
+    assert!(totals["content_tokens"].is_object());
+    assert!(totals["coverage"].is_object());
+    assert!(totals["derived"].is_object());
+}
+
+#[test]
+fn analytics_tokens_with_agent_filter() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--agent", "claude_code", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert!(json["data"]["buckets"].is_array());
+
+    // Verify filter was applied
+    let filters = json["_meta"]["filters_applied"]
+        .as_array()
+        .expect("filters_applied array");
+    let has_agent_filter = filters
+        .iter()
+        .any(|f| f.as_str().unwrap_or("").contains("agent="));
+    assert!(
+        has_agent_filter,
+        "should include agent filter in _meta.filters_applied"
+    );
+}
+
+#[test]
+fn analytics_tokens_totals_structure_complete() {
+    // Verify that the totals JSON includes all required sections
+    // even when the database has no data.
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "tokens", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    let totals = &json["data"]["totals"];
+    if totals.is_object() {
+        // Check counts section
+        let counts = &totals["counts"];
+        assert!(counts["message_count"].is_number());
+        assert!(counts["user_message_count"].is_number());
+        assert!(counts["assistant_message_count"].is_number());
+        assert!(counts["tool_call_count"].is_number());
+        assert!(counts["plan_message_count"].is_number());
+
+        // Check api_tokens section
+        let api = &totals["api_tokens"];
+        assert!(api["total"].is_number());
+        assert!(api["input"].is_number());
+        assert!(api["output"].is_number());
+        assert!(api["cache_read"].is_number());
+        assert!(api["cache_creation"].is_number());
+        assert!(api["thinking"].is_number());
+
+        // Check content_tokens section
+        let content = &totals["content_tokens"];
+        assert!(content["est_total"].is_number());
+        assert!(content["est_user"].is_number());
+        assert!(content["est_assistant"].is_number());
+
+        // Check coverage section
+        let coverage = &totals["coverage"];
+        assert!(coverage["api_coverage_message_count"].is_number());
+        assert!(coverage["api_coverage_pct"].is_number());
+
+        // Check derived section exists
+        assert!(
+            totals["derived"].is_object(),
+            "totals.derived must be present"
+        );
+    }
+}
+
+// =============================================================================
+// Analytics rebuild data tests (br-z9fse.3.4)
+// =============================================================================
+
+#[test]
+fn analytics_rebuild_json_envelope_structure() {
+    // Use isolated temp dir to avoid DB lock contention with parallel tests.
+    let temp = TempDir::new().unwrap();
+    let mut cmd = base_cmd(temp.path());
+    cmd.args(["analytics", "rebuild", "--json"]);
+    let output = cmd.output().expect("run analytics rebuild");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    // Envelope must always have command and _meta.
+    assert_eq!(json["command"], "analytics/rebuild");
+    assert!(
+        json["_meta"]["elapsed_ms"].is_number(),
+        "envelope must include _meta.elapsed_ms: {json}"
+    );
+
+    // In isolated env, the DB may not exist, so we may get an error envelope.
+    // That's valid — the important thing is the JSON structure.
+    if output.status.success() {
+        let data = &json["data"];
+        assert!(
+            data["track_a"].is_object(),
+            "analytics/rebuild must expose track_a results on success: {data}"
+        );
+        assert!(data["track_a"]["message_metrics_rows"].is_number());
+        assert!(data["track_a"]["usage_hourly_rows"].is_number());
+        assert!(data["track_a"]["usage_daily_rows"].is_number());
+        assert!(data["track_a"]["elapsed_ms"].is_number());
+        assert_eq!(data["track"], "a");
+        assert!(data["tracks_rebuilt"].is_array());
+        assert!(data["overall_elapsed_ms"].is_number());
+    }
+}
+
+#[test]
+fn analytics_rebuild_help_shows_force_flag() {
+    let mut cmd = simple_cmd();
+    cmd.args(["analytics", "rebuild", "--help"]);
+    cmd.assert()
+        .success()
+        .stdout(contains("--force"))
+        .stdout(contains("--json"));
+}
+
+#[test]
+fn analytics_rebuild_parses_force_and_json_flags() {
+    use clap::Parser;
+    use coding_agent_search::{AnalyticsCommand, Cli, Commands};
+
+    let cli = Cli::try_parse_from(["cass", "analytics", "rebuild", "--force", "--json"])
+        .expect("parse analytics rebuild with force+json");
+
+    match cli.command {
+        Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, force })) => {
+            assert!(force, "--force should be true");
+            assert!(common.json, "--json should be true");
+        }
+        other => panic!("expected analytics rebuild, got {other:?}"),
     }
 }

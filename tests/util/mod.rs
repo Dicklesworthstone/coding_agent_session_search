@@ -159,6 +159,81 @@ impl VerboseLogger {
     }
 }
 
+// =============================================================================
+// FrankenTUI Snapshot Harness Helpers
+// =============================================================================
+
+/// Render a FrankenTUI view and assert against a plain-text snapshot.
+///
+/// Snapshot files are stored under `tests/snapshots/*.snap`.
+/// Set `BLESS=1` to create or update snapshots.
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot(
+    name: &str,
+    width: u16,
+    height: u16,
+    render: impl for<'a> FnOnce(ftui::core::geometry::Rect, &mut ftui::Frame<'a>),
+) {
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    let area = ftui::core::geometry::Rect::new(0, 0, width, height);
+    render(area, &mut frame);
+    assert_ftui_snapshot_buffer(name, &frame.buffer);
+}
+
+/// Assert an existing `ftui::Buffer` against a plain-text snapshot.
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot_buffer(name: &str, buf: &ftui::Buffer) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ftui_harness::assert_buffer_snapshot(
+            name,
+            buf,
+            env!("CARGO_MANIFEST_DIR"),
+            ftui_harness::MatchMode::TrimTrailing,
+        );
+    }));
+
+    if let Err(payload) = result {
+        eprintln!(
+            "FTUI snapshot failure: name='{name}', size={}x{}, bless_hint='BLESS=1 cargo test --test ftui_harness_snapshots'",
+            buf.width(),
+            buf.height()
+        );
+        eprintln!(
+            "Rendered output preview:\n{}",
+            ftui_harness::buffer_to_text(buf)
+        );
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Render a FrankenTUI view and assert against an ANSI snapshot (`*.ansi.snap`).
+#[allow(dead_code)]
+pub fn assert_ftui_snapshot_ansi(
+    name: &str,
+    width: u16,
+    height: u16,
+    render: impl for<'a> FnOnce(ftui::core::geometry::Rect, &mut ftui::Frame<'a>),
+) {
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    let area = ftui::core::geometry::Rect::new(0, 0, width, height);
+    render(area, &mut frame);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ftui_harness::assert_buffer_snapshot_ansi(name, &frame.buffer, env!("CARGO_MANIFEST_DIR"));
+    }));
+
+    if let Err(payload) = result {
+        eprintln!(
+            "FTUI ANSI snapshot failure: name='{name}', size={}x{}, bless_hint='BLESS=1 cargo test --test ftui_harness_snapshots'",
+            frame.buffer.width(),
+            frame.buffer.height()
+        );
+        std::panic::resume_unwind(payload);
+    }
+}
+
 use coding_agent_search::connectors::{
     NormalizedConversation, NormalizedMessage, NormalizedSnippet,
 };

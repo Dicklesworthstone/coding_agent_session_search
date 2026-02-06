@@ -71,6 +71,19 @@ fn tui_headless_exits_cleanly_with_index() {
 }
 
 #[test]
+fn tui_headless_ftui_runtime_selection_exits_cleanly() {
+    // Test: requesting ftui runtime does not break --once headless smoke path
+    let tmp = TempDir::new().unwrap();
+    let data_dir = setup_indexed_data_dir(tmp.path());
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.env("CASS_TUI_RUNTIME", "ftui");
+    cmd.args(["tui", "--once", "--data-dir", data_dir.to_str().unwrap()]);
+
+    cmd.assert().success();
+}
+
+#[test]
 fn tui_headless_handles_empty_data_dir() {
     // Test: TUI --once with headless mode creates necessary files and succeeds
     // (even when starting with an empty data directory)
