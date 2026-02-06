@@ -1,2 +1,3 @@
 sync-branch: beads-sync
 allow_legacy_ids: 'true'
+issue_prefix: coding_agent_session_search
