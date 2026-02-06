@@ -333,7 +333,7 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -408,7 +408,7 @@ fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, r
     }
 }
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
@@ -650,6 +650,129 @@ CREATE TABLE IF NOT EXISTS embedding_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
 ON embedding_jobs(db_path, model_id)
 WHERE status IN ('pending', 'running');
+";
+
+const MIGRATION_V10: &str = r"
+-- Token analytics: per-message token usage ledger
+CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL,
+    agent_id INTEGER NOT NULL,
+    workspace_id INTEGER,
+    source_id TEXT NOT NULL DEFAULT 'local',
+
+    -- Timing
+    timestamp_ms INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+
+    -- Model identification
+    model_name TEXT,
+    model_family TEXT,
+    model_tier TEXT,
+    service_tier TEXT,
+    provider TEXT,
+
+    -- Token counts (nullable — not all agents provide all fields)
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    thinking_tokens INTEGER,
+    total_tokens INTEGER,
+
+    -- Cost estimation
+    estimated_cost_usd REAL,
+
+    -- Message context
+    role TEXT NOT NULL,
+    content_chars INTEGER NOT NULL,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+
+    -- Data quality
+    data_source TEXT NOT NULL DEFAULT 'api',
+
+    UNIQUE(message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
+
+-- Token analytics: pre-aggregated daily rollups
+CREATE TABLE IF NOT EXISTS token_daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    model_family TEXT NOT NULL DEFAULT 'all',
+
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_message_count INTEGER NOT NULL DEFAULT 0,
+
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+
+    total_content_chars INTEGER NOT NULL DEFAULT 0,
+    total_tool_calls INTEGER NOT NULL DEFAULT 0,
+
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+
+    session_count INTEGER NOT NULL DEFAULT 0,
+
+    last_updated INTEGER NOT NULL,
+
+    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
+
+-- Model pricing lookup table
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model_pattern TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    input_cost_per_mtok REAL NOT NULL,
+    output_cost_per_mtok REAL NOT NULL,
+    cache_read_cost_per_mtok REAL,
+    cache_creation_cost_per_mtok REAL,
+    effective_date TEXT NOT NULL,
+    PRIMARY KEY (model_pattern, effective_date)
+);
+
+-- Seed with current pricing (as of 2026-02)
+INSERT OR IGNORE INTO model_pricing VALUES
+    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
+    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
+    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
+    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
+    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
+    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
+    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
+    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
+
+-- Extend conversations table with token summary columns
+ALTER TABLE conversations ADD COLUMN total_input_tokens INTEGER;
+ALTER TABLE conversations ADD COLUMN total_output_tokens INTEGER;
+ALTER TABLE conversations ADD COLUMN total_cache_read_tokens INTEGER;
+ALTER TABLE conversations ADD COLUMN total_cache_creation_tokens INTEGER;
+ALTER TABLE conversations ADD COLUMN grand_total_tokens INTEGER;
+ALTER TABLE conversations ADD COLUMN estimated_cost_usd REAL;
+ALTER TABLE conversations ADD COLUMN primary_model TEXT;
+ALTER TABLE conversations ADD COLUMN api_call_count INTEGER;
+ALTER TABLE conversations ADD COLUMN tool_call_count INTEGER;
+ALTER TABLE conversations ADD COLUMN user_message_count INTEGER;
+ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
 ";
 
 /// Row from the embedding_jobs table.
@@ -1093,6 +1216,198 @@ impl StatsAggregator {
     pub fn raw_entry_count(&self) -> usize {
         self.deltas.len()
     }
+}
+
+// -------------------------------------------------------------------------
+// TokenStatsAggregator — Batched Token Analytics Daily Stats
+// -------------------------------------------------------------------------
+// Mirrors StatsAggregator pattern for token-level metrics.
+// Aggregates token usage in memory during batch ingestion, then flushes
+// to token_daily_stats in a single batched INSERT...ON CONFLICT operation.
+
+/// Accumulated token statistics delta for a single (day_id, agent, source, model_family) combination.
+#[derive(Clone, Debug, Default)]
+pub struct TokenStatsDelta {
+    pub api_call_count: i64,
+    pub user_message_count: i64,
+    pub assistant_message_count: i64,
+    pub tool_message_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cache_creation_tokens: i64,
+    pub total_thinking_tokens: i64,
+    pub grand_total_tokens: i64,
+    pub total_content_chars: i64,
+    pub total_tool_calls: i64,
+    pub estimated_cost_usd: f64,
+    pub session_count: i64,
+}
+
+/// In-memory aggregator for batched token daily stats updates.
+///
+/// During batch ingestion, accumulate token deltas per (day_id, agent, source, model_family) key.
+/// After processing, call `expand()` to generate the 5 permutation keys, then flush via
+/// `update_token_daily_stats_batched_in_tx`.
+#[derive(Debug, Default)]
+pub struct TokenStatsAggregator {
+    /// Raw deltas keyed by (day_id, agent_slug, source_id, model_family).
+    deltas: HashMap<(i64, String, String, String), TokenStatsDelta>,
+}
+
+impl TokenStatsAggregator {
+    pub fn new() -> Self {
+        Self {
+            deltas: HashMap::new(),
+        }
+    }
+
+    /// Record a single message's token contribution.
+    pub fn record(
+        &mut self,
+        agent_slug: &str,
+        source_id: &str,
+        day_id: i64,
+        model_family: &str,
+        role: &str,
+        usage: &crate::connectors::ExtractedTokenUsage,
+        content_chars: i64,
+    ) {
+        let key = (
+            day_id,
+            agent_slug.to_owned(),
+            source_id.to_owned(),
+            model_family.to_owned(),
+        );
+        let delta = self.deltas.entry(key).or_default();
+
+        delta.api_call_count += 1;
+        match role {
+            "user" => delta.user_message_count += 1,
+            "assistant" | "agent" => delta.assistant_message_count += 1,
+            "tool" => delta.tool_message_count += 1,
+            _ => {}
+        }
+
+        delta.total_input_tokens += usage.input_tokens.unwrap_or(0);
+        delta.total_output_tokens += usage.output_tokens.unwrap_or(0);
+        delta.total_cache_read_tokens += usage.cache_read_tokens.unwrap_or(0);
+        delta.total_cache_creation_tokens += usage.cache_creation_tokens.unwrap_or(0);
+        delta.total_thinking_tokens += usage.thinking_tokens.unwrap_or(0);
+        delta.grand_total_tokens += usage.total_tokens().unwrap_or(0);
+        delta.total_content_chars += content_chars;
+        delta.total_tool_calls += usage.tool_call_count as i64;
+    }
+
+    /// Record a session count bump for a given day/agent/source/model.
+    pub fn record_session(
+        &mut self,
+        agent_slug: &str,
+        source_id: &str,
+        day_id: i64,
+        model_family: &str,
+    ) {
+        let key = (
+            day_id,
+            agent_slug.to_owned(),
+            source_id.to_owned(),
+            model_family.to_owned(),
+        );
+        self.deltas.entry(key).or_default().session_count += 1;
+    }
+
+    /// Expand raw deltas into 5 permutation keys for the 4-dimensional composite PK:
+    /// - (agent, source, model)  — specific all three
+    /// - ("all", source, model)  — all agents
+    /// - (agent, "all", model)   — all sources
+    /// - (agent, source, "all")  — all models
+    /// - ("all", "all", "all")   — global total
+    pub fn expand(&self) -> Vec<(i64, String, String, String, TokenStatsDelta)> {
+        let mut expanded: HashMap<(i64, String, String, String), TokenStatsDelta> = HashMap::new();
+
+        for ((day_id, agent, source, model), delta) in &self.deltas {
+            let permutations = [
+                (agent.as_str(), source.as_str(), model.as_str()),
+                ("all", source.as_str(), model.as_str()),
+                (agent.as_str(), "all", model.as_str()),
+                (agent.as_str(), source.as_str(), "all"),
+                ("all", "all", "all"),
+            ];
+
+            for idx in 0..permutations.len() {
+                let (a, s, m) = permutations[idx];
+                // Deduplicate if agent/source/model is already "all"
+                if permutations[..idx].contains(&(a, s, m)) {
+                    continue;
+                }
+                let key = (*day_id, a.to_owned(), s.to_owned(), m.to_owned());
+                let entry = expanded.entry(key).or_default();
+                entry.api_call_count += delta.api_call_count;
+                entry.user_message_count += delta.user_message_count;
+                entry.assistant_message_count += delta.assistant_message_count;
+                entry.tool_message_count += delta.tool_message_count;
+                entry.total_input_tokens += delta.total_input_tokens;
+                entry.total_output_tokens += delta.total_output_tokens;
+                entry.total_cache_read_tokens += delta.total_cache_read_tokens;
+                entry.total_cache_creation_tokens += delta.total_cache_creation_tokens;
+                entry.total_thinking_tokens += delta.total_thinking_tokens;
+                entry.grand_total_tokens += delta.grand_total_tokens;
+                entry.total_content_chars += delta.total_content_chars;
+                entry.total_tool_calls += delta.total_tool_calls;
+                entry.estimated_cost_usd += delta.estimated_cost_usd;
+                entry.session_count += delta.session_count;
+            }
+        }
+
+        let mut out: Vec<(i64, String, String, String, TokenStatsDelta)> = expanded
+            .into_iter()
+            .map(|((d, a, s, m), delta)| (d, a, s, m, delta))
+            .collect();
+        out.sort_by(|(d1, a1, s1, m1, _), (d2, a2, s2, m2, _)| {
+            d1.cmp(d2)
+                .then_with(|| a1.cmp(a2))
+                .then_with(|| s1.cmp(s2))
+                .then_with(|| m1.cmp(m2))
+        });
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
+
+    pub fn raw_entry_count(&self) -> usize {
+        self.deltas.len()
+    }
+}
+
+/// Pending token_usage row to be batch-inserted.
+#[derive(Debug, Clone)]
+pub struct TokenUsageEntry {
+    pub message_id: i64,
+    pub conversation_id: i64,
+    pub agent_id: i64,
+    pub workspace_id: Option<i64>,
+    pub source_id: String,
+    pub timestamp_ms: i64,
+    pub day_id: i64,
+    pub model_name: Option<String>,
+    pub model_family: Option<String>,
+    pub model_tier: Option<String>,
+    pub service_tier: Option<String>,
+    pub provider: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub thinking_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub role: String,
+    pub content_chars: i64,
+    pub has_tool_calls: bool,
+    pub tool_call_count: u32,
+    pub data_source: String,
 }
 
 impl SqliteStorage {
@@ -2287,6 +2602,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         1 => {
             tx.execute_batch(MIGRATION_V2)?;
@@ -2297,6 +2613,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         2 => {
             tx.execute_batch(MIGRATION_V3)?;
@@ -2306,6 +2623,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         3 => {
             tx.execute_batch(MIGRATION_V4)?;
@@ -2314,6 +2632,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         4 => {
             tx.execute_batch(MIGRATION_V5)?;
@@ -2321,24 +2640,32 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         5 => {
             tx.execute_batch(MIGRATION_V6)?;
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         6 => {
             tx.execute_batch(MIGRATION_V7)?;
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         7 => {
             tx.execute_batch(MIGRATION_V8)?;
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
         }
         8 => {
             tx.execute_batch(MIGRATION_V9)?;
+            tx.execute_batch(MIGRATION_V10)?;
+        }
+        9 => {
+            tx.execute_batch(MIGRATION_V10)?;
         }
         v => return Err(anyhow!("unsupported schema version {v}")),
     }
