@@ -75,7 +75,7 @@ fn codex_connector_includes_agent_reasoning() {
     let c = &convs[0];
 
     // Should have 3 messages: user, reasoning, assistant
-    // (token_count is filtered out)
+    // (token_count does not create a synthetic message)
     assert_eq!(c.messages.len(), 3);
 
     // Check reasoning is included with correct author tag
@@ -90,11 +90,31 @@ fn codex_connector_includes_agent_reasoning() {
             .content
             .contains("think about this carefully")
     );
+
+    let assistant = c.messages.iter().find(|m| {
+        m.role == "assistant" && m.author.is_none() && m.content.contains("here is solution")
+    });
+    assert!(assistant.is_some());
+    let assistant = assistant.unwrap();
+    assert_eq!(
+        assistant
+            .extra
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(|v| v.as_i64()),
+        Some(100)
+    );
+    assert_eq!(
+        assistant
+            .extra
+            .pointer("/cass/token_usage/output_tokens")
+            .and_then(|v| v.as_i64()),
+        Some(200)
+    );
 }
 
 #[test]
 #[serial]
-fn codex_connector_filters_token_count() {
+fn codex_connector_ignores_unmatched_token_count() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/23");
     fs::create_dir_all(&sessions).unwrap();
@@ -122,8 +142,8 @@ fn codex_connector_filters_token_count() {
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
 
-    // Should only have 2 messages (user, assistant)
-    // token_count and turn_context should be filtered out
+    // Should only have 2 messages (user, assistant).
+    // token_count and turn_context do not create searchable messages.
     assert_eq!(c.messages.len(), 2);
 
     for msg in &c.messages {
@@ -131,6 +151,13 @@ fn codex_connector_filters_token_count() {
         assert!(!msg.content.contains("turn_context"));
         assert!(!msg.content.trim().is_empty());
     }
+
+    // token_count occurs before the first assistant turn and must not attach forward.
+    let assistant = c.messages.iter().find(|m| m.role == "assistant").unwrap();
+    assert!(
+        assistant.extra.pointer("/cass/token_usage").is_none(),
+        "unmatched token_count should be ignored"
+    );
 }
 
 /// Test that since_ts uses FILE-LEVEL filtering, not message-level.

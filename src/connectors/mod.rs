@@ -1013,15 +1013,36 @@ pub fn extract_claude_code_tokens(extra: &serde_json::Value) -> ExtractedTokenUs
 
 /// Extract token usage from a Codex message's raw data.
 pub fn extract_codex_tokens(extra: &serde_json::Value) -> ExtractedTokenUsage {
+    let mut input_tokens = None;
     let mut output_tokens = None;
     let mut data_source = TokenDataSource::Estimated;
 
-    // Codex event_msg with token_count payload
-    if extra.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+    // Preferred shape: token_count usage attached to assistant message extra.
+    if let Some(attached) = extra.pointer("/cass/token_usage") {
+        input_tokens = attached.get("input_tokens").and_then(|v| v.as_i64());
+        output_tokens = attached
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .or_else(|| attached.get("tokens").and_then(|v| v.as_i64()));
+
+        let source = attached.get("data_source").and_then(|v| v.as_str());
+        if source == Some("api") || input_tokens.is_some() || output_tokens.is_some() {
+            data_source = TokenDataSource::Api;
+        }
+    }
+
+    // Legacy shape: raw event_msg token_count payload.
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && extra.get("type").and_then(|v| v.as_str()) == Some("event_msg")
         && let Some(payload) = extra.get("payload")
         && payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
     {
-        output_tokens = payload.get("tokens").and_then(|v| v.as_i64());
+        input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64());
+        output_tokens = payload
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .or_else(|| payload.get("tokens").and_then(|v| v.as_i64()));
         data_source = TokenDataSource::Api;
     }
 
@@ -1039,6 +1060,7 @@ pub fn extract_codex_tokens(extra: &serde_json::Value) -> ExtractedTokenUsage {
     ExtractedTokenUsage {
         model_name,
         provider,
+        input_tokens,
         output_tokens,
         data_source,
         ..Default::default()
@@ -2002,6 +2024,62 @@ mod tests {
         let usage = extract_claude_code_tokens(&raw);
         assert!(!usage.has_token_data());
         assert_eq!(usage.data_source, TokenDataSource::Estimated);
+    }
+
+    #[test]
+    fn extract_codex_tokens_from_attached_token_usage() {
+        let raw: serde_json::Value = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "role": "assistant",
+                "content": "answer"
+            },
+            "cass": {
+                "token_usage": {
+                    "input_tokens": 111,
+                    "output_tokens": 222,
+                    "data_source": "api"
+                }
+            }
+        });
+
+        let usage = extract_codex_tokens(&raw);
+        assert_eq!(usage.input_tokens, Some(111));
+        assert_eq!(usage.output_tokens, Some(222));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_codex_tokens_from_legacy_event_msg_payload() {
+        let raw: serde_json::Value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "input_tokens": 10,
+                "output_tokens": 20
+            }
+        });
+
+        let usage = extract_codex_tokens(&raw);
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_codex_tokens_legacy_tokens_fallback() {
+        let raw: serde_json::Value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "tokens": 77
+            }
+        });
+
+        let usage = extract_codex_tokens(&raw);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(77));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
     }
 
     #[test]

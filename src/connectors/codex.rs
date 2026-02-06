@@ -56,6 +56,74 @@ impl CodexConnector {
         }
         out
     }
+
+    fn is_token_usage_target_message(message: &NormalizedMessage) -> bool {
+        // Attribute token_count usage to concrete assistant turns only.
+        // This avoids attaching usage to synthetic reasoning helper messages.
+        message.role == "assistant" && message.author.is_none()
+    }
+
+    fn token_usage_from_payload(payload: &Value) -> Option<Value> {
+        let input_tokens = payload.get("input_tokens").and_then(|v| v.as_i64());
+        let output_tokens = payload
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .or_else(|| payload.get("tokens").and_then(|v| v.as_i64()));
+
+        if input_tokens.is_none() && output_tokens.is_none() {
+            return None;
+        }
+
+        let mut usage = serde_json::Map::new();
+        if let Some(input) = input_tokens {
+            usage.insert("input_tokens".to_string(), Value::from(input));
+        }
+        if let Some(output) = output_tokens {
+            usage.insert("output_tokens".to_string(), Value::from(output));
+        }
+        usage.insert("data_source".to_string(), Value::String("api".to_string()));
+
+        Some(Value::Object(usage))
+    }
+
+    fn attach_token_usage_to_latest_assistant(
+        messages: &mut [NormalizedMessage],
+        token_usage: Value,
+        source_path: &Path,
+        line_number: usize,
+    ) {
+        if let Some(target) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| Self::is_token_usage_target_message(m))
+        {
+            if !target.extra.is_object() {
+                target.extra = Value::Object(serde_json::Map::new());
+            }
+
+            if let Some(extra) = target.extra.as_object_mut() {
+                let cass = extra
+                    .entry("cass".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+                if !cass.is_object() {
+                    *cass = Value::Object(serde_json::Map::new());
+                }
+
+                if let Some(cass_obj) = cass.as_object_mut() {
+                    // Multiple token_count events for the same assistant turn:
+                    // deterministic rule = last write wins.
+                    cass_obj.insert("token_usage".to_string(), token_usage);
+                }
+            }
+        } else {
+            tracing::debug!(
+                path = %source_path.display(),
+                line_number,
+                "codex token_count event had no preceding assistant message; skipping"
+            );
+        }
+    }
 }
 
 impl Connector for CodexConnector {
@@ -148,7 +216,7 @@ impl Connector for CodexConnector {
                     let reader = std::io::BufReader::new(f);
 
                     // Modern envelope format: each line has {type, timestamp, payload}
-                    for line_res in std::io::BufRead::lines(reader) {
+                    for (line_idx, line_res) in std::io::BufRead::lines(reader).enumerate() {
                         let line = match line_res {
                             Ok(l) => l,
                             Err(_) => continue,
@@ -258,7 +326,25 @@ impl Connector for CodexConnector {
                                                 });
                                             }
                                         }
-                                        _ => {} // Skip token_count, turn_aborted, etc.
+                                        Some("token_count") => {
+                                            if let Some(token_usage) =
+                                                Self::token_usage_from_payload(payload)
+                                            {
+                                                Self::attach_token_usage_to_latest_assistant(
+                                                    &mut messages,
+                                                    token_usage,
+                                                    &source_path,
+                                                    line_idx + 1,
+                                                );
+                                            } else {
+                                                tracing::debug!(
+                                                    path = %source_path.display(),
+                                                    line_number = line_idx + 1,
+                                                    "codex token_count event missing token fields; skipping"
+                                                );
+                                            }
+                                        }
+                                        _ => {} // Skip turn_aborted and other unknown event types
                                     }
                                 }
                             }
@@ -727,6 +813,139 @@ not valid json at all
         assert_eq!(convs[0].messages[0].idx, 0);
         assert_eq!(convs[0].messages[1].idx, 1);
         assert_eq!(convs[0].messages[2].idx, 2);
+    }
+
+    #[test]
+    fn scan_attaches_token_count_to_nearest_preceding_assistant() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"First answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"token_count","input_tokens":10,"output_tokens":20}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:03Z","payload":{"role":"assistant","content":"Second answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:04Z","payload":{"type":"token_count","input_tokens":30,"output_tokens":40}}
+"#;
+        fs::write(sessions.join("rollout-attach-nearest.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].messages.len(),
+            3,
+            "no synthetic token_count messages"
+        );
+
+        let first = &convs[0].messages[1];
+        assert_eq!(first.content, "First answer");
+        assert_eq!(
+            first
+                .extra
+                .pointer("/cass/token_usage/input_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(10)
+        );
+        assert_eq!(
+            first
+                .extra
+                .pointer("/cass/token_usage/output_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(20)
+        );
+
+        let second = &convs[0].messages[2];
+        assert_eq!(second.content, "Second answer");
+        assert_eq!(
+            second
+                .extra
+                .pointer("/cass/token_usage/input_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(30)
+        );
+        assert_eq!(
+            second
+                .extra
+                .pointer("/cass/token_usage/output_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(40)
+        );
+        assert_eq!(
+            second
+                .extra
+                .pointer("/cass/token_usage/data_source")
+                .and_then(|v| v.as_str()),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn scan_ignores_token_count_without_preceding_assistant() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:01Z","payload":{"type":"token_count","input_tokens":11,"output_tokens":22}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:02Z","payload":{"role":"assistant","content":"Answer later"}}
+"#;
+        fs::write(sessions.join("rollout-unmatched-token.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        assert!(
+            convs[0].messages[1]
+                .extra
+                .pointer("/cass/token_usage")
+                .is_none(),
+            "token_count before first assistant must not attach to future message"
+        );
+    }
+
+    #[test]
+    fn scan_multiple_token_count_for_one_assistant_prefers_last() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        let sessions = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let content = r#"{"type":"response_item","timestamp":"2025-12-01T10:00:00Z","payload":{"role":"user","content":"Question"}}
+{"type":"response_item","timestamp":"2025-12-01T10:00:01Z","payload":{"role":"assistant","content":"Answer"}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:02Z","payload":{"type":"token_count","input_tokens":5,"output_tokens":10}}
+{"type":"event_msg","timestamp":"2025-12-01T10:00:03Z","payload":{"type":"token_count","input_tokens":7,"output_tokens":14}}
+"#;
+        fs::write(sessions.join("rollout-token-last-wins.jsonl"), content).unwrap();
+
+        let connector = CodexConnector::new();
+        let ctx = ScanContext::local_default(codex_dir.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 2);
+        let assistant = &convs[0].messages[1];
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/input_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(7)
+        );
+        assert_eq!(
+            assistant
+                .extra
+                .pointer("/cass/token_usage/output_tokens")
+                .and_then(|v| v.as_i64()),
+            Some(14)
+        );
     }
 
     // =====================================================

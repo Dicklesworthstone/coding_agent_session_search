@@ -1990,6 +1990,16 @@ Watch mode maintains `watch_state.json`:
 - **1-second mtime slack**: Accounts for filesystem timestamp granularity
 - **No per-message filtering**: Prevents data loss when new messages are appended
 
+### Codex Token Backfill
+
+Codex `event_msg` `token_count` usage is attached to the nearest preceding assistant turn during indexing.
+If you indexed Codex sessions before this behavior existed, backfill usage coverage with:
+
+```bash
+cass index --full
+cass analytics rebuild --track a
+```
+
 ---
 
 ## 🐚 Shell Completions
