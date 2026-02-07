@@ -1450,6 +1450,7 @@ impl TokenStatsAggregator {
         role: &str,
         usage: &crate::connectors::ExtractedTokenUsage,
         content_chars: i64,
+        estimated_cost_usd: f64,
     ) {
         let key = (
             day_id,
@@ -1475,6 +1476,7 @@ impl TokenStatsAggregator {
         delta.grand_total_tokens += usage.total_tokens().unwrap_or(0);
         delta.total_content_chars += content_chars;
         delta.total_tool_calls += usage.tool_call_count as i64;
+        delta.estimated_cost_usd += estimated_cost_usd;
     }
 
     /// Record a session count bump for a given day/agent/source/model.
@@ -1780,6 +1782,215 @@ pub struct TokenUsageEntry {
     pub data_source: String,
 }
 
+// -------------------------------------------------------------------------
+// PricingTable — In-memory cache for model_pricing lookups (bead z9fse.10)
+// -------------------------------------------------------------------------
+
+/// One pricing row loaded from the `model_pricing` table.
+#[derive(Debug, Clone)]
+pub struct PricingEntry {
+    pub model_pattern: String,
+    pub provider: String,
+    pub input_cost_per_mtok: f64,
+    pub output_cost_per_mtok: f64,
+    pub cache_read_cost_per_mtok: Option<f64>,
+    pub cache_creation_cost_per_mtok: Option<f64>,
+    /// Effective date as day_id (YYYYMMDD integer, e.g. 20251001).
+    pub effective_day_id: i64,
+}
+
+/// Diagnostics for pricing coverage during a batch operation.
+#[derive(Debug, Clone, Default)]
+pub struct PricingDiagnostics {
+    pub priced_count: u64,
+    pub unpriced_count: u64,
+    /// Top unknown model names → count.
+    pub unknown_models: HashMap<String, u64>,
+}
+
+impl PricingDiagnostics {
+    fn record_priced(&mut self) {
+        self.priced_count += 1;
+    }
+
+    fn record_unpriced(&mut self, model_name: Option<&str>) {
+        self.unpriced_count += 1;
+        let key = model_name.unwrap_or("(none)").to_string();
+        *self.unknown_models.entry(key).or_insert(0) += 1;
+    }
+
+    /// Log a summary of pricing coverage.
+    pub fn log_summary(&self) {
+        let total = self.priced_count + self.unpriced_count;
+        if total == 0 {
+            return;
+        }
+        let pct = (self.priced_count as f64 / total as f64) * 100.0;
+        tracing::info!(
+            target: "cass::analytics::pricing",
+            priced = self.priced_count,
+            unpriced = self.unpriced_count,
+            total = total,
+            coverage_pct = format!("{pct:.1}%"),
+            "pricing coverage"
+        );
+        if !self.unknown_models.is_empty() {
+            let mut sorted: Vec<_> = self.unknown_models.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            for (model, count) in sorted.iter().take(5) {
+                tracing::debug!(
+                    target: "cass::analytics::pricing",
+                    model = model.as_str(),
+                    count = count,
+                    "unknown model (no pricing)"
+                );
+            }
+        }
+    }
+}
+
+/// In-memory pricing table loaded from `model_pricing` for fast lookups.
+#[derive(Debug, Clone)]
+pub struct PricingTable {
+    entries: Vec<PricingEntry>,
+}
+
+impl PricingTable {
+    /// Load all pricing entries from the database.
+    pub fn load(conn: &rusqlite::Connection) -> Result<Self> {
+        let mut stmt = conn.prepare(
+            "SELECT model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
+                    cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
+             FROM model_pricing
+             ORDER BY effective_date DESC",
+        )?;
+        let entries = stmt
+            .query_map([], |row| {
+                let effective_date: String = row.get(6)?;
+                let effective_day_id = date_str_to_day_id(&effective_date);
+                Ok(PricingEntry {
+                    model_pattern: row.get(0)?,
+                    provider: row.get(1)?,
+                    input_cost_per_mtok: row.get(2)?,
+                    output_cost_per_mtok: row.get(3)?,
+                    cache_read_cost_per_mtok: row.get(4)?,
+                    cache_creation_cost_per_mtok: row.get(5)?,
+                    effective_day_id,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self { entries })
+    }
+
+    /// Look up the best pricing entry for a given model name and date.
+    ///
+    /// Selection rules:
+    /// 1. Pattern must match model_name (SQL LIKE semantics).
+    /// 2. effective_day_id must be <= message_day_id.
+    /// 3. Among matches, prefer the most recent effective_date.
+    /// 4. Tie-break by pattern specificity (longest pattern wins).
+    pub fn lookup(&self, model_name: &str, message_day_id: i64) -> Option<&PricingEntry> {
+        let mut best: Option<&PricingEntry> = None;
+
+        for entry in &self.entries {
+            if entry.effective_day_id > message_day_id {
+                continue;
+            }
+            if !sql_like_match(model_name, &entry.model_pattern) {
+                continue;
+            }
+
+            match best {
+                None => best = Some(entry),
+                Some(current) => {
+                    if entry.effective_day_id > current.effective_day_id
+                        || (entry.effective_day_id == current.effective_day_id
+                            && entry.model_pattern.len() > current.model_pattern.len())
+                    {
+                        best = Some(entry);
+                    }
+                }
+            }
+        }
+
+        best
+    }
+
+    /// Compute estimated cost in USD for a set of token counts.
+    ///
+    /// Returns `None` if no pricing entry matches or if no token counts are available.
+    pub fn compute_cost(
+        &self,
+        model_name: Option<&str>,
+        message_day_id: i64,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        cache_read_tokens: Option<i64>,
+        cache_creation_tokens: Option<i64>,
+    ) -> Option<f64> {
+        let model = model_name?;
+        let pricing = self.lookup(model, message_day_id)?;
+
+        if input_tokens.is_none() && output_tokens.is_none() {
+            return None;
+        }
+
+        let mut cost = 0.0;
+        cost += input_tokens.unwrap_or(0) as f64 * pricing.input_cost_per_mtok / 1_000_000.0;
+        cost += output_tokens.unwrap_or(0) as f64 * pricing.output_cost_per_mtok / 1_000_000.0;
+
+        if let Some(cache_price) = pricing.cache_read_cost_per_mtok {
+            cost += cache_read_tokens.unwrap_or(0) as f64 * cache_price / 1_000_000.0;
+        }
+        if let Some(cache_price) = pricing.cache_creation_cost_per_mtok {
+            cost += cache_creation_tokens.unwrap_or(0) as f64 * cache_price / 1_000_000.0;
+        }
+
+        Some(cost)
+    }
+
+    /// Whether the pricing table has any entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Convert "YYYY-MM-DD" date string to day_id (YYYYMMDD integer).
+fn date_str_to_day_id(s: &str) -> i64 {
+    s.replace('-', "").parse::<i64>().unwrap_or(0)
+}
+
+/// SQL LIKE pattern matcher (case-insensitive). `%` = any sequence, `_` = any single char.
+fn sql_like_match(value: &str, pattern: &str) -> bool {
+    sql_like_match_bytes(
+        value.to_ascii_lowercase().as_bytes(),
+        pattern.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
+    if pat.is_empty() {
+        return val.is_empty();
+    }
+    match pat[0] {
+        b'%' => {
+            let mut p = 1;
+            while p < pat.len() && pat[p] == b'%' {
+                p += 1;
+            }
+            let rest = &pat[p..];
+            for i in 0..=val.len() {
+                if sql_like_match_bytes(&val[i..], rest) {
+                    return true;
+                }
+            }
+            false
+        }
+        b'_' => !val.is_empty() && sql_like_match_bytes(&val[1..], &pat[1..]),
+        c => !val.is_empty() && val[0] == c && sql_like_match_bytes(&val[1..], &pat[1..]),
+    }
+}
+
 impl SqliteStorage {
     pub fn insert_conversation_tree(
         &mut self,
@@ -1906,6 +2117,13 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
+        // Load pricing table once for the entire batch (bead z9fse.10)
+        let pricing_table = PricingTable::load(&self.conn).unwrap_or_else(|e| {
+            tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
+            PricingTable { entries: Vec::new() }
+        });
+        let mut pricing_diag = PricingDiagnostics::default();
+
         let tx = self.conn.transaction()?;
         let mut outcomes = Vec::with_capacity(conversations.len());
         let mut fts_entries = Vec::new();
@@ -2014,6 +2232,21 @@ impl SqliteStorage {
                         session_model_family = model_family.clone();
                     }
 
+                    // Compute estimated cost from pricing table (bead z9fse.10)
+                    let estimated_cost = pricing_table.compute_cost(
+                        usage.model_name.as_deref(),
+                        msg_day_id,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_creation_tokens,
+                    );
+                    if estimated_cost.is_some() {
+                        pricing_diag.record_priced();
+                    } else if usage.has_token_data() {
+                        pricing_diag.record_unpriced(usage.model_name.as_deref());
+                    }
+
                     // Feed into token stats aggregator
                     token_stats.record(
                         &conv.agent_slug,
@@ -2023,6 +2256,7 @@ impl SqliteStorage {
                         &role_s,
                         &usage,
                         msg.content.len() as i64,
+                        estimated_cost.unwrap_or(0.0),
                     );
 
                     if usage.has_token_data() {
@@ -2053,7 +2287,7 @@ impl SqliteStorage {
                         cache_creation_tokens: usage.cache_creation_tokens,
                         thinking_tokens: usage.thinking_tokens,
                         total_tokens: usage.total_tokens(),
-                        estimated_cost_usd: None, // Cost computed later via model_pricing
+                        estimated_cost_usd: estimated_cost,
                         role: role_s.clone(),
                         content_chars,
                         has_tool_calls: usage.has_tool_calls,
@@ -2195,6 +2429,10 @@ impl SqliteStorage {
         }
 
         tx.commit()?;
+
+        // Log pricing coverage diagnostics (bead z9fse.10)
+        pricing_diag.log_summary();
+
         Ok(outcomes)
     }
 
@@ -5976,5 +6214,278 @@ mod tests {
         let path = PathBuf::from("/tmp/test_lazy.db");
         let lazy = LazyDb::new(path.clone());
         assert_eq!(lazy.path(), path.as_path());
+    }
+
+    // =========================================================================
+    // Pricing / cost estimation tests (bead z9fse.10)
+    // =========================================================================
+
+    #[test]
+    fn sql_like_match_basic_patterns() {
+        assert!(sql_like_match("claude-opus-4-20250101", "claude-opus-4%"));
+        assert!(sql_like_match("claude-opus-4", "claude-opus-4%"));
+        assert!(!sql_like_match("claude-sonnet-4", "claude-opus-4%"));
+
+        // Middle wildcard (gemini pattern)
+        assert!(sql_like_match("gemini-2.0-flash-001", "gemini-2%flash%"));
+        assert!(sql_like_match("gemini-2-flash", "gemini-2%flash%"));
+        assert!(!sql_like_match("gemini-2-pro", "gemini-2%flash%"));
+
+        // Exact match
+        assert!(sql_like_match("hello", "hello"));
+        assert!(!sql_like_match("hello!", "hello"));
+
+        // Underscore wildcard
+        assert!(sql_like_match("gpt-4o", "gpt-4_"));
+        assert!(!sql_like_match("gpt-4oo", "gpt-4_"));
+
+        // Case insensitive
+        assert!(sql_like_match("Claude-Opus-4", "claude-opus-4%"));
+    }
+
+    #[test]
+    fn date_str_to_day_id_converts_correctly() {
+        assert_eq!(date_str_to_day_id("2025-10-01"), 20251001);
+        assert_eq!(date_str_to_day_id("2024-04-01"), 20240401);
+        assert_eq!(date_str_to_day_id("invalid"), 0);
+    }
+
+    #[test]
+    fn pricing_table_lookup_selects_matching_entry() {
+        let table = PricingTable {
+            entries: vec![
+                PricingEntry {
+                    model_pattern: "claude-opus-4%".into(),
+                    provider: "anthropic".into(),
+                    input_cost_per_mtok: 15.0,
+                    output_cost_per_mtok: 75.0,
+                    cache_read_cost_per_mtok: Some(1.5),
+                    cache_creation_cost_per_mtok: Some(18.75),
+                    effective_day_id: 20251001,
+                },
+                PricingEntry {
+                    model_pattern: "claude-sonnet-4%".into(),
+                    provider: "anthropic".into(),
+                    input_cost_per_mtok: 3.0,
+                    output_cost_per_mtok: 15.0,
+                    cache_read_cost_per_mtok: Some(0.3),
+                    cache_creation_cost_per_mtok: Some(3.75),
+                    effective_day_id: 20251001,
+                },
+            ],
+        };
+
+        let result = table.lookup("claude-opus-4-20260101", 20260206);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
+
+        let result = table.lookup("claude-sonnet-4-latest", 20260206);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 3.0);
+
+        assert!(table.lookup("unknown-model", 20260206).is_none());
+    }
+
+    #[test]
+    fn pricing_table_lookup_respects_effective_date() {
+        let table = PricingTable {
+            entries: vec![
+                PricingEntry {
+                    model_pattern: "claude-opus-4%".into(),
+                    provider: "anthropic".into(),
+                    input_cost_per_mtok: 15.0,
+                    output_cost_per_mtok: 75.0,
+                    cache_read_cost_per_mtok: None,
+                    cache_creation_cost_per_mtok: None,
+                    effective_day_id: 20251001,
+                },
+                PricingEntry {
+                    model_pattern: "claude-opus-4%".into(),
+                    provider: "anthropic".into(),
+                    input_cost_per_mtok: 12.0,
+                    output_cost_per_mtok: 60.0,
+                    cache_read_cost_per_mtok: None,
+                    cache_creation_cost_per_mtok: None,
+                    effective_day_id: 20260101,
+                },
+            ],
+        };
+
+        // Before price drop
+        let result = table.lookup("claude-opus-4", 20251101);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
+
+        // After price drop
+        let result = table.lookup("claude-opus-4", 20260201);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 12.0);
+
+        // Before all pricing
+        assert!(table.lookup("claude-opus-4", 20240101).is_none());
+    }
+
+    #[test]
+    fn pricing_table_lookup_specificity_tiebreak() {
+        let table = PricingTable {
+            entries: vec![
+                PricingEntry {
+                    model_pattern: "gpt-4%".into(),
+                    provider: "openai".into(),
+                    input_cost_per_mtok: 10.0,
+                    output_cost_per_mtok: 30.0,
+                    cache_read_cost_per_mtok: None,
+                    cache_creation_cost_per_mtok: None,
+                    effective_day_id: 20250101,
+                },
+                PricingEntry {
+                    model_pattern: "gpt-4-turbo%".into(),
+                    provider: "openai".into(),
+                    input_cost_per_mtok: 5.0,
+                    output_cost_per_mtok: 15.0,
+                    cache_read_cost_per_mtok: None,
+                    cache_creation_cost_per_mtok: None,
+                    effective_day_id: 20250101,
+                },
+            ],
+        };
+
+        // Longer pattern wins for specific model
+        let result = table.lookup("gpt-4-turbo-2025", 20260101);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 5.0);
+
+        // Shorter pattern matches broader model
+        let result = table.lookup("gpt-4o", 20260101);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().input_cost_per_mtok, 10.0);
+    }
+
+    #[test]
+    fn pricing_table_compute_cost_basic() {
+        let table = PricingTable {
+            entries: vec![PricingEntry {
+                model_pattern: "claude-opus-4%".into(),
+                provider: "anthropic".into(),
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_read_cost_per_mtok: Some(1.5),
+                cache_creation_cost_per_mtok: Some(18.75),
+                effective_day_id: 20251001,
+            }],
+        };
+
+        let cost = table.compute_cost(
+            Some("claude-opus-4-latest"),
+            20260206,
+            Some(1000),
+            Some(500),
+            None,
+            None,
+        );
+        assert!(cost.is_some());
+        // 1000 * 15.0 / 1M + 500 * 75.0 / 1M = 0.015 + 0.0375 = 0.0525
+        assert!((cost.unwrap() - 0.0525).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pricing_table_compute_cost_with_cache() {
+        let table = PricingTable {
+            entries: vec![PricingEntry {
+                model_pattern: "claude-opus-4%".into(),
+                provider: "anthropic".into(),
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_read_cost_per_mtok: Some(1.5),
+                cache_creation_cost_per_mtok: Some(18.75),
+                effective_day_id: 20251001,
+            }],
+        };
+
+        let cost = table.compute_cost(
+            Some("claude-opus-4-latest"),
+            20260206,
+            Some(1_000_000),
+            Some(100_000),
+            Some(500_000),
+            Some(200_000),
+        );
+        assert!(cost.is_some());
+        // input: 1M * 15/1M = 15.0, output: 100K * 75/1M = 7.5
+        // cache_read: 500K * 1.5/1M = 0.75, cache_creation: 200K * 18.75/1M = 3.75
+        // total = 27.0
+        assert!((cost.unwrap() - 27.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pricing_table_compute_cost_returns_none_for_unknown_model() {
+        let table = PricingTable {
+            entries: vec![PricingEntry {
+                model_pattern: "claude-opus-4%".into(),
+                provider: "anthropic".into(),
+                input_cost_per_mtok: 15.0,
+                output_cost_per_mtok: 75.0,
+                cache_read_cost_per_mtok: None,
+                cache_creation_cost_per_mtok: None,
+                effective_day_id: 20251001,
+            }],
+        };
+
+        assert!(
+            table
+                .compute_cost(
+                    Some("unknown-model"),
+                    20260206,
+                    Some(1000),
+                    Some(500),
+                    None,
+                    None
+                )
+                .is_none()
+        );
+        assert!(
+            table
+                .compute_cost(None, 20260206, Some(1000), Some(500), None, None)
+                .is_none()
+        );
+        assert!(
+            table
+                .compute_cost(Some("claude-opus-4"), 20260206, None, None, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pricing_table_load_from_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let table = PricingTable::load(&storage.conn).unwrap();
+        assert!(!table.is_empty());
+
+        let opus = table.lookup("claude-opus-4-latest", 20260206);
+        assert!(opus.is_some());
+        assert_eq!(opus.unwrap().input_cost_per_mtok, 15.0);
+
+        let flash = table.lookup("gemini-2.0-flash-001", 20260206);
+        assert!(flash.is_some());
+        assert_eq!(flash.unwrap().input_cost_per_mtok, 0.075);
+    }
+
+    #[test]
+    fn pricing_diagnostics_tracks_coverage() {
+        let mut diag = PricingDiagnostics::default();
+        diag.record_priced();
+        diag.record_priced();
+        diag.record_unpriced(Some("custom-model-v1"));
+        diag.record_unpriced(Some("custom-model-v1"));
+        diag.record_unpriced(None);
+
+        assert_eq!(diag.priced_count, 2);
+        assert_eq!(diag.unpriced_count, 3);
+        assert_eq!(diag.unknown_models.len(), 2);
+        assert_eq!(diag.unknown_models["custom-model-v1"], 2);
+        assert_eq!(diag.unknown_models["(none)"], 1);
     }
 }
