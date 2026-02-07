@@ -7870,12 +7870,24 @@ fn export_session_task(
     }
 }
 
+/// Configuration for inline TUI mode.
+pub struct InlineTuiConfig {
+    /// Height of the inline UI in terminal rows.
+    pub ui_height: u16,
+    /// Whether the UI is anchored to the top or bottom of the terminal.
+    pub anchor: super::ftui_adapter::UiAnchor,
+}
+
 /// Run the cass TUI using the ftui Program runtime.
 ///
 /// This replaces the manual crossterm event loop in `run_tui()`.
 /// The ftui runtime handles terminal lifecycle (raw mode, alt-screen),
 /// event polling, rendering, and cleanup via RAII.
-pub fn run_tui_ftui() -> anyhow::Result<()> {
+///
+/// When `inline_config` is `Some`, the TUI runs in inline mode: the UI
+/// chrome is anchored (top or bottom) within the terminal and scrollback
+/// is preserved. When `None`, fullscreen alt-screen mode is used.
+pub fn run_tui_ftui(inline_config: Option<InlineTuiConfig>) -> anyhow::Result<()> {
     use ftui::render::budget::FrameBudgetConfig;
 
     let model = CassApp::default();
@@ -7888,11 +7900,20 @@ pub fn run_tui_ftui() -> anyhow::Result<()> {
     // by ProgramConfig::fullscreen().
     let budget = FrameBudgetConfig::default();
 
-    ftui::App::fullscreen(model)
-        .with_mouse()
-        .with_budget(budget)
-        .run()
-        .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
+    if let Some(cfg) = inline_config {
+        ftui::App::inline(model, cfg.ui_height)
+            .anchor(cfg.anchor)
+            .with_mouse()
+            .with_budget(budget)
+            .run()
+            .map_err(|e| anyhow::anyhow!("ftui inline runtime error: {e}"))
+    } else {
+        ftui::App::fullscreen(model)
+            .with_mouse()
+            .with_budget(budget)
+            .run()
+            .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
+    }
 }
 
 // =========================================================================
@@ -12718,6 +12739,10 @@ mod tests {
     // Help Overlay Tests (bead 2noh9.3.7)
     // =========================================================================
 
+    fn test_app() -> CassApp {
+        CassApp::default()
+    }
+
     #[test]
     fn help_toggle_opens_and_closes() {
         let mut app = test_app();
@@ -12768,7 +12793,7 @@ mod tests {
         let mut app = test_app();
         let _ = app.update(CassMsg::HelpToggled);
         assert!(app.show_help);
-        let _ = app.update(CassMsg::EscPressed);
+        let _ = app.update(CassMsg::QuitRequested);
         assert!(!app.show_help);
     }
 
@@ -12798,8 +12823,9 @@ mod tests {
     fn help_overlay_contains_shortcut_keys() {
         let mut app = test_app();
         let _ = app.update(CassMsg::HelpToggled);
+        // Use a tall viewport (200 rows) so all help sections are visible
         let buf =
-            render_at_degradation(&app, 120, 60, ftui::render::budget::DegradationLevel::Full);
+            render_at_degradation(&app, 120, 200, ftui::render::budget::DegradationLevel::Full);
         let text = ftui_harness::buffer_to_text(&buf);
         // Help content should include key shortcuts from shortcuts.rs
         assert!(
@@ -12857,14 +12883,14 @@ mod tests {
     #[test]
     fn help_build_lines_contains_all_sections() {
         let app = test_app();
-        let styles = StyleContext::new(StyleOptions {
+        let styles = StyleContext::from_options(StyleOptions {
             preset: UiThemePreset::Dark,
-            fancy_borders: true,
+            ..StyleOptions::default()
         });
         let lines = app.build_help_lines(&styles);
         let text: String = lines
             .iter()
-            .map(|l| l.to_plain_text())
+            .map(|l: &ftui::text::Line| l.to_plain_text())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -12890,14 +12916,14 @@ mod tests {
     #[test]
     fn help_build_lines_references_shortcuts() {
         let app = test_app();
-        let styles = StyleContext::new(StyleOptions {
+        let styles = StyleContext::from_options(StyleOptions {
             preset: UiThemePreset::Dark,
-            fancy_borders: true,
+            ..StyleOptions::default()
         });
         let lines = app.build_help_lines(&styles);
         let text: String = lines
             .iter()
-            .map(|l| l.to_plain_text())
+            .map(|l: &ftui::text::Line| l.to_plain_text())
             .collect::<Vec<_>>()
             .join("\n");
 

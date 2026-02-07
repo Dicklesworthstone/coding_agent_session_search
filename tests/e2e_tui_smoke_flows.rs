@@ -1632,3 +1632,104 @@ fn tui_pty_analytics_navigation_flow() {
 
     tracker.complete();
 }
+
+// =============================================================================
+// Inline Mode Tests
+// =============================================================================
+
+#[test]
+fn tui_pty_inline_mode_no_altscreen() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_inline_mode_no_altscreen");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 130,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let launch_start = tracker.start("inline_launch", Some("Launching inline-mode ftui TUI"));
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    tui_cmd.arg("--inline");
+    tui_cmd.arg("--ui-height");
+    tui_cmd.arg("10");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut tui_child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn inline TUI in PTY");
+
+    let saw_startup = wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT);
+    assert!(
+        saw_startup,
+        "Did not observe startup output in inline PTY buffer"
+    );
+
+    // Give the inline renderer time to paint
+    thread::sleep(Duration::from_millis(500));
+
+    send_key_sequence(&mut *writer, b"\x1b"); // ESC to quit
+    let status = wait_for_child_exit(&mut *tui_child, PTY_EXIT_TIMEOUT);
+    tracker.end(
+        "inline_launch",
+        Some("Inline ftui quit sequence complete"),
+        launch_start,
+    );
+    assert!(
+        status.success(),
+        "inline ftui process exited unsuccessfully: {status}"
+    );
+
+    // Verify terminal restored
+    let mut stty_cmd = CommandBuilder::new("stty");
+    stty_cmd.arg("-a");
+    apply_ftui_env(&mut stty_cmd, &env);
+    let mut stty_child = pair
+        .slave
+        .spawn_command(stty_cmd)
+        .expect("spawn stty check");
+    let stty_status = wait_for_child_exit(&mut *stty_child, Duration::from_secs(8));
+    assert!(
+        stty_status.success(),
+        "stty exited unsuccessfully: {stty_status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_inline_mode_output.raw", &trace, &raw);
+
+    // Alt-screen enter is ESC[?1049h — inline mode must NOT use it
+    let alt_screen_enter = b"\x1b[?1049h";
+    let has_alt_screen = raw
+        .windows(alt_screen_enter.len())
+        .any(|w| w == alt_screen_enter);
+    assert!(
+        !has_alt_screen,
+        "Inline mode must not enter alt-screen (ESC[?1049h found in output). \
+         This breaks scrollback preservation."
+    );
+
+    // Verify the terminal was restored (canonical mode + echo)
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("icanon"),
+        "Expected stty output with canonical mode after inline exit. Output tail: {}",
+        truncate_output(&raw, 1200)
+    );
+
+    tracker.complete();
+}

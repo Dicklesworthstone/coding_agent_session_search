@@ -115,6 +115,18 @@ pub enum Commands {
         /// Override data dir (matches index --data-dir)
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Run in inline mode (UI anchored within terminal, scrollback preserved)
+        #[arg(long, default_value_t = false)]
+        inline: bool,
+
+        /// Height of the inline UI in rows (default: 12, ignored without --inline)
+        #[arg(long, default_value_t = 12)]
+        ui_height: u16,
+
+        /// Anchor the inline UI to top or bottom of the terminal (default: bottom)
+        #[arg(long, value_parser = ["top", "bottom"], default_value = "bottom")]
+        anchor: String,
     },
     /// Run indexer
     Index {
@@ -2341,64 +2353,6 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuiRuntime {
-    Legacy,
-    Ftui,
-}
-
-fn is_ftui_runtime_value(value: &str) -> bool {
-    let value = value.trim();
-    value.eq_ignore_ascii_case("ftui")
-        || value.eq_ignore_ascii_case("frankentui")
-        || value == "1"
-        || value.eq_ignore_ascii_case("true")
-        || value.eq_ignore_ascii_case("yes")
-}
-
-fn parse_tui_runtime(runtime_env: Option<&str>, once: bool) -> TuiRuntime {
-    if runtime_env.is_some_and(is_ftui_runtime_value) && !once {
-        TuiRuntime::Ftui
-    } else {
-        TuiRuntime::Legacy
-    }
-}
-
-#[cfg(test)]
-mod tui_runtime_tests {
-    use super::{TuiRuntime, parse_tui_runtime};
-
-    #[test]
-    fn parse_tui_runtime_defaults_to_legacy() {
-        assert_eq!(parse_tui_runtime(None, false), TuiRuntime::Legacy);
-    }
-
-    #[test]
-    fn parse_tui_runtime_accepts_ftui_aliases() {
-        assert_eq!(parse_tui_runtime(Some("ftui"), false), TuiRuntime::Ftui);
-        assert_eq!(
-            parse_tui_runtime(Some("FrankenTUI"), false),
-            TuiRuntime::Ftui
-        );
-        assert_eq!(parse_tui_runtime(Some("true"), false), TuiRuntime::Ftui);
-        assert_eq!(parse_tui_runtime(Some("1"), false), TuiRuntime::Ftui);
-    }
-
-    #[test]
-    fn parse_tui_runtime_falls_back_for_once_mode() {
-        assert_eq!(parse_tui_runtime(Some("ftui"), true), TuiRuntime::Legacy);
-    }
-
-    #[test]
-    fn parse_tui_runtime_ignores_unknown_values() {
-        assert_eq!(parse_tui_runtime(Some("legacy"), false), TuiRuntime::Legacy);
-        assert_eq!(
-            parse_tui_runtime(Some("something-else"), false),
-            TuiRuntime::Legacy
-        );
-    }
-}
-
 async fn execute_cli(
     cli: &Cli,
     wrap: WrapConfig,
@@ -2411,6 +2365,9 @@ async fn execute_cli(
         reset_state: false,
         asciicast: None,
         data_dir: None,
+        inline: false,
+        ui_height: 12,
+        anchor: "bottom".to_string(),
     });
 
     if cli.robot_help {
@@ -2480,43 +2437,34 @@ async fn execute_cli(
                 })?;
             if let Commands::Tui {
                 once,
-                reset_state,
+                reset_state: _,
                 asciicast,
-                data_dir,
-                ..
+                data_dir: _,
+                inline,
+                ui_height,
+                anchor,
             } = command.clone()
             {
-                let runtime_env = dotenvy::var("CASS_TUI_RUNTIME").ok();
-                let requested_ftui = runtime_env.as_deref().is_some_and(is_ftui_runtime_value);
-                let runtime = parse_tui_runtime(runtime_env.as_deref(), once);
-                info!(?runtime, once, "selected tui runtime");
+                info!(once, inline, ui_height, %anchor, "launching ftui runtime");
 
-                if requested_ftui && once {
-                    info!(
-                        "CASS_TUI_RUNTIME requested ftui with --once; using legacy headless path"
-                    );
-                }
-
-                let legacy_progress =
-                    if asciicast.is_none() && !once && matches!(runtime, TuiRuntime::Legacy) {
-                        let bg_data_dir = log_dir.clone();
-                        let bg_db = cli.db.clone();
-                        let progress = std::sync::Arc::new(indexer::IndexingProgress::default());
-                        spawn_background_indexer(bg_data_dir, bg_db, Some(progress.clone()));
-                        Some(progress)
+                let inline_config = if inline {
+                    let ui_anchor = if anchor == "top" {
+                        ui::ftui_adapter::UiAnchor::Top
                     } else {
-                        None
+                        ui::ftui_adapter::UiAnchor::Bottom
                     };
+                    Some(ui::app::InlineTuiConfig {
+                        ui_height,
+                        anchor: ui_anchor,
+                    })
+                } else {
+                    None
+                };
 
                 let run_result = if let Some(path) = asciicast {
                     tui_asciicast::run_tui_with_asciicast(&path, !once)
                 } else {
-                    match runtime {
-                        TuiRuntime::Ftui => ui::app::run_tui_ftui(),
-                        TuiRuntime::Legacy => {
-                            ui::tui::run_tui(data_dir, once, reset_state, legacy_progress, None)
-                        }
-                    }
+                    ui::app::run_tui_ftui(inline_config)
                 };
 
                 run_result.map_err(|e| CliError {
@@ -10572,47 +10520,6 @@ fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> 
     }
 
     Ok(())
-}
-
-use crossbeam_channel::Sender;
-use indexer::IndexerEvent;
-
-fn spawn_background_indexer(
-    data_dir: PathBuf,
-    db: Option<PathBuf>,
-    progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
-) -> Option<Sender<IndexerEvent>> {
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let tx_clone = tx.clone();
-    let progress_for_error = progress.clone();
-    std::thread::spawn(move || {
-        let db_path = db.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        let opts = IndexOptions {
-            full: false,
-            force_rebuild: false,
-            watch: true,
-            watch_once_paths: read_watch_once_paths_env(),
-            db_path,
-            data_dir,
-            semantic: false,
-            build_hnsw: false,
-            embedder: "fastembed".to_string(),
-            progress,
-        };
-        // Pass the receiver to run_index so it can listen for commands
-        if let Err(e) = indexer::run_index(opts, Some((tx_clone, rx))) {
-            warn!("Background indexer failed: {}", e);
-            if let Some(p) = progress_for_error {
-                if let Ok(mut last_error) = p.last_error.lock() {
-                    *last_error = Some(e.to_string());
-                }
-                p.phase.store(0, std::sync::atomic::Ordering::Relaxed);
-                p.is_rebuilding
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    });
-    Some(tx)
 }
 
 #[allow(clippy::too_many_arguments)]
