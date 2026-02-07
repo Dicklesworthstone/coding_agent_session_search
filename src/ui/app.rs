@@ -1149,7 +1149,7 @@ impl ThemeEditorState {
 
     /// Get the currently selected color slot.
     pub fn selected_slot(&self) -> ThemeColorSlot {
-        ThemeColorSlot::ALL[self.selected]
+        ThemeColorSlot::ALL[self.selected.min(ThemeColorSlot::ALL.len() - 1)]
     }
 
     /// Build a ThemeConfig from the current editor state.
