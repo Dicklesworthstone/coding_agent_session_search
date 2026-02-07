@@ -66,22 +66,34 @@ use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown}
 // ---------------------------------------------------------------------------
 use super::ftui_adapter::{Constraint, Flex, Rect};
 use super::style_system::{self, StyleContext, StyleOptions, UiThemePreset};
-use ftui::widgets::focus::{FocusId, FocusManager};
+use ftui::widgets::focus::{FocusId, FocusManager, FocusNode, NavDirection};
 
 /// Well-known focus node IDs for the cass TUI layout.
 pub mod focus_ids {
     use super::FocusId;
+    // Primary surface nodes (tab order 0-2)
     pub const SEARCH_BAR: FocusId = 1;
     pub const RESULTS_LIST: FocusId = 2;
     pub const DETAIL_PANE: FocusId = 3;
+    // Modal nodes (tab_index -1 = skip global tab order)
     pub const COMMAND_PALETTE: FocusId = 10;
     pub const HELP_OVERLAY: FocusId = 11;
     pub const EXPORT_MODAL: FocusId = 12;
     pub const CONSENT_DIALOG: FocusId = 13;
+    pub const BULK_MODAL: FocusId = 14;
+    pub const SAVED_VIEWS_MODAL: FocusId = 15;
+    pub const SOURCE_FILTER_MENU: FocusId = 16;
+    pub const DETAIL_MODAL: FocusId = 17;
+    // Focus groups
+    pub const GROUP_MAIN: u32 = 99;
     pub const GROUP_PALETTE: u32 = 100;
     pub const GROUP_HELP: u32 = 101;
     pub const GROUP_EXPORT: u32 = 102;
     pub const GROUP_CONSENT: u32 = 103;
+    pub const GROUP_BULK: u32 = 104;
+    pub const GROUP_SAVED_VIEWS: u32 = 105;
+    pub const GROUP_SOURCE_FILTER: u32 = 106;
+    pub const GROUP_DETAIL_MODAL: u32 = 107;
 }
 
 // =========================================================================
@@ -1385,7 +1397,7 @@ pub struct CassApp {
 
 impl Default for CassApp {
     fn default() -> Self {
-        Self {
+        let mut app = Self {
             surface: AppSurface::default(),
             view_stack: Vec::new(),
             analytics_view: AnalyticsView::default(),
@@ -1499,11 +1511,118 @@ impl Default for CassApp {
             macro_playback: None,
             macro_redact_paths: false,
             status: String::new(),
-        }
+        };
+        app.init_focus_graph();
+        app
     }
 }
 
 impl CassApp {
+    /// Initialize the focus graph with all nodes, edges, and groups.
+    ///
+    /// Called once after construction. Sets up 3 primary surface nodes
+    /// (SearchBar, ResultsList, DetailPane) plus modal overlay nodes,
+    /// directional edges between the main nodes, and focus groups for
+    /// each modal (used with push_trap/pop_trap).
+    fn init_focus_graph(&mut self) {
+        use focus_ids::*;
+        let g = self.focus_manager.graph_mut();
+
+        // -- Primary surface nodes (participate in global Tab order) ------
+        g.insert(FocusNode::new(SEARCH_BAR, Rect::new(0, 0, 80, 1)).with_tab_index(0));
+        g.insert(FocusNode::new(RESULTS_LIST, Rect::new(0, 2, 40, 20)).with_tab_index(1));
+        g.insert(FocusNode::new(DETAIL_PANE, Rect::new(40, 2, 40, 20)).with_tab_index(2));
+
+        // Directional edges: SearchBar ↕ ResultsList ↔ DetailPane
+        g.connect(SEARCH_BAR, NavDirection::Down, RESULTS_LIST);
+        g.connect(RESULTS_LIST, NavDirection::Up, SEARCH_BAR);
+        g.connect(RESULTS_LIST, NavDirection::Right, DETAIL_PANE);
+        g.connect(DETAIL_PANE, NavDirection::Left, RESULTS_LIST);
+        g.connect(DETAIL_PANE, NavDirection::Up, SEARCH_BAR);
+        g.connect(SEARCH_BAR, NavDirection::Down, RESULTS_LIST);
+
+        // Build wrap-around tab chain for primary nodes
+        g.build_tab_chain(true);
+
+        // -- Modal overlay nodes (tab_index -1 = skip global tab order) ---
+        g.insert(
+            FocusNode::new(COMMAND_PALETTE, Rect::new(10, 5, 60, 15))
+                .with_tab_index(-1)
+                .with_group(GROUP_PALETTE),
+        );
+        g.insert(
+            FocusNode::new(HELP_OVERLAY, Rect::new(5, 2, 70, 20))
+                .with_tab_index(-1)
+                .with_group(GROUP_HELP),
+        );
+        g.insert(
+            FocusNode::new(EXPORT_MODAL, Rect::new(10, 5, 60, 15))
+                .with_tab_index(-1)
+                .with_group(GROUP_EXPORT),
+        );
+        g.insert(
+            FocusNode::new(CONSENT_DIALOG, Rect::new(15, 8, 50, 8))
+                .with_tab_index(-1)
+                .with_group(GROUP_CONSENT),
+        );
+        g.insert(
+            FocusNode::new(BULK_MODAL, Rect::new(20, 5, 40, 10))
+                .with_tab_index(-1)
+                .with_group(GROUP_BULK),
+        );
+        g.insert(
+            FocusNode::new(SAVED_VIEWS_MODAL, Rect::new(10, 3, 60, 18))
+                .with_tab_index(-1)
+                .with_group(GROUP_SAVED_VIEWS),
+        );
+        g.insert(
+            FocusNode::new(SOURCE_FILTER_MENU, Rect::new(0, 1, 30, 10))
+                .with_tab_index(-1)
+                .with_group(GROUP_SOURCE_FILTER),
+        );
+        g.insert(
+            FocusNode::new(DETAIL_MODAL, Rect::new(5, 2, 70, 20))
+                .with_tab_index(-1)
+                .with_group(GROUP_DETAIL_MODAL),
+        );
+
+        // -- Focus groups (one per modal, used with push_trap/pop_trap) ---
+        self.focus_manager
+            .create_group(GROUP_MAIN, vec![SEARCH_BAR, RESULTS_LIST, DETAIL_PANE]);
+        self.focus_manager
+            .create_group(GROUP_PALETTE, vec![COMMAND_PALETTE]);
+        self.focus_manager
+            .create_group(GROUP_HELP, vec![HELP_OVERLAY]);
+        self.focus_manager
+            .create_group(GROUP_EXPORT, vec![EXPORT_MODAL]);
+        self.focus_manager
+            .create_group(GROUP_CONSENT, vec![CONSENT_DIALOG]);
+        self.focus_manager
+            .create_group(GROUP_BULK, vec![BULK_MODAL]);
+        self.focus_manager
+            .create_group(GROUP_SAVED_VIEWS, vec![SAVED_VIEWS_MODAL]);
+        self.focus_manager
+            .create_group(GROUP_SOURCE_FILTER, vec![SOURCE_FILTER_MENU]);
+        self.focus_manager
+            .create_group(GROUP_DETAIL_MODAL, vec![DETAIL_MODAL]);
+
+        // Start with ResultsList focused (matches legacy default FocusRegion::Results)
+        self.focus_manager.focus(RESULTS_LIST);
+    }
+
+    /// Derive the legacy FocusRegion from the current FocusManager state.
+    ///
+    /// This bridges the new graph-based focus system with existing code
+    /// that checks `focus_region` for rendering decisions.
+    pub fn focused_region(&self) -> FocusRegion {
+        match self.focus_manager.current() {
+            Some(id) if id == focus_ids::DETAIL_PANE || id == focus_ids::DETAIL_MODAL => {
+                FocusRegion::Detail
+            }
+            _ => FocusRegion::Results,
+        }
+    }
+
     fn resolved_style_context(&self) -> StyleContext {
         let mut options = self.style_options;
         options.preset = self.theme_preset;
@@ -1635,7 +1754,7 @@ impl CassApp {
             return "filter";
         }
 
-        if self.focus_region == FocusRegion::Detail {
+        if self.focused_region() == FocusRegion::Detail {
             return "detail";
         }
 
@@ -2169,7 +2288,7 @@ impl CassApp {
             .border_type(border_type)
             .title(&results_title)
             .title_alignment(Alignment::Left)
-            .style(if self.focus_region == FocusRegion::Results {
+            .style(if self.focused_region() == FocusRegion::Results {
                 pane_focused_style
             } else {
                 pane_style
@@ -2770,7 +2889,7 @@ impl CassApp {
             .border_type(border_type)
             .title(&title)
             .title_alignment(Alignment::Left)
-            .style(if self.focus_region == FocusRegion::Detail {
+            .style(if self.focused_region() == FocusRegion::Detail {
                 pane_focused_style
             } else {
                 pane_style
@@ -5426,21 +5545,20 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::FocusToggled => {
-                self.focus_region = match self.focus_region {
-                    FocusRegion::Results => FocusRegion::Detail,
-                    FocusRegion::Detail => FocusRegion::Results,
-                };
+                self.focus_manager.focus_next();
                 self.focus_flash_until =
                     Some(Instant::now() + std::time::Duration::from_millis(220));
                 self.anim.trigger_focus_flash();
                 ftui::Cmd::none()
             }
             CassMsg::FocusDirectional { direction } => {
-                self.focus_region = match direction {
-                    FocusDirection::Left => FocusRegion::Results,
-                    FocusDirection::Right => FocusRegion::Detail,
-                    _ => self.focus_region,
+                let nav_dir = match direction {
+                    FocusDirection::Left => NavDirection::Left,
+                    FocusDirection::Right => NavDirection::Right,
+                    FocusDirection::Up => NavDirection::Up,
+                    FocusDirection::Down => NavDirection::Down,
                 };
+                self.focus_manager.navigate(nav_dir);
                 ftui::Cmd::none()
             }
             CassMsg::DetailScrolled { delta } => {
@@ -5449,7 +5567,7 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::PageScrolled { delta } => {
-                if self.focus_region == FocusRegion::Detail {
+                if self.focused_region() == FocusRegion::Detail {
                     let new_scroll = self.detail_scroll as i32 + (delta * 20);
                     self.detail_scroll = new_scroll.max(0) as u16;
                 } else if let Some(pane) = self.panes.get_mut(self.active_pane) {
@@ -5530,11 +5648,14 @@ impl super::ftui_adapter::Model for CassApp {
                 self.show_detail_modal = true;
                 self.detail_scroll = 0;
                 self.modal_scroll = 0;
+                self.focus_manager.push_trap(focus_ids::GROUP_DETAIL_MODAL);
+                self.focus_manager.focus(focus_ids::DETAIL_MODAL);
                 ftui::Cmd::none()
             }
             CassMsg::DetailClosed => {
                 self.show_detail_modal = false;
-                self.focus_region = FocusRegion::Results;
+                self.focus_manager.pop_trap();
+                self.focus_manager.focus(focus_ids::RESULTS_LIST);
                 ftui::Cmd::none()
             }
             CassMsg::DetailTabChanged(tab) => {
@@ -5552,6 +5673,8 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     self.detail_scroll = 0;
                     self.show_detail_modal = true;
+                    self.focus_manager.push_trap(focus_ids::GROUP_DETAIL_MODAL);
+                    self.focus_manager.focus(focus_ids::DETAIL_MODAL);
                 } else {
                     self.status = "No active result to view.".to_string();
                 }
@@ -5658,6 +5781,8 @@ impl super::ftui_adapter::Model for CassApp {
                     self.bulk_action_idx = 0;
                     self.status =
                         "Bulk actions: ↑↓ navigate · Enter execute · Esc cancel".to_string();
+                    self.focus_manager.push_trap(focus_ids::GROUP_BULK);
+                    self.focus_manager.focus(focus_ids::BULK_MODAL);
                 }
                 ftui::Cmd::none()
             }
@@ -5900,6 +6025,8 @@ impl super::ftui_adapter::Model for CassApp {
                     self.show_detail_modal = true;
                     self.detail_scroll = 0;
                     self.modal_scroll = 0;
+                    self.focus_manager.push_trap(focus_ids::GROUP_DETAIL_MODAL);
+                    self.focus_manager.focus(focus_ids::DETAIL_MODAL);
                 } else {
                     self.status = "No active result to view.".to_string();
                 }
@@ -6038,10 +6165,13 @@ impl super::ftui_adapter::Model for CassApp {
                 self.palette_state.query.clear();
                 self.palette_state.selected = 0;
                 self.palette_state.refilter();
+                self.focus_manager.push_trap(focus_ids::GROUP_PALETTE);
+                self.focus_manager.focus(focus_ids::COMMAND_PALETTE);
                 ftui::Cmd::none()
             }
             CassMsg::PaletteClosed => {
                 self.palette_state.open = false;
+                self.focus_manager.pop_trap();
                 ftui::Cmd::none()
             }
             CassMsg::PaletteQueryChanged(q) => {
@@ -6188,6 +6318,12 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::HelpToggled => {
                 self.show_help = !self.show_help;
                 self.help_scroll = 0;
+                if self.show_help {
+                    self.focus_manager.push_trap(focus_ids::GROUP_HELP);
+                    self.focus_manager.focus(focus_ids::HELP_OVERLAY);
+                } else {
+                    self.focus_manager.pop_trap();
+                }
                 ftui::Cmd::none()
             }
             CassMsg::HelpScrolled { delta } => {
@@ -6216,6 +6352,8 @@ impl super::ftui_adapter::Model for CassApp {
                     };
                     self.export_modal_state = Some(state);
                     self.show_export_modal = true;
+                    self.focus_manager.push_trap(focus_ids::GROUP_EXPORT);
+                    self.focus_manager.focus(focus_ids::EXPORT_MODAL);
                 }
                 ftui::Cmd::none()
             }
@@ -6345,10 +6483,13 @@ impl super::ftui_adapter::Model for CassApp {
             // -- Consent dialog -----------------------------------------------
             CassMsg::ConsentDialogOpened => {
                 self.show_consent_dialog = true;
+                self.focus_manager.push_trap(focus_ids::GROUP_CONSENT);
+                self.focus_manager.focus(focus_ids::CONSENT_DIALOG);
                 ftui::Cmd::none()
             }
             CassMsg::ConsentDialogClosed => {
                 self.show_consent_dialog = false;
+                self.focus_manager.pop_trap();
                 ftui::Cmd::none()
             }
             CassMsg::ModelDownloadAccepted
@@ -6370,9 +6511,12 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.source_filter_menu_open {
                     self.source_filter_menu_open = false;
                     self.status = "Source filter menu closed".to_string();
+                    self.focus_manager.pop_trap();
                 } else {
                     self.refresh_available_source_ids();
                     self.source_filter_menu_open = true;
+                    self.focus_manager.push_trap(focus_ids::GROUP_SOURCE_FILTER);
+                    self.focus_manager.focus(focus_ids::SOURCE_FILTER_MENU);
                     self.source_filter_menu_selection = match &self.filters.source_filter {
                         SourceFilter::All => 0,
                         SourceFilter::Local => 1,
@@ -6391,6 +6535,7 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::SourceFilterSelected(filter) => {
                 self.source_filter_menu_open = false;
+                self.focus_manager.pop_trap();
                 self.status = format!("Source: {}", Self::source_filter_status(&filter));
                 ftui::Cmd::msg(CassMsg::FilterSourceSet(filter))
             }
@@ -6541,6 +6686,8 @@ impl super::ftui_adapter::Model for CassApp {
                 self.saved_view_drag = None;
                 self.saved_view_rename_mode = false;
                 self.saved_view_rename_buffer.clear();
+                self.focus_manager.push_trap(focus_ids::GROUP_SAVED_VIEWS);
+                self.focus_manager.focus(focus_ids::SAVED_VIEWS_MODAL);
                 if self.saved_views.is_empty() {
                     self.status = "No saved views. Use Ctrl+1..9 to save one.".to_string();
                 } else {
@@ -6553,6 +6700,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.saved_view_drag = None;
                 self.saved_view_rename_mode = false;
                 self.saved_view_rename_buffer.clear();
+                self.focus_manager.pop_trap();
                 self.status = "Saved views manager closed".to_string();
                 ftui::Cmd::none()
             }
@@ -6984,7 +7132,7 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // ── Click in detail: focus detail pane ──────────
                     (MouseEventKind::LeftClick, MouseHitRegion::Detail) => {
-                        if self.focus_region != FocusRegion::Detail {
+                        if self.focused_region() != FocusRegion::Detail {
                             ftui::Cmd::msg(CassMsg::FocusToggled)
                         } else {
                             ftui::Cmd::none()
@@ -6992,7 +7140,7 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // ── Click in search bar: focus results (query) ──
                     (MouseEventKind::LeftClick, MouseHitRegion::SearchBar) => {
-                        if self.focus_region != FocusRegion::Results {
+                        if self.focused_region() != FocusRegion::Results {
                             ftui::Cmd::msg(CassMsg::FocusToggled)
                         } else {
                             ftui::Cmd::none()
@@ -7185,15 +7333,18 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 if self.show_consent_dialog {
                     self.show_consent_dialog = false;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.show_export_modal {
                     self.show_export_modal = false;
                     self.export_modal_state = None;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.show_bulk_modal {
                     self.show_bulk_modal = false;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.show_saved_views_modal {
@@ -7206,24 +7357,28 @@ impl super::ftui_adapter::Model for CassApp {
                         self.show_saved_views_modal = false;
                         self.saved_view_drag = None;
                         self.status = "Saved views manager closed".to_string();
+                        self.focus_manager.pop_trap();
                     }
                     return ftui::Cmd::none();
                 }
                 if self.source_filter_menu_open {
                     self.source_filter_menu_open = false;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.palette_state.open {
                     self.palette_state.open = false;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.show_help {
                     self.show_help = false;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.show_detail_modal {
                     self.show_detail_modal = false;
-                    self.focus_region = FocusRegion::Results;
+                    self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
                 if self.detail_find.is_some() {
@@ -7458,7 +7613,7 @@ impl super::ftui_adapter::Model for CassApp {
                     .border_type(border_type)
                     .title(&query_title)
                     .title_alignment(Alignment::Left)
-                    .style(if self.focus_region == FocusRegion::Results {
+                    .style(if self.focused_region() == FocusRegion::Results {
                         pane_focused_style
                     } else {
                         pane_style
@@ -7559,7 +7714,7 @@ impl super::ftui_adapter::Model for CassApp {
                             text_muted_style,
                         );
                     }
-                    LayoutBreakpoint::Narrow => match self.focus_region {
+                    LayoutBreakpoint::Narrow => match self.focused_region() {
                         FocusRegion::Results => {
                             self.render_results_pane(
                                 frame,
@@ -8745,7 +8900,7 @@ mod tests {
         assert_eq!(app.active_pane, 0);
         assert_eq!(app.per_pane_limit, 10);
         assert_eq!(app.input_mode, InputMode::Query);
-        assert_eq!(app.focus_region, FocusRegion::Results);
+        assert_eq!(app.focused_region(), FocusRegion::Results);
         assert_eq!(app.search_mode, SearchMode::Lexical);
         assert_eq!(app.match_mode, MatchMode::Standard);
         assert_eq!(app.ranking_mode, RankingMode::Balanced);
@@ -10394,10 +10549,10 @@ mod tests {
     fn detail_closed_resets_focus() {
         let mut app = CassApp::default();
         app.show_detail_modal = true;
-        app.focus_region = FocusRegion::Detail;
+        app.focus_manager.focus(focus_ids::DETAIL_PANE);
         let _ = app.update(CassMsg::DetailClosed);
         assert!(!app.show_detail_modal);
-        assert_eq!(app.focus_region, FocusRegion::Results);
+        assert_eq!(app.focused_region(), FocusRegion::Results);
     }
 
     // =====================================================================
@@ -11818,7 +11973,7 @@ mod tests {
         let mut app = app_with_hits(5);
         render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
 
-        assert_eq!(app.focus_region, FocusRegion::Results);
+        assert_eq!(app.focused_region(), FocusRegion::Results);
         let detail = app.last_detail_area.borrow().unwrap();
         let cmd = app.update(CassMsg::MouseEvent {
             kind: MouseEventKind::LeftClick,
@@ -11835,7 +11990,7 @@ mod tests {
     fn mouse_click_in_search_bar_focuses_results() {
         use ftui::Model;
         let mut app = app_with_hits(5);
-        app.focus_region = FocusRegion::Detail;
+        app.focus_manager.focus(focus_ids::DETAIL_PANE);
         render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
 
         let search = app.last_search_bar_area.borrow().unwrap();
@@ -12032,7 +12187,7 @@ mod tests {
     #[test]
     fn narrow_layout_only_records_visible_pane() {
         let mut app = app_with_hits(5);
-        app.focus_region = FocusRegion::Results;
+        app.focus_manager.focus(focus_ids::RESULTS_LIST);
         render_at_degradation(&app, 60, 24, ftui::render::budget::DegradationLevel::Full);
 
         assert!(
@@ -13258,7 +13413,7 @@ mod tests {
     #[test]
     fn perf_guard_detail_surface_render_time() {
         let mut app = app_with_hits(5);
-        app.focus_region = FocusRegion::Detail;
+        app.focus_manager.focus(focus_ids::DETAIL_PANE);
         let start = std::time::Instant::now();
         let _ = render_at_degradation(&app, 120, 40, ftui::render::budget::DegradationLevel::Full);
         let elapsed = start.elapsed();
@@ -13281,7 +13436,7 @@ mod tests {
 
         // Detail focus
         let mut detail_app = app_with_hits(5);
-        detail_app.focus_region = FocusRegion::Detail;
+        detail_app.focus_manager.focus(focus_ids::DETAIL_PANE);
         let _ = render_at_degradation(
             &detail_app,
             120,
@@ -13766,5 +13921,180 @@ mod tests {
 
         // The rec_tag logic in view uses macro_recorder.is_some().
         assert!(app.macro_recorder.is_some());
+    }
+
+    // =========================================================================
+    // FocusGraph navigation tests (bead 2noh9.3.16)
+    // =========================================================================
+
+    #[test]
+    fn focus_graph_initialized_with_nodes() {
+        let app = CassApp::default();
+        let g = app.focus_manager.graph();
+        // 3 primary + 8 modal nodes = 11
+        assert!(g.node_count() >= 11, "got {}", g.node_count());
+        assert!(g.get(focus_ids::SEARCH_BAR).is_some());
+        assert!(g.get(focus_ids::RESULTS_LIST).is_some());
+        assert!(g.get(focus_ids::DETAIL_PANE).is_some());
+        assert!(g.get(focus_ids::COMMAND_PALETTE).is_some());
+    }
+
+    #[test]
+    fn focus_graph_default_focuses_results() {
+        let app = CassApp::default();
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+        assert_eq!(app.focused_region(), FocusRegion::Results);
+    }
+
+    #[test]
+    fn focus_toggle_cycles_through_nodes() {
+        let mut app = CassApp::default();
+        // Default: RESULTS_LIST
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+
+        // Tab (focus_next) → DETAIL_PANE
+        let _ = app.update(CassMsg::FocusToggled);
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::DETAIL_PANE));
+        assert_eq!(app.focused_region(), FocusRegion::Detail);
+
+        // Tab again → SEARCH_BAR (wraps)
+        let _ = app.update(CassMsg::FocusToggled);
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::SEARCH_BAR));
+
+        // Tab again → RESULTS_LIST
+        let _ = app.update(CassMsg::FocusToggled);
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+    }
+
+    #[test]
+    fn focus_directional_navigates_graph() {
+        let mut app = CassApp::default();
+        // Start at RESULTS_LIST, go right → DETAIL_PANE
+        let _ = app.update(CassMsg::FocusDirectional {
+            direction: FocusDirection::Right,
+        });
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::DETAIL_PANE));
+
+        // Go left → RESULTS_LIST
+        let _ = app.update(CassMsg::FocusDirectional {
+            direction: FocusDirection::Left,
+        });
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+
+        // Go up → SEARCH_BAR
+        let _ = app.update(CassMsg::FocusDirectional {
+            direction: FocusDirection::Up,
+        });
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::SEARCH_BAR));
+    }
+
+    #[test]
+    fn modal_push_trap_confines_focus() {
+        let mut app = CassApp::default();
+        assert!(!app.focus_manager.is_trapped());
+
+        // Open palette → should trap focus
+        let _ = app.update(CassMsg::PaletteOpened);
+        assert!(app.focus_manager.is_trapped());
+        assert_eq!(
+            app.focus_manager.current(),
+            Some(focus_ids::COMMAND_PALETTE)
+        );
+
+        // Tab should NOT escape the trap (only palette node in group)
+        let _ = app.update(CassMsg::FocusToggled);
+        assert_eq!(
+            app.focus_manager.current(),
+            Some(focus_ids::COMMAND_PALETTE)
+        );
+    }
+
+    #[test]
+    fn modal_pop_trap_restores_focus() {
+        let mut app = CassApp::default();
+        // Start focused on RESULTS_LIST
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+
+        // Open palette
+        let _ = app.update(CassMsg::PaletteOpened);
+        assert!(app.focus_manager.is_trapped());
+
+        // Close palette via Esc (QuitRequested)
+        let _ = app.update(CassMsg::QuitRequested);
+        assert!(!app.focus_manager.is_trapped());
+        // Focus restored to RESULTS_LIST
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::RESULTS_LIST));
+    }
+
+    #[test]
+    fn nested_modals_stack_traps() {
+        let mut app = CassApp::default();
+
+        // Open help
+        let _ = app.update(CassMsg::HelpToggled);
+        assert!(app.focus_manager.is_trapped());
+
+        // Close help
+        let _ = app.update(CassMsg::HelpToggled);
+        assert!(!app.focus_manager.is_trapped());
+    }
+
+    #[test]
+    fn detail_closed_pops_trap_and_restores() {
+        let mut app = CassApp::default();
+        app.results = vec![SearchHit {
+            title: String::new(),
+            snippet: "test".into(),
+            content: "test".into(),
+            content_hash: 0,
+            score: 1.0,
+            source_path: "/tmp/test".into(),
+            agent: "test".into(),
+            workspace: "/tmp".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: Some(0),
+            match_type: Default::default(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        }];
+        app.panes = vec![AgentPane {
+            agent: "test".into(),
+            hits: app.results.clone(),
+            selected: 0,
+            total_count: 1,
+        }];
+
+        // Switch to a non-Query input mode so DetailOpened opens detail modal
+        app.input_mode = InputMode::Agent;
+        let _ = app.update(CassMsg::DetailOpened);
+        assert!(app.show_detail_modal);
+
+        // Close detail
+        let _ = app.update(CassMsg::DetailClosed);
+        assert!(!app.show_detail_modal);
+        assert_eq!(app.focused_region(), FocusRegion::Results);
+    }
+
+    #[test]
+    fn focus_graph_has_directional_edges() {
+        let app = CassApp::default();
+        let g = app.focus_manager.graph();
+        // SearchBar Down → ResultsList
+        assert_eq!(
+            g.navigate(focus_ids::SEARCH_BAR, NavDirection::Down),
+            Some(focus_ids::RESULTS_LIST)
+        );
+        // ResultsList Right → DetailPane
+        assert_eq!(
+            g.navigate(focus_ids::RESULTS_LIST, NavDirection::Right),
+            Some(focus_ids::DETAIL_PANE)
+        );
+        // DetailPane Left → ResultsList
+        assert_eq!(
+            g.navigate(focus_ids::DETAIL_PANE, NavDirection::Left),
+            Some(focus_ids::RESULTS_LIST)
+        );
     }
 }
