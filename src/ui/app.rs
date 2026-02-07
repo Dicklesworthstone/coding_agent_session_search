@@ -798,16 +798,64 @@ pub enum FocusRegion {
 }
 
 /// Responsive layout breakpoint based on terminal width.
+///
+/// # Topology Matrix
+///
+/// | Surface          | Narrow (<80)       | MediumNarrow (80-119)    | Medium (120-159)        | Wide (≥160)              |
+/// |------------------|--------------------|--------------------------|-------------------------|--------------------------|
+/// | **Search**       | Single pane, focus  | Side-by-side tight       | Side-by-side balanced   | Side-by-side spacious    |
+/// |  └ Results       | Full-width or hide  | min 35 cols              | min 45 cols             | min 50 cols              |
+/// |  └ Detail        | Full-width or hide  | min 25 cols              | min 32 cols             | min 34 cols              |
+/// |  └ Split handle  | None (no split)     | Active (draggable)       | Active (draggable)      | Active (draggable)       |
+/// |  └ Navigation    | Focus toggles pane  | Focus + mouse + drag     | Focus + mouse + drag    | Focus + mouse + drag     |
+/// | **Analytics**    | Area-adaptive       | Area-adaptive            | Area-adaptive           | Area-adaptive            |
+/// |  └ All 8 views   | min 20w×4h guard    | Full area, inline adjust | Full area, inline adjust| Full area, inline adjust |
+/// | **Detail modal** | Full-screen overlay | Full-screen overlay      | Full-screen overlay     | Full-screen overlay      |
+/// | **Other modals** | Centered, fixed     | Centered, fixed          | Centered, fixed         | Centered, fixed          |
+/// | **Footer**       | "narrow"            | "med-n"                  | "med"                   | "wide"                   |
+/// | **Inspector**    | "Narrow (<80)"      | "MedNarrow (80-119)"     | "Medium (120-159)"      | "Wide (>=160)"           |
+///
+/// # Interaction expectations
+///
+/// - **Narrow**: Keyboard-primary. `Tab`/`Enter` switches between results ↔ detail.
+///   No split handle. Mouse clicks work on the visible pane only.
+/// - **MediumNarrow**: Both panes visible but tight. Detail shows wrapped message
+///   previews (25-col minimum). Split handle is draggable but range is constrained.
+/// - **Medium**: Comfortable dual-pane. Both panes have enough room for full content.
+///   Split handle draggable within 25–75% range.
+/// - **Wide**: Spacious dual-pane. Extra width used for wider result columns and
+///   full detail formatting. Split handle draggable within 25–75% range.
+///
+/// # Analytics surface notes
+///
+/// Analytics views do NOT consume `LayoutBreakpoint`. Each view checks its assigned
+/// `Rect` dimensions directly (e.g., `area.height < 4 || area.width < 20` as a
+/// minimum guard) and adapts layout inline. This is intentional: analytics views
+/// occupy the full content area regardless of breakpoint, so the breakpoint only
+/// affects the outer chrome (header, footer, borders).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutBreakpoint {
     /// <80 cols: single pane with tab switching (very tight)
     Narrow,
-    /// 80-119 cols: single pane, but with detail peek strip on right
+    /// 80-119 cols: side-by-side with tight detail pane
     MediumNarrow,
-    /// 120-159 cols: side-by-side results/detail with tight ratio
+    /// 120-159 cols: side-by-side results/detail with balanced ratio
     Medium,
     /// >=160 cols: comfortable side-by-side results + detail panes
     Wide,
+}
+
+/// Per-breakpoint layout parameters for the search surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchTopology {
+    /// Minimum width for the results (left) pane. 0 means single-pane mode.
+    pub min_results: u16,
+    /// Minimum width for the detail (right) pane. 0 means single-pane mode.
+    pub min_detail: u16,
+    /// Whether a draggable split handle is shown between panes.
+    pub has_split_handle: bool,
+    /// Whether both panes are visible simultaneously.
+    pub dual_pane: bool,
 }
 
 impl LayoutBreakpoint {
@@ -821,6 +869,56 @@ impl LayoutBreakpoint {
             Self::MediumNarrow
         } else {
             Self::Narrow
+        }
+    }
+
+    /// Return the search surface topology contract for this breakpoint.
+    pub fn search_topology(self) -> SearchTopology {
+        match self {
+            Self::Narrow => SearchTopology {
+                min_results: 0,
+                min_detail: 0,
+                has_split_handle: false,
+                dual_pane: false,
+            },
+            Self::MediumNarrow => SearchTopology {
+                min_results: 35,
+                min_detail: 25,
+                has_split_handle: true,
+                dual_pane: true,
+            },
+            Self::Medium => SearchTopology {
+                min_results: 45,
+                min_detail: 32,
+                has_split_handle: true,
+                dual_pane: true,
+            },
+            Self::Wide => SearchTopology {
+                min_results: 50,
+                min_detail: 34,
+                has_split_handle: true,
+                dual_pane: true,
+            },
+        }
+    }
+
+    /// Short label for the status footer.
+    pub fn footer_label(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::MediumNarrow => "med-n",
+            Self::Medium => "med",
+            Self::Wide => "wide",
+        }
+    }
+
+    /// Descriptive label for the inspector overlay.
+    pub fn inspector_label(self) -> &'static str {
+        match self {
+            Self::Narrow => "Narrow (<80)",
+            Self::MediumNarrow => "MedNarrow (80-119)",
+            Self::Medium => "Medium (120-159)",
+            Self::Wide => "Wide (>=160)",
         }
     }
 }
@@ -3705,12 +3803,7 @@ impl CassApp {
             }
             InspectorTab::Layout => {
                 let bp = LayoutBreakpoint::from_width(area.width);
-                let bp_str = match bp {
-                    LayoutBreakpoint::Narrow => "Narrow (<80)",
-                    LayoutBreakpoint::MediumNarrow => "MedNarrow (80-119)",
-                    LayoutBreakpoint::Medium => "Medium (120-159)",
-                    LayoutBreakpoint::Wide => "Wide (>=160)",
-                };
+                let bp_str = bp.inspector_label();
                 let lines = [
                     format!("Terminal: {}x{}", area.width, area.height),
                     format!("Layout:   {bp_str}"),
@@ -9705,75 +9798,16 @@ impl super::ftui_adapter::Model for CassApp {
                     (&self.results[..], 0)
                 };
 
+                let topo = breakpoint.search_topology();
                 match breakpoint {
-                    LayoutBreakpoint::Wide => {
-                        let (results_area, detail_area, split_handle) =
-                            self.split_content_area(content_area, 50, 34);
-                        *self.last_split_handle_area.borrow_mut() = split_handle;
-                        self.render_results_pane(
-                            frame,
-                            results_area,
-                            hits,
-                            selected_idx,
-                            row_h,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            row_style,
-                            row_alt_style,
-                            row_selected_style,
-                            text_muted_style,
+                    LayoutBreakpoint::Wide
+                    | LayoutBreakpoint::Medium
+                    | LayoutBreakpoint::MediumNarrow => {
+                        let (results_area, detail_area, split_handle) = self.split_content_area(
+                            content_area,
+                            topo.min_results,
+                            topo.min_detail,
                         );
-                        self.render_detail_pane(
-                            frame,
-                            detail_area,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            text_muted_style,
-                        );
-                    }
-                    LayoutBreakpoint::Medium => {
-                        let (results_area, detail_area, split_handle) =
-                            self.split_content_area(content_area, 45, 32);
-                        *self.last_split_handle_area.borrow_mut() = split_handle;
-                        self.render_results_pane(
-                            frame,
-                            results_area,
-                            hits,
-                            selected_idx,
-                            row_h,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            row_style,
-                            row_alt_style,
-                            row_selected_style,
-                            text_muted_style,
-                        );
-                        self.render_detail_pane(
-                            frame,
-                            detail_area,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            text_muted_style,
-                        );
-                    }
-                    LayoutBreakpoint::MediumNarrow => {
-                        // 80-119 cols: side-by-side with tight detail pane.
-                        // Give results priority; detail gets 25-col minimum
-                        // which is enough for wrapped message previews.
-                        let (results_area, detail_area, split_handle) =
-                            self.split_content_area(content_area, 35, 25);
                         *self.last_split_handle_area.borrow_mut() = split_handle;
                         self.render_results_pane(
                             frame,
@@ -9837,12 +9871,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
 
                 // ── Status footer ───────────────────────────────────────
-                let bp_label = match breakpoint {
-                    LayoutBreakpoint::Narrow => "narrow",
-                    LayoutBreakpoint::MediumNarrow => "med-n",
-                    LayoutBreakpoint::Medium => "med",
-                    LayoutBreakpoint::Wide => "wide",
-                };
+                let bp_label = breakpoint.footer_label();
                 let density_label = match self.density_mode {
                     DensityMode::Compact => "compact",
                     DensityMode::Cozy => "cozy",
@@ -14893,6 +14922,92 @@ mod tests {
     #[test]
     fn breakpoint_zero_is_narrow() {
         assert_eq!(LayoutBreakpoint::from_width(0), LayoutBreakpoint::Narrow);
+    }
+
+    #[test]
+    fn topology_narrow_is_single_pane() {
+        let t = LayoutBreakpoint::Narrow.search_topology();
+        assert!(!t.dual_pane);
+        assert!(!t.has_split_handle);
+        assert_eq!(t.min_results, 0);
+        assert_eq!(t.min_detail, 0);
+    }
+
+    #[test]
+    fn topology_medium_narrow_tight_split() {
+        let t = LayoutBreakpoint::MediumNarrow.search_topology();
+        assert!(t.dual_pane);
+        assert!(t.has_split_handle);
+        assert_eq!(t.min_results, 35);
+        assert_eq!(t.min_detail, 25);
+    }
+
+    #[test]
+    fn topology_medium_balanced_split() {
+        let t = LayoutBreakpoint::Medium.search_topology();
+        assert!(t.dual_pane);
+        assert!(t.has_split_handle);
+        assert_eq!(t.min_results, 45);
+        assert_eq!(t.min_detail, 32);
+    }
+
+    #[test]
+    fn topology_wide_spacious_split() {
+        let t = LayoutBreakpoint::Wide.search_topology();
+        assert!(t.dual_pane);
+        assert!(t.has_split_handle);
+        assert_eq!(t.min_results, 50);
+        assert_eq!(t.min_detail, 34);
+    }
+
+    #[test]
+    fn topology_min_sum_fits_breakpoint() {
+        // The sum of min_results + min_detail must fit within the breakpoint's minimum width.
+        let mn = LayoutBreakpoint::MediumNarrow.search_topology();
+        assert!(
+            mn.min_results + mn.min_detail <= 80,
+            "MediumNarrow mins must fit in 80 cols"
+        );
+
+        let m = LayoutBreakpoint::Medium.search_topology();
+        assert!(
+            m.min_results + m.min_detail <= 120,
+            "Medium mins must fit in 120 cols"
+        );
+
+        let w = LayoutBreakpoint::Wide.search_topology();
+        assert!(
+            w.min_results + w.min_detail <= 160,
+            "Wide mins must fit in 160 cols"
+        );
+    }
+
+    #[test]
+    fn footer_labels_are_short() {
+        for bp in [
+            LayoutBreakpoint::Narrow,
+            LayoutBreakpoint::MediumNarrow,
+            LayoutBreakpoint::Medium,
+            LayoutBreakpoint::Wide,
+        ] {
+            assert!(
+                bp.footer_label().len() <= 6,
+                "footer label too long: {}",
+                bp.footer_label()
+            );
+        }
+    }
+
+    #[test]
+    fn inspector_labels_contain_range() {
+        assert!(LayoutBreakpoint::Narrow.inspector_label().contains("<80"));
+        assert!(
+            LayoutBreakpoint::MediumNarrow
+                .inspector_label()
+                .contains("80")
+        );
+        assert!(LayoutBreakpoint::Medium.inspector_label().contains("120"));
+        assert!(LayoutBreakpoint::Wide.inspector_label().contains("160"));
     }
 
     #[test]
