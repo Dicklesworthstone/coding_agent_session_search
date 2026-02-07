@@ -53,6 +53,7 @@ use ftui::widgets::block::{Alignment, Block};
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::{RenderItem, StatefulWidget, VirtualizedList, VirtualizedListState};
+use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
 
 // ---------------------------------------------------------------------------
@@ -785,7 +786,15 @@ impl CassApp {
         row_selected_style: ftui::Style,
         text_muted_style: ftui::Style,
     ) {
-        let results_title = format!("Results ({})", hits.len());
+        let results_title = if self.selected.is_empty() {
+            format!("Results ({})", hits.len())
+        } else {
+            format!(
+                "Results ({}) \u{2022} {} selected",
+                hits.len(),
+                self.selected.len()
+            )
+        };
         let results_block = Block::new()
             .borders(borders)
             .border_type(border_type)
@@ -1159,15 +1168,23 @@ impl CassApp {
         lines: &mut [ftui::text::Line],
         query: &str,
         current_match: usize,
-        _styles: &StyleContext,
+        styles: &StyleContext,
     ) -> Vec<u16> {
-        let highlight_style = ftui::Style::default()
-            .bg(ftui::PackedRgba::rgb(255, 255, 0))
-            .fg(ftui::PackedRgba::rgb(0, 0, 0));
-        let current_style = ftui::Style::default()
-            .bg(ftui::PackedRgba::rgb(255, 140, 0))
-            .fg(ftui::PackedRgba::rgb(0, 0, 0))
-            .bold();
+        let highlight_style = if styles.options.color_profile.supports_color() {
+            ftui::Style::default()
+                .bg(ftui::PackedRgba::rgb(255, 255, 0))
+                .fg(ftui::PackedRgba::rgb(0, 0, 0))
+        } else {
+            ftui::Style::default().underline().bold()
+        };
+        let current_style = if styles.options.color_profile.supports_color() {
+            ftui::Style::default()
+                .bg(ftui::PackedRgba::rgb(255, 140, 0))
+                .fg(ftui::PackedRgba::rgb(0, 0, 0))
+                .bold()
+        } else {
+            ftui::Style::default().underline().bold().italic()
+        };
 
         if query.is_empty() {
             return Vec::new();
@@ -4222,12 +4239,16 @@ impl super::ftui_adapter::Model for CassApp {
                     .split(layout_area);
 
                 // ── Search bar ──────────────────────────────────────────
-                let query_title = format!(
-                    "cass | {} | {:?}/{:?}",
-                    self.theme_preset.name(),
-                    self.search_mode,
-                    self.match_mode
-                );
+                let mode_label = match self.search_mode {
+                    SearchMode::Lexical => "lexical",
+                    SearchMode::Semantic => "semantic",
+                    SearchMode::Hybrid => "hybrid",
+                };
+                let query_title = if area.width >= 80 {
+                    format!("cass | {} | {mode_label}", self.theme_preset.name())
+                } else {
+                    format!("cass | {mode_label}")
+                };
                 let query_block = Block::new()
                     .borders(adaptive_borders)
                     .border_type(border_type)
@@ -4388,17 +4409,24 @@ impl super::ftui_adapter::Model for CassApp {
                 } else {
                     format!(" | deg:{}", degradation.as_str())
                 };
+                let sel_tag = if self.selected.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | {} sel", self.selected.len())
+                };
                 let status_line = if self.status.is_empty() {
+                    let hints = if area.width >= 100 {
+                        " | F2=theme D=density ^B=borders"
+                    } else if area.width >= 60 {
+                        " | ?=help"
+                    } else {
+                        ""
+                    };
                     format!(
-                        " {} hits | {} | {} | {:?}{} | F2=theme D=density Ctrl+B=borders",
-                        hits_for_status,
-                        bp_label,
-                        density_label,
-                        styles.options.color_profile,
-                        degradation_tag
+                        " {hits_for_status} hits | {bp_label} | {density_label}{degradation_tag}{sel_tag}{hints}",
                     )
                 } else {
-                    format!(" {}{}", self.status, degradation_tag)
+                    format!(" {}{}{}", self.status, degradation_tag, sel_tag)
                 };
                 Paragraph::new(&*status_line)
                     .style(text_muted_style)
@@ -4416,18 +4444,22 @@ impl super::ftui_adapter::Model for CassApp {
                     .split(layout_area);
 
                 // ── Analytics header with view tabs ──────────────────────
-                let view_tabs: String = AnalyticsView::all()
-                    .iter()
-                    .map(|v| {
-                        if *v == self.analytics_view {
-                            format!("[{}]", v.label())
-                        } else {
-                            v.label().to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let header_title = format!("cass analytics | {view_tabs}");
+                let header_title = if area.width >= 100 {
+                    let view_tabs: String = AnalyticsView::all()
+                        .iter()
+                        .map(|v| {
+                            if *v == self.analytics_view {
+                                format!("[{}]", v.label())
+                            } else {
+                                v.label().to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    format!("cass analytics | {view_tabs}")
+                } else {
+                    format!("cass analytics | {}", self.analytics_view.label())
+                };
                 let header_block = Block::new()
                     .borders(adaptive_borders)
                     .border_type(border_type)
