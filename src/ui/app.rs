@@ -3399,24 +3399,74 @@ impl super::ftui_adapter::Model for CassApp {
             return;
         }
 
+        let degradation = frame.degradation;
+
         let breakpoint = LayoutBreakpoint::from_width(area.width);
-        let border_type = if self.fancy_borders {
+        // Degrade border style when the budget controller signals SimpleBorders+
+        let border_type = if self.fancy_borders && degradation.use_unicode_borders() {
             BorderType::Rounded
         } else {
             BorderType::Square
         };
         let row_h = self.density_mode.row_height();
+        // At EssentialOnly+ drop all borders and decorative chrome.
+        let adaptive_borders = if degradation.render_decorative() {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        };
+        let render_content = degradation.render_content();
 
         let styles = self.resolved_style_context();
-        let root_style = styles.style(style_system::STYLE_APP_ROOT);
-        let pane_style = styles.style(style_system::STYLE_PANE_BASE);
-        let pane_focused_style = styles.style(style_system::STYLE_PANE_FOCUSED);
-        let row_style = styles.style(style_system::STYLE_RESULT_ROW);
-        let row_alt_style = styles.style(style_system::STYLE_RESULT_ROW_ALT);
-        let row_selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
-        let text_muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
-        let warning_style = styles.style(style_system::STYLE_STATUS_WARNING);
-        let danger_style = styles.style(style_system::STYLE_STATUS_ERROR);
+        let plain = ftui::Style::default();
+
+        // At NoStyling+ degradation, drop all color to monochrome.
+        let apply_style = degradation.apply_styling();
+        let root_style = if apply_style {
+            styles.style(style_system::STYLE_APP_ROOT)
+        } else {
+            plain
+        };
+        let pane_style = if apply_style {
+            styles.style(style_system::STYLE_PANE_BASE)
+        } else {
+            plain
+        };
+        let pane_focused_style = if apply_style {
+            styles.style(style_system::STYLE_PANE_FOCUSED)
+        } else {
+            plain
+        };
+        let row_style = if apply_style {
+            styles.style(style_system::STYLE_RESULT_ROW)
+        } else {
+            plain
+        };
+        let row_alt_style = if apply_style {
+            styles.style(style_system::STYLE_RESULT_ROW_ALT)
+        } else {
+            plain
+        };
+        let row_selected_style = if apply_style {
+            styles.style(style_system::STYLE_RESULT_ROW_SELECTED)
+        } else {
+            plain
+        };
+        let text_muted_style = if apply_style {
+            styles.style(style_system::STYLE_TEXT_MUTED)
+        } else {
+            plain
+        };
+        let warning_style = if apply_style {
+            styles.style(style_system::STYLE_STATUS_WARNING)
+        } else {
+            plain
+        };
+        let danger_style = if apply_style {
+            styles.style(style_system::STYLE_STATUS_ERROR)
+        } else {
+            plain
+        };
 
         // Paint root background across the entire terminal.
         Block::new().style(root_style).render(area, frame);
@@ -3472,7 +3522,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.match_mode
                 );
                 let query_block = Block::new()
-                    .borders(Borders::ALL)
+                    .borders(adaptive_borders)
                     .border_type(border_type)
                     .title(&query_title)
                     .title_alignment(Alignment::Left)
@@ -3620,13 +3670,22 @@ impl super::ftui_adapter::Model for CassApp {
                 } else {
                     self.results.len()
                 };
+                let degradation_tag = if degradation.is_full() {
+                    String::new()
+                } else {
+                    format!(" | deg:{}", degradation.as_str())
+                };
                 let status_line = if self.status.is_empty() {
                     format!(
-                        " {} hits | {} | {} | {:?} | F2=theme D=density Ctrl+B=borders",
-                        hits_for_status, bp_label, density_label, styles.options.color_profile
+                        " {} hits | {} | {} | {:?}{} | F2=theme D=density Ctrl+B=borders",
+                        hits_for_status,
+                        bp_label,
+                        density_label,
+                        styles.options.color_profile,
+                        degradation_tag
                     )
                 } else {
-                    format!(" {}", self.status)
+                    format!(" {}{}", self.status, degradation_tag)
                 };
                 Paragraph::new(&*status_line)
                     .style(text_muted_style)
@@ -3657,14 +3716,14 @@ impl super::ftui_adapter::Model for CassApp {
                     .join(" | ");
                 let header_title = format!("cass analytics | {view_tabs}");
                 let header_block = Block::new()
-                    .borders(Borders::ALL)
+                    .borders(adaptive_borders)
                     .border_type(border_type)
                     .title(&header_title)
                     .title_alignment(Alignment::Left)
                     .style(pane_focused_style);
                 let header_inner = header_block.inner(vertical[0]);
                 header_block.render(vertical[0], frame);
-                if !header_inner.is_empty() {
+                if render_content && !header_inner.is_empty() {
                     let filter_desc = self.analytics_filter_summary();
                     Paragraph::new(&*filter_desc)
                         .style(text_muted_style)
@@ -3673,14 +3732,14 @@ impl super::ftui_adapter::Model for CassApp {
 
                 // ── Analytics content placeholder ────────────────────────
                 let content_block = Block::new()
-                    .borders(Borders::ALL)
+                    .borders(adaptive_borders)
                     .border_type(border_type)
                     .title(self.analytics_view.label())
                     .title_alignment(Alignment::Left)
                     .style(pane_style);
                 let content_inner = content_block.inner(vertical[1]);
                 content_block.render(vertical[1], frame);
-                if !content_inner.is_empty() {
+                if render_content && !content_inner.is_empty() {
                     let placeholder = format!(
                         "Analytics {} view — placeholder\n\nEsc to return to search | Ctrl+P for palette",
                         self.analytics_view.label()
@@ -3691,9 +3750,15 @@ impl super::ftui_adapter::Model for CassApp {
                 }
 
                 // ── Analytics status footer ──────────────────────────────
+                let analytics_deg_tag = if degradation.is_full() {
+                    String::new()
+                } else {
+                    format!(" | deg:{}", degradation.as_str())
+                };
                 let analytics_status = format!(
-                    " Analytics: {} | Esc=back Ctrl+P=palette",
-                    self.analytics_view.label()
+                    " Analytics: {} | Esc=back Ctrl+P=palette{}",
+                    self.analytics_view.label(),
+                    analytics_deg_tag
                 );
                 Paragraph::new(&*analytics_status)
                     .style(text_muted_style)
@@ -3718,10 +3783,21 @@ impl super::ftui_adapter::Model for CassApp {
 /// The ftui runtime handles terminal lifecycle (raw mode, alt-screen),
 /// event polling, rendering, and cleanup via RAII.
 pub fn run_tui_ftui() -> anyhow::Result<()> {
+    use ftui::render::budget::FrameBudgetConfig;
+
     let model = CassApp::default();
+
+    // 16ms budget (60fps) with adaptive PID degradation.
+    // The BudgetController inside the runtime will automatically
+    // step through DegradationLevel::Full → SimpleBorders → …
+    // when frame times exceed budget.  Bayesian diff strategy
+    // selection (RuntimeDiffConfig::default) is already enabled
+    // by ProgramConfig::fullscreen().
+    let budget = FrameBudgetConfig::default();
 
     ftui::App::fullscreen(model)
         .with_mouse()
+        .with_budget(budget)
         .run()
         .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
 }
@@ -5300,5 +5376,258 @@ mod tests {
         assert!(app.analytics_filters.workspaces.is_empty());
         assert!(app.analytics_filters.since_ms.is_none());
         assert!(app.analytics_filters.until_ms.is_none());
+    }
+
+    // ── Adaptive rendering / perf budget tests ─────────────────────────
+
+    /// Helper: render the app into a buffer at a given degradation level.
+    fn render_at_degradation(
+        app: &CassApp,
+        width: u16,
+        height: u16,
+        level: ftui::render::budget::DegradationLevel,
+    ) -> ftui::Buffer {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(width, height, &mut pool);
+        frame.set_degradation(level);
+        app.view(&mut frame);
+        frame.buffer
+    }
+
+    #[test]
+    fn view_deterministic_under_repeated_renders() {
+        use ftui_harness::buffer_to_text;
+
+        let app = CassApp::default();
+        let buf1 =
+            render_at_degradation(&app, 80, 24, ftui::render::budget::DegradationLevel::Full);
+        let buf2 =
+            render_at_degradation(&app, 80, 24, ftui::render::budget::DegradationLevel::Full);
+        assert_eq!(
+            buffer_to_text(&buf1),
+            buffer_to_text(&buf2),
+            "Repeated renders of the same state must produce identical output"
+        );
+    }
+
+    #[test]
+    fn view_no_panic_at_every_degradation_level() {
+        use ftui::render::budget::DegradationLevel;
+
+        let app = CassApp::default();
+        let levels = [
+            DegradationLevel::Full,
+            DegradationLevel::SimpleBorders,
+            DegradationLevel::NoStyling,
+            DegradationLevel::EssentialOnly,
+            DegradationLevel::Skeleton,
+        ];
+        for level in levels {
+            let _ = render_at_degradation(&app, 80, 24, level);
+        }
+    }
+
+    #[test]
+    fn view_no_panic_analytics_at_every_degradation_level() {
+        use ftui::render::budget::DegradationLevel;
+
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::AnalyticsEntered);
+        let levels = [
+            DegradationLevel::Full,
+            DegradationLevel::SimpleBorders,
+            DegradationLevel::NoStyling,
+            DegradationLevel::EssentialOnly,
+            DegradationLevel::Skeleton,
+        ];
+        for level in levels {
+            let _ = render_at_degradation(&app, 80, 24, level);
+        }
+    }
+
+    #[test]
+    fn view_degraded_borders_differ_from_full() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let app = CassApp::default();
+        let full = buffer_to_text(&render_at_degradation(&app, 80, 24, DegradationLevel::Full));
+        let simple = buffer_to_text(&render_at_degradation(
+            &app,
+            80,
+            24,
+            DegradationLevel::SimpleBorders,
+        ));
+        // Full uses rounded borders (╭), SimpleBorders uses ASCII (+/-/|).
+        assert_ne!(
+            full, simple,
+            "SimpleBorders should produce different output than Full"
+        );
+    }
+
+    #[test]
+    fn view_essential_only_skips_borders() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let app = CassApp::default();
+        let full_text =
+            buffer_to_text(&render_at_degradation(&app, 80, 24, DegradationLevel::Full));
+        let essential_text = buffer_to_text(&render_at_degradation(
+            &app,
+            80,
+            24,
+            DegradationLevel::EssentialOnly,
+        ));
+        // Full rendering has border characters; essential does not.
+        let has_box_char = |s: &str| s.contains('╭') || s.contains('─') || s.contains('+');
+        assert!(
+            has_box_char(&full_text),
+            "Full should contain border characters"
+        );
+        assert!(
+            !has_box_char(&essential_text),
+            "EssentialOnly should not contain border characters"
+        );
+    }
+
+    #[test]
+    fn view_skeleton_skips_analytics_content() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::AnalyticsEntered);
+        let full_text =
+            buffer_to_text(&render_at_degradation(&app, 80, 24, DegradationLevel::Full));
+        let skeleton_text = buffer_to_text(&render_at_degradation(
+            &app,
+            80,
+            24,
+            DegradationLevel::Skeleton,
+        ));
+        // Full shows the placeholder text; Skeleton does not.
+        assert!(
+            full_text.contains("placeholder"),
+            "Full analytics should show placeholder text"
+        );
+        assert!(
+            !skeleton_text.contains("placeholder"),
+            "Skeleton should skip content text"
+        );
+    }
+
+    #[test]
+    fn view_no_styling_drops_colors() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui::render::cell::PackedRgba;
+
+        let app = CassApp::default();
+        let full_buf = render_at_degradation(&app, 80, 24, DegradationLevel::Full);
+        let no_style_buf = render_at_degradation(&app, 80, 24, DegradationLevel::NoStyling);
+
+        // Count cells with non-default/non-transparent foreground or background.
+        let count_colored = |buf: &ftui::Buffer| -> usize {
+            buf.cells()
+                .iter()
+                .filter(|c| {
+                    c.fg != PackedRgba::WHITE && c.fg != PackedRgba::TRANSPARENT
+                        || c.bg != PackedRgba::TRANSPARENT
+                })
+                .count()
+        };
+        let full_colored = count_colored(&full_buf);
+        let no_style_colored = count_colored(&no_style_buf);
+        assert!(
+            no_style_colored < full_colored,
+            "NoStyling ({no_style_colored}) should have fewer colored cells than Full ({full_colored})"
+        );
+    }
+
+    #[test]
+    fn degradation_level_status_tag_shown_when_degraded() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let app = CassApp::default();
+        let full_text = buffer_to_text(&render_at_degradation(
+            &app,
+            120,
+            24,
+            DegradationLevel::Full,
+        ));
+        let degraded_text = buffer_to_text(&render_at_degradation(
+            &app,
+            120,
+            24,
+            DegradationLevel::SimpleBorders,
+        ));
+        assert!(
+            !full_text.contains("deg:"),
+            "Full should not show degradation tag"
+        );
+        assert!(
+            degraded_text.contains("deg:SimpleBorders"),
+            "SimpleBorders should show degradation tag in status"
+        );
+    }
+
+    #[test]
+    fn degradation_level_enum_progression() {
+        use ftui::render::budget::DegradationLevel;
+
+        let mut level = DegradationLevel::Full;
+        assert!(level.is_full());
+        assert!(level.use_unicode_borders());
+        assert!(level.apply_styling());
+        assert!(level.render_decorative());
+        assert!(level.render_content());
+
+        level = level.next(); // SimpleBorders
+        assert!(!level.use_unicode_borders());
+        assert!(level.apply_styling());
+
+        level = level.next(); // NoStyling
+        assert!(!level.apply_styling());
+        assert!(level.render_decorative());
+
+        level = level.next(); // EssentialOnly
+        assert!(!level.render_decorative());
+        assert!(level.render_content());
+
+        level = level.next(); // Skeleton
+        assert!(!level.render_content());
+
+        level = level.next(); // SkipFrame
+        assert!(level.is_max());
+    }
+
+    #[test]
+    fn frame_budget_config_defaults_are_sane() {
+        use ftui::render::budget::FrameBudgetConfig;
+
+        let cfg = FrameBudgetConfig::default();
+        assert_eq!(cfg.total, std::time::Duration::from_millis(16));
+        assert!(cfg.allow_frame_skip);
+        assert_eq!(cfg.degradation_cooldown, 3);
+    }
+
+    #[test]
+    fn render_deterministic_across_both_surfaces() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let mut app = CassApp::default();
+        let search_buf1 = render_at_degradation(&app, 80, 24, DegradationLevel::Full);
+        let search_buf2 = render_at_degradation(&app, 80, 24, DegradationLevel::Full);
+        assert_eq!(buffer_to_text(&search_buf1), buffer_to_text(&search_buf2));
+
+        let _ = app.update(CassMsg::AnalyticsEntered);
+        let analytics_buf1 = render_at_degradation(&app, 80, 24, DegradationLevel::Full);
+        let analytics_buf2 = render_at_degradation(&app, 80, 24, DegradationLevel::Full);
+        assert_eq!(
+            buffer_to_text(&analytics_buf1),
+            buffer_to_text(&analytics_buf2)
+        );
     }
 }
