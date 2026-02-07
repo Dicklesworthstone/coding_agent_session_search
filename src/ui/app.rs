@@ -42,6 +42,7 @@ use crate::ui::components::palette::{PaletteAction, PaletteState, default_action
 use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
 use crate::ui::data::{ConversationView, InputMode};
+use crate::ui::time_parser::parse_time_input;
 use crate::update_check::{UpdateInfo, open_in_browser, skip_version};
 #[cfg(not(test))]
 use crate::update_check::{run_self_update, spawn_update_check};
@@ -115,6 +116,41 @@ pub enum ContextWindow {
     Medium,
     Large,
     XLarge,
+}
+
+/// Quick time filter presets for Shift+F5 cycling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TimePreset {
+    #[default]
+    All,
+    Today,
+    Week,
+    Month,
+    Custom,
+}
+
+impl TimePreset {
+    /// Cycle to the next preset (skips Custom on cycle).
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Today,
+            Self::Today => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::All,
+            Self::Custom => Self::All,
+        }
+    }
+
+    /// Label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All time",
+            Self::Today => "Today",
+            Self::Week => "Past 7d",
+            Self::Month => "Past 30d",
+            Self::Custom => "Custom",
+        }
+    }
 }
 
 /// Visual density of the result list.
@@ -331,6 +367,8 @@ pub struct CassApp {
     pub ranking_mode: RankingMode,
     /// Context window size.
     pub context_window: ContextWindow,
+    /// Active time filter preset (for Shift+F5 cycling).
+    pub time_preset: TimePreset,
 
     // -- Focus & input ----------------------------------------------------
     /// What the user is currently typing into.
@@ -341,6 +379,8 @@ pub struct CassApp {
     pub focus_region: FocusRegion,
     /// FocusGraph-based navigation manager.
     pub focus_manager: FocusManager,
+    /// Cursor position within the query string (byte offset).
+    pub cursor_pos: usize,
     /// Cursor position within query history.
     pub history_cursor: Option<usize>,
     /// Past query strings (most recent first), deduplicated.
@@ -473,10 +513,12 @@ impl Default for CassApp {
             match_mode: MatchMode::default(),
             ranking_mode: RankingMode::default(),
             context_window: ContextWindow::default(),
+            time_preset: TimePreset::default(),
             input_mode: InputMode::Query,
             input_buffer: String::new(),
             focus_region: FocusRegion::default(),
             focus_manager: FocusManager::new(),
+            cursor_pos: 0,
             history_cursor: None,
             query_history: VecDeque::with_capacity(50),
             pane_filter: None,
@@ -873,6 +915,10 @@ pub enum CassMsg {
     },
     /// Search failed with an error message.
     SearchFailed(String),
+    /// Move cursor within the query string (Left/Right arrow keys).
+    CursorMoved { delta: i32 },
+    /// Jump cursor to start or end of query (Home/End keys).
+    CursorJumped { to_end: bool },
     /// Toggle the wildcard fallback indicator (Ctrl+F).
     WildcardFallbackToggled,
 
@@ -887,6 +933,10 @@ pub enum CassMsg {
     FilterSourceSet(SourceFilter),
     /// All filters cleared.
     FiltersClearAll,
+    /// Cycle time filter preset (All -> Today -> Week -> Month -> All).
+    TimePresetCycled,
+    /// Cycle source filter (All -> Local -> Remote -> All).
+    SourceFilterCycled,
 
     // -- Mode cycling -----------------------------------------------------
     /// Cycle search mode (Lexical -> Semantic -> Hybrid).
@@ -1314,7 +1364,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::F(3) => CassMsg::InputModeEntered(InputMode::Agent),
                     KeyCode::F(4) if shift => CassMsg::FiltersClearAll,
                     KeyCode::F(4) => CassMsg::InputModeEntered(InputMode::Workspace),
-                    KeyCode::F(5) if shift => CassMsg::Tick, // cycle time presets
+                    KeyCode::F(5) if shift => CassMsg::TimePresetCycled,
                     KeyCode::F(5) => CassMsg::InputModeEntered(InputMode::CreatedFrom),
                     KeyCode::F(6) => CassMsg::InputModeEntered(InputMode::CreatedTo),
 
@@ -1329,7 +1379,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                     // -- Source filter ---------------------------------------------
                     KeyCode::F(11) if shift => CassMsg::SourceFilterMenuToggled,
-                    KeyCode::F(11) => CassMsg::Tick, // cycle source filter
+                    KeyCode::F(11) => CassMsg::SourceFilterCycled,
 
                     // -- Ranking --------------------------------------------------
                     KeyCode::F(12) => CassMsg::RankingModeCycled,
@@ -1395,10 +1445,14 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Right | KeyCode::Char('l') if alt => CassMsg::FocusDirectional {
                         direction: FocusDirection::Right,
                     },
+                    // -- Cursor movement (query editing) --------------------------
+                    KeyCode::Left => CassMsg::CursorMoved { delta: -1 },
+                    KeyCode::Right => CassMsg::CursorMoved { delta: 1 },
+
                     KeyCode::Up => CassMsg::SelectionMoved { delta: -1 },
                     KeyCode::Down => CassMsg::SelectionMoved { delta: 1 },
-                    KeyCode::Home => CassMsg::SelectionJumped { to_end: false },
-                    KeyCode::End => CassMsg::SelectionJumped { to_end: true },
+                    KeyCode::Home => CassMsg::CursorJumped { to_end: false },
+                    KeyCode::End => CassMsg::CursorJumped { to_end: true },
                     KeyCode::PageUp => CassMsg::PageScrolled { delta: -1 },
                     KeyCode::PageDown => CassMsg::PageScrolled { delta: 1 },
                     KeyCode::Enter => CassMsg::DetailOpened,
@@ -1518,36 +1572,45 @@ impl super::ftui_adapter::Model for CassApp {
             // -- Query & search -----------------------------------------------
             CassMsg::QueryChanged(text) => {
                 if text.is_empty() {
-                    // Backspace: remove last char from query
-                    self.query.pop();
+                    // Backspace: remove char before cursor
+                    if self.cursor_pos > 0 {
+                        self.query.remove(self.cursor_pos - 1);
+                        self.cursor_pos -= 1;
+                    }
                 } else {
-                    self.query.push_str(&text);
+                    self.query.insert_str(self.cursor_pos, &text);
+                    self.cursor_pos += text.len();
                 }
                 self.dirty_since = Some(Instant::now());
-                // Mark search dirty for debounced dispatch on next Tick
                 self.search_dirty_since = Some(Instant::now());
-                self.history_cursor = None; // reset history nav on new input
-                ftui::Cmd::none()
+                self.history_cursor = None;
+                ftui::Cmd::tick(SEARCH_DEBOUNCE)
             }
             CassMsg::QueryCleared => {
                 self.query.clear();
+                self.cursor_pos = 0;
                 self.dirty_since = Some(Instant::now());
                 self.search_dirty_since = Some(Instant::now());
                 self.history_cursor = None;
-                ftui::Cmd::none()
+                ftui::Cmd::tick(SEARCH_DEBOUNCE)
             }
             CassMsg::QueryWordDeleted => {
-                // Delete last word (Ctrl+W): trim trailing whitespace, then trim to
-                // the last whitespace boundary.
-                let trimmed = self.query.trim_end();
-                if let Some(pos) = trimmed.rfind(char::is_whitespace) {
-                    self.query.truncate(pos + 1);
-                } else {
-                    self.query.clear();
+                // Delete word backward from cursor (Ctrl+W): trim trailing
+                // whitespace before cursor, then delete to word boundary.
+                if self.cursor_pos > 0 {
+                    let before = &self.query[..self.cursor_pos];
+                    let trimmed = before.trim_end();
+                    let new_end = trimmed
+                        .rfind(|c: char| c.is_whitespace())
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    self.query.drain(new_end..self.cursor_pos);
+                    self.cursor_pos = new_end;
+                    self.dirty_since = Some(Instant::now());
+                    self.search_dirty_since = Some(Instant::now());
+                    self.history_cursor = None;
+                    return ftui::Cmd::tick(SEARCH_DEBOUNCE);
                 }
-                self.dirty_since = Some(Instant::now());
-                self.search_dirty_since = Some(Instant::now());
-                self.history_cursor = None;
                 ftui::Cmd::none()
             }
             CassMsg::QuerySubmitted => {
@@ -1564,6 +1627,7 @@ impl super::ftui_adapter::Model for CassApp {
                 } else if let Some(prev) = self.query_history.front().cloned() {
                     // Empty query + history → load most recent query
                     self.query = prev;
+                    self.cursor_pos = self.query.len();
                 }
                 self.history_cursor = None;
                 self.search_dirty_since = None; // cancel pending debounce
@@ -1651,6 +1715,15 @@ impl super::ftui_adapter::Model for CassApp {
                 self.status = format!("Search error: {err}");
                 ftui::Cmd::none()
             }
+            CassMsg::CursorMoved { delta } => {
+                let new_pos = self.cursor_pos as i32 + delta;
+                self.cursor_pos = new_pos.clamp(0, self.query.len() as i32) as usize;
+                ftui::Cmd::none()
+            }
+            CassMsg::CursorJumped { to_end } => {
+                self.cursor_pos = if to_end { self.query.len() } else { 0 };
+                ftui::Cmd::none()
+            }
             CassMsg::WildcardFallbackToggled => {
                 self.wildcard_fallback = !self.wildcard_fallback;
                 ftui::Cmd::none()
@@ -1676,6 +1749,30 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::FiltersClearAll => {
                 self.filters = SearchFilters::default();
+                self.time_preset = TimePreset::All;
+                ftui::Cmd::msg(CassMsg::SearchRequested)
+            }
+            CassMsg::TimePresetCycled => {
+                self.time_preset = self.time_preset.next();
+                let now = chrono::Utc::now().timestamp();
+                let (from, to) = match self.time_preset {
+                    TimePreset::All => (None, None),
+                    TimePreset::Today => (Some(now - (now % 86400)), None),
+                    TimePreset::Week => (Some(now - 7 * 86400), None),
+                    TimePreset::Month => (Some(now - 30 * 86400), None),
+                    TimePreset::Custom => (self.filters.created_from, self.filters.created_to),
+                };
+                self.filters.created_from = from;
+                self.filters.created_to = to;
+                ftui::Cmd::msg(CassMsg::SearchRequested)
+            }
+            CassMsg::SourceFilterCycled => {
+                self.filters.source_filter = match self.filters.source_filter {
+                    SourceFilter::All => SourceFilter::Local,
+                    SourceFilter::Local => SourceFilter::Remote,
+                    SourceFilter::Remote => SourceFilter::All,
+                    SourceFilter::SourceId(_) => SourceFilter::All,
+                };
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
 
@@ -1988,10 +2085,54 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::InputModeApplied => {
-                // TODO: apply buffer as filter based on input_mode
+                let buf = self.input_buffer.trim().to_string();
+                let cmd = match self.input_mode {
+                    InputMode::Agent if !buf.is_empty() => {
+                        // Parse comma-separated agent names.
+                        let agents: HashSet<String> =
+                            buf.split(',').map(|s| s.trim().to_string()).collect();
+                        ftui::Cmd::msg(CassMsg::FilterAgentSet(agents))
+                    }
+                    InputMode::Workspace if !buf.is_empty() => {
+                        let workspaces: HashSet<String> =
+                            buf.split(',').map(|s| s.trim().to_string()).collect();
+                        ftui::Cmd::msg(CassMsg::FilterWorkspaceSet(workspaces))
+                    }
+                    InputMode::CreatedFrom => {
+                        let ts = parse_time_input(&buf);
+                        if ts.is_some() || buf.is_empty() {
+                            self.time_preset = if ts.is_some() {
+                                TimePreset::Custom
+                            } else {
+                                TimePreset::All
+                            };
+                            ftui::Cmd::msg(CassMsg::FilterTimeSet {
+                                from: ts,
+                                to: self.filters.created_to,
+                            })
+                        } else {
+                            self.status = format!("Invalid date: {buf}");
+                            ftui::Cmd::none()
+                        }
+                    }
+                    InputMode::CreatedTo => {
+                        let ts = parse_time_input(&buf);
+                        if ts.is_some() || buf.is_empty() {
+                            self.time_preset = TimePreset::Custom;
+                            ftui::Cmd::msg(CassMsg::FilterTimeSet {
+                                from: self.filters.created_from,
+                                to: ts,
+                            })
+                        } else {
+                            self.status = format!("Invalid date: {buf}");
+                            ftui::Cmd::none()
+                        }
+                    }
+                    _ => ftui::Cmd::none(),
+                };
                 self.input_mode = InputMode::Query;
                 self.input_buffer.clear();
-                ftui::Cmd::none()
+                cmd
             }
             CassMsg::InputModeCancelled => {
                 self.input_mode = InputMode::Query;
@@ -2019,6 +2160,7 @@ impl super::ftui_adapter::Model for CassApp {
                     && let Some(q) = self.query_history.get(idx)
                 {
                     self.query = q.clone();
+                    self.cursor_pos = self.query.len();
                 }
                 ftui::Cmd::none()
             }
@@ -2663,19 +2805,19 @@ impl super::ftui_adapter::Model for CassApp {
         let query_inner = query_block.inner(vertical[0]);
         query_block.render(vertical[0], frame);
         if !query_inner.is_empty() {
-            let query_line = if self.query.is_empty() {
-                "<type to search>"
+            if self.query.is_empty() {
+                Paragraph::new("\u{2502}<type to search>")
+                    .style(text_muted_style)
+                    .render(query_inner, frame);
             } else {
-                self.query.as_str()
+                // Render query with cursor indicator at cursor_pos.
+                let cpos = self.cursor_pos.min(self.query.len());
+                let display = format!("{}\u{2502}{}", &self.query[..cpos], &self.query[cpos..]);
+                let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
+                Paragraph::new(&*display)
+                    .style(text_style)
+                    .render(query_inner, frame);
             };
-            let query_style = if self.query.is_empty() {
-                text_muted_style
-            } else {
-                styles.style(style_system::STYLE_TEXT_PRIMARY)
-            };
-            Paragraph::new(query_line)
-                .style(query_style)
-                .render(query_inner, frame);
         }
 
         // ── Content area: responsive layout ─────────────────────────────
@@ -2930,6 +3072,8 @@ mod tests {
         let _p = CassMsg::PaletteOpened;
         let _h = CassMsg::HelpToggled;
         let _t = CassMsg::ThemeToggled;
+        let _cm = CassMsg::CursorMoved { delta: 1 };
+        let _cj = CassMsg::CursorJumped { to_end: true };
         let _tick = CassMsg::Tick;
         let _quit = CassMsg::QuitRequested;
         let _fq = CassMsg::ForceQuit;
@@ -3197,14 +3341,17 @@ mod tests {
         let _ = app.update(CassMsg::QueryChanged("e".into()));
         let _ = app.update(CassMsg::QueryChanged("l".into()));
         assert_eq!(app.query, "hel");
+        assert_eq!(app.cursor_pos, 3);
     }
 
     #[test]
     fn query_changed_backspace_removes_char() {
         let mut app = CassApp::default();
         app.query = "hello".to_string();
+        app.cursor_pos = 5;
         let _ = app.update(CassMsg::QueryChanged(String::new())); // backspace
         assert_eq!(app.query, "hell");
+        assert_eq!(app.cursor_pos, 4);
     }
 
     #[test]
@@ -3228,16 +3375,20 @@ mod tests {
     fn query_word_deleted_removes_last_word() {
         let mut app = CassApp::default();
         app.query = "hello world".to_string();
+        app.cursor_pos = 11;
         let _ = app.update(CassMsg::QueryWordDeleted);
         assert_eq!(app.query, "hello ");
+        assert_eq!(app.cursor_pos, 6);
     }
 
     #[test]
     fn query_word_deleted_single_word_clears() {
         let mut app = CassApp::default();
         app.query = "hello".to_string();
+        app.cursor_pos = 5;
         let _ = app.update(CassMsg::QueryWordDeleted);
         assert!(app.query.is_empty());
+        assert_eq!(app.cursor_pos, 0);
     }
 
     #[test]
@@ -3428,6 +3579,109 @@ mod tests {
         app.history_cursor = Some(2);
         let _ = app.update(CassMsg::QueryChanged("x".into()));
         assert!(app.history_cursor.is_none());
+    }
+
+    #[test]
+    fn query_changed_returns_tick_cmd() {
+        let mut app = CassApp::default();
+        let cmd = app.update(CassMsg::QueryChanged("a".into()));
+        assert!(
+            matches!(cmd, ftui::Cmd::Tick(_)),
+            "QueryChanged should return Cmd::Tick for debounce"
+        );
+    }
+
+    #[test]
+    fn query_cleared_returns_tick_and_resets_cursor() {
+        let mut app = CassApp::default();
+        app.query = "foo".to_string();
+        app.cursor_pos = 3;
+        let cmd = app.update(CassMsg::QueryCleared);
+        assert!(
+            matches!(cmd, ftui::Cmd::Tick(_)),
+            "QueryCleared should return Cmd::Tick"
+        );
+        assert_eq!(app.cursor_pos, 0);
+    }
+
+    #[test]
+    fn query_word_deleted_returns_tick_cmd() {
+        let mut app = CassApp::default();
+        app.query = "hello world".to_string();
+        app.cursor_pos = 11;
+        let cmd = app.update(CassMsg::QueryWordDeleted);
+        assert!(
+            matches!(cmd, ftui::Cmd::Tick(_)),
+            "QueryWordDeleted should return Cmd::Tick when text was deleted"
+        );
+    }
+
+    #[test]
+    fn query_word_deleted_noop_at_start() {
+        let mut app = CassApp::default();
+        app.query = "hello".to_string();
+        app.cursor_pos = 0;
+        let cmd = app.update(CassMsg::QueryWordDeleted);
+        assert_eq!(
+            app.query, "hello",
+            "should not change query when cursor at 0"
+        );
+        assert!(matches!(cmd, ftui::Cmd::None));
+    }
+
+    #[test]
+    fn cursor_moved_bounds_checking() {
+        let mut app = CassApp::default();
+        app.query = "abc".to_string();
+        app.cursor_pos = 1;
+        let _ = app.update(CassMsg::CursorMoved { delta: -1 });
+        assert_eq!(app.cursor_pos, 0);
+        let _ = app.update(CassMsg::CursorMoved { delta: -1 });
+        assert_eq!(app.cursor_pos, 0, "should clamp at 0");
+        let _ = app.update(CassMsg::CursorMoved { delta: 1 });
+        assert_eq!(app.cursor_pos, 1);
+        let _ = app.update(CassMsg::CursorMoved { delta: 10 });
+        assert_eq!(app.cursor_pos, 3, "should clamp at query length");
+    }
+
+    #[test]
+    fn cursor_jumped_to_start_and_end() {
+        let mut app = CassApp::default();
+        app.query = "hello world".to_string();
+        app.cursor_pos = 5;
+        let _ = app.update(CassMsg::CursorJumped { to_end: true });
+        assert_eq!(app.cursor_pos, 11);
+        let _ = app.update(CassMsg::CursorJumped { to_end: false });
+        assert_eq!(app.cursor_pos, 0);
+    }
+
+    #[test]
+    fn insert_at_cursor_middle() {
+        let mut app = CassApp::default();
+        app.query = "hllo".to_string();
+        app.cursor_pos = 1;
+        let _ = app.update(CassMsg::QueryChanged("e".into()));
+        assert_eq!(app.query, "hello");
+        assert_eq!(app.cursor_pos, 2);
+    }
+
+    #[test]
+    fn backspace_at_cursor_middle() {
+        let mut app = CassApp::default();
+        app.query = "heello".to_string();
+        app.cursor_pos = 3;
+        let _ = app.update(CassMsg::QueryChanged(String::new()));
+        assert_eq!(app.query, "hello");
+        assert_eq!(app.cursor_pos, 2);
+    }
+
+    #[test]
+    fn history_navigation_sets_cursor_to_end() {
+        let mut app = CassApp::default();
+        app.query_history.push_front("long query text".to_string());
+        app.cursor_pos = 0;
+        let _ = app.update(CassMsg::HistoryNavigated { forward: true });
+        assert_eq!(app.cursor_pos, 15);
     }
 
     // ==================== Update assistant tests ====================
@@ -3785,5 +4039,153 @@ mod tests {
         };
         assert!(queued_item.queued);
         assert!(!not_queued.queued);
+    }
+
+    // =====================================================================
+    // 2noh9.3.3 — Filter UI tests
+    // =====================================================================
+
+    #[test]
+    fn time_preset_cycles_all_today_week_month() {
+        assert_eq!(TimePreset::All.next(), TimePreset::Today);
+        assert_eq!(TimePreset::Today.next(), TimePreset::Week);
+        assert_eq!(TimePreset::Week.next(), TimePreset::Month);
+        assert_eq!(TimePreset::Month.next(), TimePreset::All);
+        // Custom also goes back to All
+        assert_eq!(TimePreset::Custom.next(), TimePreset::All);
+    }
+
+    #[test]
+    fn time_preset_labels() {
+        assert_eq!(TimePreset::All.label(), "All time");
+        assert_eq!(TimePreset::Today.label(), "Today");
+        assert_eq!(TimePreset::Week.label(), "Past 7d");
+        assert_eq!(TimePreset::Month.label(), "Past 30d");
+        assert_eq!(TimePreset::Custom.label(), "Custom");
+    }
+
+    #[test]
+    fn time_preset_cycled_sets_filter_timestamps() {
+        let mut app = CassApp::default();
+        assert_eq!(app.time_preset, TimePreset::All);
+        assert!(app.filters.created_from.is_none());
+
+        // Cycle: All -> Today
+        let _ = app.update(CassMsg::TimePresetCycled);
+        assert_eq!(app.time_preset, TimePreset::Today);
+        assert!(app.filters.created_from.is_some());
+        assert!(app.filters.created_to.is_none());
+
+        // Cycle: Today -> Week
+        let _ = app.update(CassMsg::TimePresetCycled);
+        assert_eq!(app.time_preset, TimePreset::Week);
+        assert!(app.filters.created_from.is_some());
+
+        // Cycle: Week -> Month
+        let _ = app.update(CassMsg::TimePresetCycled);
+        assert_eq!(app.time_preset, TimePreset::Month);
+        assert!(app.filters.created_from.is_some());
+
+        // Cycle: Month -> All (clears timestamps)
+        let _ = app.update(CassMsg::TimePresetCycled);
+        assert_eq!(app.time_preset, TimePreset::All);
+        assert!(app.filters.created_from.is_none());
+        assert!(app.filters.created_to.is_none());
+    }
+
+    #[test]
+    fn source_filter_cycles_all_local_remote() {
+        let mut app = CassApp::default();
+        assert_eq!(app.filters.source_filter, SourceFilter::All);
+
+        let _ = app.update(CassMsg::SourceFilterCycled);
+        assert_eq!(app.filters.source_filter, SourceFilter::Local);
+
+        let _ = app.update(CassMsg::SourceFilterCycled);
+        assert_eq!(app.filters.source_filter, SourceFilter::Remote);
+
+        let _ = app.update(CassMsg::SourceFilterCycled);
+        assert_eq!(app.filters.source_filter, SourceFilter::All);
+    }
+
+    #[test]
+    fn source_filter_source_id_resets_to_all() {
+        let mut app = CassApp::default();
+        app.filters.source_filter = SourceFilter::SourceId("myhost".to_string());
+        let _ = app.update(CassMsg::SourceFilterCycled);
+        assert_eq!(app.filters.source_filter, SourceFilter::All);
+    }
+
+    #[test]
+    fn input_mode_applied_agent_parses_csv() {
+        let mut app = CassApp::default();
+        app.input_mode = InputMode::Agent;
+        app.input_buffer = "claude_code, aider, codex".to_string();
+        let _ = app.update(CassMsg::InputModeApplied);
+
+        // Should have reset mode and cleared buffer
+        assert_eq!(app.input_mode, InputMode::Query);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn input_mode_applied_workspace_parses_csv() {
+        let mut app = CassApp::default();
+        app.input_mode = InputMode::Workspace;
+        app.input_buffer = "project_a, project_b".to_string();
+        let _ = app.update(CassMsg::InputModeApplied);
+
+        assert_eq!(app.input_mode, InputMode::Query);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn input_mode_applied_created_from_invalid_date_shows_error() {
+        let mut app = CassApp::default();
+        app.input_mode = InputMode::CreatedFrom;
+        app.input_buffer = "not-a-date".to_string();
+        let _ = app.update(CassMsg::InputModeApplied);
+
+        assert!(app.status.contains("Invalid date"));
+        assert_eq!(app.input_mode, InputMode::Query);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn input_mode_applied_created_from_empty_clears_filter() {
+        let mut app = CassApp::default();
+        app.time_preset = TimePreset::Custom;
+        app.input_mode = InputMode::CreatedFrom;
+        app.input_buffer = "".to_string();
+        let _ = app.update(CassMsg::InputModeApplied);
+
+        assert_eq!(app.time_preset, TimePreset::All);
+        assert_eq!(app.input_mode, InputMode::Query);
+    }
+
+    #[test]
+    fn input_mode_applied_created_to_invalid_date_shows_error() {
+        let mut app = CassApp::default();
+        app.input_mode = InputMode::CreatedTo;
+        app.input_buffer = "bogus".to_string();
+        let _ = app.update(CassMsg::InputModeApplied);
+
+        assert!(app.status.contains("Invalid date"));
+        assert_eq!(app.input_mode, InputMode::Query);
+    }
+
+    #[test]
+    fn filters_clear_all_resets_time_preset() {
+        let mut app = CassApp::default();
+        // Set up some filter state
+        app.time_preset = TimePreset::Week;
+        app.filters.created_from = Some(1000);
+        app.filters.source_filter = SourceFilter::Local;
+
+        let _ = app.update(CassMsg::FiltersClearAll);
+
+        assert_eq!(app.time_preset, TimePreset::All);
+        assert!(app.filters.created_from.is_none());
+        assert_eq!(app.filters.source_filter, SourceFilter::All);
     }
 }
