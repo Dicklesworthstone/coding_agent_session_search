@@ -104,22 +104,22 @@ Related issues: coding_agent_session_search-2noh9.1.4, coding_agent_session_sear
 
 ### Core Mapping Table
 
-| Concern | Current cass (ratatui/crossterm) | Target cass (ftui) | Implementation Notes |
+| Concern | Status | cass (ftui) | Implementation Notes |
 |---|---|---|---|
-| Terminal lifecycle | Manual raw mode + alt-screen setup/teardown in `src/ui/tui.rs` | `ftui_core::terminal_session::TerminalSession` + `SessionOptions` | Centralize startup/shutdown in one session owner; guarantees cleanup on panic/exit paths. |
-| Screen mode | Fullscreen/alt-screen only | `ftui_runtime::ScreenMode::{Fullscreen, Inline { ui_height }}` + `UiAnchor` | Enables inline mode without custom terminal hacks; preserve fullscreen default. |
-| Render pipeline | Immediate-mode drawing via ratatui frame | `ftui_render::Frame` -> `BufferDiff` -> `Presenter` | Move to deterministic diff-based rendering and reduce terminal write churn. |
-| Event model | `crossterm::event::Event` handled directly in imperative loop | `ftui_core::event::Event` consumed by `Program` update loop | Keep one conversion boundary; all feature logic receives normalized ftui events. |
-| Runtime orchestration | Hand-rolled poll loop + ad hoc async channels | `ftui_runtime::{Program, Model, Cmd, Subscription}` | Make side effects explicit (`Cmd`) and composable; simplify cancellation/debounce behavior. |
-| Layout system | Ratatui `Layout` split + hardcoded constraints | `ftui_layout::{Flex, Grid, Constraint, LayoutSizeHint}` | Replace percentage-only splits with intrinsic/responsive layout and explicit breakpoints. |
-| Widget primitives | Ratatui widgets + custom drawing functions | `ftui_widgets::{Widget, StatefulWidget}` + targeted built-ins | Prefer built-ins to reduce cass-specific UI code volume and increase testability. |
-| Command palette | Custom palette state/render code | `ftui_widgets::command_palette` | Keep keybinding contract, swap internals to standard widget. |
-| Help system | Custom help strip/overlay renderer | `ftui_widgets::{help, help_registry, hint_ranker}` | Preserve discoverability while making context ranking first-class. |
-| Results virtualization | Manual list rendering + paging state | `ftui_widgets::VirtualizedList` | Scale to large result sets with bounded render cost. |
-| Modal/toast stack | Cass-owned overlay/toast manager | `ftui_widgets::{modal, toast, notification_queue}` | Keep ESC/back semantics while standardizing stack behavior. |
-| Focus traversal | Manual focus enum + ad hoc transitions | `ftui_widgets::focus::{FocusGraph, FocusManager}` | Define one focus graph for panes, modals, and command palette. |
-| Testing harness | Ratatui backend tests + smoke e2e | `ftui-harness` snapshots + `ProgramSimulator` + render traces | Deterministic snapshot and state-transition testing becomes primary path. |
-| Debug traceability | Mixed logs + hand-debugging | `ftui_runtime::{render_trace, input_macro, AsciicastRecorder}` | Capture replayable traces for flaky keyflow and rendering bugs. |
+| Terminal lifecycle | Done | `ftui_core::terminal_session::TerminalSession` + `SessionOptions` | Centralized startup/shutdown in one session owner; guarantees cleanup on panic/exit paths. |
+| Screen mode | Done | `ftui_runtime::ScreenMode::{Fullscreen, Inline { ui_height }}` + `UiAnchor` | Inline mode via `--inline` flag; fullscreen remains default. |
+| Render pipeline | Done | `ftui_render::Frame` -> `BufferDiff` -> `Presenter` | Deterministic diff-based rendering with Bayesian strategy selection. |
+| Event model | Done | `ftui_core::event::Event` consumed by `Program` update loop | All feature logic receives normalized ftui events via `CassMsg`. |
+| Runtime orchestration | Done | `ftui_runtime::{Program, Model, Cmd, Subscription}` | Side effects are explicit (`Cmd`) and composable; cancellation/debounce via runtime. |
+| Layout system | Done | `ftui_layout::{Flex, Grid, Constraint, LayoutSizeHint}` | Responsive layout with intrinsic sizing and explicit breakpoints. |
+| Widget primitives | Done | `ftui_widgets::{Widget, StatefulWidget}` + targeted built-ins | Built-ins used where available; cass-specific wrappers where needed. |
+| Command palette | Done | `ftui_widgets::command_palette` | Keybinding contract preserved, internals use standard widget. |
+| Help system | Done | `ftui_widgets::{help, help_registry, hint_ranker}` | Discoverability preserved with context ranking. |
+| Results virtualization | Done | `ftui_widgets::VirtualizedList` | Scales to large result sets with bounded render cost. |
+| Modal/toast stack | Done | `ftui_widgets::{modal, toast, notification_queue}` | ESC/back semantics preserved with standardized stack behavior. |
+| Focus traversal | Done | `ftui_widgets::focus::{FocusGraph, FocusManager}` | One focus graph for panes, modals, and command palette. |
+| Testing harness | Done | `ftui-harness` snapshots + `ProgramSimulator` + render traces | Snapshot and state-transition testing is primary path. |
+| Debug traceability | Done | `ftui_runtime::{render_trace, input_macro, AsciicastRecorder}` | Replayable traces for keyflow and rendering debugging. |
 
 ### Widget Adoption Plan (Use Built-ins First)
 
@@ -148,10 +148,10 @@ Related issues: coding_agent_session_search-2noh9.1.4, coding_agent_session_sear
 
 ### Migration Execution Order
 
-1. Foundation (`2noh9.2.x`): dependency + runtime skeleton + terminal/session wiring.
-2. Parity (`2noh9.3.x`): search/filter/results/detail/modals reimplemented on ftui.
-3. Enhancements (`2noh9.4.x`): inline mode, traces, advanced UX, dashboards.
-4. QA and removal (`2noh9.5.x`, `2noh9.6.x`): test hardening, then remove ratatui.
+1. Foundation (`2noh9.2.x`): dependency + runtime skeleton + terminal/session wiring. **Done.**
+2. Parity (`2noh9.3.x`): search/filter/results/detail/modals reimplemented on ftui. **Done.**
+3. Enhancements (`2noh9.4.x`): inline mode, traces, advanced UX, dashboards. **In progress.**
+4. QA and removal (`2noh9.5.x`, `2noh9.6.x`): test hardening, ratatui removed. **Ratatui fully removed (2noh9.6.1).**
 
 ### Acceptance for This Mapping Bead
 

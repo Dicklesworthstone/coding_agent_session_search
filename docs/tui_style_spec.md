@@ -2,7 +2,7 @@
 
 Status: draft  
 Owner: RedHill  
-Scope: ratatui-based UI (interactive + robot-safe fallbacks)
+Scope: FrankenTUI (ftui) Elm-architecture UI (interactive + robot-safe fallbacks)
 
 ## Goals
 - Make cass “instant, legible, delightful” without sacrificing low-end terminals.

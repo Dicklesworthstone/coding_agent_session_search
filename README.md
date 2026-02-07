@@ -231,14 +231,20 @@ cass search "auth error handling" --mode hybrid --robot
 - **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms with markers (`**bold**` for text, `<mark>` for HTML output).
 
 ### 🖥️ Rich Terminal UI (TUI)
+
+Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) — a high-performance Elm-architecture TUI framework with adaptive frame budgets, Bayesian diff selection, and spring-based animations.
+
 - **Three-Pane Layout**: Filter bar (top), scrollable results (left), and syntax-highlighted details (right).
 - **Multi-Line Result Display**: Each result shows location and up to 3 lines of context; alternating stripes improve scanability.
 - **Live Status**: Footer shows real-time indexing progress—agent discovery count during scanning, then item progress with sparkline visualization (e.g., `📦 Indexing 150/2000 (7%) ▁▂▄▆█`)—plus active filters.
 - **Multi-Open Queue**: Queue multiple results with `Ctrl+Enter`, then open all in your editor with `Ctrl+O`. Confirmation prompt for large batches (≥12 items).
 - **Find-in-Detail**: Press `/` to search within the detail pane; matches highlighted with `n`/`N` navigation.
 - **Mouse Support**: Click to select results, scroll panes, or clear filters.
-- **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Toggle border style (`Ctrl+B`) between rounded Unicode and plain ASCII.
+- **Theming**: Adaptive Dark/Light modes with role-colored messages (User/Assistant/System). Presets include dark, light, high-contrast, and accessible variants.
 - **Ranking Modes**: Cycle through `recent`/`balanced`/`relevance`/`quality` with `F12`; quality mode penalizes fuzzy matches.
+- **Analytics Dashboard**: 8 views (Dashboard, Explorer, Heatmap, Breakdowns, Tools, Cost, Plans, Coverage) with interactive charts, KPI tiles, and drill-down filtering. Toggle with `A`.
+- **Inline Mode**: Run `cass tui --inline` to keep terminal scrollback intact. The UI anchors to a region of the terminal while logs scroll normally. Configure with `--ui-height <rows>` and `--anchor top|bottom`.
+- **Macro Recording**: Capture input sessions with `cass tui --record-macro session.macro` for reproducible bug reports and workflow automation. Events are saved as human-readable JSONL with full timing data.
 - **Asciicast Recording**: Capture reproducible TUI demos and bug repro artifacts with `cass tui --asciicast demo.cast`.
   - Security default: recording captures terminal output only (input keystrokes are not serialized by default).
 
@@ -1782,7 +1788,7 @@ flowchart LR
  end
 
  subgraph "Presentation"
- U1["TUI (Ratatui)\nAsync Search\nFilter Pills\nDetails"]:::pastel5
+ U1["TUI (FrankenTUI)\nElm Architecture\nAnalytics Dashboard\nAsync Search"]:::pastel5
  U2["CLI / Robot\nJSON Output\nAutomation"]:::pastel5
  end
 
@@ -1815,24 +1821,26 @@ flowchart LR
 
 ## 🔍 Deep Dive: Internals
 
-### The TUI Engine (State Machine & Async Loop)
-The interactive interface (`src/ui/tui.rs`) is the largest component (~3.5k lines), implementing a sophisticated **Immediate Mode** architecture using `ratatui`.
+### The TUI Engine (Elm Architecture on FrankenTUI)
+The interactive interface (`src/ui/app.rs`) uses **FrankenTUI (ftui)**, a Rust TUI framework implementing the Elm architecture (Model-View-Update). The runtime handles terminal lifecycle, event polling, rendering, and cleanup.
 
-1. **Application State**: A monolithic struct tracks the entire UI state (search query, cursor position, scroll offsets, active filters, and cached details).
-2. **Event Loop**: A polling loop handles standard inputs (keyboard/mouse) and custom events (Search results ready, Progress updates).
-3. **Debouncing**: User input triggers an async search task via a `tokio` channel. To prevent UI freezing, we debounce keystrokes (150ms) and run queries on a separate thread, updating the state only when results return.
-4. **Optimistic Rendering**: The UI renders the *current* state immediately (60 FPS), drawing "stale" results or loading skeletons while waiting for the async searcher.
+1. **Model (CassApp)**: A monolithic struct tracks the entire UI state (search query, cursor position, scroll offsets, active filters, cached details, animation state).
+2. **Update**: Each event (key, mouse, tick, resize) maps to a `CassMsg` variant. The `update()` function produces `Cmd` effects (async tasks, ticks, quit).
+3. **View**: The `view()` function renders the current state to an ftui `Frame`. The runtime diff engine minimizes terminal writes using Bayesian strategy selection.
+4. **Adaptive Budget**: A 16ms (60fps) frame budget with PID-controlled degradation automatically simplifies rendering (borders, animations) when frame times exceed budget.
+5. **Background Tasks**: Search queries, indexing, and analytics run on background threads via `Cmd::Task`, with results delivered as messages.
 
 ```mermaid
 graph TD
- Input([User Input]) -->|Key/Mouse| EventLoop
- EventLoop -->|Update| State[App State]
- State -->|Render| Terminal
- 
- State -->|Query Change| Debounce{Debounce}
- Debounce -->|Fire| SearchTask[Async Search]
- SearchTask -->|Results| Channel
- Channel -->|Poll| EventLoop
+ Input([User Input]) -->|Key/Mouse/Tick| Runtime
+ Runtime -->|CassMsg| Update[Model::update]
+ Update -->|Cmd| Runtime
+ Update -->|State Change| View[Model::view]
+ View -->|Frame| DiffEngine[Bayesian Diff]
+ DiffEngine -->|Minimal Writes| Terminal
+
+ Update -->|Cmd::Task| Background[Background Thread]
+ Background -->|Result Msg| Runtime
 ```
 
 ### Append-Only Storage Strategy
