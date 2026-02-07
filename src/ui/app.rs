@@ -2378,6 +2378,8 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('e') if ctrl => CassMsg::ExportModalOpened,
 
                     // -- Clipboard ------------------------------------------------
+                    KeyCode::Char('Y') if ctrl => CassMsg::CopyQuery,
+                    KeyCode::Char('y') if ctrl && shift => CassMsg::CopyQuery,
                     KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
                     KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
 
@@ -5016,6 +5018,27 @@ mod tests {
         let _tick = CassMsg::Tick;
         let _quit = CassMsg::QuitRequested;
         let _fq = CassMsg::ForceQuit;
+    }
+
+    #[test]
+    fn event_mapping_ctrl_shift_y_maps_to_copy_query() {
+        use super::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let event = Event::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            Modifiers::CTRL | Modifiers::SHIFT,
+        ));
+
+        assert!(matches!(CassMsg::from(event), CassMsg::CopyQuery));
+    }
+
+    #[test]
+    fn event_mapping_ctrl_y_maps_to_copy_path() {
+        use super::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('y'), Modifiers::CTRL));
+
+        assert!(matches!(CassMsg::from(event), CassMsg::CopyPath));
     }
 
     #[test]
