@@ -3804,9 +3804,16 @@ impl CassApp {
             InspectorTab::Layout => {
                 let bp = LayoutBreakpoint::from_width(area.width);
                 let bp_str = bp.inspector_label();
+                let topo = bp.search_topology();
+                let topo_str = if topo.dual_pane {
+                    format!("Dual (res≥{}, det≥{})", topo.min_results, topo.min_detail)
+                } else {
+                    "Single (focus-switched)".to_string()
+                };
                 let lines = [
                     format!("Terminal: {}x{}", area.width, area.height),
                     format!("Layout:   {bp_str}"),
+                    format!("Topology: {topo_str}"),
                     format!("Density:  {:?}", self.density_mode),
                     format!(
                         "Borders:  {}",
@@ -9799,44 +9806,40 @@ impl super::ftui_adapter::Model for CassApp {
                 };
 
                 let topo = breakpoint.search_topology();
-                match breakpoint {
-                    LayoutBreakpoint::Wide
-                    | LayoutBreakpoint::Medium
-                    | LayoutBreakpoint::MediumNarrow => {
-                        let (results_area, detail_area, split_handle) = self.split_content_area(
-                            content_area,
-                            topo.min_results,
-                            topo.min_detail,
-                        );
-                        *self.last_split_handle_area.borrow_mut() = split_handle;
-                        self.render_results_pane(
-                            frame,
-                            results_area,
-                            hits,
-                            selected_idx,
-                            row_h,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            row_style,
-                            row_alt_style,
-                            row_selected_style,
-                            text_muted_style,
-                        );
-                        self.render_detail_pane(
-                            frame,
-                            detail_area,
-                            border_type,
-                            adaptive_borders,
-                            &styles,
-                            pane_style,
-                            pane_focused_style,
-                            text_muted_style,
-                        );
-                    }
-                    LayoutBreakpoint::Narrow => match self.focused_region() {
+                if topo.dual_pane {
+                    // Dual-pane: split content area using topology-defined minimums.
+                    let (results_area, detail_area, split_handle) =
+                        self.split_content_area(content_area, topo.min_results, topo.min_detail);
+                    *self.last_split_handle_area.borrow_mut() = split_handle;
+                    self.render_results_pane(
+                        frame,
+                        results_area,
+                        hits,
+                        selected_idx,
+                        row_h,
+                        border_type,
+                        adaptive_borders,
+                        &styles,
+                        pane_style,
+                        pane_focused_style,
+                        row_style,
+                        row_alt_style,
+                        row_selected_style,
+                        text_muted_style,
+                    );
+                    self.render_detail_pane(
+                        frame,
+                        detail_area,
+                        border_type,
+                        adaptive_borders,
+                        &styles,
+                        pane_style,
+                        pane_focused_style,
+                        text_muted_style,
+                    );
+                } else {
+                    // Single-pane: show whichever pane has focus, full-width.
+                    match self.focused_region() {
                         FocusRegion::Results => {
                             self.render_results_pane(
                                 frame,
@@ -9867,7 +9870,7 @@ impl super::ftui_adapter::Model for CassApp {
                                 text_muted_style,
                             );
                         }
-                    },
+                    }
                 }
 
                 // ── Status footer ───────────────────────────────────────
@@ -15023,6 +15026,37 @@ mod tests {
         assert!(
             app.last_detail_area.borrow().is_some(),
             "detail area should be recorded in medium-narrow layout (both panes visible)"
+        );
+    }
+
+    #[test]
+    fn topology_driven_render_all_widths() {
+        // Verify that topology-driven rendering doesn't panic at representative widths
+        // for each breakpoint tier.
+        let widths = [40, 79, 80, 100, 119, 120, 140, 159, 160, 200];
+        for w in widths {
+            let app = app_with_hits(3);
+            render_at_degradation(&app, w, 24, ftui::render::budget::DegradationLevel::Full);
+            let bp = LayoutBreakpoint::from_width(w);
+            let topo = bp.search_topology();
+            if topo.dual_pane {
+                assert!(
+                    app.last_detail_area.borrow().is_some(),
+                    "dual_pane at w={w} should render detail area"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_single_pane_hides_other() {
+        let app = app_with_hits(3);
+        // 60 cols = Narrow: only results visible (default focus is Results)
+        render_at_degradation(&app, 60, 24, ftui::render::budget::DegradationLevel::Full);
+        // In narrow mode the detail area should NOT be set (single pane, results focused)
+        assert!(
+            app.last_detail_area.borrow().is_none(),
+            "narrow layout should not render detail when results are focused"
         );
     }
 
