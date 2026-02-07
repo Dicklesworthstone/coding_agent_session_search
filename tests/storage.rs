@@ -51,7 +51,10 @@ fn schema_version_created_on_open() {
     let db_path = tmp.path().join("store.db");
     let storage = SqliteStorage::open(&db_path).expect("open");
 
-    assert_eq!(storage.schema_version().unwrap(), 8);
+    assert_eq!(
+        storage.schema_version().unwrap(),
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION
+    );
 
     // If meta row is removed, the getter surfaces an error.
     storage.raw().execute("DELETE FROM meta", []).unwrap();
@@ -591,7 +594,11 @@ fn migration_from_v1_applies_v2_and_v3() {
     let storage = SqliteStorage::open(&db_path).expect("open v1 db");
 
     // Verify migration completed
-    assert_eq!(storage.schema_version().unwrap(), 8, "should migrate to v8");
+    assert_eq!(
+        storage.schema_version().unwrap(),
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
+        "should migrate to current schema version"
+    );
 
     // Verify FTS5 table was created
     let tables: Vec<String> = storage
@@ -707,7 +714,11 @@ fn migration_from_v2_applies_v3() {
     let storage = SqliteStorage::open(&db_path).expect("open v2 db");
 
     // Verify migration completed
-    assert_eq!(storage.schema_version().unwrap(), 8, "should migrate to v8");
+    assert_eq!(
+        storage.schema_version().unwrap(),
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
+        "should migrate to current schema version"
+    );
 }
 
 #[test]
@@ -1068,7 +1079,11 @@ fn migration_from_v3_creates_sources_table() {
     let storage = SqliteStorage::open(&db_path).expect("open v3 db");
 
     // Verify migration completed
-    assert_eq!(storage.schema_version().unwrap(), 8, "should migrate to v8");
+    assert_eq!(
+        storage.schema_version().unwrap(),
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
+        "should migrate to current schema version"
+    );
 
     // Verify sources table was created with local source
     let sources = storage.list_sources().expect("list_sources");

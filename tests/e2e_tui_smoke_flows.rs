@@ -1518,3 +1518,117 @@ fn tui_unicode_flow_with_logging() {
 
     tracker.complete();
 }
+
+// =============================================================================
+// Analytics PTY E2E Test (2noh9.4.18.11)
+// =============================================================================
+
+#[test]
+fn tui_pty_analytics_navigation_flow() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_analytics_navigation_flow");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let launch_start = tracker.start(
+        "analytics_launch",
+        Some("Launching TUI for analytics navigation"),
+    );
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    assert!(
+        wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
+        "Did not observe startup output before analytics navigation"
+    );
+    tracker.end(
+        "analytics_launch",
+        Some("TUI launched successfully"),
+        launch_start,
+    );
+
+    // Open command palette with Ctrl+P
+    let palette_start = tracker.start("palette_open", Some("Opening command palette"));
+    let before_palette = captured.lock().expect("capture lock").len();
+    send_key_sequence(&mut *writer, &[0x10]); // Ctrl+P
+    let palette_opened =
+        wait_for_output_growth(&captured, before_palette, 8, Duration::from_secs(4));
+    tracker.end("palette_open", Some("Palette opened"), palette_start);
+    assert!(
+        palette_opened,
+        "Command palette did not render after Ctrl+P"
+    );
+
+    // Type "dashboard" to filter to analytics dashboard action and press Enter
+    let nav_start = tracker.start("analytics_enter", Some("Navigating to analytics dashboard"));
+    thread::sleep(Duration::from_millis(100));
+    let before_dashboard = captured.lock().expect("capture lock").len();
+    send_key_sequence(&mut *writer, b"dashboard");
+    thread::sleep(Duration::from_millis(200));
+    send_key_sequence(&mut *writer, b"\r"); // Enter to select
+    let saw_analytics =
+        wait_for_output_growth(&captured, before_dashboard, 16, Duration::from_secs(4));
+    tracker.end("analytics_enter", Some("Navigated to analytics"), nav_start);
+    assert!(
+        saw_analytics,
+        "No output growth after selecting analytics dashboard"
+    );
+
+    // Navigate right through views (→ key = ESC [ C)
+    let cycle_start = tracker.start("view_cycle", Some("Cycling through analytics views"));
+    for i in 0..3 {
+        let before_nav = captured.lock().expect("capture lock").len();
+        send_key_sequence(&mut *writer, b"\x1b[C"); // Right arrow
+        let saw_nav = wait_for_output_growth(&captured, before_nav, 4, Duration::from_secs(3));
+        assert!(saw_nav, "No output growth after view navigation step {i}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    tracker.end("view_cycle", Some("View cycling complete"), cycle_start);
+
+    // Go back to search with Esc, then quit with Esc
+    let exit_start = tracker.start("analytics_exit", Some("Exiting analytics and quitting"));
+    send_key_sequence(&mut *writer, b"\x1b"); // Esc → back to search
+    thread::sleep(Duration::from_millis(300));
+    send_key_sequence(&mut *writer, b"\x1b"); // Esc → quit
+    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
+    tracker.end("analytics_exit", Some("Clean exit"), exit_start);
+    assert!(
+        status.success(),
+        "ftui process exited unsuccessfully after analytics flow: {status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_analytics_flow_output.raw", &trace, &raw);
+
+    let text = String::from_utf8_lossy(&raw);
+    // Verify analytics content appeared (Dashboard label should render)
+    assert!(
+        text.contains("Dashboard") || text.contains("Analytics") || text.contains("dashboard"),
+        "Expected analytics content in PTY output. Output tail:\n{}",
+        truncate_output(&raw[raw.len().saturating_sub(2000)..], 2000)
+    );
+
+    tracker.complete();
+}
