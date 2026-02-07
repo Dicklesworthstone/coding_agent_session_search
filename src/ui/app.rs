@@ -28,7 +28,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::Arc;
@@ -168,6 +168,37 @@ pub struct AnalyticsFilterState {
     pub workspaces: HashSet<String>,
     /// Source filter.
     pub source_filter: SourceFilter,
+}
+
+/// Pre-computed chart data for the analytics views.
+///
+/// Loaded once when entering the analytics surface, refreshed on filter changes.
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsChartData {
+    /// Per-agent token totals: `(agent_slug, api_tokens_total)` sorted desc.
+    pub agent_tokens: Vec<(String, f64)>,
+    /// Per-agent message counts: `(agent_slug, message_count)` sorted desc.
+    pub agent_messages: Vec<(String, f64)>,
+    /// Per-agent tool call counts: `(agent_slug, tool_call_count)` sorted desc.
+    pub agent_tool_calls: Vec<(String, f64)>,
+    /// Daily timeseries: `(label, api_tokens_total)` ordered by date.
+    pub daily_tokens: Vec<(String, f64)>,
+    /// Daily timeseries: `(label, message_count)` ordered by date.
+    pub daily_messages: Vec<(String, f64)>,
+    /// Per-model token totals: `(model_family, grand_total_tokens)` sorted desc.
+    pub model_tokens: Vec<(String, f64)>,
+    /// Coverage percentage (0..100).
+    pub coverage_pct: f64,
+    /// Total messages across all data.
+    pub total_messages: i64,
+    /// Total API tokens across all data.
+    pub total_api_tokens: i64,
+    /// Total tool calls across all data.
+    pub total_tool_calls: i64,
+    /// Number of unique agents seen.
+    pub agent_count: usize,
+    /// Per-day heatmap values: `(day_label, normalized_value)` for canvas heatmap.
+    pub heatmap_days: Vec<(String, f64)>,
 }
 
 /// Which tab is active in the detail pane.
@@ -359,9 +390,52 @@ pub struct ResultItem {
     pub agent_style: ftui::Style,
 }
 
+fn source_display_label(source_id: &str, origin_host: Option<&str>) -> String {
+    if source_id == "local" {
+        "local".to_string()
+    } else {
+        origin_host.unwrap_or(source_id).to_string()
+    }
+}
+
+fn normalized_source_kind(origin_kind: Option<&str>, source_id: &str) -> String {
+    if let Some(kind) = origin_kind.map(str::trim).filter(|s| !s.is_empty()) {
+        if kind.eq_ignore_ascii_case("local") {
+            return "local".to_string();
+        }
+        if kind.eq_ignore_ascii_case("ssh") || kind.eq_ignore_ascii_case("remote") {
+            return "remote".to_string();
+        }
+        return kind.to_ascii_lowercase();
+    }
+    if source_id == "local" {
+        "local".to_string()
+    } else {
+        "remote".to_string()
+    }
+}
+
+fn workspace_original_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    metadata
+        .get("cass")
+        .and_then(|cass| cass.get("workspace_original"))
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+}
+
+impl ResultItem {
+    fn source_badge(&self) -> String {
+        format!(
+            "[{}]",
+            source_display_label(&self.hit.source_id, self.hit.origin_host.as_deref())
+        )
+    }
+}
+
 impl RenderItem for ResultItem {
     fn render(&self, area: Rect, frame: &mut super::ftui_adapter::Frame, selected: bool) {
         let hit = &self.hit;
+        let source_badge = self.source_badge();
         let location = if let Some(line) = hit.line_number {
             format!("{}:{line}", hit.source_path)
         } else {
@@ -388,15 +462,15 @@ impl RenderItem for ResultItem {
             1 => {
                 // Compact: single line
                 let text = format!(
-                    "{sel_mark}{queue_mark}{:>2}. {title} [{location}]",
-                    self.index
+                    "{sel_mark}{queue_mark}{:>2}. {title} {source_badge} [{location}]",
+                    self.index,
                 );
                 Paragraph::new(&*text).style(base_style).render(area, frame);
             }
             2 => {
                 // Cozy: title + metadata
                 let line1 = format!("{sel_mark}{queue_mark}{:>2}. {title}", self.index);
-                let line2 = format!("      {location} | {:.1}", hit.score);
+                let line2 = format!("      {location} | {source_badge} | {:.1}", hit.score);
                 let text = format!("{line1}\n{line2}");
                 Paragraph::new(&*text).style(base_style).render(area, frame);
             }
@@ -415,7 +489,10 @@ impl RenderItem for ResultItem {
                     snippet_preview
                 };
                 let line2 = format!("      {snip}");
-                let line3 = format!("      {} | {location} | {:.1}", hit.agent, hit.score);
+                let line3 = format!(
+                    "      {} | {source_badge} | {location} | {:.1}",
+                    hit.agent, hit.score
+                );
                 let text = format!("{line1}\n{line2}\n{line3}");
                 Paragraph::new(&*text).style(base_style).render(area, frame);
             }
@@ -458,6 +535,8 @@ pub struct CassApp {
     pub analytics_view: AnalyticsView,
     /// Analytics-specific filter state.
     pub analytics_filters: AnalyticsFilterState,
+    /// Cached analytics chart data (loaded when entering analytics surface).
+    pub analytics_cache: Option<AnalyticsChartData>,
 
     // -- Search & query ---------------------------------------------------
     /// Current search query text.
@@ -568,6 +647,10 @@ pub struct CassApp {
     pub semantic_availability: SemanticAvailability,
     /// Whether the source filter popup menu is open.
     pub source_filter_menu_open: bool,
+    /// Current selection index in the source filter menu.
+    pub source_filter_menu_selection: usize,
+    /// Discovered source IDs shown in the source filter menu.
+    pub available_source_ids: Vec<String>,
     /// Command palette state.
     pub palette_state: PaletteState,
     /// Latest update check result (if any).
@@ -631,6 +714,7 @@ impl Default for CassApp {
             view_stack: Vec::new(),
             analytics_view: AnalyticsView::default(),
             analytics_filters: AnalyticsFilterState::default(),
+            analytics_cache: None,
             query: String::new(),
             filters: SearchFilters::default(),
             results: Vec::new(),
@@ -680,6 +764,8 @@ impl Default for CassApp {
             show_consent_dialog: false,
             semantic_availability: SemanticAvailability::NotInstalled,
             source_filter_menu_open: false,
+            source_filter_menu_selection: 0,
+            available_source_ids: Vec::new(),
             palette_state: PaletteState::new(default_actions()),
             update_info: None,
             update_dismissed: false,
@@ -764,6 +850,67 @@ impl CassApp {
             && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.palette_state.open
+    }
+
+    fn refresh_available_source_ids(&mut self) {
+        let mut ids = BTreeSet::new();
+        for hit in &self.results {
+            if hit.source_id != "local" {
+                ids.insert(hit.source_id.clone());
+            }
+        }
+        if let SourceFilter::SourceId(id) = &self.filters.source_filter {
+            ids.insert(id.clone());
+        }
+        self.available_source_ids = ids.into_iter().collect();
+    }
+
+    fn source_menu_items(&self) -> Vec<(String, SourceFilter)> {
+        let mut items = vec![
+            ("All sources".to_string(), SourceFilter::All),
+            ("Local only".to_string(), SourceFilter::Local),
+            ("Remote only".to_string(), SourceFilter::Remote),
+        ];
+        items.extend(
+            self.available_source_ids
+                .iter()
+                .cloned()
+                .map(|id| (format!("Source: {id}"), SourceFilter::SourceId(id))),
+        );
+        items
+    }
+
+    fn source_menu_total_items(&self) -> usize {
+        3 + self.available_source_ids.len()
+    }
+
+    fn move_source_menu_selection(&mut self, delta: i32) {
+        let total = self.source_menu_total_items().max(1);
+        let cur = self.source_filter_menu_selection as i32 + delta;
+        self.source_filter_menu_selection = cur.clamp(0, total as i32 - 1) as usize;
+    }
+
+    fn source_filter_from_menu_selection(&self) -> SourceFilter {
+        match self.source_filter_menu_selection {
+            0 => SourceFilter::All,
+            1 => SourceFilter::Local,
+            2 => SourceFilter::Remote,
+            n => self
+                .available_source_ids
+                .get(n.saturating_sub(3))
+                .cloned()
+                .map(SourceFilter::SourceId)
+                .unwrap_or(SourceFilter::All),
+        }
+    }
+
+    fn source_filter_status(filter: &SourceFilter) -> String {
+        match filter {
+            SourceFilter::All => "all sources".to_string(),
+            SourceFilter::Local => "local only".to_string(),
+            SourceFilter::Remote => "remote only".to_string(),
+            SourceFilter::SourceId(id) => format!("source '{id}'"),
+        }
     }
 
     /// Render the results list pane using VirtualizedList for O(visible) rendering.
@@ -911,17 +1058,24 @@ impl CassApp {
                     .unwrap_or_else(|| ts.to_string())
             })
             .unwrap_or_default();
-        let meta_text = format!(
-            "agent={} workspace={} score={:.3}{}",
-            hit.agent,
-            hit.workspace,
-            hit.score,
-            if ts_str.is_empty() {
-                String::new()
-            } else {
-                format!(" {ts_str}")
-            },
-        );
+        let source_label = source_display_label(&hit.source_id, hit.origin_host.as_deref());
+        let source_kind = normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id);
+        let mut meta_parts = vec![
+            format!("agent={}", hit.agent),
+            format!("workspace={}", hit.workspace),
+            format!("source={source_label}"),
+            format!("source_kind={source_kind}"),
+            format!("score={:.3}", hit.score),
+        ];
+        if let Some(ws_original) = hit.workspace_original.as_deref()
+            && ws_original != hit.workspace
+        {
+            meta_parts.push(format!("workspace_original={ws_original}"));
+        }
+        if !ts_str.is_empty() {
+            meta_parts.push(ts_str);
+        }
+        let meta_text = meta_parts.join(" ");
         lines.push(ftui::text::Line::from_spans(vec![
             ftui::text::Span::styled(meta_text, meta_style),
         ]));
@@ -1091,6 +1245,8 @@ impl CassApp {
 
         // If we have a cached conversation, serialize the full conversation
         if let Some((_, ref cv)) = self.cached_detail {
+            let source_kind = normalized_source_kind(None, &cv.convo.source_id);
+            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json);
             // Show conversation metadata as JSON
             let json = serde_json::json!({
                 "agent": cv.convo.agent_slug,
@@ -1101,7 +1257,9 @@ impl CassApp {
                 "ended_at": cv.convo.ended_at,
                 "approx_tokens": cv.convo.approx_tokens,
                 "source_id": cv.convo.source_id,
+                "source_kind": source_kind,
                 "origin_host": cv.convo.origin_host,
+                "workspace_original": workspace_original,
                 "message_count": cv.messages.len(),
             });
             if let Ok(pretty) = serde_json::to_string_pretty(&json) {
@@ -1142,10 +1300,12 @@ impl CassApp {
                 "title": hit.title,
                 "agent": hit.agent,
                 "workspace": hit.workspace,
+                "workspace_original": hit.workspace_original,
                 "source_path": hit.source_path,
                 "score": hit.score,
                 "content_length": hit.content.len(),
                 "source_id": hit.source_id,
+                "source_kind": normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id),
                 "origin_kind": hit.origin_kind,
                 "origin_host": hit.origin_host,
                 "created_at": hit.created_at,
@@ -1494,6 +1654,70 @@ impl CassApp {
             Paragraph::new(&*count_text)
                 .style(muted_style)
                 .render(count_area, frame);
+        }
+    }
+
+    /// Render the source filter popup menu centered on screen.
+    fn render_source_filter_menu_overlay(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        styles: &StyleContext,
+    ) {
+        let items = self.source_menu_items();
+        let menu_w = 44u16.min(area.width.saturating_sub(2));
+        let menu_h = (items.len() as u16 + 4).min(area.height.saturating_sub(2));
+        if menu_w == 0 || menu_h == 0 {
+            return;
+        }
+
+        let menu_x = area.x + (area.width.saturating_sub(menu_w)) / 2;
+        let menu_y = area.y + (area.height.saturating_sub(menu_h)) / 2;
+        let menu_area = Rect::new(menu_x, menu_y, menu_w, menu_h);
+
+        let background = styles.style(style_system::STYLE_PANE_BASE);
+        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
+        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
+
+        Block::new().style(background).render(menu_area, frame);
+        let outer = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title("Source Filter (Shift+F11)")
+            .title_alignment(Alignment::Left)
+            .style(border_style);
+        let inner = outer.inner(menu_area);
+        outer.render(menu_area, frame);
+        if inner.is_empty() {
+            return;
+        }
+
+        let selected = self
+            .source_filter_menu_selection
+            .min(items.len().saturating_sub(1));
+        let visible = inner.height as usize;
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+
+        for (row, (label, filter)) in items.iter().enumerate().skip(start).take(visible) {
+            let y = inner.y + (row - start) as u16;
+            let row_area = Rect::new(inner.x, y, inner.width, 1);
+            let pointer = if row == selected { "> " } else { "  " };
+            let active = if *filter == self.filters.source_filter {
+                "* "
+            } else {
+                "  "
+            };
+            let line = format!("{pointer}{active}{label}");
+            let style = if row == selected {
+                selected_style
+            } else if *filter == self.filters.source_filter {
+                muted_style
+            } else {
+                text_style
+            };
+            Paragraph::new(&*line).style(style).render(row_area, frame);
         }
     }
 
@@ -2626,6 +2850,36 @@ impl super::ftui_adapter::Model for CassApp {
             }
         }
 
+        // Source filter menu: while open, consume navigation keys and apply
+        // selection without affecting results/query.
+        if self.source_filter_menu_open {
+            match &msg {
+                CassMsg::SourceFilterMenuToggled | CassMsg::QuitRequested => {
+                    self.source_filter_menu_open = false;
+                    self.status = "Source filter menu closed".to_string();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::SelectionMoved { delta } => {
+                    self.move_source_menu_selection(*delta);
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("j") => {
+                    self.move_source_menu_selection(1);
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("k") => {
+                    self.move_source_menu_selection(-1);
+                    return ftui::Cmd::none();
+                }
+                CassMsg::DetailOpened | CassMsg::QuerySubmitted => {
+                    let filter = self.source_filter_from_menu_selection();
+                    return ftui::Cmd::msg(CassMsg::SourceFilterSelected(filter));
+                }
+                CassMsg::SourceFilterSelected(_) => {}
+                _ => return ftui::Cmd::none(),
+            }
+        }
+
         match msg {
             // -- Terminal event passthrough (unused, events come as CassMsg) ---
             CassMsg::TerminalEvent(_) => ftui::Cmd::none(),
@@ -2837,12 +3091,11 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::SourceFilterCycled => {
-                self.filters.source_filter = match self.filters.source_filter {
-                    SourceFilter::All => SourceFilter::Local,
-                    SourceFilter::Local => SourceFilter::Remote,
-                    SourceFilter::Remote => SourceFilter::All,
-                    SourceFilter::SourceId(_) => SourceFilter::All,
-                };
+                self.filters.source_filter = self.filters.source_filter.cycle();
+                self.status = format!(
+                    "Source: {}",
+                    Self::source_filter_status(&self.filters.source_filter)
+                );
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
 
@@ -3781,11 +4034,31 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Source filter menu -------------------------------------------
             CassMsg::SourceFilterMenuToggled => {
-                self.source_filter_menu_open = !self.source_filter_menu_open;
+                if self.source_filter_menu_open {
+                    self.source_filter_menu_open = false;
+                    self.status = "Source filter menu closed".to_string();
+                } else {
+                    self.refresh_available_source_ids();
+                    self.source_filter_menu_open = true;
+                    self.source_filter_menu_selection = match &self.filters.source_filter {
+                        SourceFilter::All => 0,
+                        SourceFilter::Local => 1,
+                        SourceFilter::Remote => 2,
+                        SourceFilter::SourceId(id) => self
+                            .available_source_ids
+                            .iter()
+                            .position(|s| s == id)
+                            .map(|idx| idx + 3)
+                            .unwrap_or(0),
+                    };
+                    self.status =
+                        "Source filter menu (↑/↓ select, Enter apply, Esc close)".to_string();
+                }
                 ftui::Cmd::none()
             }
             CassMsg::SourceFilterSelected(filter) => {
                 self.source_filter_menu_open = false;
+                self.status = format!("Source: {}", Self::source_filter_status(&filter));
                 ftui::Cmd::msg(CassMsg::FilterSourceSet(filter))
             }
 
@@ -4488,6 +4761,11 @@ impl super::ftui_adapter::Model for CassApp {
                 } else {
                     format!(" | {} sel", self.selected.len())
                 };
+                let source_tag = if self.filters.source_filter.is_all() {
+                    String::new()
+                } else {
+                    format!(" | src:{}", self.filters.source_filter)
+                };
                 let status_line = if self.status.is_empty() {
                     let hints = if area.width >= 100 {
                         " | F2=theme D=density ^B=borders"
@@ -4497,7 +4775,7 @@ impl super::ftui_adapter::Model for CassApp {
                         ""
                     };
                     format!(
-                        " {hits_for_status} hits | {bp_label} | {density_label}{degradation_tag}{sel_tag}{hints}",
+                        " {hits_for_status} hits | {bp_label} | {density_label}{source_tag}{degradation_tag}{sel_tag}{hints}",
                     )
                 } else {
                     format!(" {}{}{}", self.status, degradation_tag, sel_tag)
@@ -4633,6 +4911,10 @@ impl super::ftui_adapter::Model for CassApp {
                         .render(row_area, frame);
                 }
             }
+        }
+
+        if self.source_filter_menu_open {
+            self.render_source_filter_menu_overlay(frame, area, &styles);
         }
 
         // ── Command palette overlay ──────────────────────────────────
@@ -4952,6 +5234,8 @@ mod tests {
         assert!(!app.show_bulk_modal);
         assert!(!app.show_consent_dialog);
         assert!(!app.source_filter_menu_open);
+        assert_eq!(app.source_filter_menu_selection, 0);
+        assert!(app.available_source_ids.is_empty());
         assert!(app.selected.is_empty());
         assert!(app.saved_views.is_empty());
         assert!(app.query_history.is_empty());
@@ -5022,21 +5306,20 @@ mod tests {
 
     #[test]
     fn event_mapping_ctrl_shift_y_maps_to_copy_query() {
-        use super::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
 
-        let event = Event::Key(KeyEvent::new(
-            KeyCode::Char('y'),
-            Modifiers::CTRL | Modifiers::SHIFT,
-        ));
+        let event = Event::Key(
+            KeyEvent::new(KeyCode::Char('y')).with_modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        );
 
         assert!(matches!(CassMsg::from(event), CassMsg::CopyQuery));
     }
 
     #[test]
     fn event_mapping_ctrl_y_maps_to_copy_path() {
-        use super::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
 
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('y'), Modifiers::CTRL));
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('y')).with_modifiers(Modifiers::CTRL));
 
         assert!(matches!(CassMsg::from(event), CassMsg::CopyPath));
     }
@@ -6003,6 +6286,41 @@ mod tests {
         assert!(!not_queued.queued);
     }
 
+    #[test]
+    fn result_item_source_badge_reflects_local_and_remote_provenance() {
+        let mut local_hit = make_test_hit();
+        local_hit.source_id = "local".to_string();
+        local_hit.origin_kind = "local".to_string();
+        local_hit.origin_host = None;
+        let local_item = ResultItem {
+            index: 1,
+            hit: local_hit,
+            row_height: 1,
+            even: true,
+            max_width: 80,
+            queued: false,
+            stripe_style: ftui::Style::default(),
+            agent_style: ftui::Style::default(),
+        };
+        assert_eq!(local_item.source_badge(), "[local]");
+
+        let mut remote_hit = make_test_hit();
+        remote_hit.source_id = "work-laptop".to_string();
+        remote_hit.origin_kind = "ssh".to_string();
+        remote_hit.origin_host = Some("laptop".to_string());
+        let remote_item = ResultItem {
+            index: 2,
+            hit: remote_hit,
+            row_height: 1,
+            even: false,
+            max_width: 80,
+            queued: false,
+            stripe_style: ftui::Style::default(),
+            agent_style: ftui::Style::default(),
+        };
+        assert_eq!(remote_item.source_badge(), "[laptop]");
+    }
+
     // =====================================================================
     // 2noh9.3.3 — Filter UI tests
     // =====================================================================
@@ -6076,6 +6394,40 @@ mod tests {
         app.filters.source_filter = SourceFilter::SourceId("myhost".to_string());
         let _ = app.update(CassMsg::SourceFilterCycled);
         assert_eq!(app.filters.source_filter, SourceFilter::All);
+    }
+
+    #[test]
+    fn source_filter_menu_applies_selected_source_id() {
+        let mut app = CassApp::default();
+        let mut local = make_test_hit();
+        local.source_id = "local".to_string();
+        local.origin_kind = "local".to_string();
+        local.origin_host = None;
+
+        let mut remote = make_test_hit();
+        remote.source_id = "work-laptop".to_string();
+        remote.origin_kind = "ssh".to_string();
+        remote.origin_host = Some("laptop".to_string());
+
+        app.results = vec![local, remote];
+        let _ = app.update(CassMsg::SourceFilterMenuToggled);
+        assert!(app.source_filter_menu_open);
+        assert_eq!(app.available_source_ids, vec!["work-laptop".to_string()]);
+
+        app.source_filter_menu_selection = 3;
+        let cmd = app.update(CassMsg::DetailOpened);
+        for msg in extract_msgs(cmd) {
+            let cmd2 = app.update(msg);
+            for msg2 in extract_msgs(cmd2) {
+                let _ = app.update(msg2);
+            }
+        }
+
+        assert_eq!(
+            app.filters.source_filter,
+            SourceFilter::SourceId("work-laptop".to_string())
+        );
+        assert!(!app.source_filter_menu_open);
     }
 
     #[test]
@@ -6271,6 +6623,31 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_lines_include_source_provenance_fields() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.workspace_original = Some("/home/user/projects/test".to_string());
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let lines = app.build_messages_lines(&hit, 80, &styles);
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans()
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("source=laptop"));
+        assert!(text.contains("source_kind=remote"));
+        assert!(text.contains("workspace_original=/home/user/projects/test"));
+    }
+
+    #[test]
     fn build_snippets_lines_produces_output() {
         let app = CassApp::default();
         let hit = make_test_hit();
@@ -6298,6 +6675,14 @@ mod tests {
             .join("\n");
         assert!(text.contains("claude_code"), "should show agent in JSON");
         assert!(text.contains("score"), "should include score key in JSON");
+        assert!(
+            text.contains("source_kind"),
+            "should include source_kind key"
+        );
+        assert!(
+            text.contains("workspace_original"),
+            "should include workspace_original key"
+        );
     }
 
     #[test]
@@ -7126,8 +7511,6 @@ mod tests {
 
     #[test]
     fn status_footer_adapts_to_width() {
-        use ftui_harness::buffer_to_text;
-
         let app = CassApp::default();
 
         // Wide: shows full hints
@@ -7157,8 +7540,6 @@ mod tests {
 
     #[test]
     fn search_title_adapts_to_width() {
-        use ftui_harness::buffer_to_text;
-
         let app = CassApp::default();
 
         // Wide: shows theme name
@@ -7188,8 +7569,6 @@ mod tests {
 
     #[test]
     fn results_title_shows_selection_count() {
-        use ftui_harness::buffer_to_text;
-
         let mut app = app_with_hits(3);
         let _ = app.update(CassMsg::SelectAllToggled);
         let text = ftui_harness::buffer_to_text(&render_at_degradation(
@@ -7206,8 +7585,6 @@ mod tests {
 
     #[test]
     fn analytics_header_adapts_to_width() {
-        use ftui_harness::buffer_to_text;
-
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::AnalyticsEntered);
 
