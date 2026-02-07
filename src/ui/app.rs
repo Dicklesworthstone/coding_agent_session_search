@@ -351,6 +351,8 @@ pub struct CassApp {
     pub db_reader: Option<Arc<SqliteStorage>>,
     /// Known workspace list (populated on first filter prompt).
     pub known_workspaces: Option<Vec<String>>,
+    /// Search service for async query dispatch.
+    pub search_service: Option<Arc<dyn SearchService>>,
 
     // -- Status line ------------------------------------------------------
     /// Footer status text.
@@ -431,6 +433,7 @@ impl Default for CassApp {
             last_pill_rects: Vec::new(),
             db_reader: None,
             known_workspaces: None,
+            search_service: None,
             status: String::new(),
         }
     }
@@ -807,6 +810,8 @@ pub enum CassMsg {
     },
     /// Search failed with an error message.
     SearchFailed(String),
+    /// Toggle the wildcard fallback indicator (Ctrl+F).
+    WildcardFallbackToggled,
 
     // -- Filters ----------------------------------------------------------
     /// Agent filter added or changed.
@@ -1293,6 +1298,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     // -- Line editing ---------------------------------------------
                     KeyCode::Char('u') if ctrl => CassMsg::QueryCleared,
                     KeyCode::Char('w') if ctrl => CassMsg::QueryWordDeleted,
+                    KeyCode::Char('f') if ctrl => CassMsg::WildcardFallbackToggled,
 
                     // -- Density --------------------------------------------------
                     KeyCode::Char('d') if ctrl => CassMsg::DensityModeCycled,
@@ -1504,7 +1510,7 @@ impl super::ftui_adapter::Model for CassApp {
                 // Clear debounce state so we don't double-fire.
                 self.search_dirty_since = None;
                 // Build search params from current state.
-                let _params = SearchParams {
+                let params = SearchParams {
                     query: self.query.clone(),
                     filters: self.filters.clone(),
                     mode: self.search_mode,
@@ -1513,10 +1519,25 @@ impl super::ftui_adapter::Model for CassApp {
                     context_window: self.context_window,
                     limit: self.per_pane_limit * 10, // fetch enough for pane grouping
                 };
-                // TODO(2noh9.3.2-async): dispatch via Cmd::task when SearchService
-                // is wired to real Tantivy+vector index. For now, this is a no-op
-                // placeholder; results arrive via CassMsg::SearchCompleted.
-                ftui::Cmd::none()
+                // Skip empty queries.
+                if params.query.trim().is_empty() {
+                    return ftui::Cmd::none();
+                }
+                // Dispatch async search if a service is available.
+                if let Some(svc) = self.search_service.clone() {
+                    self.status = "Searching\u{2026}".to_string();
+                    ftui::Cmd::task(move || match svc.execute(&params) {
+                        Ok(result) => CassMsg::SearchCompleted {
+                            hits: result.hits,
+                            elapsed_ms: result.elapsed_ms,
+                            suggestions: result.suggestions,
+                            wildcard_fallback: result.wildcard_fallback,
+                        },
+                        Err(e) => CassMsg::SearchFailed(e),
+                    })
+                } else {
+                    ftui::Cmd::none()
+                }
             }
             CassMsg::SearchCompleted {
                 hits,
@@ -1561,6 +1582,10 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::SearchFailed(err) => {
                 self.status = format!("Search error: {err}");
+                ftui::Cmd::none()
+            }
+            CassMsg::WildcardFallbackToggled => {
+                self.wildcard_fallback = !self.wildcard_fallback;
                 ftui::Cmd::none()
             }
 
@@ -3401,5 +3426,76 @@ mod tests {
             "skip should dismiss banner in test mode"
         );
         assert!(!app.update_upgrade_armed);
+    }
+
+    // ==================== Wildcard fallback toggle tests ====================
+
+    #[test]
+    fn wildcard_fallback_toggle_flips_state() {
+        let mut app = CassApp::default();
+        assert!(!app.wildcard_fallback);
+        let _ = app.update(CassMsg::WildcardFallbackToggled);
+        assert!(app.wildcard_fallback);
+        let _ = app.update(CassMsg::WildcardFallbackToggled);
+        assert!(!app.wildcard_fallback);
+    }
+
+    // ==================== Search dispatch tests ====================
+
+    #[test]
+    fn search_requested_skips_empty_query() {
+        let mut app = CassApp::default();
+        app.query = "   ".to_string();
+        app.search_dirty_since = Some(Instant::now());
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(app.search_dirty_since.is_none(), "dirty state should clear");
+        // No search dispatched (no service, query is empty whitespace)
+        assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn search_requested_dispatches_with_service() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct MockSearch {
+            called: AtomicBool,
+        }
+        impl SearchService for MockSearch {
+            fn execute(&self, _params: &SearchParams) -> Result<SearchResult, String> {
+                self.called.store(true, Ordering::SeqCst);
+                Ok(SearchResult {
+                    hits: vec![],
+                    elapsed_ms: 5,
+                    suggestions: vec![],
+                    wildcard_fallback: false,
+                })
+            }
+        }
+
+        let mock = Arc::new(MockSearch {
+            called: AtomicBool::new(false),
+        });
+        let mut app = CassApp::default();
+        app.query = "test query".to_string();
+        app.search_service = Some(mock.clone());
+        let cmd = app.update(CassMsg::SearchRequested);
+        assert!(app.status.contains("Searching"));
+        // Cmd should be a Task variant (non-none).
+        // Verify by extracting the task closure via format debug.
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("Task"), "expected Cmd::Task, got: {debug}");
+    }
+
+    #[test]
+    fn search_requested_noop_without_service() {
+        let mut app = CassApp::default();
+        app.query = "test query".to_string();
+        app.search_service = None;
+        let cmd = app.update(CassMsg::SearchRequested);
+        let debug = format!("{cmd:?}");
+        assert!(
+            debug.contains("None"),
+            "expected Cmd::None without service, got: {debug}"
+        );
     }
 }
