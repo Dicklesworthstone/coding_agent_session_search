@@ -35,6 +35,8 @@ pub enum PaletteAction {
     ScreenshotText,
     // -- Macro recording --------------------------------------------------
     MacroRecordingToggle,
+    // -- Sources management ------------------------------------------------
+    Sources,
 }
 
 /// Render-ready descriptor for an action.
@@ -219,6 +221,12 @@ pub fn default_actions() -> Vec<PaletteItem> {
         PaletteAction::MacroRecordingToggle,
         "Toggle macro recording",
         "Alt+M",
+    ));
+    // -- Sources management ------------------------------------------------
+    items.push(item(
+        PaletteAction::Sources,
+        "Sources management",
+        "Ctrl+Shift+S",
     ));
     // Slots 1-9
     for slot in 1..=9 {

@@ -44,6 +44,9 @@ pub const PANE_FILTER: &str = "/";
 // Theme editor
 pub const THEME_EDITOR: &str = "Ctrl+Shift+T";
 
+// Sources management
+pub const SOURCES: &str = "Ctrl+Shift+S";
+
 // Inspector
 pub const INSPECTOR: &str = "Ctrl+Shift+I";
 

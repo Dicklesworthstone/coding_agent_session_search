@@ -392,6 +392,8 @@ pub enum AppSurface {
     Search,
     /// Analytics dashboard surface.
     Analytics,
+    /// Sources management surface.
+    Sources,
 }
 
 /// Analytics subview within the Analytics surface.
@@ -1477,6 +1479,56 @@ impl ScreenshotFormat {
 }
 
 // =========================================================================
+// Sources view state (2noh9.4.9)
+// =========================================================================
+
+/// Display-ready row for a configured source in the Sources view.
+#[derive(Clone, Debug)]
+pub struct SourcesViewItem {
+    /// Source name (e.g., "laptop").
+    pub name: String,
+    /// Connection kind (local / ssh).
+    pub kind: crate::sources::SourceKind,
+    /// SSH host string (e.g., "user@laptop.local"), if remote.
+    pub host: Option<String>,
+    /// Sync schedule label.
+    pub schedule: String,
+    /// Number of paths configured.
+    pub path_count: usize,
+    /// Last sync timestamp (unix ms), if any.
+    pub last_sync: Option<i64>,
+    /// Last sync result label ("success", "failed", "partial", "never").
+    pub last_result: String,
+    /// Files synced in last run.
+    pub files_synced: u64,
+    /// Bytes transferred in last run.
+    pub bytes_transferred: u64,
+    /// Whether a sync/doctor action is currently running for this source.
+    pub busy: bool,
+    /// Doctor diagnostic summary (pass/warn/fail counts), if available.
+    pub doctor_summary: Option<(usize, usize, usize)>,
+    /// Error message, if the last operation failed.
+    pub error: Option<String>,
+}
+
+/// State for the Sources management surface.
+#[derive(Clone, Debug, Default)]
+pub struct SourcesViewState {
+    /// All configured sources as display rows.
+    pub items: Vec<SourcesViewItem>,
+    /// Currently selected index.
+    pub selected: usize,
+    /// Scroll offset for long lists.
+    pub scroll: usize,
+    /// Whether a bulk operation is running (e.g., sync-all).
+    pub busy: bool,
+    /// Path to sources.toml (for display).
+    pub config_path: String,
+    /// Status line message.
+    pub status: String,
+}
+
+// =========================================================================
 // CassApp — the ftui Model
 // =========================================================================
 
@@ -1737,6 +1789,10 @@ pub struct CassApp {
     /// Rolling frame timing statistics.
     pub frame_timing: FrameTimingStats,
 
+    // -- Sources management (2noh9.4.9) -----------------------------------
+    /// Sources management view state.
+    pub sources_view: SourcesViewState,
+
     // -- Status line ------------------------------------------------------
     /// Footer status text.
     pub status: String,
@@ -1863,6 +1919,7 @@ impl Default for CassApp {
             inspector_tab: InspectorTab::default(),
             inspector_state: InspectorState::default(),
             frame_timing: FrameTimingStats::default(),
+            sources_view: SourcesViewState::default(),
             status: String::new(),
         };
         app.init_focus_graph();
@@ -2101,6 +2158,10 @@ impl CassApp {
                 AnalyticsView::Plans => "analytics:plans",
                 AnalyticsView::Coverage => "analytics:coverage",
             };
+        }
+
+        if self.surface == AppSurface::Sources {
+            return "sources";
         }
 
         if self.input_mode != InputMode::Query {
@@ -4573,6 +4634,74 @@ impl CassApp {
         }
     }
 
+    /// Load sources configuration + sync status into `SourcesViewState`.
+    #[cfg(not(test))]
+    fn load_sources_view(&mut self) {
+        use crate::sources::{SourcesConfig, SyncStatus};
+
+        let config = SourcesConfig::load().unwrap_or_default();
+        let config_path = SourcesConfig::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+
+        let data_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("coding-agent-search");
+        let sync_status = SyncStatus::load(&data_dir).unwrap_or_default();
+
+        let mut items = Vec::new();
+
+        // Always show the "local" pseudo-source first.
+        items.push(SourcesViewItem {
+            name: "local".into(),
+            kind: crate::sources::SourceKind::Local,
+            host: None,
+            schedule: "always".into(),
+            path_count: 0,
+            last_sync: None,
+            last_result: "n/a".into(),
+            files_synced: 0,
+            bytes_transferred: 0,
+            busy: false,
+            doctor_summary: None,
+            error: None,
+        });
+
+        for src in &config.sources {
+            let info = sync_status.sources.get(&src.name);
+            let last_result_str = match info.map(|i| &i.last_result) {
+                Some(crate::sources::SyncResult::Success) => "success",
+                Some(crate::sources::SyncResult::PartialFailure(_)) => "partial",
+                Some(crate::sources::SyncResult::Failed(_)) => "failed",
+                Some(crate::sources::SyncResult::Skipped) | None => "never",
+            };
+            items.push(SourcesViewItem {
+                name: src.name.clone(),
+                kind: src.source_type,
+                host: src.host.clone(),
+                schedule: format!("{:?}", src.sync_schedule).to_lowercase(),
+                path_count: src.paths.len(),
+                last_sync: info.and_then(|i| i.last_sync),
+                last_result: last_result_str.into(),
+                files_synced: info.map(|i| i.files_synced).unwrap_or(0),
+                bytes_transferred: info.map(|i| i.bytes_transferred).unwrap_or(0),
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            });
+        }
+
+        let count = items.len();
+        self.sources_view = SourcesViewState {
+            items,
+            selected: self.sources_view.selected.min(count.saturating_sub(1)),
+            scroll: 0,
+            busy: false,
+            config_path,
+            status: format!("{count} source(s) configured"),
+        };
+    }
+
     /// Number of selectable items in the current analytics subview.
     fn analytics_selectable_count(&self) -> usize {
         let data = match &self.analytics_cache {
@@ -5173,6 +5302,30 @@ pub enum CassMsg {
     /// Cycle the Heatmap metric forward or backward.
     HeatmapMetricCycled { forward: bool },
 
+    // -- Sources management surface (2noh9.4.9) ----------------------------
+    /// Switch to the sources management surface.
+    SourcesEntered,
+    /// Reload sources config + sync status from disk.
+    SourcesRefreshed,
+    /// Trigger sync for the selected source (by name).
+    SourceSyncRequested(String),
+    /// Sync completed with a result message.
+    SourceSyncCompleted {
+        source_name: String,
+        message: String,
+    },
+    /// Trigger doctor diagnostics for the selected source.
+    SourceDoctorRequested(String),
+    /// Doctor diagnostics completed.
+    SourceDoctorCompleted {
+        source_name: String,
+        passed: usize,
+        warnings: usize,
+        failed: usize,
+    },
+    /// Move selection in the sources list.
+    SourcesSelectionMoved { delta: i32 },
+
     // -- Screenshot export -------------------------------------------------
     /// Capture a screenshot of the current TUI state.
     ScreenshotRequested(ScreenshotFormat),
@@ -5446,6 +5599,10 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     // -- Theme editor -------------------------------------------------
                     KeyCode::Char('t') if ctrl && shift => CassMsg::ThemeEditorOpened,
                     KeyCode::Char('T') if ctrl => CassMsg::ThemeEditorOpened,
+
+                    // -- Sources management -----------------------------------------
+                    KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
+                    KeyCode::Char('S') if ctrl => CassMsg::SourcesEntered,
 
                     // -- Inspector overlay -----------------------------------------
                     KeyCode::Char('i') if ctrl && shift => CassMsg::InspectorToggled,
@@ -6032,6 +6189,46 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 // Let other messages (analytics-specific, lifecycle, etc.) fall through.
+                _ => {}
+            }
+        }
+
+        // When on the sources surface, remap navigation and suppress query input.
+        if self.surface == AppSurface::Sources {
+            match &msg {
+                CassMsg::SelectionMoved { delta } => {
+                    return self.update(CassMsg::SourcesSelectionMoved { delta: *delta });
+                }
+                // 's' key triggers sync for selected source.
+                CassMsg::QueryChanged(text) if text == "s" || text == "S" => {
+                    if let Some(item) = self.sources_view.items.get(self.sources_view.selected)
+                        && item.kind != crate::sources::SourceKind::Local
+                        && !item.busy
+                    {
+                        let name = item.name.clone();
+                        return self.update(CassMsg::SourceSyncRequested(name));
+                    }
+                    return ftui::Cmd::none();
+                }
+                // 'd' key triggers doctor for selected source.
+                CassMsg::QueryChanged(text) if text == "d" || text == "D" => {
+                    if let Some(item) = self.sources_view.items.get(self.sources_view.selected)
+                        && item.kind != crate::sources::SourceKind::Local
+                        && !item.busy
+                    {
+                        let name = item.name.clone();
+                        return self.update(CassMsg::SourceDoctorRequested(name));
+                    }
+                    return ftui::Cmd::none();
+                }
+                // 'r' key refreshes the source list from disk.
+                CassMsg::QueryChanged(text) if text == "r" || text == "R" => {
+                    return self.update(CassMsg::SourcesRefreshed);
+                }
+                // Suppress all other query input on sources surface.
+                CassMsg::QueryChanged(_) => {
+                    return ftui::Cmd::none();
+                }
                 _ => {}
             }
         }
@@ -7108,6 +7305,7 @@ impl super::ftui_adapter::Model for CassApp {
                     Some(PaletteAction::MacroRecordingToggle) => {
                         ftui::Cmd::msg(CassMsg::MacroRecordingToggled)
                     }
+                    Some(PaletteAction::Sources) => ftui::Cmd::msg(CassMsg::SourcesEntered),
                     None => ftui::Cmd::none(),
                 }
             }
@@ -8254,11 +8452,92 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
 
+            // -- Sources management (2noh9.4.9) ----------------------------------
+            CassMsg::SourcesEntered => {
+                self.pane_split_drag = None;
+                if self.surface != AppSurface::Sources {
+                    self.view_stack.push(self.surface);
+                    self.surface = AppSurface::Sources;
+                }
+                #[cfg(not(test))]
+                self.load_sources_view();
+                ftui::Cmd::none()
+            }
+            CassMsg::SourcesRefreshed => {
+                #[cfg(not(test))]
+                self.load_sources_view();
+                self.sources_view.status = "Sources refreshed".into();
+                ftui::Cmd::none()
+            }
+            CassMsg::SourcesSelectionMoved { delta } => {
+                let count = self.sources_view.items.len();
+                if count > 0 {
+                    let cur = self.sources_view.selected as i32;
+                    let next = (cur + delta).rem_euclid(count as i32) as usize;
+                    self.sources_view.selected = next;
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SourceSyncRequested(ref name) => {
+                let name = name.clone();
+                if let Some(item) = self.sources_view.items.iter_mut().find(|i| i.name == name) {
+                    item.busy = true;
+                }
+                self.sources_view.status = format!("Syncing '{name}'...");
+                ftui::Cmd::none()
+            }
+            CassMsg::SourceSyncCompleted {
+                ref source_name,
+                ref message,
+            } => {
+                let source_name = source_name.clone();
+                let message = message.clone();
+                if let Some(item) = self
+                    .sources_view
+                    .items
+                    .iter_mut()
+                    .find(|i| i.name == source_name)
+                {
+                    item.busy = false;
+                }
+                self.sources_view.status = message;
+                ftui::Cmd::none()
+            }
+            CassMsg::SourceDoctorRequested(ref name) => {
+                let name = name.clone();
+                if let Some(item) = self.sources_view.items.iter_mut().find(|i| i.name == name) {
+                    item.busy = true;
+                }
+                self.sources_view.status = format!("Running doctor on '{name}'...");
+                ftui::Cmd::none()
+            }
+            CassMsg::SourceDoctorCompleted {
+                ref source_name,
+                passed,
+                warnings,
+                failed,
+            } => {
+                let source_name = source_name.clone();
+                if let Some(item) = self
+                    .sources_view
+                    .items
+                    .iter_mut()
+                    .find(|i| i.name == source_name)
+                {
+                    item.busy = false;
+                    item.doctor_summary = Some((passed, warnings, failed));
+                }
+                self.sources_view.status = format!(
+                    "Doctor '{source_name}': {passed} pass, {warnings} warn, {failed} fail"
+                );
+                ftui::Cmd::none()
+            }
+
             // -- Lifecycle ----------------------------------------------------
             CassMsg::QuitRequested => {
                 // ESC unwind: check pending state before quitting
-                // If on analytics surface, pop back to search.
-                if self.surface == AppSurface::Analytics {
+                // If on analytics or sources surface, pop back.
+                if self.surface == AppSurface::Analytics || self.surface == AppSurface::Sources {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
                 }
                 if self.show_consent_dialog {
@@ -8844,6 +9123,127 @@ impl super::ftui_adapter::Model for CassApp {
                     analytics_deg_tag
                 );
                 Paragraph::new(&*analytics_status)
+                    .style(text_muted_style)
+                    .render(vertical[2], frame);
+            }
+
+            AppSurface::Sources => {
+                // Clear search hit regions — not visible on sources surface.
+                *self.last_search_bar_area.borrow_mut() = None;
+                *self.last_results_inner.borrow_mut() = None;
+                *self.last_detail_area.borrow_mut() = None;
+                *self.last_status_area.borrow_mut() = None;
+                *self.last_content_area.borrow_mut() = None;
+                *self.last_split_handle_area.borrow_mut() = None;
+                self.last_saved_view_row_areas.borrow_mut().clear();
+
+                // ── Sources surface layout ─────────────────────────────
+                let vertical = Flex::vertical()
+                    .constraints([
+                        Constraint::Fixed(3), // Header
+                        Constraint::Min(4),   // Source list
+                        Constraint::Fixed(1), // Status footer
+                    ])
+                    .split(layout_area);
+
+                // ── Header ───────────────────────────────────────────
+                let header_title = format!(
+                    "cass sources | {} source(s) | {}",
+                    self.sources_view.items.len(),
+                    self.sources_view.config_path
+                );
+                let header_block = Block::new()
+                    .borders(adaptive_borders)
+                    .border_type(border_type)
+                    .title(&header_title)
+                    .title_alignment(Alignment::Left)
+                    .style(pane_focused_style);
+                let header_inner = header_block.inner(vertical[0]);
+                header_block.render(vertical[0], frame);
+                if render_content && !header_inner.is_empty() {
+                    let hints = " s=sync  d=doctor  r=refresh  Esc=back";
+                    Paragraph::new(hints)
+                        .style(text_muted_style)
+                        .render(header_inner, frame);
+                }
+
+                // ── Source list ───────────────────────────────────────
+                let content_block = Block::new()
+                    .borders(adaptive_borders)
+                    .border_type(border_type)
+                    .title("Configured Sources")
+                    .title_alignment(Alignment::Left)
+                    .style(pane_style);
+                let content_inner = content_block.inner(vertical[1]);
+                content_block.render(vertical[1], frame);
+
+                if render_content && !content_inner.is_empty() {
+                    let sv = &self.sources_view;
+                    if sv.items.is_empty() {
+                        Paragraph::new(
+                            "No sources configured.\nRun `cass sources add <host>` to add one.",
+                        )
+                        .style(text_muted_style)
+                        .render(content_inner, frame);
+                    } else {
+                        // Render each source row.
+                        let visible_rows = content_inner.height as usize;
+                        let start = sv.scroll;
+                        let end = (start + visible_rows).min(sv.items.len());
+
+                        for (vis_idx, src_idx) in (start..end).enumerate() {
+                            let item = &sv.items[src_idx];
+                            let row_y = content_inner.y + vis_idx as u16;
+                            if row_y >= content_inner.y + content_inner.height {
+                                break;
+                            }
+                            let row_area =
+                                Rect::new(content_inner.x, row_y, content_inner.width, 1);
+
+                            let is_selected = src_idx == sv.selected;
+                            let kind_tag = match item.kind {
+                                crate::sources::SourceKind::Local => "[local]",
+                                crate::sources::SourceKind::Ssh => "[ssh]  ",
+                            };
+                            let host_str = item.host.as_deref().unwrap_or("-");
+                            let sync_str = if item.busy {
+                                "\u{23F3}".to_string() // hourglass
+                            } else if let Some((p, w, f)) = item.doctor_summary {
+                                format!("dr:{p}p/{w}w/{f}f")
+                            } else {
+                                format!("last:{}", item.last_result)
+                            };
+
+                            // Truncate row to fit.
+                            let row_text = format!(
+                                " {kind_tag} {:<16} {:<24} {:<8} paths:{} {sync_str}",
+                                item.name, host_str, item.schedule, item.path_count
+                            );
+                            let display: String = row_text
+                                .chars()
+                                .take(content_inner.width as usize)
+                                .collect();
+
+                            let row_style = if is_selected {
+                                styles.style(style_system::STYLE_RESULT_ROW_SELECTED)
+                            } else {
+                                styles.style(style_system::STYLE_TEXT_PRIMARY)
+                            };
+                            Paragraph::new(&*display)
+                                .style(row_style)
+                                .render(row_area, frame);
+                        }
+                    }
+                }
+
+                // ── Sources status footer ────────────────────────────
+                let sources_status = format!(
+                    " Sources: [{}/{}] | {}",
+                    self.sources_view.selected + 1,
+                    self.sources_view.items.len(),
+                    self.sources_view.status
+                );
+                Paragraph::new(&*sources_status)
                     .style(text_muted_style)
                     .render(vertical[2], frame);
             }
