@@ -53,7 +53,6 @@ use ftui::widgets::block::{Alignment, Block};
 use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::{RenderItem, StatefulWidget, VirtualizedList, VirtualizedListState};
-use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
 
 // ---------------------------------------------------------------------------
@@ -1935,6 +1934,8 @@ pub enum CassMsg {
     CopyPath,
     /// Copy the rendered detail content to clipboard.
     CopyContent,
+    /// Copy the current search query to clipboard.
+    CopyQuery,
     /// Open the current result in $EDITOR.
     OpenInEditor,
     /// Open content in nano.
@@ -2375,6 +2376,10 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                     // -- Quick export ---------------------------------------------
                     KeyCode::Char('e') if ctrl => CassMsg::ExportModalOpened,
+
+                    // -- Clipboard ------------------------------------------------
+                    KeyCode::Char('y') if ctrl => CassMsg::CopyPath,
+                    KeyCode::Char('c') if ctrl && shift => CassMsg::CopyContent,
 
                     // -- Peek XL --------------------------------------------------
                     KeyCode::Char(' ') if ctrl => CassMsg::PeekToggled,
@@ -3128,12 +3133,22 @@ impl super::ftui_adapter::Model for CassApp {
                         let count = paths.len();
                         match copy_to_clipboard(&text) {
                             Ok(()) => {
+                                use crate::ui::components::toast::{Toast, ToastType};
                                 self.selected.clear();
                                 self.open_confirm_armed = false;
                                 self.status = format!("Copied {count} paths to clipboard");
+                                self.toast_manager.push(Toast::new(
+                                    format!("Copied {count} paths"),
+                                    ToastType::Success,
+                                ));
                             }
                             Err(e) => {
-                                self.status = format!("Clipboard copy failed: {e}");
+                                use crate::ui::components::toast::{Toast, ToastType};
+                                self.status = format!("Clipboard: {e}");
+                                self.toast_manager.push(Toast::new(
+                                    format!("Copy failed: {e}"),
+                                    ToastType::Error,
+                                ));
                             }
                         }
                         ftui::Cmd::none()
@@ -3155,17 +3170,27 @@ impl super::ftui_adapter::Model for CassApp {
                             })
                             .collect();
                         let count = export.len();
-                        self.status = match serde_json::to_string_pretty(&export) {
+                        match serde_json::to_string_pretty(&export) {
                             Ok(json) => match copy_to_clipboard(&json) {
                                 Ok(()) => {
+                                    use crate::ui::components::toast::{Toast, ToastType};
                                     self.selected.clear();
                                     self.open_confirm_armed = false;
-                                    format!("Exported {count} items as JSON to clipboard")
+                                    self.status =
+                                        format!("Exported {count} items as JSON to clipboard");
+                                    self.toast_manager.push(Toast::new(
+                                        format!("Exported {count} items as JSON"),
+                                        ToastType::Success,
+                                    ));
                                 }
-                                Err(e) => format!("JSON export failed: {e}"),
+                                Err(e) => {
+                                    self.status = format!("JSON export failed: {e}");
+                                }
                             },
-                            Err(e) => format!("JSON export failed: {e}"),
-                        };
+                            Err(e) => {
+                                self.status = format!("JSON export failed: {e}");
+                            }
+                        }
                         ftui::Cmd::none()
                     }
                     3 => {
@@ -3182,33 +3207,62 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Actions on results -------------------------------------------
             CassMsg::CopySnippet => {
+                use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    self.status = match copy_to_clipboard(hit.snippet.as_str()) {
-                        Ok(()) => "Copied snippet to clipboard".to_string(),
-                        Err(e) => format!("Clipboard copy failed: {e}"),
-                    };
+                    match copy_to_clipboard(hit.snippet.as_str()) {
+                        Ok(()) => {
+                            self.status = "Copied snippet to clipboard".to_string();
+                            self.toast_manager
+                                .push(Toast::new("Copied snippet".to_string(), ToastType::Success));
+                        }
+                        Err(e) => {
+                            self.status = format!("Clipboard: {e}");
+                            self.toast_manager
+                                .push(Toast::new(format!("Copy failed: {e}"), ToastType::Error));
+                        }
+                    }
                 } else {
                     self.status = "No active result to copy.".to_string();
                 }
                 ftui::Cmd::none()
             }
             CassMsg::CopyPath => {
+                use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    self.status = match copy_to_clipboard(hit.source_path.as_str()) {
-                        Ok(()) => "Copied path to clipboard".to_string(),
-                        Err(e) => format!("Clipboard copy failed: {e}"),
-                    };
+                    match copy_to_clipboard(hit.source_path.as_str()) {
+                        Ok(()) => {
+                            self.status = "Copied path to clipboard".to_string();
+                            self.toast_manager
+                                .push(Toast::new("Copied path".to_string(), ToastType::Success));
+                        }
+                        Err(e) => {
+                            self.status = format!("Clipboard: {e}");
+                            self.toast_manager
+                                .push(Toast::new(format!("Copy failed: {e}"), ToastType::Error));
+                        }
+                    }
                 } else {
                     self.status = "No active result to copy.".to_string();
                 }
                 ftui::Cmd::none()
             }
             CassMsg::CopyContent => {
+                use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    self.status = match copy_to_clipboard(hit.content.as_str()) {
-                        Ok(()) => "Copied content to clipboard".to_string(),
-                        Err(e) => format!("Clipboard copy failed: {e}"),
-                    };
+                    match copy_to_clipboard(hit.content.as_str()) {
+                        Ok(()) => {
+                            self.status = "Copied content to clipboard".to_string();
+                            self.toast_manager.push(Toast::new(
+                                "Copied content".to_string(),
+                                ToastType::Success,
+                            ));
+                        }
+                        Err(e) => {
+                            self.status = format!("Clipboard: {e}");
+                            self.toast_manager
+                                .push(Toast::new(format!("Copy failed: {e}"), ToastType::Error));
+                        }
+                    }
                 } else {
                     self.status = "No active result to copy.".to_string();
                 }
@@ -4774,58 +4828,34 @@ fn copy_to_clipboard(_text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Copy text to the system clipboard using OSC52 with fallback to external tools.
+///
+/// Uses ftui-extras [`Clipboard::auto`] for full auto-detection: OSC52 (works
+/// over SSH), multiplexer passthrough (tmux/screen), then external tools
+/// (pbcopy/wl-copy/xclip/xsel).
 #[cfg(not(test))]
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    use std::io::Write;
+    use ftui_extras::clipboard::{Clipboard, ClipboardSelection};
+    use ftui::TerminalCapabilities;
 
     if text.is_empty() {
         return Ok(());
     }
 
-    let mut command: Option<(String, Vec<String>)> = None;
-    if cfg!(target_os = "macos") {
-        command = Some(("pbcopy".to_string(), Vec::new()));
-    } else if cfg!(target_os = "windows") {
-        command = Some((
-            "powershell".to_string(),
-            vec!["-command".to_string(), "$Input | Set-Clipboard".to_string()],
-        ));
-    } else if command_exists("wl-copy") {
-        command = Some(("wl-copy".to_string(), Vec::new()));
-    } else if command_exists("xclip") {
-        command = Some((
-            "xclip".to_string(),
-            vec!["-selection".to_string(), "clipboard".to_string()],
-        ));
-    } else if command_exists("xsel") {
-        command = Some((
-            "xsel".to_string(),
-            vec!["--clipboard".to_string(), "--input".to_string()],
-        ));
+    let caps = TerminalCapabilities::detect();
+    let clipboard = Clipboard::auto(caps);
+
+    if !clipboard.is_available() {
+        return Err(
+            "no clipboard backend available (no OSC52 support and no clipboard tool found)"
+                .to_string(),
+        );
     }
 
-    let Some((bin, args)) = command else {
-        return Err("no clipboard tool found".to_string());
-    };
-
-    let mut child = StdCommand::new(&bin)
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn clipboard command '{bin}': {e}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("failed to write clipboard payload: {e}"))?;
-    }
-    let status = child
-        .wait()
-        .map_err(|e| format!("failed to wait for clipboard command '{bin}': {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("clipboard command '{bin}' exited with {status}"))
-    }
+    let mut stdout = std::io::stdout();
+    clipboard
+        .set(text, ClipboardSelection::Clipboard, &mut stdout)
+        .map_err(|e| format!("{e}"))
 }
 
 #[cfg(test)]
