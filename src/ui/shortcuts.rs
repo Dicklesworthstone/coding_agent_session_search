@@ -37,6 +37,7 @@ pub const COPY: &str = "y";
 pub const COPY_PATH: &str = "Ctrl+Y";
 pub const COPY_CONTENT: &str = "Ctrl+Shift+C";
 pub const BULK_MENU: &str = "A";
+pub const JSON_VIEW: &str = "J";
 pub const TOGGLE_SELECT: &str = "Ctrl+X";
 pub const PANE_FILTER: &str = "/";
 

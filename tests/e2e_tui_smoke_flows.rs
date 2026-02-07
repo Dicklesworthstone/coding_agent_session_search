@@ -58,11 +58,11 @@ fn trace_id() -> String {
 fn truncate_output(bytes: &[u8], max_len: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() > max_len {
-        format!(
-            "{}... [truncated {} bytes]",
-            &s[..max_len],
-            s.len() - max_len
-        )
+        let mut cut = max_len;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}... [truncated {} bytes]", &s[..cut], s.len() - cut)
     } else {
         s.to_string()
     }

@@ -51,6 +51,7 @@ use crate::update_check::{run_self_update, spawn_update_check};
 use ftui::widgets::Widget;
 use ftui::widgets::block::{Alignment, Block};
 use ftui::widgets::borders::{BorderType, Borders};
+use ftui::widgets::json_view::{JsonToken, JsonView};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::{RenderItem, StatefulWidget, VirtualizedList, VirtualizedListState};
 use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown};
@@ -170,36 +171,8 @@ pub struct AnalyticsFilterState {
     pub source_filter: SourceFilter,
 }
 
-/// Pre-computed chart data for the analytics views.
-///
-/// Loaded once when entering the analytics surface, refreshed on filter changes.
-#[derive(Clone, Debug, Default)]
-pub struct AnalyticsChartData {
-    /// Per-agent token totals: `(agent_slug, api_tokens_total)` sorted desc.
-    pub agent_tokens: Vec<(String, f64)>,
-    /// Per-agent message counts: `(agent_slug, message_count)` sorted desc.
-    pub agent_messages: Vec<(String, f64)>,
-    /// Per-agent tool call counts: `(agent_slug, tool_call_count)` sorted desc.
-    pub agent_tool_calls: Vec<(String, f64)>,
-    /// Daily timeseries: `(label, api_tokens_total)` ordered by date.
-    pub daily_tokens: Vec<(String, f64)>,
-    /// Daily timeseries: `(label, message_count)` ordered by date.
-    pub daily_messages: Vec<(String, f64)>,
-    /// Per-model token totals: `(model_family, grand_total_tokens)` sorted desc.
-    pub model_tokens: Vec<(String, f64)>,
-    /// Coverage percentage (0..100).
-    pub coverage_pct: f64,
-    /// Total messages across all data.
-    pub total_messages: i64,
-    /// Total API tokens across all data.
-    pub total_api_tokens: i64,
-    /// Total tool calls across all data.
-    pub total_tool_calls: i64,
-    /// Number of unique agents seen.
-    pub agent_count: usize,
-    /// Per-day heatmap values: `(day_label, normalized_value)` for canvas heatmap.
-    pub heatmap_days: Vec<(String, f64)>,
-}
+// Re-export from the analytics_charts module.
+pub use super::analytics_charts::AnalyticsChartData;
 
 /// Which tab is active in the detail pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -208,6 +181,8 @@ pub enum DetailTab {
     Messages,
     Snippets,
     Raw,
+    /// Syntax-highlighted JSON viewer with collapsible tree display.
+    Json,
 }
 
 /// Text matching strategy for search queries.
@@ -687,12 +662,19 @@ pub struct CassApp {
     pub saved_views: Vec<SavedView>,
 
     // -- Layout hit regions (for mouse) -----------------------------------
+    // RefCell enables recording rects from view() which takes &self.
+    /// Last rendered search bar area.
+    pub last_search_bar_area: RefCell<Option<Rect>>,
+    /// Last rendered results inner area (without borders).
+    pub last_results_inner: RefCell<Option<Rect>>,
     /// Last rendered detail area rectangle.
-    pub last_detail_area: Option<Rect>,
+    pub last_detail_area: RefCell<Option<Rect>>,
     /// Last rendered pane rectangles.
-    pub last_pane_rects: Vec<Rect>,
+    pub last_pane_rects: RefCell<Vec<Rect>>,
     /// Last rendered pill hit-test rectangles.
-    pub last_pill_rects: Vec<(Rect, Pill)>,
+    pub last_pill_rects: RefCell<Vec<(Rect, Pill)>>,
+    /// Last rendered status footer area.
+    pub last_status_area: RefCell<Option<Rect>>,
 
     // -- Lazy-loaded services ---------------------------------------------
     /// Database reader (initialized on first use).
@@ -789,9 +771,12 @@ impl Default for CassApp {
             search_dirty_since: None,
             spinner_frame: 0,
             saved_views: Vec::new(),
-            last_detail_area: None,
-            last_pane_rects: Vec::new(),
-            last_pill_rects: Vec::new(),
+            last_search_bar_area: RefCell::new(None),
+            last_results_inner: RefCell::new(None),
+            last_detail_area: RefCell::new(None),
+            last_pane_rects: RefCell::new(Vec::new()),
+            last_pill_rects: RefCell::new(Vec::new()),
+            last_status_area: RefCell::new(None),
             db_reader: None,
             known_workspaces: None,
             search_service: None,
@@ -831,6 +816,37 @@ impl CassApp {
             }
         }
         hits
+    }
+
+    /// Determine which UI region a mouse coordinate falls in.
+    fn hit_test(&self, x: u16, y: u16) -> MouseHitRegion {
+        // Check results inner area first (most common click target).
+        if let Some(rect) = *self.last_results_inner.borrow() {
+            if rect.contains(x, y) {
+                let row_h = self.density_mode.row_height();
+                let state = self.results_list_state.borrow();
+                let scroll = state.scroll_offset();
+                let row_in_viewport = ((y - rect.y) / row_h.max(1)) as usize;
+                let item_idx = scroll + row_in_viewport;
+                return MouseHitRegion::Results { item_idx };
+            }
+        }
+        if let Some(rect) = *self.last_detail_area.borrow() {
+            if rect.contains(x, y) {
+                return MouseHitRegion::Detail;
+            }
+        }
+        if let Some(rect) = *self.last_search_bar_area.borrow() {
+            if rect.contains(x, y) {
+                return MouseHitRegion::SearchBar;
+            }
+        }
+        if let Some(rect) = *self.last_status_area.borrow() {
+            if rect.contains(x, y) {
+                return MouseHitRegion::StatusBar;
+            }
+        }
+        MouseHitRegion::None
     }
 
     fn update_banner_visible(&self) -> bool {
@@ -953,6 +969,9 @@ impl CassApp {
             });
         let inner = results_block.inner(area);
         results_block.render(area, frame);
+
+        // Record hit region for mouse click-to-select.
+        *self.last_results_inner.borrow_mut() = Some(inner);
 
         if inner.is_empty() {
             return;
@@ -1322,6 +1341,122 @@ impl CassApp {
         lines
     }
 
+    /// Build syntax-highlighted JSON lines for the Json tab using ftui JsonView.
+    fn build_json_lines(&self, hit: &SearchHit, styles: &StyleContext) -> Vec<ftui::text::Line> {
+        let mut lines: Vec<ftui::text::Line> = Vec::new();
+        let header_style = styles.style(style_system::STYLE_TEXT_PRIMARY).bold();
+
+        // Style mapping for JSON tokens
+        let key_style = styles.style(style_system::STYLE_ROLE_USER).bold();
+        let string_style = styles.style(style_system::STYLE_STATUS_SUCCESS);
+        let number_style = styles.style(style_system::STYLE_STATUS_WARNING);
+        let literal_style = styles.style(style_system::STYLE_STATUS_INFO);
+        let punct_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let error_style = styles.style(style_system::STYLE_STATUS_ERROR);
+
+        // Header
+        lines.push(ftui::text::Line::from_spans(vec![
+            ftui::text::Span::styled("JSON Viewer", header_style),
+        ]));
+        lines.push(ftui::text::Line::from(""));
+
+        // Helper: convert JsonView formatted_lines into styled ftui Lines.
+        let convert_tokens = |token_lines: Vec<Vec<JsonToken>>, out: &mut Vec<ftui::text::Line>| {
+            for token_line in token_lines {
+                let mut spans = Vec::new();
+                for token in token_line {
+                    let (text, style) = match token {
+                        JsonToken::Key(s) => (s, key_style),
+                        JsonToken::StringVal(s) => (s, string_style),
+                        JsonToken::Number(s) => (s, number_style),
+                        JsonToken::Literal(s) => (s, literal_style),
+                        JsonToken::Punctuation(s) => (s, punct_style),
+                        JsonToken::Whitespace(s) => (s, ftui::Style::default()),
+                        JsonToken::Newline => continue,
+                        JsonToken::Error(s) => (s, error_style),
+                    };
+                    spans.push(ftui::text::Span::styled(text, style));
+                }
+                out.push(ftui::text::Line::from_spans(spans));
+            }
+        };
+
+        if let Some((_, ref cv)) = self.cached_detail {
+            // Build the full conversation JSON including metadata and messages
+            let source_kind = normalized_source_kind(None, &cv.convo.source_id);
+            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json);
+
+            let mut messages_json = Vec::new();
+            for msg in &cv.messages {
+                messages_json.push(serde_json::json!({
+                    "role": msg.role.to_string(),
+                    "author": msg.author,
+                    "created_at": msg.created_at,
+                    "content_length": msg.content.len(),
+                    "extra": msg.extra_json,
+                }));
+            }
+
+            let full_json = serde_json::json!({
+                "agent": cv.convo.agent_slug,
+                "external_id": cv.convo.external_id,
+                "title": cv.convo.title,
+                "source_path": cv.convo.source_path.display().to_string(),
+                "started_at": cv.convo.started_at,
+                "ended_at": cv.convo.ended_at,
+                "approx_tokens": cv.convo.approx_tokens,
+                "source_id": cv.convo.source_id,
+                "source_kind": source_kind,
+                "origin_host": cv.convo.origin_host,
+                "workspace_original": workspace_original,
+                "message_count": cv.messages.len(),
+                "messages": messages_json,
+            });
+
+            if let Ok(json_str) = serde_json::to_string(&full_json) {
+                let jv = JsonView::new(json_str)
+                    .with_indent(2)
+                    .with_key_style(key_style)
+                    .with_string_style(string_style)
+                    .with_number_style(number_style)
+                    .with_literal_style(literal_style)
+                    .with_punct_style(punct_style)
+                    .with_error_style(error_style);
+                convert_tokens(jv.formatted_lines(), &mut lines);
+            }
+        } else {
+            // Fallback: show the hit as JSON
+            let hit_json = serde_json::json!({
+                "title": hit.title,
+                "agent": hit.agent,
+                "workspace": hit.workspace,
+                "workspace_original": hit.workspace_original,
+                "source_path": hit.source_path,
+                "score": hit.score,
+                "content_length": hit.content.len(),
+                "source_id": hit.source_id,
+                "source_kind": normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id),
+                "origin_kind": hit.origin_kind,
+                "origin_host": hit.origin_host,
+                "created_at": hit.created_at,
+            });
+
+            if let Ok(json_str) = serde_json::to_string(&hit_json) {
+                let jv = JsonView::new(json_str)
+                    .with_indent(2)
+                    .with_key_style(key_style)
+                    .with_string_style(string_style)
+                    .with_number_style(number_style)
+                    .with_literal_style(literal_style)
+                    .with_punct_style(punct_style)
+                    .with_error_style(error_style);
+                convert_tokens(jv.formatted_lines(), &mut lines);
+            }
+        }
+
+        lines
+    }
+
     /// Apply find-in-detail highlighting to rendered lines.
     fn apply_find_highlight(
         lines: &mut [ftui::text::Line],
@@ -1415,9 +1550,10 @@ impl CassApp {
     ) {
         // Tab indicator and wrap status
         let tab_label = match self.detail_tab {
-            DetailTab::Messages => "Detail [\u{25cf}Messages] Snippets  Raw",
-            DetailTab::Snippets => "Detail  Messages [\u{25cf}Snippets] Raw",
-            DetailTab::Raw => "Detail  Messages  Snippets [\u{25cf}Raw]",
+            DetailTab::Messages => "Detail [\u{25cf}Messages] Snippets  Raw  Json",
+            DetailTab::Snippets => "Detail  Messages [\u{25cf}Snippets] Raw  Json",
+            DetailTab::Raw => "Detail  Messages  Snippets [\u{25cf}Raw] Json",
+            DetailTab::Json => "Detail  Messages  Snippets  Raw [\u{25cf}Json]",
         };
         let wrap_indicator = if self.detail_wrap { " \u{21a9}" } else { "" };
         let title = format!("{tab_label}{wrap_indicator}");
@@ -1434,6 +1570,9 @@ impl CassApp {
             });
         let inner = detail_block.inner(area);
         detail_block.render(area, frame);
+
+        // Record hit region for mouse scroll in detail.
+        *self.last_detail_area.borrow_mut() = Some(area);
 
         if inner.is_empty() {
             return;
@@ -1459,6 +1598,7 @@ impl CassApp {
                 DetailTab::Messages => self.build_messages_lines(hit, content_area.width, styles),
                 DetailTab::Snippets => self.build_snippets_lines(hit, styles),
                 DetailTab::Raw => self.build_raw_lines(hit, styles),
+                DetailTab::Json => self.build_json_lines(hit, styles),
             };
 
             // Apply find-in-detail highlighting
@@ -2136,6 +2276,8 @@ pub enum CassMsg {
     DetailFindQueryChanged(String),
     /// Move to next/previous find match.
     DetailFindNavigated { forward: bool },
+    /// Toggle JSON viewer tab (syntax-highlighted tree view).
+    ToggleJsonView,
 
     // -- Multi-select & bulk actions --------------------------------------
     /// Toggle select on the current item.
@@ -2381,11 +2523,27 @@ pub enum FocusDirection {
 }
 
 /// Mouse event kinds (simplified from crossterm/ftui).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEventKind {
     LeftClick,
+    RightClick,
     ScrollUp,
     ScrollDown,
+}
+
+/// Region identified by mouse hit-testing against last-rendered layout rects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseHitRegion {
+    /// Click/scroll landed in the results list. `item_idx` is the absolute item index.
+    Results { item_idx: usize },
+    /// Click/scroll landed in the detail pane.
+    Detail,
+    /// Click/scroll landed in the search bar.
+    SearchBar,
+    /// Click/scroll landed in the status footer.
+    StatusBar,
+    /// Click/scroll landed outside any tracked region.
+    None,
 }
 
 /// Wrapper for terminal events that will be converted to specific messages.
@@ -2656,6 +2814,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('y') => CassMsg::CopySnippet,
                     KeyCode::Char('o') => CassMsg::OpenInEditor,
                     KeyCode::Char('v') => CassMsg::ViewRaw,
+                    KeyCode::Char('J') => CassMsg::ToggleJsonView,
                     KeyCode::Char('r') => CassMsg::ResultsRefreshed,
                     KeyCode::Char('A') => CassMsg::BulkActionsOpened,
                     KeyCode::Char(' ') => CassMsg::PeekToggled,
@@ -2669,13 +2828,20 @@ impl From<super::ftui_adapter::Event> for CassMsg {
             }
 
             Event::Mouse(mouse) => {
+                use ftui::core::event::MouseButton;
                 use ftui::core::event::MouseEventKind as Mek;
                 match mouse.kind {
-                    Mek::Down(_) => CassMsg::MouseEvent {
+                    Mek::Down(MouseButton::Left) => CassMsg::MouseEvent {
                         kind: MouseEventKind::LeftClick,
                         x: mouse.x,
                         y: mouse.y,
                     },
+                    Mek::Down(MouseButton::Right) => CassMsg::MouseEvent {
+                        kind: MouseEventKind::RightClick,
+                        x: mouse.x,
+                        y: mouse.y,
+                    },
+                    Mek::Down(_) => CassMsg::Tick,
                     Mek::ScrollUp => CassMsg::MouseEvent {
                         kind: MouseEventKind::ScrollUp,
                         x: mouse.x,
@@ -3261,6 +3427,21 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::DetailTabChanged(tab) => {
                 self.detail_tab = tab;
                 self.detail_scroll = 0;
+                ftui::Cmd::none()
+            }
+            CassMsg::ToggleJsonView => {
+                if self.selected_hit().is_some() {
+                    // Toggle: if already on Json tab, go back to Raw; otherwise switch to Json.
+                    if self.detail_tab == DetailTab::Json {
+                        self.detail_tab = DetailTab::Raw;
+                    } else {
+                        self.detail_tab = DetailTab::Json;
+                    }
+                    self.detail_scroll = 0;
+                    self.show_detail_modal = true;
+                } else {
+                    self.status = "No active result to view.".to_string();
+                }
                 ftui::Cmd::none()
             }
             CassMsg::DetailWrapToggled => {
@@ -4345,16 +4526,90 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 ftui::Cmd::batch(cmds)
             }
-            CassMsg::MouseEvent { kind, x: _, y: _ } => {
-                // TODO: hit-test against last_pane_rects / last_pill_rects
-                match kind {
-                    MouseEventKind::ScrollUp => {
+            CassMsg::MouseEvent { kind, x, y } => {
+                let region = self.hit_test(x, y);
+                match (kind, region) {
+                    // ── Scroll in results ────────────────────────────
+                    (MouseEventKind::ScrollUp, MouseHitRegion::Results { .. }) => {
                         ftui::Cmd::msg(CassMsg::SelectionMoved { delta: -3 })
                     }
-                    MouseEventKind::ScrollDown => {
+                    (MouseEventKind::ScrollDown, MouseHitRegion::Results { .. }) => {
                         ftui::Cmd::msg(CassMsg::SelectionMoved { delta: 3 })
                     }
-                    MouseEventKind::LeftClick => ftui::Cmd::none(),
+                    // ── Scroll in detail ─────────────────────────────
+                    (MouseEventKind::ScrollUp, MouseHitRegion::Detail) => {
+                        ftui::Cmd::msg(CassMsg::DetailScrolled { delta: -3 })
+                    }
+                    (MouseEventKind::ScrollDown, MouseHitRegion::Detail) => {
+                        ftui::Cmd::msg(CassMsg::DetailScrolled { delta: 3 })
+                    }
+                    // ── Left click in results: select item ──────────
+                    (MouseEventKind::LeftClick, MouseHitRegion::Results { item_idx }) => {
+                        let hit_count = self
+                            .panes
+                            .get(self.active_pane)
+                            .map_or(self.results.len(), |p| p.hits.len());
+                        if item_idx < hit_count {
+                            // Compute delta from current selection to clicked row.
+                            let current =
+                                self.panes.get(self.active_pane).map_or(0, |p| p.selected);
+                            let delta = item_idx as i32 - current as i32;
+                            if delta != 0 {
+                                ftui::Cmd::msg(CassMsg::SelectionMoved { delta })
+                            } else {
+                                // Clicking the already-selected row opens detail.
+                                ftui::Cmd::msg(CassMsg::DetailOpened)
+                            }
+                        } else {
+                            ftui::Cmd::none()
+                        }
+                    }
+                    // ── Right click in results: toggle select ───────
+                    (MouseEventKind::RightClick, MouseHitRegion::Results { item_idx }) => {
+                        let hit_count = self
+                            .panes
+                            .get(self.active_pane)
+                            .map_or(self.results.len(), |p| p.hits.len());
+                        if item_idx < hit_count {
+                            // Move to the row first, then toggle selection.
+                            let current =
+                                self.panes.get(self.active_pane).map_or(0, |p| p.selected);
+                            let delta = item_idx as i32 - current as i32;
+                            let mut cmds = Vec::new();
+                            if delta != 0 {
+                                cmds.push(ftui::Cmd::msg(CassMsg::SelectionMoved { delta }));
+                            }
+                            cmds.push(ftui::Cmd::msg(CassMsg::SelectionToggled));
+                            ftui::Cmd::batch(cmds)
+                        } else {
+                            ftui::Cmd::none()
+                        }
+                    }
+                    // ── Click in detail: focus detail pane ──────────
+                    (MouseEventKind::LeftClick, MouseHitRegion::Detail) => {
+                        if self.focus_region != FocusRegion::Detail {
+                            ftui::Cmd::msg(CassMsg::FocusToggled)
+                        } else {
+                            ftui::Cmd::none()
+                        }
+                    }
+                    // ── Click in search bar: focus results (query) ──
+                    (MouseEventKind::LeftClick, MouseHitRegion::SearchBar) => {
+                        if self.focus_region != FocusRegion::Results {
+                            ftui::Cmd::msg(CassMsg::FocusToggled)
+                        } else {
+                            ftui::Cmd::none()
+                        }
+                    }
+                    // ── Scroll outside tracked regions: default to results
+                    (MouseEventKind::ScrollUp, _) => {
+                        ftui::Cmd::msg(CassMsg::SelectionMoved { delta: -3 })
+                    }
+                    (MouseEventKind::ScrollDown, _) => {
+                        ftui::Cmd::msg(CassMsg::SelectionMoved { delta: 3 })
+                    }
+                    // ── Unhandled clicks ─────────────────────────────
+                    _ => ftui::Cmd::none(),
                 }
             }
 
@@ -4363,6 +4618,15 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.surface != AppSurface::Analytics {
                     self.view_stack.push(self.surface);
                     self.surface = AppSurface::Analytics;
+                }
+                // Load chart data on entry (lazy, from db_reader).
+                if self.analytics_cache.is_none()
+                    && let Some(db) = &self.db_reader
+                {
+                    self.analytics_cache = Some(super::analytics_charts::load_chart_data(
+                        db,
+                        &self.analytics_filters,
+                    ));
                 }
                 ftui::Cmd::none()
             }
@@ -4381,22 +4645,27 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::AnalyticsTimeRangeSet { since_ms, until_ms } => {
                 self.analytics_filters.since_ms = since_ms;
                 self.analytics_filters.until_ms = until_ms;
+                self.analytics_cache = None; // invalidate chart data on filter change
                 ftui::Cmd::none()
             }
             CassMsg::AnalyticsAgentFilterSet(agents) => {
                 self.analytics_filters.agents = agents;
+                self.analytics_cache = None;
                 ftui::Cmd::none()
             }
             CassMsg::AnalyticsWorkspaceFilterSet(workspaces) => {
                 self.analytics_filters.workspaces = workspaces;
+                self.analytics_cache = None;
                 ftui::Cmd::none()
             }
             CassMsg::AnalyticsSourceFilterSet(sf) => {
                 self.analytics_filters.source_filter = sf;
+                self.analytics_cache = None;
                 ftui::Cmd::none()
             }
             CassMsg::AnalyticsFiltersClearAll => {
                 self.analytics_filters = AnalyticsFilterState::default();
+                self.analytics_cache = None;
                 ftui::Cmd::none()
             }
 
@@ -4585,6 +4854,10 @@ impl super::ftui_adapter::Model for CassApp {
                     ])
                     .split(layout_area);
 
+                // Record hit regions for mouse support.
+                *self.last_search_bar_area.borrow_mut() = Some(vertical[0]);
+                *self.last_status_area.borrow_mut() = Some(vertical[2]);
+
                 // ── Search bar ──────────────────────────────────────────
                 let mode_label = match self.search_mode {
                     SearchMode::Lexical => "lexical",
@@ -4626,6 +4899,10 @@ impl super::ftui_adapter::Model for CassApp {
 
                 // ── Content area: responsive layout ─────────────────────
                 let content_area = vertical[1];
+
+                // Reset hit regions — they'll be repopulated by render_*_pane().
+                *self.last_results_inner.borrow_mut() = None;
+                *self.last_detail_area.borrow_mut() = None;
 
                 let (hits, selected_idx) = if let Some(pane) = self.panes.get(self.active_pane) {
                     (&pane.hits[..], pane.selected)
@@ -4786,6 +5063,12 @@ impl super::ftui_adapter::Model for CassApp {
             }
 
             AppSurface::Analytics => {
+                // Clear search hit regions — not visible on analytics surface.
+                *self.last_search_bar_area.borrow_mut() = None;
+                *self.last_results_inner.borrow_mut() = None;
+                *self.last_detail_area.borrow_mut() = None;
+                *self.last_status_area.borrow_mut() = None;
+
                 // ── Analytics surface layout ─────────────────────────────
                 let vertical = Flex::vertical()
                     .constraints([
@@ -4837,13 +5120,14 @@ impl super::ftui_adapter::Model for CassApp {
                 let content_inner = content_block.inner(vertical[1]);
                 content_block.render(vertical[1], frame);
                 if render_content && !content_inner.is_empty() {
-                    let placeholder = format!(
-                        "Analytics {} view — placeholder\n\nEsc to return to search | Ctrl+P for palette",
-                        self.analytics_view.label()
+                    let empty_data = AnalyticsChartData::default();
+                    let chart_data = self.analytics_cache.as_ref().unwrap_or(&empty_data);
+                    super::analytics_charts::render_analytics_content(
+                        self.analytics_view,
+                        chart_data,
+                        content_inner,
+                        frame,
                     );
-                    Paragraph::new(&*placeholder)
-                        .style(text_muted_style)
-                        .render(content_inner, frame);
                 }
 
                 // ── Analytics status footer ──────────────────────────────
@@ -5246,6 +5530,7 @@ mod tests {
         let _msgs = DetailTab::Messages;
         let _snip = DetailTab::Snippets;
         let _raw = DetailTab::Raw;
+        let _json = DetailTab::Json;
     }
 
     #[test]
@@ -6529,6 +6814,11 @@ mod tests {
         let _ = app.update(CassMsg::DetailTabChanged(DetailTab::Raw));
         assert_eq!(app.detail_tab, DetailTab::Raw);
         assert_eq!(app.detail_scroll, 0);
+
+        app.detail_scroll = 5;
+        let _ = app.update(CassMsg::DetailTabChanged(DetailTab::Json));
+        assert_eq!(app.detail_tab, DetailTab::Json);
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]
@@ -6713,6 +7003,94 @@ mod tests {
         let _ = app.update(CassMsg::DetailClosed);
         assert!(!app.show_detail_modal);
         assert_eq!(app.focus_region, FocusRegion::Results);
+    }
+
+    // =====================================================================
+    // 2noh9.4.16 — JSON viewer tests
+    // =====================================================================
+
+    #[test]
+    fn toggle_json_view_no_hit_sets_status() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ToggleJsonView);
+        assert!(
+            app.status.contains("No active result"),
+            "should show error when no hit selected"
+        );
+        assert_ne!(app.detail_tab, DetailTab::Json);
+    }
+
+    #[test]
+    fn toggle_json_view_switches_to_json_tab() {
+        let mut app = CassApp::default();
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 1,
+            hits: vec![make_test_hit()],
+            selected: 0,
+        });
+        app.active_pane = 0;
+        let _ = app.update(CassMsg::ToggleJsonView);
+        assert_eq!(app.detail_tab, DetailTab::Json);
+        assert!(app.show_detail_modal, "should open detail modal");
+        assert_eq!(app.detail_scroll, 0, "should reset scroll");
+    }
+
+    #[test]
+    fn toggle_json_view_toggles_back_to_raw() {
+        let mut app = CassApp::default();
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 1,
+            hits: vec![make_test_hit()],
+            selected: 0,
+        });
+        app.active_pane = 0;
+        // First toggle: to Json
+        let _ = app.update(CassMsg::ToggleJsonView);
+        assert_eq!(app.detail_tab, DetailTab::Json);
+        // Second toggle: back to Raw
+        let _ = app.update(CassMsg::ToggleJsonView);
+        assert_eq!(app.detail_tab, DetailTab::Raw);
+    }
+
+    #[test]
+    fn build_json_lines_produces_syntax_colored_output() {
+        let app = CassApp::default();
+        let hit = make_test_hit();
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let lines = app.build_json_lines(&hit, &styles);
+        assert!(!lines.is_empty(), "should produce output");
+        // Should contain JSON Viewer header + JSON content
+        let text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans()
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("JSON Viewer"), "should have header");
+        assert!(text.contains("claude_code"), "should contain agent name");
+        assert!(text.contains("title"), "should contain JSON keys");
+    }
+
+    #[test]
+    fn detail_tab_json_variant_has_correct_default() {
+        // Json is not the default tab
+        assert_ne!(DetailTab::default(), DetailTab::Json);
+        assert_eq!(DetailTab::default(), DetailTab::Messages);
+    }
+
+    #[test]
+    fn detail_tab_changed_to_json_resets_scroll() {
+        let mut app = CassApp::default();
+        app.detail_scroll = 99;
+        let _ = app.update(CassMsg::DetailTabChanged(DetailTab::Json));
+        assert_eq!(app.detail_tab, DetailTab::Json);
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]
@@ -7035,13 +7413,14 @@ mod tests {
             24,
             DegradationLevel::Skeleton,
         ));
-        // Full shows the placeholder text; Skeleton does not.
+        // Full shows chart content (e.g. KPI text or "No agent data" fallback);
+        // Skeleton skips content entirely.
         assert!(
-            full_text.contains("placeholder"),
-            "Full analytics should show placeholder text"
+            full_text.contains("Agents:") || full_text.contains("No "),
+            "Full analytics should show chart content: {full_text}"
         );
         assert!(
-            !skeleton_text.contains("placeholder"),
+            !skeleton_text.contains("Agents:") && !skeleton_text.contains("No agent"),
             "Skeleton should skip content text"
         );
     }
@@ -7646,6 +8025,262 @@ mod tests {
         assert!(
             full_border_chars > essential_border_chars,
             "EssentialOnly should have fewer border characters than Full (full={full_border_chars}, essential={essential_border_chars})"
+        );
+    }
+
+    // ==================== Mouse support tests ====================
+
+    #[test]
+    fn hit_regions_recorded_after_render() {
+        let app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert!(
+            app.last_search_bar_area.borrow().is_some(),
+            "search bar area should be recorded"
+        );
+        assert!(
+            app.last_results_inner.borrow().is_some(),
+            "results inner area should be recorded"
+        );
+        assert!(
+            app.last_status_area.borrow().is_some(),
+            "status area should be recorded"
+        );
+    }
+
+    #[test]
+    fn hit_regions_include_detail_pane_in_wide_layout() {
+        let app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert!(
+            app.last_detail_area.borrow().is_some(),
+            "detail area should be recorded in wide layout"
+        );
+    }
+
+    #[test]
+    fn hit_test_returns_results_for_results_inner() {
+        let app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let inner = app.last_results_inner.borrow().unwrap();
+        let region = app.hit_test(inner.x, inner.y);
+        assert!(
+            matches!(region, MouseHitRegion::Results { item_idx: 0 }),
+            "click at results origin should return Results(0), got {region:?}"
+        );
+    }
+
+    #[test]
+    fn hit_test_returns_detail_for_detail_area() {
+        let app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let detail = app.last_detail_area.borrow().unwrap();
+        let region = app.hit_test(detail.x + 1, detail.y + 1);
+        assert_eq!(region, MouseHitRegion::Detail);
+    }
+
+    #[test]
+    fn hit_test_returns_search_bar_for_top_row() {
+        let app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let search = app.last_search_bar_area.borrow().unwrap();
+        let region = app.hit_test(search.x + 1, search.y);
+        assert_eq!(region, MouseHitRegion::SearchBar);
+    }
+
+    #[test]
+    fn hit_test_returns_none_outside_all_regions() {
+        let app = CassApp::default();
+        let region = app.hit_test(0, 0);
+        assert_eq!(region, MouseHitRegion::None);
+    }
+
+    #[test]
+    fn mouse_click_in_results_moves_selection() {
+        use ftui::Model;
+        let mut app = app_with_hits(10);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let inner = app.last_results_inner.borrow().unwrap();
+        let row_h = app.density_mode.row_height();
+        let target_y = inner.y + row_h * 2;
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: inner.x + 1,
+            y: target_y,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "clicking a non-selected row should produce a command");
+    }
+
+    #[test]
+    fn mouse_click_on_selected_row_opens_detail() {
+        use ftui::Model;
+        let mut app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let inner = app.last_results_inner.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: inner.x + 1,
+            y: inner.y,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "clicking selected row should emit DetailOpened");
+    }
+
+    #[test]
+    fn mouse_right_click_in_results_toggles_selection() {
+        use ftui::Model;
+        let mut app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert!(app.selected.is_empty());
+        let inner = app.last_results_inner.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::RightClick,
+            x: inner.x + 1,
+            y: inner.y,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "right-click should produce toggle command");
+    }
+
+    #[test]
+    fn mouse_scroll_in_results_moves_selection() {
+        use ftui::Model;
+        let mut app = app_with_hits(20);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let inner = app.last_results_inner.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            x: inner.x + 1,
+            y: inner.y + 1,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "scroll in results should produce SelectionMoved");
+    }
+
+    #[test]
+    fn mouse_scroll_in_detail_scrolls_detail() {
+        use ftui::Model;
+        let mut app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let detail = app.last_detail_area.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            x: detail.x + 1,
+            y: detail.y + 1,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "scroll in detail should produce DetailScrolled");
+    }
+
+    #[test]
+    fn mouse_click_in_detail_focuses_detail() {
+        use ftui::Model;
+        let mut app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert_eq!(app.focus_region, FocusRegion::Results);
+        let detail = app.last_detail_area.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: detail.x + 1,
+            y: detail.y + 1,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "click in detail should emit FocusToggled");
+    }
+
+    #[test]
+    fn mouse_click_in_search_bar_focuses_results() {
+        use ftui::Model;
+        let mut app = app_with_hits(5);
+        app.focus_region = FocusRegion::Detail;
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let search = app.last_search_bar_area.borrow().unwrap();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: search.x + 1,
+            y: search.y,
+        });
+        assert!(!matches!(cmd, ftui::Cmd::None), "click in search bar should emit FocusToggled");
+    }
+
+    #[test]
+    fn mouse_event_kind_has_right_click() {
+        assert_ne!(MouseEventKind::LeftClick, MouseEventKind::RightClick);
+        assert_ne!(MouseEventKind::RightClick, MouseEventKind::ScrollUp);
+    }
+
+    #[test]
+    fn hit_regions_cleared_on_analytics_surface() {
+        let mut app = app_with_hits(5);
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+        assert!(app.last_results_inner.borrow().is_some());
+
+        app.surface = AppSurface::Analytics;
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert!(
+            app.last_results_inner.borrow().is_none(),
+            "results inner should be cleared on analytics surface"
+        );
+        assert!(
+            app.last_detail_area.borrow().is_none(),
+            "detail area should be cleared on analytics surface"
+        );
+        assert!(
+            app.last_search_bar_area.borrow().is_none(),
+            "search bar should be cleared on analytics surface"
+        );
+    }
+
+    #[test]
+    fn mouse_scroll_outside_regions_defaults_to_results() {
+        use ftui::Model;
+        let mut app = CassApp::default();
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            x: 999,
+            y: 999,
+        });
+        assert!(
+            !matches!(cmd, ftui::Cmd::None),
+            "scroll outside tracked regions should still produce SelectionMoved"
+        );
+    }
+
+    #[test]
+    fn hit_test_row_calculation_respects_density() {
+        let mut app = app_with_hits(10);
+        app.density_mode = DensityMode::Spacious;
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+
+        let inner = app.last_results_inner.borrow().unwrap();
+        let region = app.hit_test(inner.x, inner.y + 3);
+        assert!(
+            matches!(region, MouseHitRegion::Results { item_idx: 1 }),
+            "2nd row in spacious density should be item_idx=1, got {region:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_layout_only_records_visible_pane() {
+        let mut app = app_with_hits(5);
+        app.focus_region = FocusRegion::Results;
+        render_at_degradation(&app, 60, 24, ftui::render::budget::DegradationLevel::Full);
+
+        assert!(
+            app.last_results_inner.borrow().is_some(),
+            "results inner should be recorded in narrow/results mode"
+        );
+        assert!(
+            app.last_detail_area.borrow().is_none(),
+            "detail area should be None in narrow layout with results focus"
         );
     }
 }

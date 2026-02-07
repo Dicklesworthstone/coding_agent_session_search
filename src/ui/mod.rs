@@ -1,4 +1,5 @@
 //! TUI entrypoint and layout.
+pub mod analytics_charts;
 pub mod app;
 pub mod components;
 pub mod data;

@@ -10,11 +10,13 @@
 //! - [`bucketing`] — day_id / hour_id ↔ ISO date conversions
 //! - [`derive`] — safe derived-metric computation
 //! - [`query`] — SQL query builders against rollup tables
+//! - [`validate`] — rollup invariant checks, drift detection, perf guardrails
 
 pub mod bucketing;
 pub mod derive;
 pub mod query;
 pub mod types;
+pub mod validate;
 
 // Re-export the most commonly used items at the crate::analytics level.
 pub use types::{
@@ -22,3 +24,4 @@ pub use types::{
     DerivedMetrics, Dim, DriftInfo, DriftSignal, GroupBy, Metric, SourceFilter, StatusResult,
     TableInfo, TimeseriesResult, ToolReport, ToolRow, UsageBucket,
 };
+pub use validate::{ValidateConfig, ValidationReport};
