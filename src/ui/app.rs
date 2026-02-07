@@ -66,6 +66,7 @@ use ftui_extras::markdown::{MarkdownRenderer, MarkdownTheme, is_likely_markdown}
 // ---------------------------------------------------------------------------
 use super::ftui_adapter::{Constraint, Flex, Rect};
 use super::style_system::{self, StyleContext, StyleOptions, UiThemePreset};
+use ftui::widgets::InspectorState;
 use ftui::widgets::focus::{FocusId, FocusManager, FocusNode, NavDirection};
 
 /// Well-known focus node IDs for the cass TUI layout.
@@ -829,6 +830,109 @@ impl DensityMode {
     }
 }
 
+/// Active tab in the inspector overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InspectorTab {
+    #[default]
+    /// Frame timing, FPS, render budget
+    Timing,
+    /// Widget layout bounds and focus state
+    Layout,
+    /// Hit-test regions and mouse targets
+    HitRegions,
+}
+
+impl InspectorTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Timing => "Timing",
+            Self::Layout => "Layout",
+            Self::HitRegions => "Hit Regions",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Timing => Self::Layout,
+            Self::Layout => Self::HitRegions,
+            Self::HitRegions => Self::Timing,
+        }
+    }
+}
+
+/// Rolling frame timing statistics for the inspector overlay.
+#[derive(Clone, Debug)]
+pub struct FrameTimingStats {
+    /// Ring buffer of recent frame durations (microseconds).
+    pub frame_times_us: VecDeque<u64>,
+    /// Timestamp of the last view() call.
+    pub last_frame: Option<Instant>,
+    /// Maximum ring buffer size.
+    capacity: usize,
+}
+
+impl Default for FrameTimingStats {
+    fn default() -> Self {
+        Self {
+            frame_times_us: VecDeque::with_capacity(120),
+            last_frame: None,
+            capacity: 120,
+        }
+    }
+}
+
+impl FrameTimingStats {
+    /// Record a frame render and return its duration in microseconds.
+    pub fn record_frame(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map(|prev| now.duration_since(prev).as_micros() as u64);
+        self.last_frame = Some(now);
+        if let Some(us) = dt {
+            if self.frame_times_us.len() >= self.capacity {
+                self.frame_times_us.pop_front();
+            }
+            self.frame_times_us.push_back(us);
+        }
+        dt
+    }
+
+    /// Average frame time in microseconds (or 0 if empty).
+    pub fn avg_us(&self) -> u64 {
+        if self.frame_times_us.is_empty() {
+            return 0;
+        }
+        let sum: u64 = self.frame_times_us.iter().sum();
+        sum / self.frame_times_us.len() as u64
+    }
+
+    /// Estimated frames per second from rolling average.
+    pub fn fps(&self) -> f64 {
+        let avg = self.avg_us();
+        if avg == 0 {
+            return 0.0;
+        }
+        1_000_000.0 / avg as f64
+    }
+
+    /// 95th percentile frame time in microseconds.
+    pub fn p95_us(&self) -> u64 {
+        if self.frame_times_us.is_empty() {
+            return 0;
+        }
+        let mut sorted: Vec<u64> = self.frame_times_us.iter().copied().collect();
+        sorted.sort_unstable();
+        let idx = (sorted.len() as f64 * 0.95) as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    /// Most recent frame time in microseconds.
+    pub fn last_us(&self) -> u64 {
+        self.frame_times_us.back().copied().unwrap_or(0)
+    }
+}
+
 /// Inline find state within the detail pane.
 #[derive(Clone, Debug, Default)]
 pub struct DetailFindState {
@@ -1390,6 +1494,16 @@ pub struct CassApp {
     /// Whether to redact absolute paths when saving macros.
     pub macro_redact_paths: bool,
 
+    // -- Inspector / debug overlays ---------------------------------------
+    /// Whether the inspector overlay is visible.
+    pub show_inspector: bool,
+    /// Active inspector tab (Timing / Layout / HitRegions).
+    pub inspector_tab: InspectorTab,
+    /// ftui inspector widget state (mode cycling, hit regions).
+    pub inspector_state: InspectorState,
+    /// Rolling frame timing statistics.
+    pub frame_timing: FrameTimingStats,
+
     // -- Status line ------------------------------------------------------
     /// Footer status text.
     pub status: String,
@@ -1510,6 +1624,10 @@ impl Default for CassApp {
             macro_recorder: None,
             macro_playback: None,
             macro_redact_paths: false,
+            show_inspector: false,
+            inspector_tab: InspectorTab::default(),
+            inspector_state: InspectorState::default(),
+            frame_timing: FrameTimingStats::default(),
             status: String::new(),
         };
         app.init_focus_graph();
@@ -2994,6 +3112,184 @@ impl CassApp {
         }
     }
 
+    /// Render the inspector debug overlay in the bottom-right corner.
+    fn render_inspector_overlay(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        styles: &StyleContext,
+    ) {
+        let overlay_w = 44u16.min(area.width.saturating_sub(2));
+        let overlay_h = 14u16.min(area.height.saturating_sub(2));
+        if overlay_w < 20 || overlay_h < 6 {
+            return; // Too narrow — auto-disable in small terminals
+        }
+        let ox = area.x + area.width.saturating_sub(overlay_w + 1);
+        let oy = area.y + area.height.saturating_sub(overlay_h + 1);
+        let overlay_area = Rect::new(ox, oy, overlay_w, overlay_h);
+
+        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
+        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let value_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
+
+        // Clear background
+        Block::new().style(bg_style).render(overlay_area, frame);
+
+        // Tab bar header
+        let tab_header: String = [
+            InspectorTab::Timing,
+            InspectorTab::Layout,
+            InspectorTab::HitRegions,
+        ]
+        .iter()
+        .map(|t| {
+            if *t == self.inspector_tab {
+                format!("[{}]", t.label())
+            } else {
+                format!(" {} ", t.label())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+        let title = format!(" Inspector: {tab_header} ");
+
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(&title)
+            .title_alignment(Alignment::Left)
+            .style(border_style);
+        let inner = block.inner(overlay_area);
+        block.render(overlay_area, frame);
+
+        if inner.is_empty() {
+            return;
+        }
+
+        let mut y = inner.y;
+        let max_y = inner.y + inner.height;
+
+        match self.inspector_tab {
+            InspectorTab::Timing => {
+                let fps = self.frame_timing.fps();
+                let avg = self.frame_timing.avg_us();
+                let p95 = self.frame_timing.p95_us();
+                let last = self.frame_timing.last_us();
+                let samples = self.frame_timing.frame_times_us.len();
+
+                let lines = [
+                    format!("FPS:     {fps:.1}"),
+                    format!("Avg:     {:.2}ms", avg as f64 / 1000.0),
+                    format!("P95:     {:.2}ms", p95 as f64 / 1000.0),
+                    format!("Last:    {:.2}ms", last as f64 / 1000.0),
+                    format!("Samples: {samples}"),
+                    String::new(),
+                    format!("Search:  {}ms", self.last_search_ms.unwrap_or(0)),
+                    format!("Results: {}", self.results.len()),
+                    format!("Panes:   {}", self.panes.len()),
+                ];
+
+                for line in &lines {
+                    if y >= max_y {
+                        break;
+                    }
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    let st = if line.is_empty() {
+                        muted_style
+                    } else {
+                        value_style
+                    };
+                    Paragraph::new(line.as_str()).style(st).render(row, frame);
+                    y += 1;
+                }
+            }
+            InspectorTab::Layout => {
+                let bp = LayoutBreakpoint::from_width(area.width);
+                let bp_str = match bp {
+                    LayoutBreakpoint::Narrow => "Narrow (<100)",
+                    LayoutBreakpoint::Medium => "Medium (100-159)",
+                    LayoutBreakpoint::Wide => "Wide (>=160)",
+                };
+                let lines = [
+                    format!("Terminal: {}x{}", area.width, area.height),
+                    format!("Layout:   {bp_str}"),
+                    format!("Density:  {:?}", self.density_mode),
+                    format!(
+                        "Borders:  {}",
+                        if self.fancy_borders {
+                            "Rounded"
+                        } else {
+                            "Plain"
+                        }
+                    ),
+                    format!("Focus:    {:?}", self.focused_region()),
+                    format!("FocusID:  {:?}", self.focus_manager.current()),
+                    format!("Trapped:  {}", self.focus_manager.is_trapped()),
+                    format!("Theme:    {:?}", self.theme_preset),
+                    format!("Input:    {:?}", self.input_mode),
+                ];
+
+                for line in &lines {
+                    if y >= max_y {
+                        break;
+                    }
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    Paragraph::new(line.as_str())
+                        .style(value_style)
+                        .render(row, frame);
+                    y += 1;
+                }
+            }
+            InspectorTab::HitRegions => {
+                let regions: Vec<(String, Option<Rect>)> = vec![
+                    ("SearchBar".into(), *self.last_search_bar_area.borrow()),
+                    ("Results".into(), *self.last_results_inner.borrow()),
+                    ("Detail".into(), *self.last_detail_area.borrow()),
+                    ("Status".into(), *self.last_status_area.borrow()),
+                    ("Content".into(), *self.last_content_area.borrow()),
+                    ("SplitHandle".into(), *self.last_split_handle_area.borrow()),
+                ];
+
+                for (name, rect) in &regions {
+                    if y >= max_y {
+                        break;
+                    }
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    let text = match rect {
+                        Some(r) => {
+                            format!("{name:<12} {}x{} @({},{})", r.width, r.height, r.x, r.y)
+                        }
+                        None => format!("{name:<12} (not rendered)"),
+                    };
+                    let st = if rect.is_some() {
+                        value_style
+                    } else {
+                        muted_style
+                    };
+                    Paragraph::new(&*text).style(st).render(row, frame);
+                    y += 1;
+                }
+
+                // Pill count and pane count
+                if y < max_y {
+                    let pill_count = self.last_pill_rects.borrow().len();
+                    let pane_count = self.last_pane_rects.borrow().len();
+                    let text = format!("Pills: {pill_count}  Panes: {pane_count}");
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    Paragraph::new(&*text).style(muted_style).render(row, frame);
+                }
+            }
+        }
+
+        // Footer hint
+        let hint = "Ctrl+Shift+I:close  Tab:tab  m:mode";
+        let hint_row = Rect::new(inner.x, max_y.saturating_sub(1), inner.width, 1);
+        Paragraph::new(hint)
+            .style(muted_style)
+            .render(hint_row, frame);
+    }
+
     /// Render the command palette overlay centered on screen.
     fn render_palette_overlay(
         &self,
@@ -4287,6 +4583,14 @@ pub enum CassMsg {
     /// Execute the selected palette action.
     PaletteActionExecuted,
 
+    // -- Inspector overlay ------------------------------------------------
+    /// Toggle the inspector debug overlay (Ctrl+Shift+I).
+    InspectorToggled,
+    /// Cycle the active inspector tab (Timing → Layout → HitRegions).
+    InspectorTabCycled,
+    /// Cycle the ftui inspector mode (Off → HitRegions → WidgetBounds → Full).
+    InspectorModeCycled,
+
     // -- Help overlay -----------------------------------------------------
     /// Toggle the help overlay.
     HelpToggled,
@@ -4742,6 +5046,10 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Delete if ctrl && shift => CassMsg::StateResetRequested,
                     KeyCode::Delete if ctrl => CassMsg::FiltersClearAll,
 
+                    // -- Inspector overlay -----------------------------------------
+                    KeyCode::Char('i') if ctrl && shift => CassMsg::InspectorToggled,
+                    KeyCode::Char('I') if ctrl => CassMsg::InspectorToggled,
+
                     // -- Borders --------------------------------------------------
                     KeyCode::Char('b') if ctrl => CassMsg::BordersToggled,
 
@@ -5011,6 +5319,22 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 CassMsg::QuitRequested => {
                     return self.update(CassMsg::UpdateDismissed);
+                }
+                _ => {}
+            }
+        }
+
+        // ── Inspector overlay key intercept ─────────────────────────
+        // Non-blocking: only intercept Tab (cycle tabs) and m (cycle mode)
+        if self.show_inspector {
+            match &msg {
+                CassMsg::InspectorTabCycled => {
+                    self.inspector_tab = self.inspector_tab.next();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::InspectorModeCycled => {
+                    self.inspector_state.cycle_mode();
+                    return ftui::Cmd::none();
                 }
                 _ => {}
             }
@@ -6315,6 +6639,26 @@ impl super::ftui_adapter::Model for CassApp {
             }
 
             // -- Help overlay -------------------------------------------------
+            // -- Inspector overlay -----------------------------------------
+            CassMsg::InspectorToggled => {
+                self.show_inspector = !self.show_inspector;
+                if self.show_inspector {
+                    self.inspector_state.toggle();
+                }
+                if !self.show_inspector && self.inspector_state.is_active() {
+                    self.inspector_state.toggle();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::InspectorTabCycled => {
+                self.inspector_tab = self.inspector_tab.next();
+                ftui::Cmd::none()
+            }
+            CassMsg::InspectorModeCycled => {
+                self.inspector_state.cycle_mode();
+                ftui::Cmd::none()
+            }
+
             CassMsg::HelpToggled => {
                 self.show_help = !self.show_help;
                 self.help_scroll = 0;
@@ -6945,6 +7289,10 @@ impl super::ftui_adapter::Model for CassApp {
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_tick);
                 self.last_tick = now;
+                // Record frame interval for inspector overlay.
+                if self.show_inspector {
+                    self.frame_timing.record_frame();
+                }
                 // Tick spring-based animations.
                 self.anim.tick(dt);
                 // Clear expired legacy flash indicators.
@@ -7334,6 +7682,13 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.show_consent_dialog {
                     self.show_consent_dialog = false;
                     self.focus_manager.pop_trap();
+                    return ftui::Cmd::none();
+                }
+                if self.show_inspector {
+                    self.show_inspector = false;
+                    if self.inspector_state.is_active() {
+                        self.inspector_state.toggle();
+                    }
                     return ftui::Cmd::none();
                 }
                 if self.show_export_modal {
@@ -7970,6 +8325,11 @@ impl super::ftui_adapter::Model for CassApp {
         // ── Help overlay ─────────────────────────────────────────────
         if self.show_help {
             self.render_help_overlay(frame, area, &styles);
+        }
+
+        // ── Inspector overlay ────────────────────────────────────────
+        if self.show_inspector {
+            self.render_inspector_overlay(frame, area, &styles);
         }
 
         // ── Command palette overlay ──────────────────────────────────
@@ -14096,5 +14456,150 @@ mod tests {
             g.navigate(focus_ids::DETAIL_PANE, NavDirection::Left),
             Some(focus_ids::RESULTS_LIST)
         );
+    }
+
+    // =========================================================================
+    // Inspector Overlay Tests
+    // =========================================================================
+
+    #[test]
+    fn inspector_toggle_opens_and_closes() {
+        let mut app = CassApp::default();
+        assert!(!app.show_inspector);
+
+        let _ = app.update(CassMsg::InspectorToggled);
+        assert!(app.show_inspector);
+        assert!(app.inspector_state.is_active());
+
+        let _ = app.update(CassMsg::InspectorToggled);
+        assert!(!app.show_inspector);
+        assert!(!app.inspector_state.is_active());
+    }
+
+    #[test]
+    fn inspector_tab_cycles_through_all_tabs() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::InspectorToggled);
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+
+        let _ = app.update(CassMsg::InspectorTabCycled);
+        assert_eq!(app.inspector_tab, InspectorTab::Layout);
+
+        let _ = app.update(CassMsg::InspectorTabCycled);
+        assert_eq!(app.inspector_tab, InspectorTab::HitRegions);
+
+        let _ = app.update(CassMsg::InspectorTabCycled);
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+    }
+
+    #[test]
+    fn inspector_esc_closes_overlay() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::InspectorToggled);
+        assert!(app.show_inspector);
+
+        let _ = app.update(CassMsg::QuitRequested);
+        assert!(!app.show_inspector);
+    }
+
+    #[test]
+    fn inspector_does_not_block_other_keys() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::InspectorToggled);
+        assert!(app.show_inspector);
+
+        // Help toggle should still work (inspector is non-blocking)
+        let _ = app.update(CassMsg::HelpToggled);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn inspector_off_by_default() {
+        let app = CassApp::default();
+        assert!(!app.show_inspector);
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+        assert!(!app.inspector_state.is_active());
+    }
+
+    #[test]
+    fn frame_timing_stats_basic() {
+        let mut stats = FrameTimingStats::default();
+        assert_eq!(stats.fps(), 0.0);
+        assert_eq!(stats.avg_us(), 0);
+        assert_eq!(stats.p95_us(), 0);
+        assert_eq!(stats.last_us(), 0);
+
+        // Simulate recording frames
+        stats.record_frame(); // first frame: no delta
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let dt = stats.record_frame();
+        assert!(dt.is_some());
+        assert!(dt.unwrap() > 0);
+        assert_eq!(stats.frame_times_us.len(), 1);
+        assert!(stats.fps() > 0.0);
+    }
+
+    #[test]
+    fn frame_timing_ring_buffer_caps_at_capacity() {
+        let mut stats = FrameTimingStats::default();
+        // Manually push 130 values (capacity is 120)
+        for i in 0..130 {
+            stats.frame_times_us.push_back(i * 100);
+        }
+        // Ring buffer should trim to capacity
+        while stats.frame_times_us.len() > stats.capacity {
+            stats.frame_times_us.pop_front();
+        }
+        assert!(stats.frame_times_us.len() <= 120);
+    }
+
+    #[test]
+    fn inspector_render_does_not_panic_small_terminal() {
+        use crate::ui::style_system::StyleOptions;
+        let app = CassApp::default();
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(10, 5, &mut pool);
+        let area = Rect::new(0, 0, 10, 5);
+        // Should not panic — auto-disables in small terminals
+        app.render_inspector_overlay(&mut frame, area, &styles);
+    }
+
+    #[test]
+    fn inspector_render_does_not_panic_normal_terminal() {
+        use crate::ui::style_system::StyleOptions;
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        let area = Rect::new(0, 0, 120, 40);
+        app.render_inspector_overlay(&mut frame, area, &styles);
+    }
+
+    #[test]
+    fn inspector_tab_labels_are_unique() {
+        let labels: Vec<&str> = [
+            InspectorTab::Timing,
+            InspectorTab::Layout,
+            InspectorTab::HitRegions,
+        ]
+        .iter()
+        .map(|t| t.label())
+        .collect();
+        let unique: HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(labels.len(), unique.len());
+    }
+
+    #[test]
+    fn ctrl_shift_i_maps_to_inspector_toggled() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Char('i'),
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            kind: ftui::KeyEventKind::Press,
+        });
+        let msg = CassMsg::from(event);
+        assert!(matches!(msg, CassMsg::InspectorToggled));
     }
 }

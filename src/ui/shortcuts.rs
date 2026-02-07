@@ -41,6 +41,9 @@ pub const JSON_VIEW: &str = "J";
 pub const TOGGLE_SELECT: &str = "Ctrl+X";
 pub const PANE_FILTER: &str = "/";
 
+// Inspector
+pub const INSPECTOR: &str = "Ctrl+Shift+I";
+
 // Macro recording
 pub const MACRO_TOGGLE: &str = "Alt+M";
 
