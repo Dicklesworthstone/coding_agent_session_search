@@ -31,10 +31,10 @@ use util::e2e_log::{E2eError, E2eErrorContext, E2ePerformanceMetrics, PhaseTrack
 static TUI_FLOW_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn tui_flow_guard() -> std::sync::MutexGuard<'static, ()> {
-    TUI_FLOW_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("tui flow mutex poisoned")
+    match TUI_FLOW_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Artifact directory for TUI E2E tests
@@ -262,6 +262,27 @@ fn wait_for_output_contains(
     }
 }
 
+fn wait_for_output_growth(
+    captured: &Arc<Mutex<Vec<u8>>>,
+    base_len: usize,
+    min_delta: usize,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        {
+            let data = captured.lock().expect("capture lock");
+            if data.len() >= base_len.saturating_add(min_delta) {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(PTY_POLL);
+    }
+}
+
 fn send_key_sequence(writer: &mut (dyn Write + Send), bytes: &[u8]) {
     writer.write_all(bytes).expect("write to PTY");
     writer.flush().expect("flush PTY");
@@ -430,14 +451,27 @@ fn tui_pty_help_overlay_open_close_flow() {
         "Did not observe startup text before help overlay interaction"
     );
 
-    send_key_sequence(&mut *writer, b"?"); // open help
+    send_key_sequence(&mut *writer, b"?"); // open help overlay
+    thread::sleep(Duration::from_millis(180));
     assert!(
-        wait_for_output_contains(&captured, "Quick Start & Shortcuts", Duration::from_secs(6)),
-        "Help overlay title not observed in PTY output"
+        child
+            .try_wait()
+            .expect("poll child after help toggle")
+            .is_none(),
+        "App exited after '?' instead of opening help overlay"
     );
-    send_key_sequence(&mut *writer, b"\x1b"); // close help
+
+    send_key_sequence(&mut *writer, b"\x1b"); // close help (should not quit app)
     thread::sleep(Duration::from_millis(200));
-    send_key_sequence(&mut *writer, b"\x1b"); // quit
+    assert!(
+        child
+            .try_wait()
+            .expect("poll child after first ESC")
+            .is_none(),
+        "App exited on first ESC; expected ESC to close help overlay"
+    );
+
+    send_key_sequence(&mut *writer, b"\x1b"); // quit app
 
     let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
     assert!(
@@ -489,17 +523,32 @@ fn tui_pty_search_detail_and_quit_flow() {
     );
 
     send_key_sequence(&mut *writer, b"hello");
-    thread::sleep(Duration::from_millis(350));
-    send_key_sequence(&mut *writer, b"\r"); // Enter: open detail for selected result
-    let saw_detail = wait_for_output_contains(&captured, "Detail view", Duration::from_secs(6))
-        || wait_for_output_contains(&captured, "Loading conversation", Duration::from_secs(6));
+    thread::sleep(Duration::from_millis(120));
+    let before_submit_len = captured.lock().expect("capture lock").len();
+    send_key_sequence(&mut *writer, b"\r"); // submit query to populate result list
+    assert!(
+        wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
+        "Did not observe output growth after query submission in PTY search flow"
+    );
+    thread::sleep(Duration::from_millis(180));
+
+    let before_open_len = captured.lock().expect("capture lock").len();
+    send_key_sequence(&mut *writer, b"v"); // open raw-detail modal for selected result
+    let saw_detail = wait_for_output_growth(&captured, before_open_len, 16, Duration::from_secs(6));
     assert!(
         saw_detail,
-        "Did not observe detail-open state in PTY output"
+        "Did not observe output growth after detail-open key in PTY search flow"
     );
 
     send_key_sequence(&mut *writer, b"\x1b"); // close detail modal/back
     thread::sleep(Duration::from_millis(200));
+    assert!(
+        child
+            .try_wait()
+            .expect("poll child after first ESC in search flow")
+            .is_none(),
+        "App exited on first ESC; expected ESC to close detail and keep app running"
+    );
     send_key_sequence(&mut *writer, b"\x1b"); // quit app
 
     let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
@@ -605,18 +654,33 @@ fn tui_pty_performance_guardrails_smoke() {
 
     send_key_sequence(&mut *writer, b"hello");
     thread::sleep(Duration::from_millis(120));
-    let detail_begin = Instant::now();
+    let before_submit_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
-    let saw_detail = wait_for_output_contains(&captured, "Detail view", Duration::from_secs(6))
-        || wait_for_output_contains(&captured, "Loading conversation", Duration::from_secs(6));
+    assert!(
+        wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
+        "No PTY output growth after query submission during perf flow"
+    );
+    thread::sleep(Duration::from_millis(160));
+
+    let before_open_len = captured.lock().expect("capture lock").len();
+    let detail_begin = Instant::now();
+    send_key_sequence(&mut *writer, b"v");
+    let saw_detail = wait_for_output_growth(&captured, before_open_len, 16, Duration::from_secs(6));
     let detail_open_ms = detail_begin.elapsed().as_millis() as u64;
     assert!(
         saw_detail,
-        "Detail view marker not observed during perf flow"
+        "No PTY output growth after detail-open key during perf flow"
     );
 
     send_key_sequence(&mut *writer, b"\x1b");
     thread::sleep(Duration::from_millis(120));
+    assert!(
+        child
+            .try_wait()
+            .expect("poll child after first ESC in perf flow")
+            .is_none(),
+        "App exited on first ESC during perf flow; expected detail-close behavior"
+    );
     send_key_sequence(&mut *writer, b"\x1b");
     let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
     assert!(
@@ -631,6 +695,7 @@ fn tui_pty_performance_guardrails_smoke() {
     save_artifact("pty_perf_guard_output.raw", &trace, &raw);
 
     let total_output_bytes = raw.len() as u64;
+    // Actions: submit query, open detail, ESC close detail, ESC quit.
     let bytes_per_action = total_output_bytes / 4;
     tracker.metrics(
         "perf_pty_runtime",

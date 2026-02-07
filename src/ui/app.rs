@@ -776,6 +776,7 @@ impl CassApp {
         selected_idx: usize,
         row_h: u16,
         border_type: BorderType,
+        borders: Borders,
         styles: &StyleContext,
         pane_style: ftui::Style,
         pane_focused_style: ftui::Style,
@@ -786,7 +787,7 @@ impl CassApp {
     ) {
         let results_title = format!("Results ({})", hits.len());
         let results_block = Block::new()
-            .borders(Borders::ALL)
+            .borders(borders)
             .border_type(border_type)
             .title(&results_title)
             .title_alignment(Alignment::Left)
@@ -1230,6 +1231,7 @@ impl CassApp {
         frame: &mut super::ftui_adapter::Frame,
         area: Rect,
         border_type: BorderType,
+        borders: Borders,
         styles: &StyleContext,
         pane_style: ftui::Style,
         pane_focused_style: ftui::Style,
@@ -1245,7 +1247,7 @@ impl CassApp {
         let title = format!("{tab_label}{wrap_indicator}");
 
         let detail_block = Block::new()
-            .borders(Borders::ALL)
+            .borders(borders)
             .border_type(border_type)
             .title(&title)
             .title_alignment(Alignment::Left)
@@ -3107,12 +3109,16 @@ impl super::ftui_adapter::Model for CassApp {
                             .collect();
                         let text = paths.join("\n");
                         let count = paths.len();
-                        self.selected.clear();
-                        self.open_confirm_armed = false;
-                        self.status = match copy_to_clipboard(&text) {
-                            Ok(()) => format!("Copied {count} paths to clipboard"),
-                            Err(e) => format!("Clipboard copy failed: {e}"),
-                        };
+                        match copy_to_clipboard(&text) {
+                            Ok(()) => {
+                                self.selected.clear();
+                                self.open_confirm_armed = false;
+                                self.status = format!("Copied {count} paths to clipboard");
+                            }
+                            Err(e) => {
+                                self.status = format!("Clipboard copy failed: {e}");
+                            }
+                        }
                         ftui::Cmd::none()
                     }
                     2 => {
@@ -3132,11 +3138,13 @@ impl super::ftui_adapter::Model for CassApp {
                             })
                             .collect();
                         let count = export.len();
-                        self.selected.clear();
-                        self.open_confirm_armed = false;
                         self.status = match serde_json::to_string_pretty(&export) {
                             Ok(json) => match copy_to_clipboard(&json) {
-                                Ok(()) => format!("Exported {count} items as JSON to clipboard"),
+                                Ok(()) => {
+                                    self.selected.clear();
+                                    self.open_confirm_armed = false;
+                                    format!("Exported {count} items as JSON to clipboard")
+                                }
                                 Err(e) => format!("JSON export failed: {e}"),
                             },
                             Err(e) => format!("JSON export failed: {e}"),
@@ -3236,11 +3244,16 @@ impl super::ftui_adapter::Model for CassApp {
                     .or_else(|_| dotenvy::var("VISUAL"))
                     .unwrap_or_else(|_| "code".to_string());
                 self.status = match open_hits_in_editor(&hits, &editor_cmd) {
-                    Ok((count, editor_bin)) => format!("Opened {count} files in {editor_bin}"),
-                    Err(e) => format!("Failed to open queued files: {e}"),
+                    Ok((count, editor_bin)) => {
+                        self.selected.clear();
+                        self.open_confirm_armed = false;
+                        format!("Opened {count} files in {editor_bin}")
+                    }
+                    Err(e) => {
+                        self.open_confirm_armed = false;
+                        format!("Failed to open queued files: {e}")
+                    }
                 };
-                self.selected.clear();
-                self.open_confirm_armed = false;
                 ftui::Cmd::none()
             }
             CassMsg::ViewRaw => {
@@ -4268,6 +4281,7 @@ impl super::ftui_adapter::Model for CassApp {
                             selected_idx,
                             row_h,
                             border_type,
+                            adaptive_borders,
                             &styles,
                             pane_style,
                             pane_focused_style,
@@ -4280,6 +4294,7 @@ impl super::ftui_adapter::Model for CassApp {
                             frame,
                             panes[1],
                             border_type,
+                            adaptive_borders,
                             &styles,
                             pane_style,
                             pane_focused_style,
@@ -4298,6 +4313,7 @@ impl super::ftui_adapter::Model for CassApp {
                             selected_idx,
                             row_h,
                             border_type,
+                            adaptive_borders,
                             &styles,
                             pane_style,
                             pane_focused_style,
@@ -4310,6 +4326,7 @@ impl super::ftui_adapter::Model for CassApp {
                             frame,
                             panes[1],
                             border_type,
+                            adaptive_borders,
                             &styles,
                             pane_style,
                             pane_focused_style,
@@ -4325,6 +4342,7 @@ impl super::ftui_adapter::Model for CassApp {
                                 selected_idx,
                                 row_h,
                                 border_type,
+                                adaptive_borders,
                                 &styles,
                                 pane_style,
                                 pane_focused_style,
@@ -4339,6 +4357,7 @@ impl super::ftui_adapter::Model for CassApp {
                                 frame,
                                 content_area,
                                 border_type,
+                                adaptive_borders,
                                 &styles,
                                 pane_style,
                                 pane_focused_style,
@@ -6505,7 +6524,13 @@ mod tests {
             DegradationLevel::EssentialOnly,
         ));
         // Full rendering has border characters; essential does not.
-        let has_box_char = |s: &str| s.contains('╭') || s.contains('─') || s.contains('+');
+        let has_box_char = |s: &str| {
+            s.contains('╭')
+                || s.contains('╮')
+                || s.contains('╰')
+                || s.contains('╯')
+                || s.contains('─')
+        };
         assert!(
             has_box_char(&full_text),
             "Full should contain border characters"
