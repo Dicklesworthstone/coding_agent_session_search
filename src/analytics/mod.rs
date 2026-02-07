@@ -18,6 +18,7 @@ pub mod types;
 
 // Re-export the most commonly used items at the crate::analytics level.
 pub use types::{
-    AnalyticsError, AnalyticsFilter, AnalyticsResult, CoverageInfo, DerivedMetrics, DriftInfo,
-    DriftSignal, GroupBy, SourceFilter, StatusResult, TableInfo, TimeseriesResult, UsageBucket,
+    AnalyticsError, AnalyticsFilter, AnalyticsResult, BreakdownResult, BreakdownRow, CoverageInfo,
+    DerivedMetrics, Dim, DriftInfo, DriftSignal, GroupBy, Metric, SourceFilter, StatusResult,
+    TableInfo, TimeseriesResult, ToolReport, ToolRow, UsageBucket,
 };

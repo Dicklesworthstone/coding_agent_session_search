@@ -30,6 +30,7 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,7 +39,7 @@ use crate::search::model_manager::SemanticAvailability;
 use crate::search::query::{QuerySuggestion, SearchFilters, SearchHit, SearchMode};
 use crate::sources::provenance::SourceFilter;
 use crate::storage::sqlite::SqliteStorage;
-use crate::ui::components::export_modal::{ExportModalState, ExportProgress};
+use crate::ui::components::export_modal::{ExportField, ExportModalState, ExportProgress};
 use crate::ui::components::palette::{PaletteAction, PaletteState, default_actions};
 use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
@@ -76,6 +77,21 @@ pub mod focus_ids {
     pub const GROUP_EXPORT: u32 = 102;
     pub const GROUP_CONSENT: u32 = 103;
 }
+
+// =========================================================================
+// Constants
+// =========================================================================
+
+/// Labels for the bulk-actions modal menu (order matters — matches action_index).
+pub const BULK_ACTIONS: [&str; 4] = [
+    "Open all in editor",
+    "Copy all paths",
+    "Export as JSON",
+    "Clear selection",
+];
+
+/// Number of selected items before requiring double-press confirmation.
+pub const OPEN_CONFIRM_THRESHOLD: usize = 12;
 
 // =========================================================================
 // Enums (ported from tui.rs, canonical for ftui)
@@ -297,6 +313,28 @@ pub struct AgentPane {
     pub total_count: usize,
 }
 
+/// Stable identity for a selected search hit.
+///
+/// Uses source/path/line/hash so selection survives pane reorder and reranking.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SelectedHitKey {
+    pub source_id: String,
+    pub source_path: String,
+    pub line_number: Option<usize>,
+    pub content_hash: u64,
+}
+
+impl SelectedHitKey {
+    fn from_hit(hit: &SearchHit) -> Self {
+        Self {
+            source_id: hit.source_id.clone(),
+            source_path: hit.source_path.clone(),
+            line_number: hit.line_number,
+            content_hash: hit.content_hash,
+        }
+    }
+}
+
 /// A search result item prepared for rendering in a VirtualizedList.
 ///
 /// Carries all context needed by `RenderItem::render()` so the item can
@@ -474,8 +512,12 @@ pub struct CassApp {
     pub pane_filter: Option<String>,
 
     // -- Multi-select -----------------------------------------------------
-    /// Set of (pane_index, item_index) pairs for multi-selected items.
-    pub selected: HashSet<(usize, usize)>,
+    /// Stable hit IDs for multi-selected items.
+    pub selected: HashSet<SelectedHitKey>,
+    /// Cursor index in the bulk-actions modal menu.
+    pub bulk_action_idx: usize,
+    /// Two-press safety flag: armed after first Ctrl+O when >= threshold items.
+    pub open_confirm_armed: bool,
 
     // -- Detail view ------------------------------------------------------
     /// Scroll position in the detail pane.
@@ -614,6 +656,8 @@ impl Default for CassApp {
             query_history: VecDeque::with_capacity(50),
             pane_filter: None,
             selected: HashSet::new(),
+            bulk_action_idx: 0,
+            open_confirm_armed: false,
             detail_scroll: 0,
             detail_tab: DetailTab::default(),
             detail_find: None,
@@ -685,6 +729,24 @@ impl CassApp {
         self.results.first()
     }
 
+    fn active_hit_key(&self) -> Option<SelectedHitKey> {
+        self.selected_hit().map(SelectedHitKey::from_hit)
+    }
+
+    fn selected_hits(&self) -> Vec<SearchHit> {
+        let mut hits = Vec::new();
+        let mut seen = HashSet::new();
+        for pane in &self.panes {
+            for hit in &pane.hits {
+                let key = SelectedHitKey::from_hit(hit);
+                if self.selected.contains(&key) && seen.insert(key) {
+                    hits.push(hit.clone());
+                }
+            }
+        }
+        hits
+    }
+
     fn update_banner_visible(&self) -> bool {
         self.update_info
             .as_ref()
@@ -753,13 +815,14 @@ impl CassApp {
             .enumerate()
             .map(|(i, hit)| {
                 let even = i % 2 == 0;
+                let queued = self.selected.contains(&SelectedHitKey::from_hit(hit));
                 ResultItem {
                     index: i + 1,
                     hit: hit.clone(),
                     row_height: row_h,
                     even,
                     max_width: inner.width,
-                    queued: self.selected.contains(&(self.active_pane, i)),
+                    queued,
                     stripe_style: if even { row_style } else { row_alt_style },
                     agent_style: row_selected_style,
                 }
@@ -1413,6 +1476,274 @@ impl CassApp {
             Paragraph::new(&*count_text)
                 .style(muted_style)
                 .render(count_area, frame);
+        }
+    }
+
+    /// Render the export modal overlay centered on screen.
+    fn render_export_overlay(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        styles: &StyleContext,
+    ) {
+        let state = match self.export_modal_state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
+        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
+        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let accent_style = styles.style(style_system::STYLE_STATUS_INFO);
+        let success_style = styles.style(style_system::STYLE_STATUS_SUCCESS);
+        let error_style = styles.style(style_system::STYLE_STATUS_ERROR);
+        let selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
+
+        // Modal dimensions: 70x22, clamped to terminal size.
+        let modal_w = 70u16.min(area.width.saturating_sub(4));
+        let modal_h = 22u16.min(area.height.saturating_sub(2));
+        let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+        let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+        let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+        // Clear background.
+        Block::new().style(bg_style).render(modal_area, frame);
+
+        // Outer border.
+        let outer = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title("Export Session as HTML (Ctrl+E)")
+            .title_alignment(Alignment::Left)
+            .style(border_style);
+        let inner = outer.inner(modal_area);
+        outer.render(modal_area, frame);
+
+        if inner.is_empty() {
+            return;
+        }
+
+        // Vertical layout: session card (3) + gap (1) + options (6) + gap (1) + preview (3) + flex + footer (1).
+        let mut y = inner.y;
+        let w = inner.width;
+        let x = inner.x;
+
+        // ── Session info card ──────────────────────────────────────
+        if y + 3 <= inner.y + inner.height {
+            let badge = format!(" {} ", state.agent_name);
+            let location = format!("  {} | {}", state.workspace, state.timestamp);
+            let badge_line = format!("{badge}{location}");
+            Paragraph::new(&*badge_line)
+                .style(accent_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+
+            let title_text = &state.title_preview;
+            Paragraph::new(title_text.as_str())
+                .style(text_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+
+            let stats = format!("{} messages", state.message_count);
+            Paragraph::new(&*stats)
+                .style(muted_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Gap.
+        y += 1;
+
+        // ── Options section ────────────────────────────────────────
+        // Separator.
+        if y < inner.y + inner.height {
+            let sep = "\u{2500}".repeat(w as usize);
+            Paragraph::new(&*sep)
+                .style(muted_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Output directory.
+        if y < inner.y + inner.height {
+            let focused = state.focused == ExportField::OutputDir;
+            let editing = state.output_dir_editing;
+            let display_path = if editing {
+                state.output_dir_buffer.as_str()
+            } else {
+                // Use a short representation
+                state.output_dir.to_str().unwrap_or(".")
+            };
+            let max_len = w.saturating_sub(14) as usize;
+            let truncated = if display_path.len() > max_len && max_len > 6 {
+                let tail = &display_path[display_path.len().saturating_sub(max_len - 3)..];
+                format!("...{tail}")
+            } else {
+                display_path.to_string()
+            };
+            let cursor = if editing { "_" } else { "" };
+            let hint = if focused && !editing {
+                " (Enter)"
+            } else if editing {
+                " (Enter=ok)"
+            } else {
+                ""
+            };
+            let line = format!(" Output: {truncated}{cursor}{hint}");
+            let row_style = if focused { accent_style } else { text_style };
+            Paragraph::new(&*line)
+                .style(row_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Checkboxes: include_tools, encrypt, password (conditional), show_timestamps.
+        let checkboxes: &[(ExportField, &str, bool)] = &[
+            (
+                ExportField::IncludeTools,
+                "Include tool calls",
+                state.include_tools,
+            ),
+            (ExportField::Encrypt, "Password protection", state.encrypt),
+        ];
+        for &(field, label, checked) in checkboxes {
+            if y >= inner.y + inner.height {
+                break;
+            }
+            let mark = if checked { "[x]" } else { "[ ]" };
+            let focused = state.focused == field;
+            let row_style = if focused { accent_style } else { text_style };
+            let line = format!(" {mark} {label}");
+            Paragraph::new(&*line)
+                .style(row_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Password row (only if encrypt is enabled).
+        if state.encrypt && y < inner.y + inner.height {
+            let focused = state.focused == ExportField::Password;
+            let display = if state.password_visible {
+                state.password.clone()
+            } else {
+                "\u{2022}".repeat(state.password.len())
+            };
+            let cursor = if focused { "_" } else { "" };
+            let vis_hint = if state.password_visible {
+                "(Ctrl+H hide)"
+            } else {
+                "(Ctrl+H show)"
+            };
+            let line = format!("     Password: {display}{cursor} {vis_hint}");
+            let row_style = if focused { accent_style } else { text_style };
+            Paragraph::new(&*line)
+                .style(row_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Show timestamps checkbox.
+        if y < inner.y + inner.height {
+            let mark = if state.show_timestamps { "[x]" } else { "[ ]" };
+            let focused = state.focused == ExportField::ShowTimestamps;
+            let row_style = if focused { accent_style } else { text_style };
+            let line = format!(" {mark} Show timestamps");
+            Paragraph::new(&*line)
+                .style(row_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Gap.
+        y += 1;
+
+        // ── Preview section ────────────────────────────────────────
+        if y < inner.y + inner.height {
+            let sep2 = "\u{2500}".repeat(w as usize);
+            Paragraph::new(&*sep2)
+                .style(muted_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        if y < inner.y + inner.height {
+            Paragraph::new(state.filename_preview.as_str())
+                .style(text_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        if y < inner.y + inner.height {
+            let est_kb = (state.message_count * 2 + 15).max(20);
+            let size_str = if est_kb > 1024 {
+                format!("~{:.1}MB", est_kb as f64 / 1024.0)
+            } else {
+                format!("~{est_kb}KB")
+            };
+            let mut features = vec!["Dark/Light themes", "Print-friendly"];
+            if state.encrypt {
+                features.push("Encrypted");
+            }
+            let preview = format!(
+                "{} msgs | {} | {}",
+                state.message_count,
+                size_str,
+                features.join(" | ")
+            );
+            Paragraph::new(&*preview)
+                .style(muted_style)
+                .render(Rect::new(x, y, w, 1), frame);
+            y += 1;
+        }
+
+        // Progress line.
+        if y < inner.y + inner.height {
+            let (progress_text, pstyle) = match &state.progress {
+                ExportProgress::Idle => (String::new(), muted_style),
+                ExportProgress::Preparing => ("Preparing export...".to_string(), accent_style),
+                ExportProgress::Encrypting => ("Encrypting content...".to_string(), accent_style),
+                ExportProgress::Writing => ("Writing HTML file...".to_string(), accent_style),
+                ExportProgress::Complete(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    (format!("Exported: {name}"), success_style)
+                }
+                ExportProgress::Error(msg) => (format!("Error: {msg}"), error_style),
+            };
+            if !progress_text.is_empty() {
+                Paragraph::new(&*progress_text)
+                    .style(pstyle)
+                    .render(Rect::new(x, y, w, 1), frame);
+            }
+        }
+
+        // ── Footer (keyboard hints) ──────────────────────────────
+        let footer_y = modal_area.y + modal_area.height - 2;
+        if footer_y > y {
+            let can_export = state.can_export();
+            let export_label = if can_export && state.focused == ExportField::ExportButton {
+                " [EXPORT] "
+            } else if can_export {
+                " Enter=Export "
+            } else {
+                " (set password) "
+            };
+            let btn_style = if can_export && state.focused == ExportField::ExportButton {
+                selected_style
+            } else if can_export {
+                accent_style
+            } else {
+                muted_style
+            };
+
+            // Build hint string with consistent spacing.
+            let hints = format!(" Tab=Navigate  Space=Toggle {export_label} Esc=Cancel");
+            Paragraph::new(&*hints)
+                .style(btn_style)
+                .render(Rect::new(x, footer_y, w, 1), frame);
         }
     }
 
@@ -2143,6 +2474,81 @@ impl super::ftui_adapter::Model for CassApp {
             return ftui::Cmd::none();
         }
 
+        // Export modal intercepts keyboard input for form navigation and text editing.
+        if self.show_export_modal
+            && let Some(ref mut state) = self.export_modal_state
+        {
+            match &msg {
+                CassMsg::QueryChanged(text) if state.is_editing_text() => {
+                    // Route typed characters to the active text field.
+                    if text.is_empty() {
+                        // Backspace
+                        if state.focused == ExportField::Password {
+                            state.password_pop();
+                        } else if state.focused == ExportField::OutputDir
+                            && state.output_dir_editing
+                        {
+                            state.output_dir_pop();
+                        }
+                    } else {
+                        for c in text.chars() {
+                            if state.focused == ExportField::Password {
+                                state.password_push(c);
+                            } else if state.focused == ExportField::OutputDir
+                                && state.output_dir_editing
+                            {
+                                state.output_dir_push(c);
+                            }
+                        }
+                    }
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QueryChanged(text) => {
+                    // Non-editing mode: check for Ctrl+H (password visibility toggle).
+                    if text == "\x08" {
+                        state.toggle_password_visibility();
+                    }
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QuerySubmitted => {
+                    // Enter key: toggle text field editing, or execute export.
+                    if state.focused == ExportField::OutputDir {
+                        state.toggle_current();
+                    } else if state.focused == ExportField::ExportButton {
+                        return self.update(CassMsg::ExportExecuted);
+                    } else if state.focused == ExportField::Password {
+                        // Enter in password field = move to next.
+                        state.next_field();
+                    } else {
+                        state.toggle_current();
+                    }
+                    return ftui::Cmd::none();
+                }
+                CassMsg::FocusToggled => {
+                    // Tab → next field.
+                    state.next_field();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::FocusDirectional { .. } => {
+                    // Shift+Tab → prev field.
+                    state.prev_field();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::PeekToggled => {
+                    // Space → toggle checkbox / button.
+                    if state.focused == ExportField::ExportButton {
+                        return self.update(CassMsg::ExportExecuted);
+                    }
+                    state.toggle_current();
+                    return ftui::Cmd::none();
+                }
+                _ => {
+                    // Let non-intercepted messages (like Tick, QuitRequested,
+                    // ExportModalOpened/Closed, etc.) fall through to normal handling.
+                }
+            }
+        }
+
         // Update banner shortcuts:
         // - U: upgrade (two-step confirm)
         // - N: open release notes
@@ -2161,6 +2567,34 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 CassMsg::QuitRequested => {
                     return self.update(CassMsg::UpdateDismissed);
+                }
+                _ => {}
+            }
+        }
+
+        // ── Bulk-actions modal intercept ────────────────────────────
+        // When the bulk modal is open, intercept navigation and confirm.
+        if self.show_bulk_modal {
+            match &msg {
+                CassMsg::SelectionMoved { delta } => {
+                    match delta {
+                        -1 => self.bulk_action_idx = self.bulk_action_idx.saturating_sub(1),
+                        1 => {
+                            self.bulk_action_idx =
+                                (self.bulk_action_idx + 1).min(BULK_ACTIONS.len() - 1);
+                        }
+                        _ => {}
+                    }
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QuerySubmitted => {
+                    // Enter in the modal executes the selected action.
+                    let idx = self.bulk_action_idx;
+                    return self.update(CassMsg::BulkActionExecuted { action_index: idx });
+                }
+                CassMsg::QuitRequested => {
+                    self.show_bulk_modal = false;
+                    return ftui::Cmd::none();
                 }
                 _ => {}
             }
@@ -2298,6 +2732,15 @@ impl super::ftui_adapter::Model for CassApp {
                         }
                     })
                     .collect();
+
+                // Keep selection stable across reranking by retaining only keys that
+                // still exist in the new result set.
+                let available: HashSet<SelectedHitKey> =
+                    hits.iter().map(SelectedHitKey::from_hit).collect();
+                self.selected.retain(|k| available.contains(k));
+                if self.selected.is_empty() {
+                    self.open_confirm_armed = false;
+                }
 
                 // Clamp active pane and selection
                 if self.active_pane >= self.panes.len() {
@@ -2578,34 +3021,53 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Multi-select & bulk ------------------------------------------
             CassMsg::SelectionToggled => {
-                let key = (
-                    self.active_pane,
-                    self.panes.get(self.active_pane).map_or(0, |p| p.selected),
-                );
-                if !self.selected.remove(&key) {
-                    self.selected.insert(key);
+                if let Some(key) = self.active_hit_key() {
+                    if self.selected.remove(&key) {
+                        self.status = format!("Deselected ({} selected)", self.selected.len());
+                    } else {
+                        self.selected.insert(key);
+                        self.status = format!(
+                            "Selected ({} total) · Ctrl+X toggle · A bulk actions · Esc clear",
+                            self.selected.len()
+                        );
+                    }
                 }
+                self.open_confirm_armed = false;
                 ftui::Cmd::none()
             }
             CassMsg::SelectAllToggled => {
-                if self.selected.is_empty() {
-                    // Select all in current pane
-                    if let Some(pane) = self.panes.get(self.active_pane) {
-                        for i in 0..pane.hits.len() {
-                            self.selected.insert((self.active_pane, i));
+                if let Some(pane) = self.panes.get(self.active_pane) {
+                    let pane_keys: Vec<SelectedHitKey> =
+                        pane.hits.iter().map(SelectedHitKey::from_hit).collect();
+                    let all_selected = pane_keys.iter().all(|k| self.selected.contains(k));
+                    if all_selected {
+                        for key in &pane_keys {
+                            self.selected.remove(key);
                         }
+                        self.status =
+                            format!("Deselected all in pane ({} total)", self.selected.len());
+                    } else {
+                        for key in pane_keys {
+                            self.selected.insert(key);
+                        }
+                        self.status = format!(
+                            "Selected all in pane ({} total) · A bulk actions",
+                            self.selected.len()
+                        );
                     }
-                } else {
-                    self.selected.clear();
                 }
+                self.open_confirm_armed = false;
                 ftui::Cmd::none()
             }
             CassMsg::ItemEnqueued => {
-                let key = (
-                    self.active_pane,
-                    self.panes.get(self.active_pane).map_or(0, |p| p.selected),
-                );
-                self.selected.insert(key);
+                if let Some(key) = self.active_hit_key() {
+                    self.selected.insert(key);
+                    self.status = format!(
+                        "Queued ({}) · Ctrl+Enter add · Ctrl+O open all",
+                        self.selected.len()
+                    );
+                }
+                self.open_confirm_armed = false;
                 // Advance selection
                 if let Some(pane) = self.panes.get_mut(self.active_pane)
                     && pane.selected + 1 < pane.hits.len()
@@ -2615,30 +3077,181 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::BulkActionsOpened => {
-                self.show_bulk_modal = true;
+                if self.selected.is_empty() {
+                    self.status =
+                        "No items selected. Ctrl+X to select, Ctrl+A to select all.".to_string();
+                } else {
+                    self.show_bulk_modal = true;
+                    self.bulk_action_idx = 0;
+                    self.status =
+                        "Bulk actions: ↑↓ navigate · Enter execute · Esc cancel".to_string();
+                }
                 ftui::Cmd::none()
             }
             CassMsg::BulkActionsClosed => {
                 self.show_bulk_modal = false;
                 ftui::Cmd::none()
             }
-            CassMsg::BulkActionExecuted { action_index: _ } => {
-                // TODO: dispatch specific bulk action
+            CassMsg::BulkActionExecuted { action_index } => {
                 self.show_bulk_modal = false;
-                ftui::Cmd::none()
+                match action_index {
+                    0 => {
+                        // Open all in editor — delegate to OpenAllQueued
+                        ftui::Cmd::msg(CassMsg::OpenAllQueued)
+                    }
+                    1 => {
+                        let selected_hits = self.selected_hits();
+                        let paths: Vec<String> = selected_hits
+                            .iter()
+                            .map(|h| h.source_path.clone())
+                            .collect();
+                        let text = paths.join("\n");
+                        let count = paths.len();
+                        self.selected.clear();
+                        self.open_confirm_armed = false;
+                        self.status = match copy_to_clipboard(&text) {
+                            Ok(()) => format!("Copied {count} paths to clipboard"),
+                            Err(e) => format!("Clipboard copy failed: {e}"),
+                        };
+                        ftui::Cmd::none()
+                    }
+                    2 => {
+                        let selected_hits = self.selected_hits();
+                        let export: Vec<serde_json::Value> = selected_hits
+                            .iter()
+                            .map(|h| {
+                                serde_json::json!({
+                                    "source_path": h.source_path,
+                                    "line_number": h.line_number,
+                                    "title": h.title,
+                                    "agent": h.agent,
+                                    "workspace": h.workspace,
+                                    "score": h.score,
+                                    "snippet": h.snippet,
+                                })
+                            })
+                            .collect();
+                        let count = export.len();
+                        self.selected.clear();
+                        self.open_confirm_armed = false;
+                        self.status = match serde_json::to_string_pretty(&export) {
+                            Ok(json) => match copy_to_clipboard(&json) {
+                                Ok(()) => format!("Exported {count} items as JSON to clipboard"),
+                                Err(e) => format!("JSON export failed: {e}"),
+                            },
+                            Err(e) => format!("JSON export failed: {e}"),
+                        };
+                        ftui::Cmd::none()
+                    }
+                    3 => {
+                        // Clear selection
+                        let count = self.selected.len();
+                        self.selected.clear();
+                        self.open_confirm_armed = false;
+                        self.status = format!("Cleared {count} selections");
+                        ftui::Cmd::none()
+                    }
+                    _ => ftui::Cmd::none(),
+                }
             }
 
             // -- Actions on results -------------------------------------------
-            CassMsg::CopySnippet | CassMsg::CopyPath | CassMsg::CopyContent => {
-                // TODO: clipboard via Cmd::task
+            CassMsg::CopySnippet => {
+                if let Some(hit) = self.selected_hit() {
+                    self.status = match copy_to_clipboard(hit.snippet.as_str()) {
+                        Ok(()) => "Copied snippet to clipboard".to_string(),
+                        Err(e) => format!("Clipboard copy failed: {e}"),
+                    };
+                } else {
+                    self.status = "No active result to copy.".to_string();
+                }
                 ftui::Cmd::none()
             }
-            CassMsg::OpenInEditor | CassMsg::OpenInNano | CassMsg::OpenAllQueued => {
-                // TODO: spawn editor via Cmd::task
+            CassMsg::CopyPath => {
+                if let Some(hit) = self.selected_hit() {
+                    self.status = match copy_to_clipboard(hit.source_path.as_str()) {
+                        Ok(()) => "Copied path to clipboard".to_string(),
+                        Err(e) => format!("Clipboard copy failed: {e}"),
+                    };
+                } else {
+                    self.status = "No active result to copy.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::CopyContent => {
+                if let Some(hit) = self.selected_hit() {
+                    self.status = match copy_to_clipboard(hit.content.as_str()) {
+                        Ok(()) => "Copied content to clipboard".to_string(),
+                        Err(e) => format!("Clipboard copy failed: {e}"),
+                    };
+                } else {
+                    self.status = "No active result to copy.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::OpenInEditor => {
+                if let Some(hit) = self.selected_hit().cloned() {
+                    let editor_cmd = dotenvy::var("EDITOR")
+                        .or_else(|_| dotenvy::var("VISUAL"))
+                        .unwrap_or_else(|_| "code".to_string());
+                    self.status = match open_hits_in_editor(std::slice::from_ref(&hit), &editor_cmd)
+                    {
+                        Ok((count, editor_bin)) => format!("Opened {count} file in {editor_bin}"),
+                        Err(e) => format!("Failed to open editor: {e}"),
+                    };
+                } else {
+                    self.status = "No active result to open.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::OpenInNano => {
+                if let Some(hit) = self.selected_hit().cloned() {
+                    self.status = match open_hits_in_editor(std::slice::from_ref(&hit), "nano") {
+                        Ok((count, editor_bin)) => format!("Opened {count} file in {editor_bin}"),
+                        Err(e) => format!("Failed to open editor: {e}"),
+                    };
+                } else {
+                    self.status = "No active result to open.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::OpenAllQueued => {
+                if self.selected.is_empty() {
+                    self.status = "No items queued. Ctrl+Enter to queue items.".to_string();
+                    self.open_confirm_armed = false;
+                    return ftui::Cmd::none();
+                }
+                if self.selected.len() >= OPEN_CONFIRM_THRESHOLD && !self.open_confirm_armed {
+                    // First press: arm confirmation
+                    self.open_confirm_armed = true;
+                    self.status = format!(
+                        "Open {} queued items? Press Ctrl+O again to confirm.",
+                        self.selected.len()
+                    );
+                    return ftui::Cmd::none();
+                }
+                // Execute: open all selected items
+                let hits = self.selected_hits();
+                let editor_cmd = dotenvy::var("EDITOR")
+                    .or_else(|_| dotenvy::var("VISUAL"))
+                    .unwrap_or_else(|_| "code".to_string());
+                self.status = match open_hits_in_editor(&hits, &editor_cmd) {
+                    Ok((count, editor_bin)) => format!("Opened {count} files in {editor_bin}"),
+                    Err(e) => format!("Failed to open queued files: {e}"),
+                };
+                self.selected.clear();
+                self.open_confirm_armed = false;
                 ftui::Cmd::none()
             }
             CassMsg::ViewRaw => {
-                // TODO: view raw via Cmd::task
+                if self.selected_hit().is_some() {
+                    self.detail_tab = DetailTab::Raw;
+                    self.show_detail_modal = true;
+                    self.detail_scroll = 0;
+                    self.modal_scroll = 0;
+                } else {
+                    self.status = "No active result to view.".to_string();
+                }
                 ftui::Cmd::none()
             }
             CassMsg::PeekToggled => {
@@ -2922,7 +3535,21 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Export modal -------------------------------------------------
             CassMsg::ExportModalOpened => {
-                self.show_export_modal = true;
+                // Initialize modal state from the currently selected hit + conversation.
+                if let Some(hit) = self.selected_hit().cloned() {
+                    let state = if let Some((_, ref cv)) = self.cached_detail {
+                        ExportModalState::from_hit(&hit, cv)
+                    } else {
+                        // Fallback: build minimal state from hit alone.
+                        ExportModalState {
+                            agent_name: hit.agent.clone(),
+                            workspace: hit.workspace.clone(),
+                            ..Default::default()
+                        }
+                    };
+                    self.export_modal_state = Some(state);
+                    self.show_export_modal = true;
+                }
                 ftui::Cmd::none()
             }
             CassMsg::ExportModalClosed => {
@@ -2930,14 +3557,78 @@ impl super::ftui_adapter::Model for CassApp {
                 self.export_modal_state = None;
                 ftui::Cmd::none()
             }
-            CassMsg::ExportFieldChanged { .. }
-            | CassMsg::ExportFieldToggled(_)
-            | CassMsg::ExportFocusMoved { .. } => {
-                // TODO: update export modal state
+            CassMsg::ExportFieldChanged { field, value } => {
+                if let Some(ref mut state) = self.export_modal_state {
+                    match field {
+                        ExportField::OutputDir => {
+                            state.output_dir_buffer = value;
+                        }
+                        ExportField::Password => {
+                            state.password = value;
+                        }
+                        _ => {}
+                    }
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::ExportFieldToggled(field) => {
+                if let Some(ref mut state) = self.export_modal_state {
+                    let prev_focused = state.focused;
+                    state.focused = field;
+                    state.toggle_current();
+                    state.focused = prev_focused;
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::ExportFocusMoved { forward } => {
+                if let Some(ref mut state) = self.export_modal_state {
+                    if forward {
+                        state.next_field();
+                    } else {
+                        state.prev_field();
+                    }
+                }
                 ftui::Cmd::none()
             }
             CassMsg::ExportExecuted => {
-                // TODO: dispatch export via Cmd::task
+                // Extract source_path before mutable borrow of export_modal_state.
+                let source_path = self
+                    .selected_hit()
+                    .map(|h| h.source_path.clone())
+                    .unwrap_or_default();
+                if let Some(ref mut state) = self.export_modal_state {
+                    if !state.can_export() {
+                        return ftui::Cmd::none();
+                    }
+                    state.progress = ExportProgress::Preparing;
+                    let output_dir = state.output_dir.clone();
+                    let output_filename = state.filename_preview.clone();
+                    let encrypt = state.encrypt;
+                    let password = if encrypt {
+                        Some(state.password.clone())
+                    } else {
+                        None
+                    };
+                    let show_timestamps = state.show_timestamps;
+                    let include_tools = state.include_tools;
+                    let title = state.title_preview.clone();
+                    let agent_name = state.agent_name.clone();
+
+                    // Dispatch the export as a background task.
+                    return ftui::Cmd::task(move || {
+                        export_session_task(
+                            &source_path,
+                            &output_dir,
+                            &output_filename,
+                            encrypt,
+                            password.as_deref(),
+                            show_timestamps,
+                            include_tools,
+                            &title,
+                            &agent_name,
+                        )
+                    });
+                }
                 ftui::Cmd::none()
             }
             CassMsg::ExportProgressUpdated(progress) => {
@@ -3379,7 +4070,10 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 if !self.selected.is_empty() {
+                    let count = self.selected.len();
                     self.selected.clear();
+                    self.open_confirm_armed = false;
+                    self.status = format!("Cleared {count} selections");
                     return ftui::Cmd::none();
                 }
                 if self.input_mode != InputMode::Query {
@@ -3766,6 +4460,56 @@ impl super::ftui_adapter::Model for CassApp {
             }
         }
 
+        // ── Export modal overlay ─────────────────────────────────────
+        if self.show_export_modal {
+            self.render_export_overlay(frame, area, &styles);
+        }
+
+        // ── Bulk actions modal overlay ───────────────────────────────
+        if self.show_bulk_modal {
+            let modal_w = 40u16.min(area.width.saturating_sub(4));
+            let modal_h = (BULK_ACTIONS.len() as u16 + 2).min(area.height.saturating_sub(4));
+            let mx = area.x + (area.width.saturating_sub(modal_w)) / 2;
+            let my = area.y + (area.height.saturating_sub(modal_h)) / 2;
+            let modal_area = Rect::new(mx, my, modal_w, modal_h);
+
+            // Clear area behind modal
+            Block::new().style(root_style).render(modal_area, frame);
+
+            let title = format!(" Bulk Actions ({} selected) ", self.selected.len());
+            let modal_block = Block::new()
+                .borders(adaptive_borders)
+                .border_type(border_type)
+                .title(&title)
+                .title_alignment(Alignment::Left)
+                .style(pane_focused_style);
+            let inner = modal_block.inner(modal_area);
+            modal_block.render(modal_area, frame);
+
+            if render_content && !inner.is_empty() {
+                for (i, label) in BULK_ACTIONS.iter().enumerate() {
+                    if i as u16 >= inner.height {
+                        break;
+                    }
+                    let row_area = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+                    let prefix = if i == self.bulk_action_idx {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    let line = format!("{prefix}{label}");
+                    let row_style_here = if i == self.bulk_action_idx {
+                        row_selected_style
+                    } else {
+                        text_muted_style
+                    };
+                    Paragraph::new(&*line)
+                        .style(row_style_here)
+                        .render(row_area, frame);
+                }
+            }
+        }
+
         // ── Command palette overlay ──────────────────────────────────
         if self.palette_state.open {
             self.render_palette_overlay(frame, area, &styles);
@@ -3776,6 +4520,154 @@ impl super::ftui_adapter::Model for CassApp {
 // =========================================================================
 // Entry Point
 // =========================================================================
+
+/// Background task: export a session to HTML.
+///
+/// Runs on a background thread via `Cmd::task` so the UI stays responsive.
+#[allow(clippy::too_many_arguments)]
+fn export_session_task(
+    source_path: &str,
+    output_dir: &std::path::Path,
+    output_filename: &str,
+    encrypt: bool,
+    password: Option<&str>,
+    show_timestamps: bool,
+    include_tools: bool,
+    title: &str,
+    agent_name: &str,
+) -> CassMsg {
+    use crate::html_export::{
+        ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
+    };
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Write};
+
+    let session = std::path::Path::new(source_path);
+    if !session.exists() {
+        return CassMsg::ExportFailed(format!("Session not found: {source_path}"));
+    }
+
+    // Read and parse session messages.
+    let file = match File::open(session) {
+        Ok(f) => f,
+        Err(e) => return CassMsg::ExportFailed(format!("Cannot open session: {e}")),
+    };
+    let reader = BufReader::new(file);
+    let mut messages: Vec<HtmlMessage> = Vec::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Extract role and content from the JSON line.
+        let role = val
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let content = val
+            .get("content")
+            .and_then(|c| {
+                if c.is_string() {
+                    c.as_str().map(|s| s.to_string())
+                } else if c.is_array() {
+                    // Handle array content (e.g., Claude Code format).
+                    let parts: Vec<String> = c
+                        .as_array()
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .filter_map(|part| {
+                            part.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect();
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join("\n"))
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        if content.is_empty() && !include_tools {
+            continue;
+        }
+        messages.push(HtmlMessage {
+            role,
+            content,
+            timestamp: val
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string()),
+            tool_call: None,
+            index: None,
+            author: None,
+        });
+    }
+
+    if messages.is_empty() {
+        return CassMsg::ExportFailed("No messages found in session".to_string());
+    }
+
+    // Build export options and generate HTML.
+    let options = HtmlExportOptions {
+        title: Some(title.to_string()),
+        include_cdn: true,
+        syntax_highlighting: true,
+        include_search: true,
+        include_theme_toggle: true,
+        encrypt,
+        print_styles: true,
+        agent_name: Some(agent_name.to_string()),
+        show_timestamps,
+        show_tool_calls: include_tools,
+    };
+
+    let exporter = HtmlExporter::with_options(options);
+    let metadata = TemplateMetadata {
+        timestamp: None,
+        agent: Some(agent_name.to_string()),
+        message_count: messages.len(),
+        duration: None,
+        project: None,
+    };
+
+    let groups = crate::group_messages_for_export(messages);
+    let html = match exporter.export_messages(title, &groups, metadata, password) {
+        Ok(h) => h,
+        Err(e) => return CassMsg::ExportFailed(format!("HTML generation failed: {e}")),
+    };
+
+    // Write output file.
+    let output_path = output_dir.join(output_filename);
+    if let Some(parent) = output_path.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return CassMsg::ExportFailed(format!("Cannot create output directory: {e}"));
+    }
+    match File::create(&output_path).and_then(|mut f| f.write_all(html.as_bytes())) {
+        Ok(()) => CassMsg::ExportCompleted {
+            output_path: output_path.clone(),
+            file_size: html.len(),
+            encrypted: encrypt,
+        },
+        Err(e) => CassMsg::ExportFailed(format!("Failed to write export: {e}")),
+    }
+}
 
 /// Run the cass TUI using the ftui Program runtime.
 ///
@@ -3800,6 +4692,139 @@ pub fn run_tui_ftui() -> anyhow::Result<()> {
         .with_budget(budget)
         .run()
         .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
+}
+
+// =========================================================================
+// Clipboard & editor helpers
+// =========================================================================
+
+fn split_editor_command(editor: &str) -> (String, Vec<String>) {
+    let trimmed = editor.trim();
+    if trimmed.is_empty() {
+        return ("vi".to_string(), Vec::new());
+    }
+    match shell_words::split(trimmed) {
+        Ok(parts) if !parts.is_empty() => (parts[0].clone(), parts[1..].to_vec()),
+        _ => (trimmed.to_string(), Vec::new()),
+    }
+}
+
+#[cfg(not(test))]
+fn command_exists(binary: &str) -> bool {
+    StdCommand::new("which")
+        .arg(binary)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let mut command: Option<(String, Vec<String>)> = None;
+    if cfg!(target_os = "macos") {
+        command = Some(("pbcopy".to_string(), Vec::new()));
+    } else if cfg!(target_os = "windows") {
+        command = Some((
+            "powershell".to_string(),
+            vec!["-command".to_string(), "$Input | Set-Clipboard".to_string()],
+        ));
+    } else if command_exists("wl-copy") {
+        command = Some(("wl-copy".to_string(), Vec::new()));
+    } else if command_exists("xclip") {
+        command = Some((
+            "xclip".to_string(),
+            vec!["-selection".to_string(), "clipboard".to_string()],
+        ));
+    } else if command_exists("xsel") {
+        command = Some((
+            "xsel".to_string(),
+            vec!["--clipboard".to_string(), "--input".to_string()],
+        ));
+    }
+
+    let Some((bin, args)) = command else {
+        return Err("no clipboard tool found".to_string());
+    };
+
+    let mut child = StdCommand::new(&bin)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn clipboard command '{bin}': {e}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("failed to write clipboard payload: {e}"))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait for clipboard command '{bin}': {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("clipboard command '{bin}' exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+fn run_editor_command(_cmd: &mut StdCommand) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn run_editor_command(cmd: &mut StdCommand) -> Result<(), String> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to launch editor '{program}': {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("editor '{program}' exited with {status}"))
+    }
+}
+
+/// Open one or more search hits in an editor. Returns `(count_opened, editor_binary)`.
+fn open_hits_in_editor(hits: &[SearchHit], editor_cmd: &str) -> Result<(usize, String), String> {
+    if hits.is_empty() {
+        return Ok((0, String::new()));
+    }
+    let (editor_bin, editor_args) = split_editor_command(editor_cmd);
+    for hit in hits {
+        let mut cmd = StdCommand::new(&editor_bin);
+        cmd.args(&editor_args);
+        if editor_bin == "code" {
+            if let Some(line) = hit.line_number {
+                cmd.arg("--goto").arg(format!("{}:{line}", hit.source_path));
+            } else {
+                cmd.arg(&hit.source_path);
+            }
+        } else if editor_bin == "vim"
+            || editor_bin == "vi"
+            || editor_bin == "nvim"
+            || editor_bin == "nano"
+        {
+            if let Some(line) = hit.line_number {
+                cmd.arg(format!("+{line}"));
+            }
+            cmd.arg(&hit.source_path);
+        } else {
+            cmd.arg(&hit.source_path);
+        }
+        run_editor_command(&mut cmd)?;
+    }
+    Ok((hits.len(), editor_bin))
 }
 
 // =========================================================================
@@ -5629,5 +6654,323 @@ mod tests {
             buffer_to_text(&analytics_buf1),
             buffer_to_text(&analytics_buf2)
         );
+    }
+
+    // =====================================================================
+    // 2noh9.3.9 — Multi-select & bulk actions
+    // =====================================================================
+
+    /// Helper: build a test SearchHit with a unique source_path and content_hash.
+    fn make_hit(id: u64, path: &str) -> SearchHit {
+        SearchHit {
+            title: format!("Hit {id}"),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: id,
+            score: 1.0 - (id as f32 * 0.1),
+            agent: "claude_code".into(),
+            source_path: path.into(),
+            workspace: "/w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: Some(id as usize),
+            match_type: Default::default(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    /// Helper: create a CassApp with one pane of N hits.
+    fn app_with_hits(n: usize) -> CassApp {
+        let mut app = CassApp::default();
+        let hits: Vec<SearchHit> = (0..n)
+            .map(|i| make_hit(i as u64, &format!("/path/{i}")))
+            .collect();
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: hits.len(),
+            hits,
+            selected: 0,
+        });
+        app.active_pane = 0;
+        app
+    }
+
+    #[test]
+    fn selected_hit_key_from_hit_captures_stable_fields() {
+        let hit = make_hit(42, "/some/path");
+        let key = SelectedHitKey::from_hit(&hit);
+        assert_eq!(key.source_id, "local");
+        assert_eq!(key.source_path, "/some/path");
+        assert_eq!(key.line_number, Some(42));
+        assert_eq!(key.content_hash, 42);
+    }
+
+    #[test]
+    fn selected_hit_key_equality_and_hash() {
+        let h1 = make_hit(1, "/a");
+        let h2 = make_hit(1, "/a");
+        let h3 = make_hit(2, "/b");
+        assert_eq!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
+        assert_ne!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h3));
+    }
+
+    #[test]
+    fn toggle_select_adds_and_removes() {
+        let mut app = app_with_hits(3);
+
+        // Toggle: nothing selected → first item selected
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert_eq!(app.selected.len(), 1);
+        assert!(
+            app.selected
+                .contains(&SelectedHitKey::from_hit(&app.panes[0].hits[0]))
+        );
+
+        // Toggle again: removes it
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn toggle_select_multiple_items() {
+        let mut app = app_with_hits(3);
+
+        // Select item 0
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert_eq!(app.selected.len(), 1);
+
+        // Move to item 1 and select
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert_eq!(app.selected.len(), 2);
+
+        // Move to item 2 and select
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert_eq!(app.selected.len(), 3);
+    }
+
+    #[test]
+    fn select_all_toggles_between_all_and_none() {
+        let mut app = app_with_hits(5);
+
+        // Select all
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert_eq!(app.selected.len(), 5);
+
+        // Toggle again: clears all
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn item_enqueued_adds_and_advances() {
+        let mut app = app_with_hits(3);
+
+        // Enqueue first item → selection moves to 1
+        let _ = app.update(CassMsg::ItemEnqueued);
+        assert_eq!(app.selected.len(), 1);
+        assert!(
+            app.selected
+                .contains(&SelectedHitKey::from_hit(&app.panes[0].hits[0]))
+        );
+        assert_eq!(app.panes[0].selected, 1);
+
+        // Enqueue again → adds second, advances to 2
+        let _ = app.update(CassMsg::ItemEnqueued);
+        assert_eq!(app.selected.len(), 2);
+        assert_eq!(app.panes[0].selected, 2);
+
+        // Enqueue at end → no further advance (already at last)
+        let _ = app.update(CassMsg::ItemEnqueued);
+        assert_eq!(app.selected.len(), 3);
+        assert_eq!(app.panes[0].selected, 2); // stays at last
+    }
+
+    #[test]
+    fn selection_survives_reranking() {
+        let mut app = app_with_hits(3);
+        // Select item 1
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        let _ = app.update(CassMsg::SelectionToggled);
+        let key = SelectedHitKey::from_hit(&app.panes[0].hits[1]);
+        assert!(app.selected.contains(&key));
+
+        // Simulate reranking by swapping items 0 and 1
+        app.panes[0].hits.swap(0, 1);
+
+        // The key should still match the same hit regardless of position
+        assert!(app.selected.contains(&key));
+        // And the hit at position 0 (formerly at position 1) should still match
+        assert!(
+            app.selected
+                .contains(&SelectedHitKey::from_hit(&app.panes[0].hits[0]))
+        );
+    }
+
+    #[test]
+    fn open_confirm_armed_resets_on_selection_change() {
+        let mut app = app_with_hits(3);
+        app.open_confirm_armed = true;
+
+        let _ = app.update(CassMsg::SelectionToggled);
+        assert!(!app.open_confirm_armed);
+
+        app.open_confirm_armed = true;
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert!(!app.open_confirm_armed);
+
+        app.open_confirm_armed = true;
+        let _ = app.update(CassMsg::ItemEnqueued);
+        assert!(!app.open_confirm_armed);
+    }
+
+    #[test]
+    fn bulk_modal_opens_and_closes() {
+        let mut app = app_with_hits(3);
+        assert!(!app.show_bulk_modal);
+
+        // Must select something first — guard prevents opening with empty selection
+        let _ = app.update(CassMsg::SelectAllToggled);
+        let _ = app.update(CassMsg::BulkActionsOpened);
+        assert!(app.show_bulk_modal);
+        assert_eq!(app.bulk_action_idx, 0);
+
+        let _ = app.update(CassMsg::BulkActionsClosed);
+        assert!(!app.show_bulk_modal);
+    }
+
+    #[test]
+    fn bulk_modal_refuses_to_open_with_empty_selection() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::BulkActionsOpened);
+        assert!(!app.show_bulk_modal);
+        assert!(app.status.contains("No items selected"));
+    }
+
+    #[test]
+    fn bulk_modal_navigation_up_down() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        let _ = app.update(CassMsg::BulkActionsOpened);
+
+        // Move down
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        assert_eq!(app.bulk_action_idx, 1);
+
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        assert_eq!(app.bulk_action_idx, 2);
+
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        assert_eq!(app.bulk_action_idx, 3); // last item (0-indexed, 4 items)
+
+        // No overflow
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 });
+        assert_eq!(app.bulk_action_idx, 3);
+
+        // Move back up
+        let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
+        assert_eq!(app.bulk_action_idx, 2);
+
+        // No underflow
+        let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
+        let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
+        let _ = app.update(CassMsg::SelectionMoved { delta: -1 });
+        assert_eq!(app.bulk_action_idx, 0);
+    }
+
+    #[test]
+    fn bulk_clear_selection_clears_and_shows_status() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert_eq!(app.selected.len(), 3);
+
+        let _ = app.update(CassMsg::BulkActionExecuted { action_index: 3 });
+        assert!(app.selected.is_empty());
+        assert!(app.status.contains("Cleared 3"));
+    }
+
+    #[test]
+    fn open_all_queued_empty_shows_message() {
+        let mut app = app_with_hits(3);
+        // No items selected
+        let _ = app.update(CassMsg::OpenAllQueued);
+        assert!(app.status.contains("No items queued"));
+    }
+
+    #[test]
+    fn open_all_queued_large_batch_requires_confirmation() {
+        let mut app = app_with_hits(15);
+        // Select all 15
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert_eq!(app.selected.len(), 15);
+
+        // First press: arms confirmation
+        let _ = app.update(CassMsg::OpenAllQueued);
+        assert!(app.open_confirm_armed);
+        assert!(app.status.contains("again to confirm"));
+        // Selection NOT cleared yet
+        assert_eq!(app.selected.len(), 15);
+    }
+
+    #[test]
+    fn open_all_queued_small_batch_opens_directly() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        assert_eq!(app.selected.len(), 3);
+
+        // Small batch (< threshold) — opens directly (will fail with editor error, but
+        // selection should be cleared)
+        let _ = app.update(CassMsg::OpenAllQueued);
+        // Selection cleared after attempt
+        assert!(app.selected.is_empty());
+        assert!(!app.open_confirm_armed);
+    }
+
+    #[test]
+    fn selected_hits_collects_matching_pane_hits() {
+        let mut app = app_with_hits(5);
+        // Enqueue items 0, 2, 4
+        let _ = app.update(CassMsg::ItemEnqueued); // item 0, advances to 1
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 }); // now at 2
+        let _ = app.update(CassMsg::ItemEnqueued); // item 2, advances to 3
+        let _ = app.update(CassMsg::SelectionMoved { delta: 1 }); // now at 4
+        let _ = app.update(CassMsg::ItemEnqueued); // item 4
+        assert_eq!(app.selected.len(), 3);
+
+        let hits = app.selected_hits();
+        assert_eq!(hits.len(), 3);
+        let paths: HashSet<String> = hits.iter().map(|h| h.source_path.clone()).collect();
+        assert!(paths.contains("/path/0"));
+        assert!(paths.contains("/path/2"));
+        assert!(paths.contains("/path/4"));
+    }
+
+    #[test]
+    fn bulk_modal_esc_closes_without_executing() {
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        let _ = app.update(CassMsg::BulkActionsOpened);
+        assert!(app.show_bulk_modal);
+
+        // Esc closes the modal
+        let _ = app.update(CassMsg::QuitRequested);
+        assert!(!app.show_bulk_modal);
+        // Selection not cleared
+        assert_eq!(app.selected.len(), 3);
+    }
+
+    #[test]
+    fn bulk_modal_renders_without_panic() {
+        use ftui_harness::buffer_to_text;
+
+        let mut app = app_with_hits(3);
+        let _ = app.update(CassMsg::SelectAllToggled);
+        let _ = app.update(CassMsg::BulkActionsOpened);
+        let buf = render_at_degradation(&app, 80, 24, ftui::render::budget::DegradationLevel::Full);
+        let text = buffer_to_text(&buf);
+        assert!(text.contains("Bulk Actions"));
     }
 }

@@ -1804,6 +1804,7 @@ fn build_boolean_query_clauses(
     let mut pending_or_group: Vec<Box<dyn Query>> = Vec::new();
     let mut next_occur = Occur::Must;
     let mut in_or_sequence = false;
+    let mut just_saw_or = false;
 
     for token in tokens {
         match token {
@@ -1817,22 +1818,32 @@ fn build_boolean_query_clauses(
                     clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
                 }
                 in_or_sequence = false;
+                just_saw_or = false;
                 next_occur = Occur::Must;
             }
             QueryToken::Or => {
                 in_or_sequence = true;
+                just_saw_or = true;
                 // Don't change next_occur; OR will group with previous term
             }
             QueryToken::Not => {
-                // Flush any OR group
-                if !pending_or_group.is_empty() {
-                    let or_clauses: Vec<_> = pending_or_group
-                        .drain(..)
-                        .map(|q| (Occur::Should, q))
-                        .collect();
-                    clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                if just_saw_or {
+                    // "OR NOT" case: Treat as "OR (NOT ...)"
+                    // Keep just_saw_or = true so the next term knows it's joining the OR group.
+                    just_saw_or = true;
+                } else {
+                    // Standard "AND NOT" case
+                    // Flush any OR group
+                    if !pending_or_group.is_empty() {
+                        let or_clauses: Vec<_> = pending_or_group
+                            .drain(..)
+                            .map(|q| (Occur::Should, q))
+                            .collect();
+                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                    }
+                    in_or_sequence = false;
+                    just_saw_or = false;
                 }
-                in_or_sequence = false;
                 next_occur = Occur::MustNot;
             }
             QueryToken::Term(term) => {
@@ -1843,22 +1854,45 @@ fn build_boolean_query_clauses(
                 }
                 let term_query = term_query.unwrap();
 
-                if in_or_sequence || next_occur == Occur::Should {
-                    // Add to OR group
+                if in_or_sequence && just_saw_or {
+                    // Extending OR group
                     if pending_or_group.is_empty() {
-                        // Pull last Must clause into OR group if exists
-                        // Fix: Check if last clause is Must BEFORE popping to avoid dropping MustNot clauses
+                        // Start of group: Pull last Must clause into OR group if exists
                         if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
                             && let Some((_, last_q)) = clauses.pop()
                         {
                             pending_or_group.push(last_q);
                         }
                     }
-                    pending_or_group.push(term_query);
-                    in_or_sequence = true; // Continue OR sequence
+
+                    if next_occur == Occur::MustNot {
+                        // "OR NOT B" -> Add (All AND NOT B) to group
+                        // We need to wrap B in a query that effectively means "NOT B"
+                        // inside a Should clause.
+                        let neg_query = BooleanQuery::new(vec![
+                            (Occur::Must, Box::new(AllQuery)),
+                            (Occur::MustNot, term_query),
+                        ]);
+                        pending_or_group.push(Box::new(neg_query));
+                    } else {
+                        pending_or_group.push(term_query);
+                    }
                 } else {
+                    // Not in OR sequence OR implicit AND breaking the sequence
+                    // Flush any pending OR group first
+                    if !pending_or_group.is_empty() {
+                        let or_clauses: Vec<_> = pending_or_group
+                            .drain(..)
+                            .map(|q| (Occur::Should, q))
+                            .collect();
+                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                    }
+                    in_or_sequence = false;
+
                     clauses.push((next_occur, term_query));
                 }
+
+                just_saw_or = false;
                 next_occur = Occur::Must; // Reset for next term
             }
             QueryToken::Phrase(phrase) => {
@@ -1869,20 +1903,39 @@ fn build_boolean_query_clauses(
                 }
                 let phrase_query = phrase_query.unwrap();
 
-                if in_or_sequence {
+                if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
                         // Pull last Must clause into OR group if exists
-                        // Fix: Check if last clause is Must BEFORE popping to avoid dropping MustNot clauses
                         if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
                             && let Some((_, last_q)) = clauses.pop()
                         {
                             pending_or_group.push(last_q);
                         }
                     }
-                    pending_or_group.push(phrase_query);
+
+                    if next_occur == Occur::MustNot {
+                        let neg_query = BooleanQuery::new(vec![
+                            (Occur::Must, Box::new(AllQuery)),
+                            (Occur::MustNot, phrase_query),
+                        ]);
+                        pending_or_group.push(Box::new(neg_query));
+                    } else {
+                        pending_or_group.push(phrase_query);
+                    }
                 } else {
+                    if !pending_or_group.is_empty() {
+                        let or_clauses: Vec<_> = pending_or_group
+                            .drain(..)
+                            .map(|q| (Occur::Should, q))
+                            .collect();
+                        clauses.push((Occur::Must, Box::new(BooleanQuery::new(or_clauses))));
+                    }
+                    in_or_sequence = false;
+
                     clauses.push((next_occur, phrase_query));
                 }
+
+                just_saw_or = false;
                 next_occur = Occur::Must;
             }
         }

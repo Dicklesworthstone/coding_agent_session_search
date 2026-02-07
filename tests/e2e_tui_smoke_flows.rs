@@ -6,8 +6,8 @@
 //! - Per-step timing metrics
 //! - Artifact storage under test-results/e2e/tui/
 //!
-//! Note: Full PTY-based interactive testing would require adding a pty crate (e.g., portable_pty).
-//! Current tests use headless mode (--once + TUI_HEADLESS=1) to verify:
+//! This suite includes both PTY-driven interactive ftui flows and headless checks.
+//! Headless mode (`--once + TUI_HEADLESS=1`) is still used to verify:
 //! - TUI launch/exit paths
 //! - CLI search equivalents for search/filter flows
 //! - Export flow via CLI
@@ -15,9 +15,13 @@
 //! Run with: cargo test --test e2e_tui_smoke_flows -- --nocapture
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 mod util;
 use util::EnvGuard;
@@ -78,6 +82,204 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
 }
 
 // =============================================================================
+// PTY Helpers
+// =============================================================================
+
+const PTY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+const PTY_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
+const PTY_POLL: Duration = Duration::from_millis(40);
+const PERF_SEARCH_P95_BUDGET_MS: u64 = 1_500;
+const PERF_TUI_STARTUP_BUDGET_MS: u64 = 5_000;
+const PERF_TUI_DETAIL_OPEN_BUDGET_MS: u64 = 5_000;
+const PERF_TUI_OUTPUT_BYTES_BUDGET: u64 = 600_000;
+const PERF_TUI_BYTES_PER_ACTION_BUDGET: u64 = 180_000;
+
+struct FtuiPtyEnv {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    xdg: PathBuf,
+    data_dir: PathBuf,
+    codex_home: PathBuf,
+}
+
+fn cass_bin_path() -> &'static str {
+    env!("CARGO_BIN_EXE_cass")
+}
+
+fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
+    let setup_start = tracker.start(
+        "pty_setup",
+        Some("Creating isolated ftui PTY environment + fixtures"),
+    );
+
+    let tmp = tempfile::TempDir::new().expect("create temp dir");
+    let home = tmp.path().join("home");
+    let xdg = tmp.path().join("xdg");
+    let data_dir = tmp.path().join("cass_data");
+    let codex_home = tmp.path().join("codex_home");
+    fs::create_dir_all(&home).expect("create home");
+    fs::create_dir_all(&xdg).expect("create xdg");
+    fs::create_dir_all(&data_dir).expect("create cass_data");
+    fs::create_dir_all(&codex_home).expect("create codex_home");
+    make_codex_fixture(&codex_home);
+
+    tracker.end(
+        "pty_setup",
+        Some("PTY fixture environment ready"),
+        setup_start,
+    );
+
+    let index_start = tracker.start(
+        "pty_index",
+        Some("Indexing fixture data for ftui interactive PTY tests"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .arg("index")
+        .arg("--full")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .env("HOME", home.to_string_lossy().as_ref())
+        .env("XDG_DATA_HOME", xdg.to_string_lossy().as_ref())
+        .env("CODEX_HOME", codex_home.to_string_lossy().as_ref())
+        .env("CASS_DATA_DIR", data_dir.to_string_lossy().as_ref())
+        .env("NO_COLOR", "1")
+        .current_dir(&home)
+        .output()
+        .expect("failed to spawn cass index");
+
+    save_artifact("pty_index_stdout.txt", trace, &output.stdout);
+    save_artifact("pty_index_stderr.txt", trace, &output.stderr);
+    let index_ms = index_start.elapsed().as_millis() as u64;
+    tracker.end("pty_index", Some("PTY index complete"), index_start);
+    tracker.metrics(
+        "pty_index_duration",
+        &E2ePerformanceMetrics::new()
+            .with_duration(index_ms)
+            .with_custom("trace_id", trace.to_string()),
+    );
+
+    if !output.status.success() {
+        let ctx = E2eErrorContext::new()
+            .with_command("cass index --full --data-dir <pty-data>")
+            .capture_cwd()
+            .add_state("trace_id", serde_json::json!(trace))
+            .add_state("exit_code", serde_json::json!(output.status.code()))
+            .add_state(
+                "stderr_tail",
+                serde_json::json!(truncate_output(&output.stderr, 1500)),
+            );
+        eprintln!(
+            "PTY index failed context: {}",
+            serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())
+        );
+        panic!(
+            "Failed to build index for PTY test: {}",
+            truncate_output(&output.stderr, 500)
+        );
+    }
+
+    FtuiPtyEnv {
+        _tmp: tmp,
+        home,
+        xdg,
+        data_dir,
+        codex_home,
+    }
+}
+
+fn apply_ftui_env(cmd: &mut CommandBuilder, env: &FtuiPtyEnv) {
+    cmd.cwd(env.home.to_string_lossy().as_ref());
+    cmd.env("HOME", env.home.to_string_lossy().as_ref());
+    cmd.env("XDG_DATA_HOME", env.xdg.to_string_lossy().as_ref());
+    cmd.env("CASS_DATA_DIR", env.data_dir.to_string_lossy().as_ref());
+    cmd.env("CODEX_HOME", env.codex_home.to_string_lossy().as_ref());
+    cmd.env("CASS_TUI_RUNTIME", "ftui");
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.env("NO_COLOR", "1");
+    cmd.env("TERM", "xterm-256color");
+}
+
+fn spawn_reader(reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let captured_clone = Arc::clone(&captured);
+    let handle = thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    captured_clone
+                        .lock()
+                        .expect("capture lock")
+                        .extend_from_slice(&buf[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (captured, handle)
+}
+
+fn wait_for_child_exit(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    timeout: Duration,
+) -> portable_pty::ExitStatus {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let status = child.wait().expect("wait after kill");
+                    panic!("PTY child timed out after {:?} (status: {status})", timeout);
+                }
+                thread::sleep(PTY_POLL);
+            }
+            Err(err) => panic!("Failed polling PTY child status: {err}"),
+        }
+    }
+}
+
+fn wait_for_output_contains(
+    captured: &Arc<Mutex<Vec<u8>>>,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        {
+            let data = captured.lock().expect("capture lock");
+            if String::from_utf8_lossy(&data).contains(needle) {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(PTY_POLL);
+    }
+}
+
+fn send_key_sequence(writer: &mut (dyn Write + Send), bytes: &[u8]) {
+    writer.write_all(bytes).expect("write to PTY");
+    writer.flush().expect("flush PTY");
+}
+
+fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
+    assert!(
+        !samples.is_empty(),
+        "percentile_ms requires non-empty samples"
+    );
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let clamped = percentile.clamp(0.0, 100.0);
+    let rank = ((clamped / 100.0) * ((sorted.len() - 1) as f64)).round() as usize;
+    sorted[rank]
+}
+
+// =============================================================================
 // Fixture Helpers
 // =============================================================================
 
@@ -107,6 +309,401 @@ fn make_claude_fixture(root: &Path, workspace_name: &str) {
 {"type":"assistant","timestamp":"2025-01-15T10:00:15Z","message":{"content":"Date filtering has been added."}}
 "#;
     fs::write(file, sample).unwrap();
+}
+
+// =============================================================================
+// PTY Interactive Flow Tests (ftui runtime)
+// =============================================================================
+
+#[test]
+fn tui_pty_launch_quit_and_terminal_cleanup() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_launch_quit_and_terminal_cleanup");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 130,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let launch_start = tracker.start("pty_launch", Some("Launching interactive ftui TUI"));
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut tui_child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    let saw_shell = wait_for_output_contains(&captured, "cass", PTY_STARTUP_TIMEOUT);
+    assert!(saw_shell, "Did not observe TUI startup text in PTY output");
+
+    send_key_sequence(&mut *writer, b"\x1b"); // ESC to quit
+    let tui_status = wait_for_child_exit(&mut *tui_child, PTY_EXIT_TIMEOUT);
+    tracker.end(
+        "pty_launch",
+        Some("ftui quit sequence complete"),
+        launch_start,
+    );
+    assert!(
+        tui_status.success(),
+        "ftui process exited unsuccessfully: {tui_status}"
+    );
+
+    let mut stty_cmd = CommandBuilder::new("stty");
+    stty_cmd.arg("-a");
+    apply_ftui_env(&mut stty_cmd, &env);
+    let mut stty_child = pair
+        .slave
+        .spawn_command(stty_cmd)
+        .expect("spawn stty check");
+    let stty_status = wait_for_child_exit(&mut *stty_child, Duration::from_secs(8));
+    assert!(
+        stty_status.success(),
+        "stty exited unsuccessfully: {stty_status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_launch_quit_output.raw", &trace, &raw);
+    let text = String::from_utf8_lossy(&raw);
+
+    // Verify terminal mode restored (canonical mode + echo on).
+    assert!(
+        text.contains("icanon"),
+        "Expected stty output to include canonical mode (icanon). Output tail: {}",
+        truncate_output(&raw, 1200)
+    );
+    assert!(
+        text.contains("echo"),
+        "Expected stty output to include echo enabled. Output tail: {}",
+        truncate_output(&raw, 1200)
+    );
+
+    tracker.complete();
+}
+
+#[test]
+fn tui_pty_help_overlay_open_close_flow() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_help_overlay_open_close_flow");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 45,
+            cols: 145,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    assert!(
+        wait_for_output_contains(&captured, "cass", PTY_STARTUP_TIMEOUT),
+        "Did not observe startup text before help overlay interaction"
+    );
+
+    send_key_sequence(&mut *writer, b"?"); // open help
+    assert!(
+        wait_for_output_contains(&captured, "Quick Start & Shortcuts", Duration::from_secs(6)),
+        "Help overlay title not observed in PTY output"
+    );
+    send_key_sequence(&mut *writer, b"\x1b"); // close help
+    thread::sleep(Duration::from_millis(200));
+    send_key_sequence(&mut *writer, b"\x1b"); // quit
+
+    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "ftui process exited unsuccessfully: {status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_help_overlay_output.raw", &trace, &raw);
+
+    tracker.complete();
+}
+
+#[test]
+fn tui_pty_search_detail_and_quit_flow() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_search_detail_and_quit_flow");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 45,
+            cols: 145,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    assert!(
+        wait_for_output_contains(&captured, "cass", PTY_STARTUP_TIMEOUT),
+        "Did not observe startup text before search flow interaction"
+    );
+
+    send_key_sequence(&mut *writer, b"hello");
+    thread::sleep(Duration::from_millis(350));
+    send_key_sequence(&mut *writer, b"\r"); // Enter: open detail for selected result
+    let saw_detail = wait_for_output_contains(&captured, "Detail view", Duration::from_secs(6))
+        || wait_for_output_contains(&captured, "Loading conversation", Duration::from_secs(6));
+    assert!(
+        saw_detail,
+        "Did not observe detail-open state in PTY output"
+    );
+
+    send_key_sequence(&mut *writer, b"\x1b"); // close detail modal/back
+    thread::sleep(Duration::from_millis(200));
+    send_key_sequence(&mut *writer, b"\x1b"); // quit app
+
+    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "ftui process exited unsuccessfully: {status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_search_detail_output.raw", &trace, &raw);
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("hello"),
+        "Expected query text to appear in PTY capture. Output tail: {}",
+        truncate_output(&raw, 1200)
+    );
+
+    tracker.complete();
+}
+
+#[test]
+fn tui_pty_performance_guardrails_smoke() {
+    let _guard_lock = tui_flow_guard();
+    let trace = trace_id();
+    let tracker = tracker_for("tui_pty_performance_guardrails_smoke");
+    let _trace_guard = tracker.trace_env_guard();
+    let env = prepare_ftui_pty_env(&trace, &tracker);
+
+    let queries = ["hello", "authentication", "session", "timeout", "hello"];
+    let mut search_latencies_ms = Vec::with_capacity(queries.len());
+
+    for (idx, query) in queries.iter().enumerate() {
+        let run_start = Instant::now();
+        let output = cargo_bin_cmd!("cass")
+            .arg("search")
+            .arg(query)
+            .arg("--robot")
+            .arg("--data-dir")
+            .arg(&env.data_dir)
+            .env("HOME", env.home.to_string_lossy().as_ref())
+            .env("XDG_DATA_HOME", env.xdg.to_string_lossy().as_ref())
+            .env("CODEX_HOME", env.codex_home.to_string_lossy().as_ref())
+            .env("CASS_DATA_DIR", env.data_dir.to_string_lossy().as_ref())
+            .env("NO_COLOR", "1")
+            .current_dir(&env.home)
+            .output()
+            .expect("spawn cass search for perf budget");
+
+        let stdout_name = format!("perf_search_{idx}_stdout.json");
+        let stderr_name = format!("perf_search_{idx}_stderr.txt");
+        save_artifact(&stdout_name, &trace, &output.stdout);
+        save_artifact(&stderr_name, &trace, &output.stderr);
+
+        assert!(
+            output.status.success(),
+            "perf search query failed for '{query}': {}",
+            truncate_output(&output.stderr, 500)
+        );
+        search_latencies_ms.push(run_start.elapsed().as_millis() as u64);
+    }
+
+    let search_p50_ms = percentile_ms(&search_latencies_ms, 50.0);
+    let search_p95_ms = percentile_ms(&search_latencies_ms, 95.0);
+    tracker.metrics(
+        "perf_search_latency",
+        &E2ePerformanceMetrics::new()
+            .with_custom("trace_id", trace.clone())
+            .with_custom("p50_ms", search_p50_ms)
+            .with_custom("p95_ms", search_p95_ms)
+            .with_custom("samples_ms", serde_json::json!(search_latencies_ms)),
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 45,
+            cols: 145,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+    let reader = pair.master.try_clone_reader().expect("clone PTY reader");
+    let (captured, reader_handle) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take PTY writer");
+
+    let startup_begin = Instant::now();
+    let mut tui_cmd = CommandBuilder::new(cass_bin_path());
+    tui_cmd.arg("tui");
+    apply_ftui_env(&mut tui_cmd, &env);
+    let mut child = pair
+        .slave
+        .spawn_command(tui_cmd)
+        .expect("spawn ftui TUI in PTY");
+
+    assert!(
+        wait_for_output_contains(&captured, "cass", PTY_STARTUP_TIMEOUT),
+        "Did not observe startup text in perf guard test"
+    );
+    let startup_ms = startup_begin.elapsed().as_millis() as u64;
+
+    send_key_sequence(&mut *writer, b"hello");
+    thread::sleep(Duration::from_millis(120));
+    let detail_begin = Instant::now();
+    send_key_sequence(&mut *writer, b"\r");
+    let saw_detail = wait_for_output_contains(&captured, "Detail view", Duration::from_secs(6))
+        || wait_for_output_contains(&captured, "Loading conversation", Duration::from_secs(6));
+    let detail_open_ms = detail_begin.elapsed().as_millis() as u64;
+    assert!(
+        saw_detail,
+        "Detail view marker not observed during perf flow"
+    );
+
+    send_key_sequence(&mut *writer, b"\x1b");
+    thread::sleep(Duration::from_millis(120));
+    send_key_sequence(&mut *writer, b"\x1b");
+    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
+    assert!(
+        status.success(),
+        "ftui process exited unsuccessfully: {status}"
+    );
+
+    drop(writer);
+    drop(pair);
+    let _ = reader_handle.join();
+    let raw = captured.lock().expect("capture lock").clone();
+    save_artifact("pty_perf_guard_output.raw", &trace, &raw);
+
+    let total_output_bytes = raw.len() as u64;
+    let bytes_per_action = total_output_bytes / 4;
+    tracker.metrics(
+        "perf_pty_runtime",
+        &E2ePerformanceMetrics::new()
+            .with_custom("trace_id", trace.clone())
+            .with_custom("startup_ms", startup_ms)
+            .with_custom("detail_open_ms", detail_open_ms)
+            .with_custom("total_output_bytes", total_output_bytes)
+            .with_custom("bytes_per_action", bytes_per_action),
+    );
+
+    let summary = serde_json::json!({
+        "trace_id": trace,
+        "test": "tui_pty_performance_guardrails_smoke",
+        "search_latency_ms": {
+            "samples": search_latencies_ms,
+            "p50": search_p50_ms,
+            "p95": search_p95_ms
+        },
+        "pty": {
+            "startup_ms": startup_ms,
+            "detail_open_ms": detail_open_ms,
+            "output_bytes_total": total_output_bytes,
+            "output_bytes_per_action": bytes_per_action
+        },
+        "budgets": {
+            "search_p95_ms": PERF_SEARCH_P95_BUDGET_MS,
+            "tui_startup_ms": PERF_TUI_STARTUP_BUDGET_MS,
+            "tui_detail_open_ms": PERF_TUI_DETAIL_OPEN_BUDGET_MS,
+            "tui_output_bytes_total": PERF_TUI_OUTPUT_BYTES_BUDGET,
+            "tui_output_bytes_per_action": PERF_TUI_BYTES_PER_ACTION_BUDGET
+        }
+    });
+    save_artifact(
+        "perf_guardrail_summary.json",
+        &trace,
+        serde_json::to_string_pretty(&summary)
+            .expect("serialize perf summary")
+            .as_bytes(),
+    );
+
+    assert!(
+        search_p95_ms <= PERF_SEARCH_P95_BUDGET_MS,
+        "Search latency budget exceeded: p95={}ms > {}ms",
+        search_p95_ms,
+        PERF_SEARCH_P95_BUDGET_MS
+    );
+    assert!(
+        startup_ms <= PERF_TUI_STARTUP_BUDGET_MS,
+        "TUI startup budget exceeded: {}ms > {}ms",
+        startup_ms,
+        PERF_TUI_STARTUP_BUDGET_MS
+    );
+    assert!(
+        detail_open_ms <= PERF_TUI_DETAIL_OPEN_BUDGET_MS,
+        "Detail-open budget exceeded: {}ms > {}ms",
+        detail_open_ms,
+        PERF_TUI_DETAIL_OPEN_BUDGET_MS
+    );
+    assert!(
+        total_output_bytes <= PERF_TUI_OUTPUT_BYTES_BUDGET,
+        "PTY output-byte budget exceeded: {} > {}",
+        total_output_bytes,
+        PERF_TUI_OUTPUT_BYTES_BUDGET
+    );
+    assert!(
+        bytes_per_action <= PERF_TUI_BYTES_PER_ACTION_BUDGET,
+        "PTY bytes/action budget exceeded: {} > {}",
+        bytes_per_action,
+        PERF_TUI_BYTES_PER_ACTION_BUDGET
+    );
+
+    tracker.complete();
 }
 
 // =============================================================================

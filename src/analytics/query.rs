@@ -496,6 +496,433 @@ pub fn query_tokens_timeseries(
 }
 
 // ---------------------------------------------------------------------------
+// query_breakdown
+// ---------------------------------------------------------------------------
+
+/// Run a breakdown query: aggregate one metric by a chosen dimension.
+///
+/// Returns rows ordered by the metric value descending, capped at `limit`.
+/// This answers questions like "which agent uses the most tokens?" or
+/// "which workspace has the most tool calls?".
+pub fn query_breakdown(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+    dim: Dim,
+    metric: Metric,
+    limit: usize,
+) -> AnalyticsResult<BreakdownResult> {
+    let query_start = std::time::Instant::now();
+
+    // For the Model dimension, use token_daily_stats (Track B) which has model_family.
+    // For Agent/Workspace/Source, use usage_daily (Track A).
+    let (table, dim_col) = match dim {
+        Dim::Agent => ("usage_daily", "agent_slug"),
+        Dim::Workspace => ("usage_daily", "workspace_id"),
+        Dim::Source => ("usage_daily", "source_id"),
+        Dim::Model => ("token_daily_stats", "model_family"),
+    };
+
+    if !table_exists(conn, table) {
+        return Ok(BreakdownResult {
+            rows: vec![],
+            dim,
+            metric,
+            source_table: table.into(),
+            elapsed_ms: query_start.elapsed().as_millis() as u64,
+        });
+    }
+
+    // Build WHERE clause.
+    let (day_min, day_max) = bucketing::resolve_day_range(filter);
+    let (dim_parts, dim_params) = build_where_parts(filter);
+    let mut where_parts = dim_parts;
+    let mut bind_values = dim_params;
+
+    if let Some(min) = day_min {
+        bind_values.push(min.to_string());
+        where_parts.push(format!("day_id >= ?{}", bind_values.len()));
+    }
+    if let Some(max) = day_max {
+        bind_values.push(max.to_string());
+        where_parts.push(format!("day_id <= ?{}", bind_values.len()));
+    }
+
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+
+    // For Track A (usage_daily), we can select the full bucket.
+    // For Track B (token_daily_stats), column names differ — map accordingly.
+    let sql = if dim == Dim::Model {
+        // Track B: token_daily_stats columns map to different names.
+        build_breakdown_sql_track_b(dim_col, &metric, &where_clause, limit)
+    } else {
+        // Track A: usage_daily — full UsageBucket columns available.
+        build_breakdown_sql_track_a(dim_col, &metric, &where_clause, limit)
+    };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare breakdown query: {e}")))?;
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows = if dim == Dim::Model {
+        read_breakdown_rows_track_b(&mut stmt, &param_refs, &metric)?
+    } else {
+        read_breakdown_rows_track_a(&mut stmt, &param_refs, &metric)?
+    };
+
+    let elapsed_ms = query_start.elapsed().as_millis() as u64;
+
+    Ok(BreakdownResult {
+        rows,
+        dim,
+        metric,
+        source_table: table.into(),
+        elapsed_ms,
+    })
+}
+
+/// Build SQL for breakdown from usage_daily (Track A).
+fn build_breakdown_sql_track_a(
+    dim_col: &str,
+    metric: &Metric,
+    where_clause: &str,
+    limit: usize,
+) -> String {
+    let order_col = metric.rollup_column().unwrap_or("api_tokens_total");
+    format!(
+        "SELECT CAST({dim_col} AS TEXT),
+                SUM(message_count),
+                SUM(user_message_count),
+                SUM(assistant_message_count),
+                SUM(tool_call_count),
+                SUM(plan_message_count),
+                SUM(api_coverage_message_count),
+                SUM(content_tokens_est_total),
+                SUM(content_tokens_est_user),
+                SUM(content_tokens_est_assistant),
+                SUM(api_tokens_total),
+                SUM(api_input_tokens_total),
+                SUM(api_output_tokens_total),
+                SUM(api_cache_read_tokens_total),
+                SUM(api_cache_creation_tokens_total),
+                SUM(api_thinking_tokens_total),
+                SUM({order_col})
+         FROM usage_daily
+         {where_clause}
+         GROUP BY {dim_col}
+         ORDER BY SUM({order_col}) DESC
+         LIMIT {limit}"
+    )
+}
+
+/// Build SQL for breakdown from token_daily_stats (Track B).
+fn build_breakdown_sql_track_b(
+    dim_col: &str,
+    metric: &Metric,
+    where_clause: &str,
+    limit: usize,
+) -> String {
+    // Map Metric to the Track B column name.
+    let order_col = match metric {
+        Metric::ApiTotal => "grand_total_tokens",
+        Metric::ApiInput => "total_input_tokens",
+        Metric::ApiOutput => "total_output_tokens",
+        Metric::CacheRead => "total_cache_read_tokens",
+        Metric::CacheCreation => "total_cache_creation_tokens",
+        Metric::Thinking => "total_thinking_tokens",
+        Metric::ToolCalls => "total_tool_calls",
+        Metric::MessageCount => "api_call_count",
+        _ => "grand_total_tokens",
+    };
+    format!(
+        "SELECT {dim_col},
+                SUM(api_call_count),
+                SUM(user_message_count),
+                SUM(assistant_message_count),
+                SUM(total_tool_calls),
+                SUM(total_input_tokens),
+                SUM(total_output_tokens),
+                SUM(total_cache_read_tokens),
+                SUM(total_cache_creation_tokens),
+                SUM(total_thinking_tokens),
+                SUM(grand_total_tokens),
+                SUM(total_content_chars),
+                SUM(estimated_cost_usd),
+                SUM({order_col})
+         FROM token_daily_stats
+         {where_clause}
+         GROUP BY {dim_col}
+         ORDER BY SUM({order_col}) DESC
+         LIMIT {limit}"
+    )
+}
+
+/// Read breakdown rows from a Track A (usage_daily) query result.
+fn read_breakdown_rows_track_a(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: &[&dyn rusqlite::types::ToSql],
+    metric: &Metric,
+) -> AnalyticsResult<Vec<BreakdownRow>> {
+    let rows_result = stmt
+        .query_map(params, |row| {
+            let key: String = row.get(0)?;
+            let bucket = UsageBucket {
+                message_count: row.get(1)?,
+                user_message_count: row.get(2)?,
+                assistant_message_count: row.get(3)?,
+                tool_call_count: row.get(4)?,
+                plan_message_count: row.get(5)?,
+                api_coverage_message_count: row.get(6)?,
+                content_tokens_est_total: row.get(7)?,
+                content_tokens_est_user: row.get(8)?,
+                content_tokens_est_assistant: row.get(9)?,
+                api_tokens_total: row.get(10)?,
+                api_input_tokens_total: row.get(11)?,
+                api_output_tokens_total: row.get(12)?,
+                api_cache_read_tokens_total: row.get(13)?,
+                api_cache_creation_tokens_total: row.get(14)?,
+                api_thinking_tokens_total: row.get(15)?,
+            };
+            let sort_value: i64 = row.get(16)?;
+            Ok((key, bucket, sort_value))
+        })
+        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows_result {
+        let (key, bucket, sort_value) =
+            row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+        // For CoveragePct, compute derived value instead of using raw column.
+        let value = if *metric == Metric::CoveragePct {
+            let pct =
+                super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count);
+            pct as i64
+        } else {
+            sort_value
+        };
+        result.push(BreakdownRow {
+            message_count: bucket.message_count,
+            key,
+            value,
+            bucket,
+        });
+    }
+    Ok(result)
+}
+
+/// Read breakdown rows from a Track B (token_daily_stats) query result.
+fn read_breakdown_rows_track_b(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: &[&dyn rusqlite::types::ToSql],
+    _metric: &Metric,
+) -> AnalyticsResult<Vec<BreakdownRow>> {
+    let rows_result = stmt
+        .query_map(params, |row| {
+            let key: String = row.get(0)?;
+            let api_call_count: i64 = row.get(1)?;
+            let user_message_count: i64 = row.get(2)?;
+            let assistant_message_count: i64 = row.get(3)?;
+            let total_tool_calls: i64 = row.get(4)?;
+            let total_input: i64 = row.get(5)?;
+            let total_output: i64 = row.get(6)?;
+            let total_cache_read: i64 = row.get(7)?;
+            let total_cache_creation: i64 = row.get(8)?;
+            let total_thinking: i64 = row.get(9)?;
+            let grand_total: i64 = row.get(10)?;
+            let total_content_chars: i64 = row.get(11)?;
+            let _estimated_cost: f64 = row.get(12)?;
+            let sort_value: i64 = row.get(13)?;
+
+            // Map Track B columns to UsageBucket.
+            let bucket = UsageBucket {
+                message_count: api_call_count,
+                user_message_count,
+                assistant_message_count,
+                tool_call_count: total_tool_calls,
+                api_coverage_message_count: api_call_count, // all are API-sourced in Track B
+                content_tokens_est_total: total_content_chars / 4, // chars → tokens estimate
+                api_tokens_total: grand_total,
+                api_input_tokens_total: total_input,
+                api_output_tokens_total: total_output,
+                api_cache_read_tokens_total: total_cache_read,
+                api_cache_creation_tokens_total: total_cache_creation,
+                api_thinking_tokens_total: total_thinking,
+                ..Default::default()
+            };
+
+            Ok((key, bucket, sort_value))
+        })
+        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows_result {
+        let (key, bucket, sort_value) =
+            row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+        result.push(BreakdownRow {
+            message_count: bucket.message_count,
+            key,
+            value: sort_value,
+            bucket,
+        });
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// query_tools
+// ---------------------------------------------------------------------------
+
+/// Run a tool usage report — tool calls broken down by a dimension.
+///
+/// Uses `usage_daily` (Track A) which has reliable `tool_call_count`.
+/// Returns rows ordered by tool_call_count descending, capped at `limit`.
+pub fn query_tools(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+    group_by: GroupBy,
+    limit: usize,
+) -> AnalyticsResult<ToolReport> {
+    let query_start = std::time::Instant::now();
+
+    let (table, bucket_col) = match group_by {
+        GroupBy::Hour => ("usage_hourly", "hour_id"),
+        _ => ("usage_daily", "day_id"),
+    };
+
+    if !table_exists(conn, table) {
+        return Ok(ToolReport {
+            rows: vec![],
+            total_tool_calls: 0,
+            total_messages: 0,
+            total_api_tokens: 0,
+            source_table: table.into(),
+            elapsed_ms: query_start.elapsed().as_millis() as u64,
+        });
+    }
+
+    // Build WHERE clause.
+    let (day_min, day_max) = bucketing::resolve_day_range(filter);
+    let (hour_min, hour_max) = bucketing::resolve_hour_range(filter);
+    let (dim_parts, dim_params) = build_where_parts(filter);
+    let mut where_parts = dim_parts;
+    let mut bind_values = dim_params;
+
+    match group_by {
+        GroupBy::Hour => {
+            if let Some(min) = hour_min {
+                bind_values.push(min.to_string());
+                where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
+            }
+            if let Some(max) = hour_max {
+                bind_values.push(max.to_string());
+                where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
+            }
+        }
+        _ => {
+            if let Some(min) = day_min {
+                bind_values.push(min.to_string());
+                where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
+            }
+            if let Some(max) = day_max {
+                bind_values.push(max.to_string());
+                where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
+            }
+        }
+    }
+
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+
+    // Group by agent_slug for tool breakdown (most useful default).
+    let sql = format!(
+        "SELECT agent_slug,
+                SUM(tool_call_count),
+                SUM(message_count),
+                SUM(api_tokens_total),
+                SUM(content_tokens_est_total)
+         FROM {table}
+         {where_clause}
+         GROUP BY agent_slug
+         ORDER BY SUM(tool_call_count) DESC
+         LIMIT {limit}"
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AnalyticsError::Db(format!("Failed to prepare tool report query: {e}")))?;
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = bind_values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect();
+
+    let rows_result = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let key: String = row.get(0)?;
+            let tool_call_count: i64 = row.get(1)?;
+            let message_count: i64 = row.get(2)?;
+            let api_tokens_total: i64 = row.get(3)?;
+            let content_tokens_est_total: i64 = row.get(4)?;
+
+            let tool_calls_per_1k_api = if api_tokens_total > 0 {
+                Some(tool_call_count as f64 / (api_tokens_total as f64 / 1000.0))
+            } else {
+                None
+            };
+            let tool_calls_per_1k_content = if content_tokens_est_total > 0 {
+                Some(tool_call_count as f64 / (content_tokens_est_total as f64 / 1000.0))
+            } else {
+                None
+            };
+
+            Ok(ToolRow {
+                key,
+                tool_call_count,
+                message_count,
+                api_tokens_total,
+                tool_calls_per_1k_api_tokens: tool_calls_per_1k_api,
+                tool_calls_per_1k_content_tokens: tool_calls_per_1k_content,
+            })
+        })
+        .map_err(|e| AnalyticsError::Db(format!("Tool report query failed: {e}")))?;
+
+    let mut rows = Vec::new();
+    let mut total_tool_calls: i64 = 0;
+    let mut total_messages: i64 = 0;
+    let mut total_api_tokens: i64 = 0;
+
+    for row in rows_result {
+        let r = row.map_err(|e| AnalyticsError::Db(format!("Row read error: {e}")))?;
+        total_tool_calls += r.tool_call_count;
+        total_messages += r.message_count;
+        total_api_tokens += r.api_tokens_total;
+        rows.push(r);
+    }
+
+    let elapsed_ms = query_start.elapsed().as_millis() as u64;
+
+    Ok(ToolReport {
+        rows,
+        total_tool_calls,
+        total_messages,
+        total_api_tokens,
+        source_table: table.into(),
+        elapsed_ms,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -585,5 +1012,334 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0], "codex");
         assert_eq!(params[1], "local");
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests with in-memory SQLite
+    // -----------------------------------------------------------------------
+
+    /// Create an in-memory database with the usage_daily schema and seed data.
+    fn setup_usage_daily_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_daily (
+                day_id INTEGER NOT NULL,
+                agent_slug TEXT NOT NULL,
+                workspace_id INTEGER NOT NULL DEFAULT 0,
+                source_id TEXT NOT NULL DEFAULT 'local',
+                message_count INTEGER NOT NULL DEFAULT 0,
+                user_message_count INTEGER NOT NULL DEFAULT 0,
+                assistant_message_count INTEGER NOT NULL DEFAULT 0,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                plan_message_count INTEGER NOT NULL DEFAULT 0,
+                api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+                content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+                content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+                content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+                api_tokens_total INTEGER NOT NULL DEFAULT 0,
+                api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+                api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+                api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+                api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+                api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+                last_updated INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
+            );",
+        )
+        .unwrap();
+
+        // Seed: 3 agents across 2 days
+        let rows = [
+            (
+                20250,
+                "claude_code",
+                1,
+                "local",
+                100,
+                50,
+                50,
+                20,
+                5,
+                80,
+                40000,
+                20000,
+                20000,
+                60000,
+                30000,
+                25000,
+                3000,
+                1500,
+                500,
+            ),
+            (
+                20250, "codex", 1, "local", 50, 25, 25, 10, 2, 40, 20000, 10000, 10000, 30000,
+                15000, 12000, 2000, 800, 200,
+            ),
+            (
+                20250, "aider", 2, "remote", 30, 15, 15, 5, 0, 0, 12000, 6000, 6000, 0, 0, 0, 0, 0,
+                0,
+            ),
+            (
+                20251,
+                "claude_code",
+                1,
+                "local",
+                120,
+                60,
+                60,
+                25,
+                8,
+                100,
+                50000,
+                25000,
+                25000,
+                80000,
+                40000,
+                32000,
+                5000,
+                2000,
+                1000,
+            ),
+            (
+                20251, "codex", 1, "local", 60, 30, 30, 15, 3, 50, 25000, 12500, 12500, 40000,
+                20000, 16000, 2500, 1000, 500,
+            ),
+        ];
+
+        for r in &rows {
+            conn.execute(
+                "INSERT INTO usage_daily (day_id, agent_slug, workspace_id, source_id,
+                    message_count, user_message_count, assistant_message_count,
+                    tool_call_count, plan_message_count, api_coverage_message_count,
+                    content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
+                    api_tokens_total, api_input_tokens_total, api_output_tokens_total,
+                    api_cache_read_tokens_total, api_cache_creation_tokens_total,
+                    api_thinking_tokens_total)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                rusqlite::params![
+                    r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9, r.10, r.11, r.12, r.13, r.14,
+                    r.15, r.16, r.17, r.18
+                ],
+            )
+            .unwrap();
+        }
+
+        conn
+    }
+
+    /// Create an in-memory database with the token_daily_stats schema and seed data.
+    fn setup_token_daily_stats_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_daily_stats (
+                day_id INTEGER NOT NULL,
+                agent_slug TEXT NOT NULL,
+                source_id TEXT NOT NULL DEFAULT 'all',
+                model_family TEXT NOT NULL DEFAULT 'all',
+                api_call_count INTEGER NOT NULL DEFAULT 0,
+                user_message_count INTEGER NOT NULL DEFAULT 0,
+                assistant_message_count INTEGER NOT NULL DEFAULT 0,
+                tool_message_count INTEGER NOT NULL DEFAULT 0,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+                grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+                total_content_chars INTEGER NOT NULL DEFAULT 0,
+                total_tool_calls INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+                session_count INTEGER NOT NULL DEFAULT 0,
+                last_updated INTEGER NOT NULL,
+                PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+            );",
+        )
+        .unwrap();
+
+        // Seed: 2 models across 1 day
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            rusqlite::params![20250, "claude_code", "local", "opus", 80, 40, 40, 5, 30000, 25000, 3000, 1500, 500, 60000, 160000, 20, 1.50, 3, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            rusqlite::params![20250, "claude_code", "local", "sonnet", 40, 20, 20, 2, 10000, 8000, 1000, 500, 200, 19700, 80000, 8, 0.40, 2, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO token_daily_stats VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            rusqlite::params![20250, "codex", "local", "gpt-4o", 50, 25, 25, 3, 15000, 12000, 2000, 800, 0, 29800, 100000, 10, 0.80, 1, now],
+        ).unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn query_breakdown_by_agent_returns_ordered_rows() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
+
+        assert_eq!(result.dim, Dim::Agent);
+        assert_eq!(result.metric, Metric::ApiTotal);
+        assert!(!result.rows.is_empty());
+        // claude_code should be first (highest api_tokens_total)
+        assert_eq!(result.rows[0].key, "claude_code");
+        // Verify descending order
+        for i in 1..result.rows.len() {
+            assert!(result.rows[i - 1].value >= result.rows[i].value);
+        }
+    }
+
+    #[test]
+    fn query_breakdown_by_source_filters_correctly() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter {
+            source: SourceFilter::Local,
+            ..Default::default()
+        };
+        let result =
+            query_breakdown(&conn, &filter, Dim::Source, Metric::MessageCount, 10).unwrap();
+
+        // Only "local" source should appear
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, "local");
+    }
+
+    #[test]
+    fn query_breakdown_by_model_uses_track_b() {
+        let conn = setup_token_daily_stats_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_breakdown(&conn, &filter, Dim::Model, Metric::ApiTotal, 10).unwrap();
+
+        assert_eq!(result.source_table, "token_daily_stats");
+        assert_eq!(result.rows.len(), 3); // opus, gpt-4o, sonnet
+        // opus has highest grand_total (60000)
+        assert_eq!(result.rows[0].key, "opus");
+    }
+
+    #[test]
+    fn query_breakdown_limit_caps_rows() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 2).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn query_breakdown_missing_table_returns_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        let filter = AnalyticsFilter::default();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn query_breakdown_result_to_json_shape() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ToolCalls, 10).unwrap();
+
+        let json = result.to_cli_json();
+        assert_eq!(json["dim"], "agent");
+        assert_eq!(json["metric"], "tool_calls");
+        assert!(json["rows"].is_array());
+        assert!(json["row_count"].is_number());
+        assert!(json["_meta"]["elapsed_ms"].is_number());
+    }
+
+    #[test]
+    fn query_tools_returns_agent_breakdown() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
+
+        assert!(!result.rows.is_empty());
+        // claude_code should have the most tool calls (20+25=45)
+        assert_eq!(result.rows[0].key, "claude_code");
+        assert_eq!(result.rows[0].tool_call_count, 45);
+
+        // Totals should sum correctly
+        let sum: i64 = result.rows.iter().map(|r| r.tool_call_count).sum();
+        assert_eq!(result.total_tool_calls, sum);
+    }
+
+    #[test]
+    fn query_tools_derived_metrics_correct() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
+
+        for row in &result.rows {
+            if row.api_tokens_total > 0 {
+                let expected = row.tool_call_count as f64 / (row.api_tokens_total as f64 / 1000.0);
+                assert!((row.tool_calls_per_1k_api_tokens.unwrap() - expected).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn query_tools_missing_table_returns_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        let filter = AnalyticsFilter::default();
+        let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
+        assert!(result.rows.is_empty());
+        assert_eq!(result.total_tool_calls, 0);
+    }
+
+    #[test]
+    fn query_tools_report_to_json_shape() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter::default();
+        let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
+
+        let json = result.to_cli_json();
+        assert!(json["rows"].is_array());
+        assert!(json["totals"]["tool_call_count"].is_number());
+        assert!(json["_meta"]["elapsed_ms"].is_number());
+    }
+
+    #[test]
+    fn query_breakdown_with_agent_filter() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter {
+            agents: vec!["codex".into()],
+            ..Default::default()
+        };
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].key, "codex");
+        // Total should be 30000 + 40000 = 70000
+        assert_eq!(result.rows[0].value, 70000);
+    }
+
+    #[test]
+    fn metric_display_roundtrip() {
+        assert_eq!(Metric::ApiTotal.to_string(), "api_total");
+        assert_eq!(Metric::ToolCalls.to_string(), "tool_calls");
+        assert_eq!(Metric::CoveragePct.to_string(), "coverage_pct");
+    }
+
+    #[test]
+    fn dim_display_roundtrip() {
+        assert_eq!(Dim::Agent.to_string(), "agent");
+        assert_eq!(Dim::Model.to_string(), "model");
+        assert_eq!(Dim::Workspace.to_string(), "workspace");
+        assert_eq!(Dim::Source.to_string(), "source");
+    }
+
+    #[test]
+    fn metric_rollup_column_coverage_pct_is_none() {
+        assert!(Metric::CoveragePct.rollup_column().is_none());
+    }
+
+    #[test]
+    fn metric_rollup_column_api_total_is_some() {
+        assert_eq!(Metric::ApiTotal.rollup_column(), Some("api_tokens_total"));
     }
 }

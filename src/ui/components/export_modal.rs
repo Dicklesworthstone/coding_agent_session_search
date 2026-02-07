@@ -2,18 +2,12 @@
 //!
 //! Provides a beautiful, keyboard-navigable modal for configuring HTML export options.
 //! Features progressive disclosure, smart defaults, and instant visual feedback.
+//!
+//! State and logic live here; rendering is done in [`super::super::app::CassApp::render_export_overlay`]
+//! using ftui widgets.
 
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-};
 use std::path::PathBuf;
 
-use super::theme::ThemePalette;
-use super::widgets::centered_rect_fixed;
 use crate::html_export::{
     ExportOptions, FilenameMetadata, FilenameOptions, generate_filepath, get_downloads_dir,
 };
@@ -347,20 +341,30 @@ impl ExportModalState {
     }
 }
 
-/// Render the export modal.
-pub fn render_export_modal(frame: &mut Frame, state: &ExportModalState, palette: ThemePalette) {
+// =========================================================================
+// Legacy ratatui rendering (used by src/ui/tui.rs — the old TUI path)
+// =========================================================================
+
+/// Render the export modal using ratatui widgets (legacy path).
+pub fn render_export_modal(
+    frame: &mut ratatui::Frame,
+    state: &ExportModalState,
+    palette: super::theme::ThemePalette,
+) {
+    use ratatui::{
+        layout::{Alignment, Constraint, Direction, Layout, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+
     let area = frame.area();
+    let modal_width = 70u16.min(area.width.saturating_sub(4));
+    let modal_height = 24u16.min(area.height.saturating_sub(2));
+    let popup_area = super::widgets::centered_rect_fixed(modal_width, modal_height, area);
 
-    // Modal size: 70x24 or smaller if terminal is small
-    let modal_width = 70.min(area.width.saturating_sub(4));
-    let modal_height = 24.min(area.height.saturating_sub(2));
-
-    let popup_area = centered_rect_fixed(modal_width, modal_height, area);
-
-    // Clear background
     frame.render_widget(Clear, popup_area);
 
-    // Build modal content
     let block = Block::default()
         .title(Span::styled(
             " Export Session as HTML ",
@@ -370,383 +374,292 @@ pub fn render_export_modal(frame: &mut Frame, state: &ExportModalState, palette:
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette.accent));
-
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    // Layout: session info, options, preview, footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(4), // Session info
-            Constraint::Length(1), // Spacer
-            Constraint::Length(7), // Options
-            Constraint::Length(1), // Spacer
-            Constraint::Length(3), // Preview
-            Constraint::Min(1),    // Flex
-            Constraint::Length(1), // Footer
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(inner);
 
-    // Session info card
-    render_session_card(frame, state, chunks[0], palette);
-
-    // Options form
-    render_options_form(frame, state, chunks[2], palette);
-
-    // Preview section
-    render_preview(frame, state, chunks[4], palette);
-
-    // Footer with keyboard hints
-    render_footer(frame, state, chunks[6], palette);
-}
-
-/// Render the session info card.
-fn render_session_card(
-    frame: &mut Frame,
-    state: &ExportModalState,
-    area: Rect,
-    palette: ThemePalette,
-) {
-    let agent_badge = format!(" {} ", state.agent_name);
-    let location = format!("{} | {}", state.workspace, state.timestamp);
-    let stats = format!("{} messages", state.message_count);
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                agent_badge,
+    // Session info card.
+    {
+        let agent_badge = format!(" {} ", state.agent_name);
+        let location = format!("{} | {}", state.workspace, state.timestamp);
+        let stats = format!("{} messages", state.message_count);
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    agent_badge,
+                    Style::default()
+                        .fg(palette.bg)
+                        .bg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(location, Style::default().fg(palette.hint)),
+            ]),
+            Line::from(Span::styled(
+                &state.title_preview,
                 Style::default()
-                    .fg(palette.bg)
-                    .bg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(location, Style::default().fg(palette.hint)),
-        ]),
-        Line::from(Span::styled(
-            &state.title_preview,
+                    .fg(palette.fg)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+            Line::from(Span::styled(stats, Style::default().fg(palette.hint))),
+        ];
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(Span::styled(" Session ", Style::default().fg(palette.hint)));
+        frame.render_widget(Paragraph::new(lines).block(blk), chunks[0]);
+    }
+
+    // Options form.
+    {
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(Span::styled(" Options ", Style::default().fg(palette.hint)));
+        let opts_inner = blk.inner(chunks[2]);
+        frame.render_widget(blk, chunks[2]);
+
+        let opt_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(opts_inner);
+
+        // Output dir.
+        let focused = state.focused == ExportField::OutputDir;
+        let editing = state.output_dir_editing;
+        let dir_style = if focused {
             Style::default()
-                .fg(palette.fg)
-                .add_modifier(Modifier::ITALIC),
-        )),
-        Line::from(Span::styled(stats, Style::default().fg(palette.hint))),
-    ];
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.fg)
+        };
+        let display_path = if editing {
+            &state.output_dir_buffer
+        } else {
+            &state.output_dir.display().to_string()
+        };
+        let max_path_len = opt_chunks[0].width.saturating_sub(18) as usize;
+        let truncated = if max_path_len < 4 {
+            display_path.to_string()
+        } else if display_path.chars().count() > max_path_len {
+            let tail_len = max_path_len.saturating_sub(3);
+            let skip = display_path.chars().count().saturating_sub(tail_len);
+            let tail: String = display_path.chars().skip(skip).collect();
+            format!("...{tail}")
+        } else {
+            display_path.to_string()
+        };
+        let cursor = if editing { "_" } else { "" };
+        let hint = if focused && !editing {
+            " (Enter to edit)"
+        } else if editing {
+            " (Enter to confirm)"
+        } else {
+            ""
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Output: ", dir_style),
+                Span::styled(format!("{truncated}{cursor}"), dir_style),
+                Span::styled(hint, Style::default().fg(palette.hint)),
+            ])),
+            opt_chunks[0],
+        );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.border))
-        .title(Span::styled(" Session ", Style::default().fg(palette.hint)));
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Render the options form.
-fn render_options_form(
-    frame: &mut Frame,
-    state: &ExportModalState,
-    area: Rect,
-    palette: ThemePalette,
-) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.border))
-        .title(Span::styled(" Options ", Style::default().fg(palette.hint)));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let option_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Output directory
-            Constraint::Length(1), // Include tools
-            Constraint::Length(1), // Encrypt
-            Constraint::Length(1), // Password (conditional)
-            Constraint::Length(1), // Show timestamps
-            Constraint::Min(0),    // Flex
-        ])
-        .split(inner);
-
-    // Output directory input
-    render_output_dir_input(frame, state, option_chunks[0], palette);
-
-    // Include tools checkbox
-    render_checkbox(
-        frame,
-        "Include tool calls and outputs",
-        state.include_tools,
-        state.focused == ExportField::IncludeTools,
-        option_chunks[1],
-        palette,
-    );
-
-    // Encrypt checkbox
-    render_checkbox(
-        frame,
-        "Password protection",
-        state.encrypt,
-        state.focused == ExportField::Encrypt,
-        option_chunks[2],
-        palette,
-    );
-
-    // Password input (only shown if encrypt is enabled)
-    if state.encrypt {
-        render_password_input(
+        // Helper to render checkbox.
+        let render_cb =
+            |f: &mut ratatui::Frame, label: &str, checked: bool, foc: bool, area: Rect| {
+                let mark = if checked { "[x]" } else { "[ ]" };
+                let s = if foc {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.fg)
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(format!(" {mark} "), s),
+                        Span::styled(label, s),
+                    ])),
+                    area,
+                );
+            };
+        render_cb(
             frame,
-            &state.password,
-            state.password_visible,
-            state.focused == ExportField::Password,
-            option_chunks[3],
-            palette,
+            "Include tool calls and outputs",
+            state.include_tools,
+            state.focused == ExportField::IncludeTools,
+            opt_chunks[1],
+        );
+        render_cb(
+            frame,
+            "Password protection",
+            state.encrypt,
+            state.focused == ExportField::Encrypt,
+            opt_chunks[2],
+        );
+
+        if state.encrypt {
+            let pfoc = state.focused == ExportField::Password;
+            let ps = if pfoc {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.fg)
+            };
+            let display = if state.password_visible {
+                state.password.clone()
+            } else {
+                "*".repeat(state.password.len())
+            };
+            let pc = if pfoc { "_" } else { "" };
+            let vh = if state.password_visible {
+                "(Ctrl+H hide)"
+            } else {
+                "(Ctrl+H show)"
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("     Password: ", ps),
+                    Span::styled(format!("{display}{pc}"), ps),
+                    Span::styled(format!(" {vh}"), Style::default().fg(palette.hint)),
+                ])),
+                opt_chunks[3],
+            );
+        }
+
+        let ts_row = if state.encrypt {
+            opt_chunks[4]
+        } else {
+            opt_chunks[3]
+        };
+        render_cb(
+            frame,
+            "Show message timestamps",
+            state.show_timestamps,
+            state.focused == ExportField::ShowTimestamps,
+            ts_row,
         );
     }
 
-    // Show timestamps checkbox
-    let timestamps_row = if state.encrypt {
-        option_chunks[4]
-    } else {
-        option_chunks[3]
-    };
-    render_checkbox(
-        frame,
-        "Show message timestamps",
-        state.show_timestamps,
-        state.focused == ExportField::ShowTimestamps,
-        timestamps_row,
-        palette,
-    );
-}
-
-/// Render the output directory input field.
-fn render_output_dir_input(
-    frame: &mut Frame,
-    state: &ExportModalState,
-    area: Rect,
-    palette: ThemePalette,
-) {
-    let focused = state.focused == ExportField::OutputDir;
-    let editing = state.output_dir_editing;
-
-    let style = if focused {
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.fg)
-    };
-
-    let display_path = if editing {
-        &state.output_dir_buffer
-    } else {
-        &state.output_dir.display().to_string()
-    };
-
-    // Truncate long paths to fit (char-safe, underflow-safe)
-    let max_path_len = area.width.saturating_sub(18) as usize;
-    let truncated_path = if max_path_len < 4 {
-        // Too narrow to show anything meaningful
-        display_path.to_string()
-    } else if display_path.chars().count() > max_path_len {
-        let tail_len = max_path_len.saturating_sub(3);
-        let skip = display_path.chars().count().saturating_sub(tail_len);
-        let tail: String = display_path.chars().skip(skip).collect();
-        format!("...{tail}")
-    } else {
-        display_path.to_string()
-    };
-
-    let cursor = if editing { "_" } else { "" };
-    let hint = if focused && !editing {
-        " (Enter to edit)"
-    } else if editing {
-        " (Enter to confirm)"
-    } else {
-        ""
-    };
-
-    let line = Line::from(vec![
-        Span::styled(" Output: ", style),
-        Span::styled(format!("{}{}", truncated_path, cursor), style),
-        Span::styled(hint, Style::default().fg(palette.hint)),
-    ]);
-
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Render a checkbox option.
-fn render_checkbox(
-    frame: &mut Frame,
-    label: &str,
-    checked: bool,
-    focused: bool,
-    area: Rect,
-    palette: ThemePalette,
-) {
-    let checkbox = if checked { "[x]" } else { "[ ]" };
-    let style = if focused {
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.fg)
-    };
-
-    let line = Line::from(vec![
-        Span::styled(format!(" {} ", checkbox), style),
-        Span::styled(label, style),
-    ]);
-
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Render password input field.
-fn render_password_input(
-    frame: &mut Frame,
-    password: &str,
-    visible: bool,
-    focused: bool,
-    area: Rect,
-    palette: ThemePalette,
-) {
-    let display = if visible {
-        password.to_string()
-    } else {
-        "*".repeat(password.len())
-    };
-
-    let style = if focused {
-        Style::default()
-            .fg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette.fg)
-    };
-
-    let visibility_hint = if visible {
-        "(Ctrl+H hide)"
-    } else {
-        "(Ctrl+H show)"
-    };
-    let cursor = if focused { "_" } else { "" };
-
-    let line = Line::from(vec![
-        Span::styled("     Password: ", style),
-        Span::styled(format!("{}{}", display, cursor), style),
-        Span::styled(
-            format!(" {}", visibility_hint),
-            Style::default().fg(palette.hint),
-        ),
-    ]);
-
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Render the preview section.
-fn render_preview(frame: &mut Frame, state: &ExportModalState, area: Rect, palette: ThemePalette) {
-    let mut features = vec!["Dark/Light themes", "Print-friendly", "Search enabled"];
-    if state.encrypt {
-        features.push("Encrypted");
-    }
-
-    // Estimate file size (rough: ~2KB per message + overhead)
-    let estimated_kb = (state.message_count * 2 + 15).max(20);
-    let size_str = if estimated_kb > 1024 {
-        format!("~{:.1}MB", estimated_kb as f64 / 1024.0)
-    } else {
-        format!("~{}KB", estimated_kb)
-    };
-
-    let features_str = features.join(" | ");
-    let preview_line = format!(
-        "{} messages | {} estimated | {}",
-        state.message_count, size_str, features_str
-    );
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette.border))
-        .title(Span::styled(" Preview ", Style::default().fg(palette.hint)));
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            &state.filename_preview,
-            Style::default().fg(palette.fg),
-        )),
-        Line::from(Span::styled(
-            preview_line,
-            Style::default().fg(palette.hint),
-        )),
-    ];
-
-    let (progress_line, progress_style) = match &state.progress {
-        ExportProgress::Idle => (None, Style::default()),
-        ExportProgress::Preparing => (
-            Some("Preparing export...".to_string()),
-            Style::default().fg(palette.accent),
-        ),
-        ExportProgress::Encrypting => (
-            Some("Encrypting content...".to_string()),
-            Style::default().fg(palette.accent),
-        ),
-        ExportProgress::Writing => (
-            Some("Writing HTML file...".to_string()),
-            Style::default().fg(palette.accent),
-        ),
-        ExportProgress::Complete(path) => {
-            let filename = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            (
-                Some(format!("Exported: {filename}")),
-                Style::default().fg(palette.user),
-            )
+    // Preview.
+    {
+        let mut features = vec!["Dark/Light themes", "Print-friendly", "Search enabled"];
+        if state.encrypt {
+            features.push("Encrypted");
         }
-        ExportProgress::Error(message) => (
-            Some(format!("Error: {message}")),
-            Style::default().fg(Color::Rgb(247, 118, 142)),
-        ),
-    };
-
-    if let Some(line) = progress_line {
-        lines.push(Line::from(Span::styled(line, progress_style)));
+        let est_kb = (state.message_count * 2 + 15).max(20);
+        let size_str = if est_kb > 1024 {
+            format!("~{:.1}MB", est_kb as f64 / 1024.0)
+        } else {
+            format!("~{est_kb}KB")
+        };
+        let preview_line = format!(
+            "{} messages | {} estimated | {}",
+            state.message_count,
+            size_str,
+            features.join(" | ")
+        );
+        let blk = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.border))
+            .title(Span::styled(" Preview ", Style::default().fg(palette.hint)));
+        let mut lines = vec![
+            Line::from(Span::styled(
+                &state.filename_preview,
+                Style::default().fg(palette.fg),
+            )),
+            Line::from(Span::styled(
+                preview_line,
+                Style::default().fg(palette.hint),
+            )),
+        ];
+        let (ptext, ps) = match &state.progress {
+            ExportProgress::Idle => (None, Style::default()),
+            ExportProgress::Preparing => (
+                Some("Preparing export...".to_string()),
+                Style::default().fg(palette.accent),
+            ),
+            ExportProgress::Encrypting => (
+                Some("Encrypting content...".to_string()),
+                Style::default().fg(palette.accent),
+            ),
+            ExportProgress::Writing => (
+                Some("Writing HTML file...".to_string()),
+                Style::default().fg(palette.accent),
+            ),
+            ExportProgress::Complete(p) => {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.display().to_string());
+                (
+                    Some(format!("Exported: {name}")),
+                    Style::default().fg(palette.user),
+                )
+            }
+            ExportProgress::Error(m) => (
+                Some(format!("Error: {m}")),
+                Style::default().fg(Color::Rgb(247, 118, 142)),
+            ),
+        };
+        if let Some(t) = ptext {
+            lines.push(Line::from(Span::styled(t, ps)));
+        }
+        frame.render_widget(Paragraph::new(lines).block(blk), chunks[4]);
     }
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// Render the footer with keyboard hints.
-fn render_footer(frame: &mut Frame, state: &ExportModalState, area: Rect, palette: ThemePalette) {
-    let can_export = state.can_export();
-    let export_style = if can_export && state.focused == ExportField::ExportButton {
-        Style::default()
-            .fg(palette.bg)
-            .bg(palette.accent)
-            .add_modifier(Modifier::BOLD)
-    } else if can_export {
-        Style::default().fg(palette.accent)
-    } else {
-        Style::default().fg(palette.hint)
-    };
-
-    let hints = vec![
-        Span::styled(" Tab ", Style::default().fg(palette.hint)),
-        Span::styled("Navigate  ", Style::default().fg(palette.fg)),
-        Span::styled(" Space ", Style::default().fg(palette.hint)),
-        Span::styled("Toggle  ", Style::default().fg(palette.fg)),
-        Span::styled(" Enter ", export_style),
-        Span::styled("Export  ", export_style),
-        Span::styled(" Esc ", Style::default().fg(palette.hint)),
-        Span::styled("Cancel", Style::default().fg(palette.fg)),
-    ];
-
-    frame.render_widget(
-        Paragraph::new(Line::from(hints)).alignment(Alignment::Center),
-        area,
-    );
+    // Footer.
+    {
+        let can_export = state.can_export();
+        let es = if can_export && state.focused == ExportField::ExportButton {
+            Style::default()
+                .fg(palette.bg)
+                .bg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if can_export {
+            Style::default().fg(palette.accent)
+        } else {
+            Style::default().fg(palette.hint)
+        };
+        let hints = vec![
+            Span::styled(" Tab ", Style::default().fg(palette.hint)),
+            Span::styled("Navigate  ", Style::default().fg(palette.fg)),
+            Span::styled(" Space ", Style::default().fg(palette.hint)),
+            Span::styled("Toggle  ", Style::default().fg(palette.fg)),
+            Span::styled(" Enter ", es),
+            Span::styled("Export  ", es),
+            Span::styled(" Esc ", Style::default().fg(palette.hint)),
+            Span::styled("Cancel", Style::default().fg(palette.fg)),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(hints)).alignment(Alignment::Center),
+            chunks[6],
+        );
+    }
 }
 
 #[cfg(test)]

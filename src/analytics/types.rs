@@ -101,6 +101,94 @@ pub struct AnalyticsFilter {
 }
 
 // ---------------------------------------------------------------------------
+// Dimension and Metric enums
+// ---------------------------------------------------------------------------
+
+/// Dimension for breakdown queries — which column to GROUP BY.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dim {
+    Agent,
+    Workspace,
+    Source,
+    Model,
+}
+
+impl std::fmt::Display for Dim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent => write!(f, "agent"),
+            Self::Workspace => write!(f, "workspace"),
+            Self::Source => write!(f, "source"),
+            Self::Model => write!(f, "model"),
+        }
+    }
+}
+
+/// Metric selector for breakdown/explorer queries.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Metric {
+    /// Total API tokens (input + output + cache + thinking).
+    #[default]
+    ApiTotal,
+    ApiInput,
+    ApiOutput,
+    CacheRead,
+    CacheCreation,
+    Thinking,
+    /// Estimated content tokens (chars / 4).
+    ContentEstTotal,
+    /// Tool call count.
+    ToolCalls,
+    /// Plan message count.
+    PlanCount,
+    /// API coverage percentage.
+    CoveragePct,
+    /// Message count.
+    MessageCount,
+}
+
+impl Metric {
+    /// Return the SQL column name in the `usage_daily`/`usage_hourly` rollup
+    /// tables that corresponds to this metric, or `None` if the metric is
+    /// derived and not stored directly.
+    pub fn rollup_column(&self) -> Option<&'static str> {
+        match self {
+            Self::ApiTotal => Some("api_tokens_total"),
+            Self::ApiInput => Some("api_input_tokens_total"),
+            Self::ApiOutput => Some("api_output_tokens_total"),
+            Self::CacheRead => Some("api_cache_read_tokens_total"),
+            Self::CacheCreation => Some("api_cache_creation_tokens_total"),
+            Self::Thinking => Some("api_thinking_tokens_total"),
+            Self::ContentEstTotal => Some("content_tokens_est_total"),
+            Self::ToolCalls => Some("tool_call_count"),
+            Self::PlanCount => Some("plan_message_count"),
+            Self::MessageCount => Some("message_count"),
+            Self::CoveragePct => None, // derived from api_coverage_message_count / message_count
+        }
+    }
+}
+
+impl std::fmt::Display for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiTotal => write!(f, "api_total"),
+            Self::ApiInput => write!(f, "api_input"),
+            Self::ApiOutput => write!(f, "api_output"),
+            Self::CacheRead => write!(f, "cache_read"),
+            Self::CacheCreation => write!(f, "cache_creation"),
+            Self::Thinking => write!(f, "thinking"),
+            Self::ContentEstTotal => write!(f, "content_est_total"),
+            Self::ToolCalls => write!(f, "tool_calls"),
+            Self::PlanCount => write!(f, "plan_count"),
+            Self::CoveragePct => write!(f, "coverage_pct"),
+            Self::MessageCount => write!(f, "message_count"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UsageBucket — the core aggregate row
 // ---------------------------------------------------------------------------
 
@@ -229,6 +317,145 @@ impl TimeseriesResult {
                 "group_by": self.group_by.to_string(),
                 "source_table": self.source_table,
                 "rows_read": self.buckets.len(),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Breakdown result
+// ---------------------------------------------------------------------------
+
+/// A single row in a breakdown query result (one value of the chosen dimension).
+#[derive(Debug, Clone, Serialize)]
+pub struct BreakdownRow {
+    /// The dimension value (agent slug, workspace id, source id, or model family).
+    pub key: String,
+    /// The metric value (SUM of the selected metric column).
+    pub value: i64,
+    /// Message count for this slice (useful for context).
+    pub message_count: i64,
+    /// Full bucket for this slice (available for derived metric computation).
+    pub bucket: UsageBucket,
+}
+
+impl BreakdownRow {
+    /// Produce JSON for CLI output.
+    pub fn to_json(&self) -> serde_json::Value {
+        let derived = super::derive::compute_derived(&self.bucket);
+        serde_json::json!({
+            "key": self.key,
+            "value": self.value,
+            "message_count": self.message_count,
+            "derived": {
+                "api_coverage_pct": derived.api_coverage_pct,
+                "tool_calls_per_1k_api_tokens": derived.tool_calls_per_1k_api_tokens,
+                "plan_message_pct": derived.plan_message_pct,
+            },
+        })
+    }
+}
+
+/// Result of a breakdown query.
+pub struct BreakdownResult {
+    /// Rows ordered by the metric value descending.
+    pub rows: Vec<BreakdownRow>,
+    /// Which dimension was grouped by.
+    pub dim: Dim,
+    /// Which metric was selected.
+    pub metric: Metric,
+    /// Which rollup table was queried.
+    pub source_table: String,
+    /// Query wall-time in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+impl BreakdownResult {
+    /// Produce the CLI-compatible JSON envelope.
+    pub fn to_cli_json(&self) -> serde_json::Value {
+        let rows_json: Vec<serde_json::Value> = self.rows.iter().map(|r| r.to_json()).collect();
+        serde_json::json!({
+            "dim": self.dim.to_string(),
+            "metric": self.metric.to_string(),
+            "rows": rows_json,
+            "row_count": self.rows.len(),
+            "_meta": {
+                "elapsed_ms": self.elapsed_ms,
+                "source_table": self.source_table,
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool report
+// ---------------------------------------------------------------------------
+
+/// A single row in a tool usage report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolRow {
+    /// The agent slug or workspace — dimension key.
+    pub key: String,
+    /// Total tool call count.
+    pub tool_call_count: i64,
+    /// Total message count.
+    pub message_count: i64,
+    /// Total API tokens.
+    pub api_tokens_total: i64,
+    /// Tool calls per 1k API tokens (derived).
+    pub tool_calls_per_1k_api_tokens: Option<f64>,
+    /// Tool calls per 1k content tokens (derived).
+    pub tool_calls_per_1k_content_tokens: Option<f64>,
+}
+
+impl ToolRow {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "key": self.key,
+            "tool_call_count": self.tool_call_count,
+            "message_count": self.message_count,
+            "api_tokens_total": self.api_tokens_total,
+            "tool_calls_per_1k_api_tokens": self.tool_calls_per_1k_api_tokens,
+            "tool_calls_per_1k_content_tokens": self.tool_calls_per_1k_content_tokens,
+        })
+    }
+}
+
+/// Result of a tool usage report query.
+pub struct ToolReport {
+    /// Rows ordered by tool_call_count descending.
+    pub rows: Vec<ToolRow>,
+    /// Totals across all rows.
+    pub total_tool_calls: i64,
+    pub total_messages: i64,
+    pub total_api_tokens: i64,
+    /// Which rollup table was queried.
+    pub source_table: String,
+    /// Query wall-time in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+impl ToolReport {
+    /// Produce the CLI-compatible JSON envelope.
+    pub fn to_cli_json(&self) -> serde_json::Value {
+        let rows_json: Vec<serde_json::Value> = self.rows.iter().map(|r| r.to_json()).collect();
+        let overall_per_1k = if self.total_api_tokens > 0 {
+            Some(self.total_tool_calls as f64 / (self.total_api_tokens as f64 / 1000.0))
+        } else {
+            None
+        };
+        serde_json::json!({
+            "rows": rows_json,
+            "row_count": self.rows.len(),
+            "totals": {
+                "tool_call_count": self.total_tool_calls,
+                "message_count": self.total_messages,
+                "api_tokens_total": self.total_api_tokens,
+                "tool_calls_per_1k_api_tokens": overall_per_1k,
+            },
+            "_meta": {
+                "elapsed_ms": self.elapsed_ms,
+                "source_table": self.source_table,
             }
         })
     }
