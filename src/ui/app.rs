@@ -204,6 +204,10 @@ pub struct ResultItem {
     pub max_width: u16,
     /// Whether the item is queued for multi-open (Ctrl+Enter).
     pub queued: bool,
+    /// Stripe background style for this row (even/odd).
+    pub stripe_style: ftui::Style,
+    /// Agent foreground+background accent style.
+    pub agent_style: ftui::Style,
 }
 
 impl RenderItem for ResultItem {
@@ -220,6 +224,13 @@ impl RenderItem for ResultItem {
             hit.title.trim()
         };
 
+        // Base style: stripe bg unless selected (highlight_style applied by VirtualizedList).
+        let base_style = if selected {
+            self.agent_style
+        } else {
+            self.stripe_style
+        };
+
         // Selection and queue indicator prefix
         let sel_mark = if selected { "\u{25b6} " } else { "  " };
         let queue_mark = if self.queued { "\u{2713}" } else { " " };
@@ -231,14 +242,14 @@ impl RenderItem for ResultItem {
                     "{sel_mark}{queue_mark}{:>2}. {title} [{location}]",
                     self.index
                 );
-                Paragraph::new(&*text).render(area, frame);
+                Paragraph::new(&*text).style(base_style).render(area, frame);
             }
             2 => {
                 // Cozy: title + metadata
                 let line1 = format!("{sel_mark}{queue_mark}{:>2}. {title}", self.index);
                 let line2 = format!("      {location} | {:.1}", hit.score);
                 let text = format!("{line1}\n{line2}");
-                Paragraph::new(&*text).render(area, frame);
+                Paragraph::new(&*text).style(base_style).render(area, frame);
             }
             _ => {
                 // Spacious: title + snippet + metadata
@@ -257,7 +268,7 @@ impl RenderItem for ResultItem {
                 let line2 = format!("      {snip}");
                 let line3 = format!("      {} | {location} | {:.1}", hit.agent, hit.score);
                 let text = format!("{line1}\n{line2}\n{line3}");
-                Paragraph::new(&*text).render(area, frame);
+                Paragraph::new(&*text).style(base_style).render(area, frame);
             }
         }
     }
@@ -572,8 +583,8 @@ impl CassApp {
         styles: &StyleContext,
         pane_style: ftui::Style,
         pane_focused_style: ftui::Style,
-        _row_style: ftui::Style,
-        _row_alt_style: ftui::Style,
+        row_style: ftui::Style,
+        row_alt_style: ftui::Style,
         row_selected_style: ftui::Style,
         text_muted_style: ftui::Style,
     ) {
@@ -606,13 +617,18 @@ impl CassApp {
         let items: Vec<ResultItem> = hits
             .iter()
             .enumerate()
-            .map(|(i, hit)| ResultItem {
-                index: i + 1,
-                hit: hit.clone(),
-                row_height: row_h,
-                even: i % 2 == 0,
-                max_width: inner.width,
-                queued: self.selected.contains(&(self.active_pane, i)),
+            .map(|(i, hit)| {
+                let even = i % 2 == 0;
+                ResultItem {
+                    index: i + 1,
+                    hit: hit.clone(),
+                    row_height: row_h,
+                    even,
+                    max_width: inner.width,
+                    queued: self.selected.contains(&(self.active_pane, i)),
+                    stripe_style: if even { row_style } else { row_alt_style },
+                    agent_style: row_selected_style,
+                }
             })
             .collect();
 
@@ -3599,6 +3615,8 @@ mod tests {
                 even: true,
                 max_width: 80,
                 queued: false,
+                stripe_style: ftui::Style::default(),
+                agent_style: ftui::Style::default(),
             };
             assert_eq!(item.height(), expected, "density {density_h}");
         }
@@ -3752,6 +3770,8 @@ mod tests {
             even: true,
             max_width: 80,
             queued: true,
+            stripe_style: ftui::Style::default(),
+            agent_style: ftui::Style::default(),
         };
         let not_queued = ResultItem {
             index: 1,
@@ -3760,6 +3780,8 @@ mod tests {
             even: true,
             max_width: 80,
             queued: false,
+            stripe_style: ftui::Style::default(),
+            agent_style: ftui::Style::default(),
         };
         assert!(queued_item.queued);
         assert!(!not_queued.queued);
