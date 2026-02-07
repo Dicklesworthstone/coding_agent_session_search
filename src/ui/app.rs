@@ -41,7 +41,9 @@ use crate::ui::components::palette::{PaletteAction, PaletteState, default_action
 use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
 use crate::ui::data::{ConversationView, InputMode};
-use crate::update_check::UpdateInfo;
+use crate::update_check::{UpdateInfo, open_in_browser, skip_version};
+#[cfg(not(test))]
+use crate::update_check::{run_self_update, spawn_update_check};
 use ftui::widgets::Widget;
 use ftui::widgets::block::{Alignment, Block};
 use ftui::widgets::borders::{BorderType, Borders};
@@ -303,6 +305,14 @@ pub struct CassApp {
     pub source_filter_menu_open: bool,
     /// Command palette state.
     pub palette_state: PaletteState,
+    /// Latest update check result (if any).
+    pub update_info: Option<UpdateInfo>,
+    /// Session-only dismissal toggle for update banner.
+    pub update_dismissed: bool,
+    /// Two-step guard: first upgrade request arms, second confirms.
+    pub update_upgrade_armed: bool,
+    /// One-shot update-check receiver started at app initialization.
+    pub update_check_rx: Option<std::sync::mpsc::Receiver<Option<UpdateInfo>>>,
 
     // -- Notifications ----------------------------------------------------
     /// Toast notification manager.
@@ -394,6 +404,19 @@ impl Default for CassApp {
             semantic_availability: SemanticAvailability::NotInstalled,
             source_filter_menu_open: false,
             palette_state: PaletteState::new(default_actions()),
+            update_info: None,
+            update_dismissed: false,
+            update_upgrade_armed: false,
+            update_check_rx: {
+                #[cfg(test)]
+                {
+                    None
+                }
+                #[cfg(not(test))]
+                {
+                    Some(spawn_update_check(env!("CARGO_PKG_VERSION").to_string()))
+                }
+            },
             toast_manager: ToastManager::default(),
             reveal_anim_start: None,
             focus_flash_until: None,
@@ -426,6 +449,25 @@ impl CassApp {
             return pane.hits.get(pane.selected);
         }
         self.results.first()
+    }
+
+    fn update_banner_visible(&self) -> bool {
+        self.update_info
+            .as_ref()
+            .is_some_and(UpdateInfo::should_show)
+            && !self.update_dismissed
+    }
+
+    fn can_handle_update_shortcuts(&self) -> bool {
+        self.update_banner_visible()
+            && self.input_mode == InputMode::Query
+            && !self.show_help
+            && !self.show_detail_modal
+            && !self.show_bulk_modal
+            && !self.show_export_modal
+            && !self.show_consent_dialog
+            && !self.source_filter_menu_open
+            && !self.palette_state.open
     }
 
     /// Render the results list pane with density-aware row heights.
@@ -752,7 +794,9 @@ pub enum CassMsg {
     QueryCleared,
     /// User deleted word-backward (Ctrl+W).
     QueryWordDeleted,
-    /// User requested immediate search (Enter or debounce expired).
+    /// User pressed Enter to submit the query (force immediate search, push to history).
+    QuerySubmitted,
+    /// Search execution requested (Enter or debounce expired).
     SearchRequested,
     /// Async search completed with results.
     SearchCompleted {
@@ -960,6 +1004,8 @@ pub enum CassMsg {
     UpdateUpgradeRequested,
     /// User chose to skip this version.
     UpdateSkipped,
+    /// User chose to view release notes.
+    UpdateReleaseNotesRequested,
     /// User dismissed the update banner.
     UpdateDismissed,
 
@@ -1162,8 +1208,8 @@ pub trait PersistenceService: Send + Sync {
     fn reset(&self) -> Result<(), String>;
 }
 
-const _SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
-const _QUERY_HISTORY_CAP: usize = 50;
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+const QUERY_HISTORY_CAP: usize = 50;
 
 // =========================================================================
 // From<Event> — convert ftui terminal events into CassMsg
@@ -1373,6 +1419,29 @@ impl super::ftui_adapter::Model for CassApp {
             return ftui::Cmd::none();
         }
 
+        // Update banner shortcuts:
+        // - U: upgrade (two-step confirm)
+        // - N: open release notes
+        // - S: skip version
+        // - Esc: dismiss banner for this session
+        if self.can_handle_update_shortcuts() {
+            match &msg {
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("u") => {
+                    return self.update(CassMsg::UpdateUpgradeRequested);
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("n") => {
+                    return self.update(CassMsg::UpdateReleaseNotesRequested);
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("s") => {
+                    return self.update(CassMsg::UpdateSkipped);
+                }
+                CassMsg::QuitRequested => {
+                    return self.update(CassMsg::UpdateDismissed);
+                }
+                _ => {}
+            }
+        }
+
         match msg {
             // -- Terminal event passthrough (unused, events come as CassMsg) ---
             CassMsg::TerminalEvent(_) => ftui::Cmd::none(),
@@ -1386,12 +1455,16 @@ impl super::ftui_adapter::Model for CassApp {
                     self.query.push_str(&text);
                 }
                 self.dirty_since = Some(Instant::now());
-                // TODO(2noh9.3.2): implement debounced search via Cmd::tick
+                // Mark search dirty for debounced dispatch on next Tick
+                self.search_dirty_since = Some(Instant::now());
+                self.history_cursor = None; // reset history nav on new input
                 ftui::Cmd::none()
             }
             CassMsg::QueryCleared => {
                 self.query.clear();
                 self.dirty_since = Some(Instant::now());
+                self.search_dirty_since = Some(Instant::now());
+                self.history_cursor = None;
                 ftui::Cmd::none()
             }
             CassMsg::QueryWordDeleted => {
@@ -1404,10 +1477,45 @@ impl super::ftui_adapter::Model for CassApp {
                     self.query.clear();
                 }
                 self.dirty_since = Some(Instant::now());
+                self.search_dirty_since = Some(Instant::now());
+                self.history_cursor = None;
                 ftui::Cmd::none()
             }
+            CassMsg::QuerySubmitted => {
+                // Enter pressed: push query to history (deduplicated), clear
+                // debounce state, and force immediate search.
+                let q = self.query.trim().to_string();
+                if !q.is_empty() {
+                    // Remove duplicate from history if present
+                    self.query_history.retain(|h| h != &q);
+                    self.query_history.push_front(q);
+                    if self.query_history.len() > QUERY_HISTORY_CAP {
+                        self.query_history.pop_back();
+                    }
+                } else if let Some(prev) = self.query_history.front().cloned() {
+                    // Empty query + history → load most recent query
+                    self.query = prev;
+                }
+                self.history_cursor = None;
+                self.search_dirty_since = None; // cancel pending debounce
+                ftui::Cmd::msg(CassMsg::SearchRequested)
+            }
             CassMsg::SearchRequested => {
-                // TODO: dispatch async search via Cmd::task
+                // Clear debounce state so we don't double-fire.
+                self.search_dirty_since = None;
+                // Build search params from current state.
+                let _params = SearchParams {
+                    query: self.query.clone(),
+                    filters: self.filters.clone(),
+                    mode: self.search_mode,
+                    match_mode: self.match_mode,
+                    ranking: self.ranking_mode,
+                    context_window: self.context_window,
+                    limit: self.per_pane_limit * 10, // fetch enough for pane grouping
+                };
+                // TODO(2noh9.3.2-async): dispatch via Cmd::task when SearchService
+                // is wired to real Tantivy+vector index. For now, this is a no-op
+                // placeholder; results arrive via CassMsg::SearchCompleted.
                 ftui::Cmd::none()
             }
             CassMsg::SearchCompleted {
@@ -1416,11 +1524,39 @@ impl super::ftui_adapter::Model for CassApp {
                 suggestions,
                 wildcard_fallback,
             } => {
-                self.results = hits;
                 self.last_search_ms = Some(elapsed_ms);
                 self.suggestions = suggestions;
                 self.wildcard_fallback = wildcard_fallback;
-                // TODO: rebuild panes from results
+
+                // Group hits by agent slug into per-agent panes.
+                let mut pane_map: std::collections::BTreeMap<String, Vec<SearchHit>> =
+                    std::collections::BTreeMap::new();
+                for hit in &hits {
+                    pane_map
+                        .entry(hit.agent.clone())
+                        .or_default()
+                        .push(hit.clone());
+                }
+                self.panes = pane_map
+                    .into_iter()
+                    .map(|(agent, agent_hits)| {
+                        let total = agent_hits.len();
+                        AgentPane {
+                            agent,
+                            hits: agent_hits,
+                            selected: 0,
+                            total_count: total,
+                        }
+                    })
+                    .collect();
+
+                // Clamp active pane and selection
+                if self.active_pane >= self.panes.len() {
+                    self.active_pane = 0;
+                }
+
+                self.results = hits;
+                self.status = format!("{} results in {}ms", self.results.len(), elapsed_ms);
                 ftui::Cmd::none()
             }
             CassMsg::SearchFailed(err) => {
@@ -1575,6 +1711,11 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Detail view --------------------------------------------------
             CassMsg::DetailOpened => {
+                // Enter is context-dependent: in Query mode, submit the query;
+                // in Results/Detail mode, open the detail modal.
+                if self.input_mode == InputMode::Query && !self.show_detail_modal {
+                    return self.update(CassMsg::QuerySubmitted);
+                }
                 self.show_detail_modal = true;
                 self.detail_scroll = 0;
                 self.modal_scroll = 0;
@@ -1811,7 +1952,27 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     Some(PaletteAction::ToggleHelpStrip) => ftui::Cmd::msg(CassMsg::HelpPinToggled),
                     Some(PaletteAction::OpenUpdateBanner) => {
-                        // TODO: show update assistant UI
+                        if let Some(info) = &self.update_info {
+                            if info.should_show() {
+                                self.update_dismissed = false;
+                                self.update_upgrade_armed = false;
+                                self.status = format!(
+                                    "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
+                                    info.current_version, info.latest_version
+                                );
+                            } else if info.is_skipped {
+                                self.status = format!(
+                                    "v{} is currently skipped. Clear update_state.json to re-enable prompts.",
+                                    info.latest_version
+                                );
+                            } else {
+                                self.status = "You're on the latest version.".to_string();
+                            }
+                        } else {
+                            self.status =
+                                "No update information available yet. Check again shortly."
+                                    .to_string();
+                        }
                         ftui::Cmd::none()
                     }
                     Some(PaletteAction::FilterAgent) => {
@@ -1950,12 +2111,111 @@ impl super::ftui_adapter::Model for CassApp {
             }
 
             // -- Update assistant ---------------------------------------------
-            CassMsg::UpdateCheckCompleted(_info) => {
-                // TODO: show update banner
+            CassMsg::UpdateCheckCompleted(info) => {
+                let should_show = info.should_show();
+                let latest = info.latest_version.clone();
+                let current = info.current_version.clone();
+                let skipped = info.is_skipped;
+                self.update_info = Some(info);
+                self.update_upgrade_armed = false;
+                if should_show {
+                    self.update_dismissed = false;
+                    self.status = format!(
+                        "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
+                        current, latest
+                    );
+                } else if skipped {
+                    self.status = format!(
+                        "Update v{} is skipped (open palette: Check updates for details).",
+                        latest
+                    );
+                }
                 ftui::Cmd::none()
             }
-            CassMsg::UpdateUpgradeRequested | CassMsg::UpdateSkipped | CassMsg::UpdateDismissed => {
-                // TODO: handle update actions
+            CassMsg::UpdateUpgradeRequested => {
+                if let Some(info) = &self.update_info {
+                    if !info.should_show() {
+                        self.status = "You're on the latest version.".to_string();
+                        self.update_upgrade_armed = false;
+                        return ftui::Cmd::none();
+                    }
+                    if !self.update_upgrade_armed {
+                        self.update_upgrade_armed = true;
+                        self.status = format!(
+                            "Confirm upgrade to v{}: press U again. Esc cancels.",
+                            info.latest_version
+                        );
+                        return ftui::Cmd::none();
+                    }
+                    self.update_upgrade_armed = false;
+                    #[cfg(test)]
+                    {
+                        self.status = format!(
+                            "TEST mode: would launch self-update to v{}.",
+                            info.latest_version
+                        );
+                        ftui::Cmd::none()
+                    }
+                    #[cfg(not(test))]
+                    {
+                        self.status =
+                            format!("Launching installer for v{}...", info.latest_version);
+                        run_self_update(&info.tag_name);
+                    }
+                } else {
+                    self.status = "No update information available yet.".to_string();
+                    self.update_upgrade_armed = false;
+                    ftui::Cmd::none()
+                }
+            }
+            CassMsg::UpdateSkipped => {
+                self.update_upgrade_armed = false;
+                if let Some(info) = &self.update_info {
+                    if !info.should_show() {
+                        self.status = "Nothing to skip: no pending update.".to_string();
+                        return ftui::Cmd::none();
+                    }
+                    if cfg!(test) {
+                        self.update_dismissed = true;
+                        self.status = format!(
+                            "Skipped v{} (test mode, not persisted).",
+                            info.latest_version
+                        );
+                    } else if let Err(e) = skip_version(&info.latest_version) {
+                        self.status = format!("Failed to skip v{}: {e}", info.latest_version);
+                    } else {
+                        self.update_dismissed = true;
+                        self.status = format!("Skipped v{}.", info.latest_version);
+                    }
+                } else {
+                    self.status = "No update information available yet.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::UpdateReleaseNotesRequested => {
+                if let Some(info) = &self.update_info {
+                    if !info.should_show() {
+                        self.status = "You're on the latest version.".to_string();
+                        return ftui::Cmd::none();
+                    }
+                    match open_in_browser(&info.release_url) {
+                        Ok(()) => {
+                            self.status =
+                                format!("Opened release notes for v{}.", info.latest_version);
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to open release notes: {e}");
+                        }
+                    }
+                } else {
+                    self.status = "No update information available yet.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::UpdateDismissed => {
+                self.update_dismissed = true;
+                self.update_upgrade_armed = false;
+                self.status = "Update banner dismissed for this session.".to_string();
                 ftui::Cmd::none()
             }
 
@@ -2097,7 +2357,41 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.peek_badge_until.is_some_and(|t| Instant::now() > t) {
                     self.peek_badge_until = None;
                 }
-                ftui::Cmd::msg(CassMsg::ToastTick)
+                // Poll update-check channel once per tick.
+                let mut update_check_done = false;
+                let mut update_info_ready: Option<UpdateInfo> = None;
+                if let Some(rx) = self.update_check_rx.as_ref() {
+                    match rx.try_recv() {
+                        Ok(info) => {
+                            update_check_done = true;
+                            update_info_ready = info;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            update_check_done = true;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+                if update_check_done {
+                    self.update_check_rx = None;
+                }
+
+                let mut cmds = Vec::new();
+                if let Some(info) = update_info_ready {
+                    cmds.push(ftui::Cmd::msg(CassMsg::UpdateCheckCompleted(info)));
+                }
+                // Debounced search-as-you-type: fire SearchRequested once the
+                // debounce window (60ms) has elapsed since the last query change.
+                if let Some(dirty_ts) = self.search_dirty_since
+                    && dirty_ts.elapsed() >= SEARCH_DEBOUNCE
+                {
+                    cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                }
+                cmds.push(ftui::Cmd::msg(CassMsg::ToastTick));
+                if cmds.len() == 1 {
+                    return cmds.remove(0);
+                }
+                ftui::Cmd::batch(cmds)
             }
             CassMsg::MouseEvent { kind, x: _, y: _ } => {
                 // TODO: hit-test against last_pane_rects / last_pill_rects
@@ -2191,9 +2485,42 @@ impl super::ftui_adapter::Model for CassApp {
         let row_alt_style = styles.style(style_system::STYLE_RESULT_ROW_ALT);
         let row_selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
         let text_muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let warning_style = styles.style(style_system::STYLE_STATUS_WARNING);
+        let danger_style = styles.style(style_system::STYLE_STATUS_ERROR);
 
         // Paint root background across the entire terminal.
         Block::new().style(root_style).render(area, frame);
+
+        // Optional update banner shown as top strip.
+        let mut layout_area = area;
+        if self.update_banner_visible()
+            && area.height >= 2
+            && let Some(info) = self.update_info.as_ref()
+        {
+            let banner_area = Rect::new(area.x, area.y, area.width, 1);
+            let mut banner_text = if self.update_upgrade_armed {
+                format!(
+                    "Update v{} -> v{} | Press U again to confirm upgrade | N notes | S skip | Esc dismiss",
+                    info.current_version, info.latest_version
+                )
+            } else {
+                format!(
+                    "Update v{} -> v{} | U upgrade | N notes | S skip | Esc dismiss",
+                    info.current_version, info.latest_version
+                )
+            };
+            if banner_text.len() > banner_area.width as usize {
+                banner_text.truncate(banner_area.width as usize);
+            }
+            Paragraph::new(&*banner_text)
+                .style(if self.update_upgrade_armed {
+                    danger_style
+                } else {
+                    warning_style
+                })
+                .render(banner_area, frame);
+            layout_area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        }
 
         // ── Main vertical split: search bar | content | status ──────────
         let vertical = Flex::vertical()
@@ -2202,7 +2529,7 @@ impl super::ftui_adapter::Model for CassApp {
                 Constraint::Min(4),   // Content area (results + detail)
                 Constraint::Fixed(1), // Status footer
             ])
-            .split(area);
+            .split(layout_area);
 
         // ── Search bar ──────────────────────────────────────────────────
         let query_title = format!(
@@ -2402,6 +2729,7 @@ pub fn run_tui_ftui() -> anyhow::Result<()> {
 // =========================================================================
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -2540,6 +2868,26 @@ mod tests {
         match cmd {
             ftui::Cmd::Msg(m) => Some(m),
             _ => None,
+        }
+    }
+
+    /// Extract all immediate messages from a command (including one level of batch).
+    fn extract_msgs(cmd: ftui::Cmd<CassMsg>) -> Vec<CassMsg> {
+        match cmd {
+            ftui::Cmd::Msg(m) => vec![m],
+            ftui::Cmd::Batch(cmds) => cmds.into_iter().filter_map(extract_msg).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn sample_update_info() -> UpdateInfo {
+        UpdateInfo {
+            latest_version: "9.9.9".to_string(),
+            tag_name: "v9.9.9".to_string(),
+            current_version: "1.0.0".to_string(),
+            release_url: "https://example.com/releases/v9.9.9".to_string(),
+            is_newer: true,
+            is_skipped: false,
         }
     }
 
@@ -2726,5 +3074,332 @@ mod tests {
             app.saved_views.iter().any(|v| v.slot == 1),
             "slot 1 should be saved"
         );
+    }
+
+    // ==================== Search bar UX tests (2noh9.3.2) ====================
+
+    #[test]
+    fn query_changed_appends_characters() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::QueryChanged("h".into()));
+        let _ = app.update(CassMsg::QueryChanged("e".into()));
+        let _ = app.update(CassMsg::QueryChanged("l".into()));
+        assert_eq!(app.query, "hel");
+    }
+
+    #[test]
+    fn query_changed_backspace_removes_char() {
+        let mut app = CassApp::default();
+        app.query = "hello".to_string();
+        let _ = app.update(CassMsg::QueryChanged(String::new())); // backspace
+        assert_eq!(app.query, "hell");
+    }
+
+    #[test]
+    fn query_changed_sets_search_dirty() {
+        let mut app = CassApp::default();
+        assert!(app.search_dirty_since.is_none());
+        let _ = app.update(CassMsg::QueryChanged("a".into()));
+        assert!(app.search_dirty_since.is_some());
+    }
+
+    #[test]
+    fn query_cleared_empties_and_marks_dirty() {
+        let mut app = CassApp::default();
+        app.query = "hello world".to_string();
+        let _ = app.update(CassMsg::QueryCleared);
+        assert!(app.query.is_empty());
+        assert!(app.search_dirty_since.is_some());
+    }
+
+    #[test]
+    fn query_word_deleted_removes_last_word() {
+        let mut app = CassApp::default();
+        app.query = "hello world".to_string();
+        let _ = app.update(CassMsg::QueryWordDeleted);
+        assert_eq!(app.query, "hello ");
+    }
+
+    #[test]
+    fn query_word_deleted_single_word_clears() {
+        let mut app = CassApp::default();
+        app.query = "hello".to_string();
+        let _ = app.update(CassMsg::QueryWordDeleted);
+        assert!(app.query.is_empty());
+    }
+
+    #[test]
+    fn query_submitted_pushes_to_history() {
+        let mut app = CassApp::default();
+        app.query = "authentication error".to_string();
+        let cmd = app.update(CassMsg::QuerySubmitted);
+        assert_eq!(app.query_history.front().unwrap(), "authentication error");
+        // Should produce SearchRequested
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn query_submitted_deduplicates_history() {
+        let mut app = CassApp::default();
+        app.query = "auth".to_string();
+        let _ = app.update(CassMsg::QuerySubmitted);
+        app.query = "db error".to_string();
+        let _ = app.update(CassMsg::QuerySubmitted);
+        app.query = "auth".to_string();
+        let _ = app.update(CassMsg::QuerySubmitted);
+        // "auth" should appear only once, at the front
+        assert_eq!(app.query_history.len(), 2);
+        assert_eq!(app.query_history[0], "auth");
+        assert_eq!(app.query_history[1], "db error");
+    }
+
+    #[test]
+    fn query_submitted_empty_loads_recent_history() {
+        let mut app = CassApp::default();
+        app.query_history.push_front("previous query".to_string());
+        app.query.clear();
+        let _ = app.update(CassMsg::QuerySubmitted);
+        assert_eq!(app.query, "previous query");
+    }
+
+    #[test]
+    fn search_completed_groups_into_panes() {
+        let mut app = CassApp::default();
+        let hits = vec![
+            SearchHit {
+                agent: "claude_code".into(),
+                title: "Session 1".into(),
+                snippet: "test".into(),
+                content: "test content".into(),
+                content_hash: 0,
+                score: 1.0,
+                source_path: "/a".into(),
+                workspace: "/w".into(),
+                workspace_original: None,
+                created_at: Some(1000),
+                line_number: Some(1),
+                match_type: Default::default(),
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+            },
+            SearchHit {
+                agent: "codex".into(),
+                title: "Session 2".into(),
+                snippet: "test".into(),
+                content: "test content 2".into(),
+                content_hash: 1,
+                score: 0.9,
+                source_path: "/b".into(),
+                workspace: "/w".into(),
+                workspace_original: None,
+                created_at: Some(2000),
+                line_number: Some(5),
+                match_type: Default::default(),
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+            },
+            SearchHit {
+                agent: "claude_code".into(),
+                title: "Session 3".into(),
+                snippet: "test".into(),
+                content: "test content 3".into(),
+                content_hash: 2,
+                score: 0.8,
+                source_path: "/c".into(),
+                workspace: "/w".into(),
+                workspace_original: None,
+                created_at: Some(3000),
+                line_number: Some(10),
+                match_type: Default::default(),
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+            },
+        ];
+        let _ = app.update(CassMsg::SearchCompleted {
+            hits,
+            elapsed_ms: 42,
+            suggestions: vec![],
+            wildcard_fallback: false,
+        });
+        assert_eq!(app.panes.len(), 2, "should have 2 agent panes");
+        // BTreeMap ordering: claude_code before codex
+        assert_eq!(app.panes[0].agent, "claude_code");
+        assert_eq!(app.panes[0].hits.len(), 2);
+        assert_eq!(app.panes[1].agent, "codex");
+        assert_eq!(app.panes[1].hits.len(), 1);
+        assert_eq!(app.results.len(), 3);
+        assert_eq!(app.last_search_ms, Some(42));
+        assert!(app.status.contains("3 results"));
+    }
+
+    #[test]
+    fn search_requested_clears_dirty_state() {
+        let mut app = CassApp::default();
+        app.search_dirty_since = Some(Instant::now());
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(app.search_dirty_since.is_none());
+    }
+
+    #[test]
+    fn history_navigation_traverses_entries() {
+        let mut app = CassApp::default();
+        app.query_history.push_front("third".to_string());
+        app.query_history.push_front("second".to_string());
+        app.query_history.push_front("first".to_string());
+        // Navigate forward through history (Ctrl+N)
+        let _ = app.update(CassMsg::HistoryNavigated { forward: true });
+        assert_eq!(app.query, "second");
+        let _ = app.update(CassMsg::HistoryNavigated { forward: true });
+        assert_eq!(app.query, "third");
+        // Navigate back (Ctrl+P)
+        let _ = app.update(CassMsg::HistoryNavigated { forward: false });
+        assert_eq!(app.query, "second");
+    }
+
+    #[test]
+    fn enter_in_query_mode_submits_search() {
+        let mut app = CassApp::default();
+        app.query = "test query".to_string();
+        app.input_mode = InputMode::Query;
+        // DetailOpened (Enter key) in query mode should route to QuerySubmitted
+        let cmd = app.update(CassMsg::DetailOpened);
+        // Should have pushed to history via QuerySubmitted
+        assert_eq!(app.query_history.front().unwrap(), "test query");
+        // Returns SearchRequested
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn enter_with_detail_modal_opens_detail() {
+        let mut app = CassApp::default();
+        app.input_mode = InputMode::Query;
+        app.show_detail_modal = true; // already in detail
+        let _ = app.update(CassMsg::DetailOpened);
+        // Should still be in detail modal (didn't redirect to search)
+        assert!(app.show_detail_modal);
+    }
+
+    #[test]
+    fn debounce_fires_search_after_elapsed() {
+        let mut app = CassApp::default();
+        // Set search_dirty_since to well past the debounce threshold
+        app.search_dirty_since = Some(Instant::now() - std::time::Duration::from_millis(100));
+        let cmd = app.update(CassMsg::Tick);
+        // Should have fired SearchRequested via batch
+        // After tick, search_dirty_since should be cleared by SearchRequested
+        // The batch contains SearchRequested + ToastTick
+        assert!(
+            matches!(cmd, ftui::Cmd::Batch(_)),
+            "tick should return batch with SearchRequested when debounce elapsed"
+        );
+    }
+
+    #[test]
+    fn debounce_does_not_fire_before_threshold() {
+        let mut app = CassApp::default();
+        // Set search_dirty_since to just now (within debounce window)
+        app.search_dirty_since = Some(Instant::now());
+        let cmd = app.update(CassMsg::Tick);
+        // Should NOT have fired SearchRequested - just ToastTick
+        assert!(
+            matches!(cmd, ftui::Cmd::Msg(_)),
+            "tick should return single Msg (ToastTick) when debounce not elapsed"
+        );
+    }
+
+    #[test]
+    fn query_changed_resets_history_cursor() {
+        let mut app = CassApp::default();
+        app.history_cursor = Some(2);
+        let _ = app.update(CassMsg::QueryChanged("x".into()));
+        assert!(app.history_cursor.is_none());
+    }
+
+    // ==================== Update assistant tests ====================
+
+    #[test]
+    fn update_check_completed_sets_banner_state() {
+        let mut app = CassApp::default();
+        assert!(!app.update_banner_visible());
+        let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
+        assert!(app.update_banner_visible());
+        assert!(!app.update_dismissed);
+        assert!(!app.update_upgrade_armed);
+        assert!(app.status.contains("Update available"));
+    }
+
+    #[test]
+    fn update_dismiss_hides_banner() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
+        assert!(app.update_banner_visible());
+        let _ = app.update(CassMsg::UpdateDismissed);
+        assert!(!app.update_banner_visible());
+        assert!(app.update_dismissed);
+        assert!(!app.update_upgrade_armed);
+    }
+
+    #[test]
+    fn update_upgrade_requires_double_confirm() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
+
+        let _ = app.update(CassMsg::UpdateUpgradeRequested);
+        assert!(app.update_upgrade_armed);
+        assert!(app.status.contains("Confirm upgrade"));
+
+        let _ = app.update(CassMsg::UpdateUpgradeRequested);
+        assert!(!app.update_upgrade_armed);
+        assert!(app.status.contains("TEST mode: would launch self-update"));
+    }
+
+    #[test]
+    fn tick_polls_update_channel_and_dispatches_completion() {
+        let mut app = CassApp::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(sample_update_info()))
+            .expect("send update info to test channel");
+        app.update_check_rx = Some(rx);
+
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        let mut completed_info: Option<UpdateInfo> = None;
+        for msg in msgs {
+            match msg {
+                CassMsg::UpdateCheckCompleted(info) => completed_info = Some(info),
+                CassMsg::ToastTick => {}
+                _ => {}
+            }
+        }
+
+        assert!(
+            completed_info.is_some(),
+            "tick should dispatch update completion"
+        );
+        assert!(app.update_check_rx.is_none(), "receiver should be consumed");
+
+        if let Some(info) = completed_info {
+            let _ = app.update(CassMsg::UpdateCheckCompleted(info));
+        }
+        assert!(app.update_banner_visible());
+    }
+
+    #[test]
+    fn update_shortcuts_intercept_query_when_banner_visible() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
+
+        let _ = app.update(CassMsg::QueryChanged("u".to_string()));
+        assert!(app.update_upgrade_armed);
+        assert!(app.query.is_empty(), "shortcut should not edit query text");
+
+        let _ = app.update(CassMsg::QueryChanged("s".to_string()));
+        assert!(
+            app.update_dismissed,
+            "skip should dismiss banner in test mode"
+        );
+        assert!(!app.update_upgrade_armed);
     }
 }
