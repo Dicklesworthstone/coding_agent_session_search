@@ -829,6 +829,13 @@ pub enum FocusRegion {
 /// - **Wide**: Spacious dual-pane. Extra width used for wider result columns and
 ///   full detail formatting. Split handle draggable within 25–75% range.
 ///
+/// # Ultra-narrow fallback
+///
+/// Below `ULTRA_NARROW_MIN_WIDTH` (30) or `ULTRA_NARROW_MIN_HEIGHT` (6), the
+/// full UI is not rendered. Instead, a compact "terminal too small" message is
+/// shown. This prevents layout panics and unreadable content at degenerate
+/// sizes (e.g., 10x3). See [`LayoutBreakpoint::is_ultra_narrow`].
+///
 /// # Analytics surface notes
 ///
 /// Analytics view content areas do NOT consume `LayoutBreakpoint` — each view
@@ -874,6 +881,14 @@ pub struct AnalyticsTopology {
     pub show_footer_hints: bool,
 }
 
+/// Ultra-narrow fallback policy constants.
+///
+/// When the terminal is smaller than these minimums, we show a compact
+/// fallback message instead of attempting to render the full UI. This
+/// prevents layout panics, empty renders, and unreadable content.
+pub const ULTRA_NARROW_MIN_WIDTH: u16 = 30;
+pub const ULTRA_NARROW_MIN_HEIGHT: u16 = 6;
+
 impl LayoutBreakpoint {
     /// Classify from terminal width.
     pub fn from_width(cols: u16) -> Self {
@@ -886,6 +901,14 @@ impl LayoutBreakpoint {
         } else {
             Self::Narrow
         }
+    }
+
+    /// Check whether the given dimensions are below the ultra-narrow threshold.
+    ///
+    /// When true, the UI should render a minimal fallback instead of the full
+    /// surface. This prevents empty/broken layouts at very constrained sizes.
+    pub fn is_ultra_narrow(width: u16, height: u16) -> bool {
+        width < ULTRA_NARROW_MIN_WIDTH || height < ULTRA_NARROW_MIN_HEIGHT
     }
 
     /// Return the search surface topology contract for this breakpoint.
@@ -9678,6 +9701,27 @@ impl super::ftui_adapter::Model for CassApp {
             return;
         }
 
+        // Ultra-narrow fallback: show a compact message for terminals too
+        // small to render any meaningful UI. Prevents layout panics and
+        // unreadable content at degenerate sizes.
+        if LayoutBreakpoint::is_ultra_narrow(area.width, area.height) {
+            let msg: &str = if area.width >= 20 {
+                "cass: terminal too small"
+            } else if area.width >= 10 {
+                "resize terminal"
+            } else {
+                "~"
+            };
+            let y = area.height / 2;
+            if y < area.height {
+                // Paragraph handles overflow/truncation internally, so we
+                // can pass the full message and let it clip to the area.
+                Paragraph::new(msg)
+                    .render(Rect::new(area.x, area.y + y, area.width, 1), frame);
+            }
+            return;
+        }
+
         let degradation = frame.degradation;
 
         let breakpoint = LayoutBreakpoint::from_width(area.width);
@@ -15158,6 +15202,61 @@ mod tests {
         assert!(
             app.last_detail_area.borrow().is_none(),
             "narrow layout should not render detail when results are focused"
+        );
+    }
+
+    // =====================================================================
+    // 1mfw3.4.4 — Ultra-narrow fallback
+    // =====================================================================
+
+    #[test]
+    fn ultra_narrow_threshold() {
+        assert!(LayoutBreakpoint::is_ultra_narrow(29, 10));
+        assert!(LayoutBreakpoint::is_ultra_narrow(50, 5));
+        assert!(LayoutBreakpoint::is_ultra_narrow(10, 3));
+        assert!(!LayoutBreakpoint::is_ultra_narrow(30, 6));
+        assert!(!LayoutBreakpoint::is_ultra_narrow(80, 24));
+    }
+
+    #[test]
+    fn ultra_narrow_render_no_panic() {
+        use ftui_harness::buffer_to_text;
+        // Very small terminal should render fallback message, not panic
+        for (w, h) in [(10, 3), (20, 5), (25, 4), (5, 2), (1, 1)] {
+            let app = CassApp::default();
+            let buf =
+                render_at_degradation(&app, w, h, ftui::render::budget::DegradationLevel::Full);
+            let text = buffer_to_text(&buf);
+            // Should NOT contain search bar or status footer chrome
+            assert!(
+                !text.contains("cass analytics"),
+                "ultra-narrow at {w}x{h} should not show analytics chrome"
+            );
+        }
+    }
+
+    #[test]
+    fn ultra_narrow_shows_resize_hint() {
+        use ftui_harness::buffer_to_text;
+        let app = CassApp::default();
+        let buf = render_at_degradation(&app, 25, 5, ftui::render::budget::DegradationLevel::Full);
+        let text = buffer_to_text(&buf);
+        assert!(
+            text.contains("too small") || text.contains("resize"),
+            "ultra-narrow should show resize hint, got: {text}"
+        );
+    }
+
+    #[test]
+    fn normal_size_not_ultra_narrow() {
+        use ftui_harness::buffer_to_text;
+        let app = CassApp::default();
+        let buf = render_at_degradation(&app, 80, 24, ftui::render::budget::DegradationLevel::Full);
+        let text = buffer_to_text(&buf);
+        // Normal terminal should show the app chrome, not the fallback
+        assert!(
+            text.contains("cass"),
+            "normal size should render full UI with app name"
         );
     }
 
