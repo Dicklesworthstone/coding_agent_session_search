@@ -333,7 +333,7 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -408,7 +408,7 @@ fn check_schema_compatibility(path: &Path) -> std::result::Result<SchemaCheck, r
     }
 }
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const MIGRATION_V1: &str = r"
 PRAGMA foreign_keys = ON;
@@ -950,6 +950,15 @@ CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family,
 CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
 CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
+";
+
+const MIGRATION_V13: &str = r"
+-- Add plan-attributed token rollups to usage tables.
+ALTER TABLE usage_hourly ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_hourly ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE usage_daily ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_daily ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Row from the embedding_jobs table.
@@ -1575,6 +1584,8 @@ pub struct UsageRollupDelta {
     pub assistant_message_count: i64,
     pub tool_call_count: i64,
     pub plan_message_count: i64,
+    pub plan_content_tokens_est_total: i64,
+    pub plan_api_tokens_total: i64,
     pub api_coverage_message_count: i64,
     pub content_tokens_est_total: i64,
     pub content_tokens_est_user: i64,
@@ -1668,6 +1679,10 @@ impl AnalyticsRollupAggregator {
             d.tool_call_count += entry.tool_call_count;
             if entry.has_plan {
                 d.plan_message_count += 1;
+                d.plan_content_tokens_est_total += content_est;
+                if is_api {
+                    d.plan_api_tokens_total += api_total;
+                }
             }
             if is_api {
                 d.api_coverage_message_count += 1;
@@ -1702,6 +1717,10 @@ impl AnalyticsRollupAggregator {
         d.tool_call_count += entry.tool_call_count;
         if entry.has_plan {
             d.plan_message_count += 1;
+            d.plan_content_tokens_est_total += content_est;
+            if is_api {
+                d.plan_api_tokens_total += api_total;
+            }
         }
         if is_api {
             d.api_coverage_message_count += 1;
@@ -1732,25 +1751,96 @@ impl AnalyticsRollupAggregator {
     }
 }
 
-/// Cheap heuristic to detect "plan" messages (phase 1).
-/// Returns true if the content looks like it contains a structured plan.
+/// Whether the current role should be considered for plan attribution.
+///
+/// Plan attribution v2 defaults to assistant/agent messages only.
+fn has_plan_for_role(role: &str, content: &str) -> bool {
+    let role = role.trim();
+    (role.eq_ignore_ascii_case("assistant") || role.eq_ignore_ascii_case("agent"))
+        && has_plan_heuristic(content)
+}
+
+/// Heuristic to detect "plan" messages.
+///
+/// v2 behavior:
+/// - Require an explicit plan marker near the top of the message.
+/// - Require structured steps (numbered or bullets) to reduce false positives.
+/// - Avoid classifying tool-output blobs as plans.
 fn has_plan_heuristic(content: &str) -> bool {
-    if content.len() < 20 {
+    if content.len() < 24 {
         return false;
     }
-    // Check for plan headers
+
     let lower = content.to_lowercase();
-    if lower.contains("## plan") || lower.contains("# plan") {
-        return true;
-    }
-    // Check for "Plan:" followed by numbered steps
-    if let Some(plan_pos) = lower.find("plan:") {
-        let after = &content[plan_pos + 5..];
-        if after.contains("1.") || after.contains("1)") {
-            return true;
+
+    // Ignore tool-output-like blobs unless they also have a strong plan header.
+    let looks_like_tool_blob = lower.contains("```")
+        || lower.contains("\"tool\"")
+        || lower.contains("stdout:")
+        || lower.contains("stderr:")
+        || lower.contains("exit code:");
+
+    let mut lines: Vec<&str> = Vec::with_capacity(60);
+    let mut in_fenced_code = false;
+    for raw in lower.lines() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            in_fenced_code = !in_fenced_code;
+            continue;
+        }
+        if in_fenced_code || line.is_empty() {
+            continue;
+        }
+        lines.push(line);
+        if lines.len() >= 60 {
+            break;
         }
     }
-    false
+
+    let header_pos = lines.iter().position(|line| {
+        line.starts_with("## plan")
+            || line.starts_with("# plan")
+            || line.starts_with("plan:")
+            || line.starts_with("implementation plan")
+            || line.starts_with("next steps:")
+            || line.starts_with("action plan:")
+    });
+    let preview_top = lines.iter().take(8).copied().collect::<Vec<_>>().join("\n");
+    let header_near_top = header_pos.is_some_and(|idx| idx <= 6) || preview_top.contains("plan:");
+
+    if !header_near_top {
+        return false;
+    }
+    if looks_like_tool_blob && header_pos.is_none() {
+        return false;
+    }
+
+    let numbered_steps = lines
+        .iter()
+        .filter(|line| is_numbered_step_line(line))
+        .count();
+    let bullet_steps = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.starts_with("+ ")
+                || line.starts_with("- [ ] ")
+                || line.starts_with("- [x] ")
+        })
+        .count();
+
+    numbered_steps >= 2 || (numbered_steps >= 1 && bullet_steps >= 1) || bullet_steps >= 3
+}
+
+fn is_numbered_step_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 || digit_count > 3 {
+        return false;
+    }
+    let rest = &trimmed[digit_count..];
+    rest.starts_with(". ") || rest.starts_with(") ")
 }
 
 /// Pending token_usage row to be batch-inserted.
@@ -2266,6 +2356,7 @@ impl SqliteStorage {
                     let content_chars = msg.content.len() as i64;
                     let content_tokens_est = content_chars / 4;
                     let msg_hour_id = SqliteStorage::hour_id_from_millis(msg_ts);
+                    let has_plan = has_plan_for_role(&role_s, &msg.content);
 
                     // Build token_usage row
                     token_entries.push(TokenUsageEntry {
@@ -2320,7 +2411,7 @@ impl SqliteStorage {
                         api_data_source: usage.data_source.as_str().to_string(),
                         tool_call_count: usage.tool_call_count as i64,
                         has_tool_calls: usage.has_tool_calls,
-                        has_plan: has_plan_heuristic(&msg.content),
+                        has_plan,
                     };
                     rollup_agg.record(&mm);
                     metrics_entries.push(mm);
@@ -3217,7 +3308,7 @@ impl SqliteStorage {
                     api_data_source: usage.data_source.as_str().to_string(),
                     tool_call_count: usage.tool_call_count as i64,
                     has_tool_calls: usage.has_tool_calls,
-                    has_plan: has_plan_heuristic(content),
+                    has_plan: has_plan_for_role(role, content),
                 });
             }
 
@@ -3247,7 +3338,8 @@ impl SqliteStorage {
                 "INSERT INTO usage_hourly (
                     hour_id, agent_slug, workspace_id, source_id,
                     message_count, user_message_count, assistant_message_count,
-                    tool_call_count, plan_message_count, api_coverage_message_count,
+                    tool_call_count, plan_message_count, plan_content_tokens_est_total,
+                    plan_api_tokens_total, api_coverage_message_count,
                     content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
                     api_tokens_total, api_input_tokens_total, api_output_tokens_total,
                     api_cache_read_tokens_total, api_cache_creation_tokens_total,
@@ -3260,6 +3352,18 @@ impl SqliteStorage {
                     SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
                     SUM(tool_call_count),
                     SUM(has_plan),
+                    SUM(CASE WHEN has_plan = 1 THEN content_tokens_est ELSE 0 END),
+                    SUM(
+                        CASE
+                            WHEN has_plan = 1 AND api_data_source = 'api'
+                                THEN COALESCE(api_input_tokens, 0)
+                                    + COALESCE(api_output_tokens, 0)
+                                    + COALESCE(api_cache_read_tokens, 0)
+                                    + COALESCE(api_cache_creation_tokens, 0)
+                                    + COALESCE(api_thinking_tokens, 0)
+                            ELSE 0
+                        END
+                    ),
                     SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
                     SUM(content_tokens_est),
                     SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
@@ -3282,7 +3386,8 @@ impl SqliteStorage {
                 "INSERT INTO usage_daily (
                     day_id, agent_slug, workspace_id, source_id,
                     message_count, user_message_count, assistant_message_count,
-                    tool_call_count, plan_message_count, api_coverage_message_count,
+                    tool_call_count, plan_message_count, plan_content_tokens_est_total,
+                    plan_api_tokens_total, api_coverage_message_count,
                     content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
                     api_tokens_total, api_input_tokens_total, api_output_tokens_total,
                     api_cache_read_tokens_total, api_cache_creation_tokens_total,
@@ -3295,6 +3400,18 @@ impl SqliteStorage {
                     SUM(CASE WHEN role IN ('assistant', 'agent') THEN 1 ELSE 0 END),
                     SUM(tool_call_count),
                     SUM(has_plan),
+                    SUM(CASE WHEN has_plan = 1 THEN content_tokens_est ELSE 0 END),
+                    SUM(
+                        CASE
+                            WHEN has_plan = 1 AND api_data_source = 'api'
+                                THEN COALESCE(api_input_tokens, 0)
+                                    + COALESCE(api_output_tokens, 0)
+                                    + COALESCE(api_cache_read_tokens, 0)
+                                    + COALESCE(api_cache_creation_tokens, 0)
+                                    + COALESCE(api_thinking_tokens, 0)
+                            ELSE 0
+                        END
+                    ),
                     SUM(CASE WHEN api_data_source = 'api' THEN 1 ELSE 0 END),
                     SUM(content_tokens_est),
                     SUM(CASE WHEN role = 'user' THEN content_tokens_est ELSE 0 END),
@@ -3902,7 +4019,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         11 => {
             tx.execute_batch(MIGRATION_V12)?;
         }
+        12 => {}
         v => return Err(anyhow!("unsupported schema version {v}")),
+    }
+
+    if current < 13 {
+        tx.execute_batch(MIGRATION_V13)?;
     }
 
     tx.execute(
@@ -4623,7 +4745,7 @@ fn flush_rollup_table(
         return Ok(0);
     }
 
-    // 20 params per row → ~49 rows max, use 30 for safety
+    // 22 params per row → ~44 rows max, use 30 for safety
     const BATCH_SIZE: usize = 30;
     let mut total_affected = 0;
 
@@ -4631,7 +4753,7 @@ fn flush_rollup_table(
 
     for chunk in entries.chunks(BATCH_SIZE) {
         let placeholders: String = (0..chunk.len())
-            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .map(|_| "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -4639,7 +4761,8 @@ fn flush_rollup_table(
             "INSERT INTO {table} (
                 {bucket_col}, agent_slug, workspace_id, source_id,
                 message_count, user_message_count, assistant_message_count,
-                tool_call_count, plan_message_count, api_coverage_message_count,
+                tool_call_count, plan_message_count, plan_content_tokens_est_total,
+                plan_api_tokens_total, api_coverage_message_count,
                 content_tokens_est_total, content_tokens_est_user, content_tokens_est_assistant,
                 api_tokens_total, api_input_tokens_total, api_output_tokens_total,
                 api_cache_read_tokens_total, api_cache_creation_tokens_total,
@@ -4652,6 +4775,8 @@ fn flush_rollup_table(
                 assistant_message_count = assistant_message_count + excluded.assistant_message_count,
                 tool_call_count = tool_call_count + excluded.tool_call_count,
                 plan_message_count = plan_message_count + excluded.plan_message_count,
+                plan_content_tokens_est_total = plan_content_tokens_est_total + excluded.plan_content_tokens_est_total,
+                plan_api_tokens_total = plan_api_tokens_total + excluded.plan_api_tokens_total,
                 api_coverage_message_count = api_coverage_message_count + excluded.api_coverage_message_count,
                 content_tokens_est_total = content_tokens_est_total + excluded.content_tokens_est_total,
                 content_tokens_est_user = content_tokens_est_user + excluded.content_tokens_est_user,
@@ -4665,7 +4790,7 @@ fn flush_rollup_table(
                 last_updated = excluded.last_updated"
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 20);
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
         for &((bucket_id, agent, workspace_id, source), d) in chunk {
             params_vec.push((*bucket_id).into());
             params_vec.push(agent.clone().into());
@@ -4676,6 +4801,8 @@ fn flush_rollup_table(
             params_vec.push(d.assistant_message_count.into());
             params_vec.push(d.tool_call_count.into());
             params_vec.push(d.plan_message_count.into());
+            params_vec.push(d.plan_content_tokens_est_total.into());
+            params_vec.push(d.plan_api_tokens_total.into());
             params_vec.push(d.api_coverage_message_count.into());
             params_vec.push(d.content_tokens_est_total.into());
             params_vec.push(d.content_tokens_est_user.into());
@@ -4992,18 +5119,18 @@ mod tests {
     }
 
     // =========================================================================
-    // V12 Analytics schema smoke test (bead z9fse.11)
+    // V13 Analytics schema smoke test (bead z9fse.11)
     // =========================================================================
 
     #[test]
-    fn migration_v12_creates_analytics_tables() {
+    fn migration_v13_creates_analytics_tables() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
 
-        // Schema version should be 12
+        // Schema version should be 13
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 12, "Schema version must be 12 after migration");
+        assert_eq!(version, 13, "Schema version must be 13 after migration");
 
         let conn = storage.raw();
 
@@ -5057,6 +5184,8 @@ mod tests {
         for expected in &[
             "hour_id",
             "plan_message_count",
+            "plan_content_tokens_est_total",
+            "plan_api_tokens_total",
             "api_coverage_message_count",
             "content_tokens_est_user",
             "api_thinking_tokens_total",
@@ -5071,6 +5200,8 @@ mod tests {
         let ud_cols = col_names(conn, "usage_daily");
         for expected in &[
             "day_id",
+            "plan_content_tokens_est_total",
+            "plan_api_tokens_total",
             "api_thinking_tokens_total",
             "content_tokens_est_assistant",
             "message_count",
@@ -5155,7 +5286,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v12_from_v10() {
+    fn migration_v13_from_v10() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
 
@@ -5192,10 +5323,10 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        // Now open with SqliteStorage — should auto-migrate to v12
+        // Now open with SqliteStorage — should auto-migrate to v13
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 12, "Should have migrated from v10 to v12");
+        assert_eq!(version, 13, "Should have migrated from v10 to v13");
 
         // Verify new tables exist
         let count: i64 = storage
@@ -5366,18 +5497,45 @@ mod tests {
         assert_eq!(rows[0].3, user_chars / 4);
 
         // Verify usage_hourly rollup
-        let (uh_msg, uh_user, uh_asst, uh_plan, uh_api_cov): (i64, i64, i64, i64, i64) = conn
+        let (uh_msg, uh_user, uh_asst, uh_plan, uh_plan_content, uh_plan_api, uh_api_cov): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT message_count, user_message_count, assistant_message_count, plan_message_count, api_coverage_message_count
+                "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
+                        plan_content_tokens_est_total, plan_api_tokens_total, api_coverage_message_count
                  FROM usage_hourly WHERE hour_id = ?",
                 params![expected_hour],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(uh_msg, 3, "Hourly rollup should have 3 messages");
         assert_eq!(uh_user, 2, "Hourly rollup should have 2 user messages");
         assert_eq!(uh_asst, 1, "Hourly rollup should have 1 assistant message");
         assert_eq!(uh_plan, 1, "Hourly rollup should have 1 plan message");
+        assert!(
+            uh_plan_content > 0,
+            "Hourly rollup should include plan content tokens"
+        );
+        assert!(
+            uh_plan_api > 0,
+            "Hourly rollup should include plan API tokens"
+        );
         assert_eq!(
             uh_api_cov, 1,
             "Hourly rollup should have 1 API-covered message"
@@ -5418,6 +5576,21 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap();
+        let mm_plan_content_est: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(content_tokens_est), 0) FROM message_metrics WHERE day_id = ? AND has_plan = 1",
+                params![expected_day],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let mm_plan_api_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(COALESCE(api_input_tokens, 0) + COALESCE(api_output_tokens, 0) + COALESCE(api_cache_read_tokens, 0) + COALESCE(api_cache_creation_tokens, 0) + COALESCE(api_thinking_tokens, 0)), 0)
+                 FROM message_metrics WHERE day_id = ? AND has_plan = 1 AND api_data_source = 'api'",
+                params![expected_day],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
         let ud_content_est: i64 = conn
             .query_row(
                 "SELECT content_tokens_est_total FROM usage_daily WHERE day_id = ?",
@@ -5425,9 +5598,24 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap();
+        let (ud_plan_content_est, ud_plan_api_total): (i64, i64) = conn
+            .query_row(
+                "SELECT plan_content_tokens_est_total, plan_api_tokens_total FROM usage_daily WHERE day_id = ?",
+                params![expected_day],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(
             mm_total_content_est, ud_content_est,
             "Daily rollup content_tokens_est_total must equal SUM of message_metrics"
+        );
+        assert_eq!(
+            mm_plan_content_est, ud_plan_content_est,
+            "Daily rollup plan_content_tokens_est_total must equal planned message_metrics content sum"
+        );
+        assert_eq!(
+            mm_plan_api_total, ud_plan_api_total,
+            "Daily rollup plan_api_tokens_total must equal planned message_metrics API token sum"
         );
 
         // Verify model rollup rows
@@ -5472,14 +5660,148 @@ mod tests {
             "## Plan\n\n1. First step\n2. Second step"
         ));
         assert!(has_plan_heuristic(
-            "# Plan\nHere is what we will do:\n1. Step one"
+            "# Plan\nHere is what we will do:\n1. Step one\n2. Step two"
         ));
-        assert!(has_plan_heuristic("The plan: 1. Do thing A 2. Do thing B"));
+        assert!(has_plan_heuristic(
+            "Plan:\n- Gather baseline\n- Implement changes\n- Validate with tests"
+        ));
+        assert!(has_plan_heuristic(
+            "Next steps:\n1. Update schema\n2. Rebuild rollups"
+        ));
         assert!(!has_plan_heuristic("Hello world"));
         assert!(!has_plan_heuristic("Short"));
         assert!(!has_plan_heuristic(
             "This is a regular message without plans"
         ));
+        assert!(!has_plan_heuristic(
+            "```json\n{\"tool\":\"shell\",\"stdout\":\"1. install\\n2. run\"}\n```"
+        ));
+    }
+
+    #[test]
+    fn has_plan_for_role_only_counts_assistant_messages() {
+        let plan_text = "## Plan\n1. First\n2. Second";
+        assert!(has_plan_for_role("assistant", plan_text));
+        assert!(has_plan_for_role("agent", plan_text));
+        assert!(has_plan_for_role("Assistant", plan_text));
+        assert!(!has_plan_for_role("user", plan_text));
+        assert!(!has_plan_for_role("tool", plan_text));
+    }
+
+    #[test]
+    fn plan_api_rollup_requires_api_data_source() {
+        let mut agg = AnalyticsRollupAggregator::new();
+
+        let estimated_plan = MessageMetricsEntry {
+            message_id: 1,
+            created_at_ms: 0,
+            hour_id: 1,
+            day_id: 1,
+            agent_slug: "codex".into(),
+            workspace_id: 0,
+            source_id: "local".into(),
+            role: "assistant".into(),
+            content_chars: 120,
+            content_tokens_est: 30,
+            model_name: None,
+            model_family: "unknown".into(),
+            model_tier: "unknown".into(),
+            provider: "unknown".into(),
+            api_input_tokens: Some(100),
+            api_output_tokens: Some(50),
+            api_cache_read_tokens: Some(0),
+            api_cache_creation_tokens: Some(0),
+            api_thinking_tokens: Some(0),
+            api_service_tier: None,
+            api_data_source: "estimated".into(),
+            tool_call_count: 0,
+            has_tool_calls: false,
+            has_plan: true,
+        };
+        agg.record(&estimated_plan);
+
+        let api_plan = MessageMetricsEntry {
+            message_id: 2,
+            created_at_ms: 0,
+            hour_id: 1,
+            day_id: 1,
+            agent_slug: "codex".into(),
+            workspace_id: 0,
+            source_id: "local".into(),
+            role: "assistant".into(),
+            content_chars: 80,
+            content_tokens_est: 20,
+            model_name: None,
+            model_family: "unknown".into(),
+            model_tier: "unknown".into(),
+            provider: "unknown".into(),
+            api_input_tokens: Some(40),
+            api_output_tokens: Some(10),
+            api_cache_read_tokens: Some(0),
+            api_cache_creation_tokens: Some(0),
+            api_thinking_tokens: Some(0),
+            api_service_tier: None,
+            api_data_source: "api".into(),
+            tool_call_count: 0,
+            has_tool_calls: false,
+            has_plan: true,
+        };
+        agg.record(&api_plan);
+
+        let key = (1_i64, "codex".to_string(), 0_i64, "local".to_string());
+        let hourly = agg.hourly.get(&key).expect("hourly rollup key must exist");
+
+        // Content rollup includes both plan messages.
+        assert_eq!(hourly.plan_message_count, 2);
+        assert_eq!(hourly.plan_content_tokens_est_total, 50);
+        // API plan tokens must include only api_data_source='api' rows.
+        assert_eq!(hourly.plan_api_tokens_total, 50);
+        // Overall API tokens still include all row-level API token fields.
+        assert_eq!(hourly.api_tokens_total, 200);
+    }
+
+    #[test]
+    fn has_plan_heuristic_curated_corpus_thresholds() {
+        // Cross-agent-style positives.
+        let positives = [
+            "## Plan\n1. Inspect current schema\n2. Add migration\n3. Verify rebuild",
+            "Plan:\n1) Reproduce\n2) Patch\n3) Add tests",
+            "Implementation plan:\n- Parse inputs\n- Update rollups\n- Run checks",
+            "Next steps:\n1. Reserve file\n2. Implement\n3. Report status",
+            "# Plan\n1. Gather requirements\n2. Ship changes",
+            "Action plan:\n- Identify root cause\n- Fix it\n- Validate",
+        ];
+
+        // Typical false positives we want to avoid.
+        let negatives = [
+            "The plan is to move fast and fix things later.",
+            "```json\n{\"tool\":\"shell\",\"stdout\":\"1. ls\\n2. cat\"}\n```",
+            "stdout:\n1. Build started\n2. Build finished\nexit code: 0",
+            "I can help with that request. Let me know if you want details.",
+            "Here is a list:\n- apples\n- oranges",
+            "Status update: completed tasks and blockers below.",
+        ];
+
+        let tp = positives
+            .iter()
+            .filter(|msg| has_plan_heuristic(msg))
+            .count();
+        let fp = negatives
+            .iter()
+            .filter(|msg| has_plan_heuristic(msg))
+            .count();
+
+        let recall = tp as f64 / positives.len() as f64;
+        let false_positive_rate = fp as f64 / negatives.len() as f64;
+
+        assert!(
+            recall >= 0.80,
+            "plan heuristic recall too low: got {recall:.2}"
+        );
+        assert!(
+            false_positive_rate <= 0.20,
+            "plan heuristic false-positive rate too high: got {false_positive_rate:.2}"
+        );
     }
 
     #[test]
@@ -5670,18 +5992,37 @@ mod tests {
         );
 
         // Verify rollups have correct data
-        let (uh_msg, uh_user, uh_asst, uh_plan): (i64, i64, i64, i64) = conn
+        let (uh_msg, uh_user, uh_asst, uh_plan, uh_plan_content, uh_plan_api): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT message_count, user_message_count, assistant_message_count, plan_message_count
+                "SELECT message_count, user_message_count, assistant_message_count, plan_message_count,
+                        plan_content_tokens_est_total, plan_api_tokens_total
                  FROM usage_hourly WHERE hour_id = ?",
                 params![expected_hour],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(uh_msg, 3);
         assert_eq!(uh_user, 2);
         assert_eq!(uh_asst, 1);
         assert_eq!(uh_plan, 1);
+        assert!(uh_plan_content > 0);
+        assert!(uh_plan_api > 0);
 
         let ud_msg: i64 = conn
             .query_row(

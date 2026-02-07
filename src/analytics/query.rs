@@ -731,12 +731,27 @@ pub fn query_breakdown(
     let query_start = std::time::Instant::now();
 
     // For the Model dimension, use token_daily_stats (Track B) which has model_family.
-    // For Agent/Workspace/Source, use usage_daily (Track A).
-    let (table, dim_col) = match dim {
-        Dim::Agent => ("usage_daily", "agent_slug"),
-        Dim::Workspace => ("usage_daily", "workspace_id"),
-        Dim::Source => ("usage_daily", "source_id"),
-        Dim::Model => ("token_daily_stats", "model_family"),
+    // For Agent/Workspace/Source, use usage_daily (Track A) — EXCEPT when the
+    // metric is EstimatedCostUsd, which only exists in Track B.  Track B has
+    // agent_slug and source_id but NOT workspace_id, so Workspace always uses
+    // Track A (cost will be 0.0 — acceptable limitation).
+    let use_track_b = dim == Dim::Model
+        || (metric == Metric::EstimatedCostUsd && matches!(dim, Dim::Agent | Dim::Source));
+
+    let (table, dim_col) = if use_track_b {
+        match dim {
+            Dim::Agent => ("token_daily_stats", "agent_slug"),
+            Dim::Source => ("token_daily_stats", "source_id"),
+            Dim::Model => ("token_daily_stats", "model_family"),
+            Dim::Workspace => unreachable!(), // guarded by use_track_b logic
+        }
+    } else {
+        match dim {
+            Dim::Agent => ("usage_daily", "agent_slug"),
+            Dim::Workspace => ("usage_daily", "workspace_id"),
+            Dim::Source => ("usage_daily", "source_id"),
+            Dim::Model => unreachable!(), // Model always routes to Track B
+        }
     };
 
     if !table_exists(conn, table) {
@@ -772,7 +787,7 @@ pub fn query_breakdown(
 
     // For Track A (usage_daily), we can select the full bucket.
     // For Track B (token_daily_stats), column names differ — map accordingly.
-    let sql = if dim == Dim::Model {
+    let sql = if use_track_b {
         // Track B: token_daily_stats columns map to different names.
         build_breakdown_sql_track_b(dim_col, &metric, &where_clause, limit)
     } else {
@@ -796,7 +811,7 @@ pub fn query_breakdown(
         .map(|v| v as &dyn rusqlite::types::ToSql)
         .collect();
 
-    let rows = if dim == Dim::Model {
+    let rows = if use_track_b {
         read_breakdown_rows_track_b(&mut stmt, &param_refs, &metric)?
     } else {
         read_breakdown_rows_track_a(&mut stmt, &param_refs, &metric)?
@@ -877,6 +892,7 @@ fn build_breakdown_sql_track_b(
         Metric::Thinking => "total_thinking_tokens",
         Metric::ToolCalls => "total_tool_calls",
         Metric::MessageCount => "api_call_count",
+        Metric::EstimatedCostUsd => "estimated_cost_usd",
         _ => "grand_total_tokens",
     };
     format!(

@@ -22,6 +22,7 @@ pub mod validate;
 pub use types::{
     AnalyticsError, AnalyticsFilter, AnalyticsResult, BreakdownResult, BreakdownRow, CoverageInfo,
     DerivedMetrics, Dim, DriftInfo, DriftSignal, GroupBy, Metric, SourceFilter, StatusResult,
-    TableInfo, TimeseriesResult, ToolReport, ToolRow, UsageBucket,
+    TableInfo, TimeseriesResult, ToolReport, ToolRow, UnpricedModel, UnpricedModelsReport,
+    UsageBucket,
 };
 pub use validate::{ValidateConfig, ValidationReport};
