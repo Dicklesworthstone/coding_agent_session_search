@@ -1389,6 +1389,23 @@ impl super::ftui_adapter::Model for CassApp {
                 // TODO(2noh9.3.2): implement debounced search via Cmd::tick
                 ftui::Cmd::none()
             }
+            CassMsg::QueryCleared => {
+                self.query.clear();
+                self.dirty_since = Some(Instant::now());
+                ftui::Cmd::none()
+            }
+            CassMsg::QueryWordDeleted => {
+                // Delete last word (Ctrl+W): trim trailing whitespace, then trim to
+                // the last whitespace boundary.
+                let trimmed = self.query.trim_end();
+                if let Some(pos) = trimmed.rfind(char::is_whitespace) {
+                    self.query.truncate(pos + 1);
+                } else {
+                    self.query.clear();
+                }
+                self.dirty_since = Some(Instant::now());
+                ftui::Cmd::none()
+            }
             CassMsg::SearchRequested => {
                 // TODO: dispatch async search via Cmd::task
                 ftui::Cmd::none()
@@ -1914,6 +1931,11 @@ impl super::ftui_adapter::Model for CassApp {
             | CassMsg::ModelDownloadFailed(_)
             | CassMsg::ModelDownloadCancelled => {
                 // TODO: model download lifecycle
+                ftui::Cmd::none()
+            }
+            CassMsg::HashModeAccepted => {
+                // User chose hash embedder fallback instead of downloading ML model.
+                self.show_consent_dialog = false;
                 ftui::Cmd::none()
             }
 
