@@ -995,7 +995,12 @@ fn read_breakdown_rows_track_b(
             let grand_total: i64 = row.get(10)?;
             let total_content_chars: i64 = row.get(11)?;
             let estimated_cost: f64 = row.get(12)?;
-            let sort_value: i64 = row.get(13)?;
+            // When the sort metric is a Real column (e.g. estimated_cost_usd),
+            // SQLite returns a float.  Read as f64 and truncate to i64.
+            let sort_value: i64 = match row.get::<_, f64>(13) {
+                Ok(v) => v as i64,
+                Err(_) => row.get(13)?,
+            };
 
             // Map Track B columns to UsageBucket.
             let bucket = UsageBucket {
