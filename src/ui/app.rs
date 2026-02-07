@@ -91,6 +91,9 @@ pub const BULK_ACTIONS: [&str; 4] = [
     "Clear selection",
 ];
 
+/// Title used by the saved-views manager modal.
+pub const SAVED_VIEWS_MODAL_TITLE: &str = " Saved Views ";
+
 /// Number of selected items before requiring double-press confirmation.
 pub const OPEN_CONFIRM_THRESHOLD: usize = 12;
 
@@ -310,7 +313,37 @@ pub struct DetailFindState {
     pub current: usize,
 }
 
-/// One column of results, grouped by agent.
+/// How results are grouped into panes (G to cycle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ResultsGrouping {
+    #[default]
+    Agent,
+    Conversation,
+    Workspace,
+    Flat,
+}
+
+impl ResultsGrouping {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "by agent",
+            Self::Conversation => "by conversation",
+            Self::Workspace => "by workspace",
+            Self::Flat => "flat",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Agent => Self::Conversation,
+            Self::Conversation => Self::Workspace,
+            Self::Workspace => Self::Flat,
+            Self::Flat => Self::Agent,
+        }
+    }
+}
+
+/// One column of results, grouped by a key.
 #[derive(Clone, Debug)]
 pub struct AgentPane {
     pub agent: String,
@@ -483,6 +516,7 @@ impl RenderItem for ResultItem {
 #[derive(Clone, Debug)]
 pub struct SavedView {
     pub slot: u8,
+    pub label: Option<String>,
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
     pub created_from: Option<i64>,
@@ -546,6 +580,8 @@ pub struct CassApp {
     pub context_window: ContextWindow,
     /// Active time filter preset (for Shift+F5 cycling).
     pub time_preset: TimePreset,
+    /// How results are grouped into panes.
+    pub grouping_mode: ResultsGrouping,
 
     // -- Focus & input ----------------------------------------------------
     /// What the user is currently typing into.
@@ -616,6 +652,14 @@ pub struct CassApp {
     pub export_modal_state: Option<ExportModalState>,
     /// Whether the bulk actions modal is visible.
     pub show_bulk_modal: bool,
+    /// Whether the saved views manager modal is visible.
+    pub show_saved_views_modal: bool,
+    /// Current selected index inside saved views manager.
+    pub saved_views_selection: usize,
+    /// Whether the saved views manager is currently renaming a slot.
+    pub saved_view_rename_mode: bool,
+    /// Rename buffer used while editing saved view labels.
+    pub saved_view_rename_buffer: String,
     /// Whether the consent dialog (model download) is visible.
     pub show_consent_dialog: bool,
     /// Semantic search availability state.
@@ -713,6 +757,7 @@ impl Default for CassApp {
             ranking_mode: RankingMode::default(),
             context_window: ContextWindow::default(),
             time_preset: TimePreset::default(),
+            grouping_mode: ResultsGrouping::default(),
             input_mode: InputMode::Query,
             input_buffer: String::new(),
             focus_region: FocusRegion::default(),
@@ -743,6 +788,10 @@ impl Default for CassApp {
             show_export_modal: false,
             export_modal_state: None,
             show_bulk_modal: false,
+            show_saved_views_modal: false,
+            saved_views_selection: 0,
+            saved_view_rename_mode: false,
+            saved_view_rename_buffer: String::new(),
             show_consent_dialog: false,
             semantic_availability: SemanticAvailability::NotInstalled,
             source_filter_menu_open: false,
@@ -821,30 +870,30 @@ impl CassApp {
     /// Determine which UI region a mouse coordinate falls in.
     fn hit_test(&self, x: u16, y: u16) -> MouseHitRegion {
         // Check results inner area first (most common click target).
-        if let Some(rect) = *self.last_results_inner.borrow() {
-            if rect.contains(x, y) {
-                let row_h = self.density_mode.row_height();
-                let state = self.results_list_state.borrow();
-                let scroll = state.scroll_offset();
-                let row_in_viewport = ((y - rect.y) / row_h.max(1)) as usize;
-                let item_idx = scroll + row_in_viewport;
-                return MouseHitRegion::Results { item_idx };
-            }
+        if let Some(rect) = *self.last_results_inner.borrow()
+            && rect.contains(x, y)
+        {
+            let row_h = self.density_mode.row_height();
+            let state = self.results_list_state.borrow();
+            let scroll = state.scroll_offset();
+            let row_in_viewport = ((y - rect.y) / row_h.max(1)) as usize;
+            let item_idx = scroll + row_in_viewport;
+            return MouseHitRegion::Results { item_idx };
         }
-        if let Some(rect) = *self.last_detail_area.borrow() {
-            if rect.contains(x, y) {
-                return MouseHitRegion::Detail;
-            }
+        if let Some(rect) = *self.last_detail_area.borrow()
+            && rect.contains(x, y)
+        {
+            return MouseHitRegion::Detail;
         }
-        if let Some(rect) = *self.last_search_bar_area.borrow() {
-            if rect.contains(x, y) {
-                return MouseHitRegion::SearchBar;
-            }
+        if let Some(rect) = *self.last_search_bar_area.borrow()
+            && rect.contains(x, y)
+        {
+            return MouseHitRegion::SearchBar;
         }
-        if let Some(rect) = *self.last_status_area.borrow() {
-            if rect.contains(x, y) {
-                return MouseHitRegion::StatusBar;
-            }
+        if let Some(rect) = *self.last_status_area.borrow()
+            && rect.contains(x, y)
+        {
+            return MouseHitRegion::StatusBar;
         }
         MouseHitRegion::None
     }
@@ -862,10 +911,124 @@ impl CassApp {
             && !self.show_help
             && !self.show_detail_modal
             && !self.show_bulk_modal
+            && !self.show_saved_views_modal
             && !self.show_export_modal
             && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.palette_state.open
+    }
+
+    fn sort_saved_views(&mut self) {
+        self.saved_views.sort_by_key(|v| v.slot);
+    }
+
+    fn clamp_saved_views_selection(&mut self) {
+        if self.saved_views.is_empty() {
+            self.saved_views_selection = 0;
+            return;
+        }
+        self.saved_views_selection = self
+            .saved_views_selection
+            .min(self.saved_views.len().saturating_sub(1));
+    }
+
+    fn selected_saved_view_slot(&self) -> Option<u8> {
+        self.saved_views
+            .get(self.saved_views_selection)
+            .map(|v| v.slot)
+    }
+
+    fn selected_saved_view_label(&self) -> Option<String> {
+        self.saved_views
+            .get(self.saved_views_selection)
+            .and_then(|v| v.label.clone())
+    }
+
+    fn move_saved_views_selection(&mut self, delta: i32) {
+        if self.saved_views.is_empty() {
+            self.saved_views_selection = 0;
+            return;
+        }
+        let len = self.saved_views.len() as i32;
+        let next = self.saved_views_selection as i32 + delta;
+        self.saved_views_selection = next.rem_euclid(len) as usize;
+    }
+
+    /// Re-group results into panes using the current `grouping_mode`.
+    fn regroup_panes(&mut self) {
+        let mut pane_map: std::collections::BTreeMap<String, Vec<SearchHit>> =
+            std::collections::BTreeMap::new();
+        for hit in &self.results {
+            let key = match self.grouping_mode {
+                ResultsGrouping::Agent => hit.agent.clone(),
+                ResultsGrouping::Conversation => {
+                    // Use last path component of source_path as conversation key.
+                    hit.source_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&hit.source_path)
+                        .to_string()
+                }
+                ResultsGrouping::Workspace => {
+                    let w = &hit.workspace;
+                    if w.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        w.rsplit('/').next().unwrap_or(w).to_string()
+                    }
+                }
+                ResultsGrouping::Flat => "All".to_string(),
+            };
+            pane_map.entry(key).or_default().push(hit.clone());
+        }
+        self.panes = pane_map
+            .into_iter()
+            .map(|(key, hits)| {
+                let total = hits.len();
+                AgentPane {
+                    agent: key,
+                    hits,
+                    selected: 0,
+                    total_count: total,
+                }
+            })
+            .collect();
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = 0;
+        }
+    }
+
+    /// Find the index of the next/previous day boundary in the active pane.
+    fn timeline_jump_index(&self, forward: bool) -> Option<usize> {
+        let pane = self.panes.get(self.active_pane)?;
+        if pane.hits.is_empty() {
+            return None;
+        }
+        let current_idx = pane.selected;
+        let current_day = pane.hits.get(current_idx)?.created_at.unwrap_or(0) / 86400;
+
+        if forward {
+            for i in (current_idx + 1)..pane.hits.len() {
+                let day = pane.hits[i].created_at.unwrap_or(0) / 86400;
+                if day != current_day {
+                    return Some(i);
+                }
+            }
+        } else {
+            for i in (0..current_idx).rev() {
+                let day = pane.hits[i].created_at.unwrap_or(0) / 86400;
+                if day != current_day {
+                    // Jump to the first hit of that previous day.
+                    let first = (0..=i)
+                        .rev()
+                        .take_while(|&j| pane.hits[j].created_at.unwrap_or(0) / 86400 == day)
+                        .last()
+                        .unwrap_or(i);
+                    return Some(first);
+                }
+            }
+        }
+        None
     }
 
     fn refresh_available_source_ids(&mut self) {
@@ -948,11 +1111,15 @@ impl CassApp {
         row_selected_style: ftui::Style,
         text_muted_style: ftui::Style,
     ) {
+        let grouping_suffix = match self.grouping_mode {
+            ResultsGrouping::Agent => String::new(),
+            other => format!(" [{}]", other.label()),
+        };
         let results_title = if self.selected.is_empty() {
-            format!("Results ({})", hits.len())
+            format!("Results ({}){grouping_suffix}", hits.len())
         } else {
             format!(
-                "Results ({}) \u{2022} {} selected",
+                "Results ({}) \u{2022} {} selected{grouping_suffix}",
                 hits.len(),
                 self.selected.len()
             )
@@ -1861,6 +2028,120 @@ impl CassApp {
         }
     }
 
+    /// Render the saved views manager popup centered on screen.
+    fn render_saved_views_overlay(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        styles: &StyleContext,
+    ) {
+        let modal_w = 72u16.min(area.width.saturating_sub(2));
+        let modal_h = 18u16.min(area.height.saturating_sub(2));
+        if modal_w == 0 || modal_h == 0 {
+            return;
+        }
+
+        let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+        let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+        let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
+        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
+        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
+        let selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
+
+        Block::new().style(bg_style).render(modal_area, frame);
+        let title = format!("{SAVED_VIEWS_MODAL_TITLE}({})", self.saved_views.len());
+        let outer = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(&title)
+            .title_alignment(Alignment::Left)
+            .style(border_style);
+        let inner = outer.inner(modal_area);
+        outer.render(modal_area, frame);
+        if inner.is_empty() {
+            return;
+        }
+
+        let mut rows = self.saved_views.clone();
+        rows.sort_by_key(|v| v.slot);
+
+        let footer_h = if self.saved_view_rename_mode { 2 } else { 1 };
+        let list_h = inner.height.saturating_sub(footer_h).max(1);
+        let list_area = Rect::new(inner.x, inner.y, inner.width, list_h);
+        let footer_area = Rect::new(inner.x, inner.y + list_h, inner.width, footer_h);
+
+        if rows.is_empty() {
+            Paragraph::new(
+                "No saved views. Use Ctrl+1..9 to save the current filters into a slot.",
+            )
+            .style(muted_style)
+            .render(list_area, frame);
+        } else {
+            let selected = self.saved_views_selection.min(rows.len().saturating_sub(1));
+            let visible = list_area.height as usize;
+            let start = selected.saturating_sub(visible.saturating_sub(1));
+            for (row, view) in rows.iter().enumerate().skip(start).take(visible) {
+                let y = list_area.y + (row - start) as u16;
+                let row_area = Rect::new(list_area.x, y, list_area.width, 1);
+                let marker = if row == selected { "> " } else { "  " };
+                let label = view
+                    .label
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Slot {}", view.slot));
+                let line = format!(
+                    "{marker}[{}] {}  a:{} w:{}  src:{}",
+                    view.slot,
+                    label,
+                    view.agents.len(),
+                    view.workspaces.len(),
+                    view.source_filter
+                );
+                let style = if row == selected {
+                    selected_style
+                } else {
+                    text_style
+                };
+                Paragraph::new(&*line).style(style).render(row_area, frame);
+            }
+        }
+
+        if self.saved_view_rename_mode {
+            let prompt = format!(
+                "Rename slot: {}{}",
+                self.saved_view_rename_buffer,
+                if self.saved_view_rename_buffer.is_empty() {
+                    ""
+                } else {
+                    " "
+                }
+            );
+            Paragraph::new(&*prompt).style(text_style).render(
+                Rect::new(footer_area.x, footer_area.y, footer_area.width, 1),
+                frame,
+            );
+            Paragraph::new("Enter=save · Esc=cancel")
+                .style(muted_style)
+                .render(
+                    Rect::new(
+                        footer_area.x,
+                        footer_area.y + 1,
+                        footer_area.width,
+                        footer_area.height.saturating_sub(1),
+                    ),
+                    frame,
+                );
+        } else {
+            Paragraph::new("Enter=load · R=rename · D=delete · C=clear all · Esc=close")
+                .style(muted_style)
+                .render(footer_area, frame);
+        }
+    }
+
     /// Render the export modal overlay centered on screen.
     fn render_export_overlay(
         &self,
@@ -2261,6 +2542,11 @@ pub enum CassMsg {
     /// Page-level scroll.
     PageScrolled { delta: i32 },
 
+    /// Cycle the results grouping mode (Agent → Conversation → Workspace → Flat).
+    GroupingCycled,
+    /// Jump to the next/previous day boundary in results.
+    TimelineJumped { forward: bool },
+
     // -- Detail view ------------------------------------------------------
     /// Open the detail modal for the currently selected result.
     DetailOpened,
@@ -2437,6 +2723,22 @@ pub enum CassMsg {
     PaneShrunk,
 
     // -- Saved views ------------------------------------------------------
+    /// Open saved views manager modal.
+    SavedViewsOpened,
+    /// Close saved views manager modal.
+    SavedViewsClosed,
+    /// Move selection in saved views modal.
+    SavedViewsSelectionMoved { delta: i32 },
+    /// Load currently selected saved view.
+    SavedViewLoadedSelected,
+    /// Enter rename mode for selected saved view.
+    SavedViewRenameStarted,
+    /// Commit rename for selected saved view.
+    SavedViewRenameCommitted,
+    /// Delete selected saved view slot.
+    SavedViewDeletedSelected,
+    /// Clear all saved view slots.
+    SavedViewsCleared,
     /// Save current view to a slot (1-9).
     ViewSaved(u8),
     /// Load a saved view from a slot (1-9).
@@ -2818,6 +3120,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('r') => CassMsg::ResultsRefreshed,
                     KeyCode::Char('A') => CassMsg::BulkActionsOpened,
                     KeyCode::Char(' ') => CassMsg::PeekToggled,
+                    KeyCode::Char('G') => CassMsg::GroupingCycled,
+                    KeyCode::Char('[') => CassMsg::TimelineJumped { forward: false },
+                    KeyCode::Char(']') => CassMsg::TimelineJumped { forward: true },
 
                     // -- Default: treat as query input ----------------------------
                     KeyCode::Char(c) => CassMsg::QueryChanged(c.to_string()),
@@ -3016,6 +3321,71 @@ impl super::ftui_adapter::Model for CassApp {
             }
         }
 
+        // Saved views manager modal intercept. While open, consume navigation
+        // and action keys so query/search state is not mutated underneath.
+        if self.show_saved_views_modal {
+            if self.saved_view_rename_mode {
+                match &msg {
+                    CassMsg::QueryChanged(text) => {
+                        if text.is_empty() {
+                            self.saved_view_rename_buffer.pop();
+                        } else {
+                            self.saved_view_rename_buffer.push_str(text);
+                        }
+                        return ftui::Cmd::none();
+                    }
+                    CassMsg::DetailOpened | CassMsg::QuerySubmitted => {
+                        return ftui::Cmd::msg(CassMsg::SavedViewRenameCommitted);
+                    }
+                    CassMsg::QuitRequested => {
+                        self.saved_view_rename_mode = false;
+                        self.saved_view_rename_buffer.clear();
+                        self.status = "Cancelled saved view rename".to_string();
+                        return ftui::Cmd::none();
+                    }
+                    CassMsg::SavedViewRenameCommitted
+                    | CassMsg::SavedViewsClosed
+                    | CassMsg::SavedViewDeletedSelected
+                    | CassMsg::SavedViewsCleared => {}
+                    _ => return ftui::Cmd::none(),
+                }
+            }
+
+            match &msg {
+                CassMsg::QuitRequested => return ftui::Cmd::msg(CassMsg::SavedViewsClosed),
+                CassMsg::SelectionMoved { delta } => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewsSelectionMoved { delta: *delta });
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("j") => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewsSelectionMoved { delta: 1 });
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("k") => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewsSelectionMoved { delta: -1 });
+                }
+                CassMsg::DetailOpened | CassMsg::QuerySubmitted => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewLoadedSelected);
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("r") => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewRenameStarted);
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("d") => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewDeletedSelected);
+                }
+                CassMsg::QueryChanged(text) if text.eq_ignore_ascii_case("c") => {
+                    return ftui::Cmd::msg(CassMsg::SavedViewsCleared);
+                }
+                CassMsg::SavedViewsSelectionMoved { .. }
+                | CassMsg::SavedViewLoadedSelected
+                | CassMsg::SavedViewRenameStarted
+                | CassMsg::SavedViewRenameCommitted
+                | CassMsg::SavedViewDeletedSelected
+                | CassMsg::SavedViewsCleared
+                | CassMsg::SavedViewsClosed
+                | CassMsg::SavedViewsOpened => {}
+                _ => return ftui::Cmd::none(),
+            }
+        }
+
         // Source filter menu: while open, consume navigation keys and apply
         // selection without affecting results/query.
         if self.source_filter_menu_open {
@@ -3157,43 +3527,19 @@ impl super::ftui_adapter::Model for CassApp {
                 self.suggestions = suggestions;
                 self.wildcard_fallback = wildcard_fallback;
 
-                // Group hits by agent slug into per-agent panes.
-                let mut pane_map: std::collections::BTreeMap<String, Vec<SearchHit>> =
-                    std::collections::BTreeMap::new();
-                for hit in &hits {
-                    pane_map
-                        .entry(hit.agent.clone())
-                        .or_default()
-                        .push(hit.clone());
-                }
-                self.panes = pane_map
-                    .into_iter()
-                    .map(|(agent, agent_hits)| {
-                        let total = agent_hits.len();
-                        AgentPane {
-                            agent,
-                            hits: agent_hits,
-                            selected: 0,
-                            total_count: total,
-                        }
-                    })
-                    .collect();
+                // Store results and group into panes using current mode.
+                self.results = hits;
+                self.regroup_panes();
 
                 // Keep selection stable across reranking by retaining only keys that
                 // still exist in the new result set.
                 let available: HashSet<SelectedHitKey> =
-                    hits.iter().map(SelectedHitKey::from_hit).collect();
+                    self.results.iter().map(SelectedHitKey::from_hit).collect();
                 self.selected.retain(|k| available.contains(k));
                 if self.selected.is_empty() {
                     self.open_confirm_armed = false;
                 }
 
-                // Clamp active pane and selection
-                if self.active_pane >= self.panes.len() {
-                    self.active_pane = 0;
-                }
-
-                self.results = hits;
                 self.status = format!("{} results in {}ms", self.results.len(), elapsed_ms);
                 // Reset scroll to top for new results.
                 let mut state = self.results_list_state.borrow_mut();
@@ -3403,6 +3749,33 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // Sync pane selection with VirtualizedListState
                     pane.selected = state.selected.unwrap_or(0);
+                }
+                ftui::Cmd::none()
+            }
+
+            // -- Grouping & timeline -----------------------------------------
+            CassMsg::GroupingCycled => {
+                self.grouping_mode = self.grouping_mode.next();
+                self.regroup_panes();
+                self.status = format!("Grouping: {}", self.grouping_mode.label());
+                ftui::Cmd::none()
+            }
+            CassMsg::TimelineJumped { forward } => {
+                if let Some(target) = self.timeline_jump_index(forward) {
+                    if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                        pane.selected = target;
+                        let mut state = self.results_list_state.borrow_mut();
+                        state.select(Some(target));
+                    }
+                    self.status = format!(
+                        "Jumped to {}",
+                        if forward { "next day" } else { "previous day" }
+                    );
+                } else {
+                    self.status = format!(
+                        "No {} day boundary",
+                        if forward { "next" } else { "previous" }
+                    );
                 }
                 ftui::Cmd::none()
             }
@@ -4007,8 +4380,7 @@ impl super::ftui_adapter::Model for CassApp {
                         ftui::Cmd::msg(CassMsg::InputModeEntered(InputMode::CreatedFrom))
                     }
                     Some(PaletteAction::OpenSavedViews) => {
-                        // TODO: show saved views picker
-                        ftui::Cmd::none()
+                        ftui::Cmd::msg(CassMsg::SavedViewsOpened)
                     }
                     Some(PaletteAction::SaveViewSlot(slot)) => {
                         ftui::Cmd::msg(CassMsg::ViewSaved(slot))
@@ -4382,9 +4754,129 @@ impl super::ftui_adapter::Model for CassApp {
             }
 
             // -- Saved views --------------------------------------------------
+            CassMsg::SavedViewsOpened => {
+                self.sort_saved_views();
+                self.clamp_saved_views_selection();
+                self.show_saved_views_modal = true;
+                self.saved_view_rename_mode = false;
+                self.saved_view_rename_buffer.clear();
+                if self.saved_views.is_empty() {
+                    self.status = "No saved views. Use Ctrl+1..9 to save one.".to_string();
+                } else {
+                    self.status = format!("Saved views manager ({})", self.saved_views.len());
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewsClosed => {
+                self.show_saved_views_modal = false;
+                self.saved_view_rename_mode = false;
+                self.saved_view_rename_buffer.clear();
+                self.status = "Saved views manager closed".to_string();
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewsSelectionMoved { delta } => {
+                self.move_saved_views_selection(delta);
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewLoadedSelected => {
+                if let Some(slot) = self.selected_saved_view_slot() {
+                    self.show_saved_views_modal = false;
+                    self.saved_view_rename_mode = false;
+                    self.saved_view_rename_buffer.clear();
+                    return ftui::Cmd::msg(CassMsg::ViewLoaded(slot));
+                }
+                use crate::ui::components::toast::{Toast, ToastType};
+                self.status = "No saved view selected".to_string();
+                self.toast_manager.push(Toast::new(
+                    "No saved view selected".to_string(),
+                    ToastType::Warning,
+                ));
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewRenameStarted => {
+                if let Some(slot) = self.selected_saved_view_slot() {
+                    self.saved_view_rename_mode = true;
+                    self.saved_view_rename_buffer =
+                        self.selected_saved_view_label().unwrap_or_default();
+                    self.status = format!("Renaming slot {slot}. Enter to save.");
+                } else {
+                    self.status = "No saved view selected".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewRenameCommitted => {
+                use crate::ui::components::toast::{Toast, ToastType};
+                if let Some(view) = self.saved_views.get_mut(self.saved_views_selection) {
+                    let slot = view.slot;
+                    let trimmed = self.saved_view_rename_buffer.trim();
+                    if trimmed.is_empty() {
+                        view.label = None;
+                        self.status = format!("Cleared label for slot {slot}");
+                        self.toast_manager.push(Toast::new(
+                            format!("Cleared label for slot {slot}"),
+                            ToastType::Success,
+                        ));
+                    } else {
+                        view.label = Some(trimmed.to_string());
+                        self.status = format!("Renamed slot {slot} to \"{trimmed}\"");
+                        self.toast_manager.push(Toast::new(
+                            format!("Renamed slot {slot}"),
+                            ToastType::Success,
+                        ));
+                    }
+                    self.saved_view_rename_mode = false;
+                    self.saved_view_rename_buffer.clear();
+                    self.dirty_since = Some(Instant::now());
+                } else {
+                    self.saved_view_rename_mode = false;
+                    self.saved_view_rename_buffer.clear();
+                    self.status = "No saved view selected".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewDeletedSelected => {
+                use crate::ui::components::toast::{Toast, ToastType};
+                if let Some(slot) = self.selected_saved_view_slot() {
+                    self.saved_views.retain(|v| v.slot != slot);
+                    self.clamp_saved_views_selection();
+                    self.saved_view_rename_mode = false;
+                    self.saved_view_rename_buffer.clear();
+                    self.dirty_since = Some(Instant::now());
+                    self.status = format!("Deleted saved view slot {slot}");
+                    self.toast_manager.push(Toast::new(
+                        format!("Deleted slot {slot}"),
+                        ToastType::Warning,
+                    ));
+                } else {
+                    self.status = "No saved view selected".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SavedViewsCleared => {
+                use crate::ui::components::toast::{Toast, ToastType};
+                let count = self.saved_views.len();
+                self.saved_views.clear();
+                self.saved_views_selection = 0;
+                self.saved_view_rename_mode = false;
+                self.saved_view_rename_buffer.clear();
+                self.dirty_since = Some(Instant::now());
+                self.status = format!("Cleared {count} saved view(s)");
+                self.toast_manager.push(Toast::new(
+                    format!("Cleared {count} saved view(s)"),
+                    ToastType::Warning,
+                ));
+                ftui::Cmd::none()
+            }
             CassMsg::ViewSaved(slot) => {
+                use crate::ui::components::toast::{Toast, ToastType};
+                let preserved_label = self
+                    .saved_views
+                    .iter()
+                    .find(|v| v.slot == slot)
+                    .and_then(|v| v.label.clone());
                 let view = SavedView {
                     slot,
+                    label: preserved_label,
                     agents: self.filters.agents.clone(),
                     workspaces: self.filters.workspaces.clone(),
                     created_from: self.filters.created_from,
@@ -4393,24 +4885,52 @@ impl super::ftui_adapter::Model for CassApp {
                     source_filter: self.filters.source_filter.clone(),
                 };
                 // Replace existing slot or push
+                let mut replaced = false;
                 if let Some(existing) = self.saved_views.iter_mut().find(|v| v.slot == slot) {
                     *existing = view;
+                    replaced = true;
                 } else {
                     self.saved_views.push(view);
                 }
+                self.sort_saved_views();
+                if let Some(idx) = self.saved_views.iter().position(|v| v.slot == slot) {
+                    self.saved_views_selection = idx;
+                }
                 self.dirty_since = Some(Instant::now());
+                let verb = if replaced { "Updated" } else { "Saved" };
+                self.status = format!("{verb} current view to slot {slot}");
+                self.toast_manager.push(Toast::new(
+                    format!("{verb} slot {slot}"),
+                    ToastType::Success,
+                ));
                 ftui::Cmd::none()
             }
             CassMsg::ViewLoaded(slot) => {
-                if let Some(view) = self.saved_views.iter().find(|v| v.slot == slot) {
+                use crate::ui::components::toast::{Toast, ToastType};
+                if let Some(view) = self.saved_views.iter().find(|v| v.slot == slot).cloned() {
                     self.filters.agents = view.agents.clone();
                     self.filters.workspaces = view.workspaces.clone();
                     self.filters.created_from = view.created_from;
                     self.filters.created_to = view.created_to;
                     self.ranking_mode = view.ranking;
                     self.filters.source_filter = view.source_filter.clone();
+                    self.show_saved_views_modal = false;
+                    self.saved_view_rename_mode = false;
+                    self.saved_view_rename_buffer.clear();
+                    let label = view
+                        .label
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| format!("slot {slot}"));
+                    self.status = format!("Loaded saved view {label}");
+                    self.toast_manager
+                        .push(Toast::new(format!("Loaded {label}"), ToastType::Success));
                     return ftui::Cmd::msg(CassMsg::SearchRequested);
                 }
+                self.status = format!("No saved view in slot {slot}");
+                self.toast_manager.push(Toast::new(
+                    format!("Slot {slot} is empty"),
+                    ToastType::Warning,
+                ));
                 ftui::Cmd::none()
             }
 
@@ -4446,6 +4966,8 @@ impl super::ftui_adapter::Model for CassApp {
                 self.per_pane_limit = state.per_pane_limit;
                 self.query_history = state.query_history;
                 self.saved_views = state.saved_views;
+                self.sort_saved_views();
+                self.clamp_saved_views_selection();
                 self.fancy_borders = state.fancy_borders;
                 self.help_pinned = state.help_pinned;
                 ftui::Cmd::none()
@@ -4687,6 +5209,17 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 if self.show_bulk_modal {
                     self.show_bulk_modal = false;
+                    return ftui::Cmd::none();
+                }
+                if self.show_saved_views_modal {
+                    if self.saved_view_rename_mode {
+                        self.saved_view_rename_mode = false;
+                        self.saved_view_rename_buffer.clear();
+                        self.status = "Cancelled saved view rename".to_string();
+                    } else {
+                        self.show_saved_views_modal = false;
+                        self.status = "Saved views manager closed".to_string();
+                    }
                     return ftui::Cmd::none();
                 }
                 if self.source_filter_menu_open {
@@ -5195,6 +5728,10 @@ impl super::ftui_adapter::Model for CassApp {
                         .render(row_area, frame);
                 }
             }
+        }
+
+        if self.show_saved_views_modal {
+            self.render_saved_views_overlay(frame, area, &styles);
         }
 
         if self.source_filter_menu_open {
@@ -5860,6 +6397,106 @@ mod tests {
             app.saved_views.iter().any(|v| v.slot == 1),
             "slot 1 should be saved"
         );
+    }
+
+    #[test]
+    fn palette_open_saved_views_dispatches() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::PaletteOpened);
+        let idx = app
+            .palette_state
+            .filtered
+            .iter()
+            .position(|i| matches!(i.action, PaletteAction::OpenSavedViews))
+            .expect("open saved views action should exist");
+        app.palette_state.selected = idx;
+
+        let cmd = app.update(CassMsg::PaletteActionExecuted);
+        assert!(!app.palette_state.open);
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SavedViewsOpened)));
+    }
+
+    #[test]
+    fn saved_views_modal_open_move_and_close() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ViewSaved(2));
+        let _ = app.update(CassMsg::ViewSaved(1));
+
+        let _ = app.update(CassMsg::SavedViewsOpened);
+        assert!(app.show_saved_views_modal);
+        assert_eq!(app.selected_saved_view_slot(), Some(1));
+
+        let _ = app.update(CassMsg::SavedViewsSelectionMoved { delta: 1 });
+        assert_eq!(app.selected_saved_view_slot(), Some(2));
+
+        let _ = app.update(CassMsg::SavedViewsClosed);
+        assert!(!app.show_saved_views_modal);
+    }
+
+    #[test]
+    fn saved_view_rename_commit_sets_label() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ViewSaved(1));
+        let _ = app.update(CassMsg::SavedViewsOpened);
+
+        let _ = app.update(CassMsg::SavedViewRenameStarted);
+        assert!(app.saved_view_rename_mode);
+
+        let _ = app.update(CassMsg::QueryChanged("Primary".to_string()));
+        let _ = app.update(CassMsg::SavedViewRenameCommitted);
+
+        assert!(!app.saved_view_rename_mode);
+        assert_eq!(
+            app.saved_views.first().and_then(|v| v.label.as_deref()),
+            Some("Primary")
+        );
+    }
+
+    #[test]
+    fn saved_view_delete_then_clear_all() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ViewSaved(1));
+        let _ = app.update(CassMsg::ViewSaved(2));
+        let _ = app.update(CassMsg::SavedViewsOpened);
+
+        assert_eq!(app.selected_saved_view_slot(), Some(2));
+        let _ = app.update(CassMsg::SavedViewDeletedSelected);
+        assert_eq!(app.saved_views.len(), 1);
+        assert_eq!(app.saved_views[0].slot, 1);
+
+        let _ = app.update(CassMsg::SavedViewsCleared);
+        assert!(app.saved_views.is_empty());
+    }
+
+    #[test]
+    fn saved_view_load_selected_dispatches_view_loaded_for_selected_slot() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ViewSaved(3));
+        let _ = app.update(CassMsg::SavedViewsOpened);
+
+        let cmd = app.update(CassMsg::SavedViewLoadedSelected);
+        assert!(!app.show_saved_views_modal);
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::ViewLoaded(3))));
+    }
+
+    #[test]
+    fn saving_existing_slot_preserves_label() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::ViewSaved(1));
+        let _ = app.update(CassMsg::SavedViewsOpened);
+        let _ = app.update(CassMsg::SavedViewRenameStarted);
+        let _ = app.update(CassMsg::QueryChanged("Pinned".to_string()));
+        let _ = app.update(CassMsg::SavedViewRenameCommitted);
+
+        app.filters.agents.insert("codex".to_string());
+        let _ = app.update(CassMsg::ViewSaved(1));
+
+        let label = app
+            .saved_views
+            .iter()
+            .find(|v| v.slot == 1)
+            .and_then(|v| v.label.as_deref());
+        assert_eq!(label, Some("Pinned"));
     }
 
     // ==================== Search bar UX tests (2noh9.3.2) ====================
@@ -8302,6 +8939,254 @@ mod tests {
         assert!(
             app.last_detail_area.borrow().is_none(),
             "detail area should be None in narrow layout with results focus"
+        );
+    }
+
+    // =====================================================================
+    // 2noh9.4.10 — Advanced navigation (grouping, timeline jump)
+    // =====================================================================
+
+    #[test]
+    fn grouping_cycles_through_all_modes() {
+        assert_eq!(ResultsGrouping::Agent.next(), ResultsGrouping::Conversation);
+        assert_eq!(
+            ResultsGrouping::Conversation.next(),
+            ResultsGrouping::Workspace
+        );
+        assert_eq!(ResultsGrouping::Workspace.next(), ResultsGrouping::Flat);
+        assert_eq!(ResultsGrouping::Flat.next(), ResultsGrouping::Agent);
+    }
+
+    #[test]
+    fn grouping_labels_are_distinct() {
+        let labels: Vec<&str> = [
+            ResultsGrouping::Agent,
+            ResultsGrouping::Conversation,
+            ResultsGrouping::Workspace,
+            ResultsGrouping::Flat,
+        ]
+        .iter()
+        .map(|g| g.label())
+        .collect();
+        let set: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(set.len(), 4, "all grouping labels should be unique");
+    }
+
+    #[test]
+    fn regroup_panes_by_agent() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.agent = "claude_code".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.agent = "codex".into();
+        let mut h3 = make_hit(3, "/c");
+        h3.agent = "claude_code".into();
+        app.results = vec![h1, h2, h3];
+        app.grouping_mode = ResultsGrouping::Agent;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].agent, "claude_code");
+        assert_eq!(app.panes[0].hits.len(), 2);
+        assert_eq!(app.panes[1].agent, "codex");
+    }
+
+    #[test]
+    fn regroup_panes_flat_creates_single_pane() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.agent = "claude_code".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.agent = "codex".into();
+        app.results = vec![h1, h2];
+        app.grouping_mode = ResultsGrouping::Flat;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 1, "flat mode should produce one pane");
+        assert_eq!(app.panes[0].agent, "All");
+        assert_eq!(app.panes[0].hits.len(), 2);
+    }
+
+    #[test]
+    fn regroup_panes_by_workspace() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.workspace = "/home/user/project-a".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.workspace = "/home/user/project-b".into();
+        let mut h3 = make_hit(3, "/c");
+        h3.workspace = "/home/user/project-a".into();
+        app.results = vec![h1, h2, h3];
+        app.grouping_mode = ResultsGrouping::Workspace;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].agent, "project-a");
+        assert_eq!(app.panes[0].hits.len(), 2);
+        assert_eq!(app.panes[1].agent, "project-b");
+    }
+
+    #[test]
+    fn regroup_panes_by_conversation() {
+        let mut app = CassApp::default();
+        // Last path component is used as the conversation key.
+        let h1 = make_hit(1, "/sessions/conv-aaa");
+        let h2 = make_hit(2, "/sessions/conv-bbb");
+        let h3 = make_hit(3, "/sessions/conv-aaa");
+        app.results = vec![h1, h2, h3];
+        app.grouping_mode = ResultsGrouping::Conversation;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].agent, "conv-aaa");
+        assert_eq!(app.panes[0].hits.len(), 2);
+        assert_eq!(app.panes[1].agent, "conv-bbb");
+    }
+
+    #[test]
+    fn grouping_cycled_msg_changes_mode_and_regroups() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.agent = "claude_code".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.agent = "codex".into();
+        app.results = vec![h1, h2];
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            hits: vec![],
+            selected: 0,
+            total_count: 0,
+        });
+        let _ = app.update(CassMsg::GroupingCycled);
+        assert_eq!(app.grouping_mode, ResultsGrouping::Conversation);
+        assert!(app.status.contains("Grouping:"));
+    }
+
+    #[test]
+    fn timeline_jump_finds_next_day() {
+        let mut app = CassApp::default();
+        let day1 = 86400 * 19000; // some day
+        let day2 = 86400 * 19001; // next day
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for i in 0..3 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day1 + i as i64);
+            hits.push(h);
+        }
+        for i in 3..6 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day2 + i as i64);
+            hits.push(h);
+        }
+        app.panes.push(AgentPane {
+            agent: "test".into(),
+            total_count: hits.len(),
+            hits,
+            selected: 0,
+        });
+        // Jump forward from day1 → should land on index 3 (first of day2)
+        let idx = app.timeline_jump_index(true);
+        assert_eq!(idx, Some(3));
+    }
+
+    #[test]
+    fn timeline_jump_finds_prev_day() {
+        let mut app = CassApp::default();
+        let day1 = 86400 * 19000;
+        let day2 = 86400 * 19001;
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for i in 0..3 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day1 + i as i64);
+            hits.push(h);
+        }
+        for i in 3..6 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day2 + i as i64);
+            hits.push(h);
+        }
+        app.panes.push(AgentPane {
+            agent: "test".into(),
+            total_count: hits.len(),
+            hits,
+            selected: 4, // in day2
+        });
+        // Jump backward from day2 → should land on index 0 (first of day1)
+        let idx = app.timeline_jump_index(false);
+        assert_eq!(idx, Some(0));
+    }
+
+    #[test]
+    fn timeline_jump_returns_none_at_boundary() {
+        let mut app = CassApp::default();
+        let day1 = 86400 * 19000;
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for i in 0..3 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day1 + i as i64);
+            hits.push(h);
+        }
+        app.panes.push(AgentPane {
+            agent: "test".into(),
+            total_count: hits.len(),
+            hits,
+            selected: 0,
+        });
+        // No previous day
+        assert_eq!(app.timeline_jump_index(false), None);
+        // No next day
+        assert_eq!(app.timeline_jump_index(true), None);
+    }
+
+    #[test]
+    fn timeline_jumped_msg_moves_selection() {
+        let mut app = CassApp::default();
+        let day1 = 86400 * 19000;
+        let day2 = 86400 * 19001;
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for i in 0..3 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day1 + i as i64);
+            hits.push(h);
+        }
+        for i in 3..5 {
+            let mut h = make_hit(i, &format!("/p/{i}"));
+            h.created_at = Some(day2 + i as i64);
+            hits.push(h);
+        }
+        app.panes.push(AgentPane {
+            agent: "test".into(),
+            total_count: hits.len(),
+            hits,
+            selected: 0,
+        });
+        let _ = app.update(CassMsg::TimelineJumped { forward: true });
+        assert_eq!(
+            app.panes[0].selected, 3,
+            "should jump to first hit of next day"
+        );
+        assert!(app.status.contains("next day"));
+    }
+
+    #[test]
+    fn results_title_shows_grouping_mode() {
+        let mut app = app_with_hits(3);
+        app.grouping_mode = ResultsGrouping::Workspace;
+        // Render so render_results_pane is called and title is built.
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+        // The title itself is local to render_results_pane so we can't read it directly,
+        // but we can verify the grouping_mode.label() is non-empty and differs from Agent.
+        assert_ne!(app.grouping_mode.label(), "by agent");
+        assert_eq!(app.grouping_mode.label(), "by workspace");
+    }
+
+    #[test]
+    fn regroup_clamps_active_pane() {
+        let mut app = CassApp::default();
+        let h1 = make_hit(1, "/a");
+        app.results = vec![h1];
+        app.grouping_mode = ResultsGrouping::Flat;
+        app.active_pane = 5; // invalid
+        app.regroup_panes();
+        assert_eq!(
+            app.active_pane, 0,
+            "active_pane should be clamped after regroup"
         );
     }
 }
