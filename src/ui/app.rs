@@ -12512,7 +12512,35 @@ pub fn run_tui_ftui(
     data_dir_override: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use ftui::ProgramConfig;
+    use ftui::core::capability_override::{CapabilityOverride, push_override};
     use ftui::render::budget::FrameBudgetConfig;
+
+    let env_truthy = |raw: Option<String>| {
+        raw.map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    };
+
+    // Auto-upgrade obviously bad inherited terminal profiles in interactive
+    // TUI sessions. This keeps UX consistent when wrapper shells export
+    // TERM=dumb even though the host terminal supports rich features.
+    let term_is_dumb = dotenvy::var("TERM")
+        .map(|v| v.trim().eq_ignore_ascii_case("dumb"))
+        .unwrap_or(false);
+    let allow_raw_dumb = env_truthy(dotenvy::var("CASS_ALLOW_DUMB_TERM").ok());
+    let headless = dotenvy::var("TUI_HEADLESS").is_ok();
+    let _caps_override = if term_is_dumb && !allow_raw_dumb && !headless {
+        eprintln!(
+            "info: TERM=dumb detected; using modern TUI capability profile. Set CASS_ALLOW_DUMB_TERM=1 to keep raw dumb mode."
+        );
+        Some(push_override(CapabilityOverride::modern()))
+    } else {
+        None
+    };
 
     let mut model = CassApp::default();
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);

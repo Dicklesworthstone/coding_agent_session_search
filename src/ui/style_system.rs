@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use ftui::render::cell::PackedRgba;
 use ftui::style::theme::themes;
 use ftui::{
-    AdaptiveColor, Color, ColorProfile, ResolvedTheme, Style, StyleSheet, Theme, ThemeBuilder,
+    AdaptiveColor, Color, ColorProfile, ResolvedTheme, Style, StyleSheet, TerminalCapabilities,
+    Theme, ThemeBuilder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -364,6 +365,7 @@ impl Default for StyleOptions {
 #[derive(Debug, Clone, Copy, Default)]
 struct EnvValues<'a> {
     no_color: Option<&'a str>,
+    cass_respect_no_color: Option<&'a str>,
     cass_no_color: Option<&'a str>,
     colorterm: Option<&'a str>,
     term: Option<&'a str>,
@@ -377,6 +379,7 @@ struct EnvValues<'a> {
 impl StyleOptions {
     pub fn from_env() -> Self {
         let no_color = dotenvy::var("NO_COLOR").ok();
+        let cass_respect_no_color = dotenvy::var("CASS_RESPECT_NO_COLOR").ok();
         let cass_no_color = dotenvy::var("CASS_NO_COLOR").ok();
         let colorterm = dotenvy::var("COLORTERM").ok();
         let term = dotenvy::var("TERM").ok();
@@ -386,8 +389,9 @@ impl StyleOptions {
         let cass_theme = dotenvy::var("CASS_THEME").ok();
         let cass_color_profile = dotenvy::var("CASS_COLOR_PROFILE").ok();
 
-        Self::from_env_values(EnvValues {
+        let mut options = Self::from_env_values(EnvValues {
             no_color: no_color.as_deref(),
+            cass_respect_no_color: cass_respect_no_color.as_deref(),
             cass_no_color: cass_no_color.as_deref(),
             colorterm: colorterm.as_deref(),
             term: term.as_deref(),
@@ -396,7 +400,23 @@ impl StyleOptions {
             cass_a11y: cass_a11y.as_deref(),
             cass_theme: cass_theme.as_deref(),
             cass_color_profile: cass_color_profile.as_deref(),
-        })
+        });
+
+        // Prefer runtime terminal capability detection for interactive TUI.
+        // This yields the best supported profile even when wrapper shells
+        // inherit conservative TERM values.
+        if !options.no_color && cass_color_profile.is_none() {
+            let caps = TerminalCapabilities::with_overrides();
+            options.color_profile = if caps.true_color {
+                ColorProfile::TrueColor
+            } else if caps.colors_256 {
+                ColorProfile::Ansi256
+            } else {
+                ColorProfile::Ansi16
+            };
+        }
+
+        options
     }
 
     fn from_env_values(values: EnvValues<'_>) -> Self {
@@ -405,7 +425,8 @@ impl StyleOptions {
             .and_then(UiThemePreset::parse)
             .unwrap_or(UiThemePreset::Dark);
 
-        let no_color_enabled = values.no_color.is_some() || values.cass_no_color.is_some();
+        let no_color_enabled = values.cass_no_color.is_some()
+            || (env_truthy(values.cass_respect_no_color) && values.no_color.is_some());
 
         let detected_profile = ColorProfile::detect_from_env(None, values.colorterm, values.term);
         let profile_override = values.cass_color_profile.and_then(parse_color_profile);
@@ -1114,6 +1135,7 @@ mod tests {
     fn options_from_values_honor_opt_out_and_profile_override() {
         let options = StyleOptions::from_env_values(EnvValues {
             no_color: Some("1"),
+            cass_respect_no_color: Some("1"),
             cass_no_color: None,
             colorterm: Some("truecolor"),
             term: Some("xterm-256color"),
@@ -1136,6 +1158,7 @@ mod tests {
     fn options_profile_override_applies_when_color_enabled() {
         let options = StyleOptions::from_env_values(EnvValues {
             no_color: None,
+            cass_respect_no_color: None,
             cass_no_color: None,
             colorterm: Some("truecolor"),
             term: Some("xterm-256color"),
@@ -1148,6 +1171,44 @@ mod tests {
 
         assert_eq!(options.color_profile, ColorProfile::Ansi16);
         assert!(!options.no_color);
+    }
+
+    #[test]
+    fn options_ignore_no_color_unless_explicitly_requested() {
+        let options = StyleOptions::from_env_values(EnvValues {
+            no_color: Some("1"),
+            cass_respect_no_color: None,
+            cass_no_color: None,
+            colorterm: Some("truecolor"),
+            term: Some("xterm-256color"),
+            cass_no_icons: None,
+            cass_no_gradient: None,
+            cass_a11y: Some("0"),
+            cass_theme: Some("dark"),
+            cass_color_profile: None,
+        });
+
+        assert!(!options.no_color);
+        assert_eq!(options.color_profile, ColorProfile::TrueColor);
+    }
+
+    #[test]
+    fn cass_no_color_always_forces_monochrome() {
+        let options = StyleOptions::from_env_values(EnvValues {
+            no_color: None,
+            cass_respect_no_color: None,
+            cass_no_color: Some("1"),
+            colorterm: Some("truecolor"),
+            term: Some("xterm-256color"),
+            cass_no_icons: None,
+            cass_no_gradient: None,
+            cass_a11y: Some("0"),
+            cass_theme: Some("dark"),
+            cass_color_profile: Some("truecolor"),
+        });
+
+        assert!(options.no_color);
+        assert_eq!(options.color_profile, ColorProfile::Mono);
     }
 
     #[test]
