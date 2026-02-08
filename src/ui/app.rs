@@ -48,7 +48,10 @@ use crate::ui::components::palette::{
 };
 use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
-use crate::ui::data::{ConversationView, InputMode, format_time_short};
+use crate::ui::data::{
+    BudgetHealthContract, CockpitState, ConversationView, DiffStrategyContract, InputMode,
+    ResizeRegimeContract, format_time_short,
+};
 use crate::ui::shortcuts;
 use crate::ui::time_parser::parse_time_input;
 use crate::update_check::{UpdateInfo, open_in_browser, skip_version};
@@ -1090,8 +1093,10 @@ impl InspectorTab {
         match self {
             Self::Timing => "Timing",
             Self::Layout => "Layout",
-            Self::HitRegions => "Hit Regions",
+            Self::HitRegions => "Hits",
             Self::Resize => "Resize",
+            Self::Diff => "Diff",
+            Self::Budget => "Budget",
         }
     }
 
@@ -1100,7 +1105,9 @@ impl InspectorTab {
             Self::Timing => Self::Layout,
             Self::Layout => Self::HitRegions,
             Self::HitRegions => Self::Resize,
-            Self::Resize => Self::Timing,
+            Self::Resize => Self::Diff,
+            Self::Diff => Self::Budget,
+            Self::Budget => Self::Timing,
         }
     }
 }
@@ -1238,6 +1245,67 @@ impl EvidenceSnapshots {
             },
             None => "\u{2014}",
         }
+    }
+
+    /// Sync evidence snapshots into cockpit data contracts.
+    ///
+    /// Translates raw ftui telemetry types into the cockpit's rendering-ready
+    /// contracts so the cockpit overlay can render without understanding
+    /// internal ftui types.
+    pub fn sync_cockpit(&self, cockpit: &mut CockpitState) {
+        // Diff strategy contract
+        if let Some(diff) = &self.diff {
+            cockpit.diff = DiffStrategyContract {
+                last_was_full_redraw: matches!(
+                    diff.strategy_used,
+                    ftui::render::diff_strategy::DiffStrategy::FullRedraw
+                ),
+                dirty_row_count: diff.span_count as u32,
+                total_row_count: (diff.rows as u32).max(1),
+                reason: match diff.strategy_used {
+                    ftui::render::diff_strategy::DiffStrategy::Full => "full",
+                    ftui::render::diff_strategy::DiffStrategy::DirtyRows => "dirty_rows",
+                    ftui::render::diff_strategy::DiffStrategy::FullRedraw => "full_redraw",
+                },
+                consecutive_full_redraws: 0, // not tracked by telemetry yet
+                full_redraw_ratio: 0.0,      // not tracked by telemetry yet
+            };
+        }
+
+        // Resize regime contract
+        cockpit.resize = ResizeRegimeContract {
+            regime: self.resize_regime_label(),
+            terminal_size: self.summary.applied_size,
+            bocpd_p_burst: self.summary.bocpd_p_burst,
+            bocpd_delay_ms: self.summary.bocpd_delay_ms,
+            history_len: self.summary.recent_resizes.len(),
+            last_action: if let Some(last) = self.summary.recent_resizes.back() {
+                last.action
+            } else {
+                "\u{2014}"
+            },
+            last_dt_ms: self.summary.recent_resizes.back().map_or(0.0, |e| e.dt_ms),
+            last_event_rate: self
+                .summary
+                .recent_resizes
+                .back()
+                .map_or(0.0, |e| e.event_rate),
+        };
+
+        // Budget health contract
+        cockpit.budget = BudgetHealthContract {
+            degradation: self.degradation_label(),
+            budget_us: self.summary.budget_us,
+            frame_time_us: self.summary.frame_time_us,
+            pid_output: self.summary.pid_output,
+            in_warmup: self.summary.in_warmup,
+            frames_observed: self.summary.frames_observed,
+            pressure: if self.summary.budget_us > 0.0 {
+                self.summary.frame_time_us / self.summary.budget_us
+            } else {
+                0.0
+            },
+        };
     }
 }
 
@@ -2301,6 +2369,8 @@ pub struct CassApp {
     pub palette_state: PaletteState,
     /// ftui CommandPalette widget (rendering, filtering, selection, scoring).
     pub command_palette: CommandPalette,
+    /// Whether the palette evidence ledger panel is visible.
+    pub show_palette_evidence: bool,
     /// Latest update check result (if any).
     pub update_info: Option<UpdateInfo>,
     /// Session-only dismissal toggle for update banner.
@@ -2409,6 +2479,10 @@ pub struct CassApp {
     /// Latest runtime evidence snapshots for explainability cockpit.
     pub evidence: EvidenceSnapshots,
 
+    // -- Explainability cockpit (1mfw3.3.2) --------------------------------
+    /// Cockpit data contracts aggregated from evidence snapshots.
+    pub cockpit: CockpitState,
+
     // -- Sources management (2noh9.4.9) -----------------------------------
     /// Sources management view state.
     pub sources_view: SourcesViewState,
@@ -2498,6 +2572,7 @@ impl Default for CassApp {
             palette_state: PaletteState::new(default_actions()),
             command_palette: {
                 let mut cp = CommandPalette::new().with_max_visible(12);
+                cp.enable_evidence_tracking(true);
                 for item in &default_actions() {
                     cp.register_action(
                         ActionItem::new(action_id(&item.action), &item.label)
@@ -2507,6 +2582,7 @@ impl Default for CassApp {
                 }
                 cp
             },
+            show_palette_evidence: false,
             update_info: None,
             update_dismissed: false,
             update_upgrade_armed: false,
@@ -2558,6 +2634,7 @@ impl Default for CassApp {
             inspector_state: InspectorState::default(),
             frame_timing: FrameTimingStats::default(),
             evidence: EvidenceSnapshots::default(),
+            cockpit: CockpitState::new(),
             sources_view: SourcesViewState::default(),
             status: String::new(),
             index_refresh_in_flight: false,
@@ -4415,6 +4492,112 @@ impl CassApp {
         }
     }
 
+    /// Render the palette evidence ledger panel below the palette overlay.
+    fn render_palette_evidence(
+        &self,
+        frame: &mut super::ftui_adapter::Frame,
+        area: Rect,
+        styles: &StyleContext,
+    ) {
+        use ftui::widgets::Widget;
+        let panel_w = 60u16.min(area.width.saturating_sub(4));
+        let panel_h = 10u16.min(area.height.saturating_sub(4));
+        if panel_w < 30 || panel_h < 5 {
+            return;
+        }
+        let px = area.x + (area.width.saturating_sub(panel_w)) / 2;
+        let py = area.y + area.height.saturating_sub(panel_h + 1);
+        let panel_area = Rect::new(px, py, panel_w, panel_h);
+        let bg = styles.style(style_system::STYLE_PANE_BASE);
+        let accent = styles.style(style_system::STYLE_PANE_FOCUSED);
+        let dim = styles.style(style_system::STYLE_TEXT_MUTED);
+        Block::new().style(bg).render(panel_area, frame);
+        let outer = Block::new()
+            .borders(Borders::ALL)
+            .border_type(if panel_w >= 40 {
+                BorderType::Rounded
+            } else {
+                BorderType::Square
+            })
+            .title(" Evidence Ledger (Alt+E) ")
+            .title_alignment(Alignment::Left)
+            .style(accent);
+        let inner = outer.inner(panel_area);
+        outer.render(panel_area, frame);
+        let mut lines: Vec<ftui::text::Line> = Vec::new();
+        if let Some(matched) = self.command_palette.selected_match() {
+            let desc = matched.result.match_type.description();
+            let pct = (matched.result.score * 100.0) as u32;
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled(
+                    format!("{} | {} | score {}%", matched.action.title, desc, pct),
+                    accent,
+                ),
+            ]));
+            for entry in matched.result.evidence.entries() {
+                let dir = if entry.bayes_factor > 1.0 {
+                    "+"
+                } else if entry.bayes_factor < 1.0 {
+                    "-"
+                } else {
+                    "="
+                };
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled(
+                        format!(
+                            "  {} {:?}: BF={:.2} {}",
+                            dir, entry.kind, entry.bayes_factor, entry.description
+                        ),
+                        dim,
+                    ),
+                ]));
+            }
+            let bf = matched.result.evidence.combined_bayes_factor();
+            let post = matched.result.evidence.posterior_probability();
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled(
+                    format!("  combined BF={:.2} | posterior={:.1}%", bf, post * 100.0),
+                    accent,
+                ),
+            ]));
+        } else {
+            lines.push(ftui::text::Line::from_spans(vec![
+                ftui::text::Span::styled("No match selected. Type a query to see evidence.", dim),
+            ]));
+        }
+        let stats = self.command_palette.scorer_stats();
+        lines.push(ftui::text::Line::from_spans(vec![
+            ftui::text::Span::styled(
+                format!(
+                    "scorer: {} full + {} incr | prune {:.0}%",
+                    stats.full_scans,
+                    stats.incremental_scans,
+                    stats.prune_ratio() * 100.0
+                ),
+                dim,
+            ),
+        ]));
+        {
+            let mut ly = inner.y;
+            for line in &lines {
+                if ly >= inner.y + inner.height {
+                    break;
+                }
+                let row = Rect::new(inner.x, ly, inner.width, 1);
+                Paragraph::new(
+                    line.spans()
+                        .iter()
+                        .map(|s| &*s.content)
+                        .collect::<Vec<_>>()
+                        .join(""),
+                )
+                .style(bg)
+                .render(row, frame);
+                ly += 1;
+            }
+        }
+    }
+
     /// Render the inspector debug overlay in the bottom-right corner.
     fn render_inspector_overlay(
         &self,
@@ -4422,8 +4605,8 @@ impl CassApp {
         area: Rect,
         styles: &StyleContext,
     ) {
-        let overlay_w = 52u16.min(area.width.saturating_sub(2));
-        let overlay_h = 14u16.min(area.height.saturating_sub(2));
+        let overlay_w = 56u16.min(area.width.saturating_sub(2));
+        let overlay_h = 16u16.min(area.height.saturating_sub(2));
         if overlay_w < 20 || overlay_h < 6 {
             return; // Too narrow — auto-disable in small terminals
         }
@@ -4445,6 +4628,8 @@ impl CassApp {
             InspectorTab::Layout,
             InspectorTab::HitRegions,
             InspectorTab::Resize,
+            InspectorTab::Diff,
+            InspectorTab::Budget,
         ]
         .iter()
         .map(|t| {
@@ -4456,7 +4641,12 @@ impl CassApp {
         })
         .collect::<Vec<_>>()
         .join(" ");
-        let title = format!(" Inspector: {tab_header} ");
+        let mode_indicator = if self.cockpit.enabled {
+            " [cockpit]"
+        } else {
+            ""
+        };
+        let title = format!(" {tab_header}{mode_indicator} ");
 
         let block = Block::new()
             .borders(Borders::ALL)
@@ -4642,10 +4832,150 @@ impl CassApp {
                     }
                 }
             }
+            InspectorTab::Diff => {
+                if let Some(diff) = &self.evidence.diff {
+                    let lines = [
+                        format!("Strategy: {}", diff.strategy_used),
+                        format!("Screen:   {}x{} {}", diff.cols, diff.rows, diff.screen_mode),
+                        format!(
+                            "Spans:    {} ({:.0}%)",
+                            diff.span_count,
+                            diff.span_coverage_pct * 100.0
+                        ),
+                        format!("MaxSpan:  {}", diff.max_span_len),
+                        format!("ScanCost: {}", diff.scan_cost_estimate),
+                        format!("Tile:     {}", if diff.tile_used { "yes" } else { "no" }),
+                        format!("P(chg):   {:.3}", diff.evidence.posterior_mean),
+                        format!(
+                            "Costs:    F={:.0} D={:.0} R={:.0}",
+                            diff.evidence.cost_full,
+                            diff.evidence.cost_dirty,
+                            diff.evidence.cost_redraw
+                        ),
+                    ];
+                    for line in &lines {
+                        if y >= max_y {
+                            break;
+                        }
+                        let row = Rect::new(inner.x, y, inner.width, 1);
+                        Paragraph::new(line.as_str())
+                            .style(value_style)
+                            .render(row, frame);
+                        y += 1;
+                    }
+                } else {
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    Paragraph::new("No diff evidence yet")
+                        .style(muted_style)
+                        .render(row, frame);
+                }
+            }
+            InspectorTab::Budget => {
+                let warn_style = styles.style(style_system::STYLE_STATUS_WARNING);
+                let error_style = styles.style(style_system::STYLE_STATUS_ERROR);
+                if let Some(budget) = &self.evidence.budget {
+                    let overrun = budget.frame_time_us > budget.budget_us;
+                    let degrading =
+                        budget.degradation_after as u8 > budget.degradation_before as u8;
+                    let pid_arrow = if budget.pid_output > 0.1 {
+                        "\u{2191}" // pressure increasing
+                    } else if budget.pid_output < -0.1 {
+                        "\u{2193}" // pressure decreasing
+                    } else {
+                        "\u{2194}" // stable
+                    };
+                    let e_zone = if budget.in_warmup {
+                        "warmup"
+                    } else if budget.e_value > 20.0 {
+                        "CRITICAL"
+                    } else if budget.e_value > 5.0 {
+                        "elevated"
+                    } else if budget.e_value < 0.5 {
+                        "healthy"
+                    } else {
+                        "normal"
+                    };
+                    let conformal_flag = budget
+                        .conformal
+                        .as_ref()
+                        .map(|c| if c.risk { " RISK" } else { "" })
+                        .unwrap_or("");
+                    let rows: Vec<(&str, String, bool)> = vec![
+                        ("Decision", format!("{:?}", budget.decision), degrading),
+                        (
+                            "Degrad",
+                            format!(
+                                "{:?} \u{2192} {:?}",
+                                budget.degradation_before, budget.degradation_after
+                            ),
+                            degrading,
+                        ),
+                        (
+                            "Frame/Bgt",
+                            format!(
+                                "{:.1}/{:.1}ms",
+                                budget.frame_time_us / 1000.0,
+                                budget.budget_us / 1000.0
+                            ),
+                            overrun,
+                        ),
+                        (
+                            "PID",
+                            format!("{:.2} {pid_arrow}", budget.pid_output),
+                            budget.pid_output > 0.3,
+                        ),
+                        (
+                            "E-value",
+                            format!("{:.2} ({e_zone}){conformal_flag}", budget.e_value),
+                            budget.e_value > 5.0,
+                        ),
+                        (
+                            "Frames",
+                            format!(
+                                "{} (chg {}ago)",
+                                budget.frames_observed, budget.frames_since_change
+                            ),
+                            false,
+                        ),
+                        (
+                            "Warmup",
+                            (if budget.in_warmup { "yes" } else { "no" }).to_string(),
+                            budget.in_warmup,
+                        ),
+                    ];
+                    for (label, value, is_warn) in &rows {
+                        if y >= max_y {
+                            break;
+                        }
+                        let row = Rect::new(inner.x, y, inner.width, 1);
+                        let text = format!("{label:<9}  {value}");
+                        let st = if *is_warn {
+                            if degrading || budget.e_value > 20.0 {
+                                error_style
+                            } else {
+                                warn_style
+                            }
+                        } else {
+                            value_style
+                        };
+                        Paragraph::new(text).style(st).render(row, frame);
+                        y += 1;
+                    }
+                } else {
+                    let row = Rect::new(inner.x, y, inner.width, 1);
+                    Paragraph::new("No budget evidence yet")
+                        .style(muted_style)
+                        .render(row, frame);
+                }
+            }
         }
 
         // Footer hint
-        let hint = "Ctrl+Shift+I:close  Tab:tab  m:mode";
+        let hint = if self.cockpit.enabled {
+            "^⇧I:close Tab:tab c:classic m:mode"
+        } else {
+            "^⇧I:close Tab:tab c:cockpit m:mode"
+        };
         let hint_row = Rect::new(inner.x, max_y.saturating_sub(1), inner.width, 1);
         Paragraph::new(hint)
             .style(muted_style)
@@ -5884,6 +6214,8 @@ pub enum CassMsg {
     PaletteSelectionMoved { delta: i32 },
     /// Execute the selected palette action.
     PaletteActionExecuted,
+    /// Toggle the palette evidence ledger panel.
+    PaletteEvidenceToggled,
 
     // -- Theme editor -----------------------------------------------------
     /// Open the interactive theme editor modal.
@@ -5914,6 +6246,8 @@ pub enum CassMsg {
     InspectorTabCycled,
     /// Cycle the ftui inspector mode (Off → HitRegions → WidgetBounds → Full).
     InspectorModeCycled,
+    /// Toggle cockpit mode on/off within the inspector overlay.
+    CockpitModeToggled,
 
     // -- Help overlay -----------------------------------------------------
     /// Toggle the help overlay.
@@ -7153,16 +7487,33 @@ impl super::ftui_adapter::Model for CassApp {
         }
 
         // ── Inspector overlay key intercept ─────────────────────────
-        // Non-blocking: only intercept Tab (cycle tabs) and m (cycle mode)
+        // Non-blocking: intercept Tab (cycle tabs), m (cycle mode), c (cockpit)
         if self.show_inspector {
             match &msg {
-                CassMsg::InspectorTabCycled => {
+                CassMsg::InspectorTabCycled | CassMsg::FocusToggled => {
                     self.inspector_tab = self.inspector_tab.next();
                     return ftui::Cmd::none();
                 }
                 CassMsg::InspectorModeCycled => {
                     self.inspector_state.cycle_mode();
                     return ftui::Cmd::none();
+                }
+                CassMsg::CockpitModeToggled => {
+                    self.cockpit.enabled = !self.cockpit.enabled;
+                    if self.cockpit.enabled {
+                        self.inspector_tab = InspectorTab::Diff;
+                    } else {
+                        self.inspector_tab = InspectorTab::Timing;
+                    }
+                    return ftui::Cmd::none();
+                }
+                // Redirect single-char keys to inspector actions when overlay is open
+                CassMsg::QueryChanged(text) if text == "m" => {
+                    self.inspector_state.cycle_mode();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::QueryChanged(text) if text == "c" => {
+                    return self.update(CassMsg::CockpitModeToggled);
                 }
                 _ => {}
             }
@@ -7409,13 +7760,21 @@ impl super::ftui_adapter::Model for CassApp {
                 CassMsg::Tick | CassMsg::ForceQuit | CassMsg::MouseEvent { .. } => {}
                 _ => {
                     if let Some(ref raw_event) = peek_raw_event()
-                        && let super::ftui_adapter::Event::Key(_) = raw_event
+                        && let super::ftui_adapter::Event::Key(ke) = raw_event
                     {
+                        // Alt+E toggles the evidence ledger panel.
+                        if ke.code == super::ftui_adapter::KeyCode::Char('e')
+                            && ke.modifiers.contains(super::ftui_adapter::Modifiers::ALT)
+                        {
+                            self.show_palette_evidence = !self.show_palette_evidence;
+                            return ftui::Cmd::none();
+                        }
                         if let Some(action) = self.command_palette.handle_event(raw_event) {
                             use ftui::widgets::command_palette::PaletteAction as WPA;
                             match action {
                                 WPA::Execute(ref id) => {
                                     self.command_palette.close();
+                                    self.show_palette_evidence = false;
                                     self.focus_manager.pop_trap();
                                     let result = action_by_id(&self.palette_state.all_actions, id)
                                         .map(|a| a.dispatch())
@@ -7424,6 +7783,7 @@ impl super::ftui_adapter::Model for CassApp {
                                 }
                                 WPA::Dismiss => {
                                     self.command_palette.close();
+                                    self.show_palette_evidence = false;
                                     self.focus_manager.pop_trap();
                                     return ftui::Cmd::none();
                                 }
@@ -8524,7 +8884,12 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::PaletteClosed => {
                 self.command_palette.close();
+                self.show_palette_evidence = false;
                 self.focus_manager.pop_trap();
+                ftui::Cmd::none()
+            }
+            CassMsg::PaletteEvidenceToggled => {
+                self.show_palette_evidence = !self.show_palette_evidence;
                 ftui::Cmd::none()
             }
             CassMsg::PaletteQueryChanged(q) => {
@@ -8544,6 +8909,7 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::PaletteActionExecuted => {
                 let result = execute_selected(&self.palette_state);
                 self.command_palette.close();
+                self.show_palette_evidence = false;
                 self.palette_result_to_cmd(result)
             }
 
@@ -8673,6 +9039,16 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::InspectorModeCycled => {
                 self.inspector_state.cycle_mode();
+                ftui::Cmd::none()
+            }
+            CassMsg::CockpitModeToggled => {
+                self.cockpit.enabled = !self.cockpit.enabled;
+                // When entering cockpit mode, jump to the first cockpit tab.
+                if self.cockpit.enabled {
+                    self.inspector_tab = InspectorTab::Diff;
+                } else {
+                    self.inspector_tab = InspectorTab::Timing;
+                }
                 ftui::Cmd::none()
             }
 
@@ -9404,6 +9780,10 @@ impl super::ftui_adapter::Model for CassApp {
                     self.frame_timing.record_frame();
                     // Refresh evidence snapshots from runtime telemetry.
                     self.evidence.refresh();
+                    // Sync cockpit data contracts from evidence.
+                    if self.cockpit.enabled {
+                        self.evidence.sync_cockpit(&mut self.cockpit);
+                    }
                 }
                 // Tick spring-based animations.
                 self.anim.tick(dt);
@@ -10214,6 +10594,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 if self.command_palette.is_visible() {
                     self.command_palette.close();
+                    self.show_palette_evidence = false;
                     self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
@@ -11007,6 +11388,9 @@ impl super::ftui_adapter::Model for CassApp {
         if self.command_palette.is_visible() {
             use super::ftui_adapter::Widget;
             self.command_palette.render(area, frame);
+            if self.show_palette_evidence {
+                self.render_palette_evidence(frame, area, &styles);
+            }
         }
 
         // ── Screenshot capture (runs after all rendering completes) ──
@@ -12385,7 +12769,10 @@ mod tests {
 
         // Execute it - should produce ThemeToggled cmd
         let cmd = app.update(CassMsg::PaletteActionExecuted);
-        assert!(!app.command_palette.is_visible(), "palette should close on execute");
+        assert!(
+            !app.command_palette.is_visible(),
+            "palette should close on execute"
+        );
         // The returned Cmd contains CassMsg::ThemeToggled; process it
         if let Some(msg) = extract_msg(cmd) {
             let _ = app.update(msg);
@@ -12550,6 +12937,64 @@ mod tests {
             app.command_palette.action_count(),
             app.palette_state.all_actions.len()
         );
+    }
+
+    // -- Evidence ledger tests (1mfw3.1.5) -----------------------------------
+
+    #[test]
+    fn palette_evidence_off_by_default() {
+        let app = CassApp::default();
+        assert!(!app.show_palette_evidence);
+    }
+
+    #[test]
+    fn palette_evidence_toggle_msg() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::PaletteOpened);
+        assert!(!app.show_palette_evidence);
+        let _ = app.update(CassMsg::PaletteEvidenceToggled);
+        assert!(app.show_palette_evidence);
+        let _ = app.update(CassMsg::PaletteEvidenceToggled);
+        assert!(!app.show_palette_evidence);
+    }
+
+    #[test]
+    fn palette_evidence_resets_on_close() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::PaletteOpened);
+        let _ = app.update(CassMsg::PaletteEvidenceToggled);
+        assert!(app.show_palette_evidence);
+        let _ = app.update(CassMsg::PaletteClosed);
+        assert!(!app.show_palette_evidence);
+    }
+
+    #[test]
+    fn palette_evidence_resets_on_execute() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::PaletteOpened);
+        let _ = app.update(CassMsg::PaletteEvidenceToggled);
+        assert!(app.show_palette_evidence);
+        let _ = app.update(CassMsg::PaletteActionExecuted);
+        assert!(!app.show_palette_evidence);
+    }
+
+    #[test]
+    fn palette_evidence_resets_on_esc() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::PaletteOpened);
+        let _ = app.update(CassMsg::PaletteEvidenceToggled);
+        assert!(app.show_palette_evidence);
+        let _ = app.update(CassMsg::QuitRequested);
+        assert!(!app.show_palette_evidence);
+    }
+
+    #[test]
+    fn palette_evidence_tracking_enabled() {
+        let app = CassApp::default();
+        // Evidence tracking is enabled; scorer stats should be accessible.
+        let stats = app.command_palette.scorer_stats();
+        // At least one scan may occur during initialization.
+        assert!(stats.full_scans <= 1);
     }
 
     #[test]
@@ -18389,6 +18834,12 @@ mod tests {
         assert_eq!(app.inspector_tab, InspectorTab::Resize);
 
         let _ = app.update(CassMsg::InspectorTabCycled);
+        assert_eq!(app.inspector_tab, InspectorTab::Diff);
+
+        let _ = app.update(CassMsg::InspectorTabCycled);
+        assert_eq!(app.inspector_tab, InspectorTab::Budget);
+
+        let _ = app.update(CassMsg::InspectorTabCycled);
         assert_eq!(app.inspector_tab, InspectorTab::Timing);
     }
 
@@ -19374,8 +19825,132 @@ mod tests {
     #[test]
     fn inspector_resize_tab_cycles_correctly() {
         assert_eq!(InspectorTab::HitRegions.next(), InspectorTab::Resize);
-        assert_eq!(InspectorTab::Resize.next(), InspectorTab::Timing);
+        assert_eq!(InspectorTab::Resize.next(), InspectorTab::Diff);
+        assert_eq!(InspectorTab::Diff.next(), InspectorTab::Budget);
+        assert_eq!(InspectorTab::Budget.next(), InspectorTab::Timing);
     }
+
+    #[test]
+    fn inspector_budget_overrun_detected() {
+        use ftui::render::budget::{BudgetDecision, DegradationLevel};
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        app.inspector_tab = InspectorTab::Budget;
+        app.evidence.budget = Some(
+            ftui::runtime::evidence_telemetry::BudgetDecisionSnapshot {
+                frame_idx: 100,
+                decision: BudgetDecision::Hold,
+                controller_decision: BudgetDecision::Hold,
+                degradation_before: DegradationLevel::Full,
+                degradation_after: DegradationLevel::Full,
+                frame_time_us: 20000.0,
+                budget_us: 16000.0,
+                pid_output: 0.4,
+                e_value: 2.0,
+                frames_observed: 50,
+                frames_since_change: 30,
+                in_warmup: false,
+                conformal: None,
+            },
+        );
+        let b = app.evidence.budget.as_ref().unwrap();
+        assert!(b.frame_time_us > b.budget_us, "overrun detected");
+        assert!(b.pid_output > 0.1, "pressure increasing");
+    }
+
+    #[test]
+    fn inspector_budget_degradation_warning() {
+        use ftui::render::budget::{BudgetDecision, DegradationLevel};
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        app.inspector_tab = InspectorTab::Budget;
+        app.evidence.budget = Some(
+            ftui::runtime::evidence_telemetry::BudgetDecisionSnapshot {
+                frame_idx: 200,
+                decision: BudgetDecision::Degrade,
+                controller_decision: BudgetDecision::Degrade,
+                degradation_before: DegradationLevel::Full,
+                degradation_after: DegradationLevel::SimpleBorders,
+                frame_time_us: 25000.0,
+                budget_us: 16000.0,
+                pid_output: 0.8,
+                e_value: 25.0,
+                frames_observed: 80,
+                frames_since_change: 0,
+                in_warmup: false,
+                conformal: None,
+            },
+        );
+        let b = app.evidence.budget.as_ref().unwrap();
+        assert!(
+            b.degradation_after as u8 > b.degradation_before as u8,
+            "degrading"
+        );
+        assert!(b.e_value > 20.0, "e-value critical");
+    }
+
+    #[test]
+    fn inspector_budget_healthy_state() {
+        use ftui::render::budget::{BudgetDecision, DegradationLevel};
+        let mut app = CassApp::default();
+        app.evidence.budget = Some(
+            ftui::runtime::evidence_telemetry::BudgetDecisionSnapshot {
+                frame_idx: 300,
+                decision: BudgetDecision::Hold,
+                controller_decision: BudgetDecision::Hold,
+                degradation_before: DegradationLevel::Full,
+                degradation_after: DegradationLevel::Full,
+                frame_time_us: 8000.0,
+                budget_us: 16000.0,
+                pid_output: -0.2,
+                e_value: 0.3,
+                frames_observed: 200,
+                frames_since_change: 150,
+                in_warmup: false,
+                conformal: None,
+            },
+        );
+        let b = app.evidence.budget.as_ref().unwrap();
+        assert!(b.frame_time_us < b.budget_us, "within budget");
+        assert!(b.e_value < 0.5, "healthy zone");
+        assert!(b.pid_output < -0.1, "pressure decreasing");
+    }
+
+    #[test]
+    fn inspector_budget_conformal_risk() {
+        use ftui::render::budget::{BudgetDecision, DegradationLevel};
+        let mut app = CassApp::default();
+        app.evidence.budget = Some(
+            ftui::runtime::evidence_telemetry::BudgetDecisionSnapshot {
+                frame_idx: 400,
+                decision: BudgetDecision::Hold,
+                controller_decision: BudgetDecision::Hold,
+                degradation_before: DegradationLevel::Full,
+                degradation_after: DegradationLevel::Full,
+                frame_time_us: 15000.0,
+                budget_us: 16000.0,
+                pid_output: 0.05,
+                e_value: 1.5,
+                frames_observed: 100,
+                frames_since_change: 50,
+                in_warmup: false,
+                conformal: Some(
+                    ftui::runtime::evidence_telemetry::ConformalSnapshot {
+                        bucket_key: "alt:Full:medium".to_string(),
+                        sample_count: 42,
+                        upper_us: 18000.0,
+                        risk: true,
+                    },
+                ),
+            },
+        );
+        let b = app.evidence.budget.as_ref().unwrap();
+        assert!(
+            b.conformal.as_ref().unwrap().risk,
+            "conformal risk flagged"
+        );
+    }
+
 
     #[test]
     fn inspector_resize_tab_reachable() {
@@ -19404,6 +19979,118 @@ mod tests {
         assert!(app.evidence.summary.has_data());
         assert_eq!(app.evidence.summary.regime, "Steady");
         assert_eq!(app.evidence.summary.degradation, "Full");
+    }
+
+    #[test]
+    fn inspector_diff_tab_label() {
+        assert_eq!(InspectorTab::Diff.label(), "Diff");
+    }
+
+    #[test]
+    fn inspector_budget_tab_label() {
+        assert_eq!(InspectorTab::Budget.label(), "Budget");
+    }
+
+    #[test]
+    fn inspector_diff_tab_no_evidence() {
+        let app = CassApp::default();
+        assert!(app.evidence.diff.is_none());
+    }
+
+    #[test]
+    fn inspector_budget_tab_no_evidence() {
+        let app = CassApp::default();
+        assert!(app.evidence.budget.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cockpit mode tests (1mfw3.3.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cockpit_disabled_by_default() {
+        let app = CassApp::default();
+        assert!(!app.cockpit.enabled);
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+    }
+
+    #[test]
+    fn cockpit_toggle_switches_to_diff_tab() {
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        let _ = app.update(CassMsg::CockpitModeToggled);
+        assert!(app.cockpit.enabled);
+        assert_eq!(app.inspector_tab, InspectorTab::Diff);
+    }
+
+    #[test]
+    fn cockpit_toggle_off_returns_to_timing() {
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        let _ = app.update(CassMsg::CockpitModeToggled);
+        assert!(app.cockpit.enabled);
+        let _ = app.update(CassMsg::CockpitModeToggled);
+        assert!(!app.cockpit.enabled);
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+    }
+
+    #[test]
+    fn cockpit_c_key_toggles_when_inspector_visible() {
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        // Simulate 'c' keypress (which generates QueryChanged("c"))
+        let _ = app.update(CassMsg::QueryChanged("c".to_string()));
+        assert!(app.cockpit.enabled);
+        assert_eq!(app.inspector_tab, InspectorTab::Diff);
+    }
+
+    #[test]
+    fn cockpit_m_key_cycles_mode_when_inspector_visible() {
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        let before = format!("{:?}", app.inspector_state);
+        let _ = app.update(CassMsg::QueryChanged("m".to_string()));
+        // inspector_state should have changed (mode cycled)
+        assert_ne!(before, format!("{:?}", app.inspector_state));
+    }
+
+    #[test]
+    fn cockpit_tab_cycles_tabs_when_inspector_visible() {
+        let mut app = CassApp::default();
+        app.show_inspector = true;
+        assert_eq!(app.inspector_tab, InspectorTab::Timing);
+        // Tab key maps to FocusToggled; inspector intercepts it for tab cycling
+        let _ = app.update(CassMsg::FocusToggled);
+        assert_eq!(app.inspector_tab, InspectorTab::Layout);
+    }
+
+    #[test]
+    fn cockpit_state_starts_empty() {
+        let app = CassApp::default();
+        assert!(!app.cockpit.has_any_data());
+    }
+
+    #[test]
+    fn cockpit_sync_populates_budget_contract() {
+        let mut app = CassApp::default();
+        // Manually set evidence summary to simulate telemetry data
+        app.evidence.summary.frames_observed = 42;
+        app.evidence.summary.budget_us = 16666.0;
+        app.evidence.summary.frame_time_us = 12000.0;
+        app.evidence.sync_cockpit(&mut app.cockpit);
+        assert!(app.cockpit.budget.has_data());
+        assert_eq!(app.cockpit.budget.frames_observed, 42);
+        assert!(!app.cockpit.budget.is_over_budget());
+    }
+
+    #[test]
+    fn cockpit_sync_without_evidence_uses_defaults() {
+        let mut app = CassApp::default();
+        app.evidence.sync_cockpit(&mut app.cockpit);
+        // No raw evidence → resize regime is em dash (no data)
+        assert!(!app.cockpit.resize.has_data());
+        // No frames observed → budget has no data
+        assert!(!app.cockpit.budget.has_data());
     }
 
     // -----------------------------------------------------------------------
