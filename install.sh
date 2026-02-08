@@ -6,6 +6,7 @@ shopt -s lastpipe 2>/dev/null || true
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-coding_agent_session_search}"
+PINNED_RATATUI_VERSION="${PINNED_RATATUI_VERSION:-v0.1.64}"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 EASY=0
@@ -27,31 +28,8 @@ err() { log "\033[0;31m✗\033[0m $*"; }
 
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
-
-  info "Resolving latest version..."
-  local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-  local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
-    tag=""
-  fi
-
-  if [ -n "$tag" ]; then
-    VERSION="$tag"
-    info "Resolved latest version: $VERSION"
-  else
-    # Try redirect-based resolution as fallback
-    local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
-    if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
-      # Validate: tag must be non-empty, start with 'v' + digit, and not contain URL chars
-      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
-        VERSION="$tag"
-        info "Resolved latest version via redirect: $VERSION"
-        return 0
-      fi
-    fi
-    VERSION="v0.1.54"
-    warn "Could not resolve latest version; defaulting to $VERSION"
-  fi
+  VERSION="$PINNED_RATATUI_VERSION"
+  info "Using pinned stable version: $VERSION"
 }
 
 maybe_add_path() {
@@ -209,7 +187,7 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git, rust nightly)"
   ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/cass"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }

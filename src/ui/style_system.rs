@@ -45,6 +45,10 @@ pub const STYLE_ROLE_GUTTER_USER: &str = "role.gutter.user";
 pub const STYLE_ROLE_GUTTER_ASSISTANT: &str = "role.gutter.assistant";
 pub const STYLE_ROLE_GUTTER_TOOL: &str = "role.gutter.tool";
 pub const STYLE_ROLE_GUTTER_SYSTEM: &str = "role.gutter.system";
+pub const STYLE_SCORE_HIGH: &str = "score.high";
+pub const STYLE_SCORE_MID: &str = "score.mid";
+pub const STYLE_SCORE_LOW: &str = "score.low";
+pub const STYLE_PILL_ACTIVE: &str = "pill.active";
 pub const STYLE_TAB_ACTIVE: &str = "tab.active";
 pub const STYLE_TAB_INACTIVE: &str = "tab.inactive";
 pub const STYLE_KBD_KEY: &str = "kbd.key";
@@ -114,7 +118,7 @@ impl UiThemePreset {
 
     fn base_theme(self) -> Theme {
         match self {
-            Self::Dark => themes::dark(),
+            Self::Dark => tokyo_night_theme(),
             Self::Light => themes::light(),
             Self::HighContrast => high_contrast_theme(),
             Self::Catppuccin => catppuccin_theme(),
@@ -573,19 +577,20 @@ impl StyleContext {
         self.sheet.get_or_default(name)
     }
 
-    /// Return a bold accent style for an agent slug.
-    pub fn agent_accent_style(&self, _agent: &str) -> Style {
-        self.style(STYLE_ROLE_ASSISTANT).bold()
+    /// Return an accent-colored style for the given agent slug.
+    pub fn agent_accent_style(&self, agent: &str) -> Style {
+        let pane = super::components::theme::ThemePalette::agent_pane(agent);
+        Style::new().fg(pane.accent).bold()
     }
 
     /// Return a score-magnitude style (high/mid/low).
     pub fn score_style(&self, score: f32) -> Style {
         if score >= 8.0 {
-            self.style(STYLE_STATUS_SUCCESS)
+            self.style(STYLE_SCORE_HIGH)
         } else if score >= 5.0 {
-            self.style(STYLE_TEXT_PRIMARY)
+            self.style(STYLE_SCORE_MID)
         } else {
-            self.style(STYLE_TEXT_MUTED)
+            self.style(STYLE_SCORE_LOW)
         }
     }
 
@@ -615,6 +620,30 @@ fn env_truthy(value: Option<&str>) -> bool {
         }
         None => false,
     }
+}
+
+fn tokyo_night_theme() -> Theme {
+    ThemeBuilder::from_theme(themes::dark())
+        .primary(Color::rgb(122, 162, 247))
+        .secondary(Color::rgb(187, 154, 247))
+        .accent(Color::rgb(125, 207, 255))
+        .background(Color::rgb(26, 27, 38))
+        .surface(Color::rgb(36, 40, 59))
+        .overlay(Color::rgb(41, 46, 66))
+        .text(Color::rgb(192, 202, 245))
+        .text_muted(Color::rgb(169, 177, 214))
+        .text_subtle(Color::rgb(105, 114, 158))
+        .success(Color::rgb(115, 218, 202))
+        .warning(Color::rgb(224, 175, 104))
+        .error(Color::rgb(247, 118, 142))
+        .info(Color::rgb(125, 207, 255))
+        .border(Color::rgb(59, 66, 97))
+        .border_focused(Color::rgb(125, 145, 200))
+        .selection_bg(Color::rgb(122, 162, 247))
+        .selection_fg(Color::rgb(26, 27, 38))
+        .scrollbar_track(Color::rgb(41, 46, 66))
+        .scrollbar_thumb(Color::rgb(125, 145, 200))
+        .build()
 }
 
 fn catppuccin_theme() -> Theme {
@@ -922,9 +951,8 @@ fn build_stylesheet(resolved: ResolvedTheme, options: StyleOptions) -> StyleShee
     sheet.define(
         STYLE_PANE_FOCUSED,
         Style::new()
-            .fg(to_packed(resolved.text))
-            .bg(to_packed(resolved.surface))
-            .underline(),
+            .fg(to_packed(resolved.border_focused))
+            .bg(to_packed(resolved.surface)),
     );
 
     sheet.define(
@@ -1039,6 +1067,42 @@ fn build_stylesheet(resolved: ResolvedTheme, options: StyleOptions) -> StyleShee
             role_system,
             0.18,
         ))),
+    );
+
+    sheet.define(
+        STYLE_SCORE_HIGH,
+        Style::new().fg(to_packed(resolved.success)).bold(),
+    );
+    sheet.define(STYLE_SCORE_MID, Style::new().fg(to_packed(resolved.info)));
+    sheet.define(
+        STYLE_SCORE_LOW,
+        Style::new().fg(to_packed(resolved.text_subtle)).dim(),
+    );
+
+    sheet.define(
+        STYLE_KBD_KEY,
+        Style::new().fg(to_packed(resolved.accent)).bold(),
+    );
+    sheet.define(
+        STYLE_KBD_DESC,
+        Style::new().fg(to_packed(resolved.text_subtle)),
+    );
+
+    sheet.define(
+        STYLE_PILL_ACTIVE,
+        Style::new().fg(to_packed(resolved.secondary)).bold(),
+    );
+
+    sheet.define(
+        STYLE_TAB_ACTIVE,
+        Style::new()
+            .fg(to_packed(resolved.accent))
+            .bold()
+            .underline(),
+    );
+    sheet.define(
+        STYLE_TAB_INACTIVE,
+        Style::new().fg(to_packed(resolved.text_muted)),
     );
 
     sheet
@@ -1212,6 +1276,24 @@ mod tests {
     }
 
     #[test]
+    fn dark_preset_matches_tokyo_night_palette() {
+        let context = StyleContext::from_options(StyleOptions {
+            preset: UiThemePreset::Dark,
+            dark_mode: true,
+            color_profile: ColorProfile::TrueColor,
+            no_color: false,
+            no_icons: false,
+            no_gradient: false,
+            a11y: false,
+        });
+
+        assert_eq!(context.resolved.background, Color::rgb(26, 27, 38));
+        assert_eq!(context.resolved.surface, Color::rgb(36, 40, 59));
+        assert_eq!(context.resolved.text, Color::rgb(192, 202, 245));
+        assert_eq!(context.resolved.border_focused, Color::rgb(125, 145, 200));
+    }
+
+    #[test]
     fn style_context_builds_required_semantic_styles() {
         let context = StyleContext::from_options(StyleOptions {
             preset: UiThemePreset::Dark,
@@ -1238,6 +1320,14 @@ mod tests {
             STYLE_ROLE_GUTTER_ASSISTANT,
             STYLE_ROLE_GUTTER_TOOL,
             STYLE_ROLE_GUTTER_SYSTEM,
+            STYLE_SCORE_HIGH,
+            STYLE_SCORE_MID,
+            STYLE_SCORE_LOW,
+            STYLE_KBD_KEY,
+            STYLE_KBD_DESC,
+            STYLE_PILL_ACTIVE,
+            STYLE_TAB_ACTIVE,
+            STYLE_TAB_INACTIVE,
         ] {
             assert!(context.sheet.contains(key), "missing style token: {key}");
         }

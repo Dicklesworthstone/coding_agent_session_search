@@ -2543,6 +2543,30 @@ fn ranking_mode_label(mode: RankingMode) -> &'static str {
     }
 }
 
+fn search_mode_token(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::Lexical => "LEX",
+        SearchMode::Semantic => "SEM",
+        SearchMode::Hybrid => "HYB",
+    }
+}
+
+fn match_mode_token(mode: MatchMode) -> &'static str {
+    match mode {
+        MatchMode::Standard => "STD",
+        MatchMode::Prefix => "PFX",
+    }
+}
+
+fn context_window_token(window: ContextWindow) -> &'static str {
+    match window {
+        ContextWindow::Small => "S",
+        ContextWindow::Medium => "M",
+        ContextWindow::Large => "L",
+        ContextWindow::XLarge => "XL",
+    }
+}
+
 /// Persisted filters+ranking for a saved-view slot.
 #[derive(Clone, Debug)]
 pub struct SavedView {
@@ -4740,9 +4764,15 @@ impl CassApp {
         pane_focused_style: ftui::Style,
         text_muted_style: ftui::Style,
     ) {
-        // Styled tab bar is rendered inside the pane below; block title is short.
+        // Keep the title explicit: include the active tab + wrap state.
         let wrap_indicator = if self.detail_wrap { " \u{21a9}" } else { "" };
-        let title = format!("Detail{wrap_indicator}");
+        let tab_label = match self.detail_tab {
+            DetailTab::Messages => "Messages",
+            DetailTab::Snippets => "Snippets",
+            DetailTab::Raw => "Raw",
+            DetailTab::Json => "Json",
+        };
+        let title = format!("Detail [{tab_label}]{wrap_indicator}");
 
         let block_style = if self.focused_region() == FocusRegion::Detail {
             pane_focused_style
@@ -11650,15 +11680,22 @@ impl super::ftui_adapter::Model for CassApp {
 
                 // ── Search bar ──────────────────────────────────────────
                 let mode_label = match self.search_mode {
-                    SearchMode::Lexical => "lexical",
-                    SearchMode::Semantic => "semantic",
-                    SearchMode::Hybrid => "hybrid",
+                    SearchMode::Lexical => "Lexical",
+                    SearchMode::Semantic => "Semantic",
+                    SearchMode::Hybrid => "Hybrid",
+                };
+                let match_label = match self.match_mode {
+                    MatchMode::Standard => "Standard",
+                    MatchMode::Prefix => "Prefix",
                 };
                 let vis = breakpoint.visibility_policy();
                 let query_title = if vis.show_theme_in_title {
-                    format!("cass | {} | {mode_label}", self.theme_preset.name())
+                    format!(
+                        "cass | {} | {mode_label}/{match_label}",
+                        self.theme_preset.name()
+                    )
                 } else {
-                    format!("cass | {mode_label}")
+                    format!("cass | {mode_label}/{match_label}")
                 };
                 let query_block = Block::new()
                     .borders(adaptive_borders)
@@ -11838,10 +11875,27 @@ impl super::ftui_adapter::Model for CassApp {
                 } else {
                     self.results.len()
                 };
+                let mode_tag = format!("mode:{}", search_mode_token(self.search_mode));
+                let match_tag = format!("match:{}", match_mode_token(self.match_mode));
+                let rank_tag = format!(
+                    "rank:{}",
+                    ranking_mode_label(self.ranking_mode).to_ascii_lowercase()
+                );
+                let ctx_tag = format!("ctx:{}", context_window_token(self.context_window));
                 let degradation_tag = if degradation.is_full() {
                     String::new()
                 } else {
                     format!(" | deg:{}", degradation.as_str())
+                };
+                let wildcard_tag = if self.wildcard_fallback {
+                    " | ✱ fuzzy".to_string()
+                } else {
+                    String::new()
+                };
+                let latency_tag = if let Some(ms) = self.last_search_ms {
+                    format!(" | {ms}ms")
+                } else {
+                    String::new()
                 };
                 let sel_tag = if self.selected.is_empty() {
                     String::new()
@@ -11866,10 +11920,13 @@ impl super::ftui_adapter::Model for CassApp {
                     let row1 = Rect::new(footer_area.x, footer_area.y, footer_area.width, 1);
                     let status_line = if self.status.is_empty() {
                         format!(
-                            " {hits_for_status} hits | {bp_label} | {density_label}{source_tag}{degradation_tag}{sel_tag}{rec_tag}",
+                            " {hits_for_status} hits | {mode_tag} | {match_tag} | {rank_tag} | {ctx_tag} | {bp_label} | {density_label}{source_tag}{wildcard_tag}{latency_tag}{degradation_tag}{sel_tag}{rec_tag}",
                         )
                     } else {
-                        format!(" {}{}{}{}", self.status, degradation_tag, sel_tag, rec_tag)
+                        format!(
+                            " {} | {mode_tag} | {match_tag} | {rank_tag} | {ctx_tag}{source_tag}{wildcard_tag}{latency_tag}{degradation_tag}{sel_tag}{rec_tag}",
+                            self.status
+                        )
                     };
                     Paragraph::new(&*status_line)
                         .style(text_muted_style)
@@ -11890,10 +11947,13 @@ impl super::ftui_adapter::Model for CassApp {
                     let status_line = if self.status.is_empty() {
                         let hints = self.build_contextual_footer_hints(area.width);
                         format!(
-                            " {hits_for_status} hits | {bp_label} | {density_label}{source_tag}{degradation_tag}{sel_tag}{rec_tag}{hints}",
+                            " {hits_for_status} hits | {mode_tag} | {match_tag} | {rank_tag} | {ctx_tag} | {bp_label} | {density_label}{source_tag}{wildcard_tag}{latency_tag}{degradation_tag}{sel_tag}{rec_tag}{hints}",
                         )
                     } else {
-                        format!(" {}{}{}{}", self.status, degradation_tag, sel_tag, rec_tag)
+                        format!(
+                            " {} | {mode_tag} | {match_tag} | {rank_tag} | {ctx_tag}{source_tag}{wildcard_tag}{latency_tag}{degradation_tag}{sel_tag}{rec_tag}",
+                            self.status
+                        )
                     };
                     Paragraph::new(&*status_line)
                         .style(text_muted_style)
@@ -12528,16 +12588,31 @@ pub fn run_tui_ftui(
     // Auto-upgrade obviously bad inherited terminal profiles in interactive
     // TUI sessions. This keeps UX consistent when wrapper shells export
     // TERM=dumb even though the host terminal supports rich features.
-    let term_is_dumb = dotenvy::var("TERM")
-        .map(|v| v.trim().eq_ignore_ascii_case("dumb"))
-        .unwrap_or(false);
+    let term_raw = dotenvy::var("TERM").unwrap_or_default();
+    let term_lower = term_raw.trim().to_ascii_lowercase();
+    let term_is_dumb = term_lower == "dumb";
     let allow_raw_dumb = env_truthy(dotenvy::var("CASS_ALLOW_DUMB_TERM").ok());
     let headless = dotenvy::var("TUI_HEADLESS").is_ok();
     let _caps_override = if term_is_dumb && !allow_raw_dumb && !headless {
         eprintln!(
-            "info: TERM=dumb detected; using modern TUI capability profile. Set CASS_ALLOW_DUMB_TERM=1 to keep raw dumb mode."
+            "info: TERM=dumb detected; enabling compatibility TUI profile (rich color + unicode, safe controls)."
         );
-        Some(push_override(CapabilityOverride::modern()))
+        Some(push_override(
+            CapabilityOverride::new()
+                .true_color(Some(true))
+                .colors_256(Some(true))
+                .unicode_box_drawing(Some(true))
+                .unicode_emoji(Some(true))
+                .double_width(Some(true))
+                .scroll_region(Some(true))
+                .focus_events(Some(true))
+                .bracketed_paste(Some(true))
+                .mouse_sgr(Some(true))
+                .osc52_clipboard(Some(true))
+                .sync_output(Some(false))
+                .osc8_hyperlinks(Some(false))
+                .kitty_keyboard(Some(false)),
+        ))
     } else {
         None
     };
@@ -12547,8 +12622,14 @@ pub fn run_tui_ftui(
     model.data_dir = data_dir.clone();
     model.db_path = data_dir.join("agent_search.db");
 
-    // 16ms budget (60fps) with adaptive PID degradation.
-    let budget = FrameBudgetConfig::default();
+    // Quality-first budget profile: favor full visuals and avoid aggressive degradation.
+    let budget = FrameBudgetConfig {
+        total: Duration::from_millis(120),
+        allow_frame_skip: false,
+        degradation_cooldown: 12,
+        upgrade_threshold: 0.25,
+        ..FrameBudgetConfig::relaxed()
+    };
 
     // Resize coalescer + evidence sink — shared across all launch modes.
     let (coalescer, evidence_sink) = build_resize_config(&data_dir);

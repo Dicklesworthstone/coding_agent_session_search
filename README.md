@@ -13,14 +13,16 @@ Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, C
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh?$(date +%s)" \
-  | bash -s -- --easy-mode --verify
+  | bash -s -- --easy-mode --verify --version v0.1.64
 ```
 
 ```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.ps1 | iex
-install.ps1 -EasyMode -Verify
+install.ps1 -EasyMode -Verify -Version v0.1.64
 ```
+
+**Release gate note:** install scripts are currently pinned to `v0.1.64` (last ratatui build) unless you explicitly pass `--version`/`-Version`.
 
 **Or via package managers:**
 
@@ -1170,7 +1172,7 @@ When an exact query returns fewer than 3 results, `cass` automatically retries w
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+M` | Toggle selection on current result |
+| `Ctrl+M` / `Ctrl+X` | Toggle selection on current result |
 | `Ctrl+A` | Select/deselect all visible results |
 | `A` | Open bulk actions menu (when items selected) |
 | `Ctrl+Enter` | Add to multi-open queue |
@@ -1229,8 +1231,8 @@ Control how much content shows in the detail preview. Cycle with `F7`:
 Efficiently work with multiple search results at once:
 
 **Multi-Select Mode**:
-1. Press `Ctrl+M` to toggle selection on current result (checkbox appears)
-2. Navigate to other results and press `Ctrl+M` again
+1. Press `Ctrl+M` (or `Ctrl+X`) to toggle selection on current result (checkbox appears)
+2. Navigate to other results and press `Ctrl+M` or `Ctrl+X` again
 3. Press `Ctrl+A` to select/deselect all visible results
 4. Selected count shown in footer: "3 selected"
 
@@ -2066,7 +2068,7 @@ scoop install dicklesworthstone/cass
 **Alternative: Install Script**
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh?$(date +%s)" \
-  | bash -s -- --easy-mode --verify
+  | bash -s -- --easy-mode --verify --version v0.1.64
 ```
 
 **Alternative: GitHub Release Binaries**
@@ -2077,9 +2079,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_ses
 Example (Linux x86_64):
 ```bash
 curl -L -o cass-linux-amd64.tar.gz \
-  https://github.com/Dicklesworthstone/coding_agent_session_search/releases/latest/download/cass-linux-amd64.tar.gz
+  https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v0.1.64/cass-linux-amd64.tar.gz
 curl -L -o SHA256SUMS.txt \
-  https://github.com/Dicklesworthstone/coding_agent_session_search/releases/latest/download/SHA256SUMS.txt
+  https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v0.1.64/SHA256SUMS.txt
 sha256sum -c SHA256SUMS.txt
 tar -xzf cass-linux-amd64.tar.gz
 install -m 755 cass ~/.local/bin/cass
@@ -2107,7 +2109,7 @@ cass
     - `Enter`: Open original log file in `$EDITOR`.
     - `Ctrl+Enter`: Add current result to queue (multi-open).
     - `Ctrl+O`: Open all queued results in editor.
-    - `Ctrl+M`: Toggle selection on current item.
+    - `Ctrl+M` / `Ctrl+X`: Toggle selection on current item.
     - `A`: Bulk actions menu (when items selected).
     - `y`: Copy file path or snippet to clipboard.
     - `/`: Find text within detail pane.
@@ -2402,7 +2404,7 @@ Selecting "Update Now" runs the same verified installer used for initial install
 macOS/Linux:
 
 ```bash
-curl -fsSL https://...install.sh | bash -s -- --easy-mode --verify
+curl -fsSL https://...install.sh | bash -s -- --easy-mode --verify --version v0.1.64
 ```
 
 Windows (PowerShell):
@@ -2471,7 +2473,9 @@ Update check state is stored in the data directory:
 | **Core** | | |
 | `CASS_DATA_DIR` | Platform default | Override data directory |
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
-| `NO_COLOR` / `CASS_NO_COLOR` | unset | Disable ANSI color output |
+| `CASS_NO_COLOR` | unset | Force monochrome TUI output |
+| `NO_COLOR` | unset | Honored by TUI only when `CASS_RESPECT_NO_COLOR=1` |
+| `CASS_RESPECT_NO_COLOR` | unset | Make TUI inherit global `NO_COLOR` |
 | **Search & Cache** | | |
 | `CASS_CACHE_SHARD_CAP` | 256 | Per-shard LRU cache entries |
 | `CASS_CACHE_TOTAL_CAP` | 2048 | Total cached search hits |
@@ -2482,6 +2486,7 @@ Update check state is stored in the data directory:
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash` or `minilm` |
 | **TUI** | | |
 | `TUI_HEADLESS` | unset | Disable interactive features |
+| `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
 | `CASS_UI_METRICS` | unset | Enable UI interaction tracing |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
 | `EDITOR` | `$VISUAL` or `vi` | External editor command |
@@ -2499,6 +2504,14 @@ Update check state is stored in the data directory:
 ---
 
 ## 🩺 Troubleshooting
+
+- **TUI looks monochrome / “1981 mode”**: Check `TERM` and `NO_COLOR`.
+  Full-style launch example:
+  ```bash
+  env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor cass
+  ```
+  If you intentionally want monochrome, use `CASS_NO_COLOR=1 cass`.
+  If a wrapper keeps forcing `TERM=dumb` and UI still degrades, either fix `TERM` or force raw mode explicitly with `CASS_ALLOW_DUMB_TERM=1 cass`.
 
 - **Checksum mismatch**: Ensure `.sha256` is reachable or pass `--checksum` explicitly. Check proxies/firewalls.
 

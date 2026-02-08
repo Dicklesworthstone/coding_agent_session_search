@@ -2391,6 +2391,12 @@ async fn execute_cli(
         return Ok(());
     }
 
+    // TUI preflight: call out env profiles that commonly make the UI look
+    // degraded (global no-color, conservative TERM profiles).
+    if matches!(command, Commands::Tui { .. }) {
+        warn_tui_terminal_profile(stderr_is_tty);
+    }
+
     // Block TUI in non-TTY contexts unless TUI_HEADLESS is set (for testing)
     if matches!(command, Commands::Tui { .. })
         && !stdout_is_tty
@@ -4333,6 +4339,49 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
     }))
 }
 
+fn warn_tui_terminal_profile(stderr_is_tty: bool) {
+    if !stderr_is_tty {
+        return;
+    }
+
+    let env_truthy = |raw: Option<String>| {
+        raw.map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    };
+
+    let no_color_global = dotenvy::var("NO_COLOR").is_ok();
+    let no_color_local = dotenvy::var("CASS_NO_COLOR").is_ok();
+    let respect_global = env_truthy(dotenvy::var("CASS_RESPECT_NO_COLOR").ok());
+    let effective_no_color = no_color_local || (respect_global && no_color_global);
+    if effective_no_color {
+        eprintln!(
+            "warning: CASS_NO_COLOR/NO_COLOR profile is active; cass TUI styling may be reduced."
+        );
+        eprintln!(
+            "hint: use `CASS_NO_COLOR=1` for monochrome, or `CASS_RESPECT_NO_COLOR=1` if you want global NO_COLOR honored."
+        );
+    } else if no_color_global {
+        eprintln!(
+            "info: NO_COLOR is set but ignored by default. Set CASS_RESPECT_NO_COLOR=1 to honor it."
+        );
+    }
+
+    let term = dotenvy::var("TERM").unwrap_or_default();
+    if term.trim().eq_ignore_ascii_case("dumb") && dotenvy::var("TUI_HEADLESS").is_err() {
+        eprintln!(
+            "warning: TERM=dumb detected; cass will apply a compatibility profile unless CASS_ALLOW_DUMB_TERM=1."
+        );
+        eprintln!(
+            "hint: try `env -u NO_COLOR TERM=xterm-256color COLORTERM=truecolor cass` for full rendering."
+        );
+    }
+}
+
 fn configure_color(choice: ColorPref, stdout_is_tty: bool, stderr_is_tty: bool) {
     let enabled = match choice {
         ColorPref::Always => true,
@@ -4754,7 +4803,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
             "  TOON_INDENT=<N>                           pretty-print TOON with indent".to_string(),
             "  TOON_KEY_FOLDING=off|safe                 TOON key folding mode".to_string(),
-            "  NO_COLOR / CASS_NO_COLOR                 disable color".to_string(),
+            "  CASS_NO_COLOR                            force monochrome".to_string(),
+            "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
             "  CASS_TRACE_FILE                          default trace path".to_string(),
         ],
         RobotTopic::Paths => {

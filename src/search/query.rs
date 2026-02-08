@@ -1077,8 +1077,10 @@ pub fn rrf_fuse_hits(
     fused.sort_by(cmp_fused_hit_desc);
 
     // Deduplicate by content hash to ensure diversity
-    // Key: (source_id, content_hash) -> seen
-    let mut seen_content: HashSet<(String, u64)> = HashSet::with_capacity(fused.len());
+    // Key: (source_id, source_path, content_hash) -> seen
+    // We include source_path to allow the same content to appear if it's in different files/sessions,
+    // but collapse identical messages within the same file (e.g. repeated logs).
+    let mut seen_content: HashSet<(String, String, u64)> = HashSet::with_capacity(fused.len());
     let mut unique_fused = Vec::with_capacity(fused.len());
 
     for entry in fused {
@@ -1087,7 +1089,11 @@ pub fn rrf_fuse_hits(
             continue;
         }
 
-        let key = (entry.hit.source_id.clone(), entry.hit.content_hash);
+        let key = (
+            entry.hit.source_id.clone(),
+            entry.hit.source_path.clone(),
+            entry.hit.content_hash,
+        );
         if !seen_content.contains(&key) {
             seen_content.insert(key);
             unique_fused.push(entry);
@@ -1866,11 +1872,23 @@ fn build_boolean_query_clauses(
                 if in_or_sequence && just_saw_or {
                     // Extending OR group
                     if pending_or_group.is_empty() {
-                        // Start of group: Pull last Must clause into OR group if exists
-                        if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
-                            && let Some((_, last_q)) = clauses.pop()
-                        {
-                            pending_or_group.push(last_q);
+                        // Start of group: Pull last clause into OR group if exists
+                        // We allow Must and MustNot clauses. MustNot is converted to (All AND Not).
+                        let can_pull = clauses
+                            .last()
+                            .is_some_and(|(occ, _)| *occ == Occur::Must || *occ == Occur::MustNot);
+
+                        if can_pull && let Some((occ, last_q)) = clauses.pop() {
+                            let q_to_push = if occ == Occur::MustNot {
+                                // Convert NOT A to (All AND NOT A) so it works in OR
+                                Box::new(BooleanQuery::new(vec![
+                                    (Occur::Must, Box::new(AllQuery)),
+                                    (Occur::MustNot, last_q),
+                                ]))
+                            } else {
+                                last_q
+                            };
+                            pending_or_group.push(q_to_push);
                         }
                     }
 
@@ -1914,11 +1932,23 @@ fn build_boolean_query_clauses(
 
                 if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
-                        // Pull last Must clause into OR group if exists
-                        if clauses.last().is_some_and(|(occ, _)| *occ == Occur::Must)
-                            && let Some((_, last_q)) = clauses.pop()
-                        {
-                            pending_or_group.push(last_q);
+                        // Start of group: Pull last clause into OR group if exists
+                        // We allow Must and MustNot clauses. MustNot is converted to (All AND Not).
+                        let can_pull = clauses
+                            .last()
+                            .is_some_and(|(occ, _)| *occ == Occur::Must || *occ == Occur::MustNot);
+
+                        if can_pull && let Some((occ, last_q)) = clauses.pop() {
+                            let q_to_push = if occ == Occur::MustNot {
+                                // Convert NOT A to (All AND NOT A) so it works in OR
+                                Box::new(BooleanQuery::new(vec![
+                                    (Occur::Must, Box::new(AllQuery)),
+                                    (Occur::MustNot, last_q),
+                                ]))
+                            } else {
+                                last_q
+                            };
+                            pending_or_group.push(q_to_push);
                         }
                     }
 

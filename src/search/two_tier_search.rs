@@ -530,7 +530,7 @@ impl<'a, D: DaemonClient> TwoTierSearcher<'a, D> {
             ));
         }
 
-        let request_id = format!("quality-{}", start.elapsed().as_nanos());
+        let request_id = format!("quality-{:016x}", rand::random::<u64>());
         let query_vec = daemon
             .embed(query, &request_id)
             .map_err(TwoTierError::DaemonError)?;
@@ -615,7 +615,7 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
                 };
 
                 let start = Instant::now();
-                let request_id = format!("refine-{}", start.elapsed().as_nanos());
+                let request_id = format!("refine-{:016x}", rand::random::<u64>());
 
                 match daemon.embed(&self.query, &request_id) {
                     Ok(query_vec) => {

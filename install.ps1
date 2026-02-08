@@ -11,39 +11,12 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
-$FallbackVersion = "v0.1.54"
+$PinnedRatatuiVersion = "v0.1.64"
 
-# Resolve latest version if not specified
+# Use pinned stable version unless explicitly overridden.
 if (-not $Version) {
-  Write-Host "Resolving latest version..."
-  try {
-    # Try GitHub API first
-    $apiUrl = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
-    $release = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept"="application/vnd.github.v3+json"} -ErrorAction Stop
-    $Version = $release.tag_name
-    Write-Host "Resolved latest version: $Version"
-  } catch {
-    # Fallback: try redirect-based resolution
-    try {
-      $redirectUrl = "https://github.com/$Owner/$Repo/releases/latest"
-      # MaximumRedirection 0 causes error on redirect; we catch it to extract Location header
-      $response = Invoke-WebRequest -Uri $redirectUrl -MaximumRedirection 0 -ErrorAction Stop
-    } catch {
-      if ($_.Exception.Response.Headers.Location) {
-        $location = $_.Exception.Response.Headers.Location.ToString()
-        $extracted = $location -replace ".*/tag/", ""
-        # Validate: must start with 'v' and not contain URL chars (/) to be a valid version
-        if ($extracted -match "^v[0-9]" -and $extracted -notmatch "/") {
-          $Version = $extracted
-          Write-Host "Resolved latest version via redirect: $Version"
-        }
-      }
-    }
-    if (-not $Version) {
-      $Version = $FallbackVersion
-      Write-Warning "Could not resolve latest version; defaulting to $Version"
-    }
-  }
+  $Version = $PinnedRatatuiVersion
+  Write-Host "Using pinned stable version: $Version"
 }
 $os = "windows"
 $arch = if ([Environment]::Is64BitProcess) { "x86_64" } else { "x86" }
@@ -103,4 +76,3 @@ if (-not $path.Contains($Dest)) {
 if ($Verify) {
   & "$Dest\cass.exe" --version | Write-Host
 }
-
