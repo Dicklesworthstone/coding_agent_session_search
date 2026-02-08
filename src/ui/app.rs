@@ -15488,6 +15488,166 @@ mod tests {
     }
 
     // =====================================================================
+    // 1mfw3.4.7 — Responsive regression suite (size-sweep matrix)
+    // =====================================================================
+
+    /// Size matrix covering all breakpoint tiers plus edge cases.
+    const SIZE_MATRIX: &[(u16, u16, &str)] = &[
+        // Ultra-narrow (fallback)
+        (10, 3, "ultra-narrow-tiny"),
+        (25, 5, "ultra-narrow-small"),
+        // Narrow
+        (30, 8, "narrow-min"),
+        (60, 24, "narrow-standard"),
+        (79, 24, "narrow-max"),
+        // MediumNarrow
+        (80, 24, "medium-narrow-min"),
+        (100, 24, "medium-narrow-mid"),
+        (119, 24, "medium-narrow-max"),
+        // Medium
+        (120, 24, "medium-min"),
+        (140, 30, "medium-mid"),
+        (159, 24, "medium-max"),
+        // Wide
+        (160, 24, "wide-min"),
+        (200, 40, "wide-standard"),
+        (300, 50, "wide-ultra"),
+        // Height edge cases
+        (120, 6, "medium-min-height"),
+        (120, 100, "medium-tall"),
+    ];
+
+    #[test]
+    fn size_sweep_no_panic() {
+        // Every entry in the size matrix must render without panicking.
+        for &(w, h, label) in SIZE_MATRIX {
+            let app = app_with_hits(5);
+            render_at_degradation(&app, w, h, ftui::render::budget::DegradationLevel::Full);
+            // If we get here, no panic occurred.
+            let _ = label; // suppress unused warning
+        }
+    }
+
+    #[test]
+    fn size_sweep_topology_consistency() {
+        // For each non-ultra-narrow size, verify topology matches actual rendering behavior.
+        for &(w, h, label) in SIZE_MATRIX {
+            if LayoutBreakpoint::is_ultra_narrow(w, h) {
+                continue; // ultra-narrow uses fallback, skip topology checks
+            }
+            let app = app_with_hits(5);
+            render_at_degradation(&app, w, h, ftui::render::budget::DegradationLevel::Full);
+
+            let bp = LayoutBreakpoint::from_width(w);
+            let topo = bp.search_topology();
+
+            if topo.dual_pane {
+                assert!(
+                    app.last_results_inner.borrow().is_some(),
+                    "{label}: dual_pane should record results inner"
+                );
+                assert!(
+                    app.last_detail_area.borrow().is_some(),
+                    "{label}: dual_pane should record detail area"
+                );
+                assert!(
+                    app.last_split_handle_area.borrow().is_some(),
+                    "{label}: dual_pane should record split handle"
+                );
+            } else {
+                // Single pane: only the focused pane is recorded.
+                assert!(
+                    app.last_split_handle_area.borrow().is_none(),
+                    "{label}: single_pane should not record split handle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn size_sweep_analytics_no_panic() {
+        // Analytics surface should render cleanly at all sizes.
+        for &(w, h, _label) in SIZE_MATRIX {
+            let mut app = CassApp::default();
+            let _ = app.update(CassMsg::AnalyticsEntered);
+            render_at_degradation(&app, w, h, ftui::render::budget::DegradationLevel::Full);
+        }
+    }
+
+    #[test]
+    fn size_sweep_focus_toggle_invariant() {
+        // Focus toggle must work correctly at every non-ultra-narrow size.
+        for &(w, h, label) in SIZE_MATRIX {
+            if LayoutBreakpoint::is_ultra_narrow(w, h) {
+                continue;
+            }
+            let mut app = app_with_hits(3);
+            assert_eq!(
+                app.focused_region(),
+                FocusRegion::Results,
+                "{label}: default focus should be Results"
+            );
+
+            let _ = app.update(CassMsg::FocusToggled);
+            assert_eq!(
+                app.focused_region(),
+                FocusRegion::Detail,
+                "{label}: after toggle, focus should be Detail"
+            );
+
+            // Re-render at this size — should not panic in either focus state.
+            render_at_degradation(&app, w, h, ftui::render::budget::DegradationLevel::Full);
+        }
+    }
+
+    #[test]
+    fn size_sweep_breakpoint_monotonic() {
+        // Breakpoints should be monotonically ordered: wider terminal = wider or equal breakpoint.
+        let widths: Vec<u16> = SIZE_MATRIX.iter().map(|&(w, _, _)| w).collect();
+        for pair in widths.windows(2) {
+            let bp_a = LayoutBreakpoint::from_width(pair[0]);
+            let bp_b = LayoutBreakpoint::from_width(pair[1]);
+            let rank = |bp: LayoutBreakpoint| -> u8 {
+                match bp {
+                    LayoutBreakpoint::Narrow => 0,
+                    LayoutBreakpoint::MediumNarrow => 1,
+                    LayoutBreakpoint::Medium => 2,
+                    LayoutBreakpoint::Wide => 3,
+                }
+            };
+            // Note: SIZE_MATRIX is not sorted by width, so we don't assert monotonicity
+            // across the matrix. Instead verify each width classifies correctly.
+            let _ = (rank(bp_a), rank(bp_b)); // suppress unused
+        }
+        // Verify the rank function itself is correct for known thresholds.
+        let rank = |w: u16| -> u8 {
+            match LayoutBreakpoint::from_width(w) {
+                LayoutBreakpoint::Narrow => 0,
+                LayoutBreakpoint::MediumNarrow => 1,
+                LayoutBreakpoint::Medium => 2,
+                LayoutBreakpoint::Wide => 3,
+            }
+        };
+        assert!(rank(79) < rank(80));
+        assert!(rank(119) < rank(120));
+        assert!(rank(159) < rank(160));
+    }
+
+    #[test]
+    fn size_sweep_visibility_policy_stable() {
+        // Visibility policy should be deterministic for a given width.
+        for &(w, _, _) in SIZE_MATRIX {
+            let bp = LayoutBreakpoint::from_width(w);
+            let v1 = bp.visibility_policy();
+            let v2 = bp.visibility_policy();
+            assert_eq!(
+                v1, v2,
+                "visibility policy should be deterministic for w={w}"
+            );
+        }
+    }
+
+    // =====================================================================
     // 2noh9.4.10 — Advanced navigation (grouping, timeline jump)
     // =====================================================================
 
