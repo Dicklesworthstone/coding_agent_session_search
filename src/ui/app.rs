@@ -42,7 +42,10 @@ use crate::search::query::{QuerySuggestion, SearchFilters, SearchHit, SearchMode
 use crate::sources::provenance::SourceFilter;
 use crate::storage::sqlite::SqliteStorage;
 use crate::ui::components::export_modal::{ExportField, ExportModalState, ExportProgress};
-use crate::ui::components::palette::{PaletteAction, PaletteState, default_actions};
+use crate::ui::components::palette::{
+    AnalyticsTarget, InputModeTarget, PaletteResult, PaletteState, ScreenshotTarget,
+    TimeFilterPreset, default_actions, execute_selected,
+};
 use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
 use crate::ui::data::{ConversationView, InputMode};
@@ -2447,6 +2450,92 @@ impl CassApp {
         }
 
         "results"
+    }
+
+    /// Translate a [`PaletteResult`] into a concrete `Cmd<CassMsg>`.
+    ///
+    /// This is the app-side half of the palette adapter layer. Most results
+    /// map to a single `CassMsg`; `OpenUpdateBanner` requires `self` access.
+    fn palette_result_to_cmd(&mut self, result: PaletteResult) -> ftui::Cmd<CassMsg> {
+        match result {
+            PaletteResult::ToggleTheme => ftui::Cmd::msg(CassMsg::ThemeToggled),
+            PaletteResult::CycleDensity => ftui::Cmd::msg(CassMsg::DensityModeCycled),
+            PaletteResult::ToggleHelpStrip => ftui::Cmd::msg(CassMsg::HelpPinToggled),
+            PaletteResult::OpenUpdateBanner => {
+                if let Some(info) = &self.update_info {
+                    if info.should_show() {
+                        self.update_dismissed = false;
+                        self.update_upgrade_armed = false;
+                        self.status = format!(
+                            "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
+                            info.current_version, info.latest_version
+                        );
+                    } else if info.is_skipped {
+                        self.status = format!(
+                            "v{} is currently skipped. Clear update_state.json to re-enable prompts.",
+                            info.latest_version
+                        );
+                    } else {
+                        self.status = "You're on the latest version.".to_string();
+                    }
+                } else {
+                    self.status =
+                        "No update information available yet. Check again shortly.".to_string();
+                }
+                ftui::Cmd::none()
+            }
+            PaletteResult::EnterInputMode(target) => {
+                let mode = match target {
+                    InputModeTarget::Agent => InputMode::Agent,
+                    InputModeTarget::Workspace => InputMode::Workspace,
+                    InputModeTarget::CreatedFrom => InputMode::CreatedFrom,
+                };
+                ftui::Cmd::msg(CassMsg::InputModeEntered(mode))
+            }
+            PaletteResult::SetTimeFilter { from } => {
+                let now = chrono::Utc::now().timestamp();
+                let from_ts = match from {
+                    TimeFilterPreset::Today => now - (now % 86400),
+                    TimeFilterPreset::LastWeek => now - (7 * 86400),
+                };
+                ftui::Cmd::msg(CassMsg::FilterTimeSet {
+                    from: Some(from_ts),
+                    to: None,
+                })
+            }
+            PaletteResult::OpenSavedViews => ftui::Cmd::msg(CassMsg::SavedViewsOpened),
+            PaletteResult::SaveViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewSaved(slot)),
+            PaletteResult::LoadViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewLoaded(slot)),
+            PaletteResult::OpenBulkActions => ftui::Cmd::msg(CassMsg::BulkActionsOpened),
+            PaletteResult::ReloadIndex => ftui::Cmd::msg(CassMsg::IndexRefreshRequested),
+            PaletteResult::OpenAnalyticsView(target) => {
+                let view = match target {
+                    AnalyticsTarget::Dashboard => AnalyticsView::Dashboard,
+                    AnalyticsTarget::Explorer => AnalyticsView::Explorer,
+                    AnalyticsTarget::Heatmap => AnalyticsView::Heatmap,
+                    AnalyticsTarget::Breakdowns => AnalyticsView::Breakdowns,
+                    AnalyticsTarget::Tools => AnalyticsView::Tools,
+                    AnalyticsTarget::Cost => AnalyticsView::Cost,
+                    AnalyticsTarget::Plans => AnalyticsView::Plans,
+                    AnalyticsTarget::Coverage => AnalyticsView::Coverage,
+                };
+                ftui::Cmd::batch(vec![
+                    ftui::Cmd::msg(CassMsg::AnalyticsEntered),
+                    ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(view)),
+                ])
+            }
+            PaletteResult::Screenshot(target) => {
+                let fmt = match target {
+                    ScreenshotTarget::Html => ScreenshotFormat::Html,
+                    ScreenshotTarget::Svg => ScreenshotFormat::Svg,
+                    ScreenshotTarget::Text => ScreenshotFormat::Text,
+                };
+                ftui::Cmd::msg(CassMsg::ScreenshotRequested(fmt))
+            }
+            PaletteResult::ToggleMacroRecording => ftui::Cmd::msg(CassMsg::MacroRecordingToggled),
+            PaletteResult::OpenSources => ftui::Cmd::msg(CassMsg::SourcesEntered),
+            PaletteResult::Noop => ftui::Cmd::none(),
+        }
     }
 
     fn footer_hint_slots(width: u16) -> usize {
@@ -7979,130 +8068,9 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::PaletteActionExecuted => {
-                let action = self
-                    .palette_state
-                    .filtered
-                    .get(self.palette_state.selected)
-                    .map(|item| item.action.clone());
+                let result = execute_selected(&self.palette_state);
                 self.palette_state.open = false;
-                match action {
-                    Some(PaletteAction::ToggleTheme) => ftui::Cmd::msg(CassMsg::ThemeToggled),
-                    Some(PaletteAction::ToggleDensity) => {
-                        ftui::Cmd::msg(CassMsg::DensityModeCycled)
-                    }
-                    Some(PaletteAction::ToggleHelpStrip) => ftui::Cmd::msg(CassMsg::HelpPinToggled),
-                    Some(PaletteAction::OpenUpdateBanner) => {
-                        if let Some(info) = &self.update_info {
-                            if info.should_show() {
-                                self.update_dismissed = false;
-                                self.update_upgrade_armed = false;
-                                self.status = format!(
-                                    "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
-                                    info.current_version, info.latest_version
-                                );
-                            } else if info.is_skipped {
-                                self.status = format!(
-                                    "v{} is currently skipped. Clear update_state.json to re-enable prompts.",
-                                    info.latest_version
-                                );
-                            } else {
-                                self.status = "You're on the latest version.".to_string();
-                            }
-                        } else {
-                            self.status =
-                                "No update information available yet. Check again shortly."
-                                    .to_string();
-                        }
-                        ftui::Cmd::none()
-                    }
-                    Some(PaletteAction::FilterAgent) => {
-                        ftui::Cmd::msg(CassMsg::InputModeEntered(InputMode::Agent))
-                    }
-                    Some(PaletteAction::FilterWorkspace) => {
-                        ftui::Cmd::msg(CassMsg::InputModeEntered(InputMode::Workspace))
-                    }
-                    Some(PaletteAction::FilterToday) => {
-                        let now = chrono::Utc::now().timestamp();
-                        let start_of_day = now - (now % 86400);
-                        ftui::Cmd::msg(CassMsg::FilterTimeSet {
-                            from: Some(start_of_day),
-                            to: None,
-                        })
-                    }
-                    Some(PaletteAction::FilterWeek) => {
-                        let now = chrono::Utc::now().timestamp();
-                        let week_ago = now - (7 * 86400);
-                        ftui::Cmd::msg(CassMsg::FilterTimeSet {
-                            from: Some(week_ago),
-                            to: None,
-                        })
-                    }
-                    Some(PaletteAction::FilterCustomDate) => {
-                        ftui::Cmd::msg(CassMsg::InputModeEntered(InputMode::CreatedFrom))
-                    }
-                    Some(PaletteAction::OpenSavedViews) => {
-                        ftui::Cmd::msg(CassMsg::SavedViewsOpened)
-                    }
-                    Some(PaletteAction::SaveViewSlot(slot)) => {
-                        ftui::Cmd::msg(CassMsg::ViewSaved(slot))
-                    }
-                    Some(PaletteAction::LoadViewSlot(slot)) => {
-                        ftui::Cmd::msg(CassMsg::ViewLoaded(slot))
-                    }
-                    Some(PaletteAction::OpenBulkActions) => {
-                        ftui::Cmd::msg(CassMsg::BulkActionsOpened)
-                    }
-                    Some(PaletteAction::ReloadIndex) => {
-                        ftui::Cmd::msg(CassMsg::IndexRefreshRequested)
-                    }
-                    // -- Analytics palette actions ---
-                    Some(PaletteAction::AnalyticsDashboard) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Dashboard)),
-                    ]),
-                    Some(PaletteAction::AnalyticsExplorer) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Explorer)),
-                    ]),
-                    Some(PaletteAction::AnalyticsHeatmap) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Heatmap)),
-                    ]),
-                    Some(PaletteAction::AnalyticsBreakdowns) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Breakdowns)),
-                    ]),
-                    Some(PaletteAction::AnalyticsTools) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Tools)),
-                    ]),
-                    Some(PaletteAction::AnalyticsCost) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Cost)),
-                    ]),
-                    Some(PaletteAction::AnalyticsPlans) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Plans)),
-                    ]),
-                    Some(PaletteAction::AnalyticsCoverage) => ftui::Cmd::batch(vec![
-                        ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                        ftui::Cmd::msg(CassMsg::AnalyticsViewChanged(AnalyticsView::Coverage)),
-                    ]),
-                    Some(PaletteAction::ScreenshotHtml) => {
-                        ftui::Cmd::msg(CassMsg::ScreenshotRequested(ScreenshotFormat::Html))
-                    }
-                    Some(PaletteAction::ScreenshotSvg) => {
-                        ftui::Cmd::msg(CassMsg::ScreenshotRequested(ScreenshotFormat::Svg))
-                    }
-                    Some(PaletteAction::ScreenshotText) => {
-                        ftui::Cmd::msg(CassMsg::ScreenshotRequested(ScreenshotFormat::Text))
-                    }
-                    Some(PaletteAction::MacroRecordingToggle) => {
-                        ftui::Cmd::msg(CassMsg::MacroRecordingToggled)
-                    }
-                    Some(PaletteAction::Sources) => ftui::Cmd::msg(CassMsg::SourcesEntered),
-                    None => ftui::Cmd::none(),
-                }
+                self.palette_result_to_cmd(result)
             }
 
             // -- Help overlay -------------------------------------------------
@@ -10620,7 +10588,7 @@ pub fn run_tui_ftui(
     // 16ms budget (60fps) with adaptive PID degradation.
     let budget = FrameBudgetConfig::default();
 
-    // Build the ProgramConfig based on inline/fullscreen mode.
+    // Build ProgramConfig once — all launch paths share this baseline.
     let mut config = if let Some(ref cfg) = inline_config {
         let mut c = ProgramConfig::inline(cfg.ui_height);
         c.ui_anchor = cfg.anchor;
@@ -10628,30 +10596,11 @@ pub fn run_tui_ftui(
     } else {
         ProgramConfig::fullscreen()
     };
-    config.budget = budget.clone();
+    config.budget = budget;
     config.mouse = true;
 
-    // If recording macros, we need direct Program access for start/stop_recording.
-    if macro_config.record_path.is_some() {
-        let mut program = ftui::Program::with_config(model, config)
-            .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
-
-        program.start_recording("cass-session");
-        let result = program.run();
-
-        // Save recorded macro on exit.
-        if let Some(ref record_path) = macro_config.record_path
-            && let Some(recorded) = program.stop_recording()
-        {
-            macro_file::save_macro(record_path, &recorded, false)?;
-            eprintln!("Macro saved to: {}", record_path.display());
-        }
-
-        result.map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
-    } else if let Some(ref play_path) = macro_config.play_path {
-        // Playback: load macro into model, which replays events via MacroPlayback
-        // on each Tick. The model converts macro events back to CassMsg and processes
-        // them as if the user had typed them.
+    // Load macro playback data into model before program creation.
+    if let Some(ref play_path) = macro_config.play_path {
         let macro_data = macro_file::load_macro(play_path)?;
         eprintln!(
             "Playing macro: {} ({} events, {:.1}s)",
@@ -10659,40 +10608,28 @@ pub fn run_tui_ftui(
             macro_data.len(),
             macro_data.total_duration().as_secs_f64()
         );
-
         model.macro_playback = Some(MacroPlayback::new(macro_data));
-
-        if let Some(cfg) = inline_config {
-            ftui::App::inline(model, cfg.ui_height)
-                .anchor(cfg.anchor)
-                .with_mouse()
-                .with_budget(budget)
-                .run()
-                .map_err(|e| anyhow::anyhow!("ftui inline runtime error: {e}"))
-        } else {
-            ftui::App::fullscreen(model)
-                .with_mouse()
-                .with_budget(budget)
-                .run()
-                .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
-        }
-    } else {
-        // Standard path — no macro, use AppBuilder for simplicity.
-        if let Some(cfg) = inline_config {
-            ftui::App::inline(model, cfg.ui_height)
-                .anchor(cfg.anchor)
-                .with_mouse()
-                .with_budget(budget)
-                .run()
-                .map_err(|e| anyhow::anyhow!("ftui inline runtime error: {e}"))
-        } else {
-            ftui::App::fullscreen(model)
-                .with_mouse()
-                .with_budget(budget)
-                .run()
-                .map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
-        }
     }
+
+    // All paths use the same Program::with_config entry point.
+    let mut program = ftui::Program::with_config(model, config)
+        .map_err(|e| anyhow::anyhow!("ftui program creation error: {e}"))?;
+
+    if macro_config.record_path.is_some() {
+        program.start_recording("cass-session");
+    }
+
+    let result = program.run();
+
+    // Save recorded macro on exit (only if recording was active).
+    if let Some(ref record_path) = macro_config.record_path
+        && let Some(recorded) = program.stop_recording()
+    {
+        macro_file::save_macro(record_path, &recorded, false)?;
+        eprintln!("Macro saved to: {}", record_path.display());
+    }
+
+    result.map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
 }
 
 /// Macro file serialization/deserialization.
@@ -11292,6 +11229,7 @@ fn open_hits_in_editor(hits: &[SearchHit], editor_cmd: &str) -> Result<(usize, S
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::ui::components::palette::PaletteAction;
 
     #[test]
     fn cass_app_default_initializes_with_sane_defaults() {
