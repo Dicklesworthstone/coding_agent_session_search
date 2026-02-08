@@ -1079,6 +1079,10 @@ pub enum InspectorTab {
     HitRegions,
     /// Resize regime, BOCPD, budget evidence
     Resize,
+    /// Diff strategy selection evidence
+    Diff,
+    /// Budget controller / degradation state
+    Budget,
 }
 
 impl InspectorTab {
@@ -2797,7 +2801,7 @@ impl CassApp {
             && !self.show_export_modal
             && !self.show_consent_dialog
             && !self.source_filter_menu_open
-            && !self.palette_state.open
+            && !self.command_palette.is_visible()
     }
 
     fn footer_hint_context_key(&self) -> &'static str {
@@ -2806,7 +2810,7 @@ impl CassApp {
             || self.show_saved_views_modal
             || self.show_consent_dialog
             || self.source_filter_menu_open
-            || self.palette_state.open
+            || self.command_palette.is_visible()
             || self.show_help
             || self.show_detail_modal
         {
@@ -7399,7 +7403,7 @@ impl super::ftui_adapter::Model for CassApp {
         // CommandPalette widget which owns query, selection, filtering, and
         // scoring.  Execute/Dismiss actions are translated back to our domain
         // via the PaletteResult adapter layer.
-        if self.palette_state.open {
+        if self.command_palette.is_visible() {
             match &msg {
                 // Let critical / non-keyboard messages through to normal handling.
                 CassMsg::Tick | CassMsg::ForceQuit | CassMsg::MouseEvent { .. } => {}
@@ -7411,7 +7415,6 @@ impl super::ftui_adapter::Model for CassApp {
                             use ftui::widgets::command_palette::PaletteAction as WPA;
                             match action {
                                 WPA::Execute(ref id) => {
-                                    self.palette_state.open = false;
                                     self.command_palette.close();
                                     self.focus_manager.pop_trap();
                                     let result = action_by_id(&self.palette_state.all_actions, id)
@@ -7420,7 +7423,6 @@ impl super::ftui_adapter::Model for CassApp {
                                     return self.palette_result_to_cmd(result);
                                 }
                                 WPA::Dismiss => {
-                                    self.palette_state.open = false;
                                     self.command_palette.close();
                                     self.focus_manager.pop_trap();
                                     return ftui::Cmd::none();
@@ -8512,18 +8514,15 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Command palette ----------------------------------------------
             CassMsg::PaletteOpened => {
-                self.palette_state.open = true;
                 self.palette_state.query.clear();
                 self.palette_state.selected = 0;
                 self.palette_state.refilter();
-                // Also open the ftui CommandPalette widget (owns rendering & filtering).
                 self.command_palette.open();
                 self.focus_manager.push_trap(focus_ids::GROUP_PALETTE);
                 self.focus_manager.focus(focus_ids::COMMAND_PALETTE);
                 ftui::Cmd::none()
             }
             CassMsg::PaletteClosed => {
-                self.palette_state.open = false;
                 self.command_palette.close();
                 self.focus_manager.pop_trap();
                 ftui::Cmd::none()
@@ -8544,7 +8543,6 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::PaletteActionExecuted => {
                 let result = execute_selected(&self.palette_state);
-                self.palette_state.open = false;
                 self.command_palette.close();
                 self.palette_result_to_cmd(result)
             }
@@ -10214,8 +10212,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
                 }
-                if self.palette_state.open {
-                    self.palette_state.open = false;
+                if self.command_palette.is_visible() {
                     self.command_palette.close();
                     self.focus_manager.pop_trap();
                     return ftui::Cmd::none();
@@ -11007,7 +11004,7 @@ impl super::ftui_adapter::Model for CassApp {
         }
 
         // ── Command palette overlay ──────────────────────────────────
-        if self.palette_state.open {
+        if self.command_palette.is_visible() {
             use super::ftui_adapter::Widget;
             self.command_palette.render(area, frame);
         }
@@ -12320,14 +12317,14 @@ mod tests {
     #[test]
     fn palette_state_not_open_by_default() {
         let app = CassApp::default();
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
     }
 
     #[test]
     fn palette_open_sets_state() {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::PaletteOpened);
-        assert!(app.palette_state.open);
+        assert!(app.command_palette.is_visible());
         assert!(app.palette_state.query.is_empty());
         assert_eq!(app.palette_state.selected, 0);
         assert_eq!(
@@ -12340,9 +12337,9 @@ mod tests {
     fn palette_close_clears_open() {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::PaletteOpened);
-        assert!(app.palette_state.open);
+        assert!(app.command_palette.is_visible());
         let _ = app.update(CassMsg::PaletteClosed);
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
     }
 
     #[test]
@@ -12388,7 +12385,7 @@ mod tests {
 
         // Execute it - should produce ThemeToggled cmd
         let cmd = app.update(CassMsg::PaletteActionExecuted);
-        assert!(!app.palette_state.open, "palette should close on execute");
+        assert!(!app.command_palette.is_visible(), "palette should close on execute");
         // The returned Cmd contains CassMsg::ThemeToggled; process it
         if let Some(msg) = extract_msg(cmd) {
             let _ = app.update(msg);
@@ -12430,7 +12427,7 @@ mod tests {
         app.palette_state.selected = idx;
         let cmd = app.update(CassMsg::PaletteActionExecuted);
         // Should produce IndexRefreshRequested
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
         // cmd should contain a message (IndexRefreshRequested)
         assert!(extract_msg(cmd).is_some());
     }
@@ -12439,10 +12436,10 @@ mod tests {
     fn palette_escape_closes_before_quit() {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::PaletteOpened);
-        assert!(app.palette_state.open);
+        assert!(app.command_palette.is_visible());
         // ESC should close palette, not quit
         let _ = app.update(CassMsg::QuitRequested);
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
     }
 
     #[test]
@@ -12502,7 +12499,7 @@ mod tests {
         app.palette_state.selected = idx;
 
         let cmd = app.update(CassMsg::PaletteActionExecuted);
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
         assert!(matches!(extract_msg(cmd), Some(CassMsg::SavedViewsOpened)));
     }
 
@@ -12532,7 +12529,7 @@ mod tests {
         assert!(app.command_palette.is_visible());
         let _ = app.update(CassMsg::PaletteActionExecuted);
         assert!(!app.command_palette.is_visible());
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
     }
 
     #[test]
@@ -12542,7 +12539,7 @@ mod tests {
         assert!(app.command_palette.is_visible());
         let _ = app.update(CassMsg::QuitRequested);
         assert!(!app.command_palette.is_visible());
-        assert!(!app.palette_state.open);
+        assert!(!app.command_palette.is_visible());
     }
 
     #[test]
@@ -12575,7 +12572,7 @@ mod tests {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::PaletteOpened);
         let _ = app.update(CassMsg::Tick);
-        assert!(app.palette_state.open);
+        assert!(app.command_palette.is_visible());
     }
 
     #[test]
@@ -19446,7 +19443,14 @@ mod tests {
         let apply_time = base + Duration::from_millis(20);
         let action = c.tick_at(apply_time);
         assert!(
-            matches!(action, CoalesceAction::ApplyResize { width: 100, height: 40, .. }),
+            matches!(
+                action,
+                CoalesceAction::ApplyResize {
+                    width: 100,
+                    height: 40,
+                    ..
+                }
+            ),
             "expected ApplyResize(100, 40), got {action:?}"
         );
         assert_eq!(c.last_applied(), (100, 40));
@@ -19467,14 +19471,22 @@ mod tests {
             let _ = c.handle_resize_at(w, h, t);
         }
         // Should be in burst regime
-        assert_eq!(c.regime(), Regime::Burst, "expected Burst after rapid events");
+        assert_eq!(
+            c.regime(),
+            Regime::Burst,
+            "expected Burst after rapid events"
+        );
 
         // Tick well past hard_deadline to force apply
         let late = base + Duration::from_millis(250);
         let action = c.tick_at(late);
         if let CoalesceAction::ApplyResize { width, height, .. } = action {
             // Latest size should be (94, 38) — last event: 80+14=94, 24+14=38
-            assert_eq!((width, height), (94, 38), "latest-wins: expected final size");
+            assert_eq!(
+                (width, height),
+                (94, 38),
+                "latest-wins: expected final size"
+            );
         }
         assert_eq!(c.last_applied(), (94, 38));
     }
@@ -19489,8 +19501,14 @@ mod tests {
         // Alternate between two sizes at varying rates
         // Fast oscillation → burst, then slow down
         let pattern: Vec<(u16, u16, u64)> = vec![
-            (100, 40, 10), (80, 24, 10), (100, 40, 10), (80, 24, 10),
-            (100, 40, 10), (80, 24, 10), (100, 40, 10), (80, 24, 10),
+            (100, 40, 10),
+            (80, 24, 10),
+            (100, 40, 10),
+            (80, 24, 10),
+            (100, 40, 10),
+            (80, 24, 10),
+            (100, 40, 10),
+            (80, 24, 10),
         ];
 
         let mut elapsed_ms = 0u64;
@@ -19538,10 +19556,13 @@ mod tests {
         let logs = c.logs();
         assert!(!logs.is_empty(), "should have decision logs");
 
-        let has_apply = logs.iter().any(|l| {
-            matches!(l.action, "apply" | "apply_forced" | "apply_immediate")
-        });
-        assert!(has_apply, "hard deadline should have forced at least one apply");
+        let has_apply = logs
+            .iter()
+            .any(|l| matches!(l.action, "apply" | "apply_forced" | "apply_immediate"));
+        assert!(
+            has_apply,
+            "hard deadline should have forced at least one apply"
+        );
     }
 
     #[test]
@@ -19614,8 +19635,7 @@ mod tests {
             let _ = c.tick_at(final_tick);
         };
 
-        let mut c1 =
-            ResizeCoalescer::new(config.clone(), (80, 24)).with_last_render(base);
+        let mut c1 = ResizeCoalescer::new(config.clone(), (80, 24)).with_last_render(base);
         let mut c2 = ResizeCoalescer::new(config, (80, 24)).with_last_render(base);
         run(&mut c1);
         run(&mut c2);
@@ -19645,7 +19665,10 @@ mod tests {
         let _ = c.tick_at(base + Duration::from_millis(200));
 
         let transitions = c.regime_transition_count();
-        assert!(transitions >= 1, "expected at least 1 regime transition, got {transitions}");
+        assert!(
+            transitions >= 1,
+            "expected at least 1 regime transition, got {transitions}"
+        );
     }
 
     #[test]
@@ -19662,11 +19685,7 @@ mod tests {
         }
 
         // Verify contiguous event_idx sequence
-        let indices: Vec<u64> = summary
-            .recent_resizes
-            .iter()
-            .map(|e| e.event_idx)
-            .collect();
+        let indices: Vec<u64> = summary.recent_resizes.iter().map(|e| e.event_idx).collect();
         for pair in indices.windows(2) {
             assert_eq!(
                 pair[1],
