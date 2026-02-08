@@ -1,7 +1,87 @@
 //! Command palette state and rendering (keyboard-first, fuzzy-ish search).
 //! Integration hooks live in `src/ui/app.rs`; this module stays side-effect free.
+//!
+//! # Interaction Contract
+//!
+//! | Trigger          | Behavior                                          |
+//! |------------------|---------------------------------------------------|
+//! | Ctrl+P / Alt+P   | Open palette → push focus trap GROUP_PALETTE       |
+//! | Esc              | Close palette → pop focus trap, discard query      |
+//! | Enter            | Execute selected action → close → dispatch CassMsg |
+//! | Up / k           | Move selection -1 (wraps)                         |
+//! | Down / j         | Move selection +1 (wraps)                         |
+//! | Ctrl+U           | Clear query                                       |
+//! | Any printable    | Append to query → refilter → reset selection to 0  |
+//! | Backspace        | Remove last char → refilter                       |
+//!
+//! # Action Groups
+//!
+//! Each [`PaletteAction`] belongs to exactly one [`PaletteGroup`]. Groups are
+//! used for categorical rendering (section headers, icons) and mapping validation.
+//!
+//! | Group       | Actions                                                    |
+//! |-------------|------------------------------------------------------------|
+//! | Chrome      | ToggleTheme, ToggleDensity, ToggleHelpStrip, OpenUpdate    |
+//! | Filter      | FilterAgent, FilterWorkspace, FilterToday/Week/CustomDate  |
+//! | View        | OpenSavedViews, SaveViewSlot, LoadViewSlot, BulkActions, ReloadIndex |
+//! | Analytics   | AnalyticsDashboard..AnalyticsCoverage (8 variants)         |
+//! | Export      | ScreenshotHtml, ScreenshotSvg, ScreenshotText             |
+//! | Recording   | MacroRecordingToggle                                       |
+//! | Sources     | Sources                                                    |
+//!
+//! # Migration Target (FrankenTUI command_palette)
+//!
+//! Each action maps to exactly one `CassMsg` dispatch (or batch). The mapping
+//! table in [`PaletteAction::target_msg_name`] documents the concrete target
+//! for every variant, ensuring no action is lost during migration.
 
 use crate::ui::shortcuts;
+
+/// Categorical grouping for palette actions. Used for section headers,
+/// icons, and migration validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PaletteGroup {
+    /// UI chrome toggles: theme, density, help strip, update banner.
+    Chrome,
+    /// Data filters: agent, workspace, time-range.
+    Filter,
+    /// View management: saved views, bulk actions, reload.
+    View,
+    /// Analytics surface navigation (8 sub-views).
+    Analytics,
+    /// Screenshot/export capture.
+    Export,
+    /// Macro recording toggle.
+    Recording,
+    /// Sources management.
+    Sources,
+}
+
+impl PaletteGroup {
+    /// Human-readable label for section headers in the palette.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Chrome => "Chrome",
+            Self::Filter => "Filters",
+            Self::View => "Views",
+            Self::Analytics => "Analytics",
+            Self::Export => "Export",
+            Self::Recording => "Recording",
+            Self::Sources => "Sources",
+        }
+    }
+
+    /// All groups in display order.
+    pub const ALL: &'static [PaletteGroup] = &[
+        PaletteGroup::Chrome,
+        PaletteGroup::Filter,
+        PaletteGroup::View,
+        PaletteGroup::Analytics,
+        PaletteGroup::Export,
+        PaletteGroup::Recording,
+        PaletteGroup::Sources,
+    ];
+}
 
 /// Action identifiers the palette can emit. These map to app-level commands.
 #[derive(Clone, Debug)]
@@ -37,6 +117,87 @@ pub enum PaletteAction {
     MacroRecordingToggle,
     // -- Sources management ------------------------------------------------
     Sources,
+}
+
+impl PaletteAction {
+    /// Returns the categorical group this action belongs to.
+    pub fn group(&self) -> PaletteGroup {
+        match self {
+            Self::ToggleTheme
+            | Self::ToggleDensity
+            | Self::ToggleHelpStrip
+            | Self::OpenUpdateBanner => PaletteGroup::Chrome,
+            Self::FilterAgent
+            | Self::FilterWorkspace
+            | Self::FilterToday
+            | Self::FilterWeek
+            | Self::FilterCustomDate => PaletteGroup::Filter,
+            Self::OpenSavedViews
+            | Self::SaveViewSlot(_)
+            | Self::LoadViewSlot(_)
+            | Self::OpenBulkActions
+            | Self::ReloadIndex => PaletteGroup::View,
+            Self::AnalyticsDashboard
+            | Self::AnalyticsExplorer
+            | Self::AnalyticsHeatmap
+            | Self::AnalyticsBreakdowns
+            | Self::AnalyticsTools
+            | Self::AnalyticsCost
+            | Self::AnalyticsPlans
+            | Self::AnalyticsCoverage => PaletteGroup::Analytics,
+            Self::ScreenshotHtml | Self::ScreenshotSvg | Self::ScreenshotText => {
+                PaletteGroup::Export
+            }
+            Self::MacroRecordingToggle => PaletteGroup::Recording,
+            Self::Sources => PaletteGroup::Sources,
+        }
+    }
+
+    /// Returns the CassMsg variant name this action dispatches to.
+    ///
+    /// This mapping table is the authoritative contract between palette actions
+    /// and app-level command dispatch. Every variant must have an explicit entry;
+    /// the match is exhaustive by design.
+    pub fn target_msg_name(&self) -> &'static str {
+        match self {
+            // Chrome
+            Self::ToggleTheme => "ThemeToggled",
+            Self::ToggleDensity => "DensityModeCycled",
+            Self::ToggleHelpStrip => "HelpPinToggled",
+            Self::OpenUpdateBanner => "update_info inline (no CassMsg)",
+            // Filter
+            Self::FilterAgent => "InputModeEntered(Agent)",
+            Self::FilterWorkspace => "InputModeEntered(Workspace)",
+            Self::FilterToday => "FilterTimeSet { from: start_of_day }",
+            Self::FilterWeek => "FilterTimeSet { from: week_ago }",
+            Self::FilterCustomDate => "InputModeEntered(CreatedFrom)",
+            // View
+            Self::OpenSavedViews => "SavedViewsOpened",
+            Self::SaveViewSlot(_) => "ViewSaved(slot)",
+            Self::LoadViewSlot(_) => "ViewLoaded(slot)",
+            Self::OpenBulkActions => "BulkActionsOpened",
+            Self::ReloadIndex => "IndexRefreshRequested",
+            // Analytics (all batch: AnalyticsEntered + AnalyticsViewChanged)
+            Self::AnalyticsDashboard => "batch[AnalyticsEntered, AnalyticsViewChanged(Dashboard)]",
+            Self::AnalyticsExplorer => "batch[AnalyticsEntered, AnalyticsViewChanged(Explorer)]",
+            Self::AnalyticsHeatmap => "batch[AnalyticsEntered, AnalyticsViewChanged(Heatmap)]",
+            Self::AnalyticsBreakdowns => {
+                "batch[AnalyticsEntered, AnalyticsViewChanged(Breakdowns)]"
+            }
+            Self::AnalyticsTools => "batch[AnalyticsEntered, AnalyticsViewChanged(Tools)]",
+            Self::AnalyticsCost => "batch[AnalyticsEntered, AnalyticsViewChanged(Cost)]",
+            Self::AnalyticsPlans => "batch[AnalyticsEntered, AnalyticsViewChanged(Plans)]",
+            Self::AnalyticsCoverage => "batch[AnalyticsEntered, AnalyticsViewChanged(Coverage)]",
+            // Export
+            Self::ScreenshotHtml => "ScreenshotRequested(Html)",
+            Self::ScreenshotSvg => "ScreenshotRequested(Svg)",
+            Self::ScreenshotText => "ScreenshotRequested(Text)",
+            // Recording
+            Self::MacroRecordingToggle => "MacroRecordingToggled",
+            // Sources
+            Self::Sources => "SourcesEntered",
+        }
+    }
 }
 
 /// Render-ready descriptor for an action.
@@ -636,5 +797,208 @@ mod tests {
 
         assert_eq!(result.label, "My Label");
         assert_eq!(result.hint, "My Hint");
+    }
+
+    // ==================== PaletteGroup tests ====================
+
+    #[test]
+    fn group_all_contains_seven_groups() {
+        assert_eq!(PaletteGroup::ALL.len(), 7);
+    }
+
+    #[test]
+    fn group_labels_are_nonempty() {
+        for g in PaletteGroup::ALL {
+            assert!(!g.label().is_empty(), "{:?} has empty label", g);
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_group() {
+        // Exhaustive: build every variant and assert group() doesn't panic.
+        let all: Vec<PaletteAction> = vec![
+            PaletteAction::ToggleTheme,
+            PaletteAction::ToggleDensity,
+            PaletteAction::ToggleHelpStrip,
+            PaletteAction::OpenUpdateBanner,
+            PaletteAction::FilterAgent,
+            PaletteAction::FilterWorkspace,
+            PaletteAction::FilterToday,
+            PaletteAction::FilterWeek,
+            PaletteAction::FilterCustomDate,
+            PaletteAction::OpenSavedViews,
+            PaletteAction::SaveViewSlot(1),
+            PaletteAction::LoadViewSlot(1),
+            PaletteAction::OpenBulkActions,
+            PaletteAction::ReloadIndex,
+            PaletteAction::AnalyticsDashboard,
+            PaletteAction::AnalyticsExplorer,
+            PaletteAction::AnalyticsHeatmap,
+            PaletteAction::AnalyticsBreakdowns,
+            PaletteAction::AnalyticsTools,
+            PaletteAction::AnalyticsCost,
+            PaletteAction::AnalyticsPlans,
+            PaletteAction::AnalyticsCoverage,
+            PaletteAction::ScreenshotHtml,
+            PaletteAction::ScreenshotSvg,
+            PaletteAction::ScreenshotText,
+            PaletteAction::MacroRecordingToggle,
+            PaletteAction::Sources,
+        ];
+        for action in &all {
+            let _ = action.group(); // must not panic
+        }
+    }
+
+    #[test]
+    fn every_action_has_a_target_msg() {
+        let all: Vec<PaletteAction> = vec![
+            PaletteAction::ToggleTheme,
+            PaletteAction::ToggleDensity,
+            PaletteAction::ToggleHelpStrip,
+            PaletteAction::OpenUpdateBanner,
+            PaletteAction::FilterAgent,
+            PaletteAction::FilterWorkspace,
+            PaletteAction::FilterToday,
+            PaletteAction::FilterWeek,
+            PaletteAction::FilterCustomDate,
+            PaletteAction::OpenSavedViews,
+            PaletteAction::SaveViewSlot(1),
+            PaletteAction::LoadViewSlot(1),
+            PaletteAction::OpenBulkActions,
+            PaletteAction::ReloadIndex,
+            PaletteAction::AnalyticsDashboard,
+            PaletteAction::AnalyticsExplorer,
+            PaletteAction::AnalyticsHeatmap,
+            PaletteAction::AnalyticsBreakdowns,
+            PaletteAction::AnalyticsTools,
+            PaletteAction::AnalyticsCost,
+            PaletteAction::AnalyticsPlans,
+            PaletteAction::AnalyticsCoverage,
+            PaletteAction::ScreenshotHtml,
+            PaletteAction::ScreenshotSvg,
+            PaletteAction::ScreenshotText,
+            PaletteAction::MacroRecordingToggle,
+            PaletteAction::Sources,
+        ];
+        for action in &all {
+            let target = action.target_msg_name();
+            assert!(!target.is_empty(), "{:?} has empty target_msg_name", action);
+        }
+    }
+
+    #[test]
+    fn chrome_group_contains_expected_actions() {
+        assert_eq!(PaletteAction::ToggleTheme.group(), PaletteGroup::Chrome);
+        assert_eq!(PaletteAction::ToggleDensity.group(), PaletteGroup::Chrome);
+        assert_eq!(PaletteAction::ToggleHelpStrip.group(), PaletteGroup::Chrome);
+        assert_eq!(
+            PaletteAction::OpenUpdateBanner.group(),
+            PaletteGroup::Chrome
+        );
+    }
+
+    #[test]
+    fn filter_group_contains_expected_actions() {
+        assert_eq!(PaletteAction::FilterAgent.group(), PaletteGroup::Filter);
+        assert_eq!(PaletteAction::FilterWorkspace.group(), PaletteGroup::Filter);
+        assert_eq!(PaletteAction::FilterToday.group(), PaletteGroup::Filter);
+        assert_eq!(PaletteAction::FilterWeek.group(), PaletteGroup::Filter);
+        assert_eq!(
+            PaletteAction::FilterCustomDate.group(),
+            PaletteGroup::Filter
+        );
+    }
+
+    #[test]
+    fn analytics_group_has_eight_variants() {
+        let analytics: Vec<PaletteAction> = vec![
+            PaletteAction::AnalyticsDashboard,
+            PaletteAction::AnalyticsExplorer,
+            PaletteAction::AnalyticsHeatmap,
+            PaletteAction::AnalyticsBreakdowns,
+            PaletteAction::AnalyticsTools,
+            PaletteAction::AnalyticsCost,
+            PaletteAction::AnalyticsPlans,
+            PaletteAction::AnalyticsCoverage,
+        ];
+        assert_eq!(analytics.len(), 8);
+        for a in &analytics {
+            assert_eq!(a.group(), PaletteGroup::Analytics);
+        }
+    }
+
+    #[test]
+    fn view_group_contains_expected_actions() {
+        assert_eq!(PaletteAction::OpenSavedViews.group(), PaletteGroup::View);
+        assert_eq!(PaletteAction::SaveViewSlot(3).group(), PaletteGroup::View);
+        assert_eq!(PaletteAction::LoadViewSlot(5).group(), PaletteGroup::View);
+        assert_eq!(PaletteAction::OpenBulkActions.group(), PaletteGroup::View);
+        assert_eq!(PaletteAction::ReloadIndex.group(), PaletteGroup::View);
+    }
+
+    #[test]
+    fn export_group_contains_expected_actions() {
+        assert_eq!(PaletteAction::ScreenshotHtml.group(), PaletteGroup::Export);
+        assert_eq!(PaletteAction::ScreenshotSvg.group(), PaletteGroup::Export);
+        assert_eq!(PaletteAction::ScreenshotText.group(), PaletteGroup::Export);
+    }
+
+    #[test]
+    fn default_actions_cover_all_groups() {
+        let actions = default_actions();
+        let mut groups_seen = std::collections::HashSet::new();
+        for a in &actions {
+            groups_seen.insert(a.action.group());
+        }
+        for g in PaletteGroup::ALL {
+            assert!(
+                groups_seen.contains(g),
+                "Group {:?} not represented in default_actions()",
+                g
+            );
+        }
+    }
+
+    #[test]
+    fn target_msg_names_are_distinct_per_non_slot_action() {
+        // Non-slot actions should each have a unique target (slots share "ViewSaved(slot)").
+        let non_slot: Vec<PaletteAction> = vec![
+            PaletteAction::ToggleTheme,
+            PaletteAction::ToggleDensity,
+            PaletteAction::ToggleHelpStrip,
+            PaletteAction::OpenUpdateBanner,
+            PaletteAction::FilterAgent,
+            PaletteAction::FilterWorkspace,
+            PaletteAction::FilterToday,
+            PaletteAction::FilterWeek,
+            PaletteAction::FilterCustomDate,
+            PaletteAction::OpenSavedViews,
+            PaletteAction::OpenBulkActions,
+            PaletteAction::ReloadIndex,
+            PaletteAction::AnalyticsDashboard,
+            PaletteAction::AnalyticsExplorer,
+            PaletteAction::AnalyticsHeatmap,
+            PaletteAction::AnalyticsBreakdowns,
+            PaletteAction::AnalyticsTools,
+            PaletteAction::AnalyticsCost,
+            PaletteAction::AnalyticsPlans,
+            PaletteAction::AnalyticsCoverage,
+            PaletteAction::ScreenshotHtml,
+            PaletteAction::ScreenshotSvg,
+            PaletteAction::ScreenshotText,
+            PaletteAction::MacroRecordingToggle,
+            PaletteAction::Sources,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for a in &non_slot {
+            let name = a.target_msg_name();
+            assert!(
+                seen.insert(name),
+                "Duplicate target_msg_name {:?} for {:?}",
+                name,
+                a
+            );
+        }
     }
 }
