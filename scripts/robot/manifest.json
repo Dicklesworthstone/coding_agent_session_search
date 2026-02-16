@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "scripts.inventory",
+      "summary": "List available scripts in coding_agent_session_search",
+      "command": [
+        "find",
+        "scripts",
+        "-maxdepth",
+        "2",
+        "-type",
+        "f"
+      ],
+      "risk": "safe"
+    },
+    {
+      "id": "scripts.sample",
+      "summary": "Run a sample script in coding_agent_session_search (scripts/bakeoff/cass_embedder_e2e.sh)",
+      "command": [
+        "bash",
+        "scripts/bakeoff/cass_embedder_e2e.sh"
+      ],
+      "risk": "ask-first"
+    }
+  ]
+}
