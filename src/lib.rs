@@ -6193,6 +6193,7 @@ fn run_diag(
     let cline_path = config_dir.join("Code/User/globalStorage/saoudrizwan.claude-dev");
     let gemini_path = home.join(".gemini/tmp");
     let clawdbot_path = home.join(".clawdbot/sessions");
+    let openclaw_path = home.join(".openclaw/agents");
     let vibe_path = home.join(".vibe/logs/session");
     let opencode_path = home.join(".opencode");
     let amp_path = config_dir.join("Code/User/globalStorage/sourcegraph.amp");
@@ -6207,6 +6208,7 @@ fn run_diag(
         ("cline", &cline_path, cline_path.exists()),
         ("gemini", &gemini_path, gemini_path.exists()),
         ("clawdbot", &clawdbot_path, clawdbot_path.exists()),
+        ("openclaw", &openclaw_path, openclaw_path.exists()),
         ("vibe", &vibe_path, vibe_path.exists()),
         ("opencode", &opencode_path, opencode_path.exists()),
         ("amp", &amp_path, amp_path.exists()),
@@ -8300,6 +8302,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "claude_code".to_string(),
             "gemini".to_string(),
             "clawdbot".to_string(),
+            "openclaw".to_string(),
             "vibe".to_string(),
             "opencode".to_string(),
             "amp".to_string(),
@@ -8308,6 +8311,7 @@ fn run_capabilities(json: bool) -> CliResult<()> {
             "cursor".to_string(),
             "chatgpt".to_string(),
             "pi_agent".to_string(),
+            "factory".to_string(),
         ],
         limits: CapabilitiesLimits {
             max_limit: 10000,

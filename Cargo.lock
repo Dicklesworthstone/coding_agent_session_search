@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "coding-agent-search"
-version = "0.1.63"
+version = "0.1.64"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -686,7 +686,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "colored",
- "console 0.16.2",
+ "console 0.15.11",
  "crc32fast",
  "criterion",
  "crossbeam-channel",
@@ -706,9 +706,9 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "libc",
- "lru 0.16.3",
+ "lru 0.12.5",
  "memmap2",
  "mime_guess",
  "notify",
@@ -728,7 +728,7 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rusqlite",
- "security-framework 3.5.1",
+ "security-framework 2.11.1",
  "semver",
  "serde",
  "serde_json",
@@ -742,7 +742,7 @@ dependencies = [
  "syntect",
  "tantivy",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "toon_rust",
@@ -808,6 +808,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
+ "unicode-width",
  "windows-sys 0.59.0",
 ]
 

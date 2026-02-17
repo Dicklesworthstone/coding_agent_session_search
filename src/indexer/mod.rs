@@ -17,8 +17,8 @@ use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     codex::CodexConnector, cursor::CursorConnector, factory::FactoryConnector,
-    gemini::GeminiConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
-    vibe::VibeConnector,
+    gemini::GeminiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
+    pi_agent::PiAgentConnector, vibe::VibeConnector,
 };
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
@@ -1228,6 +1228,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("gemini", || Box::new(GeminiConnector::new())),
         ("claude", || Box::new(ClaudeCodeConnector::new())),
         ("clawdbot", || Box::new(ClawdbotConnector::new())),
+        ("openclaw", || Box::new(OpenClawConnector::new())),
         ("vibe", || Box::new(VibeConnector::new())),
         ("opencode", || Box::new(OpenCodeConnector::new())),
         ("amp", || Box::new(AmpConnector::new())),
@@ -1280,6 +1281,7 @@ impl ConnectorKind {
             "gemini" => Some(Self::Gemini),
             "claude" => Some(Self::Claude),
             "clawdbot" => Some(Self::Clawdbot),
+            "openclaw" => Some(Self::OpenClaw),
             "vibe" => Some(Self::Vibe),
             "amp" => Some(Self::Amp),
             "opencode" => Some(Self::OpenCode),
@@ -1301,6 +1303,7 @@ impl ConnectorKind {
             Self::Gemini => Box::new(GeminiConnector::new()),
             Self::Claude => Box::new(ClaudeCodeConnector::new()),
             Self::Clawdbot => Box::new(ClawdbotConnector::new()),
+            Self::OpenClaw => Box::new(OpenClawConnector::new()),
             Self::Vibe => Box::new(VibeConnector::new()),
             Self::Amp => Box::new(AmpConnector::new()),
             Self::OpenCode => Box::new(OpenCodeConnector::new()),
@@ -1596,6 +1599,8 @@ enum ConnectorKind {
     Claude,
     #[serde(rename = "cb", alias = "Clawdbot")]
     Clawdbot,
+    #[serde(rename = "ow", alias = "OpenClaw")]
+    OpenClaw,
     #[serde(rename = "vb", alias = "Vibe")]
     Vibe,
     #[serde(rename = "am", alias = "Amp")]
