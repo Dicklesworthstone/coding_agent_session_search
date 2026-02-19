@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use std::sync::OnceLock;
+
 use thiserror::Error;
 
 use super::{
@@ -38,6 +40,28 @@ use super::{
 use ssh2::{Session, Sftp};
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{Shutdown, TcpStream};
+
+/// Detect whether the system rsync is openrsync (macOS 15+).
+///
+/// openrsync does not support `--protect-args` (GNU rsync -s flag).
+/// We cache the result for the process lifetime since the rsync binary
+/// won't change mid-run.
+fn is_openrsync() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        Command::new("rsync")
+            .arg("--version")
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .map(|line| line.starts_with("openrsync:"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Errors that can occur during sync operations.
 #[derive(Error, Debug)]
@@ -423,32 +447,28 @@ impl SyncEngine {
         let remote_spec = format!("{}:{}", host, expanded_path);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
 
+        let local_path_str = match local_path.to_str() {
+            Some(s) => s,
+            None => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some("Local path contains invalid UTF-8".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let timeout_str = self.transfer_timeout.to_string();
         let mut cmd = Command::new("rsync");
-        cmd.args([
-            "-avz",           // Archive, verbose, compress
-            "--stats",        // Show transfer stats for parsing
-            "--partial",      // Keep partial transfers for resume
-            "--protect-args", // Preserve spaces/special chars in remote paths
-            "--timeout",
-            &self.transfer_timeout.to_string(),
-            "-e",
-            &ssh_opts,
-            "--",
-            &remote_spec,
-            match local_path.to_str() {
-                Some(s) => s,
-                None => {
-                    return PathSyncResult {
-                        remote_path: remote_path.to_string(),
-                        local_path,
-                        success: false,
-                        error: Some("Local path contains invalid UTF-8".to_string()),
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        ..Default::default()
-                    };
-                }
-            },
-        ]);
+        cmd.args(["-avz", "--stats", "--partial"]);
+        // openrsync (macOS 15+) doesn't support --protect-args
+        if !is_openrsync() {
+            cmd.arg("--protect-args");
+        }
+        cmd.args(["--timeout", &timeout_str, "-e", &ssh_opts, "--", &remote_spec, local_path_str]);
 
         tracing::debug!(
             host = %host,
