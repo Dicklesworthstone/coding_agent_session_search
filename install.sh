@@ -28,16 +28,17 @@ err() { log "\033[0;31m✗\033[0m $*"; }
 
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
-  local latest=""
+  local latest="" latest_json="" tags_json=""
   if command -v curl >/dev/null 2>&1; then
-    # Try 1: Fetch latest release tag from GitHub API
-    latest=$(curl -fsSL "https://api.github.com/repos/$OWNER/$REPO/releases/latest" 2>/dev/null \
-      | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    # Try 1: Fetch latest release tag from GitHub API.
+    # Do not fail hard when releases/latest returns 404 (no releases yet).
+    latest_json=$(curl -sSL "https://api.github.com/repos/$OWNER/$REPO/releases/latest" 2>/dev/null || true)
+    latest=$(printf '%s\n' "$latest_json" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
     # Try 2: If no releases exist, fall back to latest git tag (sorted by version)
     if [ -z "$latest" ]; then
       warn "No GitHub releases found; falling back to latest git tag"
-      latest=$(curl -fsSL "https://api.github.com/repos/$OWNER/$REPO/tags?per_page=1" 2>/dev/null \
-        | grep '"name"' | head -1 | sed 's/.*"name": *"\([^"]*\)".*/\1/')
+      tags_json=$(curl -sSL "https://api.github.com/repos/$OWNER/$REPO/tags?per_page=1" 2>/dev/null || true)
+      latest=$(printf '%s\n' "$tags_json" | grep '"name"' | head -1 | sed 's/.*"name": *"\([^"]*\)".*/\1/' || true)
     fi
   fi
   if [ -n "$latest" ]; then

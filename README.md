@@ -27,6 +27,14 @@ install.ps1 -EasyMode -Verify
 ```
 
 Installs the latest release by default. Pass `--version <tag>` / `-Version <tag>` to pin a specific version.
+If release artifacts are unavailable, the shell installer falls back to the latest git tag and builds from source.
+Source builds require a Rust toolchain with Edition 2024 support (`rustc`/`cargo` 1.85+).
+
+```bash
+# Force source build from a specific tag
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh?$(date +%s)" \
+  | bash -s -- --easy-mode --verify --version v0.1.64 --from-source
+```
 
 **Or via package managers:**
 
