@@ -1063,83 +1063,122 @@ pub fn run_index(
 
     // Semantic indexing (if enabled)
     if opts.semantic {
-        tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
-
-        let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
-
-        // Fetch all messages with metadata from SQLite
-        let raw_messages = storage.fetch_messages_for_embedding()?;
-        tracing::info!(
-            message_count = raw_messages.len(),
-            "fetched messages for embedding"
-        );
-
-        // Convert to EmbeddingInput format
-        let embedding_inputs: Vec<EmbeddingInput> = raw_messages
-            .into_iter()
-            .filter_map(|msg| {
-                let role_u8 = match msg.role.as_str() {
-                    "user" => ROLE_USER,
-                    "agent" | "assistant" => ROLE_ASSISTANT,
-                    "system" => ROLE_SYSTEM,
-                    "tool" => ROLE_TOOL,
-                    _ => ROLE_USER, // default to user for unknown roles
-                };
-
-                let Some(message_id) = message_id_from_db(msg.message_id) else {
-                    tracing::warn!(
-                        raw_message_id = msg.message_id,
-                        "Skipping message with out-of-range id during semantic indexing"
-                    );
-                    return None;
-                };
-
-                Some(EmbeddingInput {
-                    message_id,
-                    created_at_ms: msg.created_at.unwrap_or(0),
-                    agent_id: saturating_u32_from_i64(msg.agent_id),
-                    workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
-                    source_id: msg.source_id_hash,
-                    role: role_u8,
-                    chunk_idx: 0,
-                    content: msg.content,
+        // In watch mode, skip the expensive bulk re-embed if a vector index and
+        // watermark already exist.  The incremental path in the watch callback
+        // will pick up any new messages via WAL append.
+        //
+        // We check for any .fsvi file because the embedder's runtime ID
+        // (e.g. "minilm-384") differs from opts.embedder (e.g. "fastembed").
+        let vi_dir = opts.data_dir.join(crate::search::vector_index::VECTOR_INDEX_DIR);
+        let has_existing_index = vi_dir.is_dir()
+            && std::fs::read_dir(&vi_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| {
+                            e.path()
+                                .extension()
+                                .is_some_and(|ext| ext == "fsvi")
+                        })
                 })
-            })
-            .collect();
+                .unwrap_or(false);
+        let has_watermark = storage.get_last_embedded_message_id()?.is_some();
 
-        // Generate embeddings
-        let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
-        tracing::info!(
-            embedded_count = embedded_messages.len(),
-            "generated embeddings"
-        );
-
-        if !embedded_messages.is_empty() {
-            let vector_index =
-                semantic_indexer.build_and_save_index(embedded_messages, &opts.data_dir)?;
-            let index_path = crate::search::vector_index::vector_index_path(
-                &opts.data_dir,
-                semantic_indexer.embedder_id(),
-            );
+        if opts.watch && has_existing_index && has_watermark {
             tracing::info!(
-                path = %index_path.display(),
-                embedder = semantic_indexer.embedder_id(),
-                "saved semantic vector index"
+                dir = %vi_dir.display(),
+                "skipping bulk semantic re-embed (existing index + watermark found); \
+                 incremental watch callback will handle new messages"
+            );
+        } else {
+            tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
+
+            let semantic_indexer =
+                SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
+
+            // Fetch all messages with metadata from SQLite
+            let raw_messages = storage.fetch_messages_for_embedding()?;
+            tracing::info!(
+                message_count = raw_messages.len(),
+                "fetched messages for embedding"
             );
 
-            // Build HNSW index for approximate nearest neighbor search (if enabled)
-            if opts.build_hnsw {
-                let hnsw_path = semantic_indexer.build_hnsw_index(
-                    &vector_index,
+            // Convert to EmbeddingInput format
+            let embedding_inputs: Vec<EmbeddingInput> = raw_messages
+                .into_iter()
+                .filter_map(|msg| {
+                    let role_u8 = match msg.role.as_str() {
+                        "user" => ROLE_USER,
+                        "agent" | "assistant" => ROLE_ASSISTANT,
+                        "system" => ROLE_SYSTEM,
+                        "tool" => ROLE_TOOL,
+                        _ => ROLE_USER, // default to user for unknown roles
+                    };
+
+                    let Some(message_id) = message_id_from_db(msg.message_id) else {
+                        tracing::warn!(
+                            raw_message_id = msg.message_id,
+                            "Skipping message with out-of-range id during semantic indexing"
+                        );
+                        return None;
+                    };
+
+                    Some(EmbeddingInput {
+                        message_id,
+                        created_at_ms: msg.created_at.unwrap_or(0),
+                        agent_id: saturating_u32_from_i64(msg.agent_id),
+                        workspace_id: saturating_u32_from_i64(
+                            msg.workspace_id.unwrap_or(0),
+                        ),
+                        source_id: msg.source_id_hash,
+                        role: role_u8,
+                        chunk_idx: 0,
+                        content: msg.content,
+                    })
+                })
+                .collect();
+
+            // Generate embeddings
+            let embedded_messages =
+                semantic_indexer.embed_messages(&embedding_inputs)?;
+            tracing::info!(
+                embedded_count = embedded_messages.len(),
+                "generated embeddings"
+            );
+
+            if !embedded_messages.is_empty() {
+                let vector_index = semantic_indexer
+                    .build_and_save_index(embedded_messages, &opts.data_dir)?;
+                let saved_path = crate::search::vector_index::vector_index_path(
                     &opts.data_dir,
-                    None, // Use default M
-                    None, // Use default ef_construction
-                )?;
-                tracing::info!(
-                    path = %hnsw_path.display(),
-                    embedder = semantic_indexer.embedder_id(),
-                    "saved HNSW index for approximate search"
+                    semantic_indexer.embedder_id(),
                 );
+                tracing::info!(
+                    path = %saved_path.display(),
+                    embedder = semantic_indexer.embedder_id(),
+                    "saved semantic vector index"
+                );
+
+                // Build HNSW index for approximate nearest neighbor search (if enabled)
+                if opts.build_hnsw {
+                    let hnsw_path = semantic_indexer.build_hnsw_index(
+                        &vector_index,
+                        &opts.data_dir,
+                        None, // Use default M
+                        None, // Use default ef_construction
+                    )?;
+                    tracing::info!(
+                        path = %hnsw_path.display(),
+                        embedder = semantic_indexer.embedder_id(),
+                        "saved HNSW index for approximate search"
+                    );
+                }
+            }
+
+            // Set watermark so incremental watch-mode embedding only sees new messages
+            if let Some(last_input) = embedding_inputs.last() {
+                storage
+                    .set_last_embedded_message_id(last_input.message_id as i64)?;
             }
         }
     }
@@ -1167,6 +1206,20 @@ pub fn run_index(
         let storage = Arc::new(Mutex::new(storage));
         let t_index = Arc::new(Mutex::new(t_index));
 
+        // Semantic embedding cooldown state for watch mode.
+        // The initial pass already embedded everything, so we start the clock
+        // from now — the cooldown must elapse before the first incremental pass.
+        let semantic_enabled = opts.semantic;
+        let embedder_id = opts.embedder.clone();
+        let data_dir_for_semantic = opts.data_dir.clone();
+        let semantic_cooldown = Duration::from_secs(
+            std::env::var("CASS_WATCH_SEMANTIC_COOLDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        );
+        let last_semantic_embed = Arc::new(Mutex::new(Instant::now()));
+
         // Initialize stale detector for watch mode
         let stale_detector = Arc::new(StaleDetector::from_env());
         let stale_config = StaleConfig::from_env();
@@ -1192,6 +1245,7 @@ pub fn run_index(
             event_channel,
             stale_detector,
             move |paths, roots, is_rebuild| {
+                let indexed;
                 if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
@@ -1202,7 +1256,7 @@ pub fn run_index(
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
                         roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let indexed = reindex_paths(
+                    indexed = reindex_paths(
                         &opts_clone,
                         all_root_paths,
                         roots,
@@ -1212,9 +1266,9 @@ pub fn run_index(
                         true,
                     );
                     // Record result to stale detector
-                    detector_clone.record_scan(indexed.unwrap_or(0));
+                    detector_clone.record_scan(indexed.as_ref().copied().unwrap_or(0));
                 } else {
-                    let indexed = reindex_paths(
+                    indexed = reindex_paths(
                         &opts_clone,
                         paths,
                         roots,
@@ -1224,7 +1278,7 @@ pub fn run_index(
                         false,
                     );
                     // Record result to stale detector
-                    detector_clone.record_scan(indexed.unwrap_or(0));
+                    detector_clone.record_scan(indexed.as_ref().copied().unwrap_or(0));
 
                     // Merge Tantivy segments if idle conditions are met.
                     // Without this, each reindex_paths() commit creates a new
@@ -1232,9 +1286,35 @@ pub fn run_index(
                     // continuous watch mode operation. The cooldown logic inside
                     // optimize_if_idle() (300s, 4-segment threshold) prevents
                     // over-merging. See issue #87.
-                    if let Ok(mut guard) = t_index.lock() {
-                        if let Err(e) = guard.optimize_if_idle() {
-                            tracing::warn!(error = %e, "segment merge failed during watch");
+                    if let Ok(mut guard) = t_index.lock()
+                        && let Err(e) = guard.optimize_if_idle()
+                    {
+                        tracing::warn!(error = %e, "segment merge failed during watch");
+                    }
+                }
+
+                // Incremental semantic embedding with cooldown
+                if semantic_enabled && indexed.as_ref().copied().unwrap_or(0) > 0 {
+                    let should_embed = last_semantic_embed
+                        .lock()
+                        .map(|t| t.elapsed() >= semantic_cooldown)
+                        .unwrap_or(false);
+                    if should_embed {
+                        match incremental_semantic_embed(
+                            &embedder_id,
+                            &data_dir_for_semantic,
+                            storage.clone(),
+                        ) {
+                            Ok(0) => {} // no new messages to embed
+                            Ok(n) => {
+                                tracing::info!(count = n, "incremental semantic embedding complete");
+                                if let Ok(mut t) = last_semantic_embed.lock() {
+                                    *t = Instant::now();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "incremental semantic embedding failed");
+                            }
                         }
                     }
                 }
@@ -2316,6 +2396,95 @@ pub mod persist {
             other => MessageRole::Other(other.to_string()),
         }
     }
+}
+
+/// Perform incremental semantic embedding for messages added since the last
+/// watermark. Loads the ONNX model, embeds the batch, appends to the existing
+/// FSVI index via WAL, and updates the watermark. The `SemanticIndexer` (and
+/// its model) is dropped at the end of this call.
+fn incremental_semantic_embed(
+    embedder: &str,
+    data_dir: &Path,
+    storage: Arc<Mutex<SqliteStorage>>,
+) -> Result<usize> {
+    // 1. Read watermark
+    let watermark = storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for watermark read: {e}"))?
+        .get_last_embedded_message_id()?
+        .unwrap_or(0);
+
+    // 2. Fetch new messages since watermark
+    let raw_messages = storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?
+        .fetch_messages_for_embedding_since(watermark)?;
+
+    if raw_messages.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::info!(
+        since_id = watermark,
+        count = raw_messages.len(),
+        "incremental semantic: fetched new messages"
+    );
+
+    // 3. Convert to EmbeddingInput (same mapping as initial pass)
+    let embedding_inputs: Vec<EmbeddingInput> = raw_messages
+        .into_iter()
+        .filter_map(|msg| {
+            let role_u8 = match msg.role.as_str() {
+                "user" => ROLE_USER,
+                "agent" | "assistant" => ROLE_ASSISTANT,
+                "system" => ROLE_SYSTEM,
+                "tool" => ROLE_TOOL,
+                _ => ROLE_USER,
+            };
+
+            let Some(message_id) = message_id_from_db(msg.message_id) else {
+                tracing::warn!(
+                    raw_message_id = msg.message_id,
+                    "Skipping message with out-of-range id during incremental semantic indexing"
+                );
+                return None;
+            };
+
+            Some(EmbeddingInput {
+                message_id,
+                created_at_ms: msg.created_at.unwrap_or(0),
+                agent_id: saturating_u32_from_i64(msg.agent_id),
+                workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
+                source_id: msg.source_id_hash,
+                role: role_u8,
+                chunk_idx: 0,
+                content: msg.content,
+            })
+        })
+        .collect();
+
+    if embedding_inputs.is_empty() {
+        return Ok(0);
+    }
+
+    // 4. Load model, embed, append
+    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let max_id = embedding_inputs
+        .iter()
+        .map(|e| e.message_id)
+        .max()
+        .unwrap_or(0);
+
+    let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
+    let count = semantic_indexer.append_to_index(embedded, data_dir)?;
+
+    // 5. Update watermark
+    storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?
+        .set_last_embedded_message_id(max_id as i64)?;
+
+    Ok(count)
 }
 
 #[cfg(test)]

@@ -274,6 +274,58 @@ impl SemanticIndexer {
             .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
     }
 
+    /// Append new embeddings to an existing FSVI index via the WAL.
+    ///
+    /// Used for incremental semantic indexing in watch mode. Opens the
+    /// existing index, appends a batch of new embeddings, and compacts if
+    /// the WAL has grown large enough.
+    ///
+    /// Returns the number of entries appended.
+    pub fn append_to_index(
+        &self,
+        embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
+        data_dir: &Path,
+    ) -> Result<usize> {
+        let index_path = vector_index_path(data_dir, self.embedder_id());
+        let mut index = FsVectorIndex::open(&index_path)
+            .map_err(|err| anyhow::anyhow!("open fsvi index for append failed: {err}"))?;
+
+        let entries: Vec<(String, Vec<f32>)> = embedded_messages
+            .into_iter()
+            .map(|em| {
+                let doc_id = SemanticDocId {
+                    message_id: em.message_id,
+                    chunk_idx: em.chunk_idx,
+                    agent_id: em.agent_id,
+                    workspace_id: em.workspace_id,
+                    source_id: em.source_id,
+                    role: em.role,
+                    created_at_ms: em.created_at_ms,
+                    content_hash: Some(em.content_hash),
+                }
+                .to_doc_id_string();
+                (doc_id, em.embedding)
+            })
+            .collect();
+
+        let count = entries.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        index
+            .append_batch(&entries)
+            .map_err(|err| anyhow::anyhow!("append_batch failed: {err}"))?;
+
+        if index.needs_compaction() {
+            index
+                .compact()
+                .map_err(|err| anyhow::anyhow!("compaction failed: {err}"))?;
+        }
+
+        Ok(count)
+    }
+
     /// Build and save an HNSW index for approximate nearest neighbor search.
     ///
     /// This creates an HNSW graph structure from the existing VectorIndex,

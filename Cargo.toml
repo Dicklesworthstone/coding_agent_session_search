@@ -126,12 +126,10 @@ proptest = "*"
 serde_yaml = "*"
 rand = "0.10"
 rand_chacha = "0.10"
-# frankensqlite compat gate tests (bead 3vvqa) — COMMENTED OUT: fsqlite-mvcc requires
-# nightly features (peer_credentials_unix_socket, unix_socket_ancillary_data) which break
-# ALL test compilation on stable Rust. Re-enable when nightly toolchain is configured.
-# fsqlite = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite", features = ["fts5"] }
-# fsqlite-types = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite-types" }
-# fsqlite-error = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite-error" }
+# frankensqlite compat gate tests (bead 3vvqa) — nightly feature blocker resolved upstream
+fsqlite = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite", features = ["fts5"] }
+fsqlite-types = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { version = "0.1.1", path = "../frankensqlite/crates/fsqlite-error" }
 
 [[bin]]
 name = "cass"
