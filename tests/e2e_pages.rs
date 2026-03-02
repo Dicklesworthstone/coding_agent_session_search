@@ -554,19 +554,28 @@ fn test_search_in_decrypted_archive() {
         "query_database",
         Some("Query decrypted database to verify schema"),
     );
-    let conn = Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
+    let conn =
+        Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
 
     use frankensqlite::compat::{ConnectionExt, RowExt};
 
     // Verify conversations table exists and has data
     let conv_count: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row: &frankensqlite::Row| row.get_typed(0))
+        .query_row_map(
+            "SELECT COUNT(*) FROM conversations",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )
         .expect("count conversations");
     assert_eq!(conv_count, 5, "Should have 5 conversations");
 
     // Verify messages table exists and has data
     let msg_count: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row: &frankensqlite::Row| row.get_typed(0))
+        .query_row_map(
+            "SELECT COUNT(*) FROM messages",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )
         .expect("count messages");
     assert!(msg_count > 0, "Should have messages");
 

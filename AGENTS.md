@@ -80,19 +80,20 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Async runtime (multi-thread, fs, spawn_blocking, signals) |
+| `asupersync` | Async runtime (multi-thread, fs, spawn_blocking, signals) — path dep |
 | `clap` | CLI argument parsing with derive macros |
 | `serde` + `serde_json` | Serialization |
-| `rusqlite` | SQLite database (bundled, modern) |
-| `tantivy` | Full-text BM25 search engine |
+| `frankensqlite` (`fsqlite`) | Pure-Rust SQLite reimplementation — primary storage backend (path dep) |
+| `rusqlite` | SQLite database (bundled) — legacy, retained during frankensqlite migration |
+| `frankensearch` | Unified search engine: lexical BM25 + semantic + RRF fusion (path dep) |
+| `franken_agent_detection` | Agent session auto-detection across 15+ providers (path dep) |
 | `fastembed` | ONNX-based text embeddings |
 | `hnsw_rs` | HNSW approximate nearest neighbors |
 | `half` + `wide` + `memmap2` | f16 quantized vectors, portable SIMD, memory-mapped I/O |
-| `ftui` + `ftui-extras` | FrankenTUI terminal interface |
-| `toon` | Terminal rendering library |
+| `ftui` + `ftui-extras` | FrankenTUI terminal interface (path dep) |
+| `toon` | Terminal rendering library (path dep) |
 | `reqwest` | HTTP client (rustls-tls, blocking + async) |
 | `rayon` | Data parallelism for CPU-bound work |
-| `crossterm` | Terminal input/output |
 | `colored` + `indicatif` + `console` | Colorful, informative console output |
 | `notify` | Filesystem watching |
 | `walkdir` + `glob` | Directory traversal and pattern matching |
@@ -104,6 +105,14 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
 | `unicode-normalization` | NFC text canonicalization |
+
+**Path dependencies** (sibling dirs under `/data/projects/`):
+- `frankensqlite` — Pure-Rust SQLite with BEGIN CONCURRENT (MVCC multi-writer)
+- `frankensearch` — Unified search: BM25 lexical + semantic embeddings + RRF fusion + reranking
+- `franken_agent_detection` — Auto-discovers agent sessions from 15+ providers
+- `frankentui` (`ftui` + `ftui-extras` + `ftui-runtime` + `ftui-tty`) — Terminal UI framework
+- `asupersync` — Async runtime (multi-thread, fs, spawn_blocking, signals)
+- `toon` — Token-optimized serialization
 
 ### Release Profile
 
@@ -190,7 +199,50 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
-## Database Guidelines (rusqlite)
+## Database Guidelines (frankensqlite + rusqlite)
+
+The project is migrating from rusqlite to frankensqlite. Both are available:
+- `frankensqlite` (import as `fsqlite`) — Pure-Rust SQLite with BEGIN CONCURRENT support
+- `rusqlite` — C-binding SQLite, retained as fallback during migration
+
+### frankensqlite Patterns
+
+```rust
+use frankensqlite::Connection;
+
+// Open with WAL mode (REQUIRED for concurrent access)
+let conn = Connection::open(path)?;
+conn.execute("PRAGMA journal_mode = WAL;")?;
+conn.execute("PRAGMA busy_timeout = 5000;")?;
+
+// Use params! macro (needs explicit import)
+use fsqlite::params;
+conn.execute_with_params("INSERT INTO t (a) VALUES (?1)", params![42])?;
+```
+
+### FrankenConnectionManager (production pattern)
+
+Use `FrankenConnectionManager` for concurrent access:
+- Reader pool (multiple concurrent readers)
+- Writer token (single writer at a time via `WriterGuard`)
+- `WriterGuard` auto-rollbacks on drop (RAII safety)
+
+### Concurrent Writer Best Practices
+
+1. **Always use WAL mode** — without it, concurrent writes corrupt the DB
+2. **Use jittered exponential backoff** on `BusySnapshot` / `WriteConflict` errors
+3. **Batch writes** — 10-20 rows per transaction (not 1 row per commit)
+4. **Limit concurrent writers** to 4 threads (matches production rayon parallelism)
+5. **Retryable errors:** `Busy`, `BusyRecovery`, `BusySnapshot`, `WriteConflict`, `SerializationFailure`, `DatabaseCorrupt`
+
+### Known frankensqlite Limitations (during migration)
+
+- `ORDER BY` with `IS NULL` expressions not supported in SELECT list
+- Mixed aggregate and non-aggregate columns without GROUP BY not supported
+- `INSERT ON CONFLICT` (UPSERT) can fail after repeated calls in release mode
+- Some complex `SELECT` queries fail with "OpenRead" errors (result-loading path)
+
+### General Rules
 
 **Do:**
 - Create connection pools and reuse across the application
@@ -263,10 +315,13 @@ cargo test --all-features
 | `tests/e2e_*.rs` | End-to-end CLI flows, filters, search, sources, TUI, deploy |
 | `tests/cli_*.rs` | CLI dispatch coverage, robot mode, index, stats |
 | `tests/tui_*.rs` | TUI headless smoke tests, snapshot tests |
+| `tests/tui_integration_smoke.rs` | TUI + full integrated stack (frankensqlite + frankensearch + FAD) |
+| `tests/frankensqlite_*.rs` | frankensqlite compat gates, concurrent stress tests |
+| `tests/agent_detection_completeness.rs` | franken_agent_detection connector completeness |
 | `tests/html_export*.rs` | HTML export pipeline, encryption |
 | `tests/storage*.rs` | SQLite storage, migration safety |
 | `tests/performance/` | Performance regression tests |
-| `benches/` | Criterion benchmarks (index, runtime, search, crypto, db, export, cache, regex) |
+| `benches/` | Criterion benchmarks (index, runtime, search, crypto, db, export, cache, regex, integration_regression) |
 
 ### Test Fixtures
 
@@ -315,9 +370,9 @@ coding_agent_session_search/
 │   │   ├── clawdbot.rs           # ClawdBot sessions
 │   │   ├── vibe.rs               # Vibe sessions
 │   │   └── factory.rs            # Connector factory
-│   ├── search/                   # Search engine
+│   ├── search/                   # Search engine (delegates to frankensearch)
 │   │   ├── query.rs              # Query parsing and execution
-│   │   ├── tantivy.rs            # BM25 full-text search (Tantivy)
+│   │   ├── tantivy.rs            # BM25 full-text search (via frankensearch)
 │   │   ├── vector_index.rs       # Vector similarity search
 │   │   ├── two_tier_search.rs    # Progressive 2-tier hybrid search
 │   │   ├── ann_index.rs          # HNSW approximate nearest neighbors
@@ -332,7 +387,7 @@ coding_agent_session_search/
 │   │   ├── canonicalize.rs       # Query canonicalization
 │   │   └── daemon_client.rs      # Search daemon RPC client
 │   ├── indexer/                  # Session indexing pipeline
-│   ├── storage/                  # SQLite persistence
+│   ├── storage/                  # SQLite persistence (frankensqlite + rusqlite)
 │   ├── ui/                       # TUI components
 │   ├── pages/                    # Web pages generation
 │   ├── pages_assets/             # Static assets for pages

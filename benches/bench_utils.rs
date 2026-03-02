@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Shared benchmark utilities for criterion benchmarks.
 //!
 //! This module provides common utilities for configuring criterion benchmarks

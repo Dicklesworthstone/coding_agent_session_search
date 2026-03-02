@@ -39,22 +39,22 @@ fn no_direct_tantivy_imports_in_src() {
             let path = entry.path();
             if path.is_dir() {
                 scan_dir(&path, violations);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    for (line_num, line) in content.lines().enumerate() {
-                        let trimmed = line.trim();
-                        // Skip comments
-                        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
-                            continue;
-                        }
-                        if trimmed.contains("use tantivy::") {
-                            violations.push(format!(
-                                "{}:{}: {}",
-                                path.display(),
-                                line_num + 1,
-                                trimmed
-                            ));
-                        }
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                for (line_num, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    // Skip comments
+                    if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                        continue;
+                    }
+                    if trimmed.contains("use tantivy::") {
+                        violations.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            line_num + 1,
+                            trimmed
+                        ));
                     }
                 }
             }
