@@ -4202,12 +4202,13 @@ fn prepare_headless_once_tui_artifacts(
 
     let db_path = data_dir.join("agent_search.db");
     {
-        let _conn = rusqlite::Connection::open(&db_path).map_err(|e| {
-            anyhow::anyhow!(
-                "initialize SQLite database for headless --once at {}: {e}",
-                db_path.display()
-            )
-        })?;
+        let _conn =
+            frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()).map_err(|e| {
+                anyhow::anyhow!(
+                    "initialize SQLite database for headless --once at {}: {e}",
+                    db_path.display()
+                )
+            })?;
     }
 
     let _index_path = crate::search::tantivy::index_dir(data_dir).map_err(|e| {
@@ -8641,15 +8642,22 @@ fn run_doctor(
 
     // 3. Check database exists and is readable
     if db_path.exists() {
-        match rusqlite::Connection::open(&db_path) {
+        match frankensqlite::Connection::open(db_path.to_string_lossy().as_ref()) {
             Ok(conn) => {
-                let conv_count = conn
-                    .query_row("SELECT COUNT(*) FROM conversations", [], |r| {
-                        r.get::<_, i64>(0)
-                    })
+                use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+                let conv_count: Option<i64> = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM conversations",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
                     .ok();
-                let msg_count = conn
-                    .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                let msg_count: Option<i64> = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM messages",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
                     .ok();
 
                 if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
@@ -8669,10 +8677,10 @@ fn run_doctor(
                     // Check for FTS table (fts_messages) - this can be missing if table was
                     // dropped after migrations completed
                     let fts_exists = conn
-                        .query_row(
+                        .query_row_map(
                             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_messages'",
-                            [],
-                            |r| r.get::<_, i64>(0),
+                            &[],
+                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
                         )
                         .unwrap_or(0)
                         > 0;
@@ -8687,6 +8695,7 @@ fn run_doctor(
                     } else {
                         // FTS table missing - attempt to recreate it if --fix is set
                         if fix {
+                            use frankensqlite::compat::BatchExt as _;
                             let create_result = conn.execute_batch(
                                 r#"
                                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
@@ -8779,12 +8788,15 @@ fn run_doctor(
 
                 // Check if index is empty but database has data
                 if num_docs == 0 && db_ok {
-                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                        if let Ok(msg_count) =
-                            conn.query_row("SELECT COUNT(*) FROM messages", [], |r| {
-                                r.get::<_, i64>(0)
-                            })
-                        {
+                    if let Ok(conn) =
+                        frankensqlite::Connection::open(db_path.to_string_lossy().as_ref())
+                    {
+                        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+                        if let Ok(msg_count) = conn.query_row_map(
+                            "SELECT COUNT(*) FROM messages",
+                            &[],
+                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
+                        ) {
                             if msg_count > 0 {
                                 add_check!(
                                     "index_sync",
@@ -10989,7 +11001,8 @@ fn run_index_with_data(
     json: bool,
     idempotency_key: Option<String>,
 ) -> CliResult<()> {
-    use rusqlite::Connection;
+    use frankensqlite::Connection;
+    use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -11025,7 +11038,7 @@ fn run_index_with_data(
 
     // Check for cached idempotency result
     if let Some(key) = &idempotency_key
-        && let Ok(conn) = Connection::open(&db_path)
+        && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
     {
         // Ensure idempotency_keys table exists
         let _ = conn.execute(
@@ -11036,22 +11049,21 @@ fn run_index_with_data(
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             )",
-            [],
         );
 
         // Clean expired keys
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = conn.execute(
+        let _ = conn.execute_params(
             "DELETE FROM idempotency_keys WHERE expires_at < ?1",
-            [now_ms],
+            frankensqlite::params![now_ms],
         );
 
         // Look up existing key
         let cached: Option<(String, String)> = conn
-            .query_row(
+            .query_row_map(
                 "SELECT params_hash, result_json FROM idempotency_keys WHERE key = ?1 AND expires_at > ?2",
-                rusqlite::params![key, now_ms],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                frankensqlite::params![key.as_str(), now_ms],
+                |r: &frankensqlite::Row| Ok((r.get_typed(0)?, r.get_typed(1)?)),
             )
             .ok();
 
@@ -11358,17 +11370,26 @@ fn run_index_with_data(
         }
     } else if let Some(fmt) = structured_format {
         // Get stats after successful indexing
-        let (conversations, messages) = if let Ok(conn) = Connection::open(&db_path) {
-            let convs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-                .unwrap_or(0);
-            let msgs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-                .unwrap_or(0);
-            (convs, msgs)
-        } else {
-            (0, 0)
-        };
+        let (conversations, messages) =
+            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
+                let convs: i64 = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM conversations",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
+                    .unwrap_or(0);
+                let msgs: i64 = conn
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM messages",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )
+                    .unwrap_or(0);
+                (convs, msgs)
+            } else {
+                (0, 0)
+            };
         let mut payload = serde_json::json!({
             "success": true,
             "elapsed_ms": elapsed_ms,
@@ -11395,13 +11416,14 @@ fn run_index_with_data(
             payload["idempotency_key"] = serde_json::json!(key);
             payload["cached"] = serde_json::json!(false);
 
-            if let Ok(conn) = Connection::open(&db_path) {
+            if let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref()) {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                 let result_json = serde_json::to_string(&payload).unwrap_or_default();
-                let _ = conn.execute(
+                let hash_str = params_hash.to_string();
+                let _ = conn.execute_params(
                     "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![key, params_hash.to_string(), result_json, now_ms, expires_ms],
+                    frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
                 );
             }
         }
