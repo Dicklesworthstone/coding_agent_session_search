@@ -22,7 +22,7 @@ use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, lo
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::verify::verify_bundle;
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use rusqlite::Connection;
+use frankensqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -554,26 +554,28 @@ fn test_search_in_decrypted_archive() {
         "query_database",
         Some("Query decrypted database to verify schema"),
     );
-    let conn = Connection::open(&decrypted_path).expect("open decrypted db");
+    let conn = Connection::open(decrypted_path.to_string_lossy().as_ref()).expect("open decrypted db");
+
+    use frankensqlite::compat::{ConnectionExt, RowExt};
 
     // Verify conversations table exists and has data
     let conv_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row: &frankensqlite::Row| row.get_typed(0))
         .expect("count conversations");
     assert_eq!(conv_count, 5, "Should have 5 conversations");
 
     // Verify messages table exists and has data
     let msg_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row: &frankensqlite::Row| row.get_typed(0))
         .expect("count messages");
     assert!(msg_count > 0, "Should have messages");
 
     // Verify export_meta table has schema version
     let schema_version: String = conn
-        .query_row(
+        .query_row_map(
             "SELECT value FROM export_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
         )
         .expect("get schema version");
     assert_eq!(schema_version, "1", "Export schema version should be 1");
@@ -668,7 +670,7 @@ fn test_summary_generation_multi_agent_fixtures() {
         "generate_summary",
         Some("Generate summary from multi-agent database"),
     );
-    let conn = rusqlite::Connection::open(&db_path).expect("open connection");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
     let summary = generator.generate(None).expect("generate summary");
     tracker.end(
@@ -786,7 +788,7 @@ fn test_summary_with_agent_filter() {
         "filter_claude",
         Some("Generate summary filtered to Claude Code only"),
     );
-    let conn = rusqlite::Connection::open(&db_path).expect("open connection");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let filters = SummaryFilters {
@@ -889,7 +891,7 @@ fn test_summary_with_workspace_exclusions() {
         "generate_with_exclusions",
         Some("Generate summary with private workspace excluded"),
     );
-    let conn = rusqlite::Connection::open(&db_path).expect("open connection");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let mut exclusions = ExclusionSet::new();
@@ -1030,7 +1032,7 @@ fn test_export_filter_date_range() {
         "filter_date_range",
         Some("Filter to February-April date range"),
     );
-    let conn = rusqlite::Connection::open(&db_path).expect("open connection");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
 
     let feb_start = 1706745600000i64; // 2024-02-01
@@ -1214,7 +1216,7 @@ fn test_prepublish_summary_render() {
         "verify_render",
         Some("Verify summary render contains all sections"),
     );
-    let conn = rusqlite::Connection::open(&db_path).expect("open connection");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open connection");
     let generator = SummaryGenerator::new(&conn);
     let summary = generator.generate(None).expect("generate");
     let rendered = summary.render_overview();

@@ -26,7 +26,9 @@ use crate::pages::secret_scan::{SecretScanReport, SecretScanSummary};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -505,9 +507,9 @@ impl<'a> SummaryGenerator<'a> {
     fn build_filter_clause(
         &self,
         filters: &SummaryFilters,
-    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    ) -> (String, Vec<ParamValue>) {
         let mut clauses = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut params: Vec<ParamValue> = Vec::new();
 
         if let Some(agents) = &filters.agents
             && !agents.is_empty()
@@ -515,7 +517,7 @@ impl<'a> SummaryGenerator<'a> {
             let placeholders: Vec<&str> = (0..agents.len()).map(|_| "?").collect();
             clauses.push(format!("c.agent IN ({})", placeholders.join(", ")));
             for agent in agents {
-                params.push(Box::new(agent.clone()));
+                params.push(ParamValue::from(agent.as_str()));
             }
         }
 
@@ -525,18 +527,18 @@ impl<'a> SummaryGenerator<'a> {
             let placeholders: Vec<&str> = (0..workspaces.len()).map(|_| "?").collect();
             clauses.push(format!("c.workspace IN ({})", placeholders.join(", ")));
             for ws in workspaces {
-                params.push(Box::new(ws.clone()));
+                params.push(ParamValue::from(ws.as_str()));
             }
         }
 
         if let Some(since) = filters.since_ts {
             clauses.push("c.started_at >= ?".to_string());
-            params.push(Box::new(since));
+            params.push(ParamValue::from(since));
         }
 
         if let Some(until) = filters.until_ts {
             clauses.push("c.started_at <= ?".to_string());
-            params.push(Box::new(until));
+            params.push(ParamValue::from(until));
         }
 
         let where_clause = if clauses.is_empty() {
@@ -549,16 +551,12 @@ impl<'a> SummaryGenerator<'a> {
     }
 
     /// Build SQL params for queries that prepend one local value before filter params.
-    fn prepend_param<'p>(
-        first: &'p dyn rusqlite::ToSql,
-        params: &'p [Box<dyn rusqlite::ToSql>],
-    ) -> Vec<&'p dyn rusqlite::ToSql> {
+    fn prepend_params(
+        first: ParamValue,
+        params: &[ParamValue],
+    ) -> Vec<ParamValue> {
         std::iter::once(first)
-            .chain(
-                params
-                    .iter()
-                    .map(|param| param.as_ref() as &dyn rusqlite::ToSql),
-            )
+            .chain(params.iter().cloned())
             .collect()
     }
 
@@ -566,7 +564,7 @@ impl<'a> SummaryGenerator<'a> {
     fn get_counts(
         &self,
         where_clause: &str,
-        params: &[Box<dyn rusqlite::ToSql>],
+        params: &[ParamValue],
     ) -> Result<(usize, usize, usize)> {
         // Count conversations
         let conv_query = format!(
@@ -575,10 +573,10 @@ impl<'a> SummaryGenerator<'a> {
         );
         let total_conversations: i64 = self
             .db
-            .query_row(
+            .query_row_map(
                 &conv_query,
-                rusqlite::params_from_iter(params.iter()),
-                |row| row.get(0),
+                params,
+                |row: &Row| row.get_typed(0),
             )
             .context("Failed to count conversations")?;
 
@@ -592,10 +590,10 @@ impl<'a> SummaryGenerator<'a> {
         );
         let (total_messages, total_characters): (i64, i64) = self
             .db
-            .query_row(
+            .query_row_map(
                 &msg_query,
-                rusqlite::params_from_iter(params.iter()),
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                params,
+                |row: &Row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )
             .context("Failed to count messages")?;
 
@@ -610,7 +608,7 @@ impl<'a> SummaryGenerator<'a> {
     fn get_time_range(
         &self,
         where_clause: &str,
-        params: &[Box<dyn rusqlite::ToSql>],
+        params: &[ParamValue],
     ) -> Result<(Option<i64>, Option<i64>)> {
         let query = format!(
             "SELECT MIN(c.started_at), MAX(c.started_at) FROM conversations c WHERE 1=1{}",
@@ -618,8 +616,8 @@ impl<'a> SummaryGenerator<'a> {
         );
         let result: (Option<i64>, Option<i64>) = self
             .db
-            .query_row(&query, rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((row.get(0)?, row.get(1)?))
+            .query_row_map(&query, params, |row: &Row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
             })
             .context("Failed to get time range")?;
         Ok(result)
@@ -629,7 +627,7 @@ impl<'a> SummaryGenerator<'a> {
     fn get_date_histogram(
         &self,
         where_clause: &str,
-        params: &[Box<dyn rusqlite::ToSql>],
+        params: &[ParamValue],
     ) -> Result<Vec<DateHistogramEntry>> {
         let query = format!(
             "SELECT DATE(m.created_at/1000, 'unixepoch') as date,
@@ -643,19 +641,17 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let mut stmt = self.db.prepare(&query)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(DateHistogramEntry {
-                date: row.get(0)?,
-                message_count: row.get::<_, i64>(1)? as usize,
-                conversation_count: row.get::<_, i64>(2)? as usize,
-            })
-        })?;
-
-        let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row?);
-        }
+        let entries = self.db.query_map_collect(
+            &query,
+            params,
+            |row: &Row| {
+                Ok(DateHistogramEntry {
+                    date: row.get_typed(0)?,
+                    message_count: row.get_typed::<i64>(1)? as usize,
+                    conversation_count: row.get_typed::<i64>(2)? as usize,
+                })
+            },
+        )?;
         Ok(entries)
     }
 
@@ -663,7 +659,7 @@ impl<'a> SummaryGenerator<'a> {
     fn get_workspace_summary(
         &self,
         where_clause: &str,
-        params: &[Box<dyn rusqlite::ToSql>],
+        params: &[ParamValue],
     ) -> Result<Vec<WorkspaceSummaryItem>> {
         let query = format!(
             "SELECT c.workspace, COUNT(*) as conv_count,
@@ -675,20 +671,21 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let mut stmt = self.db.prepare(&query)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
+        let ws_rows = self.db.query_map_collect(
+            &query,
+            params,
+            |row: &Row| {
+                Ok((
+                    row.get_typed::<String>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<Option<i64>>(2)?,
+                    row.get_typed::<Option<i64>>(3)?,
+                ))
+            },
+        )?;
 
         let mut workspaces = Vec::new();
-        for row in rows {
-            let (workspace, conv_count, min_ts, max_ts) = row?;
-
+        for (workspace, conv_count, min_ts, max_ts) in ws_rows {
             // Get message count for this workspace
             let msg_query = format!(
                 "SELECT COUNT(*) FROM messages m
@@ -696,27 +693,26 @@ impl<'a> SummaryGenerator<'a> {
                  WHERE c.workspace = ?{}",
                 where_clause
             );
-            let msg_count: i64 = self.db.query_row(
+            let prepended = Self::prepend_params(ParamValue::from(workspace.as_str()), params);
+            let msg_count: i64 = self.db.query_row_map(
                 &msg_query,
-                rusqlite::params_from_iter(Self::prepend_param(&workspace, params)),
-                |row| row.get(0),
+                &prepended,
+                |row: &Row| row.get_typed(0),
             )?;
 
             // Get sample titles
-            let titles: Vec<String> = {
-                let title_query = format!(
-                    "SELECT c.title FROM conversations c
-                     WHERE c.workspace = ? AND c.title IS NOT NULL{}
-                     ORDER BY c.started_at DESC LIMIT 5",
-                    where_clause
-                );
-                let mut title_stmt = self.db.prepare(&title_query)?;
-                let title_rows = title_stmt.query_map(
-                    rusqlite::params_from_iter(Self::prepend_param(&workspace, params)),
-                    |row| row.get(0),
-                )?;
-                title_rows.filter_map(|r| r.ok()).collect()
-            };
+            let title_query = format!(
+                "SELECT c.title FROM conversations c
+                 WHERE c.workspace = ? AND c.title IS NOT NULL{}
+                 ORDER BY c.started_at DESC LIMIT 5",
+                where_clause
+            );
+            let title_prepended = Self::prepend_params(ParamValue::from(workspace.as_str()), params);
+            let titles: Vec<String> = self.db.query_map_collect(
+                &title_query,
+                &title_prepended,
+                |row: &Row| row.get_typed(0),
+            )?;
 
             // Extract display name
             let display_name = std::path::Path::new(&workspace)
@@ -742,7 +738,7 @@ impl<'a> SummaryGenerator<'a> {
     fn get_agent_summary(
         &self,
         where_clause: &str,
-        params: &[Box<dyn rusqlite::ToSql>],
+        params: &[ParamValue],
         total_conversations: usize,
     ) -> Result<Vec<AgentSummaryItem>> {
         let query = format!(
@@ -754,15 +750,14 @@ impl<'a> SummaryGenerator<'a> {
             where_clause
         );
 
-        let mut stmt = self.db.prepare(&query)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let agent_rows = self.db.query_map_collect(
+            &query,
+            params,
+            |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )?;
 
         let mut agents = Vec::new();
-        for row in rows {
-            let (agent, conv_count) = row?;
-
+        for (agent, conv_count) in agent_rows {
             // Get message count
             let msg_query = format!(
                 "SELECT COUNT(*) FROM messages m
@@ -770,10 +765,11 @@ impl<'a> SummaryGenerator<'a> {
                  WHERE c.agent = ?{}",
                 where_clause
             );
-            let msg_count: i64 = self.db.query_row(
+            let prepended = Self::prepend_params(ParamValue::from(agent.as_str()), params);
+            let msg_count: i64 = self.db.query_row_map(
                 &msg_query,
-                rusqlite::params_from_iter(Self::prepend_param(&agent, params)),
-                |row| row.get(0),
+                &prepended,
+                |row: &Row| row.get_typed(0),
             )?;
 
             let percentage = if total_conversations > 0 {
@@ -819,27 +815,22 @@ impl<'a> SummaryGenerator<'a> {
              WHERE 1=1{}",
             where_clause
         );
-        let mut stmt = self.db.prepare(&query)?;
 
-        let rows = stmt.query_map(
-            rusqlite::params_from_iter(
-                params
-                    .iter()
-                    .map(|param| param.as_ref() as &dyn rusqlite::ToSql),
-            ),
-            |row| {
+        let conv_rows = self.db.query_map_collect(
+            &query,
+            &params,
+            |row: &Row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<String>>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<i64>(3)?,
+                    row.get_typed::<i64>(4)?,
                 ))
             },
         )?;
 
-        for row in rows {
-            let (id, workspace, title, msgs, chars) = row?;
+        for (id, workspace, title, msgs, chars) in conv_rows {
             let title_str = title.as_deref().unwrap_or("");
 
             // Check exclusions
@@ -1001,12 +992,13 @@ impl PrePublishSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensqlite::compat::BatchExt;
     use tempfile::TempDir;
 
     fn create_test_db() -> (TempDir, Connection) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
 
         conn.execute_batch(
             "CREATE TABLE conversations (
@@ -1036,25 +1028,25 @@ mod tests {
     }
 
     fn insert_test_data(conn: &Connection) {
+        use frankensqlite::compat::ConnectionExt;
+        use frankensqlite::params;
+
         // Insert conversations
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (1, 'claude-code', '/home/user/project-a', 'Fix authentication bug', '/path/a.jsonl', 1700000000000, 5)",
-            [],
+             VALUES (1, 'claude-code', '/home/user/project-a', 'Fix authentication bug', '/path/a.jsonl', 1700000000000, 5);",
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (2, 'claude-code', '/home/user/project-a', 'Add user profile', '/path/b.jsonl', 1700100000000, 3)",
-            [],
+             VALUES (2, 'claude-code', '/home/user/project-a', 'Add user profile', '/path/b.jsonl', 1700100000000, 3);",
         ).unwrap();
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (3, 'aider', '/home/user/project-b', 'Setup database', '/path/c.jsonl', 1700200000000, 4)",
-            [],
+             VALUES (3, 'aider', '/home/user/project-b', 'Setup database', '/path/c.jsonl', 1700200000000, 4);",
         ).unwrap();
 
         // Insert messages
-        for conv_id in 1..=3 {
+        for conv_id in 1..=3i64 {
             let msg_count = match conv_id {
                 1 => 5,
                 2 => 3,
@@ -1064,13 +1056,13 @@ mod tests {
             for idx in 0..msg_count {
                 let role = if idx % 2 == 0 { "user" } else { "assistant" };
                 let created_at =
-                    1700000000000i64 + (conv_id as i64 * 100000000) + (idx as i64 * 1000);
-                conn.execute(
+                    1700000000000i64 + (conv_id * 100000000) + (idx as i64 * 1000);
+                conn.execute_params(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                    rusqlite::params![
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
                         conv_id,
-                        idx,
+                        idx as i64,
                         role,
                         format!("Test message {} for conversation {}", idx, conv_id),
                         created_at
@@ -1380,14 +1372,12 @@ mod tests {
         // are active but do not match this conversation.
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (10, 'codex', NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1)",
-            [],
+             VALUES (10, 'codex', NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
         )
         .unwrap();
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
-             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000)",
-            [],
+             VALUES (10, 0, 'user', 'Workspace-less message', 1700300001000);",
         )
         .unwrap();
 

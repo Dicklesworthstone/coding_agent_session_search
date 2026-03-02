@@ -4,7 +4,9 @@
 //! exporting/encrypting data that would exceed GitHub Pages limits.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
+use frankensqlite::Connection;
+use frankensqlite::Row;
+use frankensqlite::compat::{ConnectionExt, RowExt, ParamValue};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -61,29 +63,29 @@ impl SizeEstimate {
         since_ts: Option<i64>,
         until_ts: Option<i64>,
     ) -> Result<Self> {
-        let conn = Connection::open(db_path.as_ref())
+        let conn = Connection::open(db_path.as_ref().to_string_lossy().as_ref())
             .context("Failed to open database for size estimation")?;
 
         // Build filter conditions
         let mut conditions = Vec::new();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut param_values: Vec<ParamValue> = Vec::new();
 
         if let Some(agents) = agents.filter(|a| !a.is_empty()) {
             let placeholders: Vec<_> = agents.iter().map(|_| "?").collect();
             conditions.push(format!("c.agent IN ({})", placeholders.join(", ")));
             for agent in agents {
-                params.push(Box::new(agent.clone()));
+                param_values.push(ParamValue::from(agent.as_str()));
             }
         }
 
         if let Some(since) = since_ts {
             conditions.push("c.started_at >= ?".to_string());
-            params.push(Box::new(since));
+            param_values.push(ParamValue::from(since));
         }
 
         if let Some(until) = until_ts {
             conditions.push("c.started_at <= ?".to_string());
-            params.push(Box::new(until));
+            param_values.push(ParamValue::from(until));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -92,13 +94,15 @@ impl SizeEstimate {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
+        let params_slice = &param_values;
+
         // Query conversation count
         let conv_sql = format!("SELECT COUNT(*) FROM conversations c{}", where_clause);
         let conversation_count: u64 = conn
-            .query_row(
+            .query_row_map(
                 &conv_sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| row.get::<_, i64>(0).map(|v| v as u64),
+                params_slice,
+                |row: &Row| row.get_typed::<i64>(0).map(|v| v as u64),
             )
             .unwrap_or(0);
 
@@ -111,12 +115,12 @@ impl SizeEstimate {
             where_clause
         );
         let (message_count, plaintext_bytes): (u64, u64) = conn
-            .query_row(
+            .query_row_map(
                 &msg_sql,
-                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                |row| {
-                    let raw_message_count = row.get::<_, i64>(0).unwrap_or(0);
-                    let raw_plaintext_bytes = row.get::<_, i64>(1).unwrap_or(0);
+                params_slice,
+                |row: &Row| {
+                    let raw_message_count = row.get_typed::<i64>(0).unwrap_or(0);
+                    let raw_plaintext_bytes = row.get_typed::<i64>(1).unwrap_or(0);
                     Ok((
                         raw_message_count.max(0) as u64,
                         raw_plaintext_bytes.max(0) as u64,

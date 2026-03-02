@@ -3,7 +3,7 @@ use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags};
+use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -257,9 +257,9 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    let conn = Connection::open_with_flags(
-        db_path.as_ref(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    let conn = open_with_flags(
+        &db_path.as_ref().to_string_lossy(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .context("Failed to open database for secret scan")?;
 
@@ -272,24 +272,22 @@ pub fn scan_database<P: AsRef<Path>>(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, a.slug, w.path\n         FROM conversations c\n         JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
         conv_where
     );
-    let mut conv_stmt = conn.prepare(&conv_sql)?;
-    let mut conv_rows = conv_stmt.query(rusqlite::params_from_iter(
-        conv_params.iter().map(|p| p.as_ref()),
-    ))?;
+    let conv_param_values = params_from_iter(conv_params);
+    let conv_rows = conn.query_with_params(&conv_sql, &conv_param_values)?;
 
-    while let Some(row) = conv_rows.next()? {
+    for row in &conv_rows {
         if running
             .as_ref()
             .is_some_and(|flag| !flag.load(Ordering::Relaxed))
         {
             break;
         }
-        let conv_id: i64 = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        let metadata_json: Option<String> = row.get(2)?;
-        let source_path: String = row.get(3)?;
-        let agent_slug: String = row.get(4)?;
-        let workspace_path: Option<String> = row.get(5)?;
+        let conv_id: i64 = row.get_typed(0)?;
+        let title: Option<String> = row.get_typed(1)?;
+        let metadata_json: Option<String> = row.get_typed(2)?;
+        let source_path: String = row.get_typed(3)?;
+        let agent_slug: String = row.get_typed(4)?;
+        let workspace_path: Option<String> = row.get_typed(5)?;
 
         let ctx = ScanContext {
             agent: Some(agent_slug),
@@ -338,26 +336,24 @@ pub fn scan_database<P: AsRef<Path>>(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, a.slug, w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             msg_where
         );
-        let mut msg_stmt = conn.prepare(&msg_sql)?;
-        let mut msg_rows = msg_stmt.query(rusqlite::params_from_iter(
-            msg_params.iter().map(|p| p.as_ref()),
-        ))?;
+        let msg_param_values = params_from_iter(msg_params);
+        let msg_rows = conn.query_with_params(&msg_sql, &msg_param_values)?;
 
-        while let Some(row) = msg_rows.next()? {
+        for row in &msg_rows {
             if running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
             {
                 break;
             }
-            let msg_id: i64 = row.get(0)?;
-            let msg_idx: i64 = row.get(1)?;
-            let content: String = row.get(2)?;
-            let extra_json: Option<String> = row.get(3)?;
-            let conv_id: i64 = row.get(4)?;
-            let source_path: String = row.get(5)?;
-            let agent_slug: String = row.get(6)?;
-            let workspace_path: Option<String> = row.get(7)?;
+            let msg_id: i64 = row.get_typed(0)?;
+            let msg_idx: i64 = row.get_typed(1)?;
+            let content: String = row.get_typed(2)?;
+            let extra_json: Option<String> = row.get_typed(3)?;
+            let conv_id: i64 = row.get_typed(4)?;
+            let source_path: String = row.get_typed(5)?;
+            let agent_slug: String = row.get_typed(6)?;
+            let workspace_path: Option<String> = row.get_typed(7)?;
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
@@ -850,15 +846,15 @@ fn is_allowlisted(matched: &str, config: &SecretScanConfig) -> bool {
 
 fn build_where_clause(
     filters: &SecretScanFilters,
-) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+) -> Result<(String, Vec<ParamValue>)> {
     let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut params: Vec<ParamValue> = Vec::new();
 
     if let Some(agents) = filters.agents.as_ref().filter(|a| !a.is_empty()) {
         let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
         conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
         for agent in agents {
-            params.push(Box::new(agent.clone()));
+            params.push(ParamValue::from(agent.as_str()));
         }
     }
 
@@ -866,18 +862,18 @@ fn build_where_clause(
         let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
         conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
         for ws in workspaces {
-            params.push(Box::new(ws.to_string_lossy().to_string()));
+            params.push(ParamValue::from(ws.to_string_lossy().to_string()));
         }
     }
 
     if let Some(since) = filters.since_ts {
         conditions.push("c.started_at >= ?".to_string());
-        params.push(Box::new(since));
+        params.push(ParamValue::from(since));
     }
 
     if let Some(until) = filters.until_ts {
         conditions.push("c.started_at <= ?".to_string());
-        params.push(Box::new(until));
+        params.push(ParamValue::from(until));
     }
 
     let where_clause = if conditions.is_empty() {

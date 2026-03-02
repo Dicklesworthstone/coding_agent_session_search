@@ -2291,6 +2291,199 @@ impl FrankenStorage {
         )?;
         Ok(())
     }
+
+    // =====================================================================
+    // Analytics query methods
+    // =====================================================================
+
+    /// Get session count for a date range using materialized stats.
+    /// Returns (count, is_from_cache) where is_from_cache is true if from daily_stats.
+    ///
+    /// Falls back to COUNT(*) query when daily_stats table is empty or stale.
+    pub fn count_sessions_in_range(
+        &self,
+        start_ts_ms: Option<i64>,
+        end_ts_ms: Option<i64>,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        let agent = agent_slug.unwrap_or("all");
+        let source = source_id.unwrap_or("all");
+
+        // Check if we have materialized stats
+        let stats_count: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM daily_stats",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap_or(0);
+
+        if stats_count == 0 {
+            return self.count_sessions_direct(start_ts_ms, end_ts_ms, agent_slug, source_id);
+        }
+
+        // Use materialized stats
+        let start_day = start_ts_ms.map(Self::day_id_from_millis);
+        let end_day = end_ts_ms.map(Self::day_id_from_millis);
+
+        let count: i64 = match (start_day, end_day) {
+            (Some(start), Some(end)) => self.conn.query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id BETWEEN ?1 AND ?2 AND agent_slug = ?3 AND source_id = ?4",
+                fparams![start, end, agent, source],
+                |row| row.get_typed(0),
+            )?,
+            (Some(start), None) => self.conn.query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id >= ?1 AND agent_slug = ?2 AND source_id = ?3",
+                fparams![start, agent, source],
+                |row| row.get_typed(0),
+            )?,
+            (None, Some(end)) => self.conn.query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE day_id <= ?1 AND agent_slug = ?2 AND source_id = ?3",
+                fparams![end, agent, source],
+                |row| row.get_typed(0),
+            )?,
+            (None, None) => self.conn.query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE agent_slug = ?1 AND source_id = ?2",
+                fparams![agent, source],
+                |row| row.get_typed(0),
+            )?,
+        };
+
+        Ok((count, true))
+    }
+
+    /// Direct COUNT(*) query as fallback when daily_stats is empty.
+    fn count_sessions_direct(
+        &self,
+        start_ts_ms: Option<i64>,
+        end_ts_ms: Option<i64>,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<(i64, bool)> {
+        // Build dynamic SQL with positional params
+        let mut sql = "SELECT COUNT(*) FROM conversations c
+                       JOIN agents a ON c.agent_id = a.id WHERE 1=1"
+            .to_string();
+        let mut param_values: Vec<ParamValue> = Vec::new();
+        let mut idx = 1;
+
+        if let Some(start) = start_ts_ms {
+            sql.push_str(&format!(" AND c.started_at >= ?{idx}"));
+            param_values.push(ParamValue::from(start));
+            idx += 1;
+        }
+        if let Some(end) = end_ts_ms {
+            sql.push_str(&format!(" AND c.started_at <= ?{idx}"));
+            param_values.push(ParamValue::from(end));
+            idx += 1;
+        }
+        if let Some(agent) = agent_slug
+            && agent != "all"
+        {
+            sql.push_str(&format!(" AND a.slug = ?{idx}"));
+            param_values.push(ParamValue::from(agent));
+            idx += 1;
+        }
+        if let Some(source) = source_id
+            && source != "all"
+        {
+            sql.push_str(&format!(" AND c.source_id = ?{idx}"));
+            param_values.push(ParamValue::from(source));
+            let _ = idx; // suppress unused warning
+        }
+
+        let count: i64 = self
+            .conn
+            .query_row_map(&sql, &param_values, |row| row.get_typed(0))?;
+        Ok((count, false))
+    }
+
+    /// Get daily histogram data for a date range.
+    pub fn get_daily_histogram(
+        &self,
+        start_ts_ms: i64,
+        end_ts_ms: i64,
+        agent_slug: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Result<Vec<DailyCount>> {
+        let start_day = Self::day_id_from_millis(start_ts_ms);
+        let end_day = Self::day_id_from_millis(end_ts_ms);
+        let agent = agent_slug.unwrap_or("all");
+        let source = source_id.unwrap_or("all");
+
+        let rows = self.conn.query_map_collect(
+            "SELECT day_id, session_count, message_count, total_chars
+             FROM daily_stats
+             WHERE day_id BETWEEN ?1 AND ?2 AND agent_slug = ?3 AND source_id = ?4
+             ORDER BY day_id",
+            fparams![start_day, end_day, agent, source],
+            |row| {
+                Ok(DailyCount {
+                    day_id: row.get_typed(0)?,
+                    sessions: row.get_typed(1)?,
+                    messages: row.get_typed(2)?,
+                    chars: row.get_typed(3)?,
+                })
+            },
+        )?;
+
+        Ok(rows)
+    }
+
+    /// Check health of daily stats table.
+    pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
+        let row_count: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM daily_stats",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap_or(0);
+
+        let oldest_update: Option<i64> = self
+            .conn
+            .query_row_map(
+                "SELECT MIN(last_updated) FROM daily_stats",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .ok();
+
+        let conversation_count: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap_or(0);
+
+        let materialized_total: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+                 WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap_or(0);
+
+        Ok(DailyStatsHealth {
+            populated: row_count > 0,
+            row_count,
+            oldest_update_ms: oldest_update,
+            conversation_count,
+            materialized_total,
+            drift: (conversation_count - materialized_total).abs(),
+        })
+    }
 }
 
 // =========================================================================
