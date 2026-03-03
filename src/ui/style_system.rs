@@ -100,10 +100,12 @@ pub enum UiThemePreset {
     Nightfox,
     CyberpunkAurora,
     Synthwave84,
+    #[serde(alias = "cb")]
+    Colorblind,
 }
 
 impl UiThemePreset {
-    pub const fn all() -> [Self; 18] {
+    pub const fn all() -> [Self; 19] {
         [
             Self::TokyoNight,
             Self::Daylight,
@@ -123,6 +125,7 @@ impl UiThemePreset {
             Self::CyberpunkAurora,
             Self::Synthwave84,
             Self::HighContrast,
+            Self::Colorblind,
         ]
     }
 
@@ -146,6 +149,7 @@ impl UiThemePreset {
             Self::Nightfox => "Nightfox",
             Self::CyberpunkAurora => "Cyberpunk Aurora",
             Self::Synthwave84 => "Synthwave '84",
+            Self::Colorblind => "Colorblind",
         }
     }
 
@@ -183,6 +187,9 @@ impl UiThemePreset {
             "synthwave-84" | "synthwave_84" | "synthwave84" | "synthwave" => {
                 Some(Self::Synthwave84)
             }
+            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => {
+                Some(Self::Colorblind)
+            }
             _ => None,
         }
     }
@@ -207,6 +214,7 @@ impl UiThemePreset {
             Self::Nightfox => nightfox_theme(),
             Self::CyberpunkAurora => cyberpunk_aurora_theme(),
             Self::Synthwave84 => synthwave_84_theme(),
+            Self::Colorblind => colorblind_theme(),
         }
     }
 }
@@ -1415,6 +1423,23 @@ fn synthwave_84_theme() -> Theme {
         .build()
 }
 
+/// Colorblind-accessible theme based on Tokyo Night.
+///
+/// Swaps green/orange/red role colors with blue/yellow/magenta so that
+/// all role indicators remain distinguishable for deuteranopia and
+/// protanopia users.  Background, text, and structural colors are
+/// identical to Tokyo Night.
+fn colorblind_theme() -> Theme {
+    ThemeBuilder::from_theme(tokyo_night_theme())
+        // success → teal-cyan (distinct from the blue primary)
+        .success(Color::rgb(125, 207, 255)) // #7dcfff cyan (was green #73daca)
+        // warning → warm yellow (was amber, still yellow family but brighter)
+        .warning(Color::rgb(224, 175, 104)) // #e0af68 (unchanged, already CB-safe)
+        // error → magenta/purple instead of red
+        .error(Color::rgb(187, 154, 247)) // #bb9af7 (was red #f7768e)
+        .build()
+}
+
 fn apply_a11y_overrides(theme: Theme) -> Theme {
     ThemeBuilder::from_theme(theme)
         .border_focused(Color::rgb(255, 255, 0))
@@ -1910,7 +1935,7 @@ mod tests {
         );
         assert_eq!(
             UiThemePreset::TokyoNight.previous(),
-            UiThemePreset::HighContrast
+            UiThemePreset::Colorblind
         );
     }
 

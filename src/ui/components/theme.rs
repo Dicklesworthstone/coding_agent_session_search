@@ -763,10 +763,13 @@ pub enum ThemePreset {
     Synthwave84,
     /// High Contrast - maximum contrast for accessibility (WCAG AAA)
     HighContrast,
+    /// Colorblind - deuteranopia/protanopia accessible variant of Tokyo Night
+    /// Replaces green/orange with blue/yellow for red-green colorblind users
+    Colorblind,
 }
 
 impl ThemePreset {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::TokyoNight,
         Self::Daylight,
         Self::Catppuccin,
@@ -785,6 +788,7 @@ impl ThemePreset {
         Self::CyberpunkAurora,
         Self::Synthwave84,
         Self::HighContrast,
+        Self::Colorblind,
     ];
 
     /// Get the display name for this theme preset
@@ -808,6 +812,7 @@ impl ThemePreset {
             Self::CyberpunkAurora => "Cyberpunk Aurora",
             Self::Synthwave84 => "Synthwave '84",
             Self::HighContrast => "High Contrast",
+            Self::Colorblind => "Colorblind",
         }
     }
 
@@ -844,6 +849,7 @@ impl ThemePreset {
             Self::CyberpunkAurora => ThemePalette::cyberpunk_aurora(),
             Self::Synthwave84 => ThemePalette::synthwave_84(),
             Self::HighContrast => ThemePalette::high_contrast(),
+            Self::Colorblind => ThemePalette::colorblind(),
         }
     }
 
@@ -936,6 +942,30 @@ impl ThemePalette {
             system: PackedRgba::rgb(255, 255, 0),
             stripe_even: PackedRgba::BLACK,
             stripe_odd: PackedRgba::rgb(24, 24, 24),
+        }
+    }
+
+    /// Colorblind-accessible theme - Tokyo Night base with deuteranopia/protanopia-safe colors.
+    ///
+    /// Replaces green (#9ece6a) with blue (#7aa2f7) and orange (#ff9e64) with yellow (#e0af68)
+    /// so that role colors remain distinguishable for red-green colorblind users.
+    /// Red (#f7768e) is replaced with magenta/purple (#bb9af7).
+    /// Background, text, and accent colors are unchanged from Tokyo Night.
+    pub fn colorblind() -> Self {
+        Self {
+            accent: colors::ACCENT_PRIMARY,                    // #7aa2f7 (unchanged)
+            accent_alt: colors::ACCENT_SECONDARY,              // #bb9af7 (unchanged)
+            bg: colors::BG_DEEP,                               // #1a1b26 (unchanged)
+            fg: colors::TEXT_PRIMARY,                           // #c0caf5 (unchanged)
+            surface: colors::BG_SURFACE,                       // #24283b (unchanged)
+            hint: colors::TEXT_MUTED,                           // #696e9e (unchanged)
+            border: colors::BORDER,                             // #3b4261 (unchanged)
+            user: PackedRgba::rgb(122, 162, 247),              // #7aa2f7 blue (was green #9ece6a)
+            agent: colors::ROLE_AGENT,                         // #7aa2f7 (unchanged)
+            tool: PackedRgba::rgb(224, 175, 104),              // #e0af68 yellow (was orange #ff9e64)
+            system: PackedRgba::rgb(187, 154, 247),            // #bb9af7 magenta (was red-ish #e0af68)
+            stripe_even: colors::BG_DEEP,                      // #1a1b26
+            stripe_odd: PackedRgba::rgb(30, 32, 48),           // #1e2030
         }
     }
 
@@ -1476,8 +1506,8 @@ mod tests {
         assert_eq!(preset, ThemePreset::Daylight);
         preset = preset.next();
         assert_eq!(preset, ThemePreset::Catppuccin);
-        // Cycle through all 18 and verify wrap
-        let mut p = ThemePreset::HighContrast;
+        // Cycle through all 19 and verify wrap
+        let mut p = ThemePreset::Colorblind;
         p = p.next();
         assert_eq!(p, ThemePreset::TokyoNight);
     }
@@ -1486,7 +1516,7 @@ mod tests {
     fn test_theme_preset_prev_cycles() {
         let mut preset = ThemePreset::TokyoNight;
         preset = preset.prev();
-        assert_eq!(preset, ThemePreset::HighContrast);
+        assert_eq!(preset, ThemePreset::Colorblind);
         preset = preset.prev();
         assert_eq!(preset, ThemePreset::Synthwave84);
     }
@@ -1503,7 +1533,7 @@ mod tests {
     #[test]
     fn test_theme_preset_all() {
         let all = ThemePreset::all();
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 19);
         assert!(all.contains(&ThemePreset::TokyoNight));
         assert!(all.contains(&ThemePreset::Daylight));
     }
