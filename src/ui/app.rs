@@ -12981,8 +12981,10 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     return ftui::Cmd::none();
                 }
-                CassMsg::QuerySubmitted => {
+                CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
                     // Enter key: toggle text field editing, or execute export.
+                    // Note: Enter maps to DetailOpened in the key dispatch;
+                    // QuerySubmitted is also handled for programmatic sends.
                     if state.focused == ExportField::OutputDir {
                         state.toggle_current();
                     } else if state.focused == ExportField::ExportButton {
@@ -13011,6 +13013,11 @@ impl super::ftui_adapter::Model for CassApp {
                         return self.update(CassMsg::ExportExecuted);
                     }
                     state.toggle_current();
+                    return ftui::Cmd::none();
+                }
+                CassMsg::SelectionMoved { .. } | CassMsg::PageScrolled { .. } => {
+                    // Consume navigation events so they don't reach the
+                    // conversation view underneath the modal.
                     return ftui::Cmd::none();
                 }
                 _ => {
