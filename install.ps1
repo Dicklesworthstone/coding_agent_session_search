@@ -36,7 +36,7 @@ if ($ArtifactUrl) {
   $url = "https://github.com/$Owner/$Repo/releases/download/$Version/$zip"
 }
 
-$tmp = New-TemporaryFile | Split-Path
+$tmp = (New-TemporaryFile).DirectoryName
 $zipFile = Join-Path $tmp $zip
 
 Write-Host "Downloading $url"
