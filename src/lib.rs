@@ -8728,13 +8728,14 @@ fn run_doctor(
 
                                 // Batch the INSERT to avoid OOM on large databases (#110)
                                 let total_count: i64 = conn.query_row_map(
-                                    "SELECT COUNT(*) FROM messages WHERE content IS NOT NULL",
+                                    "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id JOIN agents a ON c.agent_id = a.id LEFT JOIN workspaces w ON c.workspace_id = w.id",
                                     &[],
                                     |r: &frankensqlite::Row| r.get_typed(0),
                                 )?;
                                 let batch_size: i64 = 10_000;
                                 let mut offset: i64 = 0;
 
+                                conn.execute_batch("BEGIN;")?;
                                 while offset < total_count {
                                     info!(
                                         "Rebuilding FTS: {}/{} rows...",
@@ -8743,17 +8744,18 @@ fn run_doctor(
                                     );
                                     conn.execute_batch(&format!(
                                         "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                                         SELECT m.content, m.title, a.name, w.name, m.source_path, m.created_at, m.id
+                                         SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
                                          FROM messages m
-                                         LEFT JOIN agents a ON m.agent_id = a.id
-                                         LEFT JOIN workspaces w ON m.workspace_id = w.id
-                                         WHERE m.content IS NOT NULL
+                                         JOIN conversations c ON m.conversation_id = c.id
+                                         JOIN agents a ON c.agent_id = a.id
+                                         LEFT JOIN workspaces w ON c.workspace_id = w.id
                                          ORDER BY m.rowid
                                          LIMIT {} OFFSET {};",
                                         batch_size, offset
                                     ))?;
                                     offset += batch_size;
                                 }
+                                conn.execute_batch("COMMIT;")?;
                                 info!(
                                     "Rebuilding FTS: {}/{} rows complete.",
                                     total_count, total_count
