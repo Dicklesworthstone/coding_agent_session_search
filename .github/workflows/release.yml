@@ -38,8 +38,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64
-          - os: ubuntu-24.04-arm
+          # Linux ARM64 — use ubuntu-22.04-arm (glibc 2.35) for broader compatibility
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-arm64
