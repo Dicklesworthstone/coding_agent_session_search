@@ -280,45 +280,6 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.2.7"
-dependencies = [
- "base64 0.22.1",
- "bincode-next",
- "crossbeam-queue",
- "franken-decision 0.2.7",
- "franken-evidence 0.2.7",
- "franken-kernel 0.2.7",
- "futures-lite",
- "getrandom 0.4.2",
- "hmac",
- "js-sys",
- "libc",
- "memchr",
- "nix 0.31.2",
- "parking_lot",
- "pin-project",
- "polling",
- "rmp-serde",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "signal-hook 0.3.18",
- "slab",
- "smallvec",
- "socket2",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "visibility",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "asupersync"
-version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c42e88ddb3677b6ea2446aab13a91ca91090c6a33ef2e2ed380d3a077e82157"
 dependencies = [
@@ -353,6 +314,46 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "visibility",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.2.7"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af#9b0e5afbc0b86c29601ad62f58127f615c12e15a"
+dependencies = [
+ "base64 0.22.1",
+ "bincode-next",
+ "crossbeam-queue",
+ "franken-decision 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
+ "franken-evidence 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
+ "franken-kernel 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
+ "futures-lite",
+ "getrandom 0.4.2",
+ "hmac",
+ "js-sys",
+ "libc",
+ "memchr",
+ "nix 0.31.2",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "signal-hook 0.3.18",
+ "slab",
+ "smallvec",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -949,7 +950,7 @@ dependencies = [
  "argon2",
  "arrayvec",
  "assert_cmd",
- "asupersync 0.2.7",
+ "asupersync 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
  "base64 0.22.1",
  "blake3",
  "bloomfilter",
@@ -1902,6 +1903,7 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=5b0eb1a#5b0eb1a7ece0c741f30b0e280d73488b8c4dd783"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1923,15 +1925,6 @@ dependencies = [
 [[package]]
 name = "franken-decision"
 version = "0.2.7"
-dependencies = [
- "franken-evidence 0.2.7",
- "franken-kernel 0.2.7",
- "serde",
-]
-
-[[package]]
-name = "franken-decision"
-version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b47c84d2d9791dc0207b7325784cdd814057399493831a88a03c690cab7ce38b"
 dependencies = [
@@ -1941,11 +1934,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "franken-evidence"
+name = "franken-decision"
 version = "0.2.7"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af#9b0e5afbc0b86c29601ad62f58127f615c12e15a"
 dependencies = [
+ "franken-evidence 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
+ "franken-kernel 0.2.7 (git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af)",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1959,10 +1954,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "franken-kernel"
+name = "franken-evidence"
 version = "0.2.7"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af#9b0e5afbc0b86c29601ad62f58127f615c12e15a"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1975,8 +1972,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-kernel"
+version = "0.2.7"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=9b0e5af#9b0e5afbc0b86c29601ad62f58127f615c12e15a"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "frankensearch"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "frankensearch-core",
@@ -1991,6 +1997,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-core"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
@@ -2005,6 +2012,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-embed"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "dirs",
@@ -2018,6 +2026,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-fusion"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "frankensearch-core",
@@ -2035,6 +2044,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-index"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "crc32fast",
  "frankensearch-core",
@@ -2051,6 +2061,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-lexical"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "frankensearch-core",
@@ -2063,6 +2074,7 @@ dependencies = [
 [[package]]
 name = "frankensearch-rerank"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=35becff#35becff5ceda7865e49f3c4923410a6bcb1c61e3"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "dirs",
@@ -2102,6 +2114,7 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2115,6 +2128,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-types",
 ]
@@ -2122,6 +2136,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-pager",
@@ -2133,6 +2148,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "blake3",
@@ -2164,6 +2180,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2171,6 +2188,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2181,6 +2199,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2191,6 +2210,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2202,6 +2222,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2214,6 +2235,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -2222,6 +2244,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -2231,6 +2254,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "blake3",
  "crossbeam-epoch",
@@ -2250,6 +2274,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2260,6 +2285,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2274,6 +2300,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2285,6 +2312,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2298,6 +2326,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitflags 2.11.0",
@@ -2312,6 +2341,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "crossbeam-deque",
  "fsqlite-ast",
@@ -2332,6 +2362,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.2"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "advisory-lock",
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -2347,6 +2378,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=f2b47b5#f2b47b521f17beba49b09c34da30e9d4ff091530"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "blake3",
@@ -2363,6 +2395,7 @@ dependencies = [
 [[package]]
 name = "ftui"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2377,6 +2410,7 @@ dependencies = [
 [[package]]
 name = "ftui-a11y"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2385,6 +2419,7 @@ dependencies = [
 [[package]]
 name = "ftui-backend"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2393,6 +2428,7 @@ dependencies = [
 [[package]]
 name = "ftui-core"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2408,6 +2444,7 @@ dependencies = [
 [[package]]
 name = "ftui-extras"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2426,10 +2463,12 @@ dependencies = [
 [[package]]
 name = "ftui-i18n"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 
 [[package]]
 name = "ftui-layout"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2440,6 +2479,7 @@ dependencies = [
 [[package]]
 name = "ftui-render"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -2454,6 +2494,7 @@ dependencies = [
 [[package]]
 name = "ftui-runtime"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2473,6 +2514,7 @@ dependencies = [
 [[package]]
 name = "ftui-style"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2483,6 +2525,7 @@ dependencies = [
 [[package]]
 name = "ftui-text"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2500,6 +2543,7 @@ dependencies = [
 [[package]]
 name = "ftui-tty"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2512,6 +2556,7 @@ dependencies = [
 [[package]]
 name = "ftui-widgets"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -7231,6 +7276,7 @@ dependencies = [
 [[package]]
 name = "tru"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/toon_rust?rev=bc3f9da#bc3f9daaa3546f8722ca4163d7500886c58a69d8"
 dependencies = [
  "anyhow",
  "chrono",

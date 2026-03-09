@@ -5652,6 +5652,70 @@ impl SqliteStorage {
         Ok(out)
     }
 
+    /// Fetch messages for embedding that were inserted after `since_id`.
+    /// Used for incremental semantic indexing in watch mode.
+    pub fn fetch_messages_for_embedding_since(
+        &self,
+        since_id: i64,
+    ) -> Result<Vec<MessageForEmbedding>> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
+              FROM messages m
+              JOIN conversations c ON m.conversation_id = c.id
+              WHERE m.id > ?1
+              ORDER BY m.id",
+        )?;
+
+        let rows = stmt.query_map(params![since_id], |row| {
+            let source_id_str: String = row
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| "local".to_string());
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(source_id_str.as_bytes());
+            let source_id_hash = hasher.finalize();
+
+            Ok(MessageForEmbedding {
+                message_id: row.get(0)?,
+                created_at: row.get(1)?,
+                agent_id: row.get(2)?,
+                workspace_id: row.get(3)?,
+                source_id_hash,
+                role: row.get(5)?,
+                content: row.get(6)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Get the watermark for incremental semantic embedding.
+    /// Returns the highest message id that has been embedded, or None if no
+    /// embedding pass has been recorded yet.
+    pub fn get_last_embedded_message_id(&self) -> Result<Option<i64>> {
+        let result: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_embedded_message_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result.and_then(|s| s.parse().ok()))
+    }
+
+    /// Set the watermark for incremental semantic embedding.
+    pub fn set_last_embedded_message_id(&mut self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?)",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Insert or update an embedding job, returning the job ID.
     pub fn upsert_embedding_job(
         &self,
