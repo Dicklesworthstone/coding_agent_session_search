@@ -2154,6 +2154,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "hashbrown 0.14.5",
+ "lru 0.12.5",
  "serde",
  "serde_json",
  "tracing",
@@ -7397,11 +7398,13 @@ dependencies = [
  "log",
  "native-tls",
  "percent-encoding",
+ "rustls",
  "rustls-pki-types",
  "socks",
  "ureq-proto",
  "utf-8",
  "webpki-root-certs",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]

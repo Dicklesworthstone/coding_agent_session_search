@@ -33,8 +33,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
-          - os: ubuntu-latest
+          # Linux x86_64 — use ubuntu-22.04 (glibc 2.35) for broader compatibility
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
