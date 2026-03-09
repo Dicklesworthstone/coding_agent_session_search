@@ -35,7 +35,7 @@ notify = "*"
 rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 # FrankenSQLite foundation for staged storage migration (bead 300hj).
 # Keep rusqlite side-by-side during transition; migration code opts in explicitly.
-frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c3995c8", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2ed140c", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -133,7 +133,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "c3995c8" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2ed140c" }
 
 [[bin]]
 name = "cass"

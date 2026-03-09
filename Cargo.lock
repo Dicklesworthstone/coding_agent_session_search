@@ -2114,7 +2114,7 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2128,7 +2128,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-types",
 ]
@@ -2136,7 +2136,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2149,7 +2149,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "blake3",
@@ -2181,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -2189,7 +2189,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2200,7 +2200,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2211,7 +2211,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2223,7 +2223,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2236,7 +2236,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -2245,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -2255,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "blake3",
  "crossbeam-epoch",
@@ -2275,7 +2275,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2286,7 +2286,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2303,7 +2303,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2315,7 +2315,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2329,7 +2329,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitflags 2.11.0",
@@ -2344,7 +2344,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "crossbeam-deque",
  "fsqlite-ast",
@@ -2365,7 +2365,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "advisory-lock",
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -2381,7 +2381,7 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.1.1"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=c3995c8#c3995c87e88fba3453104dc7ebd7605d5b83856f"
+source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2ed140c#2ed140ca5ae0d41f03cbcd8dc807a234cf9928b2"
 dependencies = [
  "asupersync 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "blake3",
