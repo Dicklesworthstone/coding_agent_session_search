@@ -1778,6 +1778,77 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     (normalized, note)
 }
 
+/// Build a helpful error message when a command group (e.g. `analytics`, `sources`,
+/// `models`, `import`) is invoked without a required subcommand.
+fn format_missing_subcommand_error(args: &[String]) -> String {
+    // Find the bare command group name from the args (skip program name and flags).
+    let group = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    let (subcommands, examples): (&[&str], &[&str]) = match group {
+        "analytics" => (
+            &["status", "tokens", "tools", "models", "rebuild", "validate"],
+            &[
+                "cass analytics status --json",
+                "cass analytics tokens --days 7 --group-by day --json",
+                "cass analytics rebuild --json",
+            ],
+        ),
+        "sources" => (
+            &["list", "add", "remove", "sync", "status", "mappings", "discover", "wizard"],
+            &[
+                "cass sources list --json",
+                "cass sources add user@host --name myserver",
+                "cass sources status --json",
+            ],
+        ),
+        "models" => (
+            &["status", "install", "verify", "remove", "check-update"],
+            &[
+                "cass models status --json",
+                "cass models install --model all-minilm-l6-v2",
+                "cass models verify --json",
+            ],
+        ),
+        "import" => (
+            &["chatgpt"],
+            &["cass import chatgpt /path/to/conversations.json"],
+        ),
+        _ => (
+            &[],
+            &["cass --help"],
+        ),
+    };
+
+    let mut msg = format!(
+        "Missing required subcommand. Run `cass {} --help` for usage.",
+        group
+    );
+
+    if !subcommands.is_empty() {
+        msg.push_str(&format!(
+            "\n\nAvailable subcommands for `cass {}`:\n",
+            group
+        ));
+        for sc in subcommands {
+            msg.push_str(&format!("  {}\n", sc));
+        }
+    }
+
+    if !examples.is_empty() {
+        msg.push_str("\nExamples:\n");
+        for ex in examples {
+            msg.push_str(&format!("  {}\n", ex));
+        }
+    }
+
+    msg
+}
+
 /// Build a friendly parse error with actionable, context-aware examples for AI agents.
 ///
 /// This function analyzes what the agent was likely trying to do and provides
@@ -2225,6 +2296,15 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
             ) {
                 err.exit();
             }
+
+            // Handle bare subcommand invocations (e.g. `cass analytics` without a
+            // sub-subcommand).  Clap reports MissingSubcommand for these; we turn
+            // that into a targeted hint listing the available sub-subcommands.
+            if err.kind() == ErrorKind::MissingSubcommand {
+                let msg = format_missing_subcommand_error(&normalized_args);
+                return Err(CliError::usage(msg, None));
+            }
+
             // Attempt heuristic recovery
             if let Some((recovered_args, note)) = heuristic_parse_recovery(&err, &normalized_args) {
                 // Try parsing again with recovered args
@@ -8701,15 +8781,20 @@ fn run_doctor(
                     );
 
                     // Check for FTS table (fts_messages) - this can be missing if table was
-                    // dropped after migrations completed
+                    // dropped after migrations completed.
+                    //
+                    // Fix #116/#117: Do NOT query sqlite_master here.  FrankenSQLite
+                    // filters virtual tables with rootpage=0, which makes the table
+                    // invisible even when it exists.  Instead, probe the table directly
+                    // with a cheap query that will fail with a "no such table" error
+                    // only when the table is genuinely absent.
                     let fts_exists = conn
                         .query_row_map(
-                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='fts_messages'",
+                            "SELECT COUNT(*) FROM fts_messages LIMIT 1",
                             &[],
                             |r: &frankensqlite::Row| r.get_typed::<i64>(0),
                         )
-                        .unwrap_or(0)
-                        > 0;
+                        .is_ok();
 
                     if fts_exists {
                         add_check!(
