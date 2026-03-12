@@ -10,6 +10,7 @@ pub mod ftui_harness;
 pub mod html_export;
 pub mod indexer;
 pub mod model;
+pub mod monitor;
 pub mod pages;
 pub mod search;
 pub mod sources;
