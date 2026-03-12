@@ -27,17 +27,10 @@ const DARK_BG: PackedRgba = PackedRgba::rgb(20, 20, 30);
 const SELECTED_BG: PackedRgba = PackedRgba::rgb(40, 40, 70);
 const HEADER_BG: PackedRgba = PackedRgba::rgb(15, 15, 25);
 
-// ─── ASCII Art ─────────────────────────────────────────────────────────────
+// ─── Header ──────────────────────────────────────────────────────────────
 
-const LOGO: &[&str] = &[
-    r"  ██████╗ █████╗ ███████╗███████╗",
-    r" ██╔════╝██╔══██╗██╔════╝██╔════╝",
-    r" ██║     ███████║███████╗███████╗",
-    r" ██║     ██╔══██║╚════██║╚════██║",
-    r" ╚██████╗██║  ██║███████║███████║",
-    r"  ╚═════╝╚═╝  ╚═╝╚══════╝╚══════╝",
-];
-
+const LOGO_LINE: &str = " ▄▀▀ ▄▀▄ ▄▀▀ ▄▀▀";
+const LOGO_LINE2: &str = " ▀▄▄ █▀█ ▄██ ▄██";
 const SUBTITLE: &str = "  M O N I T O R";
 
 // ─── Model ─────────────────────────────────────────────────────────────────
@@ -217,7 +210,7 @@ impl Model for MonitorApp {
         // Main vertical layout: header | content | footer
         let v_chunks = Flex::vertical()
             .constraints([
-                Constraint::Fixed(LOGO.len() as u16 + 3), // logo + subtitle + border
+                Constraint::Fixed(4), // logo (2 lines) + subtitle + border
                 Constraint::Fill,                          // main content
                 Constraint::Fixed(1),                      // footer
             ])
@@ -244,44 +237,35 @@ impl Model for MonitorApp {
 
 impl MonitorApp {
     fn render_header(&self, buf: &mut ftui::Buffer, area: Rect) {
-        // Draw logo
-        for (i, line) in LOGO.iter().enumerate() {
-            let y = area.y + i as u16;
-            if y >= area.y + area.height {
-                break;
-            }
-            draw_str(buf, area.x + 2, y, line, Style::default().fg(CYAN).bold());
+        // Draw compact 2-line logo
+        draw_str(buf, area.x + 2, area.y, LOGO_LINE, Style::default().fg(CYAN).bold());
+        if area.y + 1 < area.y + area.height {
+            draw_str(buf, area.x + 2, area.y + 1, LOGO_LINE2, Style::default().fg(CYAN).bold());
         }
 
-        // Draw subtitle
-        let sub_y = area.y + LOGO.len() as u16;
-        if sub_y < area.y + area.height {
-            draw_str(
-                buf,
-                area.x + 2,
-                sub_y,
-                SUBTITLE,
-                Style::default().fg(MAGENTA),
-            );
+        // Draw subtitle + agent count on the same line as logo line 1
+        let sub_x = area.x + 2 + LOGO_LINE.len() as u16 + 3;
+        draw_str(buf, sub_x, area.y, SUBTITLE, Style::default().fg(MAGENTA));
 
-            // Agent count badge
-            let needs_attention = self.agents.iter().filter(|a| a.state.needs_attention()).count();
-            let badge = if needs_attention > 0 {
-                format!(
-                    "  {} agents  {} need attention",
-                    self.agents.len(),
-                    needs_attention
-                )
-            } else {
-                format!("  {} agents active", self.agents.len())
-            };
-            let badge_x = area.x + 2 + SUBTITLE.len() as u16 + 2;
-            let badge_style = if needs_attention > 0 {
-                Style::default().fg(YELLOW).bold()
-            } else {
-                Style::default().fg(GREEN)
-            };
-            draw_str(buf, badge_x, sub_y, &badge, badge_style);
+        // Agent count badge on line 2
+        let needs_attention = self.agents.iter().filter(|a| a.state.needs_attention()).count();
+        let badge = if needs_attention > 0 {
+            format!(
+                "{} agents  {} need attention",
+                self.agents.len(),
+                needs_attention
+            )
+        } else {
+            format!("{} agents active", self.agents.len())
+        };
+        let badge_x = area.x + 2 + LOGO_LINE2.len() as u16 + 3;
+        let badge_style = if needs_attention > 0 {
+            Style::default().fg(YELLOW).bold()
+        } else {
+            Style::default().fg(GREEN)
+        };
+        if area.y + 1 < area.y + area.height {
+            draw_str(buf, badge_x, area.y + 1, &badge, badge_style);
         }
 
         // Bottom border of header
