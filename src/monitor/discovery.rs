@@ -118,14 +118,26 @@ pub fn extract_project_name(cwd: &str) -> String {
     }
 }
 
-/// Parse lsof -Fn output to extract the cwd path.
+/// Parse lsof -Fn output to extract the cwd path for the target PID.
 ///
-/// Output format: `p<pid>\nn<path>\n`
-pub fn parse_lsof_cwd(output: &str) -> Option<PathBuf> {
+/// Output may contain entries for many PIDs (macOS lsof quirk).
+/// Format: `p<pid>\nf<fd>\nn<path>\n` repeated per process.
+/// We find our target PID block and take the `n` line from it.
+pub fn parse_lsof_cwd(output: &str, target_pid: u32) -> Option<PathBuf> {
+    let target_prefix = format!("p{target_pid}");
+    let mut found_pid = false;
+
     for line in output.lines() {
-        if let Some(path) = line.strip_prefix('n') {
-            if path.starts_with('/') {
-                return Some(PathBuf::from(path));
+        if line.starts_with('p') {
+            // New PID block — check if it's ours
+            found_pid = line == target_prefix;
+            continue;
+        }
+        if found_pid {
+            if let Some(path) = line.strip_prefix('n') {
+                if path.starts_with('/') {
+                    return Some(PathBuf::from(path));
+                }
             }
         }
     }
@@ -144,7 +156,7 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_lsof_cwd(&stdout)
+    parse_lsof_cwd(&stdout, pid)
 }
 
 /// Find the most recently modified JSONL session file for a project.
@@ -319,11 +331,22 @@ mod tests {
 
     #[test]
     fn parse_lsof_cwd_output() {
-        let output = "p12345\nn/Users/lee/Projects/leegonzales/cass\n";
-        let cwd = parse_lsof_cwd(output);
+        let output = "p12345\nfcwd\nn/Users/lee/Projects/leegonzales/cass\n";
+        let cwd = parse_lsof_cwd(output, 12345);
         assert_eq!(
             cwd,
             Some(PathBuf::from("/Users/lee/Projects/leegonzales/cass"))
+        );
+    }
+
+    #[test]
+    fn parse_lsof_cwd_skips_other_pids() {
+        // macOS lsof may return entries for many PIDs
+        let output = "p100\nfcwd\nn/\np12345\nfcwd\nn/Users/lee/Projects/cass\np200\nfcwd\nn/tmp\n";
+        let cwd = parse_lsof_cwd(output, 12345);
+        assert_eq!(
+            cwd,
+            Some(PathBuf::from("/Users/lee/Projects/cass"))
         );
     }
 }
