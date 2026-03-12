@@ -23,11 +23,18 @@ pub fn collect_snapshot() -> Vec<AgentInstance> {
     let own_pid = std::process::id();
     let mut agents_with_paths = discovery::discover_agents(&claude_projects_dir, own_pid);
 
+    // Discover team configurations
+    let teams = discovery::discover_teams(&home);
+
     // Derive state from session files for each agent
     for (agent, session_path) in &mut agents_with_paths {
         if let Some(path) = session_path {
             match session::derive_state(path) {
-                Ok((derived_state, ctx)) => {
+                Ok((derived_state, mut ctx)) => {
+                    // Attach telemetry from full JSONL scan
+                    if let Some(ref mut c) = ctx {
+                        c.telemetry = session::derive_telemetry(path);
+                    }
                     agent.state = derived_state;
                     agent.session_context = ctx;
                     agent.last_activity_secs = session::file_staleness_secs(path);
@@ -49,14 +56,151 @@ pub fn collect_snapshot() -> Vec<AgentInstance> {
                 }
             }
         }
+
+        // Annotate with team info by matching CWD to team member CWDs
+        let cwd_str = agent.cwd.to_string_lossy().to_string();
+        for team in teams.values() {
+            for member in &team.members {
+                if let Some(ref member_cwd) = member.cwd {
+                    if cwd_str == *member_cwd {
+                        agent.team_name = Some(team.name.clone());
+                        agent.agent_role = Some(member.agent_type.clone());
+                        agent.agent_slug = Some(member.name.clone());
+                        break;
+                    }
+                }
+            }
+            if agent.team_name.is_some() {
+                break;
+            }
+        }
     }
 
-    let mut agents: Vec<AgentInstance> = agents_with_paths.into_iter().map(|(a, _)| a).collect();
+    // Collect parent agents and discover subagents
+    let mut agents: Vec<AgentInstance> = Vec::new();
 
-    // Sort by priority (needs-attention first)
-    agents.sort_by_key(|a| a.state.priority());
+    for (agent, session_path) in agents_with_paths {
+        // For each parent agent with a session_id, try to discover subagents
+        let mut subagent_instances = Vec::new();
+        if let Some(ref ctx) = agent.session_context {
+            if let Some(ref session_id) = ctx.session_id {
+                let project_key =
+                    discovery::cwd_to_project_key(agent.cwd.to_str().unwrap_or(""));
+                let subagent_files = discovery::discover_subagents(
+                    &claude_projects_dir,
+                    &project_key,
+                    session_id,
+                    60, // 60s staleness threshold
+                );
 
-    agents
+                for sub in subagent_files {
+                    let sub_cwd = sub.cwd.unwrap_or_else(|| agent.cwd.clone());
+                    let sub_project = discovery::extract_project_name(
+                        sub_cwd.to_str().unwrap_or(""),
+                    );
+
+                    // Try to derive state from the subagent's JSONL
+                    let (sub_state, sub_ctx, sub_staleness) =
+                        match session::derive_state(&sub.session_path) {
+                            Ok((s, mut c)) => {
+                                // Attach telemetry for subagents too
+                                if let Some(ref mut ctx) = c {
+                                    ctx.telemetry =
+                                        session::derive_telemetry(&sub.session_path);
+                                }
+                                let staleness =
+                                    session::file_staleness_secs(&sub.session_path);
+                                let final_state = if staleness > 30
+                                    && !matches!(
+                                        s,
+                                        state::AgentState::WaitingInput
+                                            | state::AgentState::WaitingPermission
+                                            | state::AgentState::Queued
+                                    ) {
+                                    state::AgentState::Idle
+                                } else {
+                                    s
+                                };
+                                (final_state, c, staleness)
+                            }
+                            Err(_) => (state::AgentState::Starting, None, 0),
+                        };
+
+                    // Check if this subagent is a team member
+                    let sub_cwd_str = sub_cwd.to_string_lossy().to_string();
+                    let mut sub_team_name = None;
+                    let mut sub_agent_role = None;
+                    let mut sub_agent_slug_from_team = None;
+                    for team in teams.values() {
+                        for member in &team.members {
+                            if let Some(ref member_cwd) = member.cwd {
+                                if sub_cwd_str == *member_cwd {
+                                    sub_team_name = Some(team.name.clone());
+                                    sub_agent_role = Some(member.agent_type.clone());
+                                    sub_agent_slug_from_team = Some(member.name.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        if sub_team_name.is_some() {
+                            break;
+                        }
+                    }
+
+                    let sub_instance = AgentInstance {
+                        pid: 0, // Subagents may not have a discoverable PID
+                        tty: String::new(),
+                        cwd: sub_cwd,
+                        project_name: sub_project,
+                        state: sub_state,
+                        permission_mode: state::PermissionMode::Default,
+                        age_secs: 0,
+                        last_activity_secs: sub_staleness,
+                        session_context: sub_ctx,
+                        is_subagent: true,
+                        parent_session_id: Some(session_id.clone()),
+                        team_name: sub_team_name,
+                        agent_role: sub_agent_role,
+                        agent_slug: sub_agent_slug_from_team.or(sub.slug),
+                    };
+
+                    subagent_instances.push(sub_instance);
+                }
+            }
+        }
+
+        // Also check if the session path points inside a subagents/ dir
+        // (should not happen for parent agents, but defensive)
+        let _ = session_path; // consumed
+
+        agents.push(agent);
+        // Group subagents immediately after their parent
+        agents.extend(subagent_instances);
+    }
+
+    // Stable sort: parents by priority, subagents stay after their parent
+    // We partition into groups (parent + its subagents) then sort groups
+    let mut groups: Vec<Vec<AgentInstance>> = Vec::new();
+    let mut current_group: Vec<AgentInstance> = Vec::new();
+
+    for agent in agents {
+        if !agent.is_subagent {
+            if !current_group.is_empty() {
+                groups.push(std::mem::take(&mut current_group));
+            }
+            current_group.push(agent);
+        } else {
+            current_group.push(agent);
+        }
+    }
+    if !current_group.is_empty() {
+        groups.push(current_group);
+    }
+
+    // Sort groups by the parent's priority
+    groups.sort_by_key(|g| g.first().map(|a| a.state.priority()).unwrap_or(255));
+
+    groups.into_iter().flatten().collect()
 }
 
 /// Format a duration in seconds as a human-readable age string.

@@ -236,9 +236,198 @@ pub fn discover_agents(
             age_secs: proc.age_secs,
             last_activity_secs: 0,
             session_context: None,
+            is_subagent: false,
+            parent_session_id: None,
+            team_name: None,
+            agent_role: None,
+            agent_slug: None,
         };
 
         results.push((instance, session_path));
+    }
+
+    results
+}
+
+// ─── Team config discovery ────────────────────────────────────────────────
+
+/// A team member entry from a Claude team config file.
+#[derive(Debug, Clone)]
+pub struct TeamMember {
+    pub name: String,
+    pub agent_id: String,
+    pub agent_type: String,
+    pub cwd: Option<String>,
+}
+
+/// A discovered team configuration.
+#[derive(Debug, Clone)]
+pub struct TeamConfig {
+    pub name: String,
+    pub members: Vec<TeamMember>,
+}
+
+/// Discover all active team configurations from `~/.claude/teams/*/config.json`.
+pub fn discover_teams(home: &Path) -> std::collections::HashMap<String, TeamConfig> {
+    let teams_dir = home.join(".claude").join("teams");
+    let mut teams = std::collections::HashMap::new();
+
+    let entries = match std::fs::read_dir(&teams_dir) {
+        Ok(e) => e,
+        Err(_) => return teams,
+    };
+
+    for entry in entries.flatten() {
+        let config_path = entry.path().join("config.json");
+        if !config_path.is_file() {
+            continue;
+        }
+
+        let data = match std::fs::read_to_string(&config_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let json: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let team_name = entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+
+        let members: Vec<TeamMember> = json
+            .get("members")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        Some(TeamMember {
+                            name: m.get("name")?.as_str()?.to_string(),
+                            agent_id: m.get("agentId")?.as_str()?.to_string(),
+                            agent_type: m
+                                .get("agentType")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            cwd: m.get("cwd").and_then(|v| v.as_str()).map(String::from),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        teams.insert(
+            team_name.clone(),
+            TeamConfig {
+                name: team_name,
+                members,
+            },
+        );
+    }
+
+    teams
+}
+
+// ─── Subagent session discovery ───────────────────────────────────────────
+
+/// A discovered subagent session file.
+#[derive(Debug, Clone)]
+pub struct SubagentFile {
+    pub agent_id: String,
+    pub slug: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub session_path: PathBuf,
+}
+
+/// Discover active subagents for a parent session.
+///
+/// Scans `~/.claude/projects/<project_key>/<session_id>/subagents/agent-*.jsonl`
+/// and reads the first line for metadata. Filters by staleness.
+pub fn discover_subagents(
+    claude_projects_dir: &Path,
+    project_key: &str,
+    parent_session_id: &str,
+    max_staleness_secs: u64,
+) -> Vec<SubagentFile> {
+    let subagents_dir = claude_projects_dir
+        .join(project_key)
+        .join(parent_session_id)
+        .join("subagents");
+
+    if !subagents_dir.is_dir() {
+        return vec![];
+    }
+
+    let entries = match std::fs::read_dir(&subagents_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let now = SystemTime::now();
+    let mut results = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|e| e == "jsonl") {
+            continue;
+        }
+
+        // Check staleness
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = now.duration_since(modified) {
+                    if elapsed.as_secs() > max_staleness_secs {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Read first line for metadata
+        let first_line = match std::fs::read_to_string(&path) {
+            Ok(content) => content.lines().next().map(String::from),
+            Err(_) => continue,
+        };
+
+        let (agent_id, slug, cwd, session_id) = if let Some(line) = first_line {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                (
+                    json.get("agentId")
+                        .or_else(|| json.get("agent_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    json.get("slug").and_then(|v| v.as_str()).map(String::from),
+                    json.get("cwd")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from),
+                    json.get("sessionId")
+                        .or_else(|| json.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                )
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        if agent_id.is_empty() {
+            continue;
+        }
+
+        results.push(SubagentFile {
+            agent_id,
+            slug,
+            cwd,
+            session_id,
+            session_path: path,
+        });
     }
 
     results

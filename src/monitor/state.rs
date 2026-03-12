@@ -94,6 +94,29 @@ impl fmt::Display for PermissionMode {
     }
 }
 
+/// Session telemetry derived from full JSONL scan of usage data.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTelemetry {
+    /// Total context window tokens (input + cache_creation + cache_read)
+    pub context_tokens: u64,
+    /// Context pressure as percentage (context_tokens / context_max * 100)
+    pub context_pressure_pct: u8,
+    /// Model's max context window
+    pub context_max: u64,
+    /// Total output tokens generated this session
+    pub total_output_tokens: u64,
+    /// Number of assistant turns (conversation depth)
+    pub turn_count: u32,
+    /// Context growth rate: tokens gained per minute (last 5 turns)
+    pub burn_rate_per_min: u64,
+    /// Tool usage counts (top tools, sorted by frequency descending)
+    pub tool_mix: Vec<(String, u32)>,
+    /// Session start timestamp (ISO8601)
+    pub session_start: Option<String>,
+    /// Whether messages are queued (queue-operation: enqueue seen)
+    pub has_queued_messages: bool,
+}
+
 /// Context extracted from the session JSONL for display in the detail pane.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionContext {
@@ -104,6 +127,9 @@ pub struct SessionContext {
     pub session_id: Option<String>,
     /// Recent activity entries (most recent first), summarized for display.
     pub recent_activity: Vec<ActivityEntry>,
+    /// Telemetry data from full JSONL scan (usage, burn rate, tool mix).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<SessionTelemetry>,
 }
 
 /// A single summarized activity entry from the JSONL log.
@@ -126,6 +152,21 @@ pub struct AgentInstance {
     pub age_secs: u64,
     pub last_activity_secs: u64,
     pub session_context: Option<SessionContext>,
+    /// Whether this is a subagent spawned by a parent session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_subagent: bool,
+    /// Session ID of the parent agent (if this is a subagent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Team name this agent belongs to (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+    /// Role within the team (e.g., "researcher", "test-runner").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    /// Short slug identifying this subagent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_slug: Option<String>,
 }
 
 #[cfg(test)]

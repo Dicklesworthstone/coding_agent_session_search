@@ -3,6 +3,7 @@
 //! Renders a split-pane TUI: agent table on the left, detail pane on the right.
 //! Refreshes every N seconds via background task. Keyboard-navigable.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use ftui::layout::{Constraint, Flex};
@@ -12,6 +13,55 @@ use ftui::{Cmd, Event, Frame, KeyCode, KeyEvent, Model, Program, ProgramConfig, 
 use ftui::core::geometry::Rect;
 
 use crate::monitor::state::{AgentInstance, AgentState, PermissionMode};
+
+// ─── Spinner ──────────────────────────────────────────────────────────────
+
+const BRAILLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+// ─── Filter ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    All,
+    NeedsAttention,
+    Working,
+    Idle,
+    Teams,
+}
+
+impl FilterMode {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::NeedsAttention,
+            Self::NeedsAttention => Self::Working,
+            Self::Working => Self::Idle,
+            Self::Idle => Self::Teams,
+            Self::Teams => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::NeedsAttention => "Attention",
+            Self::Working => "Working",
+            Self::Idle => "Idle",
+            Self::Teams => "Teams",
+        }
+    }
+
+    fn matches_agent(self, agent: &AgentInstance) -> bool {
+        match self {
+            Self::All => true,
+            Self::NeedsAttention => agent.state.needs_attention(),
+            Self::Working => {
+                matches!(agent.state, AgentState::Working | AgentState::ToolRunning)
+            }
+            Self::Idle => matches!(agent.state, AgentState::Idle | AgentState::Starting),
+            Self::Teams => agent.team_name.is_some() || agent.is_subagent,
+        }
+    }
+}
 
 // ─── Colors ────────────────────────────────────────────────────────────────
 
@@ -40,6 +90,9 @@ pub struct MonitorApp {
     selected: usize,
     tick_count: u64,
     interval_secs: u64,
+    prev_attention_pids: HashSet<u32>,
+    filter: FilterMode,
+    detail_scroll: usize,
 }
 
 impl MonitorApp {
@@ -49,7 +102,17 @@ impl MonitorApp {
             selected: 0,
             tick_count: 0,
             interval_secs,
+            prev_attention_pids: HashSet::new(),
+            filter: FilterMode::All,
+            detail_scroll: 0,
         }
+    }
+
+    fn filtered_agents(&self) -> Vec<&AgentInstance> {
+        self.agents
+            .iter()
+            .filter(|a| self.filter.matches_agent(a))
+            .collect()
     }
 }
 
@@ -63,6 +126,10 @@ pub enum MonitorMsg {
     SelectPrev,
     SelectFirst,
     SelectLast,
+    CycleFilter,
+    DetailScrollUp,
+    DetailScrollDown,
+    OpenEditor,
     Quit,
     Noop,
 }
@@ -111,6 +178,34 @@ impl From<Event> for MonitorMsg {
                 code: KeyCode::End, ..
             }) => Self::SelectLast,
 
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('f'),
+                ..
+            }) => Self::CycleFilter,
+
+            Event::Key(KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('+'),
+                ..
+            }) => Self::DetailScrollUp,
+
+            Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('-'),
+                ..
+            }) => Self::DetailScrollDown,
+
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('e'),
+                ..
+            }) => Self::OpenEditor,
+
             Event::Tick => Self::Tick,
             _ => Self::Noop,
         }
@@ -152,41 +247,120 @@ impl Model for MonitorApp {
                 ])
             }
             MonitorMsg::Refreshed(agents) => {
-                // Preserve selection position
-                let old_pid = self.agents.get(self.selected).map(|a| a.pid);
+                // Preserve selection by PID in filtered view
+                let old_pid = self
+                    .filtered_agents()
+                    .get(self.selected)
+                    .map(|a| a.pid);
                 self.agents = agents;
 
-                // Try to keep the same agent selected by PID
+                // Try to keep the same agent selected by PID in filtered list
                 if let Some(pid) = old_pid {
-                    if let Some(idx) = self.agents.iter().position(|a| a.pid == pid) {
+                    let new_idx = self
+                        .agents
+                        .iter()
+                        .filter(|a| self.filter.matches_agent(a))
+                        .enumerate()
+                        .find(|(_, a)| a.pid == pid)
+                        .map(|(i, _)| i);
+                    if let Some(idx) = new_idx {
                         self.selected = idx;
                     }
                 }
-                if self.selected >= self.agents.len() && !self.agents.is_empty() {
-                    self.selected = self.agents.len() - 1;
+                let count = self.filtered_agents().len();
+                if self.selected >= count && count > 0 {
+                    self.selected = count - 1;
                 }
 
-                Cmd::none()
+                // Detect new attention-needing PIDs and ring bell
+                let current_attention: HashSet<u32> = self
+                    .agents
+                    .iter()
+                    .filter(|a| a.state.needs_attention())
+                    .map(|a| a.pid)
+                    .collect();
+                let has_new = current_attention
+                    .iter()
+                    .any(|pid| !self.prev_attention_pids.contains(pid));
+                self.prev_attention_pids = current_attention;
+
+                if has_new {
+                    Cmd::Task(
+                        TaskSpec::default(),
+                        Box::new(|| {
+                            // Write bell to /dev/tty to bypass ftui's terminal capture
+                            if let Ok(mut tty) = std::fs::OpenOptions::new()
+                                .write(true)
+                                .open("/dev/tty")
+                            {
+                                use std::io::Write;
+                                let _ = tty.write_all(b"\x07");
+                            }
+                            MonitorMsg::Noop
+                        }),
+                    )
+                } else {
+                    Cmd::none()
+                }
             }
             MonitorMsg::SelectNext => {
-                if !self.agents.is_empty() {
-                    self.selected = (self.selected + 1).min(self.agents.len() - 1);
+                let count = self.filtered_agents().len();
+                if count > 0 {
+                    self.selected = (self.selected + 1).min(count - 1);
                 }
+                self.detail_scroll = 0;
                 Cmd::none()
             }
             MonitorMsg::SelectPrev => {
                 self.selected = self.selected.saturating_sub(1);
+                self.detail_scroll = 0;
                 Cmd::none()
             }
             MonitorMsg::SelectFirst => {
                 self.selected = 0;
+                self.detail_scroll = 0;
                 Cmd::none()
             }
             MonitorMsg::SelectLast => {
-                if !self.agents.is_empty() {
-                    self.selected = self.agents.len() - 1;
+                let count = self.filtered_agents().len();
+                if count > 0 {
+                    self.selected = count - 1;
                 }
+                self.detail_scroll = 0;
                 Cmd::none()
+            }
+            MonitorMsg::CycleFilter => {
+                self.filter = self.filter.next();
+                self.selected = 0;
+                self.detail_scroll = 0;
+                Cmd::none()
+            }
+            MonitorMsg::DetailScrollUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(3);
+                Cmd::none()
+            }
+            MonitorMsg::DetailScrollDown => {
+                self.detail_scroll += 3;
+                Cmd::none()
+            }
+            MonitorMsg::OpenEditor => {
+                let cwd = self
+                    .filtered_agents()
+                    .get(self.selected)
+                    .map(|a| a.cwd.to_string_lossy().to_string());
+                if let Some(cwd) = cwd {
+                    Cmd::Task(
+                        TaskSpec::default(),
+                        Box::new(move || {
+                            let _ = std::process::Command::new("open")
+                                .args(["-a", "Cursor", &cwd])
+                                .spawn();
+                            MonitorMsg::Noop
+                        }),
+                    )
+                } else {
+                    Cmd::none()
+                }
             }
             MonitorMsg::Quit => Cmd::Quit,
             MonitorMsg::Noop => Cmd::none(),
@@ -219,7 +393,8 @@ impl Model for MonitorApp {
         self.render_header(buf, v_chunks[0]);
         self.render_footer(buf, v_chunks[2]);
 
-        if self.agents.is_empty() {
+        let filtered = self.filtered_agents();
+        if filtered.is_empty() {
             self.render_empty(buf, v_chunks[1]);
         } else {
             // Horizontal split: table (60%) | detail (40%)
@@ -227,8 +402,8 @@ impl Model for MonitorApp {
                 .constraints([Constraint::Percentage(60.0), Constraint::Percentage(40.0)])
                 .split(v_chunks[1]);
 
-            self.render_table(buf, h_chunks[0]);
-            self.render_detail(buf, h_chunks[1]);
+            self.render_table_filtered(&filtered, buf, h_chunks[0]);
+            self.render_detail_filtered(&filtered, buf, h_chunks[1]);
         }
     }
 }
@@ -248,15 +423,25 @@ impl MonitorApp {
         draw_str(buf, sub_x, area.y, SUBTITLE, Style::default().fg(MAGENTA));
 
         // Agent count badge on line 2
+        let parent_count = self.agents.iter().filter(|a| !a.is_subagent).count();
+        let sub_count = self.agents.iter().filter(|a| a.is_subagent).count();
         let needs_attention = self.agents.iter().filter(|a| a.state.needs_attention()).count();
         let badge = if needs_attention > 0 {
-            format!(
-                "{} agents  {} need attention",
-                self.agents.len(),
-                needs_attention
-            )
+            if sub_count > 0 {
+                format!(
+                    "{} agents + {} subagents  {} need attention",
+                    parent_count, sub_count, needs_attention
+                )
+            } else {
+                format!(
+                    "{} agents  {} need attention",
+                    parent_count, needs_attention
+                )
+            }
+        } else if sub_count > 0 {
+            format!("{} agents + {} subagents", parent_count, sub_count)
         } else {
-            format!("{} agents active", self.agents.len())
+            format!("{} agents active", parent_count)
         };
         let badge_x = area.x + 2 + LOGO_LINE2.len() as u16 + 3;
         let badge_style = if needs_attention > 0 {
@@ -282,9 +467,27 @@ impl MonitorApp {
     fn render_footer(&self, buf: &mut ftui::Buffer, area: Rect) {
         let blink = self.tick_count % 2 == 0;
         let dot = if blink { "●" } else { "○" };
+        let filter_label = if self.filter == FilterMode::All {
+            String::new()
+        } else {
+            format!("  │  Filter: {}", self.filter.label())
+        };
+
+        // Context pressure warning
+        let high_ctx_count = self
+            .agents
+            .iter()
+            .filter(|a| agent_pressure_pct(a).map_or(false, |p| p > 75))
+            .count();
+        let ctx_warning = if high_ctx_count > 0 {
+            format!("  │  ⚠ {} agent{} >75% ctx", high_ctx_count, if high_ctx_count == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
+
         let footer = format!(
-            " {} Live  │  j/k Navigate  │  q Quit  │  Refreshing every {}s",
-            dot, self.interval_secs
+            " {} Live  │  j/k Navigate  │  f Filter  │  e Editor  │  q Quit{}{}",
+            dot, filter_label, ctx_warning
         );
         draw_str(
             buf,
@@ -319,7 +522,12 @@ impl MonitorApp {
         draw_str(buf, x2, mid_y + 1, msg2, Style::default().fg(DIM));
     }
 
-    fn render_table(&self, buf: &mut ftui::Buffer, area: Rect) {
+    fn render_table_filtered(
+        &self,
+        filtered: &[&AgentInstance],
+        buf: &mut ftui::Buffer,
+        area: Rect,
+    ) {
         if area.height < 3 || area.width < 20 {
             return;
         }
@@ -327,8 +535,8 @@ impl MonitorApp {
         // Column header
         let header_y = area.y;
         let header = format!(
-            " {:<22} {:<16} {:<8} {:<8}",
-            "PROJECT", "STATE", "AGE", "MODE"
+            " {:<22} {:<16} {:<8} {:<8} {:<10}",
+            "PROJECT", "STATE", "AGE", "MODE", "CTX"
         );
         draw_str(
             buf,
@@ -359,13 +567,12 @@ impl MonitorApp {
         let row_start = sep_y + 1;
         let max_rows = (area.height - 2) as usize;
 
-        for (i, agent) in self.agents.iter().enumerate() {
+        for (i, agent) in filtered.iter().enumerate() {
             if i >= max_rows {
                 break;
             }
             let y = row_start + i as u16;
             let is_selected = i == self.selected;
-            let blink = self.tick_count % 2 == 0;
 
             let row_bg = if is_selected { SELECTED_BG } else { DARK_BG };
 
@@ -385,18 +592,27 @@ impl MonitorApp {
                 }
             }
 
-            // Project name
-            let name = truncate_str(&agent.project_name, 21);
+            // Project name (subagents show with tree prefix and slug)
+            let (name_str, name_color) = if agent.is_subagent {
+                let slug = agent
+                    .agent_slug
+                    .as_deref()
+                    .unwrap_or(&agent.project_name);
+                (format!("├─ {}", truncate_str(slug, 18)), DIM)
+            } else {
+                (truncate_str(&agent.project_name, 21), WHITE)
+            };
             draw_str(
                 buf,
                 area.x + 1,
                 y,
-                &format!(" {:<21}", name),
-                Style::default().fg(WHITE).bg(row_bg),
+                &format!(" {:<21}", name_str),
+                Style::default().fg(name_color).bg(row_bg),
             );
 
             // State with color
-            let (state_icon, state_text, state_color) = state_display(&agent.state, blink);
+            let (state_icon, state_text, state_color) =
+                state_display(&agent.state, self.tick_count);
             let state_str = format!("{} {}", state_icon, state_text);
             draw_str(
                 buf,
@@ -425,10 +641,26 @@ impl MonitorApp {
                 &format!("{:<8}", mode_str),
                 Style::default().fg(mode_color).bg(row_bg),
             );
+
+            // CTX pressure bar
+            let ctx_str = render_context_bar_compact(agent);
+            let ctx_color = context_pressure_color(agent);
+            draw_str(
+                buf,
+                area.x + 56,
+                y,
+                &ctx_str,
+                Style::default().fg(ctx_color).bg(row_bg),
+            );
         }
     }
 
-    fn render_detail(&self, buf: &mut ftui::Buffer, area: Rect) {
+    fn render_detail_filtered(
+        &self,
+        filtered: &[&AgentInstance],
+        buf: &mut ftui::Buffer,
+        area: Rect,
+    ) {
         if area.height < 3 || area.width < 10 {
             return;
         }
@@ -444,152 +676,285 @@ impl MonitorApp {
 
         let inner = Rect::new(area.x + 2, area.y, area.width.saturating_sub(3), area.height);
 
-        if let Some(agent) = self.agents.get(self.selected) {
-            let mut y = inner.y;
+        if let Some(agent) = filtered.get(self.selected) {
+            // Build logical lines, then render with scroll offset
+            let mut lines: Vec<DetailLine> = Vec::new();
 
-            // Title
-            draw_str(
-                buf,
-                inner.x,
-                y,
-                "AGENT DETAIL",
-                Style::default().fg(CYAN).bold(),
-            );
-            y += 1;
-            draw_hline(buf, inner.x, y, inner.width, '─', DIM);
-            y += 1;
+            lines.push(DetailLine::styled("AGENT DETAIL", Style::default().fg(CYAN).bold()));
+            lines.push(DetailLine::Separator);
+            lines.push(DetailLine::label_value("PID", &agent.pid.to_string()));
+            lines.push(DetailLine::label_value("TTY", &agent.tty));
+            lines.push(DetailLine::label_value("CWD", &agent.cwd.to_string_lossy()));
 
-            // PID
-            draw_label_value(buf, inner.x, y, inner.width, "PID", &agent.pid.to_string());
-            y += 1;
-
-            // TTY
-            draw_label_value(buf, inner.x, y, inner.width, "TTY", &agent.tty);
-            y += 1;
-
-            // CWD
-            let cwd = agent.cwd.to_string_lossy();
-            draw_label_value(buf, inner.x, y, inner.width, "CWD", &cwd);
-            y += 1;
-
-            // State
-            let blink = self.tick_count % 2 == 0;
-            let (icon, text, color) = state_display(&agent.state, blink);
-            draw_str(
-                buf,
-                inner.x,
-                y,
+            let (icon, text, color) = state_display(&agent.state, self.tick_count);
+            lines.push(DetailLine::styled(
                 &format!("State:  {} {}", icon, text),
                 Style::default().fg(color),
-            );
-            y += 1;
+            ));
 
-            // Last activity
-            let activity = if agent.last_activity_secs == 0 {
-                "just now".to_string()
-            } else {
-                format!("{}s ago", agent.last_activity_secs)
-            };
-            draw_label_value(buf, inner.x, y, inner.width, "Activity", &activity);
-            y += 2;
+            let activity = format_activity_age(agent.last_activity_secs);
+            lines.push(DetailLine::label_value("Activity", &activity));
+            lines.push(DetailLine::Blank);
 
-            // Session context
+            // Team context section (if applicable)
+            if agent.team_name.is_some() || agent.is_subagent {
+                lines.push(DetailLine::styled(
+                    "TEAM CONTEXT",
+                    Style::default().fg(CYAN).bold(),
+                ));
+                lines.push(DetailLine::Separator);
+                if let Some(ref team) = agent.team_name {
+                    lines.push(DetailLine::label_value("Team", team));
+                }
+                if let Some(ref role) = agent.agent_role {
+                    lines.push(DetailLine::label_value("Role", role));
+                }
+                if let Some(ref slug) = agent.agent_slug {
+                    lines.push(DetailLine::label_value("Name", slug));
+                }
+                if agent.is_subagent {
+                    lines.push(DetailLine::label_value("Type", "subagent"));
+                    if let Some(ref parent_id) = agent.parent_session_id {
+                        let short_id = if parent_id.len() > 12 {
+                            &parent_id[..12]
+                        } else {
+                            parent_id
+                        };
+                        lines.push(DetailLine::label_value("Parent", short_id));
+                    }
+                }
+                lines.push(DetailLine::Blank);
+            }
+
+            // Telemetry section
+            if let Some(ref telem) = agent
+                .session_context
+                .as_ref()
+                .and_then(|c| c.telemetry.as_ref())
+            {
+                lines.push(DetailLine::styled(
+                    "TELEMETRY",
+                    Style::default().fg(CYAN).bold(),
+                ));
+                lines.push(DetailLine::Separator);
+
+                // Context gauge: 10-char bar + percentage + absolute
+                let ctx_bar = render_context_gauge(telem.context_pressure_pct);
+                let ctx_abs = format_token_count(telem.context_tokens);
+                let ctx_max = format_token_count(telem.context_max);
+                let gauge_color = if telem.context_pressure_pct > 75 {
+                    RED
+                } else if telem.context_pressure_pct > 50 {
+                    YELLOW
+                } else {
+                    GREEN
+                };
+                lines.push(DetailLine::styled(
+                    &format!(
+                        "Context:  {} {}% ({} / {})",
+                        ctx_bar, telem.context_pressure_pct, ctx_abs, ctx_max
+                    ),
+                    Style::default().fg(gauge_color),
+                ));
+
+                // Burn rate
+                if telem.burn_rate_per_min > 0 {
+                    lines.push(DetailLine::label_value(
+                        "Burn",
+                        &format!("{} tok/min", format_number(telem.burn_rate_per_min)),
+                    ));
+                }
+
+                // Output tokens
+                lines.push(DetailLine::label_value(
+                    "Output",
+                    &format!("{} tokens (total)", format_number(telem.total_output_tokens)),
+                ));
+
+                // Turn count
+                lines.push(DetailLine::label_value(
+                    "Turns",
+                    &telem.turn_count.to_string(),
+                ));
+
+                // Session duration (use agent process age)
+                if agent.age_secs > 0 {
+                    lines.push(DetailLine::label_value(
+                        "Session",
+                        &format_age(agent.age_secs),
+                    ));
+                }
+
+                // Queue status
+                if telem.has_queued_messages {
+                    lines.push(DetailLine::styled(
+                        "Queued:   yes",
+                        Style::default().fg(YELLOW),
+                    ));
+                }
+
+                // Tool mix (top 4)
+                if !telem.tool_mix.is_empty() {
+                    lines.push(DetailLine::Blank);
+                    lines.push(DetailLine::styled(
+                        "TOOL MIX",
+                        Style::default().fg(CYAN).bold(),
+                    ));
+                    lines.push(DetailLine::Separator);
+
+                    let max_count = telem.tool_mix.first().map(|(_, c)| *c).unwrap_or(1);
+                    for (name, count) in telem.tool_mix.iter().take(4) {
+                        let bar = render_tool_bar(*count, max_count);
+                        lines.push(DetailLine::styled(
+                            &format!("{:<8} {} {:>4}", truncate_str(name, 8), bar, count),
+                            Style::default().fg(MAGENTA),
+                        ));
+                    }
+                }
+
+                lines.push(DetailLine::Blank);
+            }
+
             if let Some(ref ctx) = agent.session_context {
-                draw_str(
-                    buf,
-                    inner.x,
-                    y,
+                lines.push(DetailLine::styled(
                     "SESSION CONTEXT",
                     Style::default().fg(CYAN).bold(),
-                );
-                y += 1;
-                draw_hline(buf, inner.x, y, inner.width, '─', DIM);
-                y += 1;
+                ));
+                lines.push(DetailLine::Separator);
 
                 if let Some(ref model) = ctx.model {
-                    draw_label_value(buf, inner.x, y, inner.width, "Model", model);
-                    y += 1;
+                    lines.push(DetailLine::label_value("Model", model));
                 }
                 if let Some(ref branch) = ctx.git_branch {
-                    draw_label_value(buf, inner.x, y, inner.width, "Branch", branch);
-                    y += 1;
+                    lines.push(DetailLine::label_value("Branch", branch));
                 }
                 if let Some(ref msg) = ctx.last_user_message {
-                    y += 1;
-                    draw_str(
-                        buf,
-                        inner.x,
-                        y,
+                    lines.push(DetailLine::Blank);
+                    lines.push(DetailLine::styled(
                         "Last User Message:",
                         Style::default().fg(DIM),
-                    );
-                    y += 1;
-                    let wrapped = truncate_str(msg, (inner.width as usize).saturating_sub(2));
-                    draw_str(
-                        buf,
-                        inner.x + 1,
-                        y,
-                        &wrapped,
+                    ));
+                    let wrapped =
+                        truncate_str(msg, (inner.width as usize).saturating_sub(2));
+                    lines.push(DetailLine::IndentedStyled(
+                        wrapped,
                         Style::default().fg(WHITE),
-                    );
-                    y += 1;
+                    ));
                 }
                 if let Some(ref msg) = ctx.last_assistant_message {
-                    y += 1;
-                    draw_str(
-                        buf,
-                        inner.x,
-                        y,
+                    lines.push(DetailLine::Blank);
+                    lines.push(DetailLine::styled(
                         "Last Assistant:",
                         Style::default().fg(DIM),
-                    );
-                    y += 1;
-                    let wrapped = truncate_str(msg, (inner.width as usize).saturating_sub(2));
-                    draw_str(
-                        buf,
-                        inner.x + 1,
-                        y,
-                        &wrapped,
+                    ));
+                    let wrapped =
+                        truncate_str(msg, (inner.width as usize).saturating_sub(2));
+                    lines.push(DetailLine::IndentedStyled(
+                        wrapped,
                         Style::default().fg(GREEN),
-                    );
-                    y += 1;
+                    ));
                 }
 
-                // Recent activity log
                 if !ctx.recent_activity.is_empty() {
-                    y += 1;
-                    draw_str(
-                        buf,
-                        inner.x,
-                        y,
+                    lines.push(DetailLine::Blank);
+                    lines.push(DetailLine::styled(
                         "RECENT ACTIVITY",
                         Style::default().fg(CYAN).bold(),
-                    );
-                    y += 1;
-                    draw_hline(buf, inner.x, y, inner.width, '─', DIM);
-                    y += 1;
+                    ));
+                    lines.push(DetailLine::Separator);
 
                     for entry in &ctx.recent_activity {
-                        if y >= inner.y + inner.height {
-                            break;
-                        }
-                        let time_style = Style::default().fg(DIM);
                         let summary_style = match entry.kind.as_str() {
                             "user" => Style::default().fg(YELLOW),
                             "tool" => Style::default().fg(MAGENTA),
                             "assistant" => Style::default().fg(GREEN),
                             _ => Style::default().fg(WHITE),
                         };
-
-                        draw_str(buf, inner.x, y, &entry.timestamp, time_style);
                         let summary = truncate_str(
                             &entry.summary,
                             (inner.width as usize).saturating_sub(10),
                         );
-                        draw_str(buf, inner.x + 9, y, &summary, summary_style);
-                        y += 1;
+                        lines.push(DetailLine::Activity {
+                            timestamp: entry.timestamp.clone(),
+                            summary,
+                            style: summary_style,
+                        });
                     }
                 }
+            }
+
+            // Render with scroll offset
+            let total_lines = lines.len();
+            let visible_height = inner.height as usize;
+
+            // Show scroll-up indicator
+            if self.detail_scroll > 0 {
+                draw_str(
+                    buf,
+                    inner.x + inner.width.saturating_sub(1),
+                    inner.y,
+                    "^",
+                    Style::default().fg(DIM),
+                );
+            }
+
+            let mut screen_y = inner.y;
+            for (i, line) in lines.iter().enumerate() {
+                if i < self.detail_scroll {
+                    continue;
+                }
+                if screen_y >= inner.y + inner.height {
+                    break;
+                }
+                match line {
+                    DetailLine::Styled(text, style) => {
+                        draw_str(buf, inner.x, screen_y, text, *style);
+                    }
+                    DetailLine::IndentedStyled(text, style) => {
+                        draw_str(buf, inner.x + 1, screen_y, text, *style);
+                    }
+                    DetailLine::LabelValue(label, value) => {
+                        draw_label_value(
+                            buf,
+                            inner.x,
+                            screen_y,
+                            inner.width,
+                            label,
+                            value,
+                        );
+                    }
+                    DetailLine::Separator => {
+                        draw_hline(buf, inner.x, screen_y, inner.width, '─', DIM);
+                    }
+                    DetailLine::Blank => {}
+                    DetailLine::Activity {
+                        timestamp,
+                        summary,
+                        style,
+                    } => {
+                        draw_str(
+                            buf,
+                            inner.x,
+                            screen_y,
+                            timestamp,
+                            Style::default().fg(DIM),
+                        );
+                        draw_str(buf, inner.x + 9, screen_y, summary, *style);
+                    }
+                }
+                screen_y += 1;
+            }
+
+            // Show scroll-down indicator
+            if self.detail_scroll + visible_height < total_lines {
+                let indicator_y = inner.y + inner.height.saturating_sub(1);
+                draw_str(
+                    buf,
+                    inner.x + inner.width.saturating_sub(1),
+                    indicator_y,
+                    "v",
+                    Style::default().fg(DIM),
+                );
             }
         } else {
             draw_str(
@@ -600,6 +965,31 @@ impl MonitorApp {
                 Style::default().fg(DIM),
             );
         }
+    }
+}
+
+// ─── Detail line model (for scrollable detail pane) ───────────────────────
+
+enum DetailLine {
+    Styled(String, Style),
+    IndentedStyled(String, Style),
+    LabelValue(String, String),
+    Separator,
+    Blank,
+    Activity {
+        timestamp: String,
+        summary: String,
+        style: Style,
+    },
+}
+
+impl DetailLine {
+    fn styled(text: &str, style: Style) -> Self {
+        Self::Styled(text.to_string(), style)
+    }
+
+    fn label_value(label: &str, value: &str) -> Self {
+        Self::LabelValue(label.to_string(), value.to_string())
     }
 }
 
@@ -646,21 +1036,66 @@ fn draw_label_value(buf: &mut ftui::Buffer, x: u16, y: u16, width: u16, label: &
     draw_str(buf, val_x, y, &val, Style::default().fg(WHITE));
 }
 
-fn state_display(state: &AgentState, blink: bool) -> (&'static str, &'static str, PackedRgba) {
+fn state_display(state: &AgentState, tick_count: u64) -> (String, &'static str, PackedRgba) {
+    let blink = tick_count % 2 == 0;
     match state {
         AgentState::WaitingInput => {
             let icon = if blink { "⚠" } else { " " };
-            (icon, "NEEDS INPUT", YELLOW)
+            (icon.to_string(), "NEEDS INPUT", YELLOW)
         }
         AgentState::WaitingPermission => {
             let icon = if blink { "🔒" } else { " " };
-            (icon, "PERMISSION", RED)
+            (icon.to_string(), "PERMISSION", RED)
         }
-        AgentState::Working => ("⚙", "WORKING", GREEN),
-        AgentState::ToolRunning => ("🔧", "TOOL RUN", GREEN),
-        AgentState::Queued => ("⏳", "QUEUED", MAGENTA),
-        AgentState::Idle => ("💤", "IDLE", DIM),
-        AgentState::Starting => ("🚀", "STARTING", DIM),
+        AgentState::Working => {
+            let frame = BRAILLE_SPINNER[(tick_count % 10) as usize];
+            (frame.to_string(), "WORKING", GREEN)
+        }
+        AgentState::ToolRunning => {
+            let frame = BRAILLE_SPINNER[(tick_count % 10) as usize];
+            (frame.to_string(), "TOOL RUN", GREEN)
+        }
+        AgentState::Queued => ("⏳".to_string(), "QUEUED", MAGENTA),
+        AgentState::Idle => ("💤".to_string(), "IDLE", DIM),
+        AgentState::Starting => ("🚀".to_string(), "STARTING", DIM),
+    }
+}
+
+/// Get telemetry pressure percentage for an agent, or None.
+fn agent_pressure_pct(agent: &AgentInstance) -> Option<u8> {
+    agent
+        .session_context
+        .as_ref()?
+        .telemetry
+        .as_ref()
+        .map(|t| t.context_pressure_pct)
+}
+
+/// Render compact 3-char block bar + percentage for table CTX column.
+/// e.g. "██░ 59%" or "███ 92%"
+fn render_context_bar_compact(agent: &AgentInstance) -> String {
+    match agent_pressure_pct(agent) {
+        Some(pct) => {
+            let filled = match pct {
+                0..=33 => 1,
+                34..=66 => 2,
+                _ => 3,
+            };
+            let bar: String = "█".repeat(filled as usize)
+                + &"░".repeat(3 - filled as usize);
+            format!("{} {:>3}%", bar, pct)
+        }
+        None => "  ---".to_string(),
+    }
+}
+
+/// Color for context pressure: GREEN <50%, YELLOW 50-75%, RED >75%.
+fn context_pressure_color(agent: &AgentInstance) -> PackedRgba {
+    match agent_pressure_pct(agent) {
+        Some(pct) if pct > 75 => RED,
+        Some(pct) if pct > 50 => YELLOW,
+        Some(_) => GREEN,
+        None => DIM,
     }
 }
 
@@ -669,6 +1104,63 @@ fn mode_display(mode: &PermissionMode) -> (&'static str, PackedRgba) {
         PermissionMode::DangerouslySkip => ("yolo", RED),
         PermissionMode::AllowDangerouslySkip => ("allow", YELLOW),
         PermissionMode::Default => ("default", DIM),
+    }
+}
+
+/// Render a 10-char context gauge bar: "████████░░"
+fn render_context_gauge(pct: u8) -> String {
+    let filled = ((pct as f32 / 100.0) * 10.0).round() as usize;
+    let filled = filled.min(10);
+    let empty = 10 - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+/// Render a 10-char proportional tool bar relative to max.
+fn render_tool_bar(count: u32, max_count: u32) -> String {
+    if max_count == 0 {
+        return "░░░░░░░░░░".to_string();
+    }
+    let filled = ((count as f32 / max_count as f32) * 10.0).round() as usize;
+    let filled = filled.max(1).min(10);
+    let empty = 10 - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+/// Format a token count as "123K" or "1,234" for display.
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Format a number with comma separators.
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    if len <= 3 {
+        return s;
+    }
+    let mut result = String::with_capacity(len + len / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn format_activity_age(secs: u64) -> String {
+    if secs == 0 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
     }
 }
 
