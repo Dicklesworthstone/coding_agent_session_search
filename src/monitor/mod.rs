@@ -76,8 +76,10 @@ fn format_age(secs: u64) -> String {
 pub fn run_monitor(json: bool, interval: u64, once: bool) -> Result<(), CliError> {
     if json {
         run_monitor_json(interval, once)
-    } else {
+    } else if once {
         run_monitor_table(interval, once)
+    } else {
+        tui::run_monitor_tui(interval)
     }
 }
 
@@ -184,10 +186,15 @@ fn format_state_colored(state: &state::AgentState) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}..", &s[..max.saturating_sub(2)])
+        let end = s
+            .char_indices()
+            .nth(max.saturating_sub(2))
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}..", &s[..end])
     }
 }
 
