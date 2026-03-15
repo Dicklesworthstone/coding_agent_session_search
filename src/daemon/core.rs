@@ -237,63 +237,67 @@ impl ModelDaemon {
         // Start background embedding worker
         self.init_worker();
 
-        loop {
-            // Check for shutdown
-            if self.shutdown.load(Ordering::SeqCst) {
-                info!("Shutdown requested, stopping daemon");
-                break;
-            }
+        std::thread::scope(|s| {
+            loop {
+                // Check for shutdown
+                if self.shutdown.load(Ordering::SeqCst) {
+                    info!("Shutdown requested, stopping daemon");
+                    break;
+                }
 
-            // Check for idle shutdown
-            if self.should_shutdown_idle() {
-                info!(
-                    idle_secs = self.config.idle_timeout.as_secs(),
-                    "Idle timeout reached, shutting down"
-                );
-                break;
-            }
+                // Check for idle shutdown
+                if self.should_shutdown_idle() {
+                    info!(
+                        idle_secs = self.config.idle_timeout.as_secs(),
+                        "Idle timeout reached, shutting down"
+                    );
+                    break;
+                }
 
-            // Enforce configured memory limit when enabled.
-            if self.memory_limit_exceeded() {
-                let memory_bytes = self.resources.memory_usage();
-                error!(
-                    memory_bytes = memory_bytes,
-                    memory_limit = self.config.memory_limit,
-                    "Daemon memory limit exceeded, shutting down"
-                );
-                break;
-            }
+                // Enforce configured memory limit when enabled.
+                if self.memory_limit_exceeded() {
+                    let memory_bytes = self.resources.memory_usage();
+                    error!(
+                        memory_bytes = memory_bytes,
+                        memory_limit = self.config.memory_limit,
+                        "Daemon memory limit exceeded, shutting down"
+                    );
+                    break;
+                }
 
-            // Accept new connections
-            match listener.accept() {
-                Ok((stream, _addr)) => {
-                    let active = self.active_connections.fetch_add(1, Ordering::SeqCst);
-                    if active >= self.config.max_connections as u64 {
-                        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-                        warn!(
-                            active = active,
-                            max = self.config.max_connections,
-                            "Max connections reached, rejecting"
-                        );
-                        continue;
+                // Accept new connections
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        let active = self.active_connections.fetch_add(1, Ordering::SeqCst);
+                        if active >= self.config.max_connections as u64 {
+                            self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                            warn!(
+                                active = active,
+                                max = self.config.max_connections,
+                                "Max connections reached, rejecting"
+                            );
+                            continue;
+                        }
+
+                        self.touch_activity();
+                        s.spawn(move || {
+                            if let Err(e) = self.handle_connection(stream) {
+                                debug!(error = %e, "Connection error");
+                            }
+                            self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
-
-                    self.touch_activity();
-                    if let Err(e) = self.handle_connection(stream) {
-                        debug!(error = %e, "Connection error");
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No pending connections, sleep briefly
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    self.active_connections.fetch_sub(1, Ordering::SeqCst);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No pending connections, sleep briefly
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    error!(error = %e, "Accept error");
-                    std::thread::sleep(Duration::from_millis(100));
+                    Err(e) => {
+                        error!(error = %e, "Accept error");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
-        }
+        });
 
         // Shutdown embedding worker
         if let Some(handle) = self.worker_handle.lock().take()
