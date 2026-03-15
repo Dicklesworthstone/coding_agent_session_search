@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
@@ -43,7 +43,7 @@ lru = "*"
 rustc-hash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
 smallvec = "*"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "*"
-reqwest = { version = "*", default-features = false, features = ["json", "rustls", "blocking", "multipart"] }
+reqwest = { version = "*", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart"] }
 portable-pty = "*"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
