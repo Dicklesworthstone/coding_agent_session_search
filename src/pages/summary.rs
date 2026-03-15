@@ -332,14 +332,6 @@ impl ExclusionSet {
         self.excluded_conversations.remove(&conversation_id);
     }
 
-    /// Add a title pattern to exclusions.
-    pub fn add_pattern(&mut self, pattern: &str) -> Result<()> {
-        let regex = Regex::new(pattern).context("Invalid exclusion pattern")?;
-        self.excluded_patterns.push(regex);
-        self.excluded_pattern_strings.push(pattern.to_string());
-        Ok(())
-    }
-
     /// Check if a workspace is excluded.
     pub fn is_workspace_excluded(&self, workspace: &str) -> bool {
         self.excluded_workspaces.contains(workspace)
@@ -351,8 +343,16 @@ impl ExclusionSet {
     }
 
     /// Check if a title matches any exclusion pattern.
-    pub fn matches_pattern(&self, title: &str) -> bool {
-        self.excluded_patterns.iter().any(|p| p.is_match(title))
+    pub fn is_excluded(&self, title: &str) -> bool {
+        self.excluded_patterns.iter().any(|re| re.is_match(title))
+    }
+
+    /// Add a title pattern to exclusions.
+    pub fn add_pattern(&mut self, pattern: &str) -> Result<()> {
+        let regex = Regex::new(pattern).context("Invalid exclusion pattern")?;
+        self.excluded_patterns.push(regex);
+        self.excluded_pattern_strings.push(pattern.to_string());
+        Ok(())
     }
 
     /// Check if an item should be excluded based on all criteria.
@@ -370,7 +370,7 @@ impl ExclusionSet {
         if self.is_conversation_excluded(conversation_id) {
             return true;
         }
-        self.matches_pattern(title)
+        self.is_excluded(title)
     }
 
     /// Get the count of excluded items.
@@ -1228,8 +1228,8 @@ mod tests {
         assert!(!exclusions.is_conversation_excluded(43));
 
         exclusions.add_pattern("(?i)secret").unwrap();
-        assert!(exclusions.matches_pattern("This is a Secret task"));
-        assert!(!exclusions.matches_pattern("This is a normal task"));
+        assert!(exclusions.is_excluded("This is a Secret task"));
+        assert!(!exclusions.is_excluded("This is a normal task"));
     }
 
     #[test]
@@ -1368,7 +1368,7 @@ mod tests {
         exclusions.compile_patterns().unwrap();
 
         assert_eq!(exclusions.excluded_patterns.len(), 1);
-        assert!(exclusions.matches_pattern("test123pattern"));
+        assert!(exclusions.is_excluded("test123pattern"));
     }
 
     #[test]

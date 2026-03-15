@@ -437,6 +437,11 @@ impl DecryptionEngine {
         for (chunk_index, chunk_file) in self.config.payload.files.iter().enumerate() {
             progress(chunk_index, self.config.payload.chunk_count);
 
+            // Prevent directory traversal
+            if chunk_file.contains("..") || Path::new(chunk_file).is_absolute() {
+                bail!("Invalid chunk path: potential directory traversal");
+            }
+
             let chunk_path = encrypted_dir.join(chunk_file);
             let ciphertext = std::fs::read(&chunk_path)?;
 

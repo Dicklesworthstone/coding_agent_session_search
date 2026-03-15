@@ -361,6 +361,9 @@ fn handle_request(site_dir: &std::path::Path, request: &str) -> Vec<u8> {
 fn handle_connection(mut stream: std::net::TcpStream, site_dir: &std::path::Path) {
     use std::io::{Read, Write};
 
+    // Set a reasonable read timeout so slow clients don't block the thread indefinitely
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
     let mut buf = vec![0u8; 8192];
     let n = match stream.read(&mut buf) {
         Ok(n) if n > 0 => n,
@@ -372,6 +375,8 @@ fn handle_connection(mut stream: std::net::TcpStream, site_dir: &std::path::Path
 
     let _ = stream.write_all(&response);
     let _ = stream.flush();
+
+    // Explicitly shutdown the connection to clean up resources promptly
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
