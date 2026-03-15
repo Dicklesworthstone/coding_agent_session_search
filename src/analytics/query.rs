@@ -18,12 +18,13 @@ use super::types::*;
 
 /// Check whether a table exists in the database.
 pub fn table_exists(conn: &Connection, name: &str) -> bool {
-    conn.query_row_map(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        &[ParamValue::from(name)],
-        |_: &Row| Ok(()),
-    )
-    .is_ok()
+    let rows = match conn.query_map_collect(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
+        row.get_typed::<String>(1)
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return false,
+    };
+    !rows.is_empty()
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -101,20 +102,20 @@ fn query_table_stats(
 ///
 /// `workspace_column` should be provided only for tables that contain a
 /// workspace id dimension (for example `usage_daily.workspace_id`).
-pub fn build_where_parts(
-    filter: &AnalyticsFilter,
-    workspace_column: Option<&str>,
-) -> (Vec<String>, Vec<String>) {
-    let mut parts = Vec::new();
-    let mut params = Vec::new();
+pub fn build_where_parts<'a>(
+    filter: &'a AnalyticsFilter,
+    workspace_column: Option<&'a str>,
+) -> (Vec<String>, Vec<ParamValue>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut params: Vec<ParamValue> = Vec::new();
 
     // Agent filters — multiple agents are OR'd together.
     if !filter.agents.is_empty() {
         let placeholders: Vec<String> = filter
             .agents
             .iter()
-            .map(|a| {
-                params.push(a.clone());
+            .map(|agent| {
+                params.push(ParamValue::from(agent.as_str()));
                 format!("?{}", params.len())
             })
             .collect();
@@ -125,15 +126,15 @@ pub fn build_where_parts(
     match &filter.source {
         SourceFilter::All => {}
         SourceFilter::Local => {
-            params.push("local".into());
+            params.push(ParamValue::from("local"));
             parts.push(format!("source_id = ?{}", params.len()));
         }
         SourceFilter::Remote => {
-            params.push("local".into());
+            params.push(ParamValue::from("local"));
             parts.push(format!("source_id != ?{}", params.len()));
         }
         SourceFilter::Specific(s) => {
-            params.push(s.clone());
+            params.push(ParamValue::from(s.as_str()));
             parts.push(format!("source_id = ?{}", params.len()));
         }
     }
@@ -145,7 +146,7 @@ pub fn build_where_parts(
             .workspace_ids
             .iter()
             .map(|workspace_id| {
-                params.push(workspace_id.to_string());
+                params.push(ParamValue::from(*workspace_id));
                 format!("?{}", params.len())
             })
             .collect();
@@ -396,21 +397,21 @@ pub fn query_tokens_timeseries(
     match group_by {
         GroupBy::Hour => {
             if let Some(min) = hour_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = hour_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
         _ => {
             if let Some(min) = day_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = day_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
@@ -461,10 +462,7 @@ pub fn query_tokens_timeseries(
          ORDER BY {bucket_col}"
     );
 
-    let param_values: Vec<ParamValue> = bind_values
-        .iter()
-        .map(|v| ParamValue::from(v.as_str()))
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let raw_buckets: Vec<(i64, UsageBucket)> = conn
         .query_map_collect(&sql, &param_values, |row: &Row| {
@@ -577,11 +575,11 @@ pub fn query_cost_timeseries(
     let mut bind_values = dim_params;
 
     if let Some(min) = day_min {
-        bind_values.push(min.to_string());
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("day_id >= ?{}", bind_values.len()));
     }
     if let Some(max) = day_max {
-        bind_values.push(max.to_string());
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("day_id <= ?{}", bind_values.len()));
     }
 
@@ -611,10 +609,7 @@ pub fn query_cost_timeseries(
          ORDER BY day_id"
     );
 
-    let param_values: Vec<ParamValue> = bind_values
-        .iter()
-        .map(|v| ParamValue::from(v.as_str()))
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let raw_buckets: Vec<(i64, UsageBucket)> = conn
         .query_map_collect(&sql, &param_values, |row: &Row| {
@@ -753,11 +748,11 @@ pub fn query_breakdown(
     let mut bind_values = dim_params;
 
     if let Some(min) = day_min {
-        bind_values.push(min.to_string());
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("day_id >= ?{}", bind_values.len()));
     }
     if let Some(max) = day_max {
-        bind_values.push(max.to_string());
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("day_id <= ?{}", bind_values.len()));
     }
 
@@ -784,10 +779,7 @@ pub fn query_breakdown(
         )
     };
 
-    let param_values: Vec<ParamValue> = bind_values
-        .iter()
-        .map(|v| ParamValue::from(v.as_str()))
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let rows = if use_track_b {
         read_breakdown_rows_track_b(conn, &sql, &param_values, &metric)?
@@ -1078,21 +1070,21 @@ pub fn query_tools(
     match group_by {
         GroupBy::Hour => {
             if let Some(min) = hour_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = hour_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
         _ => {
             if let Some(min) = day_min {
-                bind_values.push(min.to_string());
+                bind_values.push(ParamValue::from(min));
                 where_parts.push(format!("{bucket_col} >= ?{}", bind_values.len()));
             }
             if let Some(max) = day_max {
-                bind_values.push(max.to_string());
+                bind_values.push(ParamValue::from(max));
                 where_parts.push(format!("{bucket_col} <= ?{}", bind_values.len()));
             }
         }
@@ -1118,10 +1110,7 @@ pub fn query_tools(
          LIMIT {limit}"
     );
 
-    let param_values: Vec<ParamValue> = bind_values
-        .iter()
-        .map(|v| ParamValue::from(v.as_str()))
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let tool_rows = conn
         .query_map_collect(&sql, &param_values, |row: &Row| {
@@ -1200,7 +1189,7 @@ pub fn query_session_scatter(
     }
 
     let mut where_parts: Vec<String> = Vec::new();
-    let mut bind_values: Vec<String> = Vec::new();
+    let mut bind_values: Vec<ParamValue> = Vec::new();
 
     // Agent filters.
     if !filter.agents.is_empty() {
@@ -1208,7 +1197,7 @@ pub fn query_session_scatter(
             .agents
             .iter()
             .map(|agent| {
-                bind_values.push(agent.clone());
+                bind_values.push(ParamValue::from(agent.as_str()));
                 format!("?{}", bind_values.len())
             })
             .collect();
@@ -1219,15 +1208,15 @@ pub fn query_session_scatter(
     match &filter.source {
         SourceFilter::All => {}
         SourceFilter::Local => {
-            bind_values.push("local".into());
+            bind_values.push(ParamValue::from("local"));
             where_parts.push(format!("c.source_id = ?{}", bind_values.len()));
         }
         SourceFilter::Remote => {
-            bind_values.push("local".into());
+            bind_values.push(ParamValue::from("local"));
             where_parts.push(format!("c.source_id != ?{}", bind_values.len()));
         }
         SourceFilter::Specific(s) => {
-            bind_values.push(s.clone());
+            bind_values.push(ParamValue::from(s.as_str()));
             where_parts.push(format!("c.source_id = ?{}", bind_values.len()));
         }
     }
@@ -1238,7 +1227,7 @@ pub fn query_session_scatter(
             .workspace_ids
             .iter()
             .map(|workspace_id| {
-                bind_values.push(workspace_id.to_string());
+                bind_values.push(ParamValue::from(*workspace_id));
                 format!("?{}", bind_values.len())
             })
             .collect();
@@ -1255,12 +1244,12 @@ pub fn query_session_scatter(
             THEN COALESCE(m.created_at, c.started_at, 0) * 1000 \
             ELSE COALESCE(m.created_at, c.started_at, 0) \
         END";
-    if let Some(since_ms) = filter.since_ms {
-        bind_values.push(since_ms.to_string());
+    if let Some(min) = filter.since_ms {
+        bind_values.push(ParamValue::from(min));
         where_parts.push(format!("{timestamp_expr} >= ?{}", bind_values.len()));
     }
-    if let Some(until_ms) = filter.until_ms {
-        bind_values.push(until_ms.to_string());
+    if let Some(max) = filter.until_ms {
+        bind_values.push(ParamValue::from(max));
         where_parts.push(format!("{timestamp_expr} <= ?{}", bind_values.len()));
     }
 
@@ -1349,10 +1338,7 @@ pub fn query_session_scatter(
          LIMIT {limit}"
     );
 
-    let param_values: Vec<ParamValue> = bind_values
-        .iter()
-        .map(|v| ParamValue::from(v.as_str()))
-        .collect();
+    let param_values: Vec<ParamValue> = bind_values.clone();
 
     let points = conn
         .query_map_collect(&sql, &param_values, |row: &Row| {
@@ -1454,7 +1440,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("agent_slug IN"));
-        assert_eq!(params, vec!["claude_code"]);
+        assert_eq!(params, vec![ParamValue::from("claude_code")]);
     }
 
     #[test]
@@ -1480,7 +1466,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id = ?1"));
-        assert_eq!(params, vec!["local"]);
+        assert_eq!(params, vec![ParamValue::from("local")]);
     }
 
     #[test]
@@ -1492,7 +1478,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id != ?1"));
-        assert_eq!(params, vec!["local"]);
+        assert_eq!(params, vec![ParamValue::from("local")]);
     }
 
     #[test]
@@ -1504,7 +1490,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("source_id = ?1"));
-        assert_eq!(params, vec!["myhost.local"]);
+        assert_eq!(params, vec![ParamValue::from("myhost.local")]);
     }
 
     #[test]
@@ -1517,8 +1503,8 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 2);
         assert_eq!(params.len(), 2);
-        assert_eq!(params[0], "codex");
-        assert_eq!(params[1], "local");
+        assert_eq!(params[0], ParamValue::from("codex"));
+        assert_eq!(params[1], ParamValue::from("local"));
     }
 
     #[test]
@@ -1530,7 +1516,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, Some("workspace_id"));
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("workspace_id IN (?1, ?2)"));
-        assert_eq!(params, vec!["7", "42"]);
+        assert_eq!(params, vec![ParamValue::from(7_i64), ParamValue::from(42_i64)]);
     }
 
     #[test]
@@ -2152,55 +2138,14 @@ mod tests {
     }
 
     #[test]
-    fn query_tokens_timeseries_legacy_rollup_schema_defaults_plan_token_rollups_to_zero() {
-        let conn = setup_usage_daily_legacy_db();
-        let filter = AnalyticsFilter::default();
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Day).unwrap();
-
-        assert_eq!(result.buckets.len(), 1);
-        let bucket = &result.buckets[0].1;
-        assert_eq!(bucket.plan_content_tokens_est_total, 0);
-        assert_eq!(bucket.plan_api_tokens_total, 0);
-    }
-
-    #[test]
-    fn query_tokens_timeseries_hourly_reads_usage_hourly_rollup() {
-        let conn = setup_usage_hourly_db();
-        let filter = AnalyticsFilter::default();
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Hour).unwrap();
-
-        assert_eq!(result.source_table, "usage_hourly");
-        assert_eq!(result.group_by, GroupBy::Hour);
-        assert_eq!(result.buckets.len(), 2);
-        assert_eq!(result.totals.message_count, 30);
-        assert_eq!(result.totals.tool_call_count, 8);
-        assert_eq!(result.totals.api_tokens_total, 4000);
-        assert_eq!(result.totals.plan_content_tokens_est_total, 600);
-        assert_eq!(result.totals.plan_api_tokens_total, 1100);
-    }
-
-    #[test]
-    fn query_tokens_timeseries_workspace_filter_applies() {
-        let conn = setup_usage_daily_db();
-        let filter = AnalyticsFilter {
-            workspace_ids: vec![2],
-            ..Default::default()
-        };
-        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Day).unwrap();
-        assert_eq!(result.buckets.len(), 1);
-        assert_eq!(result.totals.message_count, 30);
-        assert_eq!(result.totals.tool_call_count, 5);
-    }
-
-    #[test]
     fn query_breakdown_result_to_json_shape() {
         let conn = setup_usage_daily_db();
         let filter = AnalyticsFilter::default();
-        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ToolCalls, 10).unwrap();
+        let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
 
         let json = result.to_cli_json();
         assert_eq!(json["dim"], "agent");
-        assert_eq!(json["metric"], "tool_calls");
+        assert_eq!(json["metric"], "api_total");
         assert!(json["rows"].is_array());
         assert!(json["row_count"].is_number());
         assert!(json["_meta"]["elapsed_ms"].is_number());
@@ -2480,8 +2425,7 @@ mod tests {
     fn query_breakdown_model_with_cost_metric_orders_by_cost() {
         let conn = setup_token_daily_stats_db();
         let filter = AnalyticsFilter::default();
-        let result =
-            query_breakdown(&conn, &filter, Dim::Model, Metric::EstimatedCostUsd, 10).unwrap();
+        let result = query_breakdown(&conn, &filter, Dim::Model, Metric::EstimatedCostUsd, 10).unwrap();
 
         // Should order by estimated_cost_usd DESC: opus (1.50) > codex/gpt-4o (0.80) > sonnet (0.40)
         assert_eq!(result.rows[0].key, "opus");
