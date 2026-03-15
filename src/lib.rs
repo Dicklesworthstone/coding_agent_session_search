@@ -4670,7 +4670,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
                     chars.next();
                     break;
                 }
-                phrase.push(chars.next().unwrap());
+                if let Some(n) = chars.next() {
+                    phrase.push(n);
+                }
             }
             if !phrase.is_empty() {
                 terms.push(phrase);
@@ -4680,7 +4682,9 @@ fn extract_search_terms(query: &str) -> Vec<String> {
             let mut word = String::from(c);
             while let Some(&next) = chars.peek() {
                 if next.is_alphanumeric() || next == '_' || next == '-' {
-                    word.push(chars.next().unwrap());
+                    if let Some(n) = chars.next() {
+                        word.push(n);
+                    }
                 } else if next == ':' {
                     // This is a field filter - skip the whole thing
                     chars.next(); // consume ':'
@@ -12502,7 +12506,7 @@ fn run_export_html(
             },
             "warnings": []
         });
-        println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+        println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string()));
         return Ok(());
     }
 
@@ -12517,7 +12521,7 @@ fn run_export_html(
             "encrypted": encrypt,
             "estimated_size_bytes": estimated_size
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
         return Ok(());
     }
 
@@ -12610,7 +12614,7 @@ fn run_export_html(
                 "title": session_title
             }
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
     } else {
         println!("✓ Exported to {}", output_path.display());
         if encrypt {
@@ -14287,7 +14291,7 @@ fn run_timeline(
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).expect("valid start of day");
         let local_start = match Local.from_local_datetime(&start_of_day) {
             chrono::LocalResult::Single(dt) => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
