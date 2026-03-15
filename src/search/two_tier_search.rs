@@ -711,7 +711,10 @@ impl<'a, D: DaemonClient> Iterator for TwoTierSearchIter<'a, D> {
                                         let quality_s = quality_norm[idx];
                                         (1.0 - weight) * fast_s + weight * quality_s
                                     } else {
-                                        fast_norm.get(idx).copied().unwrap_or(0.0)
+                                        // Unrefined documents get a penalized score that assumes 0.0 for quality
+                                        // to preserve their original ranking but place them appropriately below
+                                        // high-quality refined items.
+                                        fast_norm.get(idx).copied().unwrap_or(0.0) * (1.0 - weight)
                                     };
                                     blended.push(ScoredResult {
                                         idx: fast.idx,
