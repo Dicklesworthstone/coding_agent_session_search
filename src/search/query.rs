@@ -1537,10 +1537,18 @@ impl CachedHit {
             + self.hit.source_path.len()
             + self.hit.agent.len()
             + self.hit.workspace.len()
-            + self.hit.workspace_original.as_ref().map_or(0, std::string::String::len)
+            + self
+                .hit
+                .workspace_original
+                .as_ref()
+                .map_or(0, std::string::String::len)
             + self.hit.source_id.len()
             + self.hit.origin_kind.len()
-            + self.hit.origin_host.as_ref().map_or(0, std::string::String::len);
+            + self
+                .hit
+                .origin_host
+                .as_ref()
+                .map_or(0, std::string::String::len);
         // Lowercase cache copies
         let lc_strings =
             self.lc_content.len() + self.lc_title.as_ref().map_or(0, std::string::String::len);

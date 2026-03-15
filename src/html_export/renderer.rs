@@ -688,32 +688,32 @@ fn render_message_group(
     // Check for content collapse
     let content_bytes = group.primary.content.len();
     let mut content_chars = 0; // Calculated lazily
-    let should_collapse = options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
-        content_chars = group.primary.content.chars().count();
-        content_chars > options.collapse_threshold
-    };
+    let should_collapse =
+        options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+            content_chars = group.primary.content.chars().count();
+            content_chars > options.collapse_threshold
+        };
 
-    let (content_wrapper_start, content_wrapper_end) =
-        if should_collapse {
-            let preview_chars = options.collapse_threshold.min(500);
-            let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
-            let preview = &group.primary.content[..safe_len];
-            (
-                format!(
-                    r#"<details class="message-collapse">
+    let (content_wrapper_start, content_wrapper_end) = if should_collapse {
+        let preview_chars = options.collapse_threshold.min(500);
+        let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
+        let preview = &group.primary.content[..safe_len];
+        (
+            format!(
+                r#"<details class="message-collapse">
                     <summary>
                         <span class="message-preview">{}</span>
                         <span class="message-expand-hint">Click to expand ({} chars)</span>
                     </summary>
                     <div class="message-expanded">"#,
-                    super::template::html_escape(preview),
-                    content_chars
-                ),
-                "</div></details>".to_string(),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+                super::template::html_escape(preview),
+                content_chars
+            ),
+            "</div></details>".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // Only render content div if there's actual content
     let content_section = if content_html.trim().is_empty() {
@@ -962,41 +962,41 @@ pub fn render_message(message: &Message, options: &RenderOptions) -> Result<Stri
     // Check if message should be collapsed
     let content_bytes = message.content.len();
     let mut content_chars = 0; // Calculated lazily
-    let should_collapse = options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
-        content_chars = message.content.chars().count();
-        content_chars > options.collapse_threshold
-    };
+    let should_collapse =
+        options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+            content_chars = message.content.chars().count();
+            content_chars > options.collapse_threshold
+        };
 
-    let (content_wrapper_start, content_wrapper_end) =
-        if should_collapse {
-            debug!(
-                component = "renderer",
-                operation = "collapse_message",
-                message_index = message.index.unwrap_or(0),
-                content_len = content_chars,
-                collapse_threshold = options.collapse_threshold,
-                "Collapsing long message"
-            );
-            let preview_chars = options.collapse_threshold.min(500);
-            // Safe truncation at char boundary to avoid panic on multi-byte UTF-8.
-            let safe_len = byte_index_for_char_count(&message.content, preview_chars);
-            let preview = &message.content[..safe_len];
-            (
-                format!(
-                    r#"<details class="message-collapse">
+    let (content_wrapper_start, content_wrapper_end) = if should_collapse {
+        debug!(
+            component = "renderer",
+            operation = "collapse_message",
+            message_index = message.index.unwrap_or(0),
+            content_len = content_chars,
+            collapse_threshold = options.collapse_threshold,
+            "Collapsing long message"
+        );
+        let preview_chars = options.collapse_threshold.min(500);
+        // Safe truncation at char boundary to avoid panic on multi-byte UTF-8.
+        let safe_len = byte_index_for_char_count(&message.content, preview_chars);
+        let preview = &message.content[..safe_len];
+        (
+            format!(
+                r#"<details class="message-collapse">
                     <summary>
                         <span class="message-preview">{}</span>
                         <span class="message-expand-hint">Click to expand ({} chars)</span>
                     </summary>
                     <div class="message-expanded">"#,
-                    html_escape(preview),
-                    content_chars
-                ),
-                "</div></details>".to_string(),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+                html_escape(preview),
+                content_chars
+            ),
+            "</div></details>".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
 
     // Tool badges rendered as compact icons in header (upper-right)
     let tool_badges_html = if options.show_tool_calls {

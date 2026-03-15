@@ -187,9 +187,7 @@ impl UiThemePreset {
             "synthwave-84" | "synthwave_84" | "synthwave84" | "synthwave" => {
                 Some(Self::Synthwave84)
             }
-            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => {
-                Some(Self::Colorblind)
-            }
+            "colorblind" | "colour-blind" | "color-blind" | "cb" | "cvd" => Some(Self::Colorblind),
             _ => None,
         }
     }

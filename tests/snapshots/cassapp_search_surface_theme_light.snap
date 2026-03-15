@@ -6,7 +6,7 @@
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭Results (1)───────────────────────────────────────────────────────────────────────│╭Detail [Messages] ↩───────────────╮
 │ [pane:Mixed] [idx:1/1] [hits:1] [row:1/1] [sel:0] [exact:0] [prefix:0] [fuzzy:1] ││  ● Messages  │  Snippets  │  Raw │
-│▶   1. ▼ @aider Large-snippet rendering edge case                                 ││ [agent:✓ aider] [mt:suffix]      │
+│▶   1. ▼ @aider Large-snippet rendering edge case                                 ││ [agent:✓ aider] [src:⇄ ci-linux] │
 │      M█▇ 6.4 [ci-linux] mt suffix │ ws /workspace/cass │ ● 1 msg                 ││────────────────────────────────  │
 │      /workspace/cass/tests/regression/long_snippet.md:9                          ││Large-snippet rendering edge case │
 │    ╰─ ⇄ remote · score 0.640 (6.4/10) · idx 1 · ● 1 msg                          ││agent=aider │ ws=/workspace/cass ││

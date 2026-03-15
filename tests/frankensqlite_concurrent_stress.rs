@@ -247,17 +247,24 @@ fn stress_write_heavy_contention() {
 
     // Verify via reader
     let reader = mgr.reader();
-    let rows = reader.query("SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id").unwrap();
+    let rows = reader
+        .query("SELECT thread_id, COUNT(*) FROM items GROUP BY thread_id")
+        .unwrap();
     for row in rows {
         let tid: i64 = row.get_typed(0).unwrap();
         let cnt: i64 = row.get_typed(1).unwrap();
         println!("thread {} inserted {} rows", tid, cnt);
-        
+
         if tid == 1 {
-            let seqs = reader.query("SELECT id, seq FROM items WHERE thread_id = 1 ORDER BY seq").unwrap();
+            let seqs = reader
+                .query("SELECT id, seq FROM items WHERE thread_id = 1 ORDER BY seq")
+                .unwrap();
             let mut seq_list = Vec::new();
             for s_row in seqs {
-                seq_list.push((s_row.get_typed::<i64>(0).unwrap(), s_row.get_typed::<i64>(1).unwrap()));
+                seq_list.push((
+                    s_row.get_typed::<i64>(0).unwrap(),
+                    s_row.get_typed::<i64>(1).unwrap(),
+                ));
             }
             println!("thread 1 seqs: {:?}", seq_list);
         }
@@ -265,8 +272,10 @@ fn stress_write_heavy_contention() {
 
     let rows = reader.query("SELECT COUNT(*) FROM items").unwrap();
     let count: i64 = rows[0].get_typed(0).unwrap();
-    
-    let max_id: i64 = reader.query("SELECT MAX(id) FROM items").unwrap()[0].get_typed(0).unwrap_or(0);
+
+    let max_id: i64 = reader.query("SELECT MAX(id) FROM items").unwrap()[0]
+        .get_typed(0)
+        .unwrap_or(0);
     println!("Total rows: {}, Max ID: {}", count, max_id);
 
     assert!(

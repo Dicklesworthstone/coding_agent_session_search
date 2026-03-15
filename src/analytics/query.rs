@@ -18,12 +18,13 @@ use super::types::*;
 
 /// Check whether a table exists in the database.
 pub fn table_exists(conn: &Connection, name: &str) -> bool {
-    let rows = match conn.query_map_collect(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
-        row.get_typed::<String>(1)
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return false,
-    };
+    let rows =
+        match conn.query_map_collect(&format!("PRAGMA table_info({})", name), &[], |row: &Row| {
+            row.get_typed::<String>(1)
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return false,
+        };
     !rows.is_empty()
 }
 
@@ -1516,7 +1517,10 @@ mod tests {
         let (parts, params) = build_where_parts(&f, Some("workspace_id"));
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("workspace_id IN (?1, ?2)"));
-        assert_eq!(params, vec![ParamValue::from(7_i64), ParamValue::from(42_i64)]);
+        assert_eq!(
+            params,
+            vec![ParamValue::from(7_i64), ParamValue::from(42_i64)]
+        );
     }
 
     #[test]
@@ -2426,7 +2430,8 @@ mod tests {
     fn query_breakdown_model_with_cost_metric_orders_by_cost() {
         let conn = setup_token_daily_stats_db();
         let filter = AnalyticsFilter::default();
-        let result = query_breakdown(&conn, &filter, Dim::Model, Metric::EstimatedCostUsd, 10).unwrap();
+        let result =
+            query_breakdown(&conn, &filter, Dim::Model, Metric::EstimatedCostUsd, 10).unwrap();
 
         // Should order by estimated_cost_usd DESC: opus (1.50) > codex/gpt-4o (0.80) > sonnet (0.40)
         assert_eq!(result.rows[0].key, "opus");

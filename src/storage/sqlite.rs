@@ -1534,11 +1534,7 @@ impl FrankenStorage {
     fn sync_meta_schema_version(&self, version: i64) -> Result<()> {
         // The meta table is created by V1 migration. If it doesn't exist yet,
         // there's nothing to sync.
-        let rows = self
-            .conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
-            .with_context(|| "checking for meta table")?;
-        if rows.is_empty() {
+        if self.conn.query("SELECT key FROM meta;").is_err() {
             return Ok(());
         }
 
@@ -2084,18 +2080,15 @@ const MIGRATION_NAMES: [(i64, &str); 13] = [
 /// - If `schema_version = 0` but tables exist → corrupted state, log warning
 fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     // Check if _schema_migrations already exists → already transitioned.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_schema_migrations';")
-        .with_context(|| "checking for _schema_migrations table")?;
-    if !rows.is_empty() {
+    if conn
+        .query("SELECT version FROM \"_schema_migrations\";")
+        .is_ok()
+    {
         return Ok(());
     }
 
     // Check if the meta table exists.
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name='meta';")
-        .with_context(|| "checking for meta table")?;
-    if rows.is_empty() {
+    if conn.query("SELECT key FROM meta;").is_err() {
         // No meta table → fresh database, let MigrationRunner handle it.
         return Ok(());
     }
@@ -2654,7 +2647,10 @@ impl FrankenStorage {
         if result.is_err() {
             let _ = self.conn.execute_batch("ROLLBACK;");
         } else {
-            info!("Rebuilding FTS: {}/{} rows complete.", total_count, total_count);
+            info!(
+                "Rebuilding FTS: {}/{} rows complete.",
+                total_count, total_count
+            );
         }
         result
     }
@@ -5907,7 +5903,10 @@ impl SqliteStorage {
             offset += batch_size;
         }
         tx.commit()?;
-        info!("Rebuilding FTS: {}/{} rows complete.", total_count, total_count);
+        info!(
+            "Rebuilding FTS: {}/{} rows complete.",
+            total_count, total_count
+        );
         Ok(())
     }
 

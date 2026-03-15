@@ -1066,17 +1066,15 @@ pub fn run_index(
         // In watch mode, skip the expensive bulk re-embed if a vector index and
         // watermark already exist. The incremental path in the watch callback
         // will pick up any new messages via WAL append.
-        let vi_dir = opts.data_dir.join(crate::search::vector_index::VECTOR_INDEX_DIR);
+        let vi_dir = opts
+            .data_dir
+            .join(crate::search::vector_index::VECTOR_INDEX_DIR);
         let has_existing_index = vi_dir.is_dir()
             && std::fs::read_dir(&vi_dir)
                 .map(|entries| {
                     entries
                         .filter_map(|e| e.ok())
-                        .any(|e| {
-                            e.path()
-                                .extension()
-                                .is_some_and(|ext| ext == "fsvi")
-                        })
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "fsvi"))
                 })
                 .unwrap_or(false);
         let has_watermark = storage.get_last_embedded_message_id()?.is_some();
@@ -1123,9 +1121,7 @@ pub fn run_index(
                         message_id,
                         created_at_ms: msg.created_at.unwrap_or(0),
                         agent_id: saturating_u32_from_i64(msg.agent_id),
-                        workspace_id: saturating_u32_from_i64(
-                            msg.workspace_id.unwrap_or(0),
-                        ),
+                        workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
                         source_id: msg.source_id_hash,
                         role: role_u8,
                         chunk_idx: 0,
@@ -1301,7 +1297,10 @@ pub fn run_index(
                         ) {
                             Ok(0) => {} // no new messages to embed
                             Ok(n) => {
-                                tracing::info!(count = n, "incremental semantic embedding complete");
+                                tracing::info!(
+                                    count = n,
+                                    "incremental semantic embedding complete"
+                                );
                                 if let Ok(mut t) = last_semantic_embed.lock() {
                                     *t = Instant::now();
                                 }

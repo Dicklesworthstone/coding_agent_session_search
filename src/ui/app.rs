@@ -19179,7 +19179,9 @@ fn export_session_task(
 
     let view = match load_conversation_uncached(&storage, source_path) {
         Ok(Some(v)) => v,
-        Ok(None) => return CassMsg::ExportFailed(format!("Session not found in index: {source_path}")),
+        Ok(None) => {
+            return CassMsg::ExportFailed(format!("Session not found in index: {source_path}"));
+        }
         Err(e) => return CassMsg::ExportFailed(format!("Failed to load session: {e}")),
     };
 
@@ -19197,11 +19199,12 @@ fn export_session_task(
             crate::model::types::MessageRole::System => "system",
             crate::model::types::MessageRole::Tool => "tool",
             crate::model::types::MessageRole::Other(_) => "unknown",
-        }.to_string();
+        }
+        .to_string();
 
-        let timestamp_str = msg.created_at.and_then(|ts| {
-            DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
-        });
+        let timestamp_str = msg
+            .created_at
+            .and_then(|ts| DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339()));
 
         messages.push(HtmlMessage {
             role: role_str,
@@ -25099,11 +25102,11 @@ mod tests {
     fn export_session_html_task_preserves_existing_file_on_collision() {
         use crate::storage::sqlite::SqliteStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        
+
         // Setup mock DB
         let db_path = tmp.path().join("cass.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
-        
+
         let conn = storage.raw();
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)", []).unwrap();
         conn.execute(
@@ -36384,7 +36387,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         // Evidence sink enabled state matches (disabled by default since
         // FTUI_RECORD_RESIZE is not set in test env).
         assert_eq!(sink_a.enabled, sink_b.enabled);
-        assert!(!sink_a.enabled, "evidence sink should be disabled by default (opt-in via FTUI_RECORD_RESIZE=1)");
+        assert!(
+            !sink_a.enabled,
+            "evidence sink should be disabled by default (opt-in via FTUI_RECORD_RESIZE=1)"
+        );
     }
 
     #[test]

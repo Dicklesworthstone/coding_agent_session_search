@@ -201,15 +201,17 @@ impl UdsDaemonClient {
     }
 
     /// Get a fresh connection, reconnecting if needed.
-    fn get_connection_locked(&self) -> Result<parking_lot::MutexGuard<'_, Option<UnixStream>>, DaemonError> {
+    fn get_connection_locked(
+        &self,
+    ) -> Result<parking_lot::MutexGuard<'_, Option<UnixStream>>, DaemonError> {
         // Try to use existing connection
         let conn = self.connection.lock();
         let is_valid = conn.as_ref().is_some_and(|s| s.peer_addr().is_ok());
-        
+
         if is_valid {
             return Ok(conn);
         }
-        
+
         // Connection is stale or missing, release lock and reconnect
         drop(conn);
 
@@ -221,7 +223,9 @@ impl UdsDaemonClient {
         if conn.is_some() {
             Ok(conn)
         } else {
-            Err(DaemonError::Unavailable("connection not established".to_string()))
+            Err(DaemonError::Unavailable(
+                "connection not established".to_string(),
+            ))
         }
     }
 
@@ -245,7 +249,10 @@ impl UdsDaemonClient {
         if let Err(e) = stream.write_all(&encoded) {
             *stream_guard = None;
             self.available.store(false, Ordering::SeqCst);
-            return Err(DaemonError::Unavailable(format!("failed to send request: {}", e)));
+            return Err(DaemonError::Unavailable(format!(
+                "failed to send request: {}",
+                e
+            )));
         }
 
         // Read length prefix
@@ -256,7 +263,10 @@ impl UdsDaemonClient {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 return Err(DaemonError::Timeout("response timeout".to_string()));
             } else {
-                return Err(DaemonError::Unavailable(format!("failed to read response length: {}", e)));
+                return Err(DaemonError::Unavailable(format!(
+                    "failed to read response length: {}",
+                    e
+                )));
             }
         }
 
@@ -284,10 +294,13 @@ impl UdsDaemonClient {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 return Err(DaemonError::Timeout("response timeout".to_string()));
             } else {
-                return Err(DaemonError::Unavailable(format!("failed to read response: {}", e)));
+                return Err(DaemonError::Unavailable(format!(
+                    "failed to read response: {}",
+                    e
+                )));
             }
         }
-        
+
         // Release connection lock before decoding
         drop(stream_guard);
 

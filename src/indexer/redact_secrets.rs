@@ -233,10 +233,7 @@ mod tests {
             "number": 42
         });
         let output = redact_json(&input);
-        assert_eq!(
-            output["tool_result"],
-            json!("Response contains [REDACTED]")
-        );
+        assert_eq!(output["tool_result"], json!("Response contains [REDACTED]"));
         assert_eq!(output["safe"], json!("no secrets here"));
         assert_eq!(output["number"], json!(42));
     }

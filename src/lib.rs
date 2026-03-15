@@ -1799,7 +1799,9 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             ],
         ),
         "sources" => (
-            &["list", "add", "remove", "sync", "status", "mappings", "discover", "wizard"],
+            &[
+                "list", "add", "remove", "sync", "status", "mappings", "discover", "wizard",
+            ],
             &[
                 "cass sources list --json",
                 "cass sources add user@host --name myserver",
@@ -1818,10 +1820,7 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             &["chatgpt"],
             &["cass import chatgpt /path/to/conversations.json"],
         ),
-        _ => (
-            &[],
-            &["cass --help"],
-        ),
+        _ => (&[], &["cass --help"]),
     };
 
     let mut msg = format!(
@@ -12506,7 +12505,10 @@ fn run_export_html(
             },
             "warnings": []
         });
-        println!("{}", serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12521,7 +12523,10 @@ fn run_export_html(
             "encrypted": encrypt,
             "estimated_size_bytes": estimated_size
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
         return Ok(());
     }
 
@@ -12614,7 +12619,10 @@ fn run_export_html(
                 "title": session_title
             }
         });
-        println!("{}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+        );
     } else {
         println!("✓ Exported to {}", output_path.display());
         if encrypt {
@@ -13727,7 +13735,10 @@ fn format_as_markdown(
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         match role.as_str() {
@@ -13792,7 +13803,10 @@ fn format_as_text(messages: &[serde_json::Value], include_tools: bool) -> String
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         text.push_str(&format!("=== {} ===\n\n", role.to_uppercase()));
@@ -13876,7 +13890,10 @@ fn format_as_html(
     for msg in messages {
         let role = extract_role(msg);
         // Skip non-message records (queue-operation, summary, etc.)
-        if !matches!(role.as_str(), "user" | "assistant" | "system" | "tool" | "unknown") {
+        if !matches!(
+            role.as_str(),
+            "user" | "assistant" | "system" | "tool" | "unknown"
+        ) {
             continue;
         }
         let role_class = if role == "user" { "user" } else { "assistant" };
@@ -14291,7 +14308,10 @@ fn run_timeline(
 
     let now = Local::now();
     let (start_ts, end_ts) = if today {
-        let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).expect("valid start of day");
+        let start_of_day = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("valid start of day");
         let local_start = match Local.from_local_datetime(&start_of_day) {
             chrono::LocalResult::Single(dt) => dt,
             chrono::LocalResult::Ambiguous(dt, _) => dt,
