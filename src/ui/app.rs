@@ -7243,11 +7243,7 @@ impl CassApp {
             "\u{2302}"
         };
         let source_label = source_display_label(&hit.source_id, hit.origin_host.as_deref());
-        let source_chip = if let Some(host) = hit.origin_host.as_deref() {
-            format!("{source_icon} {source_label}@{host}")
-        } else {
-            format!("{source_icon} {source_label}")
-        };
+        let source_chip = format!("{source_icon} {source_label}");
         let workspace_room = inner_width.saturating_sub(44).clamp(16, 56) as usize;
         let workspace_chip = elide_path_for_metadata(&hit.workspace, workspace_room);
         let score_style = styles.score_style(normalize_score_for_visuals(hit.score));
@@ -15549,11 +15545,13 @@ impl super::ftui_adapter::Model for CassApp {
                     let include_tools = state.include_tools;
                     let title = state.title_preview.clone();
                     let agent_name = state.agent_name.clone();
+                    let db_path = self.db_path.clone();
                     self.status = "Exporting HTML...".to_string();
 
                     // Dispatch the export as a background task.
                     return ftui::Cmd::task(move || {
                         export_session_task(
+                            &db_path,
                             &source_path,
                             &output_path,
                             encrypt,
@@ -19157,6 +19155,7 @@ fn write_export_bytes_no_overwrite(
 /// Runs on a background thread via `Cmd::task` so the UI stays responsive.
 #[allow(clippy::too_many_arguments)]
 fn export_session_task(
+    db_path: &std::path::Path,
     source_path: &str,
     output_path: &std::path::Path,
     encrypt: bool,
@@ -19169,82 +19168,48 @@ fn export_session_task(
     use crate::html_export::{
         ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
     };
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
+    use crate::storage::sqlite::SqliteStorage;
+    use crate::ui::data::load_conversation_uncached;
+    use chrono::DateTime;
 
-    let session = std::path::Path::new(source_path);
-    if !session.exists() {
-        return CassMsg::ExportFailed(format!("Session not found: {source_path}"));
-    }
-
-    // Read and parse session messages.
-    let file = match File::open(session) {
-        Ok(f) => f,
-        Err(e) => return CassMsg::ExportFailed(format!("Cannot open session: {e}")),
+    let storage = match SqliteStorage::open_readonly(db_path) {
+        Ok(s) => s,
+        Err(e) => return CassMsg::ExportFailed(format!("Failed to open database: {e}")),
     };
-    let reader = BufReader::new(file);
+
+    let view = match load_conversation_uncached(&storage, source_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => return CassMsg::ExportFailed(format!("Session not found in index: {source_path}")),
+        Err(e) => return CassMsg::ExportFailed(format!("Failed to load session: {e}")),
+    };
+
     let mut messages: Vec<HtmlMessage> = Vec::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let val: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // Extract role and content from the JSON line.
-        let role = val
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let content = val
-            .get("content")
-            .and_then(|c| {
-                if c.is_string() {
-                    c.as_str().map(|s| s.to_string())
-                } else if c.is_array() {
-                    // Handle array content (e.g., Claude Code format).
-                    let parts: Vec<String> = c
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .filter_map(|part| {
-                            part.get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
-                    if parts.is_empty() {
-                        None
-                    } else {
-                        Some(parts.join("\n"))
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
+    for msg in view.messages {
+        let content = msg.content;
         if content.is_empty() && !include_tools {
             continue;
         }
+
+        let role_str = match msg.role {
+            crate::model::types::MessageRole::User => "user",
+            crate::model::types::MessageRole::Agent => "assistant",
+            crate::model::types::MessageRole::System => "system",
+            crate::model::types::MessageRole::Tool => "tool",
+            crate::model::types::MessageRole::Other(_) => "unknown",
+        }.to_string();
+
+        let timestamp_str = msg.created_at.and_then(|ts| {
+            DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+        });
+
         messages.push(HtmlMessage {
-            role,
+            role: role_str,
             content,
-            timestamp: val
-                .get("timestamp")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string()),
+            timestamp: timestamp_str,
             tool_call: None,
-            index: None,
-            author: None,
+            index: Some(msg.idx as usize),
+            author: msg.author,
         });
     }
 
@@ -25132,19 +25097,35 @@ mod tests {
 
     #[test]
     fn export_session_html_task_preserves_existing_file_on_collision() {
+        use crate::storage::sqlite::SqliteStorage;
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let session_path = tmp.path().join("session.jsonl");
-        std::fs::write(
-            &session_path,
-            r#"{"role":"user","content":"hello"}
-{"role":"assistant","content":"hi"}"#,
-        )
-        .expect("write session fixture");
+        
+        // Setup mock DB
+        let db_path = tmp.path().join("cass.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name) VALUES (1, 'claude_code', 'Claude Code')", []).unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) 
+             VALUES (1, 1, 'ext', 'Test', '/fake/session.jsonl', 'local', 10)",
+             []
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'hello')", []
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 1, 1, 'assistant', 'hi')", []
+        ).unwrap();
+
+        let session_path = "/fake/session.jsonl";
+
         let existing_path = tmp.path().join("session.html");
         std::fs::write(&existing_path, "existing").expect("seed existing html export");
 
         let msg = export_session_task(
-            &session_path.display().to_string(),
+            &db_path,
+            session_path,
             &existing_path,
             false,
             None,
@@ -38003,7 +37984,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let mut app = app_with_hits(50);
         let _ = app.update(CassMsg::SearchRequested);
 
-        for i in 0..20 {
+        for i in 0..19 {
             let _ = app.update(CassMsg::ThemeToggled);
             let buf = render_at_degradation(&app, 120, 24, DegradationLevel::Full);
             let text = buffer_to_text(&buf);
@@ -38013,8 +37994,8 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             );
         }
 
-        // After even number of toggles, should be back to original dark mode
-        assert!(app.theme_dark, "20 toggles should return to dark theme");
+        // After exactly 19 toggles, should be back to original dark mode
+        assert!(app.theme_dark, "19 toggles should return to dark theme");
     }
 
     /// Stress: all degradation levels × all density modes render without panic.

@@ -152,8 +152,8 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
         output.push_str("|-------|-------|\n");
         output.push_str(&format!("| Agent | {} |\n", escape_markdown(&hit.agent)));
         output.push_str(&format!(
-            "| Workspace | `{}` |\n",
-            escape_markdown(&hit.workspace.replace('`', ""))
+            "| Workspace | {} |\n",
+            escape_markdown(&hit.workspace)
         ));
 
         if options.include_score {
@@ -177,8 +177,8 @@ fn export_markdown(hits: &[SearchHit], options: &ExportOptions) -> String {
                 hit.source_path.clone()
             };
             output.push_str(&format!(
-                "| Source | `{}` |\n",
-                escape_markdown(&path_display.replace('`', ""))
+                "| Source | {} |\n",
+                escape_markdown(&path_display)
             ));
 
             if let Some(line) = hit.line_number {

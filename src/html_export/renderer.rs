@@ -686,9 +686,15 @@ fn render_message_group(
     };
 
     // Check for content collapse
-    let content_chars = group.primary.content.chars().count();
+    let content_bytes = group.primary.content.len();
+    let mut content_chars = 0; // Calculated lazily
+    let should_collapse = options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+        content_chars = group.primary.content.chars().count();
+        content_chars > options.collapse_threshold
+    };
+
     let (content_wrapper_start, content_wrapper_end) =
-        if options.collapse_threshold > 0 && content_chars > options.collapse_threshold {
+        if should_collapse {
             let preview_chars = options.collapse_threshold.min(500);
             let safe_len = byte_index_for_char_count(&group.primary.content, preview_chars);
             let preview = &group.primary.content[..safe_len];
@@ -954,9 +960,15 @@ pub fn render_message(message: &Message, options: &RenderOptions) -> Result<Stri
     let content_html = render_content(&message.content, options);
 
     // Check if message should be collapsed
-    let content_chars = message.content.chars().count();
+    let content_bytes = message.content.len();
+    let mut content_chars = 0; // Calculated lazily
+    let should_collapse = options.collapse_threshold > 0 && content_bytes > options.collapse_threshold && {
+        content_chars = message.content.chars().count();
+        content_chars > options.collapse_threshold
+    };
+
     let (content_wrapper_start, content_wrapper_end) =
-        if options.collapse_threshold > 0 && content_chars > options.collapse_threshold {
+        if should_collapse {
             debug!(
                 component = "renderer",
                 operation = "collapse_message",

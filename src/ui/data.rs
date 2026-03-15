@@ -196,7 +196,7 @@ pub static CONVERSATION_CACHE: Lazy<ConversationCache> = Lazy::new(|| {
 
 /// Load a conversation from the database (bypassing cache).
 /// Use `load_conversation` for cached access.
-fn load_conversation_uncached(
+pub(crate) fn load_conversation_uncached(
     storage: &SqliteStorage,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
