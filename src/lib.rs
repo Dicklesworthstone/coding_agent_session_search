@@ -12473,14 +12473,30 @@ fn run_export_html(
         })
         .collect();
 
-    // Count message types from RAW messages (not processed Messages) for accuracy.
+    // Count message types from RAW messages for accuracy.
     // Must distinguish human-typed prompts from tool results, which both have role "user".
     // Tool results have content as an array containing {"type": "tool_result", ...} blocks.
+    // Also exclude skill injections from counts when !include_skills, since those messages
+    // are dropped from the rendered output and shouldn't inflate the prompt count.
     let mut human_turns = 0usize;
     let mut assistant_msgs = 0usize;
     let mut tool_use_count = 0usize;
     for msg in &raw_messages {
         let role = extract_role(msg);
+        let text = extract_text_content(msg);
+
+        // Skip messages that would be dropped by skill filtering
+        if !include_skills {
+            if text.contains("Base directory for this skill:")
+                || text.contains("<system-reminder>")
+                || text.contains("The following skills are available for use with the Skill tool:")
+                || (text.contains("skillInjection:") && text.contains("matchedSkills"))
+                || text.contains("<!-- skillInjection:")
+            {
+                continue;
+            }
+        }
+
         match role.as_str() {
             "user" => {
                 // Check if this is a tool result return or a human-typed message.
