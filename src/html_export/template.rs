@@ -81,18 +81,20 @@ const SCREEN_ONLY_CSS: &str = r#"
 "#;
 
 const CDN_FALLBACK_CSS: &str = r#"
-/* CDN fallback hooks */
+/* CDN fallback hooks — activated when CDNs fail to load or are disabled */
 .no-tailwind .toolbar,
 .no-tailwind .header,
 .no-tailwind .conversation {
     backdrop-filter: none !important;
 }
 
-.no-prism pre code[class*="language-"] {
+/* Ensure ALL code blocks are legible without Prism syntax highlighting.
+   Covers both language-tagged and untagged code blocks. */
+.no-prism pre code {
     color: #c0caf5;
 }
 
-.no-prism pre code[class*="language-"] .token {
+.no-prism pre code .token {
     color: inherit;
 }
 "#;
@@ -253,8 +255,14 @@ pub struct TemplateMetadata {
     /// Agent type (Claude, Codex, etc.)
     pub agent: Option<String>,
 
-    /// Message count
+    /// Total rendered message count (internal)
     pub message_count: usize,
+
+    /// Human-typed turns (user messages that aren't tool results)
+    pub human_turns: usize,
+
+    /// Tool call count
+    pub tool_calls: usize,
 
     /// Duration of session
     pub duration: Option<String>,
@@ -383,9 +391,18 @@ impl HtmlTemplate {
             "Preparing HTML render"
         );
 
+        // When CDNs are disabled, add no-prism class so fallback CSS activates.
+        // Without this, code blocks are illegible (dark text on dark background)
+        // because the Prism onerror handlers never fire to add the class.
+        let html_classes = if !options.include_cdn {
+            r#" class="no-prism no-tailwind""#
+        } else {
+            ""
+        };
+
         format!(
             r#"<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="dark"{html_classes}>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -457,9 +474,22 @@ impl HtmlTemplate {
         }
 
         if self.metadata.message_count > 0 {
+            // Show human turns + tool calls instead of raw message count.
+            // "577 messages" is misleading; "19 turns, 284 tool calls" is accurate.
+            let turns_str = if self.metadata.human_turns > 0 {
+                format!(
+                    "{} turn{}, {} tool call{}",
+                    self.metadata.human_turns,
+                    if self.metadata.human_turns == 1 { "" } else { "s" },
+                    self.metadata.tool_calls,
+                    if self.metadata.tool_calls == 1 { "" } else { "s" },
+                )
+            } else {
+                format!("{} messages", self.metadata.message_count)
+            };
             meta_items.push(format!(
-                r#"<span>{} messages</span>"#,
-                self.metadata.message_count
+                r#"<span>{}</span>"#,
+                turns_str
             ));
         }
 

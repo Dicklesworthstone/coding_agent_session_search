@@ -3416,7 +3416,13 @@ async fn execute_cli(
                     include_tools,
                     include_skills,
                 } => {
-                    run_export(&path, format, output.as_deref(), include_tools, include_skills)?;
+                    run_export(
+                        &path,
+                        format,
+                        output.as_deref(),
+                        include_tools,
+                        include_skills,
+                    )?;
                 }
                 Commands::ExportHtml {
                     session,
@@ -12078,11 +12084,21 @@ fn run_export(
     if !include_skills {
         messages.retain(|msg| {
             let content = extract_text_content(msg);
-            if content.contains("Base directory for this skill:") { return false; }
-            if content.contains("<system-reminder>") { return false; }
-            if content.contains("The following skills are available for use with the Skill tool:") { return false; }
-            if content.contains("skillInjection:") && content.contains("matchedSkills") { return false; }
-            if content.contains("<!-- skillInjection:") { return false; }
+            if content.contains("Base directory for this skill:") {
+                return false;
+            }
+            if content.contains("<system-reminder>") {
+                return false;
+            }
+            if content.contains("The following skills are available for use with the Skill tool:") {
+                return false;
+            }
+            if content.contains("skillInjection:") && content.contains("matchedSkills") {
+                return false;
+            }
+            if content.contains("<!-- skillInjection:") {
+                return false;
+            }
             true
         });
     }
@@ -12411,7 +12427,9 @@ fn run_export_html(
                     return None;
                 }
                 // Skill listing dumps (injected by hooks)
-                if content.contains("The following skills are available for use with the Skill tool:") {
+                if content
+                    .contains("The following skills are available for use with the Skill tool:")
+                {
                     return None;
                 }
                 // Vercel plugin hook injections with skill metadata
@@ -12455,7 +12473,19 @@ fn run_export_html(
         })
         .collect();
 
-    // Store original message count for explain/dry_run modes
+    // Count human turns vs tool calls for accurate display.
+    // "577 messages" is misleading for a 19-turn conversation. Show the
+    // breakdown that actually matters: human prompts and tool interactions.
+    let mut human_turns = 0usize;
+    let mut tool_calls = 0usize;
+    for msg in &messages {
+        if msg.role == "user" && msg.tool_call.is_none() {
+            human_turns += 1;
+        }
+        if msg.tool_call.is_some() {
+            tool_calls += 1;
+        }
+    }
     let message_count = messages.len();
 
     // --- Build metadata ---
@@ -12483,6 +12513,8 @@ fn run_export_html(
         }),
         agent: agent_name.clone(),
         message_count,
+        human_turns,
+        tool_calls,
         duration,
         project: workspace.clone(),
     };
@@ -12667,7 +12699,14 @@ fn run_export_html(
         if encrypt {
             println!("  🔒 Encrypted with Web Crypto (AES-256-GCM)");
         }
-        println!("  {} messages, {} bytes", message_count, file_size);
+        if human_turns > 0 {
+            println!(
+                "  {} turns, {} tool calls ({} total messages), {} bytes",
+                human_turns, tool_calls, message_count, file_size
+            );
+        } else {
+            println!("  {} messages, {} bytes", message_count, file_size);
+        }
     }
 
     Ok(())
