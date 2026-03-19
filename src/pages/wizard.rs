@@ -1739,7 +1739,10 @@ impl PagesWizard {
         pb3.finish_with_message(format!(
             "✓ Bundle complete: {} files, fingerprint {}",
             bundle_result.total_files,
-            bundle_result.fingerprint.get(..8).unwrap_or(&bundle_result.fingerprint)
+            bundle_result
+                .fingerprint
+                .get(..8)
+                .unwrap_or(&bundle_result.fingerprint)
         ));
 
         // Phase 4: Post-export verification

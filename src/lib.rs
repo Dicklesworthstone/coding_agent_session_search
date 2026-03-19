@@ -10296,7 +10296,10 @@ fn run_config_based_export(
         }
         println!(
             "  Fingerprint: {}",
-            bundle_result.fingerprint.get(..8).unwrap_or(&bundle_result.fingerprint)
+            bundle_result
+                .fingerprint
+                .get(..8)
+                .unwrap_or(&bundle_result.fingerprint)
         );
 
         if let Some(deploy) = deploy_result {

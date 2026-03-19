@@ -259,84 +259,220 @@ pub fn load_chart_data(
     }
 
     // Agent message counts.
-    if let Some(result) = try_analytics!("agent_messages", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Agent, analytics::Metric::MessageCount, 20,
-    ), load_errors) {
-        data.agent_messages = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "agent_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Agent,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
+    ) {
+        data.agent_messages = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
         data.total_messages = result.rows.iter().map(|r| r.value).sum();
     }
 
     // Workspace breakdown (Track A — usage_daily).
-    if let Some(result) = try_analytics!("workspace_tokens", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Workspace, analytics::Metric::ApiTotal, 20,
-    ), load_errors) {
-        data.workspace_tokens = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "workspace_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Workspace,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
+    ) {
+        data.workspace_tokens = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
-    if let Some(result) = try_analytics!("workspace_messages", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Workspace, analytics::Metric::MessageCount, 20,
-    ), load_errors) {
-        data.workspace_messages = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "workspace_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Workspace,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
+    ) {
+        data.workspace_messages = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
 
     // Source breakdown (Track A — usage_daily).
-    if let Some(result) = try_analytics!("source_tokens", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Source, analytics::Metric::ApiTotal, 20,
-    ), load_errors) {
-        data.source_tokens = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "source_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Source,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
+    ) {
+        data.source_tokens = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
-    if let Some(result) = try_analytics!("source_messages", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Source, analytics::Metric::MessageCount, 20,
-    ), load_errors) {
-        data.source_messages = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "source_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Source,
+            analytics::Metric::MessageCount,
+            20,
+        ),
+        load_errors
+    ) {
+        data.source_messages = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
 
     // Tool usage — load full rows for the enhanced tools table.
-    if let Some(result) = try_analytics!("tools", analytics::query::query_tools(conn, &filter, group_by, 50), load_errors) {
-        data.agent_tool_calls = result.rows.iter().map(|r| (r.key.clone(), r.tool_call_count as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "tools",
+        analytics::query::query_tools(conn, &filter, group_by, 50),
+        load_errors
+    ) {
+        data.agent_tool_calls = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.tool_call_count as f64))
+            .collect();
         data.total_tool_calls = result.total_tool_calls;
         data.tool_rows = result.rows;
     }
 
     // Per-session scatter points (messages vs API tokens).
-    if let Some(points) = try_analytics!("session_scatter", analytics::query::query_session_scatter(conn, &filter, 600), load_errors) {
+    if let Some(points) = try_analytics!(
+        "session_scatter",
+        analytics::query::query_session_scatter(conn, &filter, 600),
+        load_errors
+    ) {
         data.session_scatter = points;
     }
 
     // Daily timeseries (for sparklines and line chart).
-    if let Some(result) = try_analytics!("timeseries", analytics::query::query_tokens_timeseries(conn, &filter, group_by), load_errors) {
-        data.daily_tokens = result.buckets.iter().map(|(label, bucket)| (label.clone(), bucket.api_tokens_total as f64)).collect();
-        data.daily_messages = result.buckets.iter().map(|(label, bucket)| (label.clone(), bucket.message_count as f64)).collect();
-        data.daily_content_tokens = result.buckets.iter().map(|(label, bucket)| (label.clone(), bucket.content_tokens_est_total as f64)).collect();
-        data.daily_tool_calls = result.buckets.iter().map(|(label, bucket)| (label.clone(), bucket.tool_call_count as f64)).collect();
-        data.daily_plan_messages = result.buckets.iter().map(|(label, bucket)| (label.clone(), bucket.plan_message_count as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "timeseries",
+        analytics::query::query_tokens_timeseries(conn, &filter, group_by),
+        load_errors
+    ) {
+        data.daily_tokens = result
+            .buckets
+            .iter()
+            .map(|(label, bucket)| (label.clone(), bucket.api_tokens_total as f64))
+            .collect();
+        data.daily_messages = result
+            .buckets
+            .iter()
+            .map(|(label, bucket)| (label.clone(), bucket.message_count as f64))
+            .collect();
+        data.daily_content_tokens = result
+            .buckets
+            .iter()
+            .map(|(label, bucket)| (label.clone(), bucket.content_tokens_est_total as f64))
+            .collect();
+        data.daily_tool_calls = result
+            .buckets
+            .iter()
+            .map(|(label, bucket)| (label.clone(), bucket.tool_call_count as f64))
+            .collect();
+        data.daily_plan_messages = result
+            .buckets
+            .iter()
+            .map(|(label, bucket)| (label.clone(), bucket.plan_message_count as f64))
+            .collect();
         data.total_content_tokens = result.totals.content_tokens_est_total;
         data.total_plan_messages = result.totals.plan_message_count;
 
         // Build heatmap data (normalize token values to 0..1).
-        let max_tokens = data.daily_tokens.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
-        data.heatmap_days = data.daily_tokens.iter().map(|(label, v)| {
-            let norm = if max_tokens > 0.0 { v / max_tokens } else { 0.0 };
-            (label.clone(), norm)
-        }).collect();
+        let max_tokens = data
+            .daily_tokens
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(0.0_f64, f64::max);
+        data.heatmap_days = data
+            .daily_tokens
+            .iter()
+            .map(|(label, v)| {
+                let norm = if max_tokens > 0.0 {
+                    v / max_tokens
+                } else {
+                    0.0
+                };
+                (label.clone(), norm)
+            })
+            .collect();
     }
 
     // Model breakdown (Track B — token_daily_stats).
-    if let Some(result) = try_analytics!("model_tokens", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Model, analytics::Metric::ApiTotal, 20,
-    ), load_errors) {
-        data.model_tokens = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "model_tokens",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Model,
+            analytics::Metric::ApiTotal,
+            20,
+        ),
+        load_errors
+    ) {
+        data.model_tokens = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
 
     // Coverage percentage.
-    if let Some(status) = try_analytics!("status", analytics::query::query_status(conn, &filter), load_errors) {
+    if let Some(status) = try_analytics!(
+        "status",
+        analytics::query::query_status(conn, &filter),
+        load_errors
+    ) {
         data.coverage_pct = status.coverage.api_token_coverage_pct;
     }
 
     // Per-agent plan message breakdown.
-    if let Some(result) = try_analytics!("plan_messages", analytics::query::query_breakdown(
-        conn, &filter, analytics::Dim::Agent, analytics::Metric::PlanCount, 20,
-    ), load_errors) {
-        data.agent_plan_messages = result.rows.iter().map(|r| (r.key.clone(), r.value as f64)).collect();
+    if let Some(result) = try_analytics!(
+        "plan_messages",
+        analytics::query::query_breakdown(
+            conn,
+            &filter,
+            analytics::Dim::Agent,
+            analytics::Metric::PlanCount,
+            20,
+        ),
+        load_errors
+    ) {
+        data.agent_plan_messages = result
+            .rows
+            .iter()
+            .map(|r| (r.key.clone(), r.value as f64))
+            .collect();
     }
 
     // Log summary of load errors.
@@ -942,19 +1078,36 @@ pub fn render_explorer(
 
     if metric_data.is_empty() {
         if area.height >= 12 && area.width >= 40 {
-            let accent = if dark_mode { PackedRgba::rgb(90, 180, 255) } else { PackedRgba::rgb(20, 100, 200) };
-            let primary = if dark_mode { PackedRgba::rgb(60, 120, 200) } else { PackedRgba::rgb(40, 80, 160) };
-            
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
             let mut lines = Vec::new();
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("             ▃▄▅▇██▇▅▄▃             ", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "             ▃▄▅▇██▇▅▄▃             ",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("         ▂▄▆████████████▆▄▂         ", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "         ▂▄▆████████████▆▄▂         ",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("       ▃▆██████████████████▆▃       ", ftui::Style::new().fg(cc.muted)),
+                ftui::text::Span::styled(
+                    "       ▃▆██████████████████▆▃       ",
+                    ftui::Style::new().fg(cc.muted),
+                ),
             ]));
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
@@ -1715,31 +1868,64 @@ pub fn render_heatmap(
 
     if series.is_empty() {
         if area.height >= 12 && area.width >= 40 {
-            let muted = if dark_mode { PackedRgba::rgb(120, 125, 140) } else { PackedRgba::rgb(100, 105, 115) };
-            let accent = if dark_mode { PackedRgba::rgb(90, 180, 255) } else { PackedRgba::rgb(20, 100, 200) };
-            let primary = if dark_mode { PackedRgba::rgb(60, 120, 200) } else { PackedRgba::rgb(40, 80, 160) };
+            let muted = if dark_mode {
+                PackedRgba::rgb(120, 125, 140)
+            } else {
+                PackedRgba::rgb(100, 105, 115)
+            };
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
             let mut lines = Vec::new();
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░", ftui::Style::new().fg(muted)),
+                ftui::text::Span::styled(
+                    "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
+                    ftui::Style::new().fg(muted),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ███ ███ ███ ███ ███ ███ ███", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ███ ███ ███ ███ ███ ███ ███",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░", ftui::Style::new().fg(muted)),
+                ftui::text::Span::styled(
+                    "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
+                    ftui::Style::new().fg(muted),
+                ),
             ]));
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
@@ -2084,11 +2270,19 @@ pub fn render_breakdowns(
             " No {} breakdown data for the current filters.",
             tab.label()
         );
-        
+
         if area.height >= 12 && area.width >= 40 {
-            let accent = if dark_mode { PackedRgba::rgb(90, 180, 255) } else { PackedRgba::rgb(20, 100, 200) };
-            let primary = if dark_mode { PackedRgba::rgb(60, 120, 200) } else { PackedRgba::rgb(40, 80, 160) };
-            
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
             let mut lines = Vec::new();
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
@@ -2336,25 +2530,48 @@ pub fn render_tools(
 
     if data.tool_rows.is_empty() {
         if area.height >= 12 && area.width >= 40 {
-            let accent = if dark_mode { PackedRgba::rgb(90, 180, 255) } else { PackedRgba::rgb(20, 100, 200) };
-            let primary = if dark_mode { PackedRgba::rgb(60, 120, 200) } else { PackedRgba::rgb(40, 80, 160) };
-            
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
             let mut lines = Vec::new();
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   Agent                 Calls   Msgs   Tokens   Trend  ", ftui::Style::new().fg(cc.muted)),
+                ftui::text::Span::styled(
+                    "   Agent                 Calls   Msgs   Tokens   Trend  ",
+                    ftui::Style::new().fg(cc.muted),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ██████████               ██     ██       ██     ███  ", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "   ██████████               ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ████████████             ██     ██       ██     ███  ", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ████████████             ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ██████                   ██     ██       ██     ███  ", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "   ██████                   ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ████████                 ██     ██       ██     ███  ", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ████████                 ██     ██       ██     ███  ",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
@@ -2456,9 +2673,9 @@ fn tools_header_line(width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    
+
     let w = width;
-    
+
     if width < 56 {
         let name_w: usize = 10;
         let label = "Agent";
@@ -2481,12 +2698,7 @@ fn tools_header_line(width: usize) -> String {
 
     let line = format!(
         " {}{} {:>8} {:>8} {:>10} {:>8} {:>6}",
-        label, pad,
-        "Calls",
-        "Msgs",
-        "API Tok",
-        "Calls/1K",
-        "Share",
+        label, pad, "Calls", "Msgs", "API Tok", "Calls/1K", "Share",
     );
     truncate_with_ellipsis(&line, width)
 }
@@ -2500,7 +2712,7 @@ fn tools_row_line(row: &crate::analytics::ToolRow, pct_share: f64, width: usize)
         .tool_calls_per_1k_api_tokens
         .map(|v| format!("{v:.2}"))
         .unwrap_or_else(|| "\u{2014}".to_string());
-        
+
     if width < 56 {
         let name_w: usize = 10;
         let truncated_name = shorten_label(&row.key, name_w);
@@ -2510,7 +2722,8 @@ fn tools_row_line(row: &crate::analytics::ToolRow, pct_share: f64, width: usize)
 
         let line = format!(
             " {}{} {:>5} {:>5} {:>8} {:>4.0}%",
-            truncated_name, pad,
+            truncated_name,
+            pad,
             format_compact(row.tool_call_count),
             format_compact(row.message_count),
             format_compact(row.api_tokens_total),
@@ -2518,17 +2731,18 @@ fn tools_row_line(row: &crate::analytics::ToolRow, pct_share: f64, width: usize)
         );
         return truncate_with_ellipsis(&line, width);
     }
-    
+
     let w = width;
     let name_w = (w * 28 / 100).clamp(8, 24);
     let truncated_name = shorten_label(&row.key, name_w);
     let current_w = display_width(&truncated_name);
     let pad_w = name_w.saturating_sub(current_w);
     let pad = " ".repeat(pad_w);
-    
+
     let line = format!(
         " {}{} {:>8} {:>8} {:>10} {:>8} {:>5.1}%",
-        truncated_name, pad,
+        truncated_name,
+        pad,
         format_number(row.tool_call_count),
         format_number(row.message_count),
         format_compact(row.api_tokens_total),
@@ -2767,7 +2981,8 @@ pub fn render_coverage(
                 let pad = " ".repeat(name_w.saturating_sub(display_width(&t_name)));
                 format!(
                     " {}{} {:>8} {:>6}",
-                    t_name, pad,
+                    t_name,
+                    pad,
                     format_compact(*tokens as i64),
                     format_compact(msgs as i64),
                 )
@@ -2777,7 +2992,8 @@ pub fn render_coverage(
                 let pad = " ".repeat(name_w.saturating_sub(display_width(&t_name)));
                 format!(
                     " {}{} {:>12} {:>10} {:>8}",
-                    t_name, pad,
+                    t_name,
+                    pad,
                     format_compact(*tokens as i64),
                     format_compact(msgs as i64),
                     "",
@@ -2846,16 +3062,30 @@ pub fn render_coverage(
         sparkline.render(spark_area, frame);
     } else {
         if chunks[2].height >= 8 && chunks[2].width >= 40 {
-            let accent = if dark_mode { PackedRgba::rgb(90, 180, 255) } else { PackedRgba::rgb(20, 100, 200) };
-            let primary = if dark_mode { PackedRgba::rgb(60, 120, 200) } else { PackedRgba::rgb(40, 80, 160) };
-            
+            let accent = if dark_mode {
+                PackedRgba::rgb(90, 180, 255)
+            } else {
+                PackedRgba::rgb(20, 100, 200)
+            };
+            let primary = if dark_mode {
+                PackedRgba::rgb(60, 120, 200)
+            } else {
+                PackedRgba::rgb(40, 80, 160)
+            };
+
             let mut lines = Vec::new();
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ▂▂▃▄▅▆▇██████████████▇▆▅▄▃▂▂   ", ftui::Style::new().fg(accent)),
+                ftui::text::Span::styled(
+                    "   ▂▂▃▄▅▆▇██████████████▇▆▅▄▃▂▂   ",
+                    ftui::Style::new().fg(accent),
+                ),
             ]));
             lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ████████████████████████████   ", ftui::Style::new().fg(primary)),
+                ftui::text::Span::styled(
+                    "   ████████████████████████████   ",
+                    ftui::Style::new().fg(primary),
+                ),
             ]));
             lines.push(ftui::text::Line::from(""));
             lines.push(ftui::text::Line::from_spans(vec![

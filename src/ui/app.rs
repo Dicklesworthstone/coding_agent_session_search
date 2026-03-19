@@ -106,6 +106,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ftui::runtime::input_macro::{MacroPlayback, MacroRecorder};
+use ftui::runtime::{StopSignal, SubId, Subscription};
 
 use crate::model::types::MessageRole;
 use crate::search::model_manager::SemanticAvailability;
@@ -3945,6 +3946,8 @@ pub struct CassApp {
     pub search_has_more: bool,
     /// Guard against overlapping async search requests (initial or load-more).
     pub search_in_flight: bool,
+    /// True after initial live results arrive but refinement is still streaming.
+    pub search_refining: bool,
     /// Which search mode is active (lexical / semantic / hybrid).
     pub search_mode: SearchMode,
     /// Text matching strategy.
@@ -4181,8 +4184,8 @@ pub struct CassApp {
     pub last_mouse_pos: Option<(u16, u16)>,
     /// Timestamp of last saved-view drag hover change (for stabilization).
     pub drag_hover_settled_at: Option<Instant>,
-    /// Index of the result item currently under the mouse cursor (hover highlight).
-    pub hovered_result: Option<usize>,
+    /// Result row currently under the mouse cursor (pane-aware hover highlight).
+    pub hovered_result: Option<HoveredResult>,
 
     // -- Lazy-loaded services ---------------------------------------------
     /// Data directory used for runtime state/index operations.
@@ -4195,6 +4198,10 @@ pub struct CassApp {
     pub known_workspaces: Option<Vec<String>>,
     /// Search service for async query dispatch.
     pub search_service: Option<Arc<dyn SearchService>>,
+    /// Concrete search service used for live progressive subscriptions.
+    progressive_search_service: Option<Arc<TantivySearchService>>,
+    /// Active live-search subscription request, if any.
+    live_search_request: Option<LiveSearchRequest>,
 
     // -- Macro recording/playback -----------------------------------------
     /// Active macro recorder (when interactive recording is in progress).
@@ -4270,6 +4277,7 @@ impl Default for CassApp {
             search_backend_offset: 0,
             search_has_more: false,
             search_in_flight: false,
+            search_refining: false,
             search_mode: SearchMode::default(),
             match_mode: MatchMode::default(),
             ranking_mode: RankingMode::default(),
@@ -4399,6 +4407,8 @@ impl Default for CassApp {
             db_reader: None,
             known_workspaces: None,
             search_service: None,
+            progressive_search_service: None,
+            live_search_request: None,
             macro_recorder: None,
             macro_playback: None,
             macro_redact_paths: false,
@@ -4783,6 +4793,9 @@ impl CassApp {
                         rect.width.saturating_sub(2),
                         rect.height.saturating_sub(2),
                     );
+                    if y < inner.y {
+                        return MouseHitRegion::PaneHeader { pane_idx };
+                    }
                     let row_in_viewport = if inner.height == 0 || y < inner.y {
                         0
                     } else {
@@ -5430,6 +5443,109 @@ impl CassApp {
             self.input_mode = InputMode::Query;
             self.input_buffer.clear();
         }
+    }
+
+    fn enter_query_input_context(&mut self) {
+        self.focus_manager.focus(focus_ids::SEARCH_BAR);
+        if self.input_mode != InputMode::Query {
+            self.input_mode = InputMode::Query;
+            self.input_buffer.clear();
+        }
+        self.cursor_pos = self.query.len();
+    }
+
+    fn enter_detail_focus_context(&mut self) {
+        self.focus_manager.focus(focus_ids::DETAIL_PANE);
+    }
+
+    fn interactive_search_limit(&self) -> usize {
+        let visible_rows = self.results_list_state.borrow().visible_count().max(8);
+        let visible_panes = self.last_pane_rects.borrow().len().max(1);
+        let live_window = visible_rows
+            .saturating_mul(visible_panes)
+            .saturating_mul(2)
+            .clamp(16, 32);
+        live_window.min(self.search_page_size.max(1)).max(1)
+    }
+
+    fn build_search_params(&self, pass: SearchPass, offset: usize) -> SearchParams {
+        let limit = match pass {
+            SearchPass::Interactive => self.interactive_search_limit(),
+            SearchPass::Upgrade | SearchPass::Pagination => self.search_page_size.max(1),
+        };
+        SearchParams {
+            query: self.query.clone(),
+            filters: self.filters.clone(),
+            pass,
+            mode: self.search_mode,
+            match_mode: self.match_mode,
+            ranking: self.ranking_mode,
+            context_window: self.context_window,
+            limit,
+            offset,
+        }
+    }
+
+    fn dispatch_search_pass(
+        &mut self,
+        generation: u64,
+        pass: SearchPass,
+        offset: usize,
+    ) -> ftui::Cmd<CassMsg> {
+        let params = self.build_search_params(pass, offset);
+        let requested_limit = params.limit;
+        if let Some(svc) = self.search_service.clone() {
+            if matches!(pass, SearchPass::Interactive) {
+                self.search_generation = generation;
+                self.search_backend_offset = 0;
+                self.search_has_more = false;
+            }
+            self.search_in_flight = true;
+            self.status = match pass {
+                SearchPass::Interactive => "Searching…".to_string(),
+                SearchPass::Upgrade => "Refining…".to_string(),
+                SearchPass::Pagination => {
+                    format!("Loading more… ({} loaded)", self.results.len())
+                }
+            };
+            self.search_refining = false;
+            self.set_loading_context(LoadingContext::Search);
+            ftui::Cmd::task(move || match svc.execute(&params) {
+                Ok(result) => CassMsg::SearchCompleted {
+                    generation,
+                    pass,
+                    requested_limit,
+                    hits: result.hits,
+                    elapsed_ms: result.elapsed_ms,
+                    suggestions: result.suggestions,
+                    wildcard_fallback: result.wildcard_fallback,
+                    append: matches!(pass, SearchPass::Pagination),
+                },
+                Err(e) => CassMsg::SearchFailed {
+                    generation,
+                    error: e,
+                },
+            })
+        } else {
+            self.search_in_flight = false;
+            self.clear_loading_context(LoadingContext::Search);
+            ftui::Cmd::none()
+        }
+    }
+
+    fn should_refine_search(&self) -> bool {
+        !self.query.trim().is_empty()
+            && matches!(self.search_mode, SearchMode::Semantic | SearchMode::Hybrid)
+    }
+
+    fn progressive_subscription_id(generation: u64) -> SubId {
+        0x4341_5353_5f53_4541 ^ generation
+    }
+
+    fn live_request_is_progressive_for(&self, generation: u64) -> bool {
+        self.live_search_request
+            .as_ref()
+            .is_some_and(|request| request.generation == generation && request.progressive)
     }
 
     fn split_content_area(
@@ -6652,7 +6768,7 @@ impl CassApp {
         let total_hits: usize = self.panes.iter().map(|pane| pane.total_count).sum();
         let pane_count = self.panes.len();
         let single_pane = pane_count <= 1;
-        let in_flight_suffix = if self.search_in_flight {
+        let in_flight_suffix = if self.search_in_flight || self.search_refining {
             format!(" {} ", self.loading_spinner_glyph())
         } else {
             String::new()
@@ -7127,7 +7243,11 @@ impl CassApp {
                         focus_flash_intensity,
                         query_terms: extract_query_terms(&self.query),
                         query_highlight_style: styles.style(style_system::STYLE_QUERY_HIGHLIGHT),
-                        hovered: self.hovered_result == Some(i),
+                        hovered: self.hovered_result
+                            == Some(HoveredResult {
+                                pane_idx: self.active_pane,
+                                item_idx: i,
+                            }),
                     }
                 })
                 .collect();
@@ -7294,7 +7414,11 @@ impl CassApp {
                         },
                         query_terms: extract_query_terms(&self.query),
                         query_highlight_style: styles.style(style_system::STYLE_QUERY_HIGHLIGHT),
-                        hovered: is_active && self.hovered_result == Some(i),
+                        hovered: self.hovered_result
+                            == Some(HoveredResult {
+                                pane_idx,
+                                item_idx: i,
+                            }),
                     }
                 })
                 .collect();
@@ -11631,6 +11755,8 @@ pub enum CassMsg {
     SearchCompleted {
         /// Monotonic generation id so stale async completions can be ignored.
         generation: u64,
+        pass: SearchPass,
+        requested_limit: usize,
         hits: Vec<SearchHit>,
         elapsed_ms: u128,
         suggestions: Vec<QuerySuggestion>,
@@ -11640,6 +11766,14 @@ pub enum CassMsg {
     },
     /// Search failed with an error message.
     SearchFailed { generation: u64, error: String },
+    /// Refinement failed after initial live results were already displayed.
+    SearchRefinementFailed {
+        generation: u64,
+        latency_ms: u128,
+        error: String,
+    },
+    /// Live progressive stream fully completed or was cancelled.
+    SearchStreamFinished { generation: u64 },
     /// Move cursor within the query string (Left/Right arrow keys).
     CursorMoved { delta: i32 },
     /// Move cursor by word boundary (Ctrl+Left/Right).
@@ -12103,6 +12237,19 @@ pub struct SavedViewDragState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneSplitDragState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoveredResult {
+    pub pane_idx: usize,
+    pub item_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LiveSearchRequest {
+    generation: u64,
+    params: SearchParams,
+    progressive: bool,
+}
+
 /// Mouse event kinds (simplified from crossterm/ftui).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEventKind {
@@ -12128,6 +12275,8 @@ enum MouseHitRegion {
     /// Click/scroll landed in a results pane row.
     /// `pane_idx` is the absolute pane index, `item_idx` is row index inside that pane.
     Results { pane_idx: usize, item_idx: usize },
+    /// Click landed on a pane header/title area.
+    PaneHeader { pane_idx: usize },
     /// Click/scroll landed in the detail pane.
     Detail,
     /// Click on a surface tab in the shell strip.
@@ -12606,17 +12755,43 @@ pub trait SearchService: Send + Sync {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchPass {
+    Interactive,
+    Upgrade,
+    Pagination,
+}
+
 /// Parameters for a search query.
 #[derive(Debug, Clone)]
 pub struct SearchParams {
     pub query: String,
     pub filters: SearchFilters,
+    pub pass: SearchPass,
     pub mode: SearchMode,
     pub match_mode: MatchMode,
     pub ranking: RankingMode,
     pub context_window: ContextWindow,
     pub limit: usize,
     pub offset: usize,
+}
+
+struct CassSearchSubscription {
+    id: SubId,
+    generation: u64,
+    params: SearchParams,
+    service: Arc<TantivySearchService>,
+}
+
+impl Subscription<CassMsg> for CassSearchSubscription {
+    fn id(&self) -> SubId {
+        self.id
+    }
+
+    fn run(&self, sender: std::sync::mpsc::Sender<CassMsg>, stop: StopSignal) {
+        self.service
+            .run_live_search_stream(self.params.clone(), self.generation, sender, stop);
+    }
 }
 
 /// Result returned by [`SearchService::execute`].
@@ -12690,6 +12865,141 @@ impl TantivySearchService {
     fn new(client: Arc<crate::search::query::SearchClient>) -> Self {
         Self { client }
     }
+
+    fn progressive_enabled() -> bool {
+        dotenvy::var("CASS_TUI_TWO_TIER")
+            .ok()
+            .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    }
+
+    fn supports_progressive(&self, params: &SearchParams) -> bool {
+        Self::progressive_enabled()
+            && matches!(params.pass, SearchPass::Interactive)
+            && params.offset == 0
+            && !params.query.trim().is_empty()
+            && matches!(params.mode, SearchMode::Semantic | SearchMode::Hybrid)
+            && self.client.can_progressively_refine()
+    }
+
+    fn run_live_search_stream(
+        &self,
+        params: SearchParams,
+        generation: u64,
+        sender: std::sync::mpsc::Sender<CassMsg>,
+        stop: StopSignal,
+    ) {
+        if !self.supports_progressive(&params) {
+            let message = match self.execute(&params) {
+                Ok(result) => CassMsg::SearchCompleted {
+                    generation,
+                    pass: params.pass,
+                    requested_limit: params.limit,
+                    hits: result.hits,
+                    elapsed_ms: result.elapsed_ms,
+                    suggestions: result.suggestions,
+                    wildcard_fallback: result.wildcard_fallback,
+                    append: matches!(params.pass, SearchPass::Pagination),
+                },
+                Err(error) => CassMsg::SearchFailed { generation, error },
+            };
+            let _ = sender.send(message);
+            let _ = sender.send(CassMsg::SearchStreamFinished { generation });
+            return;
+        }
+
+        let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = sender.send(CassMsg::SearchFailed {
+                    generation,
+                    error: format!("failed to start progressive runtime: {err}"),
+                });
+                let _ = sender.send(CassMsg::SearchStreamFinished { generation });
+                return;
+            }
+        };
+
+        let cx = asupersync::Cx::for_request();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_done = Arc::clone(&done);
+        let cancel_stop = stop.clone();
+        let cancel_cx = cx.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            while !cancel_done.load(std::sync::atomic::Ordering::Relaxed) {
+                if cancel_stop.wait_timeout(Duration::from_millis(10)) {
+                    cancel_cx.cancel_fast(asupersync::CancelKind::RaceLost);
+                    break;
+                }
+            }
+        });
+
+        let client = Arc::clone(&self.client);
+        let live_result = runtime.block_on(async move {
+            client
+                .search_progressive_with_callback(
+                    &cx,
+                    &params.query,
+                    params.filters.clone(),
+                    params.limit,
+                    0,
+                    crate::search::query::FieldMask::new(false, true, true, true),
+                    params.mode,
+                    |event| {
+                        if stop.is_stopped() {
+                            return;
+                        }
+                        let message = match event {
+                            crate::search::query::ProgressiveSearchEvent::Phase {
+                                kind,
+                                result,
+                                elapsed_ms,
+                            } => CassMsg::SearchCompleted {
+                                generation,
+                                pass: match kind {
+                                    crate::search::query::ProgressivePhaseKind::Initial => {
+                                        SearchPass::Interactive
+                                    }
+                                    crate::search::query::ProgressivePhaseKind::Refined => {
+                                        SearchPass::Upgrade
+                                    }
+                                },
+                                requested_limit: params.limit,
+                                hits: result.hits,
+                                elapsed_ms,
+                                suggestions: result.suggestions,
+                                wildcard_fallback: result.wildcard_fallback,
+                                append: false,
+                            },
+                            crate::search::query::ProgressiveSearchEvent::RefinementFailed {
+                                latency_ms,
+                                error,
+                            } => CassMsg::SearchRefinementFailed {
+                                generation,
+                                latency_ms,
+                                error,
+                            },
+                        };
+                        let _ = sender.send(message);
+                    },
+                )
+                .await
+        });
+
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = cancel_thread.join();
+
+        if let Err(err) = live_result
+            && !stop.is_stopped()
+        {
+            let _ = sender.send(CassMsg::SearchFailed {
+                generation,
+                error: err.to_string(),
+            });
+        }
+
+        let _ = sender.send(CassMsg::SearchStreamFinished { generation });
+    }
 }
 
 impl SearchService for TantivySearchService {
@@ -12701,6 +13011,21 @@ impl SearchService for TantivySearchService {
         let started = Instant::now();
         let limit = params.limit;
         let offset = params.offset;
+        let interactive = matches!(params.pass, SearchPass::Interactive);
+        let field_mask = if interactive {
+            FieldMask::new(false, true, true, true)
+        } else {
+            FieldMask::new(true, true, true, true)
+        };
+        let two_tier_enabled = Self::progressive_enabled();
+        let semantic_tier_mode = if two_tier_enabled {
+            match params.pass {
+                SearchPass::Interactive => SemanticTierMode::FastOnly,
+                SearchPass::Upgrade | SearchPass::Pagination => SemanticTierMode::Progressive,
+            }
+        } else {
+            SemanticTierMode::Single
+        };
 
         // Fix #79: Empty queries bypass BM25 and use date-sorted browsing.
         // BM25 relevance scoring is meaningless without search terms, so we
@@ -12709,7 +13034,13 @@ impl SearchService for TantivySearchService {
             let newest_first = !matches!(params.ranking, RankingMode::DateOldest);
             let hits = self
                 .client
-                .browse_by_date(params.filters.clone(), limit, offset, newest_first)
+                .browse_by_date(
+                    params.filters.clone(),
+                    limit,
+                    offset,
+                    newest_first,
+                    field_mask,
+                )
                 .map_err(|e| e.to_string())?;
             return Ok(SearchResult {
                 hits,
@@ -12719,12 +13050,8 @@ impl SearchService for TantivySearchService {
             });
         }
 
-        let sparse_threshold = 3;
-        let field_mask = FieldMask::new(true, true, true, true);
-        let tui_tier_mode = dotenvy::var("CASS_TUI_TWO_TIER")
-            .ok()
-            .filter(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .map_or(SemanticTierMode::Single, |_| SemanticTierMode::Progressive);
+        let sparse_threshold = if interactive { 0 } else { 3 };
+        let requested_mode = params.mode;
 
         let execute_mode = |mode: SearchMode| -> Result<BackendSearchResult, String> {
             match mode {
@@ -12749,7 +13076,7 @@ impl SearchService for TantivySearchService {
                             offset,
                             field_mask,
                             false,
-                            tui_tier_mode,
+                            semantic_tier_mode,
                         )
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
@@ -12762,7 +13089,7 @@ impl SearchService for TantivySearchService {
                 }
                 SearchMode::Hybrid => self
                     .client
-                    .search_hybrid(
+                    .search_hybrid_with_tier(
                         &params.query,
                         &params.query,
                         params.filters.clone(),
@@ -12771,6 +13098,7 @@ impl SearchService for TantivySearchService {
                         sparse_threshold,
                         field_mask,
                         false,
+                        semantic_tier_mode,
                     )
                     .map_err(|e| e.to_string()),
             }
@@ -12778,9 +13106,9 @@ impl SearchService for TantivySearchService {
 
         // Semantic/hybrid modes can be unavailable if embedders are not installed.
         // Fall back to lexical so typing always returns results instead of no-op.
-        let backend = match execute_mode(params.mode) {
+        let backend = match execute_mode(requested_mode) {
             Ok(result) => result,
-            Err(err) if matches!(params.mode, SearchMode::Semantic | SearchMode::Hybrid) => {
+            Err(err) if matches!(requested_mode, SearchMode::Semantic | SearchMode::Hybrid) => {
                 execute_mode(SearchMode::Lexical).map_err(|fallback_err| {
                     format!("search failed ({err}); lexical fallback failed: {fallback_err}")
                 })?
@@ -12798,6 +13126,7 @@ impl SearchService for TantivySearchService {
 }
 
 const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(16);
+const SEARCH_UPGRADE_DELAY: std::time::Duration = std::time::Duration::from_millis(90);
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
 
 /// Minimum distance (in terminal cells) for a drag event to be considered
@@ -13096,6 +13425,21 @@ impl super::ftui_adapter::Model for CassApp {
     fn init(&mut self) -> ftui::Cmd<CassMsg> {
         // Request state load on startup.
         ftui::Cmd::msg(CassMsg::StateLoadRequested)
+    }
+
+    fn subscriptions(&self) -> Vec<Box<dyn Subscription<Self::Message>>> {
+        let Some(request) = self.live_search_request.as_ref() else {
+            return Vec::new();
+        };
+        let Some(service) = self.progressive_search_service.as_ref() else {
+            return Vec::new();
+        };
+        vec![Box::new(CassSearchSubscription {
+            id: Self::progressive_subscription_id(request.generation),
+            generation: request.generation,
+            params: request.params.clone(),
+            service: Arc::clone(service),
+        })]
     }
 
     fn update(&mut self, msg: CassMsg) -> ftui::Cmd<CassMsg> {
@@ -14088,89 +14432,43 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::SearchRequested => {
                 // Clear debounce state so we don't double-fire.
                 self.search_dirty_since = None;
-                // Build search params from current state.
                 let generation = self.search_generation.wrapping_add(1);
-                let params = SearchParams {
-                    query: self.query.clone(),
-                    filters: self.filters.clone(),
-                    mode: self.search_mode,
-                    match_mode: self.match_mode,
-                    ranking: self.ranking_mode,
-                    context_window: self.context_window,
-                    // Unlimited results are implemented via paging (no silent hard cap).
-                    limit: self.search_page_size.max(1),
-                    offset: 0,
-                };
-                // Dispatch async search if a service is available.
-                // Note: empty queries are allowed — the backend handles them
-                // by browsing recent sessions sorted by date (fix #79).
-                if let Some(svc) = self.search_service.clone() {
+                let params = self.build_search_params(SearchPass::Interactive, 0);
+                if let Some(service) = self.progressive_search_service.clone()
+                    && service.supports_progressive(&params)
+                {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
-                    self.search_has_more = true;
+                    self.search_has_more = false;
                     self.search_in_flight = true;
-                    self.status = "Searching\u{2026}".to_string();
+                    self.search_refining = false;
+                    self.live_search_request = Some(LiveSearchRequest {
+                        generation,
+                        params,
+                        progressive: true,
+                    });
+                    self.status = "Searching…".to_string();
                     self.set_loading_context(LoadingContext::Search);
-                    ftui::Cmd::task(move || match svc.execute(&params) {
-                        Ok(result) => CassMsg::SearchCompleted {
-                            generation,
-                            hits: result.hits,
-                            elapsed_ms: result.elapsed_ms,
-                            suggestions: result.suggestions,
-                            wildcard_fallback: result.wildcard_fallback,
-                            append: false,
-                        },
-                        Err(e) => CassMsg::SearchFailed {
-                            generation,
-                            error: e,
-                        },
-                    })
-                } else {
-                    self.search_in_flight = false;
-                    self.clear_loading_context(LoadingContext::Search);
-                    ftui::Cmd::none()
+                    return ftui::Cmd::none();
                 }
+                self.live_search_request = None;
+                self.dispatch_search_pass(generation, SearchPass::Interactive, 0)
             }
             CassMsg::SearchMoreRequested => {
-                if self.search_in_flight || !self.search_has_more {
+                if self.search_in_flight || self.search_refining || !self.search_has_more {
                     return ftui::Cmd::none();
                 }
                 let generation = self.search_generation;
-                let params = SearchParams {
-                    query: self.query.clone(),
-                    filters: self.filters.clone(),
-                    mode: self.search_mode,
-                    match_mode: self.match_mode,
-                    ranking: self.ranking_mode,
-                    context_window: self.context_window,
-                    limit: self.search_page_size.max(1),
-                    offset: self.search_backend_offset,
-                };
-                if let Some(svc) = self.search_service.clone() {
-                    self.search_in_flight = true;
-                    self.status = format!("Loading more\u{2026} ({} loaded)", self.results.len());
-                    self.set_loading_context(LoadingContext::Search);
-                    ftui::Cmd::task(move || match svc.execute(&params) {
-                        Ok(result) => CassMsg::SearchCompleted {
-                            generation,
-                            hits: result.hits,
-                            elapsed_ms: result.elapsed_ms,
-                            suggestions: result.suggestions,
-                            wildcard_fallback: result.wildcard_fallback,
-                            append: true,
-                        },
-                        Err(e) => CassMsg::SearchFailed {
-                            generation,
-                            error: e,
-                        },
-                    })
-                } else {
-                    self.search_in_flight = false;
-                    ftui::Cmd::none()
-                }
+                self.dispatch_search_pass(
+                    generation,
+                    SearchPass::Pagination,
+                    self.search_backend_offset,
+                )
             }
             CassMsg::SearchCompleted {
                 generation,
+                pass,
+                requested_limit,
                 hits,
                 elapsed_ms,
                 suggestions,
@@ -14181,10 +14479,13 @@ impl super::ftui_adapter::Model for CassApp {
                     // Stale async completion from an older query — ignore.
                     return ftui::Cmd::none();
                 }
+                let progressive_initial = matches!(pass, SearchPass::Interactive)
+                    && self.live_request_is_progressive_for(generation);
                 self.search_in_flight = false;
+                self.search_refining = progressive_initial;
                 self.clear_loading_context(LoadingContext::Search);
                 self.last_search_ms = Some(elapsed_ms);
-                let page_size = self.search_page_size.max(1);
+                let page_size = requested_limit.max(1);
                 if append {
                     let backend_returned = hits.len();
                     // Append page results without duplicating hits already loaded.
@@ -14245,16 +14546,30 @@ impl super::ftui_adapter::Model for CassApp {
                     self.open_confirm_armed = false;
                 }
 
-                self.status = format!(
-                    "Loaded {} results in {}ms{}",
-                    self.results.len(),
-                    elapsed_ms,
-                    if self.search_has_more {
-                        " · more available"
-                    } else {
-                        ""
-                    }
-                );
+                self.status = match pass {
+                    SearchPass::Interactive => format!(
+                        "Loaded {} fast results in {}ms{}",
+                        self.results.len(),
+                        elapsed_ms,
+                        if self.search_refining {
+                            " · refining"
+                        } else if self.search_has_more {
+                            " · more available"
+                        } else {
+                            ""
+                        }
+                    ),
+                    SearchPass::Upgrade | SearchPass::Pagination => format!(
+                        "Loaded {} results in {}ms{}",
+                        self.results.len(),
+                        elapsed_ms,
+                        if self.search_has_more {
+                            " · more available"
+                        } else {
+                            ""
+                        }
+                    ),
+                };
                 // Warn on slow searches so users notice latency issues.
                 if elapsed_ms >= 1000 {
                     self.toast_manager.push(
@@ -14274,10 +14589,15 @@ impl super::ftui_adapter::Model for CassApp {
                     self.anim.clear_reveal();
                     self.reveal_anim_start = None;
                 }
-                // Reset scroll to top for new results.
+                // Reset scroll to top for new query results, but preserve the
+                // current selection while refining the same generation.
                 let mut state = self.results_list_state.borrow_mut();
-                state.scroll_to_top();
-                state.select(Some(0));
+                if matches!(pass, SearchPass::Interactive) {
+                    state.scroll_to_top();
+                    state.select(Some(0));
+                } else if let Some(pane) = self.panes.get(self.active_pane) {
+                    state.select(Some(pane.selected));
+                }
                 // If the user typed while the request was in-flight, schedule
                 // the next debounced search now that we're idle again.
                 if let Some(dirty_ts) = self.search_dirty_since {
@@ -14294,6 +14614,14 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::none();
                 }
                 self.search_in_flight = false;
+                self.search_refining = false;
+                if self
+                    .live_search_request
+                    .as_ref()
+                    .is_some_and(|request| request.generation == generation)
+                {
+                    self.live_search_request = None;
+                }
                 self.clear_loading_context(LoadingContext::Search);
                 self.status = format!("Search error: {error}");
                 // If the user typed while the request was in-flight, schedule
@@ -14304,6 +14632,52 @@ impl super::ftui_adapter::Model for CassApp {
                         return ftui::Cmd::msg(CassMsg::SearchRequested);
                     }
                     return ftui::Cmd::tick(SEARCH_DEBOUNCE.saturating_sub(elapsed));
+                }
+                ftui::Cmd::none()
+            }
+            CassMsg::SearchRefinementFailed {
+                generation,
+                latency_ms,
+                error,
+            } => {
+                if generation != self.search_generation {
+                    return ftui::Cmd::none();
+                }
+                self.search_refining = false;
+                self.clear_loading_context(LoadingContext::Search);
+                self.status = format!(
+                    "Loaded {} fast results · refinement failed after {}ms",
+                    self.results.len(),
+                    latency_ms
+                );
+                self.toast_manager.push(
+                    crate::ui::components::toast::Toast::warning(format!(
+                        "Refinement failed: {error}"
+                    ))
+                    .with_id("search_refinement_failed".to_string()),
+                );
+                ftui::Cmd::none()
+            }
+            CassMsg::SearchStreamFinished { generation } => {
+                if generation != self.search_generation {
+                    return ftui::Cmd::none();
+                }
+                self.search_in_flight = false;
+                let was_refining = self.search_refining;
+                self.search_refining = false;
+                self.live_search_request = None;
+                self.clear_loading_context(LoadingContext::Search);
+                if was_refining && self.status.contains("· refining") {
+                    self.status = format!(
+                        "Loaded {} results in {}ms{}",
+                        self.results.len(),
+                        self.last_search_ms.unwrap_or(0),
+                        if self.search_has_more {
+                            " · more available"
+                        } else {
+                            ""
+                        }
+                    );
                 }
                 ftui::Cmd::none()
             }
@@ -14517,6 +14891,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 if self.search_has_more
                     && !self.search_in_flight
+                    && !self.search_refining
                     && self.surface == AppSurface::Search
                     && !self.show_detail_modal
                     && self
@@ -14548,6 +14923,7 @@ impl super::ftui_adapter::Model for CassApp {
                 if to_end
                     && self.search_has_more
                     && !self.search_in_flight
+                    && !self.search_refining
                     && self.surface == AppSurface::Search
                     && !self.show_detail_modal
                 {
@@ -14629,6 +15005,7 @@ impl super::ftui_adapter::Model for CassApp {
                 if delta > 0
                     && self.search_has_more
                     && !self.search_in_flight
+                    && !self.search_refining
                     && self.surface == AppSurface::Search
                     && !self.show_detail_modal
                     && self
@@ -17044,13 +17421,13 @@ impl super::ftui_adapter::Model for CassApp {
                         ftui::Cmd::msg(CassMsg::DetailScrolled { delta: 3 })
                     }
                     // ── Hover in results: track hovered row ─────────
-                    (MouseEventKind::Moved, MouseHitRegion::Results { item_idx, .. }) => {
+                    (MouseEventKind::Moved, MouseHitRegion::Results { pane_idx, item_idx }) => {
                         let hit_count = self
                             .panes
-                            .get(self.active_pane)
+                            .get(pane_idx)
                             .map_or(self.results.len(), |p| p.hits.len());
                         let new_hover = if item_idx < hit_count {
-                            Some(item_idx)
+                            Some(HoveredResult { pane_idx, item_idx })
                         } else {
                             None
                         };
@@ -17063,6 +17440,20 @@ impl super::ftui_adapter::Model for CassApp {
                     (MouseEventKind::Moved, _) => {
                         if self.hovered_result.is_some() {
                             self.hovered_result = None;
+                        }
+                        ftui::Cmd::none()
+                    }
+                    // ── Click pane header: focus/switch pane only ─────
+                    (MouseEventKind::LeftClick, MouseHitRegion::PaneHeader { pane_idx }) => {
+                        if pane_idx < self.panes.len() {
+                            self.active_pane = pane_idx;
+                            if let Some(pane) = self.panes.get(self.active_pane) {
+                                self.results_list_state
+                                    .borrow_mut()
+                                    .select(Some(pane.selected));
+                            }
+                            self.adjust_pane_scroll_offset();
+                            self.enter_results_navigation_context();
                         }
                         ftui::Cmd::none()
                     }
@@ -17133,33 +17524,25 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // ── Click in detail: focus detail pane ──────────
                     (MouseEventKind::LeftClick, MouseHitRegion::Detail) => {
-                        if self.focused_region() != FocusRegion::Detail {
-                            ftui::Cmd::msg(CassMsg::FocusToggled)
-                        } else {
-                            ftui::Cmd::none()
-                        }
+                        self.enter_detail_focus_context();
+                        ftui::Cmd::none()
                     }
                     // ── Click on surface tab: switch surfaces ──
-                    (MouseEventKind::LeftClick, MouseHitRegion::Tab { surface }) => {
-                        match surface {
-                            AppSurface::Search => {
-                                if self.surface != AppSurface::Search {
-                                    ftui::Cmd::msg(CassMsg::ViewStackPopped)
-                                } else {
-                                    ftui::Cmd::none()
-                                }
+                    (MouseEventKind::LeftClick, MouseHitRegion::Tab { surface }) => match surface {
+                        AppSurface::Search => {
+                            if self.surface != AppSurface::Search {
+                                ftui::Cmd::msg(CassMsg::ViewStackPopped)
+                            } else {
+                                ftui::Cmd::none()
                             }
-                            AppSurface::Analytics => ftui::Cmd::msg(CassMsg::AnalyticsEntered),
-                            AppSurface::Sources => ftui::Cmd::msg(CassMsg::SourcesEntered),
                         }
-                    }
-                    // ── Click in search bar: focus results (query) ──
+                        AppSurface::Analytics => ftui::Cmd::msg(CassMsg::AnalyticsEntered),
+                        AppSurface::Sources => ftui::Cmd::msg(CassMsg::SourcesEntered),
+                    },
+                    // ── Click in search bar: enter query editing ───────
                     (MouseEventKind::LeftClick, MouseHitRegion::SearchBar) => {
-                        if self.focused_region() != FocusRegion::Results {
-                            ftui::Cmd::msg(CassMsg::FocusToggled)
-                        } else {
-                            ftui::Cmd::none()
-                        }
+                        self.enter_query_input_context();
+                        ftui::Cmd::none()
                     }
                     // ── Scroll outside tracked regions: default to results
                     (MouseEventKind::ScrollUp, _) => {
@@ -17218,15 +17601,14 @@ impl super::ftui_adapter::Model for CassApp {
                                     ) {
                                         Ok(status) => {
                                             let has_messages = status.coverage.total_messages > 0;
-                                            let needs_rebuild = status
-                                                .recommended_action
-                                                .starts_with("rebuild")
-                                                || status.drift.signals.iter().any(|signal| {
-                                                    matches!(
-                                                        signal.signal.as_str(),
-                                                        "missing_rollups" | "no_analytics_data"
-                                                    )
-                                                });
+                                            let needs_rebuild =
+                                                status.recommended_action.starts_with("rebuild")
+                                                    || status.drift.signals.iter().any(|signal| {
+                                                        matches!(
+                                                            signal.signal.as_str(),
+                                                            "missing_rollups" | "no_analytics_data"
+                                                        )
+                                                    });
                                             tracing::debug!(
                                                 has_messages,
                                                 needs_rebuild,
@@ -19810,8 +20192,44 @@ pub fn run_tui_ftui(
             },
         ) {
             Ok(Some(client)) => {
-                let service = TantivySearchService::new(Arc::new(client));
-                Some(Arc::new(service))
+                use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+                use crate::search::model_manager::{
+                    load_hash_semantic_context, load_semantic_context,
+                };
+
+                let client = Arc::new(client);
+                let prefer_hash = EmbedderRegistry::new(&data_dir).best_available().name
+                    == HASH_EMBEDDER;
+                let setup = if prefer_hash {
+                    load_hash_semantic_context(&data_dir, &model.db_path)
+                } else {
+                    load_semantic_context(&data_dir, &model.db_path)
+                };
+                model.semantic_availability = setup.availability.clone();
+
+                if let Some(context) = setup.context {
+                    let ann_path = Some(
+                        data_dir
+                            .join(crate::search::vector_index::VECTOR_INDEX_DIR)
+                            .join(format!("hnsw-{}.chsw", context.embedder.id())),
+                    );
+                    if let Err(err) = client.set_semantic_context(
+                        context.embedder,
+                        context.index,
+                        context.filter_maps,
+                        context.roles,
+                        ann_path,
+                    ) {
+                        tracing::debug!(error = %err, "tui semantic context unavailable");
+                        let _ = client.clear_semantic_context();
+                    }
+                } else {
+                    let _ = client.clear_semantic_context();
+                }
+
+                let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
+                model.progressive_search_service = Some(Arc::clone(&service));
+                Some(service as Arc<dyn SearchService>)
             }
             Ok(None) => {
                 if model.status.is_empty() {
@@ -22492,6 +22910,8 @@ mod tests {
         ];
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
             hits,
             elapsed_ms: 42,
             suggestions: vec![],
@@ -23261,6 +23681,49 @@ mod tests {
     }
 
     #[test]
+    fn search_requested_uses_interactive_pass_budget() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct FixtureSearch {
+            params: Mutex<Vec<SearchParams>>,
+        }
+
+        impl SearchService for FixtureSearch {
+            fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
+                self.params
+                    .lock()
+                    .expect("fixture params lock")
+                    .push(params.clone());
+                Ok(SearchResult {
+                    hits: vec![],
+                    elapsed_ms: 5,
+                    suggestions: vec![],
+                    wildcard_fallback: false,
+                })
+            }
+        }
+
+        let fixture = Arc::new(FixtureSearch::default());
+        let mut app = app_with_hits(32);
+        app.search_page_size = 250;
+        app.query = "auth".to_string();
+        app.search_service = Some(fixture.clone());
+
+        let _ = app.update(CassMsg::SearchRequested);
+
+        let recorded = fixture.params.lock().expect("fixture params lock");
+        assert_eq!(recorded.len(), 0, "task should not run inline in unit test");
+        let live_limit = app.interactive_search_limit();
+        assert!(live_limit < app.search_page_size);
+        let debug = format!(
+            "{:?}",
+            app.dispatch_search_pass(app.search_generation, SearchPass::Interactive, 0)
+        );
+        assert!(debug.contains("Task"));
+    }
+
+    #[test]
     fn search_requested_noop_without_service() {
         let mut app = CassApp::default();
         app.query = "test query".to_string();
@@ -23281,6 +23744,8 @@ mod tests {
 
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
             hits: vec![],
             elapsed_ms: 1,
             suggestions: vec![],
@@ -23295,6 +23760,71 @@ mod tests {
             error: "boom".into(),
         });
         assert!(app.loading_context.is_none());
+    }
+
+    #[test]
+    fn interactive_search_completion_schedules_upgrade() {
+        let mut app = CassApp::default();
+        app.query = "semantic".to_string();
+        app.search_mode = SearchMode::Semantic;
+        app.search_page_size = 250;
+
+        let cmd = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Interactive,
+            requested_limit: app.interactive_search_limit(),
+            hits: vec![],
+            elapsed_ms: 3,
+            suggestions: vec![],
+            wildcard_fallback: false,
+            append: false,
+        });
+
+        let debug = format!("{cmd:?}");
+        assert!(
+            debug.contains("Task"),
+            "interactive completion should defer an upgrade task, got: {debug}"
+        );
+        assert!(app.status.contains("fast results"));
+    }
+
+    #[test]
+    fn lexical_interactive_completion_does_not_schedule_upgrade() {
+        let mut app = CassApp::default();
+        app.query = "lexical".to_string();
+        app.search_mode = SearchMode::Lexical;
+        app.search_page_size = 250;
+
+        let cmd = app.update(CassMsg::SearchCompleted {
+            generation: app.search_generation,
+            pass: SearchPass::Interactive,
+            requested_limit: app.interactive_search_limit(),
+            hits: vec![],
+            elapsed_ms: 3,
+            suggestions: vec![],
+            wildcard_fallback: false,
+            append: false,
+        });
+
+        assert!(
+            !format!("{cmd:?}").contains("Task"),
+            "lexical interactive completion should not schedule a refinement task"
+        );
+    }
+
+    #[test]
+    fn upgrade_scheduling_is_limited_to_semantic_modes() {
+        let mut app = CassApp::default();
+        app.query = "auth".to_string();
+
+        app.search_mode = SearchMode::Lexical;
+        assert!(!app.should_schedule_search_upgrade());
+
+        app.search_mode = SearchMode::Semantic;
+        assert!(app.should_schedule_search_upgrade());
+
+        app.search_mode = SearchMode::Hybrid;
+        assert!(app.should_schedule_search_upgrade());
     }
 
     // ==================== VirtualizedList integration tests ====================
@@ -23466,6 +23996,8 @@ mod tests {
         }];
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
             hits,
             elapsed_ms: 10,
             suggestions: vec![],
@@ -29282,25 +29814,26 @@ mod tests {
     fn mouse_click_in_detail_focuses_detail() {
         use ftui::Model;
         let mut app = app_with_hits(5);
+        app.focus_manager.focus(focus_ids::SEARCH_BAR);
         render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
 
-        assert_eq!(app.focused_region(), FocusRegion::Results);
         let detail = app.last_detail_area.borrow().unwrap();
         let cmd = app.update(CassMsg::MouseEvent {
             kind: MouseEventKind::LeftClick,
             x: detail.x + 1,
             y: detail.y + 1,
         });
-        assert!(
-            !matches!(cmd, ftui::Cmd::None),
-            "click in detail should emit FocusToggled"
-        );
+        assert!(matches!(cmd, ftui::Cmd::None));
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::DETAIL_PANE));
+        assert_eq!(app.focused_region(), FocusRegion::Detail);
     }
 
     #[test]
-    fn mouse_click_in_search_bar_focuses_results() {
+    fn mouse_click_in_search_bar_enters_query_context() {
         use ftui::Model;
         let mut app = app_with_hits(5);
+        app.input_mode = InputMode::Agent;
+        app.input_buffer = "codex".to_string();
         app.focus_manager.focus(focus_ids::DETAIL_PANE);
         render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
 
@@ -29310,10 +29843,11 @@ mod tests {
             x: search.x + 1,
             y: search.y,
         });
-        assert!(
-            !matches!(cmd, ftui::Cmd::None),
-            "click in search bar should emit FocusToggled"
-        );
+        assert!(matches!(cmd, ftui::Cmd::None));
+        assert_eq!(app.focus_manager.current(), Some(focus_ids::SEARCH_BAR));
+        assert_eq!(app.input_mode, InputMode::Query);
+        assert!(app.input_buffer.is_empty());
+        assert_eq!(app.cursor_pos, app.query.len());
     }
 
     #[test]
@@ -33499,6 +34033,8 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             .collect();
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
             hits,
             elapsed_ms: 7,
             suggestions: Vec::new(),
@@ -33530,6 +34066,8 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             .collect();
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
+            pass: SearchPass::Upgrade,
+            requested_limit: app.search_page_size.max(1),
             hits,
             elapsed_ms: 6,
             suggestions: Vec::new(),
