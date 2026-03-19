@@ -7433,17 +7433,20 @@ impl CassApp {
             vec![ftui::text::Span::styled(" ", label_style)];
         let mut line2_width: usize = 1; // leading space
         let max_chip_width = inner_width as usize;
+        let mut chip_count = 0usize;
         let mut push_chip = |key: &str, value: String, value_style_chip: ftui::Style| {
-            let chip_w = display_width(key) + display_width(&value) + 4; // "[" + key + ":" + value + "] "
+            let sep_w = if chip_count == 0 { 0 } else { 3 }; // " · "
+            let chip_w = display_width(key) + display_width(&value) + 1 + sep_w; // "key:" + value
             if line2_width + chip_w > max_chip_width {
                 return;
             }
+            if chip_count > 0 {
+                line2_spans.push(ftui::text::Span::styled(" \u{00b7} ", label_style));
+            }
             line2_width += chip_w;
-            line2_spans.push(ftui::text::Span::styled("[", label_style));
-            line2_spans.push(ftui::text::Span::styled(key.to_string(), label_style));
-            line2_spans.push(ftui::text::Span::styled(":", label_style));
+            line2_spans.push(ftui::text::Span::styled(format!("{key}:"), label_style));
             line2_spans.push(ftui::text::Span::styled(value, value_style_chip));
-            line2_spans.push(ftui::text::Span::styled("] ", label_style));
+            chip_count += 1;
         };
 
         let mut sparkline_data: Option<(String, usize)> = None;
@@ -10438,7 +10441,7 @@ impl CassApp {
                     shortcuts::EXPORT_MARKDOWN
                 ),
                 format!(
-                    "{}/Alt+H toggle this help; {} quit (or back from detail)",
+                    "{}/Alt+? toggle this help; {} quit (or back from detail)",
                     shortcuts::HELP,
                     shortcuts::QUIT
                 ),
@@ -10537,12 +10540,12 @@ impl CassApp {
             if self.help_pinned {
                 format!("Quick Start & Shortcuts (pinned) [{pct}%]")
             } else {
-                format!("Quick Start & Shortcuts (F1 or Alt+H) [{pct}%]")
+                format!("Quick Start & Shortcuts (F1 or Alt+?) [{pct}%]")
             }
         } else if self.help_pinned {
             "Quick Start & Shortcuts (pinned)".to_string()
         } else {
-            "Quick Start & Shortcuts (F1 or Alt+H)".to_string()
+            "Quick Start & Shortcuts (F1 or Alt+?)".to_string()
         };
         let outer = Block::new()
             .borders(Borders::ALL)
@@ -12817,8 +12820,7 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                     // -- Help -----------------------------------------------------
                     KeyCode::F(1) => CassMsg::HelpToggled,
-                    KeyCode::Char('h') if alt => CassMsg::HelpToggled,
-                    KeyCode::Char('H') if alt => CassMsg::HelpToggled,
+                    KeyCode::Char('?') if alt => CassMsg::HelpToggled,
 
                     // -- Theme ----------------------------------------------------
                     KeyCode::F(2) if shift => CassMsg::ThemePreviousToggled,
@@ -20733,10 +20735,10 @@ mod tests {
     }
 
     #[test]
-    fn event_mapping_alt_h_maps_to_help_toggled() {
+    fn event_mapping_alt_question_maps_to_help_toggled() {
         use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
 
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('h')).with_modifiers(Modifiers::ALT));
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('?')).with_modifiers(Modifiers::ALT));
 
         assert!(matches!(CassMsg::from(event), CassMsg::HelpToggled));
     }

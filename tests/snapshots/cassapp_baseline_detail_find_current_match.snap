@@ -1,7 +1,7 @@
 ╭ Detail · Messages ↩ ─────────────────────────────────────────────────────────────────────────╮
 │  ▐Messages▌  │  Snippets  │  Raw  │  Json  │  Analytics  │  Export                           │
 │ agent ✓ aider · ws /workspace/cass · src ⇄ ci-linux · score 0.640 (6.4/10) · mt suffix       │
-│ [at:2023-11-14 22:13] [dur:2m 0s] [msgs:2 msgs] [mix:u:1 a:1 t:0 s:0]                        │
+│ at:2023-11-14 22:13 · dur:2m 0s · msgs:2 msgs · mix:u:1 a:1 t:0 s:0                          │
 │ activity █                                                          █  2 msgs                │
 │────────────────────────────────────────────────────────────────────────────────────────────  │
 │Large-snippet rendering edge case                                                             │
