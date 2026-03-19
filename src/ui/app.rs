@@ -102,7 +102,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ftui::runtime::input_macro::{MacroPlayback, MacroRecorder};
@@ -1591,6 +1591,446 @@ impl FrameTimingStats {
     pub fn last_us(&self) -> u64 {
         self.frame_times_us.back().copied().unwrap_or(0)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TuiLatencyPhase {
+    Initial,
+    Refined,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTuiLatencySample {
+    generation: u64,
+    query: String,
+    query_len: usize,
+    progressive: bool,
+    requested_limit: usize,
+    input_started_at: Option<Instant>,
+    requested_at: Instant,
+    initial_backend_elapsed_ms: Option<u128>,
+    initial_results_count: Option<usize>,
+    initial_results_applied_at: Option<Instant>,
+    initial_frame_rendered_at: Option<Instant>,
+    initial_visible_superseded_by_refined: bool,
+    refined_backend_elapsed_ms: Option<u128>,
+    refined_results_count: Option<usize>,
+    refined_results_applied_at: Option<Instant>,
+    refined_frame_rendered_at: Option<Instant>,
+    first_visible_phase: Option<TuiLatencyPhase>,
+    first_visible_at: Option<Instant>,
+    refinement_failed_latency_ms: Option<u128>,
+    refinement_failed_at: Option<Instant>,
+    refinement_error: Option<String>,
+    search_failed_at: Option<Instant>,
+    search_error: Option<String>,
+    stream_finished_at: Option<Instant>,
+    superseded_by_generation: Option<u64>,
+}
+
+impl PendingTuiLatencySample {
+    fn new(
+        generation: u64,
+        query: String,
+        progressive: bool,
+        requested_limit: usize,
+        input_started_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            generation,
+            query_len: query.chars().count(),
+            query,
+            progressive,
+            requested_limit,
+            input_started_at,
+            requested_at: Instant::now(),
+            initial_backend_elapsed_ms: None,
+            initial_results_count: None,
+            initial_results_applied_at: None,
+            initial_frame_rendered_at: None,
+            initial_visible_superseded_by_refined: false,
+            refined_backend_elapsed_ms: None,
+            refined_results_count: None,
+            refined_results_applied_at: None,
+            refined_frame_rendered_at: None,
+            first_visible_phase: None,
+            first_visible_at: None,
+            refinement_failed_latency_ms: None,
+            refinement_failed_at: None,
+            refinement_error: None,
+            search_failed_at: None,
+            search_error: None,
+            stream_finished_at: None,
+            superseded_by_generation: None,
+        }
+    }
+
+    fn has_pending_frame(&self) -> bool {
+        let initial_pending = self.initial_results_applied_at.is_some()
+            && self.initial_frame_rendered_at.is_none()
+            && !self.initial_visible_superseded_by_refined;
+        let refined_pending =
+            self.refined_results_applied_at.is_some() && self.refined_frame_rendered_at.is_none();
+        initial_pending || refined_pending
+    }
+
+    fn finalize(self, completed: bool) -> TuiLatencySample {
+        let input_to_request_us =
+            micros_between_optional(self.input_started_at, Some(self.requested_at));
+        let request_to_initial_apply_us =
+            micros_between(self.requested_at, self.initial_results_applied_at);
+        let input_to_initial_apply_us =
+            micros_between_optional(self.input_started_at, self.initial_results_applied_at);
+        let request_to_initial_visible_us =
+            micros_between(self.requested_at, self.initial_frame_rendered_at);
+        let input_to_initial_visible_us =
+            micros_between_optional(self.input_started_at, self.initial_frame_rendered_at);
+        let request_to_refined_apply_us =
+            micros_between(self.requested_at, self.refined_results_applied_at);
+        let input_to_refined_apply_us =
+            micros_between_optional(self.input_started_at, self.refined_results_applied_at);
+        let request_to_refined_visible_us =
+            micros_between(self.requested_at, self.refined_frame_rendered_at);
+        let input_to_refined_visible_us =
+            micros_between_optional(self.input_started_at, self.refined_frame_rendered_at);
+        let request_to_first_visible_us = micros_between(self.requested_at, self.first_visible_at);
+        let input_to_first_visible_us =
+            micros_between_optional(self.input_started_at, self.first_visible_at);
+        let request_to_stream_finished_us =
+            micros_between(self.requested_at, self.stream_finished_at);
+
+        TuiLatencySample {
+            generation: self.generation,
+            query: self.query,
+            query_len: self.query_len,
+            progressive: self.progressive,
+            requested_limit: self.requested_limit,
+            completed,
+            superseded_by_generation: self.superseded_by_generation,
+            first_visible_phase: self.first_visible_phase,
+            input_to_request_us,
+            request_to_initial_apply_us,
+            input_to_initial_apply_us,
+            initial_backend_elapsed_ms: self.initial_backend_elapsed_ms,
+            initial_results_count: self.initial_results_count,
+            request_to_initial_visible_us,
+            input_to_initial_visible_us,
+            initial_visible_superseded_by_refined: self.initial_visible_superseded_by_refined,
+            request_to_refined_apply_us,
+            input_to_refined_apply_us,
+            refined_backend_elapsed_ms: self.refined_backend_elapsed_ms,
+            refined_results_count: self.refined_results_count,
+            request_to_refined_visible_us,
+            input_to_refined_visible_us,
+            request_to_first_visible_us,
+            input_to_first_visible_us,
+            refinement_failed_latency_ms: self.refinement_failed_latency_ms,
+            refinement_error: self.refinement_error,
+            search_error: self.search_error,
+            request_to_stream_finished_us,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TuiLatencySample {
+    generation: u64,
+    query: String,
+    query_len: usize,
+    progressive: bool,
+    requested_limit: usize,
+    completed: bool,
+    superseded_by_generation: Option<u64>,
+    first_visible_phase: Option<TuiLatencyPhase>,
+    input_to_request_us: Option<u64>,
+    request_to_initial_apply_us: Option<u64>,
+    input_to_initial_apply_us: Option<u64>,
+    initial_backend_elapsed_ms: Option<u128>,
+    initial_results_count: Option<usize>,
+    request_to_initial_visible_us: Option<u64>,
+    input_to_initial_visible_us: Option<u64>,
+    initial_visible_superseded_by_refined: bool,
+    request_to_refined_apply_us: Option<u64>,
+    input_to_refined_apply_us: Option<u64>,
+    refined_backend_elapsed_ms: Option<u128>,
+    refined_results_count: Option<usize>,
+    request_to_refined_visible_us: Option<u64>,
+    input_to_refined_visible_us: Option<u64>,
+    request_to_first_visible_us: Option<u64>,
+    input_to_first_visible_us: Option<u64>,
+    refinement_failed_latency_ms: Option<u128>,
+    refinement_error: Option<String>,
+    search_error: Option<String>,
+    request_to_stream_finished_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TuiLatencyTraceReport {
+    schema_version: u8,
+    samples: Vec<TuiLatencySample>,
+}
+
+#[derive(Debug)]
+struct TuiLatencyRecorder {
+    output_path: PathBuf,
+    active: HashMap<u64, PendingTuiLatencySample>,
+    completed: Vec<TuiLatencySample>,
+}
+
+impl TuiLatencyRecorder {
+    fn new(output_path: PathBuf) -> Self {
+        Self {
+            output_path,
+            active: HashMap::new(),
+            completed: Vec::new(),
+        }
+    }
+
+    fn begin_search(
+        &mut self,
+        generation: u64,
+        query: String,
+        progressive: bool,
+        requested_limit: usize,
+        input_started_at: Option<Instant>,
+    ) {
+        self.finalize_superseded(generation);
+        self.active.insert(
+            generation,
+            PendingTuiLatencySample::new(
+                generation,
+                query,
+                progressive,
+                requested_limit,
+                input_started_at,
+            ),
+        );
+    }
+
+    fn note_results_applied(
+        &mut self,
+        generation: u64,
+        pass: SearchPass,
+        elapsed_ms: u128,
+        results_count: usize,
+    ) {
+        let now = Instant::now();
+        let Some(sample) = self.active.get_mut(&generation) else {
+            return;
+        };
+        match pass {
+            SearchPass::Interactive => {
+                sample.initial_backend_elapsed_ms = Some(elapsed_ms);
+                sample.initial_results_count = Some(results_count);
+                sample.initial_results_applied_at = Some(now);
+                if !sample.progressive {
+                    sample.stream_finished_at.get_or_insert(now);
+                }
+            }
+            SearchPass::Upgrade => {
+                if sample.initial_results_applied_at.is_some()
+                    && sample.initial_frame_rendered_at.is_none()
+                {
+                    sample.initial_visible_superseded_by_refined = true;
+                }
+                sample.refined_backend_elapsed_ms = Some(elapsed_ms);
+                sample.refined_results_count = Some(results_count);
+                sample.refined_results_applied_at = Some(now);
+            }
+            SearchPass::Pagination => {}
+        }
+        self.maybe_finalize(generation);
+    }
+
+    fn note_refinement_failed(&mut self, generation: u64, latency_ms: u128, error: String) {
+        let Some(sample) = self.active.get_mut(&generation) else {
+            return;
+        };
+        sample.refinement_failed_latency_ms = Some(latency_ms);
+        sample.refinement_failed_at = Some(Instant::now());
+        sample.refinement_error = Some(error);
+        self.maybe_finalize(generation);
+    }
+
+    fn note_search_failed(&mut self, generation: u64, error: String) {
+        let Some(sample) = self.active.get_mut(&generation) else {
+            return;
+        };
+        let now = Instant::now();
+        sample.search_failed_at = Some(now);
+        sample.search_error = Some(error);
+        sample.stream_finished_at.get_or_insert(now);
+        self.maybe_finalize(generation);
+    }
+
+    fn note_stream_finished(&mut self, generation: u64) {
+        let Some(sample) = self.active.get_mut(&generation) else {
+            return;
+        };
+        sample.stream_finished_at = Some(Instant::now());
+        self.maybe_finalize(generation);
+    }
+
+    fn note_frame_rendered(&mut self, generation: u64) {
+        let now = Instant::now();
+        let Some(sample) = self.active.get_mut(&generation) else {
+            return;
+        };
+        if sample.refined_results_applied_at.is_some() && sample.refined_frame_rendered_at.is_none()
+        {
+            if sample.initial_results_applied_at.is_some()
+                && sample.initial_frame_rendered_at.is_none()
+            {
+                sample.initial_visible_superseded_by_refined = true;
+            }
+            sample.refined_frame_rendered_at = Some(now);
+            if sample.first_visible_at.is_none() {
+                sample.first_visible_phase = Some(TuiLatencyPhase::Refined);
+                sample.first_visible_at = Some(now);
+            }
+            self.maybe_finalize(generation);
+            return;
+        }
+
+        if sample.initial_results_applied_at.is_some()
+            && sample.initial_frame_rendered_at.is_none()
+            && !sample.initial_visible_superseded_by_refined
+        {
+            sample.initial_frame_rendered_at = Some(now);
+            if sample.first_visible_at.is_none() {
+                sample.first_visible_phase = Some(TuiLatencyPhase::Initial);
+                sample.first_visible_at = Some(now);
+            }
+        }
+        self.maybe_finalize(generation);
+    }
+
+    fn flush(&mut self) -> anyhow::Result<()> {
+        self.finalize_all();
+        if let Some(parent) = self.output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let report = TuiLatencyTraceReport {
+            schema_version: 1,
+            samples: std::mem::take(&mut self.completed),
+        };
+        let payload = serde_json::to_vec_pretty(&report)?;
+        std::fs::write(&self.output_path, payload)?;
+        Ok(())
+    }
+
+    fn finalize_superseded(&mut self, next_generation: u64) {
+        let stale_generations: Vec<u64> = self
+            .active
+            .keys()
+            .copied()
+            .filter(|generation| *generation < next_generation)
+            .collect();
+        for generation in stale_generations {
+            if let Some(mut sample) = self.active.remove(&generation) {
+                sample.superseded_by_generation = Some(next_generation);
+                let completed = sample.first_visible_at.is_some()
+                    || sample.search_failed_at.is_some()
+                    || sample.stream_finished_at.is_some();
+                self.completed.push(sample.finalize(completed));
+            }
+        }
+    }
+
+    fn finalize_all(&mut self) {
+        let generations: Vec<u64> = self.active.keys().copied().collect();
+        for generation in generations {
+            if let Some(sample) = self.active.remove(&generation) {
+                let completed = sample.first_visible_at.is_some()
+                    || sample.search_failed_at.is_some()
+                    || sample.stream_finished_at.is_some();
+                self.completed.push(sample.finalize(completed));
+            }
+        }
+    }
+
+    fn maybe_finalize(&mut self, generation: u64) {
+        let should_finalize = self.active.get(&generation).is_some_and(|sample| {
+            sample.stream_finished_at.is_some() && !sample.has_pending_frame()
+        });
+        if should_finalize && let Some(sample) = self.active.remove(&generation) {
+            self.completed.push(sample.finalize(true));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tui_latency_recorder_tests {
+    use super::*;
+
+    #[test]
+    fn recorder_captures_initial_visible_latency() {
+        let mut recorder = TuiLatencyRecorder::new(PathBuf::from("trace.json"));
+        recorder.begin_search(
+            1,
+            "hello".to_string(),
+            true,
+            12,
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+        recorder.note_results_applied(1, SearchPass::Interactive, 4, 7);
+        recorder.note_frame_rendered(1);
+        recorder.note_stream_finished(1);
+
+        assert_eq!(recorder.completed.len(), 1);
+        let sample = &recorder.completed[0];
+        assert_eq!(sample.first_visible_phase, Some(TuiLatencyPhase::Initial));
+        assert!(sample.input_to_first_visible_us.is_some());
+        assert!(sample.request_to_initial_visible_us.is_some());
+        assert_eq!(sample.initial_results_count, Some(7));
+    }
+
+    #[test]
+    fn recorder_marks_initial_phase_as_superseded_when_refined_wins_first_frame() {
+        let mut recorder = TuiLatencyRecorder::new(PathBuf::from("trace.json"));
+        recorder.begin_search(
+            1,
+            "hel".to_string(),
+            true,
+            12,
+            Some(Instant::now() - Duration::from_millis(10)),
+        );
+        recorder.note_results_applied(1, SearchPass::Interactive, 3, 8);
+        recorder.note_results_applied(1, SearchPass::Upgrade, 6, 8);
+        recorder.note_stream_finished(1);
+        recorder.note_frame_rendered(1);
+
+        assert_eq!(recorder.completed.len(), 1);
+        let sample = &recorder.completed[0];
+        assert_eq!(sample.first_visible_phase, Some(TuiLatencyPhase::Refined));
+        assert!(sample.initial_visible_superseded_by_refined);
+        assert!(sample.input_to_initial_visible_us.is_none());
+        assert!(sample.input_to_refined_visible_us.is_some());
+    }
+}
+
+fn micros_between(start: Instant, end: Option<Instant>) -> Option<u64> {
+    end.map(|end_at| end_at.duration_since(start).as_micros() as u64)
+}
+
+fn micros_between_optional(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    Some(end?.duration_since(start?).as_micros() as u64)
+}
+
+fn latency_trace_recorder_from_env() -> anyhow::Result<Option<Arc<Mutex<TuiLatencyRecorder>>>> {
+    let Some(path) = dotenvy::var("CASS_TUI_LATENCY_TRACE_FILE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(Mutex::new(TuiLatencyRecorder::new(
+        PathBuf::from(path),
+    )))))
 }
 
 // ---------------------------------------------------------------------------
@@ -4210,6 +4650,8 @@ pub struct CassApp {
     pub macro_playback: Option<MacroPlayback>,
     /// Whether to redact absolute paths when saving macros.
     pub macro_redact_paths: bool,
+    /// Optional end-to-end latency recorder for live search measurements.
+    latency_trace: Option<Arc<Mutex<TuiLatencyRecorder>>>,
 
     // -- Inspector / debug overlays ---------------------------------------
     /// Whether the inspector overlay is visible.
@@ -4412,6 +4854,7 @@ impl Default for CassApp {
             macro_recorder: None,
             macro_playback: None,
             macro_redact_paths: false,
+            latency_trace: None,
             show_inspector: false,
             inspector_tab: InspectorTab::default(),
             inspector_state: InspectorState::default(),
@@ -5589,6 +6032,78 @@ impl CassApp {
         self.live_search_request
             .as_ref()
             .is_some_and(|request| request.generation == generation && request.progressive)
+    }
+
+    fn trace_search_requested(
+        &self,
+        generation: u64,
+        query: String,
+        progressive: bool,
+        requested_limit: usize,
+    ) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.begin_search(
+                generation,
+                query,
+                progressive,
+                requested_limit,
+                self.search_dirty_since,
+            );
+        }
+    }
+
+    fn trace_search_results_applied(
+        &self,
+        generation: u64,
+        pass: SearchPass,
+        elapsed_ms: u128,
+        results_count: usize,
+    ) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.note_results_applied(generation, pass, elapsed_ms, results_count);
+        }
+    }
+
+    fn trace_search_failed(&self, generation: u64, error: &str) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.note_search_failed(generation, error.to_string());
+        }
+    }
+
+    fn trace_search_refinement_failed(&self, generation: u64, latency_ms: u128, error: &str) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.note_refinement_failed(generation, latency_ms, error.to_string());
+        }
+    }
+
+    fn trace_search_stream_finished(&self, generation: u64) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.note_stream_finished(generation);
+        }
+    }
+
+    fn trace_search_frame_rendered(&self) {
+        let Some(recorder) = self.latency_trace.as_ref() else {
+            return;
+        };
+        if let Ok(mut trace) = recorder.lock() {
+            trace.note_frame_rendered(self.search_generation);
+        }
     }
 
     fn split_content_area(
@@ -14497,11 +15012,21 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::SearchRequested => {
                 // Clear debounce state so we don't double-fire.
-                self.search_dirty_since = None;
                 let generation = self.search_generation.wrapping_add(1);
                 let params = self.build_search_params(SearchPass::Interactive, 0);
+                let progressive = self
+                    .progressive_search_service
+                    .as_ref()
+                    .is_some_and(|service| service.supports_progressive(&params));
+                self.trace_search_requested(
+                    generation,
+                    params.query.clone(),
+                    progressive,
+                    params.limit,
+                );
+                self.search_dirty_since = None;
                 if let Some(service) = self.progressive_search_service.clone()
-                    && service.supports_progressive(&params)
+                    && progressive
                 {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
@@ -14572,6 +15097,12 @@ impl super::ftui_adapter::Model for CassApp {
                         self.search_has_more = false;
                     }
                     self.regroup_panes();
+                    self.trace_search_results_applied(
+                        generation,
+                        pass,
+                        elapsed_ms,
+                        self.results.len(),
+                    );
                     self.status = format!(
                         "Loaded {} (+{added}) results · last page {}ms{}",
                         self.results.len(),
@@ -14602,6 +15133,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.search_backend_offset = self.results.len();
                 self.search_has_more = self.results.len() >= page_size;
                 self.regroup_panes();
+                self.trace_search_results_applied(generation, pass, elapsed_ms, self.results.len());
 
                 // Keep selection stable across reranking by retaining only keys that
                 // still exist in the new result set.
@@ -14681,6 +15213,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.search_in_flight = false;
                 self.search_refining = false;
+                self.trace_search_failed(generation, &error);
                 if self
                     .live_search_request
                     .as_ref()
@@ -14711,6 +15244,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.search_refining = false;
                 self.clear_loading_context(LoadingContext::Search);
+                self.trace_search_refinement_failed(generation, latency_ms, &error);
                 self.status = format!(
                     "Loaded {} fast results · refinement failed after {}ms",
                     self.results.len(),
@@ -14733,6 +15267,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.search_refining = false;
                 self.live_search_request = None;
                 self.clear_loading_context(LoadingContext::Search);
+                self.trace_search_stream_finished(generation);
                 if was_refining && self.status.contains("· refining") {
                     self.status = format!(
                         "Loaded {} results in {}ms{}",
@@ -19732,6 +20267,10 @@ impl super::ftui_adapter::Model for CassApp {
             self.render_toasts(frame, area, &styles);
         }
 
+        if self.surface == AppSurface::Search {
+            self.trace_search_frame_rendered();
+        }
+
         // ── Screenshot capture (runs after all rendering completes) ──
         if let Some(format) = self.screenshot_pending {
             let exported =
@@ -20231,6 +20770,7 @@ pub fn run_tui_ftui(
     };
 
     let mut model = CassApp::default();
+    let latency_trace = latency_trace_recorder_from_env()?;
     if should_upgrade_style_profile_for_dumb_term(
         model.style_options,
         term_is_dumb,
@@ -20249,6 +20789,7 @@ pub fn run_tui_ftui(
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
     model.data_dir = data_dir.clone();
     model.db_path = data_dir.join("agent_search.db");
+    model.latency_trace = latency_trace.clone();
     model.refresh_theme_config_from_data_dir();
     model.search_service = match crate::search::tantivy::index_dir(&data_dir) {
         Ok(index_path) => match crate::search::query::SearchClient::open_with_options(
@@ -20369,6 +20910,14 @@ pub fn run_tui_ftui(
     {
         macro_file::save_macro(record_path, &recorded, false)?;
         eprintln!("Macro saved to: {}", record_path.display());
+    }
+
+    if let Some(recorder) = latency_trace {
+        let mut trace = recorder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("latency trace lock poisoned"))?;
+        trace.flush()?;
+        eprintln!("Latency trace saved to: {}", trace.output_path.display());
     }
 
     result.map_err(|e| anyhow::anyhow!("ftui runtime error: {e}"))
