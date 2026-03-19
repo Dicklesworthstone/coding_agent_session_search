@@ -583,6 +583,10 @@ fn decrypt_all_chunks(
     for (chunk_index, chunk_file) in config.payload.files.iter().enumerate() {
         progress(chunk_index as f32 / config.payload.chunk_count as f32);
 
+        // Prevent path traversal from a tampered config.json
+        if chunk_file.contains("..") || std::path::Path::new(chunk_file).is_absolute() {
+            anyhow::bail!("Invalid chunk path: potential directory traversal");
+        }
         let chunk_path = archive_dir.join(chunk_file);
         let ciphertext = std::fs::read(&chunk_path)?;
 
@@ -795,7 +799,7 @@ mod tests {
         std::fs::write(&input_path, b"Test data for key management").unwrap();
 
         // Encrypt
-        let mut engine = EncryptionEngine::new(1024);
+        let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("test-password").unwrap();
         engine
             .encrypt_file(&input_path, &output_dir, |_, _| {})

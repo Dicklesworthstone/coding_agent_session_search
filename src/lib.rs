@@ -10173,7 +10173,7 @@ fn run_config_based_export(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Encryption enabled but no password provided"))?;
         let chunk_size = config.encryption.chunk_size.unwrap_or(8 * 1024 * 1024) as usize;
-        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size);
+        let mut enc_engine = crate::pages::encrypt::EncryptionEngine::new(chunk_size)?;
         enc_engine.add_password_slot(password)?;
 
         // Add recovery slot if requested
@@ -10186,11 +10186,7 @@ fn run_config_based_export(
         }
 
         // Encrypt the database into the temp encrypted dir
-        let enc_config = enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
-
-        // Write config.json
-        let config_path = encrypted_dir.join("config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&enc_config)?)?;
+        enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
     } else {
         if !wizard_state.unencrypted_confirmed {
             anyhow::bail!(
@@ -14660,13 +14656,14 @@ fn run_timeline(
                             origin_host,
                             origin_kind,
                         )| {
-                            let duration = ended.map(|e| e - started);
+                            let duration_ms = ended.map(|e| e - started);
+                            let duration_secs = duration_ms.map(|ms| ms / 1000);
                             // Use "local" as default origin_kind if not in DB (backward compat)
                             let kind = origin_kind.as_deref().unwrap_or("local");
                             serde_json::json!({
                                 "id": id, "agent": agent, "title": title,
                                 "started_at": started, "ended_at": ended,
-                                "duration_seconds": duration, "source_path": path,
+                                "duration_seconds": duration_secs, "source_path": path,
                                 "message_count": msg_count,
                                 // Provenance fields (P3.5)
                                 "source_id": source_id,

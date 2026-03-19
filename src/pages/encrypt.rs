@@ -132,6 +132,8 @@ pub struct EncryptionConfig {
 }
 
 /// Encryption engine for pages export
+///
+/// `Debug` is implemented manually to avoid printing the secret DEK.
 pub struct EncryptionEngine {
     dek: SecretKey,
     export_id: [u8; 16],
@@ -140,29 +142,43 @@ pub struct EncryptionEngine {
     key_slots: Vec<KeySlot>,
 }
 
+impl std::fmt::Debug for EncryptionEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionEngine")
+            .field("chunk_size", &self.chunk_size)
+            .field("key_slots", &self.key_slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for EncryptionEngine {
     fn default() -> Self {
-        Self::new(DEFAULT_CHUNK_SIZE)
+        Self::new(DEFAULT_CHUNK_SIZE).expect("default chunk size must be valid")
     }
 }
 
 impl EncryptionEngine {
     /// Create new encryption engine with random DEK
-    pub fn new(chunk_size: usize) -> Self {
-        let chunk_size = chunk_size.clamp(1, MAX_CHUNK_SIZE);
+    pub fn new(chunk_size: usize) -> Result<Self> {
+        if chunk_size == 0 {
+            bail!("chunk_size must be > 0");
+        }
+        if chunk_size > MAX_CHUNK_SIZE {
+            bail!("chunk_size must be <= {MAX_CHUNK_SIZE} bytes");
+        }
         let mut export_id = [0u8; 16];
         let mut base_nonce = [0u8; 12];
         let mut rng = rand::rng();
         rng.fill_bytes(&mut export_id);
         rng.fill_bytes(&mut base_nonce);
 
-        Self {
+        Ok(Self {
             dek: SecretKey::random(),
             export_id,
             base_nonce,
             chunk_size,
             key_slots: Vec::new(),
-        }
+        })
     }
 
     /// Add a password-based key slot using Argon2id
@@ -687,7 +703,7 @@ mod tests {
         std::fs::write(&input_path, test_data).unwrap();
 
         // Encrypt
-        let mut engine = EncryptionEngine::new(1024); // Small chunks for testing
+        let mut engine = EncryptionEngine::new(1024).unwrap(); // Small chunks for testing
         engine.add_password_slot("test-password").unwrap();
 
         let config = engine
@@ -720,7 +736,7 @@ mod tests {
         std::fs::write(&input_path, test_data).unwrap();
 
         // Encrypt with multiple slots
-        let mut engine = EncryptionEngine::new(1024);
+        let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("password1").unwrap();
         engine.add_password_slot("password2").unwrap();
         engine.add_recovery_slot(b"recovery-secret").unwrap();
@@ -763,7 +779,7 @@ mod tests {
 
         std::fs::write(&input_path, b"Test data for tampering").unwrap();
 
-        let mut engine = EncryptionEngine::new(1024);
+        let mut engine = EncryptionEngine::new(1024).unwrap();
         engine.add_password_slot("password").unwrap();
 
         let config = engine
@@ -783,5 +799,17 @@ mod tests {
                 .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_encryption_engine_rejects_zero_chunk_size() {
+        let err = EncryptionEngine::new(0).unwrap_err();
+        assert!(err.to_string().contains("chunk_size"));
+    }
+
+    #[test]
+    fn test_encryption_engine_rejects_oversized_chunk_size() {
+        let err = EncryptionEngine::new(MAX_CHUNK_SIZE + 1).unwrap_err();
+        assert!(err.to_string().contains("chunk_size"));
     }
 }

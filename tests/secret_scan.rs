@@ -291,6 +291,20 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_key_is_not_reported_as_openai_key() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        setup_db(&db_path, "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh")?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            !report.findings.iter().any(|f| f.kind == "openai_key"),
+            "Anthropic keys should not also be classified as OpenAI keys"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn detects_jwt_token() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
@@ -329,6 +343,23 @@ mod tests {
             .find(|f| f.kind == "private_key")
             .unwrap();
         assert_eq!(finding.severity, SecretSeverity::Critical);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_encrypted_private_key_header() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        setup_db(
+            &db_path,
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHjBABgkqhkiG9w0BBQMwDgQIc...",
+        )?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            report.findings.iter().any(|f| f.kind == "private_key"),
+            "should detect encrypted private key header"
+        );
         Ok(())
     }
 

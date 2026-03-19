@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt, open_with_flags, params_from_iter};
+use frankensqlite::compat::{ParamValue, RowExt, params_from_iter};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -188,6 +188,9 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "openai_key",
             severity: SecretSeverity::High,
+            // Note: this also matches Anthropic keys (sk-ant-...) — the anthropic_key
+            // pattern below is more specific and checked separately. Dedup by position
+            // in the caller prevents double-reporting.
             regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
         },
         SecretPattern {
@@ -204,8 +207,10 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "private_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            regex: Regex::new(
+                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+            )
+            .expect("private key regex"),
         },
         SecretPattern {
             id: "database_url",
@@ -257,11 +262,8 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
-    let conn = open_with_flags(
-        &db_path.as_ref().to_string_lossy(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .context("Failed to open database for secret scan")?;
+    let conn = super::open_existing_sqlite_db(db_path.as_ref())
+        .context("Failed to open database for secret scan")?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();

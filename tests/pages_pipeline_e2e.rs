@@ -58,7 +58,7 @@ fn build_pipeline(temp_dir: &TempDir) -> PipelineArtifacts {
 
     // 3. Encrypt (simulating Wizard/Encrypt Step)
     let encrypt_dir = temp_dir.path().join("encrypt_staging");
-    let mut enc_engine = EncryptionEngine::new(1024 * 1024); // 1MB chunks
+    let mut enc_engine = EncryptionEngine::new(1024 * 1024).expect("valid chunk size"); // 1MB chunks
     enc_engine
         .add_password_slot(TEST_PASSWORD)
         .expect("Failed to add password slot");

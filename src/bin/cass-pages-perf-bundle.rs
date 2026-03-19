@@ -140,7 +140,7 @@ fn main() -> Result<()> {
     let export_stats = export_engine.execute(|_, _| {}, None)?;
 
     eprintln!("[perf-bundle] encrypting export...");
-    let mut enc_engine = EncryptionEngine::new(args.chunk_bytes);
+    let mut enc_engine = EncryptionEngine::new(args.chunk_bytes)?;
     enc_engine.add_password_slot(&args.password)?;
     if let Some(secret) = &args.recovery_secret {
         enc_engine.add_recovery_slot(secret.as_bytes())?;

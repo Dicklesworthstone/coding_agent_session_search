@@ -161,7 +161,7 @@ fn build_full_pipeline(
     // Step 3: Encrypt
     let start = tracker.start("encrypt", Some("Encrypt exported database with AES-GCM"));
     let encrypt_dir = temp_dir.path().join("encrypt_staging");
-    let mut enc_engine = EncryptionEngine::new(CHUNK_SIZE);
+    let mut enc_engine = EncryptionEngine::new(CHUNK_SIZE).expect("valid chunk size");
 
     if include_password {
         enc_engine

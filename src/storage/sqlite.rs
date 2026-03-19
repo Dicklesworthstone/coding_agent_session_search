@@ -2245,15 +2245,15 @@ impl FrankenStorage {
     /// Convert a millisecond timestamp to a day ID (days since 2020-01-01).
     pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        let secs = timestamp_ms / 1000;
-        (secs - EPOCH_2020_SECS) / 86400
+        let secs = timestamp_ms.div_euclid(1000);
+        (secs - EPOCH_2020_SECS).div_euclid(86400)
     }
 
     /// Convert a millisecond timestamp to an hour ID (hours since 2020-01-01 00:00 UTC).
     pub fn hour_id_from_millis(timestamp_ms: i64) -> i64 {
         const EPOCH_2020_SECS: i64 = 1_577_836_800;
-        let secs = timestamp_ms / 1000;
-        (secs - EPOCH_2020_SECS) / 3600
+        let secs = timestamp_ms.div_euclid(1000);
+        (secs - EPOCH_2020_SECS).div_euclid(3600)
     }
 
     /// Convert a day ID back to milliseconds (start of day).
@@ -4899,7 +4899,7 @@ pub struct PricingEntry {
     pub output_cost_per_mtok: f64,
     pub cache_read_cost_per_mtok: Option<f64>,
     pub cache_creation_cost_per_mtok: Option<f64>,
-    /// Effective date as day_id (YYYYMMDD integer, e.g. 20251001).
+    /// Effective date as day_id (days since 2020-01-01).
     pub effective_day_id: i64,
 }
 
@@ -4971,7 +4971,16 @@ impl PricingTable {
         let entries = stmt
             .query_map([], |row| {
                 let effective_date: String = row.get(6)?;
-                let effective_day_id = date_str_to_day_id(&effective_date);
+                let effective_day_id = date_str_to_day_id(&effective_date).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )),
+                    )
+                })?;
                 Ok(PricingEntry {
                     model_pattern: row.get(0)?,
                     provider: row.get(1)?,
@@ -4997,7 +5006,7 @@ impl PricingTable {
         let mut entries = Vec::with_capacity(rows.len());
         for row in &rows {
             let effective_date: String = row.get_typed(6)?;
-            let effective_day_id = date_str_to_day_id(&effective_date);
+            let effective_day_id = date_str_to_day_id(&effective_date)?;
             entries.push(PricingEntry {
                 model_pattern: row.get_typed(0)?,
                 provider: row.get_typed(1)?,
@@ -5084,9 +5093,17 @@ impl PricingTable {
     }
 }
 
-/// Convert "YYYY-MM-DD" date string to day_id (YYYYMMDD integer).
-fn date_str_to_day_id(s: &str) -> i64 {
-    s.replace('-', "").parse::<i64>().unwrap_or(0)
+/// Convert "YYYY-MM-DD" date string to day_id (days since 2020-01-01),
+/// matching the format produced by `day_id_from_millis`.
+fn date_str_to_day_id(s: &str) -> Result<i64> {
+    use chrono::NaiveDate;
+    const EPOCH_2020: NaiveDate = match NaiveDate::from_ymd_opt(2020, 1, 1) {
+        Some(d) => d,
+        None => unreachable!(),
+    };
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(|d| (d - EPOCH_2020).num_days())
+        .with_context(|| format!("invalid effective_date '{s}'"))
 }
 
 /// SQL LIKE pattern matcher (case-insensitive). `%` = any sequence, `_` = any single char.
@@ -6131,13 +6148,13 @@ impl SqliteStorage {
 
     /// Convert a millisecond timestamp to a day_id (days since 2020-01-01).
     pub fn day_id_from_millis(timestamp_ms: i64) -> i64 {
-        let secs = timestamp_ms / 1000;
+        let secs = timestamp_ms.div_euclid(1000);
         (secs - Self::EPOCH_2020_SECS).div_euclid(86400)
     }
 
     /// Convert a millisecond timestamp to an hour_id (hours since 2020-01-01 00:00 UTC).
     pub fn hour_id_from_millis(timestamp_ms: i64) -> i64 {
-        let secs = timestamp_ms / 1000;
+        let secs = timestamp_ms.div_euclid(1000);
         (secs - Self::EPOCH_2020_SECS).div_euclid(3600)
     }
 
@@ -8474,6 +8491,24 @@ mod tests {
     }
 
     #[test]
+    fn day_and_hour_ids_floor_negative_millis() {
+        // One millisecond before the Unix epoch should still floor into the
+        // previous second/hour/day rather than truncating toward zero.
+        let ts_ms = -1_i64;
+        let expected_secs = -1_i64;
+        let epoch_2020_secs = 1_577_836_800_i64;
+
+        assert_eq!(
+            SqliteStorage::day_id_from_millis(ts_ms),
+            (expected_secs - epoch_2020_secs).div_euclid(86_400)
+        );
+        assert_eq!(
+            SqliteStorage::hour_id_from_millis(ts_ms),
+            (expected_secs - epoch_2020_secs).div_euclid(3_600)
+        );
+    }
+
+    #[test]
     fn migration_v13_from_v10() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -9774,13 +9809,17 @@ mod tests {
 
     #[test]
     fn date_str_to_day_id_converts_correctly() {
-        assert_eq!(date_str_to_day_id("2025-10-01"), 20251001);
-        assert_eq!(date_str_to_day_id("2024-04-01"), 20240401);
-        assert_eq!(date_str_to_day_id("invalid"), 0);
+        // 2025-10-01 is 2100 days after 2020-01-01
+        assert_eq!(date_str_to_day_id("2025-10-01").unwrap(), 2100);
+        // 2024-04-01 is 1552 days after 2020-01-01
+        assert_eq!(date_str_to_day_id("2024-04-01").unwrap(), 1552);
+        assert!(date_str_to_day_id("invalid").is_err());
     }
 
     #[test]
     fn pricing_table_lookup_selects_matching_entry() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -9790,7 +9829,7 @@ mod tests {
                     output_cost_per_mtok: 75.0,
                     cache_read_cost_per_mtok: Some(1.5),
                     cache_creation_cost_per_mtok: Some(18.75),
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day,
                 },
                 PricingEntry {
                     model_pattern: "claude-sonnet-4%".into(),
@@ -9799,24 +9838,26 @@ mod tests {
                     output_cost_per_mtok: 15.0,
                     cache_read_cost_per_mtok: Some(0.3),
                     cache_creation_cost_per_mtok: Some(3.75),
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day,
                 },
             ],
         };
 
-        let result = table.lookup("claude-opus-4-20260101", 20260206);
+        let result = table.lookup("claude-opus-4-20260101", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
 
-        let result = table.lookup("claude-sonnet-4-latest", 20260206);
+        let result = table.lookup("claude-sonnet-4-latest", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 3.0);
 
-        assert!(table.lookup("unknown-model", 20260206).is_none());
+        assert!(table.lookup("unknown-model", lookup_day).is_none());
     }
 
     #[test]
     fn pricing_table_lookup_respects_effective_date() {
+        let effective_day_1 = date_str_to_day_id("2025-10-01").unwrap();
+        let effective_day_2 = date_str_to_day_id("2026-01-01").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -9826,7 +9867,7 @@ mod tests {
                     output_cost_per_mtok: 75.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20251001,
+                    effective_day_id: effective_day_1,
                 },
                 PricingEntry {
                     model_pattern: "claude-opus-4%".into(),
@@ -9835,27 +9876,33 @@ mod tests {
                     output_cost_per_mtok: 60.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20260101,
+                    effective_day_id: effective_day_2,
                 },
             ],
         };
 
         // Before price drop
-        let result = table.lookup("claude-opus-4", 20251101);
+        let result = table.lookup("claude-opus-4", date_str_to_day_id("2025-11-01").unwrap());
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 15.0);
 
         // After price drop
-        let result = table.lookup("claude-opus-4", 20260201);
+        let result = table.lookup("claude-opus-4", date_str_to_day_id("2026-02-01").unwrap());
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 12.0);
 
         // Before all pricing
-        assert!(table.lookup("claude-opus-4", 20240101).is_none());
+        assert!(
+            table
+                .lookup("claude-opus-4", date_str_to_day_id("2024-01-01").unwrap())
+                .is_none()
+        );
     }
 
     #[test]
     fn pricing_table_lookup_specificity_tiebreak() {
+        let effective_day = date_str_to_day_id("2025-01-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-01-01").unwrap();
         let table = PricingTable {
             entries: vec![
                 PricingEntry {
@@ -9865,7 +9912,7 @@ mod tests {
                     output_cost_per_mtok: 30.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20250101,
+                    effective_day_id: effective_day,
                 },
                 PricingEntry {
                     model_pattern: "gpt-4-turbo%".into(),
@@ -9874,24 +9921,25 @@ mod tests {
                     output_cost_per_mtok: 15.0,
                     cache_read_cost_per_mtok: None,
                     cache_creation_cost_per_mtok: None,
-                    effective_day_id: 20250101,
+                    effective_day_id: effective_day,
                 },
             ],
         };
 
         // Longer pattern wins for specific model
-        let result = table.lookup("gpt-4-turbo-2025", 20260101);
+        let result = table.lookup("gpt-4-turbo-2025", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 5.0);
 
         // Shorter pattern matches broader model
-        let result = table.lookup("gpt-4o", 20260101);
+        let result = table.lookup("gpt-4o", lookup_day);
         assert!(result.is_some());
         assert_eq!(result.unwrap().input_cost_per_mtok, 10.0);
     }
 
     #[test]
     fn pricing_table_compute_cost_basic() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -9900,13 +9948,13 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: Some(1.5),
                 cache_creation_cost_per_mtok: Some(18.75),
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
         let cost = table.compute_cost(
             Some("claude-opus-4-latest"),
-            20260206,
+            date_str_to_day_id("2026-02-06").unwrap(),
             Some(1000),
             Some(500),
             None,
@@ -9919,6 +9967,7 @@ mod tests {
 
     #[test]
     fn pricing_table_compute_cost_with_cache() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -9927,13 +9976,13 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: Some(1.5),
                 cache_creation_cost_per_mtok: Some(18.75),
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
         let cost = table.compute_cost(
             Some("claude-opus-4-latest"),
-            20260206,
+            date_str_to_day_id("2026-02-06").unwrap(),
             Some(1_000_000),
             Some(100_000),
             Some(500_000),
@@ -9948,6 +9997,8 @@ mod tests {
 
     #[test]
     fn pricing_table_compute_cost_returns_none_for_unknown_model() {
+        let effective_day = date_str_to_day_id("2025-10-01").unwrap();
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
         let table = PricingTable {
             entries: vec![PricingEntry {
                 model_pattern: "claude-opus-4%".into(),
@@ -9956,7 +10007,7 @@ mod tests {
                 output_cost_per_mtok: 75.0,
                 cache_read_cost_per_mtok: None,
                 cache_creation_cost_per_mtok: None,
-                effective_day_id: 20251001,
+                effective_day_id: effective_day,
             }],
         };
 
@@ -9964,7 +10015,7 @@ mod tests {
             table
                 .compute_cost(
                     Some("unknown-model"),
-                    20260206,
+                    lookup_day,
                     Some(1000),
                     Some(500),
                     None,
@@ -9974,12 +10025,12 @@ mod tests {
         );
         assert!(
             table
-                .compute_cost(None, 20260206, Some(1000), Some(500), None, None)
+                .compute_cost(None, lookup_day, Some(1000), Some(500), None, None)
                 .is_none()
         );
         assert!(
             table
-                .compute_cost(Some("claude-opus-4"), 20260206, None, None, None, None)
+                .compute_cost(Some("claude-opus-4"), lookup_day, None, None, None, None)
                 .is_none()
         );
     }
@@ -9993,13 +10044,44 @@ mod tests {
         let table = PricingTable::load(&storage.conn).unwrap();
         assert!(!table.is_empty());
 
-        let opus = table.lookup("claude-opus-4-latest", 20260206);
+        let lookup_day = date_str_to_day_id("2026-02-06").unwrap();
+
+        let opus = table.lookup("claude-opus-4-latest", lookup_day);
         assert!(opus.is_some());
         assert_eq!(opus.unwrap().input_cost_per_mtok, 15.0);
 
-        let flash = table.lookup("gemini-2.0-flash-001", 20260206);
+        let flash = table.lookup("gemini-2.0-flash-001", lookup_day);
         assert!(flash.is_some());
         assert_eq!(flash.unwrap().input_cost_per_mtok, 0.075);
+    }
+
+    #[test]
+    fn pricing_table_load_rejects_invalid_effective_date() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO model_pricing (
+                    model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
+                    cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "broken-model%",
+                    "test",
+                    1.0_f64,
+                    2.0_f64,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    "not-a-date"
+                ],
+            )
+            .unwrap();
+
+        let err = PricingTable::load(&storage.conn).unwrap_err();
+        assert!(err.to_string().contains("invalid effective_date"));
     }
 
     #[test]

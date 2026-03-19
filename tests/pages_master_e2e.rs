@@ -146,7 +146,7 @@ fn build_pipeline(config: &E2EConfig) -> PipelineArtifacts {
     // Step 3: Encrypt
     debug!("Step 3: Encrypting archive");
     let encrypt_dir = temp_dir.path().join("encrypt_staging");
-    let mut enc_engine = EncryptionEngine::new(1024 * 1024); // 1MB chunks
+    let mut enc_engine = EncryptionEngine::new(1024 * 1024).expect("valid chunk size"); // 1MB chunks
 
     enc_engine
         .add_password_slot(TEST_PASSWORD)

@@ -2,10 +2,9 @@ use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
-use frankensqlite::compat::{
-    ConnectionExt, OpenFlags, ParamValue, RowExt, TransactionExt, open_with_flags,
-};
-use frankensqlite::{Connection, Row};
+use frankensqlite::Row as FrankenRow;
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -68,19 +67,16 @@ impl ExportEngine {
         }
 
         // 1. Open source DB
-        let src = open_with_flags(
-            &self.source_db_path.to_string_lossy(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .context("Failed to open source database")?;
+        let src = super::open_existing_sqlite_db(&self.source_db_path)
+            .context("Failed to open source database")?;
 
         // 2. Prepare output DB
         if self.output_path.exists() {
             std::fs::remove_file(&self.output_path)
                 .context("Failed to remove existing output file")?;
         }
-        let dest = Connection::open(self.output_path.to_string_lossy().as_ref())
-            .context("Failed to create output database")?;
+        let mut dest =
+            Connection::open(&self.output_path).context("Failed to create output database")?;
 
         let tx = dest.transaction()?;
 
@@ -97,6 +93,7 @@ impl ExportEngine {
                 message_count INTEGER,
                 metadata_json TEXT
             )",
+            [],
         )
         .context("Failed to create conversations table")?;
 
@@ -111,6 +108,7 @@ impl ExportEngine {
                 attachment_refs TEXT,
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id)
             )",
+            [],
         )
         .context("Failed to create messages table")?;
 
@@ -119,6 +117,7 @@ impl ExportEngine {
                 key TEXT PRIMARY KEY,
                 value TEXT
             )",
+            [],
         )
         .context("Failed to create export_meta table")?;
 
@@ -129,6 +128,7 @@ impl ExportEngine {
                 content_rowid='id',
                 tokenize='porter unicode61 remove_diacritics 2'
             )",
+            [],
         )
         .context("Failed to create messages_fts table")?;
 
@@ -139,6 +139,7 @@ impl ExportEngine {
                 content_rowid='id',
                 tokenize="unicode61 tokenchars '-_./:@#$%\\'"
             )"#,
+            [],
         )
         .context("Failed to create messages_code_fts table")?;
 
@@ -200,7 +201,7 @@ impl ExportEngine {
 
         // Count total for progress
         let count_query = format!("SELECT COUNT(*) FROM ({})", query);
-        let total_convs: usize = src.query_row_map(&count_query, &params, |row: &Row| {
+        let total_convs: usize = src.query_row_map(&count_query, &params, |row: &FrankenRow| {
             row.get_typed::<i64>(0).map(|v| v as usize)
         })?;
 
@@ -217,7 +218,7 @@ impl ExportEngine {
             Option<String>,
         );
         let conv_rows: Vec<ConversationExportRow> =
-            src.query_map_collect(&query, &params, |row: &Row| {
+            src.query_map_collect(&query, &params, |row: &FrankenRow| {
                 Ok((
                     row.get_typed::<i64>(0)?,
                     row.get_typed::<String>(1)?,
@@ -255,10 +256,10 @@ impl ExportEngine {
             // Transform Path
             let transformed_path = self.transform_path(source_path, workspace);
 
-            tx.execute_compat(
+            tx.execute(
                 "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                frankensqlite::params![
+                rusqlite::params![
                     *id,
                     agent.as_str(),
                     workspace.as_deref(),
@@ -278,7 +279,7 @@ impl ExportEngine {
                  WHERE conversation_id = ?1
                  ORDER BY idx ASC",
                 frankensqlite::params![*id],
-                |row: &Row| {
+                |row: &FrankenRow| {
                     Ok((
                         row.get_typed::<String>(0)?,
                         row.get_typed::<String>(1)?,
@@ -289,22 +290,22 @@ impl ExportEngine {
             )?;
 
             for (role, content, created_at, idx) in &msg_rows {
-                tx.execute_compat(
+                tx.execute(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    frankensqlite::params![*id, *idx, role.as_str(), content.as_str(), *created_at],
+                    rusqlite::params![*id, *idx, role.as_str(), content.as_str(), *created_at],
                 )?;
 
-                let msg_id: i64 = tx.query_row("SELECT last_insert_rowid()")?.get_typed(0)?;
+                let msg_id = tx.last_insert_rowid();
 
                 // Populate FTS
-                tx.execute_compat(
+                tx.execute(
                     "INSERT INTO messages_fts (rowid, content) VALUES (?1, ?2)",
-                    frankensqlite::params![msg_id, content.as_str()],
+                    rusqlite::params![msg_id, content.as_str()],
                 )?;
-                tx.execute_compat(
+                tx.execute(
                     "INSERT INTO messages_code_fts (rowid, content) VALUES (?1, ?2)",
-                    frankensqlite::params![msg_id, content.as_str()],
+                    rusqlite::params![msg_id, content.as_str()],
                 )?;
 
                 msg_processed += 1;
@@ -315,11 +316,14 @@ impl ExportEngine {
         }
 
         // Metadata
-        tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
+        tx.execute(
+            "INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')",
+            [],
+        )?;
         let exported_at = Utc::now().to_rfc3339();
-        tx.execute_compat(
+        tx.execute(
             "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
-            frankensqlite::params![exported_at.as_str()],
+            rusqlite::params![exported_at.as_str()],
         )?;
 
         tx.commit()?;

@@ -1,3 +1,7 @@
+use anyhow::{Context, Result, bail};
+use frankensqlite::Connection;
+use std::path::Path;
+
 pub mod analytics;
 pub mod archive_config;
 pub mod attachments;
@@ -23,3 +27,12 @@ pub mod size;
 pub mod summary;
 pub mod verify;
 pub mod wizard;
+
+pub(crate) fn open_existing_sqlite_db(path: &Path) -> Result<Connection> {
+    if !path.exists() {
+        bail!("database does not exist: {}", path.display());
+    }
+
+    Connection::open(path.to_string_lossy().as_ref())
+        .with_context(|| format!("opening sqlite database at {}", path.display()))
+}

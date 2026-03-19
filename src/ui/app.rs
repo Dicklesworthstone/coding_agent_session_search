@@ -5422,6 +5422,10 @@ impl CassApp {
                 ftui::Cmd::msg(CassMsg::InputModeEntered(mode))
             }
             PaletteResult::SetTimeFilter { from } => {
+                self.time_preset = match from {
+                    TimeFilterPreset::Today => TimePreset::Today,
+                    TimeFilterPreset::LastWeek => TimePreset::Week,
+                };
                 let now = chrono::Utc::now().timestamp();
                 let from_ts = match from {
                     TimeFilterPreset::Today => now - (now % 86400),
@@ -16450,7 +16454,8 @@ impl super::ftui_adapter::Model for CassApp {
                     InputMode::CreatedFrom => {
                         let ts = parse_time_input(&buf);
                         if ts.is_some() || buf.is_empty() {
-                            self.time_preset = if ts.is_some() {
+                            self.time_preset = if ts.is_some() || self.filters.created_to.is_some()
+                            {
                                 TimePreset::Custom
                             } else {
                                 TimePreset::All
@@ -16467,7 +16472,12 @@ impl super::ftui_adapter::Model for CassApp {
                     InputMode::CreatedTo => {
                         let ts = parse_time_input(&buf);
                         if ts.is_some() || buf.is_empty() {
-                            self.time_preset = TimePreset::Custom;
+                            self.time_preset =
+                                if ts.is_some() || self.filters.created_from.is_some() {
+                                    TimePreset::Custom
+                                } else {
+                                    TimePreset::All
+                                };
                             ftui::Cmd::msg(CassMsg::FilterTimeSet {
                                 from: self.filters.created_from,
                                 to: ts,
@@ -16501,11 +16511,11 @@ impl super::ftui_adapter::Model for CassApp {
                 if len == 0 {
                     return ftui::Cmd::none();
                 }
-                let cursor = self.history_cursor.unwrap_or(0);
-                self.history_cursor = Some(if forward {
-                    (cursor + 1).min(len.saturating_sub(1))
-                } else {
-                    cursor.saturating_sub(1)
+                self.history_cursor = Some(match self.history_cursor {
+                    None if forward => 1.min(len.saturating_sub(1)),
+                    None => 0,
+                    Some(cursor) if forward => (cursor + 1).min(len.saturating_sub(1)),
+                    Some(cursor) => cursor.saturating_sub(1),
                 });
                 if let Some(idx) = self.history_cursor
                     && let Some(q) = self.query_history.get(idx)
@@ -23074,6 +23084,29 @@ mod tests {
             let _ = app.palette_result_to_cmd(r);
         }
     }
+
+    #[test]
+    fn palette_time_filter_updates_time_preset() {
+        let mut app = CassApp::default();
+
+        let cmd = app.palette_result_to_cmd(PaletteResult::SetTimeFilter {
+            from: TimeFilterPreset::Today,
+        });
+        assert_eq!(app.time_preset, TimePreset::Today);
+        assert!(matches!(
+            extract_msgs(cmd).as_slice(),
+            [CassMsg::FilterTimeSet { .. }]
+        ));
+
+        let cmd = app.palette_result_to_cmd(PaletteResult::SetTimeFilter {
+            from: TimeFilterPreset::LastWeek,
+        });
+        assert_eq!(app.time_preset, TimePreset::Week);
+        assert!(matches!(
+            extract_msgs(cmd).as_slice(),
+            [CassMsg::FilterTimeSet { .. }]
+        ));
+    }
     #[test]
     fn palette_filter_mode_round_trip() {
         let mut app = CassApp::default();
@@ -25983,6 +26016,24 @@ mod tests {
     }
 
     #[test]
+    fn input_mode_applied_created_from_empty_with_end_keeps_custom() {
+        let mut app = CassApp::default();
+        app.time_preset = TimePreset::Custom;
+        app.filters.created_to = Some(2_000);
+        app.input_mode = InputMode::CreatedFrom;
+        app.input_buffer.clear();
+
+        let cmd = app.update(CassMsg::InputModeApplied);
+        for msg in extract_msgs(cmd) {
+            let _ = app.update(msg);
+        }
+
+        assert_eq!(app.time_preset, TimePreset::Custom);
+        assert!(app.filters.created_from.is_none());
+        assert_eq!(app.filters.created_to, Some(2_000));
+    }
+
+    #[test]
     fn input_mode_applied_created_to_invalid_date_shows_error() {
         let mut app = CassApp::default();
         app.input_mode = InputMode::CreatedTo;
@@ -25991,6 +26042,24 @@ mod tests {
 
         assert!(app.status.contains("Invalid date"));
         assert_eq!(app.input_mode, InputMode::Query);
+    }
+
+    #[test]
+    fn input_mode_applied_created_to_empty_with_start_keeps_custom() {
+        let mut app = CassApp::default();
+        app.time_preset = TimePreset::Custom;
+        app.filters.created_from = Some(1_000);
+        app.input_mode = InputMode::CreatedTo;
+        app.input_buffer.clear();
+
+        let cmd = app.update(CassMsg::InputModeApplied);
+        for msg in extract_msgs(cmd) {
+            let _ = app.update(msg);
+        }
+
+        assert_eq!(app.time_preset, TimePreset::Custom);
+        assert_eq!(app.filters.created_from, Some(1_000));
+        assert!(app.filters.created_to.is_none());
     }
 
     #[test]

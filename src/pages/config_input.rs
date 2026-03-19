@@ -491,6 +491,17 @@ impl PagesConfig {
             ));
         }
 
+        if let Some(chunk_size) = self.encryption.chunk_size {
+            if chunk_size == 0 {
+                errors.push("encryption.chunk_size must be greater than 0 bytes.".to_string());
+            } else if chunk_size > crate::pages::encrypt::MAX_CHUNK_SIZE as u64 {
+                errors.push(format!(
+                    "encryption.chunk_size ({chunk_size}) exceeds the maximum supported size of {} bytes.",
+                    crate::pages::encrypt::MAX_CHUNK_SIZE
+                ));
+            }
+        }
+
         // Warnings
         if self
             .encryption
@@ -769,6 +780,28 @@ mod tests {
         let result = config.validate();
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("repo")));
+    }
+
+    #[test]
+    fn test_validate_zero_chunk_size() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+        config.encryption.chunk_size = Some(0);
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("chunk_size")));
+    }
+
+    #[test]
+    fn test_validate_oversized_chunk_size() {
+        let mut config = PagesConfig::default();
+        config.encryption.password = Some("test123".to_string());
+        config.encryption.chunk_size = Some(crate::pages::encrypt::MAX_CHUNK_SIZE as u64 + 1);
+
+        let result = config.validate();
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("chunk_size")));
     }
 
     #[test]

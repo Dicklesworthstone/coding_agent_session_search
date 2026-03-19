@@ -44,7 +44,7 @@ fn create_test_archive(temp_dir: &Path, password: &str) -> std::path::PathBuf {
     .unwrap();
 
     let encrypt_dir = temp_dir.join("encrypted");
-    let mut engine = EncryptionEngine::new(1024);
+    let mut engine = EncryptionEngine::new(1024).expect("valid chunk size");
     engine.add_password_slot(password).unwrap();
 
     engine
@@ -64,7 +64,7 @@ fn create_test_archive_with_recovery(
     fs::write(&input_path, b"Test database content").unwrap();
 
     let encrypt_dir = temp_dir.join("encrypted");
-    let mut engine = EncryptionEngine::new(1024);
+    let mut engine = EncryptionEngine::new(1024).expect("valid chunk size");
     engine.add_password_slot(password).unwrap();
     engine.add_recovery_slot(recovery).unwrap();
 
