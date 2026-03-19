@@ -1089,33 +1089,26 @@ pub fn render_explorer(
                 PackedRgba::rgb(40, 80, 160)
             };
 
-            let mut lines = Vec::new();
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "             ▃▄▅▇██▇▅▄▃             ",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "         ▂▄▆████████████▆▄▂         ",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "       ▃▆██████████████████▆▃       ",
                     ftui::Style::new().fg(cc.muted),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     " No analytics timeseries yet. If data exists, cass is rebuilding automatically.",
                     ftui::Style::new().fg(cc.axis).bold(),
-                ),
-            ]));
+                )]),
+            ];
             Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
             return;
         }
@@ -1883,57 +1876,42 @@ pub fn render_heatmap(
             } else {
                 PackedRgba::rgb(40, 80, 160)
             };
-            let mut lines = Vec::new();
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
                     ftui::Style::new().fg(muted),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ███ ███ ███ ███ ███ ███ ███",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ▓▓▓ ███ ███ ███ ███ ███ ▓▓▓",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ▒▒▒ ▓▓▓ ███ ███ ███ ▓▓▓ ▒▒▒",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ░░░ ▒▒▒ ▓▓▓ ███ ▓▓▓ ▒▒▒ ░░░",
                     ftui::Style::new().fg(muted),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     " No daily data available for this view yet.",
                     ftui::Style::new().fg(cc.axis).bold(),
-                ),
-            ]));
+                )]),
+            ];
             Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
             return;
         }
@@ -2283,28 +2261,30 @@ pub fn render_breakdowns(
                 PackedRgba::rgb(40, 80, 160)
             };
 
-            let mut lines = Vec::new();
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(accent)),
-                ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(primary)),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ████████████    ", ftui::Style::new().fg(accent)),
-                ftui::text::Span::styled("   ██████████████  ", ftui::Style::new().fg(primary)),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(accent)),
-                ftui::text::Span::styled("   ████████        ", ftui::Style::new().fg(primary)),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("   ██████          ", ftui::Style::new().fg(accent)),
-                ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(primary)),
-            ]));
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(msg, ftui::Style::new().fg(cc.axis).bold()),
-            ]));
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ██████████      ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ████████████    ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ██████████████  ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ████████        ", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("   ██████          ", ftui::Style::new().fg(accent)),
+                    ftui::text::Span::styled("   ████████████████", ftui::Style::new().fg(primary)),
+                ]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                    msg,
+                    ftui::Style::new().fg(cc.axis).bold(),
+                )]),
+            ];
             Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
             return;
         }
@@ -2541,45 +2521,34 @@ pub fn render_tools(
                 PackedRgba::rgb(40, 80, 160)
             };
 
-            let mut lines = Vec::new();
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   Agent                 Calls   Msgs   Tokens   Trend  ",
                     ftui::Style::new().fg(cc.muted),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ██████████               ██     ██       ██     ███  ",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ████████████             ██     ██       ██     ███  ",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ██████                   ██     ██       ██     ███  ",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ████████                 ██     ██       ██     ███  ",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     " No tool usage data available for the current filters.",
                     ftui::Style::new().fg(cc.axis).bold(),
-                ),
-            ]));
+                )]),
+            ];
             Paragraph::new(ftui::text::Text::from_lines(lines)).render(area, frame);
             return;
         }
@@ -3073,27 +3042,22 @@ pub fn render_coverage(
                 PackedRgba::rgb(40, 80, 160)
             };
 
-            let mut lines = Vec::new();
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+            let lines = vec![
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ▂▂▃▄▅▆▇██████████████▇▆▅▄▃▂▂   ",
                     ftui::Style::new().fg(accent),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     "   ████████████████████████████   ",
                     ftui::Style::new().fg(primary),
-                ),
-            ]));
-            lines.push(ftui::text::Line::from(""));
-            lines.push(ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled(
+                )]),
+                ftui::text::Line::from(""),
+                ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
                     " No daily data for sparkline",
                     ftui::Style::new().fg(cc.axis).bold(),
-                ),
-            ]));
+                )]),
+            ];
             Paragraph::new(ftui::text::Text::from_lines(lines)).render(chunks[2], frame);
             return;
         }

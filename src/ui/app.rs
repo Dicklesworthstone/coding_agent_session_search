@@ -2452,34 +2452,34 @@ fn decode_html_entities(text: &str) -> String {
         }
         // Find the semicolon to delimit the entity.
         let rest = &text[i + 1..];
-        if let Some(semi) = rest.find(';') {
-            if semi <= 10 {
-                let entity = &rest[..semi];
-                let decoded = if entity.starts_with("#x") || entity.starts_with("#X") {
-                    u32::from_str_radix(&entity[2..], 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                } else if entity.starts_with('#') {
-                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
-                } else {
-                    match entity {
-                        "amp" => Some('&'),
-                        "lt" => Some('<'),
-                        "gt" => Some('>'),
-                        "quot" => Some('"'),
-                        "apos" => Some('\''),
-                        "nbsp" => Some('\u{00a0}'),
-                        _ => None,
-                    }
-                };
-                if let Some(c) = decoded {
-                    out.push(c);
-                    // Skip past the entity (advance the iterator past the semicolon).
-                    for _ in 0..semi + 1 {
-                        chars.next();
-                    }
-                    continue;
+        if let Some(semi) = rest.find(';')
+            && semi <= 10
+        {
+            let entity = &rest[..semi];
+            let decoded = if entity.starts_with("#x") || entity.starts_with("#X") {
+                u32::from_str_radix(&entity[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            } else if let Some(decimal) = entity.strip_prefix('#') {
+                decimal.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                match entity {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some('\u{00a0}'),
+                    _ => None,
                 }
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                // Skip past the entity (advance the iterator past the semicolon).
+                for _ in 0..semi + 1 {
+                    chars.next();
+                }
+                continue;
             }
         }
         out.push('&');
@@ -5487,7 +5487,7 @@ impl CassApp {
         let mut cursor = self.query.len();
         for (byte_idx, ch) in self.query.char_indices() {
             let mut buf = [0u8; 4];
-            let char_width = display_width(ch.encode_utf8(&mut buf)) as usize;
+            let char_width = display_width(ch.encode_utf8(&mut buf));
             let next_cols = consumed_cols.saturating_add(char_width.max(1));
             if click_cols <= consumed_cols {
                 cursor = byte_idx;
@@ -6756,9 +6756,8 @@ impl CassApp {
 
         let max_chars = width as usize;
         let mut used = 0usize;
-        let mut rendered = 0usize;
         let mut spans: Vec<ftui::text::Span<'static>> = Vec::new();
-        for (key, value, style) in lanes {
+        for (rendered, (key, value, style)) in lanes.into_iter().enumerate() {
             let lane_chars = display_width(key) + display_width(&value) + 1; // "key:" + value
             let separator_cost = if rendered == 0 { 1 } else { 3 }; // " " or " · "
             if used + separator_cost + lane_chars > max_chars {
@@ -6774,7 +6773,6 @@ impl CassApp {
             spans.push(ftui::text::Span::styled(format!("{key}:"), label_s));
             spans.push(ftui::text::Span::styled(value, style));
             used += lane_chars;
-            rendered += 1;
         }
 
         if spans.is_empty() {
@@ -12992,7 +12990,7 @@ impl TantivySearchService {
         let cancel_cx = cx.clone();
         let cancel_thread = std::thread::spawn(move || {
             while !cancel_done.load(std::sync::atomic::Ordering::Relaxed) {
-                if cancel_stop.wait_timeout(Duration::from_millis(10)) {
+                if cancel_stop.wait_timeout(Duration::from_millis(4)) {
                     cancel_cx.set_cancel_requested(true);
                     break;
                 }
@@ -13005,13 +13003,15 @@ impl TantivySearchService {
         let live_result = runtime.block_on(async move {
             client
                 .search_progressive_with_callback(
-                    &cx,
-                    &params.query,
-                    params.filters.clone(),
-                    params.limit,
-                    0,
-                    crate::search::query::FieldMask::new(false, true, true, true),
-                    params.mode,
+                    crate::search::query::ProgressiveSearchRequest {
+                        cx: &cx,
+                        query: &params.query,
+                        filters: params.filters.clone(),
+                        limit: params.limit,
+                        sparse_threshold: 0,
+                        field_mask: crate::search::query::FieldMask::new(false, true, true, true),
+                        mode: params.mode,
+                    },
                     |event| {
                         if phase_stop.is_stopped() {
                             return;
@@ -13192,7 +13192,7 @@ impl SearchService for TantivySearchService {
     }
 }
 
-const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(16);
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(8);
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
 
 /// Minimum distance (in terminal cells) for a drag event to be considered
