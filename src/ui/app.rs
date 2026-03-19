@@ -4163,6 +4163,8 @@ pub struct CassApp {
     pub last_pane_first_index: RefCell<usize>,
     /// Last rendered pill hit-test rectangles.
     pub last_pill_rects: RefCell<Vec<(Rect, Pill)>>,
+    /// Last rendered surface tab hit-test rectangles (shell strip).
+    pub last_tab_rects: RefCell<Vec<(Rect, AppSurface)>>,
     /// Last rendered status footer area.
     pub last_status_area: RefCell<Option<Rect>>,
     /// Last rendered content area (results/detail container).
@@ -4383,6 +4385,7 @@ impl Default for CassApp {
             last_pane_rects: RefCell::new(Vec::new()),
             last_pane_first_index: RefCell::new(0),
             last_pill_rects: RefCell::new(Vec::new()),
+            last_tab_rects: RefCell::new(Vec::new()),
             last_status_area: RefCell::new(None),
             last_content_area: RefCell::new(None),
             last_split_handle_area: RefCell::new(None),
@@ -4825,6 +4828,15 @@ impl CassApp {
         {
             return MouseHitRegion::Pill { index: idx };
         }
+        // Check surface tabs (shell strip) before generic SearchBar.
+        if let Some((_, surface)) = self
+            .last_tab_rects
+            .borrow()
+            .iter()
+            .find(|(rect, _)| rect.contains(x, y))
+        {
+            return MouseHitRegion::Tab { surface: *surface };
+        }
         if let Some(rect) = *self.last_search_bar_area.borrow()
             && rect.contains(x, y)
         {
@@ -5227,14 +5239,14 @@ impl CassApp {
         };
 
         let max_chars = width as usize;
-        let mut used = 0usize;
+        let used = std::cell::Cell::new(0usize);
         let mut spans: Vec<ftui::text::Span<'static>> = Vec::new();
         let mut try_push = |text: String, style: ftui::Style| -> bool {
             let cols = display_width(&text);
-            if used + cols > max_chars {
+            if used.get() + cols > max_chars {
                 return false;
             }
-            used += cols;
+            used.set(used.get() + cols);
             spans.push(ftui::text::Span::styled(text, style));
             true
         };
@@ -5245,10 +5257,13 @@ impl CassApp {
             (AppSurface::Analytics, "Analytics", analytics_active_style),
             (AppSurface::Sources, "Sources", sources_active_style),
         ];
+        // Track tab column offsets for mouse hit-testing.
+        let mut tab_col_ranges: Vec<(usize, usize, AppSurface)> = Vec::new();
         for (idx, (surface, label, active_style)) in surface_tabs.iter().enumerate() {
             if idx > 0 && !try_push(" ".to_string(), bracket_style) {
                 break;
             }
+            let tab_start_col = used.get();
             let is_active = *surface == self.surface;
             let tab_style = if is_active {
                 *active_style
@@ -5272,7 +5287,15 @@ impl CassApp {
                     break;
                 }
             }
+            tab_col_ranges.push((tab_start_col, used.get(), *surface));
         }
+        // Store tab column ranges for mouse hit-testing (y will be set by caller).
+        *self.last_tab_rects.borrow_mut() = tab_col_ranges
+            .into_iter()
+            .map(|(start, end, surface)| {
+                (Rect::new(start as u16, 0, (end - start) as u16, 1), surface)
+            })
+            .collect();
 
         let hint_pairs = [
             (shortcuts::SURFACE_ANALYTICS, "analytics"),
@@ -9257,7 +9280,7 @@ impl CassApp {
             let mut hint_lines: Vec<ftui::text::Line<'static>> = Vec::new();
             if self.panes.is_empty() {
                 // No results at all — guide user to search.
-                if content_area.height >= 16 {
+                if content_area.height >= 16 && content_area.width >= 45 {
                     hint_lines.push(ftui::text::Line::from_spans(vec![
                         ftui::text::Span::styled("  ██████╗  █████╗ ███████╗███████╗ ", accent_s),
                     ]));
@@ -12107,6 +12130,8 @@ enum MouseHitRegion {
     Results { pane_idx: usize, item_idx: usize },
     /// Click/scroll landed in the detail pane.
     Detail,
+    /// Click on a surface tab in the shell strip.
+    Tab { surface: AppSurface },
     /// Click/scroll landed in the search bar.
     SearchBar,
     /// Click/scroll landed in the status footer.
@@ -12772,7 +12797,7 @@ impl SearchService for TantivySearchService {
     }
 }
 
-const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(16);
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(450);
 
 /// Minimum distance (in terminal cells) for a drag event to be considered
@@ -17114,6 +17139,20 @@ impl super::ftui_adapter::Model for CassApp {
                             ftui::Cmd::none()
                         }
                     }
+                    // ── Click on surface tab: switch surfaces ──
+                    (MouseEventKind::LeftClick, MouseHitRegion::Tab { surface }) => {
+                        match surface {
+                            AppSurface::Search => {
+                                if self.surface != AppSurface::Search {
+                                    ftui::Cmd::msg(CassMsg::ViewStackPopped)
+                                } else {
+                                    ftui::Cmd::none()
+                                }
+                            }
+                            AppSurface::Analytics => ftui::Cmd::msg(CassMsg::AnalyticsEntered),
+                            AppSurface::Sources => ftui::Cmd::msg(CassMsg::SourcesEntered),
+                        }
+                    }
                     // ── Click in search bar: focus results (query) ──
                     (MouseEventKind::LeftClick, MouseHitRegion::SearchBar) => {
                         if self.focused_region() != FocusRegion::Results {
@@ -17170,30 +17209,48 @@ impl super::ftui_adapter::Model for CassApp {
                                     &db, &filters, group_by,
                                 );
 
-                                let should_auto_rebuild = if data.daily_tokens.is_empty() {
+                                let should_auto_rebuild = if data.is_empty() {
+                                    // Data is empty — check whether messages exist
+                                    // and analytics tables need rebuilding.
                                     match crate::analytics::query::query_status(
                                         db.raw(),
                                         &crate::analytics::AnalyticsFilter::default(),
                                     ) {
                                         Ok(status) => {
-                                            status.coverage.total_messages > 0
-                                                && (status
-                                                    .recommended_action
-                                                    .starts_with("rebuild")
-                                                    || status.drift.signals.iter().any(|signal| {
-                                                        matches!(
-                                                            signal.signal.as_str(),
-                                                            "missing_rollups" | "no_analytics_data"
-                                                        )
-                                                    }))
+                                            let has_messages = status.coverage.total_messages > 0;
+                                            let needs_rebuild = status
+                                                .recommended_action
+                                                .starts_with("rebuild")
+                                                || status.drift.signals.iter().any(|signal| {
+                                                    matches!(
+                                                        signal.signal.as_str(),
+                                                        "missing_rollups" | "no_analytics_data"
+                                                    )
+                                                });
+                                            tracing::debug!(
+                                                has_messages,
+                                                needs_rebuild,
+                                                action = %status.recommended_action,
+                                                "analytics auto-rebuild check"
+                                            );
+                                            has_messages && needs_rebuild
                                         }
-                                        Err(_) => false,
+                                        Err(e) => {
+                                            // query_status failed (likely frankensqlite compat) —
+                                            // try rebuild anyway since we have no data to show.
+                                            tracing::warn!(
+                                                error = %e,
+                                                "analytics query_status failed, attempting rebuild"
+                                            );
+                                            true
+                                        }
                                     }
                                 } else {
                                     false
                                 };
 
                                 if should_auto_rebuild {
+                                    tracing::info!("analytics auto-rebuild triggered");
                                     // rebuild_analytics() requires rusqlite SqliteStorage
                                     match crate::storage::sqlite::SqliteStorage::open(&db_path) {
                                         Ok(mut db_rw) => match db_rw.rebuild_analytics() {
@@ -18042,6 +18099,14 @@ impl super::ftui_adapter::Model for CassApp {
             };
             Block::new().style(shell_bg_style).render(shell_area, frame);
             let shell_line = self.build_surface_shell_line(shell_area.width, &styles, apply_style);
+            // Fix tab hit-test y-coordinates now that we know the shell_area position.
+            {
+                let mut tabs = self.last_tab_rects.borrow_mut();
+                for (rect, _) in tabs.iter_mut() {
+                    rect.x = rect.x.saturating_add(shell_area.x);
+                    rect.y = shell_area.y;
+                }
+            }
             Paragraph::new(ftui::text::Text::from_lines(vec![line_into_static(
                 shell_line,
             )]))
@@ -18053,6 +18118,9 @@ impl super::ftui_adapter::Model for CassApp {
                 layout_area.width,
                 layout_area.height - 1,
             );
+        } else {
+            // Shell strip not rendered — clear stale tab hit regions.
+            self.last_tab_rects.borrow_mut().clear();
         }
 
         // ── Surface routing ──────────────────────────────────────────────
