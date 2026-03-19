@@ -497,12 +497,12 @@ pub struct ScoredResult {
 /// Search phase result for progressive display.
 #[derive(Debug, Clone)]
 pub enum SearchPhase {
-    /// Initial fast results.
+    /// Initial results from fast embeddings.
     Initial {
         results: Vec<ScoredResult>,
         latency_ms: u64,
     },
-    /// Refined quality results.
+    /// Refined results from quality embeddings (if daemon available).
     Refined {
         results: Vec<ScoredResult>,
         latency_ms: u64,
@@ -771,15 +771,27 @@ pub fn normalize_scores(scores: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
-    let min = scores.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let valid_scores = scores.iter().copied().filter(|s| !s.is_nan());
+    let min = valid_scores.clone().fold(f32::INFINITY, f32::min);
+    let max = valid_scores.fold(f32::NEG_INFINITY, f32::max);
+
+    if min.is_infinite() || max.is_infinite() {
+        return vec![0.0; scores.len()];
+    }
+
     let range = max - min;
 
     if range.abs() < f32::EPSILON {
-        return vec![1.0; scores.len()];
+        return scores
+            .iter()
+            .map(|&s| if s.is_nan() { 0.0 } else { 1.0 })
+            .collect();
     }
 
-    scores.iter().map(|&s| (s - min) / range).collect()
+    scores
+        .iter()
+        .map(|&s| if s.is_nan() { 0.0 } else { (s - min) / range })
+        .collect()
 }
 
 /// Blend two score vectors with the given weight for the second vector.
@@ -1019,6 +1031,17 @@ mod tests {
         for n in &normalized {
             assert!((n - 1.0).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn test_score_normalization_constant_with_nan_keeps_nan_zeroed() {
+        let scores = vec![f32::NAN, 0.5, 0.5];
+        let normalized = normalize_scores(&scores);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0], 0.0);
+        assert!((normalized[1] - 1.0).abs() < 0.001);
+        assert!((normalized[2] - 1.0).abs() < 0.001);
     }
 
     #[test]

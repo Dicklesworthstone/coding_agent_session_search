@@ -326,6 +326,25 @@ fn send_key_sequence(writer: &mut (dyn Write + Send), bytes: &[u8]) {
     writer.flush().expect("flush PTY");
 }
 
+fn quit_tui_with_escape(
+    writer: &mut (dyn Write + Send),
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    max_presses: usize,
+    settle: Duration,
+) -> (portable_pty::ExitStatus, usize) {
+    for press in 1..=max_presses {
+        send_key_sequence(writer, b"\x1b");
+        thread::sleep(settle);
+        if let Some(status) = child
+            .try_wait()
+            .expect("poll child after ESC during PTY quit")
+        {
+            return (status, press);
+        }
+    }
+    (wait_for_child_exit(child, PTY_EXIT_TIMEOUT), max_presses)
+}
+
 fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
     assert!(
         !samples.is_empty(),
@@ -2221,10 +2240,10 @@ fn tui_pty_record_macro_creates_file() {
 }
 
 #[test]
-fn tui_play_macro_writes_latency_trace() {
+fn tui_typing_writes_latency_trace() {
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
-    let tracker = tracker_for("tui_play_macro_writes_latency_trace");
+    let tracker = tracker_for("tui_typing_writes_latency_trace");
     let _trace_guard = tracker.trace_env_guard();
     let env = prepare_ftui_pty_env(&trace, &tracker);
 
@@ -2244,10 +2263,7 @@ fn tui_play_macro_writes_latency_trace() {
     let (captured, reader_handle) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take PTY writer");
 
-    let launch_start = tracker.start(
-        "latency_playback",
-        Some("Launching TUI with PTY typing and latency tracing"),
-    );
+    let launch_start = tracker.start("latency_typing", Some("Launching TUI with latency tracing"));
     let mut tui_cmd = CommandBuilder::new(cass_bin_path());
     tui_cmd.arg("tui");
     apply_ftui_env(&mut tui_cmd, &env);
@@ -2265,18 +2281,18 @@ fn tui_play_macro_writes_latency_trace() {
         "Did not observe startup output for latency PTY"
     );
 
-    for byte in b"hello" {
-        send_key_sequence(&mut *writer, &[*byte]);
-        thread::sleep(Duration::from_millis(100));
-    }
-    thread::sleep(Duration::from_millis(600));
-    send_key_sequence(&mut *writer, b"\x1b");
-    thread::sleep(Duration::from_millis(100));
-    send_key_sequence(&mut *writer, b"\x1b");
+    let before_query_len = captured.lock().expect("capture lock").len();
+    send_key_sequence(&mut *writer, b"hello");
+    assert!(
+        wait_for_output_growth(&captured, before_query_len, 24, Duration::from_secs(6)),
+        "Did not observe output growth after live query typing in latency PTY"
+    );
+    thread::sleep(Duration::from_millis(200));
 
-    let status = wait_for_child_exit(&mut *tui_child, PTY_EXIT_TIMEOUT);
+    let (status, esc_presses) =
+        quit_tui_with_escape(&mut *writer, &mut *tui_child, 4, Duration::from_millis(180));
     tracker.end(
-        "latency_playback",
+        "latency_typing",
         Some("Latency PTY typing run complete"),
         launch_start,
     );
@@ -2289,7 +2305,20 @@ fn tui_play_macro_writes_latency_trace() {
     drop(pair);
     let _ = reader_handle.join();
     let raw = captured.lock().expect("capture lock").clone();
-    save_artifact("pty_latency_playback_output.raw", &trace, &raw);
+    save_artifact("pty_latency_typing_output.raw", &trace, &raw);
+    let summary = serde_json::json!({
+        "trace_id": trace,
+        "test": "tui_typing_writes_latency_trace",
+        "esc_presses_to_exit": esc_presses,
+        "captured_bytes": raw.len(),
+    });
+    save_artifact(
+        "pty_latency_trace_summary.json",
+        &trace,
+        serde_json::to_string_pretty(&summary)
+            .expect("serialize latency PTY summary")
+            .as_bytes(),
+    );
 
     assert!(
         latency_path.exists(),

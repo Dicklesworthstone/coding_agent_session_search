@@ -1908,6 +1908,7 @@ impl TuiLatencyRecorder {
 
     fn flush(&mut self) -> anyhow::Result<()> {
         self.finalize_all();
+        self.completed.sort_by_key(|sample| sample.generation);
         if let Some(parent) = self.output_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1923,12 +1924,13 @@ impl TuiLatencyRecorder {
     }
 
     fn finalize_superseded(&mut self, next_generation: u64) {
-        let stale_generations: Vec<u64> = self
+        let mut stale_generations: Vec<u64> = self
             .active
             .keys()
             .copied()
             .filter(|generation| *generation < next_generation)
             .collect();
+        stale_generations.sort_unstable();
         for generation in stale_generations {
             if let Some(mut sample) = self.active.remove(&generation) {
                 sample.superseded_by_generation = Some(next_generation);
@@ -1941,7 +1943,8 @@ impl TuiLatencyRecorder {
     }
 
     fn finalize_all(&mut self) {
-        let generations: Vec<u64> = self.active.keys().copied().collect();
+        let mut generations: Vec<u64> = self.active.keys().copied().collect();
+        generations.sort_unstable();
         for generation in generations {
             if let Some(sample) = self.active.remove(&generation) {
                 let completed = sample.first_visible_at.is_some()
@@ -5393,7 +5396,7 @@ impl CassApp {
                         self.update_dismissed = false;
                         self.update_upgrade_armed = false;
                         self.status = format!(
-                            "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
+                            "Update available v{} -> v{} (Alt+U=upgrade, Alt+N=notes, Alt+I=ignore, Esc=dismiss)",
                             info.current_version, info.latest_version
                         );
                     } else if info.is_skipped {
@@ -13845,6 +13848,15 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Delete if ctrl && shift => CassMsg::StateResetRequested,
                     KeyCode::Delete if ctrl => CassMsg::FiltersClearAll,
 
+                    // -- Update banner --------------------------------------------
+                    KeyCode::Char('u') | KeyCode::Char('U') if alt => {
+                        CassMsg::UpdateUpgradeRequested
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') if alt => {
+                        CassMsg::UpdateReleaseNotesRequested
+                    }
+                    KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
+
                     // -- Sources management -----------------------------------------
                     KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,
                     KeyCode::Char('S') if ctrl && shift => CassMsg::SourcesEntered,
@@ -14172,28 +14184,12 @@ impl super::ftui_adapter::Model for CassApp {
         }
 
         // Update banner shortcuts:
-        // - Shift+U: upgrade (two-step confirm)
-        // - Shift+N: open release notes
-        // - Shift+S: skip version
+        // - Alt+U: upgrade (two-step confirm)
+        // - Alt+N: open release notes
+        // - Alt+I: ignore/skip version
         // - Esc: dismiss banner for this session
-        // Only intercept when the query is empty so that typing a capital
-        // letter during active query editing is not stolen by the banner.
-        if self.can_handle_update_shortcuts() {
-            match &msg {
-                CassMsg::QueryChanged(text) if text == "U" && self.query.is_empty() => {
-                    return self.update(CassMsg::UpdateUpgradeRequested);
-                }
-                CassMsg::QueryChanged(text) if text == "N" && self.query.is_empty() => {
-                    return self.update(CassMsg::UpdateReleaseNotesRequested);
-                }
-                CassMsg::QueryChanged(text) if text == "S" && self.query.is_empty() => {
-                    return self.update(CassMsg::UpdateSkipped);
-                }
-                CassMsg::QuitRequested => {
-                    return self.update(CassMsg::UpdateDismissed);
-                }
-                _ => {}
-            }
+        if self.can_handle_update_shortcuts() && let CassMsg::QuitRequested = msg {
+            return self.update(CassMsg::UpdateDismissed);
         }
 
         // ── Inspector overlay key intercept ─────────────────────────
@@ -17002,7 +16998,7 @@ impl super::ftui_adapter::Model for CassApp {
                 if should_show {
                     self.update_dismissed = false;
                     self.status = format!(
-                        "Update available v{} -> v{} (U=upgrade, N=notes, S=skip, Esc=dismiss)",
+                        "Update available v{} -> v{} (Alt+U=upgrade, Alt+N=notes, Alt+I=ignore, Esc=dismiss)",
                         current, latest
                     );
                 } else if skipped {
@@ -17023,7 +17019,7 @@ impl super::ftui_adapter::Model for CassApp {
                     if !self.update_upgrade_armed {
                         self.update_upgrade_armed = true;
                         self.status = format!(
-                            "Confirm upgrade to v{}: press U again. Esc cancels.",
+                            "Confirm upgrade to v{}: press Alt+U again. Esc cancels.",
                             info.latest_version
                         );
                         return ftui::Cmd::none();
@@ -19064,12 +19060,12 @@ impl super::ftui_adapter::Model for CassApp {
             let banner_area = Rect::new(area.x, area.y, area.width, 1);
             let mut banner_text = if self.update_upgrade_armed {
                 format!(
-                    "Update v{} -> v{} | Press U again to confirm upgrade | N notes | S skip | Esc dismiss",
+                    "Update v{} -> v{} | Press Alt+U again to confirm upgrade | Alt+N notes | Alt+I ignore | Esc dismiss",
                     info.current_version, info.latest_version
                 )
             } else {
                 format!(
-                    "Update v{} -> v{} | U upgrade | N notes | S skip | Esc dismiss",
+                    "Update v{} -> v{} | Alt+U upgrade | Alt+N notes | Alt+I ignore | Esc dismiss",
                     info.current_version, info.latest_version
                 )
             };
@@ -24216,32 +24212,35 @@ mod tests {
     }
 
     #[test]
-    fn update_shortcuts_intercept_shifted_query_when_banner_visible() {
+    fn update_shortcuts_use_alt_modifiers() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('u')).with_modifiers(Modifiers::ALT));
+        assert!(matches!(
+            CassMsg::from(event),
+            CassMsg::UpdateUpgradeRequested
+        ));
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('n')).with_modifiers(Modifiers::ALT));
+        assert!(matches!(
+            CassMsg::from(event),
+            CassMsg::UpdateReleaseNotesRequested
+        ));
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('i')).with_modifiers(Modifiers::ALT));
+        assert!(matches!(CassMsg::from(event), CassMsg::UpdateSkipped));
+    }
+
+    #[test]
+    fn update_banner_does_not_hijack_query_input() {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
 
         let _ = app.update(CassMsg::QueryChanged("U".to_string()));
-        assert!(app.update_upgrade_armed);
-        assert!(app.query.is_empty(), "shortcut should not edit query text");
-
-        let _ = app.update(CassMsg::QueryChanged("S".to_string()));
-        assert!(
-            app.update_dismissed,
-            "skip should dismiss banner in test mode"
-        );
-        assert!(!app.update_upgrade_armed);
-    }
-
-    #[test]
-    fn update_banner_does_not_hijack_lowercase_query_input() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::UpdateCheckCompleted(sample_update_info()));
-
-        let _ = app.update(CassMsg::QueryChanged("u".to_string()));
-        assert_eq!(app.query, "u");
+        assert_eq!(app.query, "U");
         assert!(
             !app.update_upgrade_armed,
-            "lowercase query text should not trigger update action"
+            "query text should not trigger update action"
         );
     }
 
