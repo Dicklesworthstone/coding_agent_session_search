@@ -291,6 +291,7 @@ impl GitHubDeployer {
         progress("copy", "Copying bundle files...");
         let work_dir = temp_dir.join(&self.repo_name);
         copy_bundle_to_repo(bundle_dir, &work_dir)?;
+        configure_git_identity(&work_dir, username)?;
 
         // Step 6: Create orphan branch and push
         progress("push", "Pushing to gh-pages branch...");
@@ -575,6 +576,26 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Configure a local git identity for commits in the temporary deployment clone.
+fn configure_git_identity(repo_dir: &Path, username: &str) -> Result<()> {
+    let email = format!("{username}@users.noreply.github.com");
+
+    for (key, value) in [("user.name", username), ("user.email", email.as_str())] {
+        let output = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(repo_dir)
+            .output()
+            .with_context(|| format!("Failed to set git {key}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to set git {key}: {stderr}");
+        }
+    }
+
+    Ok(())
+}
+
 /// Push to gh-pages branch as orphan
 fn push_gh_pages(repo_dir: &Path) -> Result<String> {
     // Create orphan branch
@@ -848,5 +869,65 @@ mod tests {
         assert!(visited.contains(&"root.txt".to_string()));
         assert!(!visited.contains(&"linked-file.txt".to_string()));
         assert!(!visited.iter().any(|p| p.starts_with("linked-dir/")));
+    }
+
+    #[test]
+    fn test_configure_git_identity_sets_local_commit_metadata() {
+        use tempfile::TempDir;
+
+        let repo = TempDir::new().unwrap();
+        let init = Command::new("git")
+            .args(["init"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        configure_git_identity(repo.path(), "cass-test").unwrap();
+
+        let name = Command::new("git")
+            .args(["config", "user.name"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "cass-test");
+
+        let email = Command::new("git")
+            .args(["config", "user.email"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&email.stdout).trim(),
+            "cass-test@users.noreply.github.com"
+        );
+
+        std::fs::write(repo.path().join("index.html"), "<html></html>").unwrap();
+
+        let add = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let commit = Command::new("git")
+            .args(["commit", "-m", "Test commit"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
     }
 }

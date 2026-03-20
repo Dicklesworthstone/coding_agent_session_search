@@ -1551,19 +1551,54 @@ struct ResolvedSemanticDocId {
 type ProgressiveLookupKey = (String, String, i64);
 type ResolvedSemanticLookupRow = Option<(ProgressiveLookupKey, ResolvedSemanticDocId)>;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
+struct ProgressiveLexicalHit {
+    title: String,
+    snippet: String,
+    content: String,
+    match_type: MatchType,
+    line_number: Option<usize>,
+}
+
+impl ProgressiveLexicalHit {
+    fn from_search_hit(hit: &SearchHit, field_mask: FieldMask) -> Self {
+        Self {
+            title: if field_mask.wants_title() {
+                hit.title.clone()
+            } else {
+                String::new()
+            },
+            snippet: if field_mask.wants_snippet() {
+                hit.snippet.clone()
+            } else {
+                String::new()
+            },
+            content: if field_mask.needs_content() {
+                hit.content.clone()
+            } else {
+                String::new()
+            },
+            match_type: hit.match_type,
+            line_number: hit.line_number,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct ProgressiveLexicalCache {
-    hits_by_message: HashMap<u64, SearchHit>,
+    hits_by_message: HashMap<u64, ProgressiveLexicalHit>,
     wildcard_fallback: bool,
     suggestions: Vec<QuerySuggestion>,
 }
+
+type ProgressiveLexicalSnapshot = Arc<ProgressiveLexicalCache>;
 
 struct CassProgressiveLexicalAdapter {
     client: Arc<SearchClient>,
     filters: SearchFilters,
     field_mask: FieldMask,
     sparse_threshold: usize,
-    shared: Arc<Mutex<ProgressiveLexicalCache>>,
+    shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
 }
 
 impl CassProgressiveLexicalAdapter {
@@ -1572,7 +1607,7 @@ impl CassProgressiveLexicalAdapter {
         filters: SearchFilters,
         field_mask: FieldMask,
         sparse_threshold: usize,
-        shared: Arc<Mutex<ProgressiveLexicalCache>>,
+        shared: Arc<Mutex<ProgressiveLexicalSnapshot>>,
     ) -> Self {
         Self {
             client,
@@ -1631,7 +1666,7 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
                 };
                 hits_by_message
                     .entry(resolved_doc.message_id)
-                    .or_insert_with(|| hit.clone());
+                    .or_insert_with(|| ProgressiveLexicalHit::from_search_hit(hit, self.field_mask));
                 scored.push(FsScoredResult {
                     doc_id: resolved_doc.doc_id,
                     score: hit.score,
@@ -1647,11 +1682,11 @@ impl FsLexicalSearch for CassProgressiveLexicalAdapter {
             }
 
             if let Ok(mut guard) = self.shared.lock() {
-                *guard = ProgressiveLexicalCache {
+                *guard = Arc::new(ProgressiveLexicalCache {
                     hits_by_message,
                     wildcard_fallback: result.wildcard_fallback,
                     suggestions: result.suggestions,
-                };
+                });
             }
 
             Ok(scored)
@@ -3008,7 +3043,8 @@ impl SearchClient {
                 .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
         };
 
-        let lexical_cache = Arc::new(Mutex::new(ProgressiveLexicalCache::default()));
+        let lexical_cache: Arc<Mutex<ProgressiveLexicalSnapshot>> =
+            Arc::new(Mutex::new(Arc::new(ProgressiveLexicalCache::default())));
         let text_cache: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let text_client = Arc::clone(self);
         let text_cache_for_lookup = Arc::clone(&text_cache);
@@ -3060,7 +3096,7 @@ impl SearchClient {
                 if phase_error.is_some() {
                     return;
                 }
-                let lexical_snapshot = phase_cache.lock().ok().map(|guard| guard.clone());
+                let lexical_snapshot = phase_cache.lock().ok().map(|guard| Arc::clone(&guard));
                 let event_result = match phase {
                     FsSearchPhase::Initial {
                         results, latency, ..
@@ -3069,7 +3105,7 @@ impl SearchClient {
                             &results,
                             &phase_filters,
                             field_mask,
-                            lexical_snapshot.as_ref(),
+                            lexical_snapshot.as_deref(),
                             limit,
                             fetch_limit,
                         )
@@ -3085,7 +3121,7 @@ impl SearchClient {
                             &results,
                             &phase_filters,
                             field_mask,
-                            lexical_snapshot.as_ref(),
+                            lexical_snapshot.as_deref(),
                             limit,
                             fetch_limit,
                         )
@@ -6086,6 +6122,42 @@ mod tests {
         metrics.inc_reload();
         let (hits, miss, shortfall, reloads, _) = metrics.snapshot_all();
         assert_eq!((hits, miss, shortfall, reloads), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn progressive_lexical_hit_omits_unused_content() {
+        let hit = SearchHit {
+            title: "hello world".into(),
+            snippet: "hello **world**".into(),
+            content: "hello world from a much larger conversation body".into(),
+            content_hash: stable_content_hash("hello world from a much larger conversation body"),
+            score: 1.0,
+            source_path: "p".into(),
+            agent: "a".into(),
+            workspace: "w".into(),
+            workspace_original: None,
+            created_at: None,
+            line_number: Some(3),
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+        };
+
+        let snippet_only =
+            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(false, true, true, true));
+        assert_eq!(snippet_only.title, hit.title);
+        assert_eq!(snippet_only.snippet, hit.snippet);
+        assert!(
+            snippet_only.content.is_empty(),
+            "snippet-only progressive cache should not retain full content"
+        );
+        assert_eq!(snippet_only.match_type, hit.match_type);
+        assert_eq!(snippet_only.line_number, hit.line_number);
+
+        let full =
+            ProgressiveLexicalHit::from_search_hit(&hit, FieldMask::new(true, true, true, true));
+        assert_eq!(full.content, hit.content);
     }
 
     #[test]
