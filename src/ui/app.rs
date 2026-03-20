@@ -11180,7 +11180,7 @@ impl CassApp {
                 ("Alt+= / Alt+-", "Increase/decrease pane items"),
                 ("Alt+D", "Toggle detail preview pane"),
                 ("Ctrl+D", "Cycle density mode (compact/cozy/spacious)"),
-                ("F2/Shift+F2", "Next/prev theme"),
+                ("F2 / Alt+T", "Next/prev theme"),
                 ("Ctrl+B", "Toggle border style"),
             ],
         );
@@ -13781,25 +13781,45 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                     // -- Theme ----------------------------------------------------
                     KeyCode::F(2) if shift => CassMsg::ThemePreviousToggled,
+                    KeyCode::Char('t') if alt && shift => CassMsg::ThemePreviousToggled,
+                    KeyCode::Char('T') if alt && shift => CassMsg::ThemePreviousToggled,
                     KeyCode::F(2) => CassMsg::ThemeToggled,
+                    KeyCode::Char('t') if alt && !shift => CassMsg::ThemeToggled,
+                    KeyCode::Char('T') if alt && !shift => CassMsg::ThemeToggled,
 
                     // -- Filters --------------------------------------------------
                     KeyCode::F(3) if shift => CassMsg::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('g') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
+                    KeyCode::Char('G') if alt && shift => CassMsg::FilterAgentSet(HashSet::new()),
                     KeyCode::F(3) => CassMsg::InputModeEntered(InputMode::Agent),
+                    KeyCode::Char('g') if alt && !shift => CassMsg::InputModeEntered(InputMode::Agent),
+                    KeyCode::Char('G') if alt && !shift => CassMsg::InputModeEntered(InputMode::Agent),
+
                     KeyCode::F(4) if shift => CassMsg::FiltersClearAll,
+                    KeyCode::Char('w') if alt && shift => CassMsg::FiltersClearAll,
+                    KeyCode::Char('W') if alt && shift => CassMsg::FiltersClearAll,
                     KeyCode::F(4) => CassMsg::InputModeEntered(InputMode::Workspace),
+                    KeyCode::Char('w') if alt && !shift => CassMsg::InputModeEntered(InputMode::Workspace),
+                    KeyCode::Char('W') if alt && !shift => CassMsg::InputModeEntered(InputMode::Workspace),
+
                     KeyCode::F(5) if shift => CassMsg::TimePresetCycled,
                     KeyCode::F(5) => CassMsg::InputModeEntered(InputMode::CreatedFrom),
                     KeyCode::F(6) => CassMsg::InputModeEntered(InputMode::CreatedTo),
 
                     // -- Context window -------------------------------------------
                     KeyCode::F(7) => CassMsg::ContextWindowCycled,
+                    KeyCode::Char('c') if alt => CassMsg::ContextWindowCycled,
+                    KeyCode::Char('C') if alt => CassMsg::ContextWindowCycled,
 
                     // -- Editor ---------------------------------------------------
                     KeyCode::F(8) => CassMsg::OpenInEditor,
+                    KeyCode::Char('o') if alt => CassMsg::OpenInEditor,
+                    KeyCode::Char('O') if alt => CassMsg::OpenInEditor,
 
                     // -- Match mode -----------------------------------------------
                     KeyCode::F(9) => CassMsg::MatchModeCycled,
+                    KeyCode::Char('m') if alt => CassMsg::MatchModeCycled,
+                    KeyCode::Char('M') if alt => CassMsg::MatchModeCycled,
 
                     // -- Source filter ---------------------------------------------
                     KeyCode::F(11) if shift => CassMsg::SourceFilterMenuToggled,
@@ -13807,6 +13827,8 @@ impl From<super::ftui_adapter::Event> for CassMsg {
 
                     // -- Ranking --------------------------------------------------
                     KeyCode::F(12) => CassMsg::RankingModeCycled,
+                    KeyCode::Char('r') if alt => CassMsg::RankingModeCycled,
+                    KeyCode::Char('R') if alt => CassMsg::RankingModeCycled,
 
                     // -- Search mode (Alt+S) --------------------------------------
                     KeyCode::Char('s') if ctrl && !shift => CassMsg::StatsBarToggled,
