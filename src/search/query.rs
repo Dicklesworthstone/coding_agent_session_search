@@ -4920,7 +4920,7 @@ mod tests {
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
-    use crate::storage::sqlite::{FrankenStorage, SqliteStorage};
+    use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::compat::BatchExt;
     use serde_json::json;
     use tempfile::TempDir;
@@ -5103,28 +5103,70 @@ mod tests {
 
     fn build_progressive_hybrid_fixture() -> Result<ProgressiveHybridFixture> {
         let dir = TempDir::new()?;
-        let db_path = dir.path().join("cass.db");
-        let mut storage = SqliteStorage::open(&db_path)?;
         let mut index = TantivyIndex::open_or_create(dir.path())?;
-
-        let agent = Agent {
-            id: None,
-            slug: "codex".into(),
-            name: "Codex".into(),
-            version: None,
-            kind: AgentKind::Cli,
-        };
-        let agent_id = storage.ensure_agent(&agent)?;
         let workspace_path = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace_path)?;
-        let workspace_id = storage.ensure_workspace(&workspace_path, None)?;
+        let agent_id = 1_i64;
+        let workspace_id = 1_i64;
+        let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
+        let source_hash = crc32fast::hash(source_id.as_bytes());
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+            CREATE TABLE sources (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                origin_host TEXT,
+                started_at INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at INTEGER,
+                content TEXT NOT NULL
+            );
+            "#,
+        )?;
+        conn.execute_compat(
+            "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
+            params![agent_id, "codex"],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
+            params![workspace_id, workspace_path.to_string_lossy().to_string()],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO sources (id, kind) VALUES (?1, ?2)",
+            params![source_id, "local"],
+        )?;
 
         let query = "oauth refresh token middleware session cache".to_string();
         let filler = " context window ranking provenance semantic upgrade lexical overlay";
         let base_ts = 1_700_000_100_000_i64;
         let doc_count = 64usize;
+        let mut message_rows = Vec::with_capacity(doc_count);
 
         for idx in 0..doc_count {
+            let conversation_id = i64::try_from(idx + 1)?;
+            let message_id = u64::try_from(idx + 1)?;
             let source_path = dir.path().join(format!("progressive-{idx:03}.jsonl"));
             let repeated = filler.repeat(48);
             let content = if idx % 4 == 0 {
@@ -5145,35 +5187,38 @@ mod tests {
                 )
             };
             let created_at = base_ts + idx as i64;
+            let source_path_str = source_path.to_string_lossy().to_string();
+            let title = format!("progressive fixture {idx}");
 
-            let conversation = Conversation {
-                id: None,
-                agent_slug: agent.slug.clone(),
-                workspace: Some(workspace_path.clone()),
-                external_id: Some(format!("progressive-{idx}")),
-                title: Some(format!("progressive fixture {idx}")),
-                source_path: source_path.clone(),
-                started_at: Some(created_at),
-                ended_at: Some(created_at),
-                approx_tokens: Some(256),
-                metadata_json: json!({"fixture": "progressive_hybrid"}),
-                messages: vec![Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: Some("user".into()),
-                    created_at: Some(created_at),
-                    content: content.clone(),
-                    extra_json: json!({}),
-                    snippets: Vec::new(),
-                }],
-                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
-                origin_host: None,
-            };
-            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+            conn.execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, title, source_path, source_id, origin_host, started_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                params![
+                    conversation_id,
+                    agent_id,
+                    workspace_id,
+                    title,
+                    source_path_str.clone(),
+                    source_id,
+                    created_at
+                ],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, created_at, content
+                 ) VALUES (?1, ?2, 0, 'user', ?3, ?4)",
+                params![
+                    i64::try_from(message_id)?,
+                    conversation_id,
+                    created_at,
+                    content.clone()
+                ],
+            )?;
+            message_rows.push((message_id, created_at, content.clone()));
 
             let normalized = NormalizedConversation {
-                agent_slug: agent.slug.clone(),
+                agent_slug: "codex".into(),
                 external_id: Some(format!("progressive-{idx}")),
                 title: Some(format!("progressive fixture {idx}")),
                 workspace: Some(workspace_path.clone()),
@@ -5195,25 +5240,6 @@ mod tests {
         }
         index.commit()?;
 
-        let message_rows: Vec<(u64, i64, String)> = {
-            let mut stmt = storage.raw().prepare(
-                "SELECT m.id, COALESCE(m.created_at, c.started_at, 0), m.content
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 ORDER BY c.id",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let message_id: i64 = row.get(0)?;
-                let created_at: i64 = row.get(1)?;
-                let content: String = row.get(2)?;
-                Ok((
-                    u64::try_from(message_id).unwrap_or(u64::MAX),
-                    created_at,
-                    content,
-                ))
-            })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-        };
         assert_eq!(
             message_rows.len(),
             doc_count,
@@ -5222,17 +5248,13 @@ mod tests {
 
         let fast_embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
         let quality_embedder = crate::search::hash_embedder::HashEmbedder::new(384);
-        let source_hash = crc32fast::hash(crate::sources::provenance::LOCAL_SOURCE_ID.as_bytes());
         let filter_maps = SemanticFilterMaps::for_tests(
-            HashMap::from([(agent.slug.clone(), u32::try_from(agent_id)?)]),
+            HashMap::from([("codex".to_string(), u32::try_from(agent_id)?)]),
             HashMap::from([(
                 workspace_path.to_string_lossy().to_string(),
                 u32::try_from(workspace_id)?,
             )]),
-            HashMap::from([(
-                crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
-                source_hash,
-            )]),
+            HashMap::from([(source_id.to_string(), source_hash)]),
             HashSet::new(),
         );
         let fast_path = dir.path().join("vector.fast.idx");
@@ -5274,15 +5296,12 @@ mod tests {
         }
         fast_writer.finish()?;
         quality_writer.finish()?;
-        drop(storage);
 
         let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
         let client = SearchClient {
             reader,
-            sqlite: Mutex::new(Some(SendConnection(Connection::open(
-                db_path.to_string_lossy().into_owned(),
-            )?))),
-            sqlite_path: Some(db_path.clone()),
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
