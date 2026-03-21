@@ -672,7 +672,7 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with(&prefix)
+                && is_backup_root_name(name, &prefix)
                 && let Ok(meta) = fs::metadata(&path)
                 && let Ok(mtime) = meta.modified()
             {
@@ -695,6 +695,10 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
     }
 
     Ok(())
+}
+
+fn is_backup_root_name(name: &str, prefix: &str) -> bool {
+    name.starts_with(prefix) && !name.ends_with("-wal") && !name.ends_with("-shm")
 }
 
 /// Public schema version constant for external checks.
@@ -1171,192 +1175,6 @@ ALTER TABLE conversations ADD COLUMN api_call_count INTEGER;
 ALTER TABLE conversations ADD COLUMN tool_call_count INTEGER;
 ALTER TABLE conversations ADD COLUMN user_message_count INTEGER;
 ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
-";
-
-const MIGRATION_V11: &str = r"
--- Analytics fact table: one row per message with pre-extracted metrics.
--- Designed for fast analytical queries without touching message content.
--- Buckets use message created_at (not conversation started_at).
-CREATE TABLE IF NOT EXISTS message_metrics (
-    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
-    created_at_ms INTEGER NOT NULL,
-    hour_id INTEGER NOT NULL,          -- hours since 2020-01-01 00:00 UTC
-    day_id INTEGER NOT NULL,           -- days since 2020-01-01 (matches daily_stats)
-
-    -- Dimensions
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,  -- 0 = unknown
-    source_id TEXT NOT NULL DEFAULT 'local',
-    role TEXT NOT NULL,                -- user/assistant/tool/system/other
-
-    -- Content-size metrics (always available, every message)
-    content_chars INTEGER NOT NULL,
-    content_tokens_est INTEGER NOT NULL,  -- chars/4 deterministic estimate
-
-    -- API usage metrics (nullable — only agents with provider data)
-    api_input_tokens INTEGER,
-    api_output_tokens INTEGER,
-    api_cache_read_tokens INTEGER,
-    api_cache_creation_tokens INTEGER,
-    api_thinking_tokens INTEGER,
-    api_service_tier TEXT,
-    api_data_source TEXT NOT NULL DEFAULT 'estimated',  -- 'api' or 'estimated'
-
-    -- Tool / plan flags
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    has_tool_calls INTEGER NOT NULL DEFAULT 0,  -- 0/1
-    has_plan INTEGER NOT NULL DEFAULT 0         -- 0/1 (cheap heuristic)
-);
-
-CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
-
--- Hourly rollup table: fast time-series queries at hour granularity.
--- Keyed by (hour_id, agent_slug, workspace_id, source_id).
-CREATE TABLE IF NOT EXISTS usage_hourly (
-    hour_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,  -- messages with api_data_source='api'
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
-CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
-
--- Daily rollup table: same schema as hourly, keyed by day_id.
--- Avoids summing 24 hourly rows for daily queries.
-CREATE TABLE IF NOT EXISTS usage_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
-";
-
-const MIGRATION_V12: &str = r"
--- Add model dimensions to message_metrics for model-aware Track A analytics.
-ALTER TABLE message_metrics ADD COLUMN model_name TEXT;
-ALTER TABLE message_metrics ADD COLUMN model_family TEXT NOT NULL DEFAULT 'unknown';
-ALTER TABLE message_metrics ADD COLUMN model_tier TEXT NOT NULL DEFAULT 'unknown';
-ALTER TABLE message_metrics ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown';
-
-CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
-
--- Daily model rollups for fast model-oriented analytics queries.
-CREATE TABLE IF NOT EXISTS usage_models_daily (
-    day_id INTEGER NOT NULL,
-    agent_slug TEXT NOT NULL,
-    workspace_id INTEGER NOT NULL DEFAULT 0,
-    source_id TEXT NOT NULL DEFAULT 'local',
-    model_family TEXT NOT NULL DEFAULT 'unknown',
-    model_tier TEXT NOT NULL DEFAULT 'unknown',
-
-    -- Counts
-    message_count INTEGER NOT NULL DEFAULT 0,
-    user_message_count INTEGER NOT NULL DEFAULT 0,
-    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-    tool_call_count INTEGER NOT NULL DEFAULT 0,
-    plan_message_count INTEGER NOT NULL DEFAULT 0,
-    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
-
-    -- Content-estimated tokens
-    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
-    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
-
-    -- API tokens
-    api_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
-    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
-
-    last_updated INTEGER NOT NULL DEFAULT 0,
-
-    PRIMARY KEY (
-        day_id,
-        agent_slug,
-        workspace_id,
-        source_id,
-        model_family,
-        model_tier
-    )
-);
-
-CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
-CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
-";
-
-const MIGRATION_V13: &str = r"
--- Add plan-attributed token rollups to usage tables.
-ALTER TABLE usage_hourly ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE usage_hourly ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
-
-ALTER TABLE usage_daily ADD COLUMN plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE usage_daily ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
 ";
 
 const MIGRATION_V14: &str = r"
@@ -5617,6 +5435,52 @@ mod tests {
         assert!(backups.len() <= 3);
     }
 
+    #[test]
+    fn cleanup_old_backups_ignores_wal_and_shm_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        for i in 0..3 {
+            let backup_name = format!("test.db.backup.{}", 1000 + i);
+            let backup_path = dir.path().join(&backup_name);
+            std::fs::write(&backup_path, format!("backup {i}")).unwrap();
+            std::fs::write(format!("{}-wal", backup_path.display()), b"wal").unwrap();
+            std::fs::write(format!("{}-shm", backup_path.display()), b"shm").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        cleanup_old_backups(&db_path, 2).unwrap();
+
+        let mut roots = Vec::new();
+        let mut wals = Vec::new();
+        let mut shms = Vec::new();
+        for entry in std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with("-wal") {
+                wals.push(name);
+            } else if name.ends_with("-shm") {
+                shms.push(name);
+            } else if name.contains("backup") {
+                roots.push(name);
+            }
+        }
+
+        assert_eq!(roots.len(), 2, "should keep two backup roots");
+        assert_eq!(
+            wals.len(),
+            2,
+            "should keep WAL sidecars only for retained backups"
+        );
+        assert_eq!(
+            shms.len(),
+            2,
+            "should keep SHM sidecars only for retained backups"
+        );
+    }
+
     // =========================================================================
     // Storage open/create tests (bead yln.4)
     // =========================================================================
@@ -5689,6 +5553,31 @@ mod tests {
         let reopened = SqliteStorage::open_or_rebuild(&db_path)
             .expect("current schema DB should open without rebuild");
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_or_rebuild_does_not_treat_non_database_paths_as_corruption() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db_dir");
+        std::fs::create_dir(&db_path).unwrap();
+
+        let result = SqliteStorage::open_or_rebuild(&db_path);
+
+        match result {
+            Err(MigrationError::Database(_)) | Err(MigrationError::Io(_)) => {}
+            Err(MigrationError::RebuildRequired { reason, .. }) => {
+                panic!("should not rebuild non-database path: {reason}")
+            }
+            Err(MigrationError::Other(msg)) => {
+                panic!("should preserve underlying open error, got Other: {msg}")
+            }
+            Ok(_) => panic!("directory path must not open as a database"),
+        }
+
+        assert!(
+            db_path.is_dir(),
+            "non-database directory must be left in place"
+        );
     }
 
     // =========================================================================
@@ -5903,10 +5792,8 @@ mod tests {
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
             )
             .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')",
-            )
-            .unwrap();
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '10')")
+                .unwrap();
             // Apply V1-V10 so schema is correct
             let mut tx = conn.transaction().unwrap();
             tx.execute_batch(MIGRATION_V1).unwrap();
@@ -5919,10 +5806,8 @@ mod tests {
             tx.execute_batch(MIGRATION_V8).unwrap();
             tx.execute_batch(MIGRATION_V9).unwrap();
             tx.execute_batch(MIGRATION_V10).unwrap();
-            tx.execute(
-                "UPDATE meta SET value = '10' WHERE key = 'schema_version'",
-            )
-            .unwrap();
+            tx.execute("UPDATE meta SET value = '10' WHERE key = 'schema_version'")
+                .unwrap();
             tx.commit().unwrap();
         }
 
@@ -5957,7 +5842,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         // Register agent + workspace
         let agent = Agent {
@@ -6416,7 +6301,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         // Register agent
         let agent = Agent {
@@ -6908,7 +6793,7 @@ mod tests {
     fn set_and_get_last_scan_ts() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
-        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let storage = SqliteStorage::open(&db_path).unwrap();
 
         let expected_ts = 1700000000000_i64;
         storage.set_last_scan_ts(expected_ts).unwrap();
