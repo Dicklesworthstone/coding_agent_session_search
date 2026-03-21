@@ -46,6 +46,21 @@ fn test_prerequisites_ready_with_api_credentials() {
 }
 
 #[test]
+fn test_prerequisites_ready_with_api_credentials_without_wrangler() {
+    let prereqs = Prerequisites {
+        wrangler_version: None,
+        wrangler_authenticated: false,
+        account_email: None,
+        api_credentials_present: true,
+        account_id: Some("abc123".to_string()),
+        disk_space_mb: 10000,
+    };
+
+    assert!(prereqs.is_ready());
+    assert!(prereqs.missing().is_empty());
+}
+
+#[test]
 fn test_prerequisites_wrangler_not_installed() {
     let prereqs = Prerequisites {
         wrangler_version: None,
@@ -329,7 +344,7 @@ fn test_auth_state_combinations() {
         (true, true, true, true),     // Both OK
         (true, false, false, false),  // Neither auth method
         (false, false, false, false), // No wrangler
-        (false, true, true, false),   // Auth but no wrangler
+        (false, true, true, true),    // API credentials allow direct deploy without wrangler
     ];
 
     for (has_wrangler, interactive, api_creds, expected_ready) in test_cases {

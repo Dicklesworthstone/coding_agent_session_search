@@ -4109,7 +4109,7 @@ impl SqliteStorage {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
+            .with_context(|| format!("opening sqlite db readonly at {}", path.display()))?;
 
         apply_common_pragmas(&conn)?;
 
@@ -6386,7 +6386,6 @@ impl SqliteStorage {
              WHERE day_id BETWEEN ? AND ? AND agent_slug = ? AND source_id = ?
              ORDER BY day_id",
         )?;
-
         let rows = stmt.query_map(params![start_day, end_day, agent, source], |row| {
             Ok(DailyCount {
                 day_id: row.get(0)?,
@@ -6395,7 +6394,6 @@ impl SqliteStorage {
                 chars: row.get(3)?,
             })
         })?;
-
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -6434,10 +6432,10 @@ impl SqliteStorage {
         let tx = self.conn.transaction()?;
 
         // Step 1: Clear analytics tables
-        tx.execute("DELETE FROM message_metrics", [])?;
-        tx.execute("DELETE FROM usage_hourly", [])?;
-        tx.execute("DELETE FROM usage_daily", [])?;
-        tx.execute("DELETE FROM usage_models_daily", [])?;
+        tx.execute("DELETE FROM message_metrics")?;
+        tx.execute("DELETE FROM usage_hourly")?;
+        tx.execute("DELETE FROM usage_daily")?;
+        tx.execute("DELETE FROM usage_models_daily")?;
 
         // Step 2: Stream messages in chunks, extract metrics, batch insert
         const CHUNK_SIZE: i64 = 10_000;
@@ -6783,7 +6781,7 @@ impl SqliteStorage {
             .unwrap_or(0);
 
         // Clear existing stats
-        tx.execute("DELETE FROM daily_stats", [])?;
+        tx.execute("DELETE FROM daily_stats")?;
 
         // Rebuild from conversations table - per agent, per source
         // Note: COALESCE wraps the entire day_id calculation to match Rust's unwrap_or(0) behavior
@@ -7154,10 +7152,7 @@ fn init_meta(conn: &mut Connection) -> Result<()> {
 
     if existing.is_none() {
         // Start at version 0 so migrate() applies full schema on first open.
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', 0)",
-            [],
-        )?;
+        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', 0)", [])?;
     }
 
     Ok(())
@@ -7671,7 +7666,7 @@ fn update_daily_stats_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
         for (day_id, agent, source, delta) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -7682,7 +7677,7 @@ fn update_daily_stats_batched_in_tx(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_affected)
@@ -7724,7 +7719,7 @@ fn insert_token_usage_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
         for e in chunk {
             params_vec.push(e.message_id.into());
             params_vec.push(e.conversation_id.into());
@@ -7732,7 +7727,7 @@ fn insert_token_usage_batched_in_tx(
             params_vec.push(
                 e.workspace_id
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(e.source_id.clone().into());
             params_vec.push(e.timestamp_ms.into());
@@ -7741,66 +7736,66 @@ fn insert_token_usage_batched_in_tx(
                 e.model_name
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.model_family
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.model_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.service_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.provider
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.input_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.output_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.cache_read_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.cache_creation_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.thinking_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.total_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.estimated_cost_usd
-                    .map(rusqlite::types::Value::Real)
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .map(|v| ParamValue::from(v))
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(e.role.clone().into());
             params_vec.push(e.content_chars.into());
@@ -7809,7 +7804,7 @@ fn insert_token_usage_batched_in_tx(
             params_vec.push(e.data_source.clone().into());
         }
 
-        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_inserted += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_inserted)
@@ -7864,7 +7859,7 @@ fn update_token_daily_stats_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 19);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 19);
         for (day_id, agent, source, model, delta) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -7882,12 +7877,12 @@ fn update_token_daily_stats_batched_in_tx(
             params_vec.push(delta.grand_total_tokens.into());
             params_vec.push(delta.total_content_chars.into());
             params_vec.push(delta.total_tool_calls.into());
-            params_vec.push(rusqlite::types::Value::Real(delta.estimated_cost_usd));
+            params_vec.push(ParamValue::from(delta.estimated_cost_usd));
             params_vec.push(delta.session_count.into());
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_affected)
@@ -7928,7 +7923,7 @@ fn insert_message_metrics_batched_in_tx(
             placeholders
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 24);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 24);
         for e in chunk {
             params_vec.push(e.message_id.into());
             params_vec.push(e.created_at_ms.into());
@@ -7944,7 +7939,7 @@ fn insert_message_metrics_batched_in_tx(
                 e.model_name
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(e.model_family.clone().into());
             params_vec.push(e.model_tier.clone().into());
@@ -7952,33 +7947,33 @@ fn insert_message_metrics_batched_in_tx(
             params_vec.push(
                 e.api_input_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.api_output_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.api_cache_read_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.api_cache_creation_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.api_thinking_tokens
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(
                 e.api_service_tier
                     .clone()
                     .map(|v| v.into())
-                    .unwrap_or(rusqlite::types::Value::Null),
+                    .unwrap_or(ParamValue(frankensqlite::SqliteValue::Null)),
             );
             params_vec.push(e.api_data_source.clone().into());
             params_vec.push(e.tool_call_count.into());
@@ -7986,7 +7981,7 @@ fn insert_message_metrics_batched_in_tx(
             params_vec.push((e.has_plan as i64).into());
         }
 
-        total_inserted += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_inserted += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_inserted)
@@ -8064,7 +8059,7 @@ fn flush_rollup_table(
                 last_updated = excluded.last_updated"
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
         for &((bucket_id, agent, workspace_id, source), d) in chunk {
             params_vec.push((*bucket_id).into());
             params_vec.push(agent.clone().into());
@@ -8090,7 +8085,7 @@ fn flush_rollup_table(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_affected)
@@ -8147,7 +8142,7 @@ fn flush_model_daily_rollup_table(
                 last_updated = excluded.last_updated"
         );
 
-        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 22);
+        let mut params_vec: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 22);
         for &((day_id, agent, workspace_id, source, model_family, model_tier), d) in chunk {
             params_vec.push((*day_id).into());
             params_vec.push(agent.clone().into());
@@ -8173,7 +8168,7 @@ fn flush_model_daily_rollup_table(
             params_vec.push(now.into());
         }
 
-        total_affected += tx.execute(&sql, rusqlite::params_from_iter(params_vec))?;
+        total_affected += tx.execute_with_params(&sql, &param_slice_to_values(&params_vec))?;
     }
 
     Ok(total_affected)
@@ -9257,10 +9252,10 @@ mod tests {
         assert!(orig_models_daily > 0);
 
         // Destroy analytics tables (simulate corruption)
-        conn.execute("DELETE FROM message_metrics", []).unwrap();
-        conn.execute("DELETE FROM usage_hourly", []).unwrap();
-        conn.execute("DELETE FROM usage_daily", []).unwrap();
-        conn.execute("DELETE FROM usage_models_daily", []).unwrap();
+        conn.execute("DELETE FROM message_metrics").unwrap();
+        conn.execute("DELETE FROM usage_hourly").unwrap();
+        conn.execute("DELETE FROM usage_daily").unwrap();
+        conn.execute("DELETE FROM usage_models_daily").unwrap();
 
         // Verify they're empty
         let zero: i64 = conn
@@ -10175,12 +10170,12 @@ mod tests {
 
         storage
             .conn
-            .execute(
+            .execute_compat(
                 "INSERT INTO model_pricing (
                     model_pattern, provider, input_cost_per_mtok, output_cost_per_mtok,
                     cache_read_cost_per_mtok, cache_creation_cost_per_mtok, effective_date
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
+                fparams![
                     "broken-model%",
                     "test",
                     1.0_f64,
