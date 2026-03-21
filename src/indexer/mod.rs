@@ -3535,7 +3535,9 @@ mod tests {
             .unwrap()
             .flatten()
             .collect();
-        if !cols.iter().any(|c| c == "created_at") {
+        // Contentless FTS5 (V14) should NOT have message_id column.
+        // If it has message_id or is missing created_at, recreate.
+        if !cols.iter().any(|c| c == "created_at") || cols.iter().any(|c| c == "message_id") {
             conn.execute_batch(
                 r#"
 DROP TABLE IF EXISTS fts_messages;
@@ -3546,7 +3548,7 @@ CREATE VIRTUAL TABLE fts_messages USING fts5(
     workspace,
     source_path,
     created_at UNINDEXED,
-    message_id UNINDEXED,
+    content='',
     tokenize='porter'
 );
 "#,

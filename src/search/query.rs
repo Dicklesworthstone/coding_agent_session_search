@@ -4028,10 +4028,23 @@ impl SearchClient {
         Ok(hits)
     }
 
+    fn sqlite_fts_uses_message_id_column(conn: &Connection) -> bool {
+        conn.query_map_collect(
+            "PRAGMA table_info(fts_messages)",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed::<String>(1),
+        )
+        .map(|columns: Vec<String>| columns.iter().any(|name| name == "message_id"))
+        .unwrap_or(false)
+    }
+
     /// FTS5 fallback search using frankensqlite SQL aux functions.
     ///
     /// Mirrors `browse_by_date_sqlite` query/filter logic while using
-    /// `bm25(fts_messages)` for ranking and `snippet(...)` for lexical previews.
+    /// `bm25(fts_messages)` for ranking and canonical message/conversation
+    /// tables for payload fields. The JOIN predicate is schema-adaptive so the
+    /// fallback works with both legacy `message_id` FTS tables and the newer
+    /// contentless `rowid = messages.id` layout.
     fn search_sqlite_fts5(
         &self,
         conn: &Connection,
@@ -4047,31 +4060,38 @@ impl SearchClient {
         };
 
         let query_match_type = dominant_match_type(raw_query);
-
-        let content_expr = if field_mask.needs_content() {
-            "fts_messages.content"
+        let message_join = if Self::sqlite_fts_uses_message_id_column(conn) {
+            "CAST(fts_messages.message_id AS INTEGER) = m.id"
         } else {
-            "''"
+            "fts_messages.rowid = m.id"
         };
-        let snippet_expr = if field_mask.wants_snippet() {
-            "snippet(fts_messages, 0, '<b>', '</b>', '...', 24)"
+
+        // Contentless FTS5 cannot project stored columns directly, and we want
+        // consistent results for legacy schemas too, so payload fields always
+        // come from the canonical tables.
+        let content_expr = if field_mask.needs_content() {
+            "m.content"
+        } else if field_mask.wants_snippet() {
+            "substr(m.content, 1, 512)"
         } else {
             "''"
         };
         let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
+            "c.title"
         } else {
             "''"
         };
 
         let mut sql = format!(
-            "SELECT {title_expr}, {content_expr}, {snippet_expr}, fts_messages.agent,
-                    COALESCE(fts_messages.workspace, ''), fts_messages.source_path,
-                    CAST(fts_messages.created_at AS INTEGER), m.idx, c.source_id, c.origin_host,
+            "SELECT {title_expr}, {content_expr}, a.slug,
+                    COALESCE(w.path, ''), c.source_path,
+                    m.created_at, m.idx, c.source_id, c.origin_host,
                     COALESCE(s.kind, 'local'), bm25(fts_messages)
              FROM fts_messages
-             LEFT JOIN messages m ON CAST(fts_messages.message_id AS INTEGER) = m.id
-             LEFT JOIN conversations c ON m.conversation_id = c.id
+             JOIN messages m ON {message_join}
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
              WHERE fts_messages MATCH ?"
         );
@@ -4079,7 +4099,7 @@ impl SearchClient {
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(" AND fts_messages.agent IN ({placeholders})"));
+            sql.push_str(&format!(" AND a.slug IN ({placeholders})"));
             for a in &filters.agents {
                 params.push(ParamValue::from(a.as_str()));
             }
@@ -4087,20 +4107,18 @@ impl SearchClient {
 
         if !filters.workspaces.is_empty() {
             let placeholders = sql_placeholders(filters.workspaces.len());
-            sql.push_str(&format!(
-                " AND COALESCE(fts_messages.workspace, '') IN ({placeholders})"
-            ));
+            sql.push_str(&format!(" AND COALESCE(w.path, '') IN ({placeholders})"));
             for w in &filters.workspaces {
                 params.push(ParamValue::from(w.as_str()));
             }
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND CAST(fts_messages.created_at AS INTEGER) >= ?");
+            sql.push_str(" AND m.created_at >= ?");
             params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND CAST(fts_messages.created_at AS INTEGER) <= ?");
+            sql.push_str(" AND m.created_at <= ?");
             params.push(ParamValue::from(created_to));
         }
 
@@ -4126,28 +4144,23 @@ impl SearchClient {
             conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
                 let title: String = row.get_typed::<Option<String>>(0)?.unwrap_or_default();
                 let raw_content: String = row.get_typed(1)?;
-                let sql_snippet = row
-                    .get_typed::<Option<String>>(2)?
-                    .unwrap_or_default()
-                    .replace("<b>", "**")
-                    .replace("</b>", "**");
-                let agent: String = row.get_typed(3)?;
-                let workspace: String = row.get_typed(4)?;
-                let source_path: String = row.get_typed(5)?;
-                let created_at: Option<i64> = row.get_typed(6)?;
-                let idx: Option<i64> = row.get_typed(7)?;
+                let agent: String = row.get_typed(2)?;
+                let workspace: String = row.get_typed(3)?;
+                let source_path: String = row.get_typed(4)?;
+                let created_at: Option<i64> = row.get_typed(5)?;
+                let idx: Option<i64> = row.get_typed(6)?;
                 let source_id: String = row
-                    .get_typed::<Option<String>>(8)?
+                    .get_typed::<Option<String>>(7)?
                     .unwrap_or_else(default_source_id);
-                let origin_host: Option<String> = row.get_typed(9)?;
+                let origin_host: Option<String> = row.get_typed(8)?;
                 let origin_kind: String = row
-                    .get_typed::<Option<String>>(10)?
+                    .get_typed::<Option<String>>(9)?
                     .unwrap_or_else(default_origin_kind);
-                let bm25_score: f64 = row.get_typed(11)?;
+                let bm25_score: f64 = row.get_typed(10)?;
 
                 let line_number = idx.map(|i| (i + 1) as usize);
                 let snippet = if field_mask.wants_snippet() {
-                    sql_snippet
+                    snippet_from_content(&raw_content)
                 } else {
                     String::new()
                 };
@@ -6798,15 +6811,23 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
                 source_id TEXT,
-                origin_host TEXT
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
-                idx INTEGER
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
              );
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
@@ -6815,24 +6836,26 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                message_id UNINDEXED
+                content='',
+                tokenize='porter'
              );",
         )?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 't', '/tmp/session.jsonl')",
         )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
             params![
+                1_i64,
                 "auth token failure",
                 "t",
                 "codex",
                 "/tmp/session.jsonl",
-                42_i64,
-                1_i64
+                42_i64
             ],
         )?;
 
@@ -6863,20 +6886,28 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
+    fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
-            "CREATE TABLE conversations (
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
                 source_id TEXT,
-                origin_host TEXT
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
-                idx INTEGER
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
              );
-             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
                 title,
@@ -6884,42 +6915,132 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                message_id UNINDEXED
+                message_id UNINDEXED,
+                tokenize='porter'
              );",
         )?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/legacy')")?;
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'legacy title', '/tmp/legacy.jsonl')",
         )?;
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(2, 'local', NULL)",
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(42, 1, 4, 'legacy auth token failure', 99)",
         )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(7, 1, 0)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(8, 2, 0)")?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                1_i64,
+                "legacy auth token failure",
+                "legacy title",
+                "codex",
+                "/legacy",
+                "/tmp/legacy.jsonl",
+                99_i64,
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "legacy title");
+        assert_eq!(hits[0].source_path, "/tmp/legacy.jsonl");
+        assert_eq!(hits[0].workspace, "/legacy");
+        assert_eq!(hits[0].line_number, Some(5));
+        assert_eq!(hits[0].content, "legacy auth token failure");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'best', '/tmp/best.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'worse', '/tmp/worse.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(7, 1, 0, 'auth auth auth failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(8, 2, 0, 'auth failure', 43)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                7_i64,
                 "auth auth auth failure",
                 "best",
                 "codex",
                 "/ws",
                 "/tmp/best.jsonl",
-                42_i64,
-                7_i64
+                42_i64
             ],
         )?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                8_i64,
                 "auth failure",
                 "worse",
                 "codex",
                 "/ws",
                 "/tmp/worse.jsonl",
-                43_i64,
-                8_i64
+                43_i64
             ],
         )?;
 
@@ -6950,20 +7071,28 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_backend_uses_sql_snippet_aux_function() -> Result<()> {
+    fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
                 source_id TEXT,
-                origin_host TEXT
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
-                idx INTEGER
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
                 title,
@@ -6971,25 +7100,28 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                message_id UNINDEXED
+                content='',
+                tokenize='porter'
              );",
         )?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/ws')")?;
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'snippet title', '/tmp/snippet.jsonl')",
         )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'alpha beta gamma delta epsilon zeta eta theta', 42)")?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                1_i64,
                 "alpha beta gamma delta epsilon zeta eta theta",
                 "snippet title",
                 "codex",
                 "/ws",
                 "/tmp/snippet.jsonl",
-                42_i64,
-                1_i64
+                42_i64
             ],
         )?;
 
@@ -7012,8 +7144,9 @@ mod tests {
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].snippet.contains("**delta**"));
-        assert_ne!(hits[0].snippet, snippet_from_content(&hits[0].content));
+        // With contentless FTS5, snippet is generated from content via snippet_from_content()
+        assert_eq!(hits[0].snippet, snippet_from_content(&hits[0].content));
+        assert!(hits[0].snippet.contains("delta"));
 
         Ok(())
     }
@@ -7023,15 +7156,23 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
                 source_id TEXT,
-                origin_host TEXT
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
-                idx INTEGER
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
              );
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
@@ -7040,41 +7181,45 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                message_id UNINDEXED
+                content='',
+                tokenize='porter'
              );",
         )?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('laptop', 'ssh')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/local')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/remote')")?;
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, 1, 'local', NULL, 'local title', '/tmp/local.jsonl')",
         )?;
-        conn.execute("INSERT INTO conversations(id, source_id, origin_host) VALUES(2, 'laptop', 'dev@laptop')")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(2, 2, 0)")?;
+        conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                1_i64,
                 "auth token failure",
                 "local title",
                 "codex",
                 "/local",
                 "/tmp/local.jsonl",
-                42_i64,
-                1_i64
+                42_i64
             ],
         )?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                2_i64,
                 "auth token failure",
                 "remote title",
                 "codex",
                 "/remote",
                 "/tmp/remote.jsonl",
-                43_i64,
-                2_i64
+                43_i64
             ],
         )?;
 
@@ -7130,15 +7275,23 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
                 source_id TEXT,
-                origin_host TEXT
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
-                idx INTEGER
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
              );
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
@@ -7147,38 +7300,46 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                message_id UNINDEXED
+                content='',
+                tokenize='porter'
              );",
         )?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')")?;
+        // Conversation 1: no workspace (workspace_id=NULL)
         conn.execute(
-            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(1, 1, NULL, 'local', NULL, 'null workspace', '/tmp/null-workspace.jsonl')",
         )?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")?;
-        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(2, 1, 1)")?;
+        // Conversation 2: with workspace
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 1, 'local', NULL, 'named workspace', '/tmp/named-workspace.jsonl')",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-             VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
             params![
+                1_i64,
                 "auth token failure",
                 "null workspace",
                 "codex",
                 "/tmp/null-workspace.jsonl",
-                42_i64,
-                1_i64
+                42_i64
             ],
         )?;
         conn.execute_compat(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                2_i64,
                 "auth token failure",
                 "named workspace",
                 "codex",
                 "/named",
                 "/tmp/named-workspace.jsonl",
-                43_i64,
-                2_i64
+                43_i64
             ],
         )?;
 

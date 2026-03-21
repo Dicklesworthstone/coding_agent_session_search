@@ -500,6 +500,14 @@ fn fts_messages_is_fts5_virtual_table() {
         "fts_messages should have workspace"
     );
     assert!(
+        sql.contains("content=''"),
+        "fts_messages should use contentless storage"
+    );
+    assert!(
+        !sql.contains("message_id UNINDEXED"),
+        "fts_messages should no longer store legacy message_id payloads"
+    );
+    assert!(
         sql.contains("porter"),
         "fts_messages should use porter tokenizer"
     );

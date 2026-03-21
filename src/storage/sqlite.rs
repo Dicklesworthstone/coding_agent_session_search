@@ -637,8 +637,8 @@ pub fn is_user_data_file(path: &Path) -> bool {
 pub const FTS5_REGISTER_SQL: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
         content, title, agent, workspace, source_path, \
-        created_at UNINDEXED, message_id UNINDEXED, \
-        tokenize='porter'\
+        created_at UNINDEXED, \
+        content='', tokenize='porter'\
     )";
 
 /// Register the `fts_messages` FTS5 virtual table on a frankensqlite
@@ -674,8 +674,8 @@ pub(crate) fn rebuild_fts_on_connection(conn: &FrankenConnection) -> Result<()> 
                 total_count
             );
             conn.execute_batch(&format!(
-                "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                 SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
                  JOIN agents a ON c.agent_id = a.id
@@ -817,7 +817,7 @@ pub fn cleanup_old_backups(db_path: &Path, keep_count: usize) -> Result<(), std:
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
@@ -1445,6 +1445,37 @@ ALTER TABLE usage_daily ADD COLUMN plan_content_tokens_est_total INTEGER NOT NUL
 ALTER TABLE usage_daily ADD COLUMN plan_api_tokens_total INTEGER NOT NULL DEFAULT 0;
 ";
 
+const MIGRATION_V14: &str = r"
+-- Switch FTS5 from internal-content to contentless mode.
+-- Internal-content mode duplicated all indexed columns in shadow tables,
+-- causing ~45% DB bloat. Contentless mode (content='') stores only the
+-- inverted index, and queries JOIN back to source tables for column data.
+DROP TABLE IF EXISTS fts_messages;
+CREATE VIRTUAL TABLE fts_messages USING fts5(
+    content,
+    title,
+    agent,
+    workspace,
+    source_path,
+    created_at UNINDEXED,
+    content='',
+    tokenize='porter'
+);
+INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+SELECT
+    m.id,
+    m.content,
+    c.title,
+    a.slug,
+    w.path,
+    c.source_path,
+    m.created_at
+FROM messages m
+JOIN conversations c ON m.conversation_id = c.id
+JOIN agents a ON c.agent_id = a.id
+LEFT JOIN workspaces w ON c.workspace_id = w.id;
+";
+
 /// Row from the embedding_jobs table.
 #[derive(Debug, Clone)]
 pub struct EmbeddingJobRow {
@@ -1777,7 +1808,9 @@ fn franken_check_schema_compatibility(path: &Path) -> Result<SchemaCheck> {
 /// the transition function backfills `_schema_migrations` and no further
 /// migrations are needed.
 fn build_cass_migrations() -> MigrationRunner {
-    MigrationRunner::new().add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
+    MigrationRunner::new()
+        .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
+        .add(14, "fts_contentless", MIGRATION_V14)
 }
 
 /// Combined V13 schema for fresh databases.
@@ -1894,7 +1927,7 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
     PRIMARY KEY (conversation_id, tag_id)
 );
 
--- Full-text search (V2/V3)
+-- Full-text search (V14 contentless)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     content,
     title,
@@ -1902,7 +1935,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     workspace,
     source_path,
     created_at UNINDEXED,
-    message_id UNINDEXED,
+    content='',
     tokenize='porter'
 );
 
@@ -2159,7 +2192,7 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 ";
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 13] = [
+const MIGRATION_NAMES: [(i64, &str); 14] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -2173,6 +2206,7 @@ const MIGRATION_NAMES: [(i64, &str); 13] = [
     (11, "message_metrics"),
     (12, "model_dimensions"),
     (13, "plan_token_rollups"),
+    (14, "fts_contentless"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -3483,18 +3517,18 @@ fn franken_batch_insert_fts(tx: &FrankenTransaction<'_>, entries: &[FtsEntry]) -
             .join(",");
 
         let sql = format!(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {placeholders}"
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {placeholders}"
         );
 
         let mut param_values: Vec<ParamValue> = Vec::with_capacity(chunk.len() * 7);
         for entry in chunk {
+            param_values.push(ParamValue::from(entry.message_id));
             param_values.push(ParamValue::from(entry.content.as_str()));
             param_values.push(ParamValue::from(entry.title.as_str()));
             param_values.push(ParamValue::from(entry.agent.as_str()));
             param_values.push(ParamValue::from(entry.workspace.as_str()));
             param_values.push(ParamValue::from(entry.source_path.as_str()));
             param_values.push(ParamValue::from(entry.created_at));
-            param_values.push(ParamValue::from(entry.message_id));
         }
 
         tx.execute_compat(&sql, &param_values)?;
@@ -6019,8 +6053,8 @@ impl SqliteStorage {
                 total_count
             );
             tx.execute(
-                "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                 SELECT m.content, c.title, a.slug, w.path, c.source_path, m.created_at, m.id
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
                  JOIN agents a ON c.agent_id = a.id
@@ -7256,11 +7290,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         }
         12 => {}
         13 => {}
+        14 => {}
         v => return Err(anyhow!("unsupported schema version {v}")),
     }
 
     if current < 13 {
         tx.execute_batch(MIGRATION_V13)?;
+    }
+
+    if current < 14 {
+        tx.execute_batch(MIGRATION_V14)?;
     }
 
     tx.execute(
@@ -7351,8 +7390,8 @@ fn insert_snippets(tx: &Transaction<'_>, message_id: i64, snippets: &[Snippet]) 
 // FTS5 Batch Insert (P2 Opt 2.1)
 // -------------------------------------------------------------------------
 
-/// Batch size for FTS5 inserts. With 7 columns per row and SQLite's
-/// SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
+/// Batch size for FTS5 inserts. With 7 columns per row (rowid + 6 cols) and
+/// SQLite's SQLITE_MAX_VARIABLE_NUMBER default of 999, max batch is ~142 rows.
 /// Using 100 for safety margin and memory efficiency.
 const FTS5_BATCH_SIZE: usize = 100;
 
@@ -7420,7 +7459,7 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
             .join(", ");
 
         let sql = format!(
-            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id) VALUES {}",
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at) VALUES {}",
             placeholders
         );
 
@@ -7428,13 +7467,13 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
         // Capacity: chunk.len() * 7
         let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 7);
         for entry in chunk {
+            params_vec.push(entry.message_id.into());
             params_vec.push(entry.content.clone().into());
             params_vec.push(entry.title.clone().into());
             params_vec.push(entry.agent.clone().into());
             params_vec.push(entry.workspace.clone().into());
             params_vec.push(entry.source_path.clone().into());
             params_vec.push(entry.created_at.into());
-            params_vec.push(entry.message_id.into());
         }
 
         if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params_vec)) {
@@ -7447,16 +7486,16 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
             // Fall back to individual inserts for this batch
             for entry in chunk {
                 if let Err(e2) = tx.execute(
-                    "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                    "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                      VALUES(?,?,?,?,?,?,?)",
                     params![
+                        entry.message_id,
                         entry.content,
                         entry.title,
                         entry.agent,
                         entry.workspace,
                         entry.source_path,
-                        entry.created_at,
-                        entry.message_id
+                        entry.created_at
                     ],
                 ) {
                     tracing::debug!(
@@ -8392,7 +8431,7 @@ mod tests {
     }
 
     // =========================================================================
-    // V13 Analytics schema smoke test (bead z9fse.11)
+    // Current analytics/schema smoke test (bead z9fse.11)
     // =========================================================================
 
     #[test]
@@ -8401,9 +8440,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
 
-        // Schema version should be 13
+        // Schema version should be current.
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 13, "Schema version must be 13 after migration");
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "Schema version must match CURRENT_SCHEMA_VERSION after migration"
+        );
 
         let conn = storage.raw();
 
@@ -8614,10 +8656,13 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        // Now open with SqliteStorage — should auto-migrate to v13
+        // Now open with SqliteStorage — should auto-migrate to current schema
         let storage = SqliteStorage::open(&db_path).unwrap();
         let version = storage.schema_version().unwrap();
-        assert_eq!(version, 13, "Should have migrated from v10 to v13");
+        assert_eq!(
+            version, CURRENT_SCHEMA_VERSION,
+            "Should have migrated from v10 to the current schema"
+        );
 
         // Verify new tables exist
         let count: i64 = storage
@@ -10248,24 +10293,33 @@ mod tests {
             );
         }
 
-        // _schema_migrations tracking table should exist with 1 entry (combined V13).
+        // Fresh frankensqlite databases should record both applied migrations:
+        // the combined V13 base schema and the V14 contentless FTS upgrade.
         let rows = storage
             .raw()
             .query("SELECT COUNT(*) FROM _schema_migrations;")
             .unwrap();
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(
-            count, 1,
-            "_schema_migrations should have 1 entry (combined V13)"
+            count, 2,
+            "_schema_migrations should record the V13 base schema and V14 FTS migration"
         );
 
-        // The single entry should be version 13.
+        // The latest applied migration should be the current schema version.
         let rows = storage
             .raw()
-            .query("SELECT version FROM _schema_migrations;")
+            .query("SELECT version FROM _schema_migrations ORDER BY version;")
             .unwrap();
-        let version: i64 = rows.first().unwrap().get_typed(0).unwrap();
-        assert_eq!(version, 13, "_schema_migrations entry should be version 13");
+        let versions: Vec<i64> = rows
+            .iter()
+            .map(|row| row.get_typed(0))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            versions,
+            vec![13, 14],
+            "_schema_migrations should contain v13 and v14"
+        );
     }
 
     #[test]
