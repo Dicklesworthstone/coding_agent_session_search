@@ -1927,18 +1927,6 @@ CREATE TABLE IF NOT EXISTS conversation_tags (
     PRIMARY KEY (conversation_id, tag_id)
 );
 
--- Full-text search (V14 contentless)
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-    content,
-    title,
-    agent,
-    workspace,
-    source_path,
-    created_at UNINDEXED,
-    content='',
-    tokenize='porter'
-);
-
 -- Daily stats (V8)
 CREATE TABLE IF NOT EXISTS daily_stats (
     day_id INTEGER NOT NULL,
@@ -7477,15 +7465,17 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
         }
 
         if let Err(e) = tx.execute(&sql, rusqlite::params_from_iter(params_vec)) {
-            // FTS is best-effort; log and continue
+            let batch_error = e.to_string();
             tracing::debug!(
                 batch_size = chunk.len(),
-                error = %e,
+                error = %batch_error,
                 "fts_batch_insert_failed"
             );
-            // Fall back to individual inserts for this batch
+            // Fall back to per-row inserts for compatibility, but keep the
+            // overall write transactional: if any FTS row still fails, abort
+            // so canonical rows and search index rows cannot diverge.
             for entry in chunk {
-                if let Err(e2) = tx.execute(
+                tx.execute(
                     "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                      VALUES(?,?,?,?,?,?,?)",
                     params![
@@ -7497,15 +7487,14 @@ fn batch_insert_fts_messages(tx: &Transaction<'_>, entries: &[FtsEntry]) -> Resu
                         entry.source_path,
                         entry.created_at
                     ],
-                ) {
-                    tracing::debug!(
-                        message_id = entry.message_id,
-                        error = %e2,
-                        "fts_insert_skipped"
-                    );
-                } else {
-                    inserted += 1;
-                }
+                )
+                .with_context(|| {
+                    format!(
+                        "inserting FTS row for message {} after batch failure ({batch_error})",
+                        entry.message_id
+                    )
+                })?;
+                inserted += 1;
             }
         } else {
             inserted += chunk.len();

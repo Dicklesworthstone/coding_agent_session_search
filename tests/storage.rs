@@ -137,6 +137,76 @@ fn transaction_rolls_back_on_duplicate_idx() {
 }
 
 #[test]
+fn insert_conversation_tree_rolls_back_when_fts_insert_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("fts_tree_rollback.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    storage
+        .raw()
+        .execute("DROP TABLE fts_messages", [])
+        .unwrap();
+
+    let conv = sample_conv(None, vec![msg(0, 1)]);
+    let result = storage.insert_conversation_tree(agent_id, None, &conv);
+    assert!(
+        result.is_err(),
+        "FTS write failure should abort the whole insert"
+    );
+
+    let conv_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .unwrap();
+    let msg_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(conv_count, 0, "conversation insert should roll back");
+    assert_eq!(msg_count, 0, "message insert should roll back");
+}
+
+#[test]
+fn insert_conversations_batched_rolls_back_when_fts_insert_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("fts_batch_rollback.db");
+    let mut storage = SqliteStorage::open(&db_path).expect("open");
+
+    let agent_id = storage.ensure_agent(&sample_agent()).unwrap();
+    let convs = vec![
+        sample_conv(Some("batch-rollback-1"), vec![msg(0, 1)]),
+        sample_conv(Some("batch-rollback-2"), vec![msg(0, 2)]),
+    ];
+    let refs: Vec<(i64, Option<i64>, &Conversation)> =
+        convs.iter().map(|conv| (agent_id, None, conv)).collect();
+
+    storage
+        .raw()
+        .execute("DROP TABLE fts_messages", [])
+        .unwrap();
+
+    let result = storage.insert_conversations_batched(&refs);
+    assert!(
+        result.is_err(),
+        "batched insert should abort when FTS rows cannot be written"
+    );
+
+    let conv_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .unwrap();
+    let msg_count: i64 = storage
+        .raw()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(conv_count, 0, "batched conversations should roll back");
+    assert_eq!(msg_count, 0, "batched messages should roll back");
+}
+
+#[test]
 fn append_only_updates_existing_conversation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("append.db");
