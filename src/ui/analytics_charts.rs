@@ -560,7 +560,6 @@ pub fn render_dashboard(
         };
         let mut lines: Vec<ftui::text::Line<'static>> = Vec::new();
         lines.push(ftui::text::Line::from(""));
-
         if area.height >= 14 && area.width >= 40 {
             lines.push(ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled("         ▆", ftui::Style::new().fg(accent)),
