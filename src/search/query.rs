@@ -1759,10 +1759,6 @@ pub struct SearchClient {
     reader: Option<(IndexReader, FsCassFields)>,
     sqlite: Mutex<Option<SendConnection>>,
     sqlite_path: Option<PathBuf>,
-    /// rusqlite connection for FTS5 queries (#121/#122/#126).
-    /// FrankenSQLite cannot handle FTS5 virtual tables, so the fallback
-    /// search path uses rusqlite (bundled FTS5) instead.
-    rusqlite_fts: Mutex<Option<rusqlite::Connection>>,
     prefix_cache: Mutex<CacheShards>,
     reload_on_search: bool,
     last_reload: Mutex<Option<Instant>>,
@@ -2230,7 +2226,6 @@ impl SearchClient {
             reader: tantivy,
             sqlite: Mutex::new(None),
             sqlite_path,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: options.enable_reload,
             last_reload: Mutex::new(None),
@@ -2272,41 +2267,6 @@ impl SearchClient {
                         error = %e,
                         path = %path.display(),
                         "sqlite open failed"
-                    );
-                }
-            }
-        }
-
-        Ok(guard)
-    }
-
-    /// Lazily open a rusqlite connection for FTS5 queries (#121/#122/#126).
-    ///
-    /// FrankenSQLite cannot handle FTS5 virtual tables, so the FTS5 fallback
-    /// search path uses rusqlite (which bundles FTS5 via `bundled` feature).
-    fn rusqlite_fts_guard(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<rusqlite::Connection>>> {
-        let mut guard = self
-            .rusqlite_fts
-            .lock()
-            .map_err(|_| anyhow!("rusqlite_fts lock poisoned"))?;
-
-        if guard.is_none()
-            && let Some(path) = &self.sqlite_path
-        {
-            match rusqlite::Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
-                Ok(conn) => {
-                    *guard = Some(conn);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        path = %path.display(),
-                        "rusqlite FTS5 open failed"
                     );
                 }
             }
@@ -2493,20 +2453,17 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        // Fix #121/#122/#126: Use rusqlite for FTS5 fallback queries.
-        // FrankenSQLite cannot handle FTS5 virtual tables, so we use rusqlite
-        // (which bundles FTS5 via the `bundled` feature) instead.
-        let rusqlite_guard = self.rusqlite_fts_guard()?;
-        if let Some(rconn) = rusqlite_guard.as_ref() {
+        let sqlite_guard = self.sqlite_guard()?;
+        if let Some(conn) = sqlite_guard.as_ref() {
             tracing::info!(
-                backend = "sqlite-fts5-rusqlite",
+                backend = "sqlite-fts5-frankensqlite",
                 query = sanitized,
                 limit = fallback_fetch_limit,
                 offset = 0,
                 "search_start"
             );
             let hits = self.search_sqlite_fts5(
-                rconn,
+                conn,
                 query,
                 filters.clone(),
                 fallback_fetch_limit,
@@ -4071,14 +4028,13 @@ impl SearchClient {
         Ok(hits)
     }
 
-    /// FTS5 fallback search using rusqlite (fix #121/#122/#126).
+    /// FTS5 fallback search using frankensqlite SQL aux functions.
     ///
-    /// FrankenSQLite cannot handle FTS5 virtual tables, so this method uses
-    /// rusqlite (which bundles FTS5 via the `bundled` feature) for the FTS5
-    /// fallback search path. Mirrors `browse_by_date_sqlite` query/filter logic.
+    /// Mirrors `browse_by_date_sqlite` query/filter logic while using
+    /// `bm25(fts_messages)` for ranking and `snippet(...)` for lexical previews.
     fn search_sqlite_fts5(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &Connection,
         raw_query: &str,
         filters: SearchFilters,
         limit: usize,
@@ -4092,9 +4048,13 @@ impl SearchClient {
 
         let query_match_type = dominant_match_type(raw_query);
 
-        let needs_raw_content = field_mask.needs_content() || field_mask.wants_snippet();
-        let content_expr = if needs_raw_content {
+        let content_expr = if field_mask.needs_content() {
             "fts_messages.content"
+        } else {
+            "''"
+        };
+        let snippet_expr = if field_mask.wants_snippet() {
+            "snippet(fts_messages, 0, '<b>', '</b>', '...', 24)"
         } else {
             "''"
         };
@@ -4105,63 +4065,43 @@ impl SearchClient {
         };
 
         let mut sql = format!(
-            "SELECT {title_expr}, {content_expr}, fts_messages.agent, fts_messages.workspace,
-                    fts_messages.source_path, fts_messages.created_at, m.idx,
-                    c.source_id, c.origin_host, COALESCE(s.kind, 'local')
+            "SELECT {title_expr}, {content_expr}, {snippet_expr}, fts_messages.agent,
+                    COALESCE(fts_messages.workspace, ''), fts_messages.source_path,
+                    fts_messages.created_at, m.idx, c.source_id, c.origin_host,
+                    COALESCE(s.kind, 'local'), bm25(fts_messages)
              FROM fts_messages
              LEFT JOIN messages m ON fts_messages.message_id = m.id
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE fts_messages MATCH ?1"
+             WHERE fts_messages MATCH ?"
         );
-        let mut param_idx: usize = 2;
-        let mut dyn_params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(fts_query.clone())];
+        let mut params = vec![ParamValue::from(fts_query.as_str())];
 
         if !filters.agents.is_empty() {
-            let phs: Vec<String> = filters
-                .agents
-                .iter()
-                .map(|_| {
-                    let p = format!("?{param_idx}");
-                    param_idx += 1;
-                    p
-                })
-                .collect();
-            sql.push_str(&format!(" AND fts_messages.agent IN ({})", phs.join(",")));
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(" AND fts_messages.agent IN ({placeholders})"));
             for a in &filters.agents {
-                dyn_params.push(Box::new(a.clone()));
+                params.push(ParamValue::from(a.as_str()));
             }
         }
 
         if !filters.workspaces.is_empty() {
-            let phs: Vec<String> = filters
-                .workspaces
-                .iter()
-                .map(|_| {
-                    let p = format!("?{param_idx}");
-                    param_idx += 1;
-                    p
-                })
-                .collect();
+            let placeholders = sql_placeholders(filters.workspaces.len());
             sql.push_str(&format!(
-                " AND COALESCE(fts_messages.workspace, '') IN ({})",
-                phs.join(",")
+                " AND COALESCE(fts_messages.workspace, '') IN ({placeholders})"
             ));
             for w in &filters.workspaces {
-                dyn_params.push(Box::new(w.clone()));
+                params.push(ParamValue::from(w.as_str()));
             }
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(&format!(" AND fts_messages.created_at >= ?{param_idx}"));
-            param_idx += 1;
-            dyn_params.push(Box::new(created_from));
+            sql.push_str(" AND fts_messages.created_at >= ?");
+            params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(&format!(" AND fts_messages.created_at <= ?{param_idx}"));
-            param_idx += 1;
-            dyn_params.push(Box::new(created_to));
+            sql.push_str(" AND fts_messages.created_at <= ?");
+            params.push(ParamValue::from(created_to));
         }
 
         match &filters.source_filter {
@@ -4173,55 +4113,40 @@ impl SearchClient {
                 sql.push_str(" AND COALESCE(c.source_id, 'local') != 'local'");
             }
             SourceFilter::SourceId(id) => {
-                sql.push_str(&format!(
-                    " AND COALESCE(c.source_id, 'local') = ?{param_idx}"
-                ));
-                param_idx += 1;
-                dyn_params.push(Box::new(id.clone()));
+                sql.push_str(" AND COALESCE(c.source_id, 'local') = ?");
+                params.push(ParamValue::from(id.as_str()));
             }
         }
 
-        sql.push_str(&format!(" LIMIT ?{} OFFSET ?{}", param_idx, param_idx + 1));
-        dyn_params.push(Box::new(limit as i64));
-        dyn_params.push(Box::new(offset as i64));
+        sql.push_str(" ORDER BY bm25(fts_messages), m.id LIMIT ? OFFSET ?");
+        params.push(ParamValue::from(limit as i64));
+        params.push(ParamValue::from(offset as i64));
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            dyn_params.iter().map(|b| b.as_ref()).collect();
+        conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+            let title: String = row.get_typed::<Option<String>>(0)?.unwrap_or_default();
+            let raw_content: String = row.get_typed(1)?;
+            let sql_snippet = row
+                .get_typed::<Option<String>>(2)?
+                .unwrap_or_default()
+                .replace("<b>", "**")
+                .replace("</b>", "**");
+            let agent: String = row.get_typed(3)?;
+            let workspace: String = row.get_typed(4)?;
+            let source_path: String = row.get_typed(5)?;
+            let created_at: Option<i64> = row.get_typed(6)?;
+            let idx: Option<i64> = row.get_typed(7)?;
+            let source_id: String = row
+                .get_typed::<Option<String>>(8)?
+                .unwrap_or_else(default_source_id);
+            let origin_host: Option<String> = row.get_typed(9)?;
+            let origin_kind: String = row
+                .get_typed::<Option<String>>(10)?
+                .unwrap_or_else(default_origin_kind);
+            let bm25_score: f64 = row.get_typed(11)?;
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?
-                    .unwrap_or_else(default_origin_kind),
-            ))
-        })?;
-
-        let mut hits = Vec::new();
-        for (rank, row_result) in rows.enumerate() {
-            let (
-                title,
-                raw_content,
-                agent,
-                workspace,
-                source_path,
-                created_at,
-                idx,
-                source_id,
-                origin_host,
-                origin_kind,
-            ) = row_result?;
             let line_number = idx.map(|i| (i + 1) as usize);
             let snippet = if field_mask.wants_snippet() {
-                snippet_from_content(&raw_content)
+                sql_snippet
             } else {
                 String::new()
             };
@@ -4236,25 +4161,25 @@ impl SearchClient {
                 content.as_str()
             };
             let content_hash = stable_hit_hash(hash_basis, &source_path, line_number, created_at);
-            hits.push(SearchHit {
+
+            Ok(SearchHit {
                 title,
                 snippet,
                 content,
                 content_hash,
-                score: 1.0 / (rank as f32 + 1.0),
+                score: (-bm25_score) as f32,
                 source_path,
                 agent,
-                workspace: workspace.unwrap_or_default(),
+                workspace,
                 workspace_original: None,
                 created_at,
                 line_number,
                 match_type: query_match_type,
-                source_id: source_id.unwrap_or_else(default_source_id),
+                source_id,
                 origin_kind,
                 origin_host,
-            });
-        }
-        Ok(hits)
+            })
+        })
     }
 
     /// Browse messages ordered by date, without any text query.
@@ -5517,7 +5442,6 @@ mod tests {
             reader,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6182,7 +6106,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6233,7 +6156,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6351,7 +6273,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6847,7 +6768,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6917,7 +6837,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -6937,6 +6856,162 @@ mod tests {
         assert_eq!(hits[0].line_number, Some(1));
         assert_eq!(hits[0].source_id, "local");
         assert_eq!(hits[0].origin_kind, "local");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT,
+                origin_host TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+        )?;
+        conn.execute(
+            "INSERT INTO conversations(id, source_id, origin_host) VALUES(2, 'local', NULL)",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(7, 1, 0)")?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(8, 2, 0)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "auth auth auth failure",
+                "best",
+                "codex",
+                "/ws",
+                "/tmp/best.jsonl",
+                42_i64,
+                7_i64
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "auth failure",
+                "worse",
+                "codex",
+                "/ws",
+                "/tmp/worse.jsonl",
+                43_i64,
+                8_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "best");
+        assert_eq!(hits[1].title, "worse");
+        assert!(hits[0].score > hits[1].score);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_backend_uses_sql_snippet_aux_function() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                source_id TEXT,
+                origin_host TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, source_id, origin_host) VALUES(1, 'local', NULL)",
+        )?;
+        conn.execute("INSERT INTO messages(id, conversation_id, idx) VALUES(1, 1, 0)")?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "alpha beta gamma delta epsilon zeta eta theta",
+                "snippet title",
+                "codex",
+                "/ws",
+                "/tmp/snippet.jsonl",
+                42_i64,
+                1_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("**delta**"));
+        assert_ne!(hits[0].snippet, snippet_from_content(&hits[0].content));
+
         Ok(())
     }
 
@@ -7004,7 +7079,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7109,7 +7183,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7178,7 +7251,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7306,7 +7378,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7364,7 +7435,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7418,7 +7488,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7453,7 +7522,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -7518,7 +7586,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -8311,7 +8378,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -8403,7 +8469,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -8448,7 +8513,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -9128,7 +9192,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -9942,7 +10005,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
@@ -9981,7 +10043,6 @@ mod tests {
             reader: None,
             sqlite: Mutex::new(None),
             sqlite_path: None,
-            rusqlite_fts: Mutex::new(None),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
             last_reload: Mutex::new(None),
