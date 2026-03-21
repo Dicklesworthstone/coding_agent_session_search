@@ -1617,7 +1617,10 @@ impl SyncStatus {
         }
     }
 
-    /// Save sync status to disk (atomic write via temp file + rename).
+    /// Save sync status to disk.
+    ///
+    /// Uses an atomic rename on Unix. On Windows, falls back to remove-then-rename
+    /// because replacing an existing destination with `std::fs::rename` fails.
     pub fn save(&self, data_dir: &Path) -> Result<(), std::io::Error> {
         let path = Self::status_path(data_dir);
         if let Some(parent) = path.parent() {
@@ -1626,7 +1629,7 @@ impl SyncStatus {
         let content = serde_json::to_string_pretty(self)?;
         let tmp_path = unique_atomic_temp_path(&path);
         std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, &path)
+        replace_file_from_temp(&tmp_path, &path)
     }
 
     /// Update status for a source from a sync report.
@@ -1697,6 +1700,25 @@ fn unique_atomic_temp_path(path: &Path) -> PathBuf {
         timestamp,
         nonce
     ))
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(rename_err) if final_path.exists() => {
+                std::fs::remove_file(final_path)?;
+                std::fs::rename(temp_path, final_path).map_err(|_| rename_err)
+            }
+            Err(rename_err) => Err(rename_err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)
+    }
 }
 
 #[cfg(test)]
@@ -1988,6 +2010,28 @@ Total transferred file size: 1,234 bytes
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_overwrites_existing_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let final_path = temp.path().join("sync_status.json");
+        let first_tmp = temp.path().join("first.tmp");
+        let second_tmp = temp.path().join("second.tmp");
+
+        std::fs::write(&first_tmp, "{\"first\":true}").expect("write first temp");
+        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read first final"),
+            "{\"first\":true}"
+        );
+
+        std::fs::write(&second_tmp, "{\"second\":true}").expect("write second temp");
+        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read second final"),
+            "{\"second\":true}"
+        );
     }
 
     #[test]

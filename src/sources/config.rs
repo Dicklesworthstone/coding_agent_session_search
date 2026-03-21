@@ -880,7 +880,7 @@ impl SourcesConfig {
         // Write atomically (temp file + rename)
         let temp_path = config_path.with_extension("toml.tmp");
         std::fs::write(&temp_path, &toml_str)?;
-        std::fs::rename(&temp_path, &config_path)?;
+        replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(BackupInfo {
             backup_path,
@@ -932,6 +932,25 @@ impl SourcesConfig {
     }
 }
 
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(windows)]
+    {
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => Ok(()),
+            Err(rename_err) if final_path.exists() => {
+                std::fs::remove_file(final_path)?;
+                std::fs::rename(temp_path, final_path).map_err(|_| rename_err)
+            }
+            Err(rename_err) => Err(rename_err),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp_path, final_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +959,28 @@ mod tests {
     fn test_empty_config_default() {
         let config = SourcesConfig::default();
         assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_overwrites_existing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let final_path = temp.path().join("sources.toml");
+        let first_tmp = temp.path().join("first.tmp");
+        let second_tmp = temp.path().join("second.tmp");
+
+        std::fs::write(&first_tmp, "first = true\n").expect("write first temp");
+        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read first final"),
+            "first = true\n"
+        );
+
+        std::fs::write(&second_tmp, "second = true\n").expect("write second temp");
+        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        assert_eq!(
+            std::fs::read_to_string(&final_path).expect("read second final"),
+            "second = true\n"
+        );
     }
 
     #[test]
