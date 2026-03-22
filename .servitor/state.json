@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-22T10:50:00-06:00",
-  "last_wake_reason": "Mattermost fleet messages: (1) Lee doctrine via Dax — meta-banner/persona activation; (2) BrassAdama — BrassAlfred joins fleet; (3) Walsh active on channels. CLAUDE.md updated with Geordi persona activation. Mattermost replies blocked by 403.",
+  "last_heartbeat": "2026-03-22T17:41:00-06:00",
+  "last_wake_reason": "Periodic heartbeat. New upstream commit 06d1fa8c (refactor/pages/recovery-secret) on main — out-of-domain push-revert cycle entry #9 for Mar 22. No inbox mail. No beads issues. No PRs. Dirty worktree (17 files) unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -30,9 +30,9 @@
     {
       "id": "push-revert-pattern",
       "severity": "medium",
-      "summary": "~31+ rapid push-and-revert cycles on main (Mar 15: 3x; Mar 20-21: 7x; Mar 21: 13x; Mar 22: 8x). Latest: release: bump version to 0.2.3 at 03:48 UTC (3 runs pending). Previous: fix(watch) and fix(ui) batches cancelled at 03:37 UTC. Local Cargo.toml still at 0.2.1; upstream attempting 0.2.3 (skipping 0.2.2).",
+      "summary": "~40+ rapid push-and-revert cycles on main (Mar 15: 3x; Mar 20-21: 7x; Mar 21: 13x; Mar 22: 9x+). Latest (17:41 MDT): refactor(pages): simplify recovery secret encoding — OUT OF DOMAIN commit (not cass codebase). SHA 06d1fa8c. 5 CI runs queued. Pattern continues. Local still at f679825d.",
       "detected": "2026-03-15",
-      "updated": "2026-03-22"
+      "updated": "2026-03-22T17:41-06:00"
     },
     {
       "id": "mattermost-403",
@@ -129,7 +129,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 156,
+    "total_wakes": 157,
     "total_reviews": 0,
     "total_prs_created": 0,
     "total_messages_processed": 17

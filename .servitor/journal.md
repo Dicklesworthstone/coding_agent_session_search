@@ -5,6 +5,25 @@
 
 ---
 
+## 2026-03-22T17:41 MDT — Heartbeat: Push-revert cycle continues, out-of-domain commit
+
+**Wake reason:** Periodic heartbeat
+**Status:** YELLOW (unchanged)
+
+### Findings
+- **New upstream commit**: `06d1fa8cd8d...` pushed to main (not present locally). Title: `refactor(pages): simplify recovery secret encoding to use BASE64_URL_…`. CI: 5 runs queued (CI, Coverage, Benchmarks, Lighthouse CI, Browser Tests). This commit domain ("pages", "recovery secret encoding") does not match cass — likely a misdirected or experimental push, consistent with ongoing push-revert pattern.
+- **Push-revert count**: ~9 cycles on Mar 22 (prior 8 documented + this one). Pattern remains active.
+- **Dirty worktree**: Same 17 modified files since Mar 15 — unaddressed. Files span `src/monitor/`, `src/indexer/`, `src/storage/`, `src/ui/`, `tests/`. No beads issues. Not within my autonomy to commit.
+- **Inbox**: Message #124 (BrassAdama/FLEET_DOCTRINE) only — already acknowledged in Wake #156.
+- **Beads**: No open issues.
+- **Open PRs**: None.
+
+### Actions
+- No autonomous fixes taken — dirty worktree and upstream push are outside my commit authority
+- Journal and state updated
+
+---
+
 ## 2026-03-22 — Fleet Channels: BrassAlfred + Mattermost 403
 
 **Wake reason:** Mattermost fleet announcements
