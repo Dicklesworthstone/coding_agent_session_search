@@ -1597,9 +1597,13 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     let mut first_event: Option<Instant> = None;
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
-    // Use checked_sub to avoid panic if system uptime < min_scan_interval.
-    let mut last_scan = Instant::now()
-        .checked_sub(min_scan_interval)
+    // Use checked_sub to avoid panic if system uptime < min_scan_interval
+    // (e.g., --watch-interval 999999 on a freshly booted system).
+    // If the full interval won't fit, try smaller values so the first scan
+    // still fires quickly rather than waiting the full cooldown.
+    let mut last_scan = [min_scan_interval, Duration::from_secs(60), Duration::from_secs(1)]
+        .iter()
+        .find_map(|d| Instant::now().checked_sub(*d))
         .unwrap_or_else(Instant::now);
 
     tracing::info!(
