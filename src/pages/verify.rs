@@ -990,6 +990,9 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
         }
     }
 
+    // Recursive scan: detect secret files/dirs hidden in subdirectories
+    find_secrets_recursive(site_dir, site_dir, &mut errors);
+
     // Check config.json doesn't contain plaintext secrets
     // Note: We're looking for actual secret values, not field names like "total_plaintext_size"
     let config_path = site_dir.join("config.json");
@@ -1020,6 +1023,52 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
         CheckResult::pass()
     } else {
         CheckResult::fail(errors.join("; "))
+    }
+}
+
+/// Recursively scan a directory tree for secret files and directories.
+/// Finds entries whose name (not full path) matches SECRET_FILES or SECRET_DIRS
+/// at any depth, catching secrets hidden in subdirectories.
+fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String>) {
+    let entries = match fs::read_dir(current) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let rel_path = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if path.is_dir() {
+            if SECRET_DIRS.contains(&name.as_str()) {
+                // Skip if this is a top-level match (already caught above)
+                if current != base {
+                    findings.push(format!(
+                        "Secret directory found in site subdirectory: {}/",
+                        rel_path
+                    ));
+                }
+            }
+            // Always recurse into subdirectories
+            find_secrets_recursive(base, &path, findings);
+        } else if path.is_file() && SECRET_FILES.contains(&name.as_str()) {
+            // Skip if this is a top-level match (already caught above)
+            if current != base {
+                findings.push(format!(
+                    "Secret file found in site subdirectory: {}",
+                    rel_path
+                ));
+            }
+        }
     }
 }
 

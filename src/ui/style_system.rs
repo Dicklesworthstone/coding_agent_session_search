@@ -1068,6 +1068,9 @@ fn env_truthy(value: Option<&str>) -> bool {
     match value {
         Some(raw) => {
             let normalized = raw.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return false;
+            }
             !(normalized == "0"
                 || normalized == "false"
                 || normalized == "off"
@@ -2273,8 +2276,8 @@ mod tests {
         // Verify env_truthy handles edge values correctly.
         assert!(!env_truthy(None), "None → false");
         assert!(
-            env_truthy(Some("")),
-            "empty string → true (not in falsy list)"
+            !env_truthy(Some("")),
+            "empty string → false (treated as unset)"
         );
         assert!(env_truthy(Some("1")), "\"1\" → true");
         assert!(env_truthy(Some("yes")), "\"yes\" → true");

@@ -234,6 +234,13 @@ pub fn key_revoke(
         bail!("Slot {} not found", slot_id_to_revoke);
     }
 
+    let revoked_slot_is_recovery = config
+        .key_slots
+        .iter()
+        .find(|s| s.id == slot_id_to_revoke)
+        .map(|s| s.slot_type == SlotType::Recovery)
+        .unwrap_or(false);
+
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
 
@@ -252,7 +259,7 @@ pub fn key_revoke(
         &config,
         manifest.as_ref(),
         None,
-        !has_recovery_slot,
+        revoked_slot_is_recovery || !has_recovery_slot,
     )?;
 
     info!(slot_id = slot_id_to_revoke, "Revoked key slot");
@@ -1049,6 +1056,31 @@ mod tests {
         key_revoke(&archive_dir, "second-password", recovery_slot_id).unwrap();
 
         assert!(!private_dir.join("recovery-secret.txt").exists());
+    }
+
+    #[test]
+    fn test_key_revoke_one_of_multiple_recovery_slots_removes_stale_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (first_recovery_slot_id, first_secret) =
+            key_add_recovery(&archive_dir, "test-password").unwrap();
+        let (second_recovery_slot_id, second_secret) =
+            key_add_recovery(&archive_dir, "test-password").unwrap();
+
+        let recovery_file_before =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+        assert!(recovery_file_before.contains(second_secret.encoded()));
+
+        key_revoke(&archive_dir, "test-password", second_recovery_slot_id).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(DecryptionEngine::unlock_with_recovery(config, first_secret.as_bytes()).is_ok());
+
+        assert_ne!(first_recovery_slot_id, second_recovery_slot_id);
     }
 
     #[test]
