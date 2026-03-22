@@ -1140,6 +1140,11 @@ fn test_pages_wizard_pty_respects_db_override_and_writes_bundle_root() {
         captured_output
     );
     assert!(
+        captured_output.contains("Conversations: 2"),
+        "wizard summary should reflect the overridden --db contents\noutput:\n{}",
+        captured_output
+    );
+    assert!(
         captured_output.contains("cass pages --preview"),
         "wizard should suggest the built-in preview command\noutput:\n{}",
         captured_output

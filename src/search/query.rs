@@ -2060,7 +2060,8 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 
 /// Normalize a term into tokenizer-aligned parts.
 /// Splits on non-word punctuation (hyphens preserved) to match `hyphen_normalize` tokenizer,
-/// preserving `*` for wildcards.
+/// preserving `*` for wildcards. The FTS5 transpiler quotes hyphenated terms later so
+/// stock SQLite parses them correctly.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
     fs_cass_sanitize_query(raw)
         .split_whitespace()
@@ -4444,8 +4445,6 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     let mut pending_or_group: Vec<String> = Vec::new();
     let mut next_op = "AND";
     let mut in_or_sequence = false;
-    let mut pending_unary_not = false;
-
     for token in tokens {
         match token {
             FsCassQueryToken::And => {
@@ -4460,28 +4459,22 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 }
                 in_or_sequence = false;
                 next_op = "AND";
-                pending_unary_not = false;
             }
             FsCassQueryToken::Or => {
-                // Our FTS5 fallback cannot reliably represent `NOT A OR B`
-                // (leading unary NOT inside OR groups). Degrade `OR` to `AND`
-                // in that narrow case to preserve Tantivy's practical behavior.
-                in_or_sequence = !(pending_or_group.is_empty()
-                    && fts_clauses.len() == 1
-                    && fts_clauses
-                        .first()
-                        .is_some_and(|(op, text)| *op == "AND" && text.starts_with("NOT ")));
+                // Start or continue an OR group. Unsupported `OR NOT` forms
+                // are rejected when the subsequent NOT token arrives.
+                in_or_sequence = true;
             }
             FsCassQueryToken::Not => {
-                // FTS5 supports both unary (`NOT foo`) and binary (`foo NOT bar`) NOT,
-                // but we reject `OR NOT` groupings in the fallback transpiler.
+                // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
+                // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
+                // in the fallback transpiler.
                 if in_or_sequence {
                     return None;
                 }
 
                 if fts_clauses.is_empty() && pending_or_group.is_empty() {
-                    pending_unary_not = true;
-                    continue;
+                    return None;
                 }
 
                 if !pending_or_group.is_empty() {
@@ -4509,16 +4502,25 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 }
 
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string.
-                // e.g. "foo bar" -> foo AND bar.
-                // Hyphens are preserved: "foo-bar" stays as one token.
+                // e.g. "foo bar" -> foo AND bar. Hyphens stay intact here so we can
+                // later emit them as quoted terms; bare `foo-bar` is invalid FTS5 syntax.
                 let term_parts = normalize_term_parts(&t);
                 if term_parts.is_empty() {
                     continue;
                 }
 
-                // If multiple parts, wrap in parens and join with AND to ensure they stay together
+                // If multiple parts, wrap in parens and join with AND to ensure they stay together.
+                // Stock FTS5 requires hyphenated tokens to be quoted (and prefix queries need the
+                // trailing * outside the quotes), otherwise `MATCH 'foo-bar'` is parsed as syntax.
                 let fts_term = if term_parts.len() > 1 {
                     format!("({})", term_parts.join(" AND "))
+                } else if term_parts[0].contains('-') {
+                    match pattern {
+                        FsCassWildcardPattern::Prefix(_) => {
+                            format!("\"{}\"*", term_parts[0].trim_end_matches('*'))
+                        }
+                        _ => format!("\"{}\"", term_parts[0]),
+                    }
                 } else {
                     term_parts[0].clone()
                 };
@@ -4537,13 +4539,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_term);
                     in_or_sequence = true;
                 } else {
-                    let term = if pending_unary_not {
-                        pending_unary_not = false;
-                        format!("NOT {fts_term}")
-                    } else {
-                        fts_term
-                    };
-                    fts_clauses.push((next_op, term));
+                    fts_clauses.push((next_op, fts_term));
                 }
                 next_op = "AND";
             }
@@ -4568,13 +4564,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_phrase);
                     in_or_sequence = true;
                 } else {
-                    let phrase = if pending_unary_not {
-                        pending_unary_not = false;
-                        format!("NOT {fts_phrase}")
-                    } else {
-                        fts_phrase
-                    };
-                    fts_clauses.push((next_op, phrase));
+                    fts_clauses.push((next_op, fts_phrase));
                 }
                 next_op = "AND";
             }
@@ -4594,8 +4584,8 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
         return Some("".to_string());
     }
 
-    // Safety guard: the fallback transpiler cannot represent a binary NOT as the
-    // very first operator (there is no left operand).
+    // Safety guard: the fallback transpiler must never emit NOT as the first
+    // operator because SQLite FTS5 requires a left operand.
     if fts_clauses.first().is_some_and(|(op, _)| *op == "NOT") {
         return None;
     }
@@ -7247,6 +7237,10 @@ mod tests {
             "hyphenated bead IDs should survive the rusqlite fallback path"
         );
 
+        let prefix_hits =
+            client.search("br-12*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
+        assert_eq!(prefix_hits.len(), 2);
+
         let filtered_hits = client.search(
             "br-123",
             SearchFilters {
@@ -9795,9 +9789,9 @@ mod tests {
     }
 
     #[test]
-    fn transpile_to_fts5_rejects_unary_not_queries() {
-        assert_eq!(transpile_to_fts5("NOT foo").as_deref(), Some("NOT foo"));
-        assert_eq!(transpile_to_fts5("-foo").as_deref(), Some("NOT foo"));
+    fn transpile_to_fts5_rejects_leading_unary_not_queries() {
+        assert_eq!(transpile_to_fts5("NOT foo"), None);
+        assert_eq!(transpile_to_fts5("-foo"), None);
     }
 
     #[test]
@@ -9811,6 +9805,10 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("foo NOT bar").as_deref(),
             Some("foo NOT bar")
+        );
+        assert_eq!(
+            transpile_to_fts5("foo NOT bar-baz"),
+            Some("foo NOT \"bar-baz\"".to_string())
         );
     }
 
@@ -13099,7 +13097,7 @@ mod tests {
             transpile_to_fts5("foo OR bar"),
             Some("(foo OR bar)".to_string())
         );
-        assert_eq!(transpile_to_fts5("NOT foo"), Some("NOT foo".to_string()));
+        assert_eq!(transpile_to_fts5("NOT foo"), None);
 
         // Precedence: OR binds tighter than AND in our parser logic
         // "A AND B OR C" -> "A AND (B OR C)"
@@ -13133,19 +13131,19 @@ mod tests {
         assert_eq!(transpile_to_fts5("*foo"), None);
         assert_eq!(transpile_to_fts5("f*o"), None);
 
-        // Hyphens are now preserved by cass_sanitize_query, so `foo-bar`
-        // stays as a single FTS5 token (the hyphen_normalize tokenizer
-        // decomposes it at index time, not at query-sanitization time).
+        // Hyphens are preserved by cass_sanitize_query, then quoted for FTS5
+        // so stock SQLite parses the term instead of treating `-bar` as syntax.
         assert_eq!(
             transpile_to_fts5("foo-bar"),
-            Some("foo-bar".to_string())
+            Some("\"foo-bar\"".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("foo-bar*"),
+            Some("\"foo-bar\"*".to_string())
         );
 
-        // NOT A OR B -> NOT A AND B (Tantivy logic replication)
-        assert_eq!(
-            transpile_to_fts5("NOT A OR B"),
-            Some("NOT A AND B".to_string())
-        );
+        // Leading unary-NOT forms are not valid FTS5 queries.
+        assert_eq!(transpile_to_fts5("NOT A OR B"), None);
     }
 
     #[test]

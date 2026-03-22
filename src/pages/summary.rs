@@ -512,7 +512,10 @@ impl<'a> SummaryGenerator<'a> {
             && !agents.is_empty()
         {
             let placeholders: Vec<&str> = (0..agents.len()).map(|_| "?").collect();
-            clauses.push(format!("c.agent IN ({})", placeholders.join(", ")));
+            clauses.push(format!(
+                "c.agent_id IN (SELECT id FROM agents WHERE slug IN ({}))",
+                placeholders.join(", ")
+            ));
             for agent in agents {
                 params.push(ParamValue::from(agent.as_str()));
             }
@@ -522,7 +525,10 @@ impl<'a> SummaryGenerator<'a> {
             && !workspaces.is_empty()
         {
             let placeholders: Vec<&str> = (0..workspaces.len()).map(|_| "?").collect();
-            clauses.push(format!("c.workspace IN ({})", placeholders.join(", ")));
+            clauses.push(format!(
+                "c.workspace_id IN (SELECT id FROM workspaces WHERE path IN ({}))",
+                placeholders.join(", ")
+            ));
             for ws in workspaces {
                 params.push(ParamValue::from(ws.as_str()));
             }
@@ -692,11 +698,12 @@ impl<'a> SummaryGenerator<'a> {
         params: &[ParamValue],
     ) -> Result<Vec<WorkspaceSummaryItem>> {
         let query = format!(
-            "SELECT c.workspace, COUNT(*) as conv_count,
+            "SELECT w.path, COUNT(*) as conv_count,
                     MIN(c.started_at), MAX(c.started_at)
              FROM conversations c
-             WHERE c.workspace IS NOT NULL{}
-             GROUP BY c.workspace
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             WHERE w.path IS NOT NULL{}
+             GROUP BY w.path
              ORDER BY conv_count DESC",
             where_clause
         );
@@ -715,7 +722,12 @@ impl<'a> SummaryGenerator<'a> {
             // Get message count for this workspace
             let msg_query = format!(
                 "SELECT COUNT(*) FROM messages
-                 WHERE conversation_id IN (SELECT c.id FROM conversations c WHERE c.workspace = ?{})",
+                 WHERE conversation_id IN (
+                     SELECT c.id
+                     FROM conversations c
+                     LEFT JOIN workspaces w ON c.workspace_id = w.id
+                     WHERE w.path = ?{}
+                 )",
                 where_clause
             );
             let prepended = Self::prepend_params(ParamValue::from(workspace.as_str()), params);
@@ -725,8 +737,10 @@ impl<'a> SummaryGenerator<'a> {
 
             // Get sample titles
             let title_query = format!(
-                "SELECT c.title FROM conversations c
-                 WHERE c.workspace = ? AND c.title IS NOT NULL{}
+                "SELECT c.title
+                 FROM conversations c
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 WHERE w.path = ? AND c.title IS NOT NULL{}
                  ORDER BY c.started_at DESC LIMIT 5",
                 where_clause
             );
@@ -766,10 +780,11 @@ impl<'a> SummaryGenerator<'a> {
         total_conversations: usize,
     ) -> Result<Vec<AgentSummaryItem>> {
         let query = format!(
-            "SELECT c.agent, COUNT(*) as conv_count
+            "SELECT a.slug, COUNT(*) as conv_count
              FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
              WHERE 1=1{}
-             GROUP BY c.agent
+             GROUP BY a.slug
              ORDER BY conv_count DESC",
             where_clause
         );
@@ -783,7 +798,12 @@ impl<'a> SummaryGenerator<'a> {
             // Get message count
             let msg_query = format!(
                 "SELECT COUNT(*) FROM messages
-                 WHERE conversation_id IN (SELECT c.id FROM conversations c WHERE c.agent = ?{})",
+                 WHERE conversation_id IN (
+                     SELECT c.id
+                     FROM conversations c
+                     JOIN agents a ON c.agent_id = a.id
+                     WHERE a.slug = ?{}
+                 )",
                 where_clause
             );
             let prepended = Self::prepend_params(ParamValue::from(agent.as_str()), params);
@@ -827,10 +847,11 @@ impl<'a> SummaryGenerator<'a> {
 
         // Query conversations and filter
         let query = format!(
-            "SELECT c.id, c.workspace, c.title,
+            "SELECT c.id, w.path, c.title,
                     (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id),
                     (SELECT SUM(LENGTH(content)) FROM messages WHERE conversation_id = c.id)
              FROM conversations c
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1{}",
             where_clause
         );
@@ -1015,16 +1036,26 @@ mod tests {
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).unwrap();
 
         conn.execute_batch(
-            "CREATE TABLE conversations (
+            "CREATE TABLE agents (
                 id INTEGER PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT,
+                slug TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
                 title TEXT,
                 source_path TEXT NOT NULL,
                 started_at INTEGER,
                 ended_at INTEGER,
                 message_count INTEGER,
-                metadata_json TEXT
+                metadata_json TEXT,
+                FOREIGN KEY (agent_id) REFERENCES agents(id),
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
             );
             CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -1045,18 +1076,27 @@ mod tests {
         use frankensqlite::compat::ConnectionExt;
         use frankensqlite::params;
 
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude-code');")
+            .unwrap();
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'aider');")
+            .unwrap();
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project-a');")
+            .unwrap();
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/project-b');")
+            .unwrap();
+
         // Insert conversations
         conn.execute(
-            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (1, 'claude-code', '/home/user/project-a', 'Fix authentication bug', '/path/a.jsonl', 1700000000000, 5);",
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (1, 1, 1, 'Fix authentication bug', '/path/a.jsonl', 1700000000000, 5);",
         ).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (2, 'claude-code', '/home/user/project-a', 'Add user profile', '/path/b.jsonl', 1700100000000, 3);",
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (2, 1, 1, 'Add user profile', '/path/b.jsonl', 1700100000000, 3);",
         ).unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (3, 'aider', '/home/user/project-b', 'Setup database', '/path/c.jsonl', 1700200000000, 4);",
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (3, 2, 2, 'Setup database', '/path/c.jsonl', 1700200000000, 4);",
         ).unwrap();
 
         // Insert messages
@@ -1383,9 +1423,11 @@ mod tests {
 
         // Conversation without workspace should still be counted when exclusions
         // are active but do not match this conversation.
+        conn.execute("INSERT INTO agents (id, slug) VALUES (3, 'codex');")
+            .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (10, 'codex', NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (10, 3, NULL, 'General session', '/path/no-workspace.jsonl', 1700300000000, 1);",
         )
         .unwrap();
         conn.execute(
