@@ -10423,8 +10423,10 @@ impl CassApp {
         let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
         let value_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
 
-        // Clear background
-        Block::new().style(bg_style).render(overlay_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(overlay_area, ftui::Cell::from_char(' ').with_bg(bg_color));
 
         // Tab bar header — use short labels based on topology
         let tabs = [
@@ -11626,7 +11628,10 @@ impl CassApp {
         let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
         let selected_style = styles.style(style_system::STYLE_RESULT_ROW_SELECTED);
 
-        Block::new().style(bg_style).render(modal_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(modal_area, ftui::Cell::from_char(' ').with_bg(bg_color));
         let title = format!("{SAVED_VIEWS_MODAL_TITLE}({})", self.saved_views.len());
         let outer = Block::new()
             .borders(Borders::ALL)
@@ -11753,8 +11758,10 @@ impl CassApp {
         let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
         let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
 
-        // Clear background.
-        Block::new().style(bg_style).render(modal_area, frame);
+        // Clear background — use draw_rect_filled to overwrite both characters
+        // and styles (Block::style only sets bg without clearing foreground text).
+        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+        frame.draw_rect_filled(modal_area, ftui::Cell::from_char(' ').with_bg(bg_color));
 
         // Outer border.
         let outer = Block::new()
@@ -20495,8 +20502,10 @@ impl super::ftui_adapter::Model for CassApp {
             let my = area.y + (area.height.saturating_sub(modal_h)) / 2;
             let modal_area = Rect::new(mx, my, modal_w, modal_h);
 
-            // Clear area behind modal
-            Block::new().style(root_style).render(modal_area, frame);
+            // Clear area behind modal — use draw_rect_filled to overwrite both characters
+            // and styles (Block::style only sets bg without clearing foreground text).
+            let bg_color = root_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+            frame.draw_rect_filled(modal_area, ftui::Cell::from_char(' ').with_bg(bg_color));
 
             let title = format!(" Bulk Actions ({} selected) ", self.selected.len());
             let modal_block = Block::new()
