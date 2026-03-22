@@ -2078,6 +2078,29 @@ fn normalize_phrase_terms(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn render_fts5_term_part(part: &str) -> Option<String> {
+    let pattern = FsCassWildcardPattern::parse(part);
+    if matches!(
+        pattern,
+        FsCassWildcardPattern::Suffix(_)
+            | FsCassWildcardPattern::Substring(_)
+            | FsCassWildcardPattern::Complex(_)
+    ) {
+        return None;
+    }
+
+    if part.contains('-') {
+        return Some(match pattern {
+            FsCassWildcardPattern::Prefix(_) => {
+                format!("\"{}\"*", part.trim_end_matches('*'))
+            }
+            _ => format!("\"{}\"", part),
+        });
+    }
+
+    Some(part.to_string())
+}
+
 /// Determine the dominant match type from a query string.
 /// Returns the "loosest" pattern used (Substring > Suffix > Prefix > Exact).
 fn dominant_match_type(query: &str) -> MatchType {
@@ -4496,17 +4519,6 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 next_op = "NOT";
             }
             FsCassQueryToken::Term(t) => {
-                // Check for unsupported wildcards
-                let pattern = FsCassWildcardPattern::parse(&t);
-                if matches!(
-                    pattern,
-                    FsCassWildcardPattern::Suffix(_)
-                        | FsCassWildcardPattern::Substring(_)
-                        | FsCassWildcardPattern::Complex(_)
-                ) {
-                    return None;
-                }
-
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string.
                 // e.g. "foo bar" -> foo AND bar. Hyphens stay intact here so we can
                 // later emit them as quoted terms; bare `foo-bar` is invalid FTS5 syntax.
@@ -4515,20 +4527,18 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     continue;
                 }
 
+                let mut rendered_parts = Vec::with_capacity(term_parts.len());
+                for part in &term_parts {
+                    rendered_parts.push(render_fts5_term_part(part)?);
+                }
+
                 // If multiple parts, wrap in parens and join with AND to ensure they stay together.
                 // Stock FTS5 requires hyphenated tokens to be quoted (and prefix queries need the
-                // trailing * outside the quotes), otherwise `MATCH 'foo-bar'` is parsed as syntax.
-                let fts_term = if term_parts.len() > 1 {
-                    format!("({})", term_parts.join(" AND "))
-                } else if term_parts[0].contains('-') {
-                    match pattern {
-                        FsCassWildcardPattern::Prefix(_) => {
-                            format!("\"{}\"*", term_parts[0].trim_end_matches('*'))
-                        }
-                        _ => format!("\"{}\"", term_parts[0]),
-                    }
+                // trailing * outside the quotes), otherwise bare `foo-bar` is parsed as syntax.
+                let fts_term = if rendered_parts.len() > 1 {
+                    format!("({})", rendered_parts.join(" AND "))
                 } else {
-                    term_parts[0].clone()
+                    rendered_parts[0].clone()
                 };
 
                 if in_or_sequence {
@@ -7252,6 +7262,24 @@ mod tests {
         )?;
         assert_eq!(leading_or_hits.len(), 2);
 
+        let dotted_hits = client.search(
+            "br-123.jsonl",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(dotted_hits.len(), 2);
+
+        let dotted_prefix_hits = client.search(
+            "br-123.json*",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(dotted_prefix_hits.len(), 2);
+
         let prefix_hits =
             client.search("br-12*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
         assert_eq!(prefix_hits.len(), 2);
@@ -9821,6 +9849,18 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("OR foo-bar"),
             Some("\"foo-bar\"".to_string())
+        );
+    }
+
+    #[test]
+    fn transpile_to_fts5_quotes_hyphenated_subterms_after_sanitization_split() {
+        assert_eq!(
+            transpile_to_fts5("br-123.jsonl"),
+            Some("(\"br-123\" AND jsonl)".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.json*"),
+            Some("(\"br-123\" AND json*)".to_string())
         );
     }
 
@@ -13165,6 +13205,14 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("foo-bar*"),
             Some("\"foo-bar\"*".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.jsonl"),
+            Some("(\"br-123\" AND jsonl)".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("br-123.json*"),
+            Some("(\"br-123\" AND json*)".to_string())
         );
 
         // Leading unary-NOT forms are not valid FTS5 queries.

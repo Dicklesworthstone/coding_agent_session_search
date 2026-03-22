@@ -1000,4 +1000,72 @@ mod tests {
 
         assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
     }
+
+    #[test]
+    fn test_key_add_password_updates_private_fingerprint_and_master_key() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let old_fingerprint =
+            std::fs::read_to_string(private_dir.join("integrity-fingerprint.txt")).unwrap();
+        let old_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+
+        key_add_password(&archive_dir, "test-password", "new-password").unwrap();
+
+        let new_fingerprint =
+            std::fs::read_to_string(private_dir.join("integrity-fingerprint.txt")).unwrap();
+        let new_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+
+        assert_ne!(old_fingerprint, new_fingerprint);
+        assert_ne!(old_master_key, new_master_key);
+    }
+
+    #[test]
+    fn test_key_add_recovery_writes_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+
+        let (_slot_id, secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        let recovery_file =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+
+        assert!(recovery_file.contains(secret.encoded()));
+    }
+
+    #[test]
+    fn test_key_revoke_recovery_removes_private_recovery_artifact() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let (recovery_slot_id, _secret) = key_add_recovery(&archive_dir, "test-password").unwrap();
+        key_add_password(&archive_dir, "test-password", "second-password").unwrap();
+        assert!(private_dir.join("recovery-secret.txt").exists());
+
+        key_revoke(&archive_dir, "second-password", recovery_slot_id).unwrap();
+
+        assert!(!private_dir.join("recovery-secret.txt").exists());
+    }
+
+    #[test]
+    fn test_key_rotate_refreshes_private_recovery_and_master_key() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let private_dir = site_dir.parent().unwrap().join("private");
+
+        let old_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+        let result =
+            key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+
+        let new_master_key = std::fs::read_to_string(private_dir.join("master-key.json")).unwrap();
+        let recovery_file =
+            std::fs::read_to_string(private_dir.join("recovery-secret.txt")).unwrap();
+
+        assert_ne!(old_master_key, new_master_key);
+        assert!(recovery_file.contains(result.recovery_secret.as_deref().unwrap()));
+    }
 }
