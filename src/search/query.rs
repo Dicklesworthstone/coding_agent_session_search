@@ -613,7 +613,7 @@ impl QueryExplanation {
         }
 
         // Boolean queries use combination strategy
-        // Also if any single term is split into multiple subterms (compound term like "foo-bar")
+        // Also if any single term is split into multiple subterms (e.g. "foo.bar" -> "foo", "bar")
         let has_compound_terms = parsed.terms.iter().any(|t| t.subterms.len() > 1);
 
         if !parsed.operators.is_empty()
@@ -2059,7 +2059,8 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Normalize a term into tokenizer-aligned parts.
-/// Splits on punctuation to match SimpleTokenizer behavior, preserving `*` for wildcards.
+/// Splits on non-word punctuation (hyphens preserved) to match `hyphen_normalize` tokenizer,
+/// preserving `*` for wildcards.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
     fs_cass_sanitize_query(raw)
         .split_whitespace()
@@ -4067,6 +4068,10 @@ impl SearchClient {
             db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // Live databases can be briefly busy during writer handoffs. A short
+        // timeout avoids turning transient lock contention into a false
+        // "search is broken" failure for the fallback path.
+        conn.busy_timeout(Duration::from_millis(250))?;
 
         // Gracefully bail if the fts_messages table doesn't exist.
         let has_fts: bool = conn
@@ -4505,7 +4510,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
 
                 // Sanitize and normalize. FTS5 implicitly ANDs words in a string.
                 // e.g. "foo bar" -> foo AND bar.
-                // normalize_term_parts splits "foo-bar" -> "foo", "bar".
+                // Hyphens are preserved: "foo-bar" stays as one token.
                 let term_parts = normalize_term_parts(&t);
                 if term_parts.is_empty() {
                     continue;
@@ -7121,6 +7126,141 @@ mod tests {
             legacy_count_after, 1,
             "opening the legacy db must not persist duplicate fts_messages schema rows"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("hyphenated-rusqlite-fallback.db");
+
+        {
+            let conn = LegacyConnection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+                 CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+                 CREATE TABLE conversations (
+                    id INTEGER PRIMARY KEY,
+                    agent_id INTEGER,
+                    workspace_id INTEGER,
+                    source_id TEXT,
+                    origin_host TEXT,
+                    title TEXT,
+                    source_path TEXT
+                 );
+                 CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    conversation_id INTEGER,
+                    idx INTEGER,
+                    content TEXT,
+                    created_at INTEGER
+                 );
+                 CREATE VIRTUAL TABLE fts_messages USING fts5(
+                    content,
+                    title,
+                    agent,
+                    workspace,
+                    source_path,
+                    created_at UNINDEXED,
+                    content='',
+                    tokenize='porter'
+                 );",
+            )?;
+            conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')", [])?;
+            conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')", [])?;
+            conn.execute(
+                "INSERT INTO workspaces(id, path) VALUES(1, '/ws/alpha')",
+                [],
+            )?;
+            conn.execute("INSERT INTO workspaces(id, path) VALUES(2, '/ws/beta')", [])?;
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+                 VALUES(1, 1, 1, 'local', NULL, 'alpha bead', '/tmp/alpha.jsonl')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+                 VALUES(2, 1, 2, 'local', NULL, 'beta bead', '/tmp/beta.jsonl')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(11, 1, 0, 'Need follow-up on br-123 root cause', 100)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(12, 2, 0, 'Need follow-up on br-123 user report', 101)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    11_i64,
+                    "Need follow-up on br-123 root cause",
+                    "alpha bead",
+                    "codex",
+                    "/ws/alpha",
+                    "/tmp/alpha.jsonl",
+                    100_i64
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    12_i64,
+                    "Need follow-up on br-123 user report",
+                    "beta bead",
+                    "codex",
+                    "/ws/beta",
+                    "/tmp/beta.jsonl",
+                    101_i64
+                ],
+            )?;
+        }
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            _shared_filters: Arc::new(Mutex::new(())),
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+        };
+
+        let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
+        assert_eq!(all_hits.len(), 2);
+        assert!(
+            all_hits.iter().all(|hit| hit.content.contains("br-123")),
+            "hyphenated bead IDs should survive the rusqlite fallback path"
+        );
+
+        let filtered_hits = client.search(
+            "br-123",
+            SearchFilters {
+                workspaces: HashSet::from_iter(["/ws/beta".to_string()]),
+                ..SearchFilters::default()
+            },
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(filtered_hits.len(), 1);
+        assert_eq!(filtered_hits[0].workspace, "/ws/beta");
+        assert_eq!(filtered_hits[0].source_path, "/tmp/beta.jsonl");
+        assert!(filtered_hits[0].content.contains("br-123"));
 
         Ok(())
     }
@@ -12993,13 +13133,12 @@ mod tests {
         assert_eq!(transpile_to_fts5("*foo"), None);
         assert_eq!(transpile_to_fts5("f*o"), None);
 
-        // Mixed sanitization
-        // "foo-bar" -> "foo bar" -> "foo AND bar" in FTS5 implicit syntax?
-        // My implementation splits "foo-bar" into "foo", "bar" and joins with AND.
-        // And wraps in parens if >1 part.
+        // Hyphens are now preserved by cass_sanitize_query, so `foo-bar`
+        // stays as a single FTS5 token (the hyphen_normalize tokenizer
+        // decomposes it at index time, not at query-sanitization time).
         assert_eq!(
             transpile_to_fts5("foo-bar"),
-            Some("(foo AND bar)".to_string())
+            Some("foo-bar".to_string())
         );
 
         // NOT A OR B -> NOT A AND B (Tantivy logic replication)
