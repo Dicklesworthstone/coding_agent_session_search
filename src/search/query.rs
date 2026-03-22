@@ -2908,7 +2908,9 @@ impl SearchClient {
                 let started_at: Option<i64> = row.get_typed(12)?;
 
                 let created_at = msg_created_at.or(started_at);
-                let line_number = idx.map(|i| (i + 1) as usize);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
                     snippet_from_content(&content)
                 } else {
@@ -3980,7 +3982,8 @@ impl SearchClient {
             let line_number = doc
                 .get_first(fields.msg_idx)
                 .and_then(|v| v.as_u64())
-                .map(|i| (i + 1) as usize);
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
             let hash_basis = if content.is_empty() {
                 raw_content
             } else {
@@ -4220,7 +4223,9 @@ impl SearchClient {
             let source_id = source_id_opt.unwrap_or_else(default_source_id);
             let origin_kind = origin_kind_opt.unwrap_or_else(default_origin_kind);
 
-            let line_number = idx.map(|i| (i + 1) as usize);
+            let line_number = idx
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
             let snippet = if field_mask.wants_snippet() {
                 snippet_from_content(&raw_content)
             } else {
@@ -4379,7 +4384,9 @@ impl SearchClient {
                 let origin_kind: String = row
                     .get_typed::<Option<String>>(9)?
                     .unwrap_or_else(default_origin_kind);
-                let line_number = idx.map(|i| (i + 1) as usize);
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
                 let snippet = if field_mask.wants_snippet() {
                     snippet_from_content(&raw_content)
                 } else {
