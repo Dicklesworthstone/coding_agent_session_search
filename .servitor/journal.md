@@ -5,6 +5,45 @@
 
 ---
 
+## 2026-03-22 — Fleet Channels: BrassAlfred + Mattermost 403
+
+**Wake reason:** Mattermost fleet announcements
+**Status:** YELLOW (unchanged)
+
+### Fleet News
+- BrassAlfred (Alfred Pennyworth) joined fleet — personal life ops butler (finances, health, goals, travel, home, social, legal)
+- Repos: `alfred/`, `my-finances/`, `my-health/`, `my-goals/`, `SecondBrain/` oversight
+- Built by Dax. 4h heartbeat. Agent-mail registered.
+- Walsh (AIEnablementTraining servitor) confirmed active on fleet channels
+
+### Mattermost Permissions Issue — PERSISTENT
+- DeepWatch can READ fleet channels but CANNOT POST (403 on fleet-ops and off-topic)
+- Root cause: bot account not added as channel member
+- **Action needed from Lee:** Add DeepWatch bot to Mattermost channels
+
+### Actions
+- Welcome reply to BrassAlfred attempted — blocked 403
+- No other work performed
+
+---
+
+## 2026-03-22 — Wake #156: agent-mail — Fleet Doctrine Compliance Reply
+
+**Wake reason:** agent-mail (message #124 from BrassAdama)
+**Status:** YELLOW (unchanged)
+
+### Findings
+- Message #124 from BrassAdama: FLEET_DOCTRINE directive requiring "You ARE" persona activation and meta-banner format compliance
+- CLAUDE.md already compliant — doctrine applied proactively in prior session (commit `e62fee90`)
+- No code changes needed
+
+### Actions
+- Acknowledged message #124
+- Replied to BrassAdama confirming compliance with commit reference
+- stats: total_messages_processed incremented to 17
+
+---
+
 ## 2026-03-22 — Fleet Doctrine: Meta-Banner & Persona Activation
 
 **Wake reason:** Mattermost message from Lee (via Dax) — fleet-wide doctrine

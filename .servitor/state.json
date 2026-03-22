@@ -1,0 +1,137 @@
+{
+  "repo": "cass",
+  "initialized": "2026-03-14T18:36:54-06:00",
+  "last_heartbeat": "2026-03-22T10:50:00-06:00",
+  "last_wake_reason": "Mattermost fleet messages: (1) Lee doctrine via Dax — meta-banner/persona activation; (2) BrassAdama — BrassAlfred joins fleet; (3) Walsh active on channels. CLAUDE.md updated with Geordi persona activation. Mattermost replies blocked by 403.",
+  "health_status": "yellow",
+  "roadmap": [],
+  "active_reviews": [],
+  "known_issues": [
+    {
+      "id": "ci-red-main",
+      "severity": "high",
+      "summary": "CI failing on all phantom pushes. Latest (23:16 UTC): asupersync local path dep missing in CI. Earlier: cli_robot.rs integration tests, begin_concurrent_persist. All runs orphaned (force-pushed away).",
+      "detected": "2026-03-15",
+      "updated": "2026-03-20"
+    },
+    {
+      "id": "release-blocked",
+      "severity": "high",
+      "summary": "v0.2.2 release blocked by CI test failures",
+      "detected": "2026-03-15"
+    },
+    {
+      "id": "dirty-worktree",
+      "severity": "medium",
+      "summary": "17 modified files uncommitted on main (+377/-327 lines)",
+      "detected": "2026-03-15",
+      "updated": "2026-03-20"
+    },
+    {
+      "id": "push-revert-pattern",
+      "severity": "medium",
+      "summary": "~31+ rapid push-and-revert cycles on main (Mar 15: 3x; Mar 20-21: 7x; Mar 21: 13x; Mar 22: 8x). Latest: release: bump version to 0.2.3 at 03:48 UTC (3 runs pending). Previous: fix(watch) and fix(ui) batches cancelled at 03:37 UTC. Local Cargo.toml still at 0.2.1; upstream attempting 0.2.3 (skipping 0.2.2).",
+      "detected": "2026-03-15",
+      "updated": "2026-03-22"
+    },
+    {
+      "id": "mattermost-403",
+      "severity": "medium",
+      "summary": "DeepWatch bot can READ Mattermost channels but cannot POST (403) — not added as channel member. Affects fleet-ops and off-topic. Action needed: Lee adds bot to channels.",
+      "detected": "2026-03-22"
+    },
+    {
+      "id": "asupersync-fixture-error",
+      "severity": "low",
+      "summary": "Upstream asupersync dep has unquoted name=beta in test fixture Cargo.toml. Non-fatal locally but generates error output.",
+      "detected": "2026-03-20"
+    }
+  ],
+  "resolved_issues": [
+    {
+      "id": "rustc-too-old",
+      "summary": "rustc updated from 1.85.0 to 1.94.0 — local builds now succeed",
+      "resolved": "2026-03-20"
+    },
+    {
+      "id": "clippy-warnings",
+      "summary": "cargo clippy --all-targets now clean — zero warnings",
+      "resolved": "2026-03-20"
+    },
+    {
+      "id": "orphaned-ci-runs",
+      "summary": "All 10 orphaned CI runs from 3 phantom commits resolved: 5 cancelled, 4 failed, 1 success",
+      "resolved": "2026-03-16"
+    },
+    {
+      "id": "fmt-drift",
+      "summary": "cargo fmt --check now passes — drift resolved",
+      "resolved": "2026-03-15"
+    },
+    {
+      "id": "test-failures-29",
+      "summary": "29 failures reduced to 7 — remaining are analytics_tokens DB fixture issue only",
+      "resolved": "2026-03-15"
+    },
+    {
+      "id": "beads-issue-77",
+      "summary": "Beads tracker now clean — no open issues",
+      "resolved": "2026-03-15"
+    }
+  ],
+  "tech_debt": [
+    {
+      "id": "cargo-outdated-missing",
+      "summary": "cargo-outdated not installed — dependency health unchecked",
+      "detected": "2026-03-15"
+    }
+  ],
+  "contacts": [
+    {
+      "agent": "IronFleet",
+      "role": "Fleet Commander (legacy)",
+      "established": "2026-03-15"
+    },
+    {
+      "agent": "BrassAdama",
+      "role": "Fleet Commander — servitor repo",
+      "established": "2026-03-15"
+    },
+    {
+      "agent": "SteelGuard",
+      "role": "AISkills repo servitor",
+      "established": "2026-03-22"
+    },
+    {
+      "agent": "QuillKeeper",
+      "role": "substack repo servitor — contact established (their side); reply failed (not in our project). Need BrassAdama to broker or QuillKeeper to send from substack project key.",
+      "established": "2026-03-22"
+    },
+    {
+      "agent": "Dax",
+      "role": "bizops (catalyst) servitor — contact pending",
+      "established": "2026-03-22"
+    },
+    {
+      "agent": "ChartreuseBear",
+      "role": "ElliotSkyFallDailyWeather servitor — contact pending",
+      "established": "2026-03-22"
+    },
+    {
+      "agent": "BrassAlfred",
+      "role": "Alfred Pennyworth — personal life ops butler (finances, health, goals, travel, home, social, legal). Repos: alfred/, my-finances/, my-health/, my-goals/, SecondBrain/. 4h heartbeat.",
+      "established": "2026-03-22"
+    },
+    {
+      "agent": "Walsh",
+      "role": "AIEnablementTraining servitor — active on fleet Mattermost channels",
+      "established": "2026-03-22"
+    }
+  ],
+  "stats": {
+    "total_wakes": 156,
+    "total_reviews": 0,
+    "total_prs_created": 0,
+    "total_messages_processed": 17
+  }
+}
