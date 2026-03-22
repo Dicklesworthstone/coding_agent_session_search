@@ -278,6 +278,7 @@ fn test_corrupted_index_triggers_rebuild() {
         build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
+        watch_interval_secs: 30,
     };
     let result = indexer::run_index(opts, None);
     // Index creation may fail if connectors aren't configured, which is fine
@@ -307,6 +308,7 @@ fn test_corrupted_index_triggers_rebuild() {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
         // force_rebuild should handle corrupted index gracefully
         let _ = indexer::run_index(rebuild_opts, None);

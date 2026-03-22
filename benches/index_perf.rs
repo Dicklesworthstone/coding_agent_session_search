@@ -97,6 +97,7 @@ fn bench_index_full(c: &mut Criterion) {
         build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
+        watch_interval_secs: 30,
     };
 
     // create empty index dir so Tantivy opens cleanly
@@ -135,6 +136,7 @@ fn bench_streaming_vs_batch(c: &mut Criterion) {
             build_hnsw: false,
             embedder: "fastembed".to_string(),
             progress: None,
+            watch_interval_secs: 30,
         };
 
         // Benchmark batch mode
@@ -201,6 +203,7 @@ fn bench_channel_overhead(c: &mut Criterion) {
         build_hnsw: false,
         embedder: "fastembed".to_string(),
         progress: None,
+        watch_interval_secs: 30,
     };
 
     // Enable streaming mode for this benchmark

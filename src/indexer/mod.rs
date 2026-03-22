@@ -1596,9 +1596,21 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     let mut pending: Vec<PathBuf> = Vec::new();
     let mut first_event: Option<Instant> = None;
     let mut last_stale_check = Instant::now();
-    let mut last_scan = Instant::now();
+    // Initialize to the past so the first scan can fire immediately.
+    let mut last_scan = Instant::now() - min_scan_interval;
+
+    tracing::info!(
+        watch_interval_secs,
+        "watch mode: minimum interval between scan cycles"
+    );
 
     loop {
+        // How much cooldown remains before we may fire the next callback.
+        // Using this as recv_timeout lets us keep accumulating events
+        // instead of blocking with thread::sleep (which would drop events
+        // if the inotify buffer fills up).
+        let cooldown_remaining = min_scan_interval.saturating_sub(last_scan.elapsed());
+
         // Calculate timeout: use stale check interval when idle, debounce when active
         let timeout = if pending.is_empty() {
             stale_check_interval
@@ -1606,19 +1618,22 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             let now = Instant::now();
             let elapsed = now.duration_since(first_event.unwrap_or(now));
             if elapsed >= max_wait {
-                // Enforce minimum interval between scans to prevent CPU burn
-                // when events arrive faster than we can process them (issue #129)
-                let since_last_scan = last_scan.elapsed();
-                if since_last_scan < min_scan_interval {
-                    std::thread::sleep(min_scan_interval - since_last_scan);
+                if cooldown_remaining.is_zero() {
+                    // Cooldown elapsed and max_wait exceeded: fire now.
+                    callback(std::mem::take(&mut pending), &roots, false);
+                    last_scan = Instant::now();
+                    first_event = None;
+                    continue;
                 }
-                callback(std::mem::take(&mut pending), &roots, false);
-                last_scan = Instant::now();
-                first_event = None;
-                continue;
+                // max_wait exceeded but cooldown still active: wait for
+                // the remaining cooldown while accumulating new events.
+                cooldown_remaining
+            } else {
+                let remaining = max_wait.saturating_sub(elapsed);
+                // Use the larger of (debounce, cooldown_remaining) to ensure
+                // we never fire the callback faster than min_scan_interval.
+                debounce.min(remaining).max(cooldown_remaining)
             }
-            let remaining = max_wait.saturating_sub(elapsed);
-            debounce.min(remaining)
         };
 
         match rx.recv_timeout(timeout) {
@@ -1630,22 +1645,20 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
             }
             Ok(IndexerEvent::Command(cmd)) => match cmd {
                 ReindexCommand::Full => {
-                    // Flush pending first, then do full rebuild
+                    // Full rebuild commands bypass cooldown for responsive
+                    // operator-initiated rebuilds.
                     if !pending.is_empty() {
                         callback(std::mem::take(&mut pending), &roots, false);
+                        last_scan = Instant::now();
                     }
                     callback(vec![], &roots, true);
+                    last_scan = Instant::now();
                     first_event = None;
                 }
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                // Process pending events if any
-                if !pending.is_empty() {
-                    // Enforce minimum interval between scans (issue #129)
-                    let since_last_scan = last_scan.elapsed();
-                    if since_last_scan < min_scan_interval {
-                        std::thread::sleep(min_scan_interval - since_last_scan);
-                    }
+                // Process pending events only if cooldown has elapsed
+                if !pending.is_empty() && last_scan.elapsed() >= min_scan_interval {
                     callback(std::mem::take(&mut pending), &roots, false);
                     last_scan = Instant::now();
                     first_event = None;
@@ -1679,6 +1692,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
                                 );
                                 // Trigger full rebuild
                                 callback(vec![], &roots, true);
+                                last_scan = Instant::now();
                             }
                             StaleAction::None => {
                                 // Stale detection disabled, should not reach here

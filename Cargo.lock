@@ -2132,7 +2132,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -2146,14 +2146,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-types",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync 0.2.8",
  "blake3",
@@ -2202,14 +2202,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
@@ -2270,7 +2270,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "crc32c",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync 0.2.8",
  "bitflags 2.11.0",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync 0.2.8",
  "crossbeam-deque",
@@ -2396,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "asupersync 0.2.8",
  "blake3",

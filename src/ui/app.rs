@@ -17710,6 +17710,7 @@ impl super::ftui_adapter::Model for CassApp {
                             build_hnsw: false,
                             embedder: "fastembed".to_string(),
                             progress: Some(progress),
+                            watch_interval_secs: 30,
                         };
                         match crate::indexer::run_index(opts, None) {
                             Ok(()) => CassMsg::IndexRefreshCompleted,
