@@ -4324,9 +4324,12 @@ fn state_meta_json(
         0
     };
 
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000;
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
+    let index_age_secs = last_indexed_at.and_then(|ts| {
+        if ts <= 0 {
+            return None;
+        }
+        let ts_secs = (ts / 1000) as u64;
+        Some(now_secs.saturating_sub(ts_secs))
     });
     let is_stale = match index_age_secs {
         None => true,
@@ -8541,7 +8544,17 @@ fn rebuild_tantivy_from_db(
         retryable: true,
     })?;
 
-    let _ = std::fs::remove_dir_all(&index_path);
+    if let Err(e) = std::fs::remove_dir_all(&index_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(CliError {
+            code: 5,
+            kind: "doctor",
+            message: format!("failed to remove stale index directory: {e}"),
+            hint: None,
+            retryable: true,
+        });
+    }
     std::fs::create_dir_all(&index_path).map_err(|e| CliError {
         code: 5,
         kind: "doctor",
@@ -11923,7 +11936,7 @@ fn run_index_with_data(
         && let Ok(conn) = Connection::open(db_path.to_string_lossy().as_ref())
     {
         // Ensure idempotency_keys table exists
-        let _ = conn.execute(
+        if let Err(e) = conn.execute(
             "CREATE TABLE IF NOT EXISTS idempotency_keys (
                 key TEXT PRIMARY KEY,
                 params_hash TEXT NOT NULL,
@@ -11931,14 +11944,18 @@ fn run_index_with_data(
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             )",
-        );
+        ) {
+            tracing::warn!("Failed to create idempotency_keys table: {e}");
+        }
 
         // Clean expired keys
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let _ = conn.execute_compat(
+        if let Err(e) = conn.execute_compat(
             "DELETE FROM idempotency_keys WHERE expires_at < ?1",
             frankensqlite::params![now_ms],
-        );
+        ) {
+            tracing::warn!("Failed to clean expired idempotency keys: {e}");
+        }
 
         // Look up existing key
         let cached: Option<(String, String)> = conn
@@ -12304,10 +12321,12 @@ fn run_index_with_data(
                 let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                 let result_json = serde_json::to_string(&payload).unwrap_or_default();
                 let hash_str = params_hash.to_string();
-                let _ = conn.execute_compat(
+                if let Err(e) = conn.execute_compat(
                     "INSERT OR REPLACE INTO idempotency_keys (key, params_hash, result_json, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                     frankensqlite::params![key.as_str(), hash_str.as_str(), result_json.as_str(), now_ms, expires_ms],
-                );
+                ) {
+                    tracing::warn!("Failed to store idempotency key: {e}");
+                }
             }
         }
 
