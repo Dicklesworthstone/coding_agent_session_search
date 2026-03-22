@@ -20504,7 +20504,10 @@ impl super::ftui_adapter::Model for CassApp {
 
             // Clear area behind modal — use draw_rect_filled to overwrite both characters
             // and styles (Block::style only sets bg without clearing foreground text).
-            let bg_color = root_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
+            let bg_color = styles
+                .style(style_system::STYLE_PANE_BASE)
+                .bg
+                .unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
             frame.draw_rect_filled(modal_area, ftui::Cell::from_char(' ').with_bg(bg_color));
 
             let title = format!(" Bulk Actions ({} selected) ", self.selected.len());
