@@ -80,7 +80,7 @@ export function initSearch(container, onSelect) {
     setupEventListeners();
 
     // Load initial data (recent conversations)
-    loadRecentConversations();
+    loadRecentConversations(searchEpoch);
 
     // Populate filter options
     populateFilters();
@@ -476,7 +476,7 @@ async function performSearch(epoch) {
 /**
  * Load recent conversations (no search query)
  */
-async function loadRecentConversations(epoch) {
+async function loadRecentConversations(epoch = searchEpoch) {
     try {
         let results;
 
@@ -590,23 +590,13 @@ function renderDirectResults() {
  */
 function sanitizeSnippet(html) {
     if (!html) return '';
-    
-    // Use rare private use characters as placeholders
-    const MARK_OPEN = '\uE000';
-    const MARK_CLOSE = '\uE001';
-    
-    // Replace markers with placeholders
-    const safe = html
-        .replace(/<mark>/g, MARK_OPEN)
-        .replace(/<\/mark>/g, MARK_CLOSE);
-        
-    // Escape the entire string (handling all user content)
-    const escaped = escapeHtml(safe);
-    
-    // Restore markers
-    return escaped
-        .replace(new RegExp(MARK_OPEN, 'g'), '<mark>')
-        .replace(new RegExp(MARK_CLOSE, 'g'), '</mark>');
+
+    return html
+        .split(/(<\/?mark>)/g)
+        .map((segment) => (segment === '<mark>' || segment === '</mark>')
+            ? segment
+            : escapeHtml(segment))
+        .join('');
 }
 
 /**
@@ -622,7 +612,7 @@ function createResultCard(result, index) {
     article.setAttribute('role', 'option');
     article.setAttribute('aria-selected', 'false');
     article.id = `result-${result.conversation_id}`;
-    article.setAttribute('aria-label', `${result.title || 'Untitled conversation'}, ${formatAgentName(result.agent)}${result.workspace ? ', ' + formatWorkspace(result.workspace) : ''}, ${formatTime(result.started_at)}`);
+    article.setAttribute('aria-label', getResultAriaLabel(result));
 
     article.innerHTML = `
         <div class="result-header">
@@ -655,7 +645,7 @@ function createResultCard(result, index) {
  * @private
  */
 function createResultCardHtml(result) {
-    const ariaLabel = `${escapeHtml(result.title || 'Untitled conversation')}, ${formatAgentName(result.agent)}${result.workspace ? ', ' + formatWorkspace(result.workspace) : ''}, ${formatTime(result.started_at)}`;
+    const ariaLabel = escapeHtml(getResultAriaLabel(result));
     return `
         <article
             class="result-card"
@@ -680,6 +670,12 @@ function createResultCardHtml(result) {
             </div>
         </article>
     `;
+}
+
+function getResultAriaLabel(result) {
+    const title = result.title || 'Untitled conversation';
+    const workspaceLabel = result.workspace ? `, ${formatWorkspace(result.workspace)}` : '';
+    return `${title}, ${formatAgentName(result.agent)}${workspaceLabel}, ${formatTime(result.started_at)}`;
 }
 
 /**
@@ -909,7 +905,7 @@ export function clearSearch(options = {}) {
     setSearchMode('auto');
 
     if (reloadRecent) {
-        loadRecentConversations();
+        loadRecentConversations(searchEpoch);
     } else {
         hideNoResults();
         if (elements.resultsList) {
