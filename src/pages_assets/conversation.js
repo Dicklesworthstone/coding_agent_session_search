@@ -52,6 +52,7 @@ let currentMessages = [];
 let onBack = null;
 let messageVirtualList = null; // Virtual list for long conversations
 let attachmentState = createAttachmentState();
+let activeConversationLoadId = 0;
 
 // DOM element references
 let elements = {
@@ -77,14 +78,18 @@ export function initConversationViewer(container, backCallback) {
  * @param {number|null} highlightMessageId - Message ID to highlight/scroll to
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
+    const loadId = ++activeConversationLoadId;
+    let conversation;
+    let messages;
+
     // Check if conversation is already in cache
     if (loadedConversations.has(conversationId)) {
         const cached = loadedConversations.get(conversationId);
         // Move to end of map (most recently used)
         loadedConversations.delete(conversationId);
         loadedConversations.set(conversationId, cached);
-        currentConversation = cached.conversation;
-        currentMessages = cached.messages;
+        conversation = cached.conversation;
+        messages = cached.messages;
         console.debug(`[Conversation] Using cached conversation ${conversationId}`);
     } else {
         // Unload oldest conversation if at limit
@@ -93,20 +98,22 @@ export async function loadConversation(conversationId, highlightMessageId = null
         }
 
         // Load conversation metadata
-        currentConversation = getConversation(conversationId);
+        conversation = getConversation(conversationId);
 
-        if (!currentConversation) {
-            showError('Conversation not found');
+        if (!conversation) {
+            if (loadId === activeConversationLoadId) {
+                showError('Conversation not found');
+            }
             return;
         }
 
         // Load messages
-        currentMessages = getConversationMessages(conversationId);
+        messages = getConversationMessages(conversationId);
 
         // Cache the loaded data
         loadedConversations.set(conversationId, {
-            conversation: currentConversation,
-            messages: currentMessages,
+            conversation,
+            messages,
             loadedAt: Date.now(),
         });
         console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
@@ -119,8 +126,15 @@ export async function loadConversation(conversationId, highlightMessageId = null
 
     await ensureAttachmentsReady();
 
+    if (loadId !== activeConversationLoadId) {
+        return;
+    }
+
+    currentConversation = conversation;
+    currentMessages = messages;
+
     // Render the view
-    render(currentConversation, currentMessages, highlightMessageId);
+    render(conversation, messages, highlightMessageId);
 }
 
 function createAttachmentState() {
@@ -425,6 +439,7 @@ function appendAttachmentsToMessage(messageElement, message) {
 }
 
 function handleArchiveLock() {
+    activeConversationLoadId += 1;
     currentConversation = null;
     currentMessages = [];
     destroyVirtualList();
@@ -890,6 +905,7 @@ export function getCacheStats() {
  * Clear the viewer
  */
 export function clearViewer() {
+    activeConversationLoadId += 1;
     // Clean up virtual list
     destroyVirtualList();
 

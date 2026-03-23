@@ -23,6 +23,8 @@ const CACHE_CONFIG = {
 let manifest = null;
 let isManifestLoaded = false;
 let manifestLoadPromise = null;
+let manifestLoadEpoch = 0;
+let attachmentEpoch = 0;
 
 // Blob cache: hash -> { data: Uint8Array, objectUrl: string|null, size: number }
 const blobCache = new Map();
@@ -30,6 +32,14 @@ let cacheSize = 0;
 
 // LRU tracking
 const lruOrder = [];
+
+function isCurrentEpoch(epoch) {
+    return epoch === attachmentEpoch;
+}
+
+function createInvalidationError() {
+    return new Error('Attachment request invalidated');
+}
 
 /**
  * Initialize the attachment system
@@ -40,28 +50,43 @@ const lruOrder = [];
  * @returns {Promise<object|null>} Manifest or null if no attachments
  */
 export async function initAttachments(dek, exportId) {
+    const epoch = attachmentEpoch;
+
     if (isManifestLoaded) {
         return manifest;
     }
 
-    if (manifestLoadPromise) {
+    if (manifestLoadPromise && manifestLoadEpoch === epoch) {
         return manifestLoadPromise;
     }
 
-    manifestLoadPromise = loadManifest(dek, exportId);
+    manifestLoadEpoch = epoch;
+    manifestLoadPromise = (async () => {
+        try {
+            const loadedManifest = await loadManifest(dek, exportId);
+            if (!isCurrentEpoch(epoch)) {
+                throw createInvalidationError();
+            }
+            manifest = loadedManifest;
+            isManifestLoaded = true;
+            return manifest;
+        } catch (error) {
+            if (error.message !== 'Attachment request invalidated') {
+                console.warn('[Attachments] No attachments found or manifest failed:', error.message);
+            }
+            if (isCurrentEpoch(epoch)) {
+                manifest = null;
+                isManifestLoaded = true;
+            }
+            return null;
+        } finally {
+            if (manifestLoadEpoch === epoch) {
+                manifestLoadPromise = null;
+            }
+        }
+    })();
 
-    try {
-        manifest = await manifestLoadPromise;
-        isManifestLoaded = true;
-        return manifest;
-    } catch (error) {
-        console.warn('[Attachments] No attachments found or manifest failed:', error.message);
-        manifest = null;
-        isManifestLoaded = true;
-        return null;
-    } finally {
-        manifestLoadPromise = null;
-    }
+    return manifestLoadPromise;
 }
 
 /**
@@ -141,6 +166,8 @@ export function getMessageAttachments(messageId) {
  * @returns {Promise<Uint8Array>} Decrypted blob data
  */
 export async function loadBlob(hash, dek, exportId) {
+    const epoch = attachmentEpoch;
+
     // Check cache
     if (blobCache.has(hash)) {
         updateLru(hash);
@@ -186,6 +213,10 @@ export async function loadBlob(hash, dek, exportId) {
 
     const data = new Uint8Array(plaintext);
 
+    if (!isCurrentEpoch(epoch)) {
+        throw createInvalidationError();
+    }
+
     // Cache the result
     cacheBlob(hash, data);
 
@@ -202,6 +233,8 @@ export async function loadBlob(hash, dek, exportId) {
  * @returns {Promise<string>} Object URL
  */
 export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
+    const epoch = attachmentEpoch;
+
     // Check if we already have an object URL
     const cached = blobCache.get(hash);
     if (cached?.objectUrl) {
@@ -215,6 +248,11 @@ export async function loadBlobAsUrl(hash, mimeType, dek, exportId) {
     // Create object URL
     const blob = new Blob([data], { type: mimeType });
     const url = URL.createObjectURL(blob);
+
+    if (!isCurrentEpoch(epoch)) {
+        URL.revokeObjectURL(url);
+        throw createInvalidationError();
+    }
 
     // Update cache with URL
     if (blobCache.has(hash)) {
@@ -344,10 +382,12 @@ export function clearCache() {
  * Reset the attachment system (for re-auth)
  */
 export function reset() {
+    attachmentEpoch += 1;
     clearCache();
     manifest = null;
     isManifestLoaded = false;
     manifestLoadPromise = null;
+    manifestLoadEpoch = attachmentEpoch;
 }
 
 /**
@@ -465,6 +505,9 @@ async function loadImageAttachment(container, img, hash, mimeType, dek, exportId
         img.classList.remove('hidden');
         container.classList.add('loaded');
     } catch (error) {
+        if (error.message === 'Attachment request invalidated') {
+            return;
+        }
         console.error('[Attachments] Failed to load image:', error);
         loading.classList.add('hidden');
         placeholder.classList.remove('hidden');
@@ -534,6 +577,9 @@ async function downloadAttachment(entry, dek, exportId) {
         a.click();
         document.body.removeChild(a);
     } catch (error) {
+        if (error.message === 'Attachment request invalidated') {
+            return;
+        }
         console.error('[Attachments] Failed to download:', error);
         alert('Failed to download attachment');
     }

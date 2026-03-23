@@ -20,6 +20,8 @@ export const COI_STATE = {
     DEGRADED: 'DEGRADED',
 };
 
+let activeReloadController = null;
+
 function hashScopeId(input) {
     let hash = 0x811c9dc5;
     for (let i = 0; i < input.length; i++) {
@@ -250,6 +252,11 @@ export function updateProgressStep(stepId, status) {
 export function showReloadRequiredUI(container, options = {}) {
     const { onReload = null, countdownSeconds = 3, autoReload = true } = options;
 
+    if (activeReloadController) {
+        activeReloadController.cancel();
+        activeReloadController = null;
+    }
+
     container.innerHTML = `
         <div class="coi-status needs-reload">
             <div class="coi-header">
@@ -318,6 +325,9 @@ export function showReloadRequiredUI(container, options = {}) {
             clearInterval(timerId);
             timerId = null;
         }
+        if (activeReloadController === control) {
+            activeReloadController = null;
+        }
         if (onReload) {
             onReload();
         }
@@ -334,6 +344,9 @@ export function showReloadRequiredUI(container, options = {}) {
         }
         if (cancelBtn) {
             cancelBtn.classList.add('hidden');
+        }
+        if (activeReloadController === control) {
+            activeReloadController = null;
         }
     };
 
@@ -358,10 +371,12 @@ export function showReloadRequiredUI(container, options = {}) {
     }
 
     // Return control object for external management
-    return {
+    const control = {
         cancel: cancelCountdown,
         reload: doReload,
     };
+    activeReloadController = control;
+    return control;
 }
 
 /**
@@ -395,6 +410,10 @@ export function showDegradedModeWarning() {
  * @param {HTMLElement} container - Container to hide
  */
 export function hideStatusUI(container) {
+    if (activeReloadController) {
+        activeReloadController.cancel();
+        activeReloadController = null;
+    }
     container.classList.add('hidden');
     container.innerHTML = '';
 }

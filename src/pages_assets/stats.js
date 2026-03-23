@@ -16,9 +16,14 @@ let analyticsData = null;
 let container = null;
 let isLoading = false;
 let currentTimelineView = 'monthly'; // 'daily' | 'weekly' | 'monthly'
+let analyticsEpoch = 0;
 
 // Cache for computed analytics (when using database fallback)
 let computedAnalytics = null;
+
+function isCurrentAnalyticsEpoch(epoch) {
+    return epoch === analyticsEpoch;
+}
 
 /**
  * Initialize the stats module with a container element
@@ -33,6 +38,8 @@ export function initStats(containerElement) {
  * @returns {Promise<Object>} Analytics data
  */
 export async function loadAnalytics() {
+    const epoch = analyticsEpoch;
+
     if (analyticsData) {
         return analyticsData;
     }
@@ -42,16 +49,28 @@ export async function loadAnalytics() {
 
     try {
         // Try to load precomputed JSON files
-        analyticsData = await loadPrecomputedAnalytics();
+        const loadedAnalytics = await loadPrecomputedAnalytics();
+        if (!isCurrentAnalyticsEpoch(epoch)) {
+            return null;
+        }
+        analyticsData = loadedAnalytics;
     } catch (error) {
         console.warn('[Stats] Precomputed analytics not available, using database fallback:', error.message);
 
         // Fall back to database queries
         if (isDatabaseReady()) {
-            analyticsData = computeAnalyticsFromDatabase();
+            const computed = computeAnalyticsFromDatabase();
+            if (!isCurrentAnalyticsEpoch(epoch)) {
+                return null;
+            }
+            analyticsData = computed;
         } else {
             throw new Error('Database not ready and precomputed analytics not available');
         }
+    }
+
+    if (!isCurrentAnalyticsEpoch(epoch)) {
+        return null;
     }
 
     isLoading = false;
@@ -283,10 +302,18 @@ export async function renderStatsDashboard() {
         return;
     }
 
+    const epoch = analyticsEpoch;
+
     try {
         const data = await loadAnalytics();
+        if (!data || !isCurrentAnalyticsEpoch(epoch)) {
+            return;
+        }
         renderDashboard(data);
     } catch (error) {
+        if (!isCurrentAnalyticsEpoch(epoch)) {
+            return;
+        }
         console.error('[Stats] Failed to load analytics:', error);
         renderErrorState(error.message);
     }
@@ -766,8 +793,14 @@ function escapeHtml(text) {
  * Clear cached analytics data
  */
 export function clearStatsCache() {
+    analyticsEpoch += 1;
     analyticsData = null;
     computedAnalytics = null;
+    isLoading = false;
+    currentTimelineView = 'monthly';
+    if (container) {
+        container.innerHTML = '';
+    }
 }
 
 /**
