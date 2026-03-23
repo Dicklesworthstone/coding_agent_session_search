@@ -38,19 +38,20 @@ function getArchiveOpfsDbName() {
  */
 self.onmessage = async (event) => {
     const { type, ...data } = event.data;
+    const { requestId } = data;
 
     try {
         switch (type) {
             case 'UNLOCK_PASSWORD':
-                await handleUnlockPassword(data.password, data.config);
+                await handleUnlockPassword(data.password, data.config, requestId);
                 break;
 
             case 'UNLOCK_RECOVERY':
-                await handleUnlockRecovery(data.recoverySecret, data.config);
+                await handleUnlockRecovery(data.recoverySecret, data.config, requestId);
                 break;
 
             case 'DECRYPT_DATABASE':
-                await handleDecryptDatabase(data.dek, data.config, data.opfsEnabled);
+                await handleDecryptDatabase(data.dek, data.config, data.opfsEnabled, requestId);
                 break;
 
             case 'CLEAR_KEYS':
@@ -65,6 +66,7 @@ self.onmessage = async (event) => {
         self.postMessage({
             type: type.replace('UNLOCK', 'UNLOCK_FAILED').replace('DECRYPT', 'DECRYPT_FAILED'),
             error: error.message,
+            requestId,
         });
     }
 };
@@ -72,7 +74,7 @@ self.onmessage = async (event) => {
 /**
  * Handle password-based unlock
  */
-async function handleUnlockPassword(password, cfg) {
+async function handleUnlockPassword(password, cfg, requestId) {
     config = cfg;
 
     // Find password slot
@@ -81,13 +83,13 @@ async function handleUnlockPassword(password, cfg) {
         throw new Error('No password slot found in archive');
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
     // Try each password slot
     for (const slot of passwordSlots) {
         try {
             const kek = await deriveKekFromPassword(password, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80 });
+            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
 
             const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
             dek = unwrappedDek;
@@ -95,6 +97,7 @@ async function handleUnlockPassword(password, cfg) {
             self.postMessage({
                 type: 'UNLOCK_SUCCESS',
                 dek: arrayToBase64(dek),
+                requestId,
             });
             return;
         } catch (error) {
@@ -109,7 +112,7 @@ async function handleUnlockPassword(password, cfg) {
 /**
  * Handle recovery secret-based unlock
  */
-async function handleUnlockRecovery(recoverySecret, cfg) {
+async function handleUnlockRecovery(recoverySecret, cfg, requestId) {
     config = cfg;
 
     // Find recovery slot
@@ -118,7 +121,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
         throw new Error('No recovery slot found in archive');
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Deriving key...', percent: 10, requestId });
 
     // Convert recovery secret to bytes
     let secretBytes;
@@ -137,7 +140,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
     for (const slot of recoverySlots) {
         try {
             const kek = await deriveKekFromRecovery(secretBytes, slot);
-            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80 });
+            self.postMessage({ type: 'PROGRESS', phase: 'Unwrapping key...', percent: 80, requestId });
 
             const unwrappedDek = await unwrapDek(kek, slot, config.export_id);
             dek = unwrappedDek;
@@ -145,6 +148,7 @@ async function handleUnlockRecovery(recoverySecret, cfg) {
             self.postMessage({
                 type: 'UNLOCK_SUCCESS',
                 dek: arrayToBase64(dek),
+                requestId,
             });
             return;
         } catch (error) {
@@ -251,7 +255,7 @@ async function unwrapDek(kek, slot, exportId) {
 /**
  * Handle database decryption
  */
-async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
+async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled, requestId) {
     config = cfg;
     dek = base64ToArray(dekBase64);
     const { payload } = config;
@@ -259,7 +263,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
     const baseNonce = base64ToArray(config.base_nonce);
     const exportId = base64ToArray(config.export_id);
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
 
     // Import DEK for decryption
     const dekKey = await crypto.subtle.importKey(
@@ -311,13 +315,14 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
                 type: 'PROGRESS',
                 phase: `Decrypting chunk ${i + 1}/${totalChunks}...`,
                 percent: percent,
+                requestId,
             });
         } catch (error) {
             throw new Error(`Failed to decrypt chunk ${i}: ${error.message}`);
         }
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Decompressing...', percent: 92 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Decompressing...', percent: 92, requestId });
 
     // Concatenate chunks
     const compressed = concatenateChunks(decryptedChunks);
@@ -331,7 +336,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
         decompressed = compressed;
     }
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95 });
+    self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
 
     // Store in OPFS or memory
     const dbBytes = decompressed;
@@ -346,6 +351,7 @@ async function handleDecryptDatabase(dekBase64, cfg, opfsEnabled) {
             type: 'DECRYPT_SUCCESS',
             dbSize: dbBytes.byteLength,
             dbBytes: transfer,
+            requestId,
         },
         [transfer]
     );
@@ -441,7 +447,7 @@ async function decompressDeflate(compressed) {
 /**
  * Initialize sqlite-wasm with decrypted database
  */
-async function initDatabase(dbBytes, opfsEnabled) {
+async function initDatabase(dbBytes, opfsEnabled, requestId) {
     // Load sqlite-wasm if not loaded
     if (!self.sqlite3) {
         await loadSqlite();
@@ -482,6 +488,7 @@ async function initDatabase(dbBytes, opfsEnabled) {
             type: 'DB_READY',
             conversationCount: getConversationCount(db),
             messageCount: getMessageCount(db),
+            requestId,
         });
     } catch (error) {
         throw new Error(`Failed to initialize database: ${error.message}`);

@@ -35,6 +35,7 @@ const state = {
 let router = null;
 let storageReady = null;
 let settingsReady = false;
+let waitingForDatabaseReady = false;
 
 // DOM element references
 let elements = {
@@ -62,16 +63,33 @@ export function init() {
         return;
     }
 
-    // Check if database is ready
-    if (!isDatabaseReady()) {
-        console.log('[Viewer] Waiting for database...');
-        // Listen for database ready event
-        window.addEventListener('cass:db-ready', handleDatabaseReady);
+    if (state.initialized) {
+        if (!isDatabaseReady()) {
+            console.log('[Viewer] Waiting for database re-open...');
+            ensureDatabaseReadyListener();
+            return;
+        }
+
+        refreshAfterDatabaseReady();
         return;
     }
 
-    // Database is ready, initialize views
+    if (!isDatabaseReady()) {
+        console.log('[Viewer] Waiting for database...');
+        ensureDatabaseReadyListener();
+        return;
+    }
+
     initializeViews();
+}
+
+function ensureDatabaseReadyListener() {
+    if (waitingForDatabaseReady) {
+        return;
+    }
+
+    waitingForDatabaseReady = true;
+    window.addEventListener('cass:db-ready', handleDatabaseReady);
 }
 
 /**
@@ -80,6 +98,13 @@ export function init() {
 function handleDatabaseReady(event) {
     console.log('[Viewer] Database ready:', event.detail);
     window.removeEventListener('cass:db-ready', handleDatabaseReady);
+    waitingForDatabaseReady = false;
+
+    if (state.initialized) {
+        refreshAfterDatabaseReady();
+        return;
+    }
+
     initializeViews();
 }
 
@@ -130,6 +155,38 @@ function initializeViews() {
     state.initialized = true;
 
     console.log('[Viewer] Initialized with hash-based routing');
+}
+
+function refreshAfterDatabaseReady() {
+    if (!state.initialized) {
+        initializeViews();
+        return;
+    }
+
+    switch (state.view) {
+        case 'conversation':
+            if (state.conversationId) {
+                handleConversationRoute(state.conversationId, state.messageId);
+                return;
+            }
+            break;
+        case 'settings':
+            handleSettingsRoute();
+            return;
+        case 'stats':
+            handleStatsRoute();
+            return;
+        case 'not-found':
+            handleNotFoundRoute(window.location.hash || '/');
+            return;
+        default:
+            break;
+    }
+
+    handleSearchRoute({ q: state.searchQuery });
+    if (!state.searchQuery) {
+        clearSearch({ reloadRecent: true });
+    }
 }
 
 /**
@@ -652,6 +709,13 @@ export function cleanup() {
         router.destroy();
         router = null;
     }
+
+    window.removeEventListener('cass:db-ready', handleDatabaseReady);
+    window.removeEventListener('cass:lock', handleGlobalLock);
+    waitingForDatabaseReady = false;
+    storageReady = null;
+    settingsReady = false;
+    state.initialized = false;
 
     closeDatabase();
     clearSearch();

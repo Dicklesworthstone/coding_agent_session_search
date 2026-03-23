@@ -16,12 +16,11 @@ let qrScanner = null;
 let strengthMeter = null;
 let isUnencryptedArchive = false;
 let tofuStatus = { valid: true, isFirstVisit: true };
-
-const LEGACY_SESSION_KEYS = {
-    DEK: 'cass_session_dek',
-    EXPIRY: 'cass_session_expiry',
-    UNLOCKED: 'cass_unlocked',
-};
+let unlockInFlight = false;
+let decryptInFlight = false;
+let activeUnlockRequestId = null;
+let activeDecryptRequestId = null;
+let nextWorkerRequestId = 1;
 
 // DOM Elements
 const elements = {
@@ -128,16 +127,9 @@ function cacheElements() {
  * Set up event listeners (CSP-safe, no inline handlers)
  */
 function setupEventListeners() {
-    // Password unlock
-    elements.unlockBtn?.addEventListener('click', handleUnlockClick);
+    // Password unlock: use form submit as the single entry point.
+    // Separate click/keypress handlers can fire duplicate unlock requests.
     document.getElementById('auth-form')?.addEventListener('submit', handleUnlockClick);
-
-    // Enter key in password field
-    elements.passwordInput?.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            handleUnlockClick(e);
-        }
-    });
 
     // Toggle password visibility
     elements.togglePassword?.addEventListener('click', togglePasswordVisibility);
@@ -170,6 +162,32 @@ function setupEventListeners() {
             closeQrScanner();
         }
     });
+}
+
+function allocateWorkerRequestId() {
+    const requestId = nextWorkerRequestId;
+    nextWorkerRequestId += 1;
+    return requestId;
+}
+
+function isCurrentWorkerMessage(type, requestId) {
+    if (requestId == null) {
+        return true;
+    }
+
+    switch (type) {
+        case 'UNLOCK_SUCCESS':
+        case 'UNLOCK_FAILED':
+            return requestId === activeUnlockRequestId;
+        case 'DECRYPT_SUCCESS':
+        case 'DECRYPT_FAILED':
+        case 'DB_READY':
+            return requestId === activeDecryptRequestId;
+        case 'PROGRESS':
+            return requestId === activeUnlockRequestId || requestId === activeDecryptRequestId;
+        default:
+            return true;
+    }
 }
 
 /**
@@ -449,6 +467,10 @@ async function handleUnlockClick(event) {
         event.preventDefault();
     }
 
+    if (unlockInFlight || decryptInFlight) {
+        return;
+    }
+
     if (isUnencryptedArchive) {
         await transitionToAppUnencrypted();
         return;
@@ -470,12 +492,15 @@ async function handleUnlockClick(event) {
     hideError();
     showProgress('Deriving key...');
     disableForm();
+    unlockInFlight = true;
+    activeUnlockRequestId = allocateWorkerRequestId();
 
     // Send unlock request to worker
     worker.postMessage({
         type: 'UNLOCK_PASSWORD',
         password: password,
         config: config,
+        requestId: activeUnlockRequestId,
     });
 }
 
@@ -564,11 +589,17 @@ async function closeQrScanner() {
  * Handle successful QR code scan
  */
 function handleQrSuccess(decodedText) {
+    if (unlockInFlight || decryptInFlight) {
+        return;
+    }
+
     closeQrScanner();
 
     hideError();
     showProgress('Deriving key from QR...');
     disableForm();
+    unlockInFlight = true;
+    activeUnlockRequestId = allocateWorkerRequestId();
 
     // Try to parse as JSON recovery data, or use raw text as recovery secret
     let recoverySecret;
@@ -584,6 +615,7 @@ function handleQrSuccess(decodedText) {
         type: 'UNLOCK_RECOVERY',
         recoverySecret: recoverySecret,
         config: config,
+        requestId: activeUnlockRequestId,
     });
 }
 
@@ -602,6 +634,11 @@ function handleQrError(error) {
  */
 function handleWorkerMessage(event) {
     const { type, ...data } = event.data;
+
+    if (!isCurrentWorkerMessage(type, data.requestId)) {
+        console.debug('Ignoring stale worker message:', type, data.requestId);
+        return;
+    }
 
     switch (type) {
         case 'UNLOCK_SUCCESS':
@@ -638,6 +675,10 @@ function handleWorkerMessage(event) {
  */
 function handleWorkerError(error) {
     console.error('Worker error:', error);
+    unlockInFlight = false;
+    decryptInFlight = false;
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
     hideProgress();
     enableForm();
     showError('An error occurred during decryption. Please try again.');
@@ -647,6 +688,8 @@ function handleWorkerError(error) {
  * Handle successful unlock
  */
 function handleUnlockSuccess(data) {
+    unlockInFlight = false;
+    activeUnlockRequestId = null;
     hideProgress();
 
     // Store session key in memory
@@ -666,6 +709,8 @@ function handleUnlockSuccess(data) {
  * Handle failed unlock
  */
 function handleUnlockFailed(data) {
+    unlockInFlight = false;
+    activeUnlockRequestId = null;
     hideProgress();
     enableForm();
 
@@ -684,6 +729,8 @@ async function handleDecryptSuccess(data) {
     updateProgress('Database decrypted', 100);
 
     if (!data?.dbBytes) {
+        decryptInFlight = false;
+        activeDecryptRequestId = null;
         hideProgress();
         showError('Decryption did not return a database payload');
         enableForm();
@@ -716,8 +763,12 @@ async function handleDecryptSuccess(data) {
                 messageCount: stats.messages || 0,
             },
         }));
+        decryptInFlight = false;
+        activeDecryptRequestId = null;
     } catch (error) {
         console.error('Failed to initialize database:', error);
+        decryptInFlight = false;
+        activeDecryptRequestId = null;
         hideProgress();
         showError('Failed to initialize database');
         enableForm();
@@ -732,6 +783,8 @@ async function handleDecryptSuccess(data) {
  * Handle failed decryption
  */
 function handleDecryptFailed(data) {
+    decryptInFlight = false;
+    activeDecryptRequestId = null;
     hideProgress();
     showError(`Decryption failed: ${data.error}`);
     enableForm();
@@ -746,6 +799,8 @@ function handleDecryptFailed(data) {
  * Handle database ready
  */
 function handleDatabaseReady(data) {
+    decryptInFlight = false;
+    activeDecryptRequestId = null;
     hideProgress();
     // The viewer.js module will handle database queries
     window.dispatchEvent(new CustomEvent('cass:db-ready', { detail: data }));
@@ -755,6 +810,12 @@ function handleDatabaseReady(data) {
  * Transition from auth screen to app screen
  */
 function transitionToApp() {
+    if (decryptInFlight) {
+        return;
+    }
+
+    decryptInFlight = true;
+    activeDecryptRequestId = allocateWorkerRequestId();
     elements.authScreen.classList.add('hidden');
     elements.appScreen.classList.remove('hidden');
 
@@ -764,6 +825,7 @@ function transitionToApp() {
         dek: window.cassSession.dek,
         config: config,
         opfsEnabled: isOpfsEnabled(),
+        requestId: activeDecryptRequestId,
     });
 
     // Load viewer module
@@ -771,6 +833,11 @@ function transitionToApp() {
 }
 
 async function transitionToAppUnencrypted() {
+    if (decryptInFlight) {
+        return;
+    }
+
+    decryptInFlight = true;
     hideError();
     disableForm();
 
@@ -782,8 +849,10 @@ async function transitionToAppUnencrypted() {
 
     try {
         await loadUnencryptedDatabase();
+        decryptInFlight = false;
     } catch (error) {
         console.error('Failed to load unencrypted database:', error);
+        decryptInFlight = false;
         elements.appScreen.classList.add('hidden');
         elements.authScreen.classList.remove('hidden');
         showError('Failed to load unencrypted database');
@@ -860,6 +929,10 @@ async function closeLiveDatabase() {
  */
 async function lockArchive(options = {}) {
     const { broadcast = false, action = 'lock' } = options;
+    unlockInFlight = false;
+    decryptInFlight = false;
+    activeUnlockRequestId = null;
+    activeDecryptRequestId = null;
 
     // Clear session
     window.cassSession = null;
@@ -996,9 +1069,6 @@ function clearStoredSession() {
                 sessionKeys.DEK,
                 sessionKeys.EXPIRY,
                 sessionKeys.UNLOCKED,
-                LEGACY_SESSION_KEYS.DEK,
-                LEGACY_SESSION_KEYS.EXPIRY,
-                LEGACY_SESSION_KEYS.UNLOCKED,
             ]) {
                 storage.removeItem(key);
             }

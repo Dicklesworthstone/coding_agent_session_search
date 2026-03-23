@@ -60,7 +60,6 @@ const LEGACY_SESSION_KEYS = [
     'cass_unlocked',
 ];
 const ALL_ARCHIVE_SESSION_KEY_RE = /^cass_session_(?:dek|expiry|unlocked)_[0-9a-f]{8}$/;
-const ALL_ARCHIVE_TOFU_KEY_RE = /^cass_fingerprint_v2_[0-9a-f]{8}$/;
 
 // In-memory storage (fallback and default)
 const memoryStore = new Map();
@@ -118,7 +117,6 @@ function isArchivePreferenceKey(name) {
 function getCurrentArchiveSessionKeys() {
     const scopeId = getArchiveScopeId();
     return new Set([
-        ...LEGACY_SESSION_KEYS,
         `cass_session_dek_${scopeId}`,
         `cass_session_expiry_${scopeId}`,
         `cass_unlocked_${scopeId}`,
@@ -127,14 +125,6 @@ function getCurrentArchiveSessionKeys() {
 
 function isArchiveSessionKey(name) {
     return LEGACY_SESSION_KEYS.includes(name) || ALL_ARCHIVE_SESSION_KEY_RE.test(name);
-}
-
-function getCurrentArchiveTofuKey() {
-    return `cass_fingerprint_v2_${getArchiveScopeId()}`;
-}
-
-function isArchiveTofuKey(name) {
-    return ALL_ARCHIVE_TOFU_KEY_RE.test(name);
 }
 
 function getServiceWorkerCachePrefix() {
@@ -232,7 +222,6 @@ export function setOpfsEnabled(enabled) {
         } else {
             localStorage.removeItem(KEYS.OPFS_ENABLED);
         }
-        localStorage.removeItem(LEGACY_PREF_KEYS.OPFS_ENABLED);
     } catch (e) {
         // Ignore
     }
@@ -268,7 +257,6 @@ export async function setStorageMode(mode, migrate = false) {
     // Save mode preference (in localStorage so it persists)
     try {
         localStorage.setItem(KEYS.MODE, mode);
-        localStorage.removeItem(LEGACY_PREF_KEYS.MODE);
     } catch (e) {
         console.warn('[Storage] Could not save mode preference');
     }
@@ -648,7 +636,6 @@ export async function clearCurrentStorage() {
     console.log('[Storage] Clearing current storage:', currentMode);
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
-    const currentTofuKey = getCurrentArchiveTofuKey();
 
     switch (currentMode) {
         case StorageMode.MEMORY:
@@ -663,9 +650,7 @@ export async function clearCurrentStorage() {
 
         case StorageMode.LOCAL:
             removeStorageEntries(localStorage, (key) =>
-                key.startsWith(archiveDataPrefix)
-                || currentSessionKeys.has(key)
-                || key === currentTofuKey
+                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
             );
             break;
 
@@ -698,7 +683,7 @@ export async function clearOPFS(options = {}) {
                 : entry.startsWith(archiveDataPrefix);
             const shouldDeleteDb = allArchives
                 ? isCassOpfsDbFile(entry)
-                : currentArchiveDbFiles.has(entry) || LEGACY_OPFS_DB_FILES.includes(entry);
+                : currentArchiveDbFiles.has(entry);
             if (shouldDeleteData || shouldDeleteDb) {
                 entries.push(entry);
             }
@@ -727,7 +712,6 @@ export async function clearAllStorage(options = {}) {
     console.log('[Storage] Clearing all storage');
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
-    const currentTofuKey = getCurrentArchiveTofuKey();
 
     // Clear memory
     if (allArchives) {
@@ -758,15 +742,12 @@ export async function clearAllStorage(options = {}) {
                 key.startsWith(STORAGE_PREFIX)
                 && (isArchiveDataEntryName(key) || isArchivePreferenceKey(key) || Object.values(LEGACY_PREF_KEYS).includes(key))
                 || isArchiveSessionKey(key)
-                || isArchiveTofuKey(key)
             );
         } else {
             removeStorageEntries(localStorage, (key) =>
-                key.startsWith(archiveDataPrefix)
-                || currentSessionKeys.has(key)
-                || key === currentTofuKey
+                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
             );
-            clearCurrentArchivePreferenceKeys({ includeLegacy: true });
+            clearCurrentArchivePreferenceKeys();
         }
     } catch (e) {
         // Ignore

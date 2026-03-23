@@ -20,8 +20,25 @@ export const COI_STATE = {
     DEGRADED: 'DEGRADED',
 };
 
-// Local storage key for tracking setup completion
-const SETUP_COMPLETE_KEY = 'cass-coi-setup-complete';
+function hashScopeId(input) {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+function getSetupCompleteKey() {
+    try {
+        return `cass-coi-setup-complete-${hashScopeId(new URL('./', window.location.href).href)}`;
+    } catch {
+        const href = typeof window?.location?.href === 'string'
+            ? window.location.href
+            : 'unknown';
+        return `cass-coi-setup-complete-${hashScopeId(href.split('#')[0].split('?')[0])}`;
+    }
+}
 
 /**
  * Check if COI setup has been completed before
@@ -29,7 +46,7 @@ const SETUP_COMPLETE_KEY = 'cass-coi-setup-complete';
  */
 export function isSetupComplete() {
     try {
-        return localStorage.getItem(SETUP_COMPLETE_KEY) === 'true';
+        return localStorage.getItem(getSetupCompleteKey()) === 'true';
     } catch {
         return false;
     }
@@ -40,7 +57,7 @@ export function isSetupComplete() {
  */
 export function markSetupComplete() {
     try {
-        localStorage.setItem(SETUP_COMPLETE_KEY, 'true');
+        localStorage.setItem(getSetupCompleteKey(), 'true');
     } catch {
         // localStorage not available
     }
@@ -51,9 +68,21 @@ export function markSetupComplete() {
  */
 export function clearSetupComplete() {
     try {
-        localStorage.removeItem(SETUP_COMPLETE_KEY);
+        localStorage.removeItem(getSetupCompleteKey());
     } catch {
         // localStorage not available
+    }
+}
+
+async function getCurrentServiceWorkerRegistration() {
+    if (!('serviceWorker' in navigator)) {
+        return null;
+    }
+
+    try {
+        return await navigator.serviceWorker.getRegistration();
+    } catch {
+        return null;
     }
 }
 
@@ -70,14 +99,16 @@ export function isCrossOriginIsolated() {
  * @returns {Promise<boolean>}
  */
 export async function isServiceWorkerActive() {
-    if (!('serviceWorker' in navigator)) return false;
+    const registration = await getCurrentServiceWorkerRegistration();
+    return registration?.active != null;
+}
 
-    try {
-        const registration = await navigator.serviceWorker.getRegistration();
-        return registration?.active != null;
-    } catch {
-        return false;
-    }
+/**
+ * Check if a service worker registration exists for this archive scope
+ * @returns {Promise<boolean>}
+ */
+export async function hasServiceWorkerRegistration() {
+    return (await getCurrentServiceWorkerRegistration()) != null;
 }
 
 /**
@@ -460,6 +491,13 @@ export async function initCOIDetection({
         case COI_STATE.SW_INSTALLING:
             // Still installing after timeout - check if we should show reload or proceed
             console.log('[COI] SW still installing - checking fallback');
+            if (!await hasServiceWorkerRegistration()) {
+                console.warn('[COI] No service worker registration found after waiting - degrading');
+                hideStatusUI(statusContainer);
+                showDegradedModeWarning();
+                if (onReady) onReady();
+                return COI_STATE.DEGRADED;
+            }
             if (isSharedArrayBufferAvailable()) {
                 // Already have SAB somehow (maybe browser feature)
                 markSetupComplete();
@@ -507,6 +545,7 @@ export default {
     COI_STATE,
     isCrossOriginIsolated,
     isServiceWorkerActive,
+    hasServiceWorkerRegistration,
     isServiceWorkerSupported,
     isSharedArrayBufferAvailable,
     getCOIState,

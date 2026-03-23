@@ -426,6 +426,12 @@ async function handleClearCurrentStorage() {
 
     try {
         await clearCurrentStorage();
+        if (mode === StorageMode.MEMORY && onSessionReset) {
+            onSessionReset('clear-current-storage');
+            showNotification('Current memory storage cleared and session locked', 'success');
+            return;
+        }
+
         showNotification('Current storage cleared', 'success');
         render();
     } catch (err) {
@@ -495,8 +501,10 @@ async function handleClearAll() {
         setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
         await clearServiceWorkerCache();
-        showNotification('All data cleared', 'success');
-        render();
+        if (onSessionReset) {
+            onSessionReset('clear-all');
+        }
+        showNotification('All data cleared and session locked', 'success');
     } catch (err) {
         console.error('[Settings] Failed to clear all:', err);
         showNotification('Failed to clear all data', 'error');
