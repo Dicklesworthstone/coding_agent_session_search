@@ -371,13 +371,22 @@ fn create_temp_dir() -> Result<PathBuf> {
 }
 
 fn resolve_deploy_site_dir(path: &Path) -> Result<PathBuf> {
-    if path.file_name().map(|name| name == "site").unwrap_or(false) && path.is_dir() {
-        return Ok(path.to_path_buf());
+    if path.file_name().map(|name| name == "site").unwrap_or(false) {
+        return super::resolve_site_dir(path);
     }
 
     let site_subdir = path.join("site");
-    if site_subdir.is_dir() {
-        return Ok(site_subdir);
+    match std::fs::symlink_metadata(&site_subdir) {
+        Ok(_) => return super::resolve_site_dir(path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect deployment site directory {}",
+                    site_subdir.display()
+                )
+            });
+        }
     }
 
     bail!(
@@ -570,6 +579,16 @@ fn copy_bundle_to_repo(bundle_dir: &Path, repo_dir: &Path) -> Result<()> {
 
 /// Copy directory recursively
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    let canonical_base = src.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve deployment source root {} before copying",
+            src.display()
+        )
+    })?;
+    copy_dir_recursive_inner(src, dst, &canonical_base)
+}
+
+fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Result<()> {
     if !dst.exists() {
         std::fs::create_dir_all(dst)?;
     }
@@ -582,11 +601,44 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
+            let canonical_target = src_path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked deploy entry {}",
+                    src_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to deploy symlinked site entry outside deployment root: {}",
+                    src_path.display()
+                );
+            }
+
+            let target_meta = std::fs::metadata(&src_path).with_context(|| {
+                format!(
+                    "Failed to inspect symlink target for deploy entry {}",
+                    src_path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to deploy symlinked site entry that does not point to a regular file: {}",
+                    src_path.display()
+                );
+            }
+
+            std::fs::copy(&canonical_target, &dst_path).with_context(|| {
+                format!(
+                    "Failed copying symlink target {} to {} during deploy staging",
+                    canonical_target.display(),
+                    dst_path.display()
+                )
+            })?;
             continue;
         }
 
         if file_type.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_inner(&src_path, &dst_path, canonical_base)?;
         } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path)?;
         }
@@ -842,6 +894,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_resolve_deploy_site_dir_rejects_symlinked_site_directory() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let bundle_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_site = outside.path().join("site");
+        std::fs::create_dir_all(&outside_site).unwrap();
+        std::fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
+        symlink(&outside_site, bundle_root.path().join("site")).unwrap();
+
+        let err = resolve_deploy_site_dir(bundle_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"));
+
+        let direct_err = resolve_deploy_site_dir(&bundle_root.path().join("site"))
+            .unwrap_err()
+            .to_string();
+        assert!(direct_err.contains("must not be a symlink"));
+    }
+
+    #[test]
     fn test_copy_dir_recursive() {
         use tempfile::TempDir;
 
@@ -884,7 +960,31 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_copy_dir_recursive_skips_symlinks() {
+    fn test_copy_dir_recursive_materializes_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink("root.txt", src.path().join("linked-file.txt")).unwrap();
+
+        copy_dir_recursive(src.path(), dst.path()).unwrap();
+
+        let linked_metadata =
+            std::fs::symlink_metadata(dst.path().join("linked-file.txt")).unwrap();
+        assert!(linked_metadata.file_type().is_file());
+        assert!(!linked_metadata.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("linked-file.txt")).unwrap(),
+            "root"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinks_outside_root() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -899,13 +999,13 @@ mod tests {
             src.path().join("linked-file.txt"),
         )
         .unwrap();
-        symlink(outside.path(), src.path().join("linked-dir")).unwrap();
 
-        copy_dir_recursive(src.path(), dst.path()).unwrap();
-
-        assert!(dst.path().join("root.txt").exists());
-        assert!(!dst.path().join("linked-file.txt").exists());
-        assert!(!dst.path().join("linked-dir").exists());
+        let err = copy_dir_recursive(src.path(), dst.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to deploy symlinked site entry outside deployment root"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

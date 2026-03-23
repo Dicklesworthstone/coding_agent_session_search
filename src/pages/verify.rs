@@ -1992,6 +1992,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_resolve_site_dir_rejects_symlinked_site_directory() {
+        use std::os::unix::fs::symlink;
+
+        let bundle_root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_site = outside.path().join("site");
+        fs::create_dir_all(&outside_site).unwrap();
+        fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
+        symlink(&outside_site, bundle_root.path().join("site")).unwrap();
+
+        let err = resolve_site_dir(bundle_root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"));
+
+        let direct_err = resolve_site_dir(&bundle_root.path().join("site"))
+            .unwrap_err()
+            .to_string();
+        assert!(direct_err.contains("must not be a symlink"));
+    }
+
+    #[test]
     fn test_chunk_size_limit() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path();
