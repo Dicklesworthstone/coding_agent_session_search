@@ -193,7 +193,8 @@ impl StaleDetector {
     pub fn record_scan(&self, conversations_indexed: usize) {
         if conversations_indexed > 0 {
             // Successful ingest
-            if let Ok(mut guard) = self.last_successful_ingest.lock() {
+            {
+                let mut guard = self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(Instant::now());
             }
             self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -224,7 +225,7 @@ impl StaleDetector {
         // Check if enough time has passed since last check
         let now = Instant::now();
         {
-            let mut last_check = self.last_check.lock().ok()?;
+            let mut last_check = self.last_check.lock().unwrap_or_else(|e| e.into_inner());
             let check_interval = Duration::from_secs(self.config.check_interval_mins * 60);
             if now.duration_since(*last_check) < check_interval {
                 return None;
@@ -240,7 +241,7 @@ impl StaleDetector {
 
         // Check time since last successful ingest
         let threshold = Duration::from_secs(self.config.threshold_hours * 3600);
-        let is_stale = match self.last_successful_ingest.lock().ok()?.as_ref() {
+        let is_stale = match self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(last) => now.duration_since(*last) > threshold,
             // No successful ingests ever - check if we've been running long enough
             None => now.duration_since(self.start_time) > threshold,
@@ -258,7 +259,7 @@ impl StaleDetector {
 
     /// Get statistics for logging/debugging.
     pub fn stats(&self) -> StaleStats {
-        let last_ingest = self.last_successful_ingest.lock().ok().and_then(|g| *g);
+        let last_ingest = *self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
         StaleStats {
             consecutive_zero_scans: self.consecutive_zero_scans.load(Ordering::Relaxed),
             total_ingests: self.total_ingests.load(Ordering::Relaxed),
@@ -271,7 +272,8 @@ impl StaleDetector {
 
     /// Reset the detector state (e.g., after a full rebuild).
     pub fn reset(&self) {
-        if let Ok(mut guard) = self.last_successful_ingest.lock() {
+        {
+            let mut guard = self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(Instant::now());
         }
         self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -1245,7 +1247,9 @@ pub fn run_index(
                 if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
-                        let _ = save_watch_state(&opts_clone.data_dir, &g);
+                        if let Err(e) = save_watch_state(&opts_clone.data_dir, &g) {
+                            tracing::warn!("failed to save watch state: {e}");
+                        }
                     }
                     // Reset stale detector on rebuild
                     detector_clone.reset();

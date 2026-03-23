@@ -7835,20 +7835,24 @@ fn run_diag(
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
         let size = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
         let (convs, msgs) =
-            if let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) {
-                let convs: i64 = conn
-                    .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                        r.get_typed(0)
-                    })
-                    .unwrap_or(0);
-                let msgs: i64 = conn
-                    .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                        r.get_typed(0)
-                    })
-                    .unwrap_or(0);
-                (convs, msgs)
-            } else {
-                (0, 0)
+            match Connection::open(db_path.to_string_lossy().into_owned()) {
+                Ok(conn) => {
+                    let convs: i64 = conn
+                        .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                            r.get_typed(0)
+                        })
+                        .unwrap_or(0);
+                    let msgs: i64 = conn
+                        .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                            r.get_typed(0)
+                        })
+                        .unwrap_or(0);
+                    (convs, msgs)
+                }
+                Err(e) => {
+                    tracing::warn!("failed to open database for diagnostics: {e}");
+                    (-1, -1)
+                }
             };
         (true, size, convs, msgs)
     } else {
