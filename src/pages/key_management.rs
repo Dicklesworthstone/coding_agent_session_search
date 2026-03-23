@@ -615,18 +615,56 @@ fn decrypt_all_chunks(
             export_id_raw.len()
         )
     })?;
+    let canonical_archive_dir = archive_dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve archive root {} before decrypting chunks",
+            archive_dir.display()
+        )
+    })?;
 
     let mut plaintext = Vec::new();
 
     for (chunk_index, chunk_file) in config.payload.files.iter().enumerate() {
         progress(chunk_index as f32 / config.payload.chunk_count as f32);
 
-        // Prevent path traversal from a tampered config.json
-        if chunk_file.contains("..") || std::path::Path::new(chunk_file).is_absolute() {
-            anyhow::bail!("Invalid chunk path: potential directory traversal");
+        let expected_chunk_file = format!("payload/chunk-{chunk_index:05}.bin");
+        if chunk_file != &expected_chunk_file {
+            bail!(
+                "Invalid chunk path in config.json: expected {}, got {}",
+                expected_chunk_file,
+                chunk_file
+            );
         }
         let chunk_path = archive_dir.join(chunk_file);
-        let ciphertext = std::fs::read(&chunk_path)?;
+        let chunk_meta = std::fs::symlink_metadata(&chunk_path).with_context(|| {
+            format!(
+                "Failed to inspect encrypted chunk {} at {}",
+                chunk_index,
+                chunk_path.display()
+            )
+        })?;
+        if chunk_meta.file_type().is_symlink() {
+            bail!("Encrypted chunk must not be a symlink: {}", chunk_file);
+        }
+        if !chunk_meta.file_type().is_file() {
+            bail!("Encrypted chunk must be a regular file: {}", chunk_file);
+        }
+
+        let canonical_chunk_path = chunk_path.canonicalize().with_context(|| {
+            format!(
+                "Failed to resolve encrypted chunk {} at {}",
+                chunk_index,
+                chunk_path.display()
+            )
+        })?;
+        if !canonical_chunk_path.starts_with(&canonical_archive_dir) {
+            bail!(
+                "Encrypted chunk path escapes archive directory: {}",
+                chunk_file
+            );
+        }
+
+        let ciphertext = std::fs::read(&canonical_chunk_path)?;
 
         // Derive nonce
         let nonce = derive_chunk_nonce(&base_nonce, chunk_index as u32);
@@ -1369,6 +1407,27 @@ mod tests {
             expected_viewer
         );
         assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_key_rotate_rejects_payload_directory_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let payload_dir = site_dir.join("payload");
+        let outside_payload_dir = temp_dir.path().join("outside-payload");
+
+        std::fs::rename(&payload_dir, &outside_payload_dir).unwrap();
+        symlink(&outside_payload_dir, &payload_dir).unwrap();
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("escapes archive directory"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
