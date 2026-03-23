@@ -116,7 +116,10 @@ self.addEventListener('activate', (event) => {
                         })
                 );
             })
-            .then(() => {
+            .then((results) => {
+                if (!results.every(Boolean)) {
+                    log(LOG.WARN, 'Some old caches could not be deleted during activation');
+                }
                 log(LOG.INFO, 'Service worker activated');
                 // Take control of all clients immediately
                 return self.clients.claim();
@@ -277,9 +280,15 @@ self.addEventListener('message', (event) => {
                 .then((keys) => {
                     const cachePrefix = getCachePrefix();
                     const targets = keys.filter((key) => key.startsWith(cachePrefix));
-                    return Promise.all(targets.map((key) => caches.delete(key))).then(() => targets);
+                    return Promise.all(targets.map((key) => caches.delete(key))).then((results) => ({
+                        targets,
+                        cleared: results.every(Boolean),
+                    }));
                 })
-                .then((targets) => {
+                .then(({ targets, cleared }) => {
+                    if (!cleared) {
+                        throw new Error('Some cache entries could not be deleted');
+                    }
                     respond({
                         type: 'CACHE_CLEARED',
                         cleared: targets,

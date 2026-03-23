@@ -846,7 +846,7 @@ export async function clearServiceWorkerCache(options = {}) {
 
     if (!('caches' in window)) {
         console.log('[Storage] Cache API not available');
-        return false;
+        return true;
     }
 
     try {
@@ -860,11 +860,11 @@ export async function clearServiceWorkerCache(options = {}) {
 
         const deleteResults = await Promise.all(cassNames.map((name) => caches.delete(name)));
         const cleared = deleteResults.every(Boolean);
-        if (!cleared) {
+        if (cleared) {
+            console.log('[Storage] Service Worker caches cleared:', cassNames);
+        } else {
             console.warn('[Storage] Some Service Worker caches could not be cleared:', cassNames);
         }
-
-        console.log('[Storage] Service Worker caches cleared:', cassNames);
         return cleared;
     } catch (e) {
         console.error('[Storage] Failed to clear SW cache:', e);
@@ -879,7 +879,7 @@ export async function unregisterServiceWorker(options = {}) {
     const { allArchives = false } = options;
 
     if (!('serviceWorker' in navigator)) {
-        return false;
+        return true;
     }
 
     try {
@@ -888,10 +888,11 @@ export async function unregisterServiceWorker(options = {}) {
         const targets = registrations.filter((reg) => allArchives || reg.scope === currentScope);
         const unregisterResults = await Promise.all(targets.map((reg) => reg.unregister()));
         const unregistered = unregisterResults.every(Boolean);
-        if (!unregistered) {
+        if (unregistered) {
+            console.log('[Storage] Service Workers unregistered');
+        } else {
             console.warn('[Storage] Some Service Workers could not be unregistered');
         }
-        console.log('[Storage] Service Workers unregistered');
         return unregistered;
     } catch (e) {
         console.error('[Storage] Failed to unregister SW:', e);
