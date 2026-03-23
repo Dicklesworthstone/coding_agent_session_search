@@ -289,9 +289,12 @@ export async function unregisterServiceWorker() {
  */
 export async function clearCache(options = {}) {
     const reply = await postMessageWithReply({ type: 'CLEAR_CACHE' }, options);
-    if (reply !== null) {
+    if (reply?.type === 'CACHE_CLEARED') {
         console.log('[SW] Cache cleared');
         return true;
+    }
+    if (reply?.type === 'CACHE_CLEAR_FAILED') {
+        console.warn('[SW] Cache clear failed:', reply.error);
     }
     return false;
 }

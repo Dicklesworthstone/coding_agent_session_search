@@ -21,6 +21,12 @@ let decryptInFlight = false;
 let activeUnlockRequestId = null;
 let activeDecryptRequestId = null;
 let nextWorkerRequestId = 1;
+let activeAppInitToken = 0;
+const LEGACY_SESSION_KEYS = {
+    DEK: 'cass_session_dek',
+    EXPIRY: 'cass_session_expiry',
+    UNLOCKED: 'cass_unlocked',
+};
 
 // DOM Elements
 const elements = {
@@ -172,6 +178,19 @@ function allocateWorkerRequestId() {
     const requestId = nextWorkerRequestId;
     nextWorkerRequestId += 1;
     return requestId;
+}
+
+function beginAppInitAttempt() {
+    activeAppInitToken += 1;
+    return activeAppInitToken;
+}
+
+function isCurrentAppInitToken(token) {
+    return token === activeAppInitToken;
+}
+
+function invalidateAppInitAttempt() {
+    activeAppInitToken += 1;
 }
 
 function isCurrentWorkerMessage(type, requestId) {
@@ -683,6 +702,7 @@ function handleWorkerError(error) {
         decryptInFlight
         || unlockInFlight
         || !!window.cassSession?.dek;
+    invalidateAppInitAttempt();
     unlockInFlight = false;
     decryptInFlight = false;
     activeUnlockRequestId = null;
@@ -744,6 +764,7 @@ async function handleDecryptSuccess(data) {
     updateProgress('Database decrypted', 100);
 
     if (!data?.dbBytes) {
+        invalidateAppInitAttempt();
         decryptInFlight = false;
         activeDecryptRequestId = null;
         hideProgress();
@@ -782,6 +803,7 @@ async function handleDecryptSuccess(data) {
         activeDecryptRequestId = null;
     } catch (error) {
         console.error('Failed to initialize database:', error);
+        invalidateAppInitAttempt();
         decryptInFlight = false;
         activeDecryptRequestId = null;
         hideProgress();
@@ -798,6 +820,7 @@ async function handleDecryptSuccess(data) {
  * Handle failed decryption
  */
 function handleDecryptFailed(data) {
+    invalidateAppInitAttempt();
     decryptInFlight = false;
     activeDecryptRequestId = null;
     hideProgress();
@@ -821,7 +844,11 @@ function handleDatabaseReady(data) {
     window.dispatchEvent(new CustomEvent('cass:db-ready', { detail: data }));
 }
 
-async function recoverFromAppInitFailure(message, error) {
+async function recoverFromAppInitFailure(message, error, initToken = activeAppInitToken) {
+    if (!isCurrentAppInitToken(initToken)) {
+        return;
+    }
+    invalidateAppInitAttempt();
     console.error(message, error);
     unlockInFlight = false;
     decryptInFlight = false;
@@ -848,6 +875,7 @@ function transitionToApp() {
         return;
     }
 
+    const appInitToken = beginAppInitAttempt();
     decryptInFlight = true;
     activeDecryptRequestId = allocateWorkerRequestId();
     elements.authScreen.classList.add('hidden');
@@ -863,13 +891,13 @@ function transitionToApp() {
             requestId: activeDecryptRequestId,
         });
     } catch (error) {
-        void recoverFromAppInitFailure('Failed to start archive decryption', error);
+        void recoverFromAppInitFailure('Failed to start archive decryption', error, appInitToken);
         return;
     }
 
     // Load viewer module
-    void loadViewerModule().catch((error) => {
-        void recoverFromAppInitFailure('Failed to load archive viewer', error);
+    void loadViewerModule(appInitToken).catch((error) => {
+        void recoverFromAppInitFailure('Failed to load archive viewer', error, appInitToken);
     });
 }
 
@@ -878,6 +906,7 @@ async function transitionToAppUnencrypted() {
         return;
     }
 
+    const appInitToken = beginAppInitAttempt();
     decryptInFlight = true;
     hideError();
     disableForm();
@@ -885,26 +914,25 @@ async function transitionToAppUnencrypted() {
     elements.authScreen.classList.add('hidden');
     elements.appScreen.classList.remove('hidden');
 
-    // Load viewer module early so it can subscribe to db-ready if needed
-    void loadViewerModule().catch((error) => {
-        void recoverFromAppInitFailure('Failed to load archive viewer', error);
-    });
+    try {
+        await loadViewerModule(appInitToken);
+    } catch (error) {
+        await recoverFromAppInitFailure('Failed to load archive viewer', error, appInitToken);
+        return;
+    }
 
     try {
-        await loadUnencryptedDatabase();
+        const didLoad = await loadUnencryptedDatabase(appInitToken);
+        if (!didLoad || !isCurrentAppInitToken(appInitToken)) {
+            return;
+        }
         decryptInFlight = false;
     } catch (error) {
-        console.error('Failed to load unencrypted database:', error);
-        decryptInFlight = false;
-        elements.appScreen.classList.add('hidden');
-        elements.authScreen.classList.remove('hidden');
-        showError('Failed to load unencrypted database');
-        enableForm();
-        return;
+        await recoverFromAppInitFailure('Failed to load unencrypted database', error, appInitToken);
     }
 }
 
-async function loadUnencryptedDatabase() {
+async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
     const payloadPath = getUnencryptedPayloadPath();
     const response = await fetch(payloadPath);
     if (!response.ok) {
@@ -912,8 +940,15 @@ async function loadUnencryptedDatabase() {
     }
 
     const dbBytes = new Uint8Array(await response.arrayBuffer());
+    if (!isCurrentAppInitToken(initToken)) {
+        return false;
+    }
     const dbModule = await import('./database.js');
     await dbModule.initDatabase(dbBytes);
+    if (!isCurrentAppInitToken(initToken)) {
+        await closeLiveDatabase();
+        return false;
+    }
 
     const stats = dbModule.getStatistics();
     window.dispatchEvent(new CustomEvent('cass:db-ready', {
@@ -922,6 +957,7 @@ async function loadUnencryptedDatabase() {
             messageCount: stats.messages || 0,
         },
     }));
+    return true;
 }
 
 function getUnencryptedPayloadPath() {
@@ -972,6 +1008,7 @@ async function closeLiveDatabase() {
  */
 async function lockArchive(options = {}) {
     const { broadcast = false, action = 'lock' } = options;
+    invalidateAppInitAttempt();
     unlockInFlight = false;
     decryptInFlight = false;
     activeUnlockRequestId = null;
@@ -1114,6 +1151,9 @@ function clearStoredSession() {
                 sessionKeys.DEK,
                 sessionKeys.EXPIRY,
                 sessionKeys.UNLOCKED,
+                LEGACY_SESSION_KEYS.DEK,
+                LEGACY_SESSION_KEYS.EXPIRY,
+                LEGACY_SESSION_KEYS.UNLOCKED,
             ]) {
                 storage.removeItem(key);
             }
@@ -1126,8 +1166,11 @@ function clearStoredSession() {
 /**
  * Dynamically load the viewer module
  */
-async function loadViewerModule() {
+async function loadViewerModule(initToken = activeAppInitToken) {
     const module = await import('./viewer.js');
+    if (!isCurrentAppInitToken(initToken)) {
+        return;
+    }
     module.init?.();
 }
 

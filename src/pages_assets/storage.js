@@ -680,6 +680,7 @@ export async function clearCurrentStorage() {
     console.log('[Storage] Clearing current storage:', currentMode);
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
+    const currentTofuKey = getCurrentArchiveTofuKey();
 
     // Writes in session/local modes can fall back to memoryStore if the browser
     // rejects storage access. Clear that archive-scoped fallback copy too.
@@ -707,6 +708,7 @@ export async function clearCurrentStorage() {
                     removeStorageEntries(storage, (key) =>
                         key.startsWith(archiveDataPrefix)
                         || currentSessionKeys.has(key)
+                        || key === currentTofuKey
                     );
                 }
             }
@@ -741,7 +743,7 @@ export async function clearOPFS(options = {}) {
                 : entry.startsWith(archiveDataPrefix);
             const shouldDeleteDb = allArchives
                 ? isCassOpfsDbFile(entry)
-                : currentArchiveDbFiles.has(entry);
+                : currentArchiveDbFiles.has(entry) || LEGACY_OPFS_DB_FILES.includes(entry);
             if (shouldDeleteData || shouldDeleteDb) {
                 entries.push(entry);
             }
@@ -770,6 +772,7 @@ export async function clearAllStorage(options = {}) {
     console.log('[Storage] Clearing all storage');
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
+    const currentTofuKey = getCurrentArchiveTofuKey();
 
     // Clear memory
     if (allArchives) {
@@ -806,8 +809,9 @@ export async function clearAllStorage(options = {}) {
             removeStorageEntries(localStorage, (key) =>
                 key.startsWith(archiveDataPrefix)
                 || currentSessionKeys.has(key)
+                || key === currentTofuKey
             );
-            clearCurrentArchivePreferenceKeys();
+            clearCurrentArchivePreferenceKeys({ includeLegacy: true });
         }
     } catch (e) {
         // Ignore

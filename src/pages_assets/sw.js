@@ -273,16 +273,25 @@ self.addEventListener('message', (event) => {
             break;
 
         case 'CLEAR_CACHE':
-            caches.keys().then((keys) => {
-                const cachePrefix = getCachePrefix();
-                const targets = keys.filter((key) => key.startsWith(cachePrefix));
-                return Promise.all(targets.map((key) => caches.delete(key))).then(() => {
+            caches.keys()
+                .then((keys) => {
+                    const cachePrefix = getCachePrefix();
+                    const targets = keys.filter((key) => key.startsWith(cachePrefix));
+                    return Promise.all(targets.map((key) => caches.delete(key))).then(() => targets);
+                })
+                .then((targets) => {
                     respond({
                         type: 'CACHE_CLEARED',
                         cleared: targets,
                     });
+                })
+                .catch((error) => {
+                    log(LOG.WARN, 'Failed to clear cache:', error);
+                    respond({
+                        type: 'CACHE_CLEAR_FAILED',
+                        error: error?.message || String(error),
+                    });
                 });
-            });
             break;
 
         case 'SET_LOG_LEVEL':
