@@ -144,8 +144,8 @@ pub fn encrypt_content(
 
     let derive_started = Instant::now();
     // Derive key using PBKDF2-SHA256
-    let mut key = [0u8; 32]; // 256 bits for AES-256
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut key);
+    let mut key = zeroize::Zeroizing::new([0u8; 32]); // 256 bits for AES-256
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut *key);
     debug!(
         component = "encryption",
         operation = "derive_key",
@@ -154,7 +154,7 @@ pub fn encrypt_content(
     );
 
     // Encrypt with AES-256-GCM
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref())
         .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
     let nonce = Nonce::from_slice(&iv);

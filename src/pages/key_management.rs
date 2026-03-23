@@ -477,6 +477,13 @@ fn unwrap_key(
 ) -> Result<[u8; 32]> {
     let cipher = Aes256Gcm::new_from_slice(kek).expect("Invalid key length");
 
+    let nonce: &[u8; 12] = nonce.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid nonce length: expected 12, got {}",
+            nonce.len()
+        )
+    })?;
+
     // AAD: export_id || slot_id
     let mut aad = Vec::with_capacity(export_id.len() + 1);
     aad.extend_from_slice(export_id);
