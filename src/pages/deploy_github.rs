@@ -774,6 +774,20 @@ fn enable_github_pages(username: &str, repo_name: &str) -> bool {
 
 /// Visit all files in a directory recursively
 fn visit_files(dir: &Path, f: &mut impl FnMut(&Path, u64)) -> Result<()> {
+    let canonical_base = dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve deployment source root {} before sizing",
+            dir.display()
+        )
+    })?;
+    visit_files_inner(dir, &canonical_base, f)
+}
+
+fn visit_files_inner(
+    dir: &Path,
+    canonical_base: &Path,
+    f: &mut impl FnMut(&Path, u64),
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -781,11 +795,38 @@ fn visit_files(dir: &Path, f: &mut impl FnMut(&Path, u64)) -> Result<()> {
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() {
+            let canonical_target = path.canonicalize().with_context(|| {
+                format!(
+                    "Failed to resolve symlinked deploy entry {}",
+                    path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_base) {
+                bail!(
+                    "Refusing to deploy symlinked site entry outside deployment root: {}",
+                    path.display()
+                );
+            }
+
+            let target_meta = std::fs::metadata(&path).with_context(|| {
+                format!(
+                    "Failed to inspect symlink target for deploy entry {}",
+                    path.display()
+                )
+            })?;
+            if !target_meta.is_file() {
+                bail!(
+                    "Refusing to deploy symlinked site entry that does not point to a regular file: {}",
+                    path.display()
+                );
+            }
+
+            f(&path, target_meta.len());
             continue;
         }
 
         if file_type.is_dir() {
-            visit_files(&path, f)?;
+            visit_files_inner(&path, canonical_base, f)?;
         } else if file_type.is_file() {
             f(&path, metadata.len());
         }
@@ -878,6 +919,25 @@ mod tests {
 
         assert_eq!(check.file_count, 1);
         assert_eq!(check.total_bytes, 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_size_check_counts_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::write(site_dir.join("root.txt"), "root").unwrap();
+        symlink("root.txt", site_dir.join("linked-file.txt")).unwrap();
+
+        let deployer = GitHubDeployer::default();
+        let check = deployer.check_size(temp.path()).unwrap();
+
+        assert_eq!(check.file_count, 2);
+        assert_eq!(check.total_bytes, 8);
     }
 
     #[test]
@@ -1010,7 +1070,34 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_visit_files_skips_symlink_paths() {
+    fn test_visit_files_counts_in_tree_symlinked_files() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink("root.txt", src.path().join("linked-file.txt")).unwrap();
+
+        let mut visited = Vec::new();
+        visit_files(src.path(), &mut |path, size| {
+            visited.push((
+                path.strip_prefix(src.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+                size,
+            ));
+        })
+        .unwrap();
+
+        assert!(visited.contains(&("root.txt".to_string(), 4)));
+        assert!(visited.contains(&("linked-file.txt".to_string(), 4)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_visit_files_rejects_symlink_paths_outside_root() {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
@@ -1029,20 +1116,12 @@ mod tests {
         .unwrap();
         symlink(outside.path().join("nested"), src.path().join("linked-dir")).unwrap();
 
-        let mut visited = Vec::new();
-        visit_files(src.path(), &mut |path, _size| {
-            visited.push(
-                path.strip_prefix(src.path())
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        })
-        .unwrap();
-
-        assert!(visited.contains(&"root.txt".to_string()));
-        assert!(!visited.contains(&"linked-file.txt".to_string()));
-        assert!(!visited.iter().any(|p| p.starts_with("linked-dir/")));
+        let err = visit_files(src.path(), &mut |_path, _size| {}).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to deploy symlinked site entry outside deployment root"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
