@@ -486,7 +486,11 @@ async function handleClearSWCache() {
     if (!confirmed) return;
 
     try {
-        await clearServiceWorkerCache();
+        const cacheCleared = await clearServiceWorkerCache();
+        if (!cacheCleared) {
+            showNotification('Failed to clear Service Worker cache', 'error');
+            return;
+        }
         showNotification('Service Worker cache cleared', 'success');
     } catch (err) {
         console.error('[Settings] Failed to clear SW cache:', err);
@@ -513,10 +517,16 @@ async function handleClearAll() {
         await setStorageMode(StorageMode.MEMORY);
         setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
-        await clearServiceWorkerCache();
         if (onSessionReset) {
             onSessionReset('clear-all');
         }
+
+        const cacheCleared = await clearServiceWorkerCache();
+        if (!cacheCleared) {
+            showNotification('Archive data cleared and session locked, but Service Worker cache could not be cleared', 'error');
+            return;
+        }
+
         showNotification('All data cleared and session locked', 'success');
     } catch (err) {
         console.error('[Settings] Failed to clear all:', err);
@@ -559,11 +569,23 @@ async function handleResetSession() {
 
     try {
         await clearAllStorage();
-        await clearServiceWorkerCache();
-        await unregisterServiceWorker();
-
         if (onSessionReset) {
             onSessionReset('reset');
+        }
+
+        const cacheCleared = await clearServiceWorkerCache();
+        const swUnregistered = await unregisterServiceWorker();
+        if (!cacheCleared || !swUnregistered) {
+            const failedSteps = [];
+            if (!cacheCleared) {
+                failedSteps.push('Service Worker cache');
+            }
+            if (!swUnregistered) {
+                failedSteps.push('Service Worker registration');
+            }
+
+            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be reset`, 'error');
+            return;
         }
 
         showNotification('Resetting...', 'success');
