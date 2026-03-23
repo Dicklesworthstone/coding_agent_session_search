@@ -194,7 +194,10 @@ impl StaleDetector {
         if conversations_indexed > 0 {
             // Successful ingest
             {
-                let mut guard = self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = self
+                    .last_successful_ingest
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 *guard = Some(Instant::now());
             }
             self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -241,7 +244,12 @@ impl StaleDetector {
 
         // Check time since last successful ingest
         let threshold = Duration::from_secs(self.config.threshold_hours * 3600);
-        let is_stale = match self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let is_stale = match self
+            .last_successful_ingest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             Some(last) => now.duration_since(*last) > threshold,
             // No successful ingests ever - check if we've been running long enough
             None => now.duration_since(self.start_time) > threshold,
@@ -259,7 +267,10 @@ impl StaleDetector {
 
     /// Get statistics for logging/debugging.
     pub fn stats(&self) -> StaleStats {
-        let last_ingest = *self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
+        let last_ingest = *self
+            .last_successful_ingest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         StaleStats {
             consecutive_zero_scans: self.consecutive_zero_scans.load(Ordering::Relaxed),
             total_ingests: self.total_ingests.load(Ordering::Relaxed),
@@ -273,7 +284,10 @@ impl StaleDetector {
     /// Reset the detector state (e.g., after a full rebuild).
     pub fn reset(&self) {
         {
-            let mut guard = self.last_successful_ingest.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .last_successful_ingest
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *guard = Some(Instant::now());
         }
         self.consecutive_zero_scans.store(0, Ordering::Relaxed);
@@ -1243,8 +1257,7 @@ pub fn run_index(
             stale_detector,
             opts.watch_interval_secs,
             move |paths, roots, is_rebuild| {
-                let indexed;
-                if is_rebuild {
+                let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
                         if let Err(e) = save_watch_state(&opts_clone.data_dir, &g) {
@@ -1256,7 +1269,7 @@ pub fn run_index(
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
                         roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    indexed = reindex_paths(
+                    let indexed = reindex_paths(
                         &opts_clone,
                         all_root_paths,
                         roots,
@@ -1265,13 +1278,19 @@ pub fn run_index(
                         &t_index,
                         true,
                     );
-                    // Record result to stale detector
-                    detector_clone.record_scan(indexed.as_ref().copied().unwrap_or(0));
+                    finalize_watch_reindex_result(
+                        indexed,
+                        &detector_clone,
+                        opts_clone.progress.as_ref(),
+                        "watch rebuild reindex",
+                    )
                 } else {
-                    indexed =
-                        reindex_paths(&opts_clone, paths, roots, &state, &storage, &t_index, false);
-                    // Record result to stale detector
-                    detector_clone.record_scan(indexed.as_ref().copied().unwrap_or(0));
+                    let indexed = finalize_watch_reindex_result(
+                        reindex_paths(&opts_clone, paths, roots, &state, &storage, &t_index, false),
+                        &detector_clone,
+                        opts_clone.progress.as_ref(),
+                        "watch incremental reindex",
+                    );
 
                     // Merge Tantivy segments if idle conditions are met.
                     // Without this, each reindex_paths() commit creates a new
@@ -1284,10 +1303,11 @@ pub fn run_index(
                     {
                         tracing::warn!(error = %e, "segment merge failed during watch");
                     }
-                }
+                    indexed
+                };
 
                 // Incremental semantic embedding with cooldown
-                if semantic_enabled && indexed.as_ref().copied().unwrap_or(0) > 0 {
+                if semantic_enabled && indexed > 0 {
                     let should_embed = last_semantic_embed
                         .lock()
                         .map(|t| t.elapsed() >= semantic_cooldown)
@@ -2064,6 +2084,41 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
     fs::write(&tmp_path, json)?;
     replace_file_from_temp(&tmp_path, &path)?;
     Ok(())
+}
+
+fn update_watch_last_error(progress: Option<&Arc<IndexingProgress>>, error: Option<String>) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    match progress.last_error.lock() {
+        Ok(mut guard) => *guard = error,
+        Err(poisoned) => *poisoned.into_inner() = error,
+    }
+}
+
+fn finalize_watch_reindex_result(
+    result: Result<usize>,
+    detector: &StaleDetector,
+    progress: Option<&Arc<IndexingProgress>>,
+    context: &str,
+) -> usize {
+    match result {
+        Ok(indexed) => {
+            update_watch_last_error(progress, None);
+            detector.record_scan(indexed);
+            indexed
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, context, "watch reindex failed");
+            if let Some(progress) = progress {
+                progress.phase.store(0, Ordering::Relaxed);
+            }
+            update_watch_last_error(progress, Some(format!("{context}: {error}")));
+            detector.record_scan(0);
+            0
+        }
+    }
 }
 
 fn classify_paths(
@@ -4338,6 +4393,73 @@ mod tests {
         detector.reset();
         assert_eq!(detector.stats().consecutive_zero_scans, 0);
         assert!(detector.stats().seconds_since_last_ingest.is_some());
+    }
+
+    #[test]
+    fn finalize_watch_reindex_result_records_error_and_resets_phase() {
+        let detector = StaleDetector::new(StaleConfig::default());
+        let progress = Arc::new(IndexingProgress::default());
+        progress.phase.store(2, Ordering::Relaxed);
+
+        let indexed = finalize_watch_reindex_result(
+            Err(anyhow::anyhow!("boom")),
+            &detector,
+            Some(&progress),
+            "watch incremental reindex",
+        );
+
+        assert_eq!(
+            indexed, 0,
+            "failed watch reindex should report zero indexed"
+        );
+        assert_eq!(
+            detector.stats().consecutive_zero_scans,
+            1,
+            "failed watch reindex should still count as a zero-result scan for stale detection"
+        );
+        assert_eq!(
+            progress.phase.load(Ordering::Relaxed),
+            0,
+            "failed watch reindex should reset progress phase back to idle"
+        );
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            Some("watch incremental reindex: boom"),
+            "failed watch reindex should surface the real error"
+        );
+    }
+
+    #[test]
+    fn finalize_watch_reindex_result_clears_stale_error_on_success() {
+        let detector = StaleDetector::new(StaleConfig::default());
+        let progress = Arc::new(IndexingProgress::default());
+        *progress
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some("old".to_string());
+
+        let indexed = finalize_watch_reindex_result(
+            Ok(3),
+            &detector,
+            Some(&progress),
+            "watch incremental reindex",
+        );
+
+        assert_eq!(indexed, 3);
+        assert_eq!(detector.stats().total_ingests, 1);
+        assert_eq!(
+            progress
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
+            None,
+            "successful watch reindex should clear stale error diagnostics"
+        );
     }
 
     #[test]

@@ -104,6 +104,9 @@ impl UpdateState {
     /// Check if enough time has passed since last check
     pub fn should_check(&self) -> bool {
         let now = now_unix();
+        if self.last_check_ts <= 0 || self.last_check_ts > now {
+            return true;
+        }
         now.saturating_sub(self.last_check_ts) >= CHECK_INTERVAL_SECS as i64
     }
 
@@ -166,6 +169,10 @@ struct GitHubRelease {
 /// - Network error (offline-friendly)
 /// - Parse error
 pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
+    check_for_updates_async_impl(current_version, false).await
+}
+
+async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Option<UpdateInfo> {
     // Escape hatch for CI/CD or restricted environments
     if updates_disabled() {
         return None;
@@ -174,7 +181,7 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
     let mut state = UpdateState::load_async().await;
 
     // Respect check interval
-    if !state.should_check() {
+    if !force && !state.should_check() {
         debug!("update check: skipping, checked recently");
         return None;
     }
@@ -187,26 +194,7 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
-            return None;
-        }
-    };
-
-    let current = match Version::parse(current_version) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("update check: invalid current version '{current_version}': {e}");
-            return None;
-        }
-    };
-
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
+    let info = build_update_info(current_version, release, &state)?;
 
     // Persist cadence only after a successful fetch + parse so transient
     // network or server errors do not suppress future checks for an hour.
@@ -215,24 +203,12 @@ pub async fn check_for_updates(current_version: &str) -> Option<UpdateInfo> {
         warn!("update check: failed to save state: {e}");
     }
 
-    Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
-        tag_name: release.tag_name,
-        current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
-        is_skipped,
-    })
+    Some(info)
 }
 
 /// Force a check regardless of interval (for manual refresh)
 pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
-    let mut state = UpdateState::load_async().await;
-    state.last_check_ts = 0; // Reset to force check
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to reset state: {e}");
-    }
-    check_for_updates(current_version).await
+    check_for_updates_async_impl(current_version, true).await
 }
 
 /// Skip the specified version
@@ -387,12 +363,29 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    // Parse versions
-    let latest_str = release.tag_name.trim_start_matches('v');
-    let latest = match Version::parse(latest_str) {
+    let info = build_update_info(current_version, release, &state)?;
+
+    // Persist cadence only after a successful fetch + parse so transient
+    // network or server errors do not suppress future checks for an hour.
+    state.mark_checked();
+    if let Err(e) = state.save() {
+        warn!("update check: failed to save state: {e}");
+    }
+
+    Some(info)
+}
+
+fn build_update_info(
+    current_version: &str,
+    release: GitHubRelease,
+    state: &UpdateState,
+) -> Option<UpdateInfo> {
+    let GitHubRelease { tag_name, html_url } = release;
+    let latest_version = tag_name.trim_start_matches('v').to_string();
+    let latest = match Version::parse(&latest_version) {
         Ok(v) => v,
         Err(e) => {
-            debug!("update check: invalid version '{}': {e}", release.tag_name);
+            debug!("update check: invalid version '{}': {e}", tag_name);
             return None;
         }
     };
@@ -404,23 +397,14 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
             return None;
         }
     };
-
-    let is_newer = latest > current;
-    let is_skipped = state.is_skipped(latest_str);
-
-    // Persist cadence only after a successful fetch + parse so transient
-    // network or server errors do not suppress future checks for an hour.
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
-    }
+    let is_skipped = state.is_skipped(&latest_version);
 
     Some(UpdateInfo {
-        latest_version: latest_str.to_string(),
-        tag_name: release.tag_name,
+        latest_version,
+        tag_name,
         current_version: current_version.to_string(),
-        release_url: release.html_url,
-        is_newer,
+        release_url: html_url,
+        is_newer: latest > current,
         is_skipped,
     })
 }
@@ -526,6 +510,11 @@ mod tests {
         // Simulate time passing
         state.last_check_ts = now_unix() - CHECK_INTERVAL_SECS as i64 - 1;
         assert!(state.should_check()); // Enough time passed
+
+        // Future timestamps should not suppress checks indefinitely after
+        // clock skew or state-file corruption.
+        state.last_check_ts = now_unix() + CHECK_INTERVAL_SECS as i64;
+        assert!(state.should_check());
     }
 
     #[test]
@@ -1065,6 +1054,73 @@ mod tests {
             std::env::remove_var("CASS_UPDATE_API_BASE_URL");
             std::env::remove_var("CASS_DATA_DIR");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn integration_force_check_bypasses_cadence_even_when_state_save_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_file = temp_dir.path().join("update_state.json");
+        let state = UpdateState {
+            last_check_ts: now_unix(),
+            skipped_version: None,
+        };
+        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        let release_json = r#"{
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/test/repo/releases/tag/v9.9.9"
+        }"#;
+        let (addr, handle) = start_test_server(release_json, 200);
+
+        let dir_metadata = std::fs::metadata(temp_dir.path()).unwrap();
+        let file_metadata = std::fs::metadata(&state_file).unwrap();
+        let dir_mode = dir_metadata.permissions().mode();
+        let file_mode = file_metadata.permissions().mode();
+
+        let mut readonly_dir = dir_metadata.permissions();
+        readonly_dir.set_mode(0o555);
+        std::fs::set_permissions(temp_dir.path(), readonly_dir).unwrap();
+
+        let mut readonly_file = file_metadata.permissions();
+        readonly_file.set_mode(0o444);
+        std::fs::set_permissions(&state_file, readonly_file).unwrap();
+
+        unsafe {
+            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
+            std::env::set_var("CASS_UPDATE_API_BASE_URL", format!("http://{}", addr));
+            std::env::remove_var("CASS_SKIP_UPDATE");
+            std::env::remove_var("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT");
+            std::env::remove_var("TUI_HEADLESS");
+            std::env::remove_var("CI");
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(force_check("0.1.0"));
+
+        let mut restore_file = std::fs::metadata(&state_file).unwrap().permissions();
+        restore_file.set_mode(file_mode);
+        std::fs::set_permissions(&state_file, restore_file).unwrap();
+
+        let mut restore_dir = std::fs::metadata(temp_dir.path()).unwrap().permissions();
+        restore_dir.set_mode(dir_mode);
+        std::fs::set_permissions(temp_dir.path(), restore_dir).unwrap();
+
+        unsafe {
+            std::env::remove_var("CASS_UPDATE_API_BASE_URL");
+            std::env::remove_var("CASS_DATA_DIR");
+        }
+
+        handle.join().expect("server thread");
+
+        let info = result.expect("force check should bypass cadence and succeed");
+        assert_eq!(info.latest_version, "9.9.9");
+        assert!(info.is_newer);
     }
 
     #[test]
