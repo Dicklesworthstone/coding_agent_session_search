@@ -7,6 +7,7 @@ mod tests {
     use coding_agent_search::pages::encrypt::EncryptionEngine;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
     use tempfile::TempDir;
 
     /// Create a test encrypted archive in the given directory
@@ -23,6 +24,22 @@ mod tests {
 
         // Clean up the source file
         fs::remove_file(&test_file)?;
+
+        Ok(())
+    }
+
+    fn run_node_module_assertions(script: &str) -> Result<()> {
+        let output = Command::new("node")
+            .args(["--input-type=module", "--eval", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "node module assertions failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         Ok(())
     }
@@ -431,5 +448,66 @@ mod tests {
         assert!(captured.contains(&"complete".to_string()));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_pages_share_and_router_reject_malformed_routes() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import { Router } from './src/pages_assets/router.js';
+                import { parseShareLink } from './src/pages_assets/share.js';
+
+                const router = new Router({ autoInit: false });
+                const invalidPaths = [
+                    '/c',
+                    '/c/12/extra',
+                    '/c/12/m',
+                    '/c/12/m/34/extra',
+                    '/search/extra',
+                    '/settings/extra',
+                    '/stats/extra',
+                ];
+
+                for (const path of invalidPaths) {
+                    const route = router._matchRoute(path);
+                    if (route.view !== 'not-found') {
+                        throw new Error(`expected not-found for ${path}, got ${JSON.stringify(route)}`);
+                    }
+                }
+
+                const invalidLinks = [
+                    'https://example.com/#/c/12/extra',
+                    'https://example.com/#/c/12/m/34/extra',
+                    'https://example.com/#/search/extra',
+                    'https://example.com/#/settings/extra',
+                    'https://example.com/#/stats/extra',
+                ];
+
+                for (const link of invalidLinks) {
+                    const parsed = parseShareLink(link);
+                    if (parsed !== null) {
+                        throw new Error(`expected null for ${link}, got ${JSON.stringify(parsed)}`);
+                    }
+                }
+
+                const validLink = parseShareLink('https://example.com/#/c/12/m/34?agent=claude');
+                if (!validLink || validLink.params.conversationId !== 12 || validLink.params.messageId !== 34 || validLink.query.agent !== 'claude') {
+                    throw new Error(`unexpected valid link parse result: ${JSON.stringify(validLink)}`);
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn test_stats_role_bar_markup_uses_slugged_class() {
+        let stats_js = include_str!("../src/pages_assets/stats.js");
+        assert!(
+            !stats_js.contains("role-${role.toLowerCase()}"),
+            "stats role bar markup should not use the unsanitized role class"
+        );
+        assert!(
+            stats_js.contains("role-${toCssSlug(role)}"),
+            "stats role bar markup should use the slugged role class"
+        );
     }
 }
