@@ -80,6 +80,7 @@ pub enum KdfAlgorithm {
 
 /// Key slot in config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeySlot {
     pub id: u8,
     pub slot_type: SlotType,
@@ -93,6 +94,7 @@ pub struct KeySlot {
 
 /// Argon2 parameters for config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Argon2Params {
     pub memory_kb: u32,
     pub iterations: u32,
@@ -111,6 +113,7 @@ impl Default for Argon2Params {
 
 /// Payload metadata in config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PayloadMeta {
     pub chunk_size: usize,
     pub chunk_count: usize,
@@ -121,6 +124,7 @@ pub struct PayloadMeta {
 
 /// Full config.json structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptionConfig {
     pub version: u8,
     pub export_id: String,  // base64-encoded 16 bytes

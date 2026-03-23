@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -55,6 +55,35 @@ const FORBIDDEN_CONFIG_KEYS: &[(&str, &str)] = &[
     ("private_key", "private_key field"),
     ("master_key", "master_key field"),
     ("recovery_secret", "recovery_secret"),
+];
+
+const ENCRYPTED_CONFIG_KEYS: &[&str] = &[
+    "version",
+    "export_id",
+    "base_nonce",
+    "compression",
+    "kdf_defaults",
+    "payload",
+    "key_slots",
+];
+const UNENCRYPTED_CONFIG_KEYS: &[&str] = &["encrypted", "version", "payload", "warning"];
+const ENCRYPTED_PAYLOAD_KEYS: &[&str] = &[
+    "chunk_size",
+    "chunk_count",
+    "total_compressed_size",
+    "total_plaintext_size",
+    "files",
+];
+const UNENCRYPTED_PAYLOAD_KEYS: &[&str] = &["path", "format", "size_bytes"];
+const ARGON2_PARAM_KEYS: &[&str] = &["memory_kb", "iterations", "parallelism"];
+const KEY_SLOT_KEYS: &[&str] = &[
+    "id",
+    "slot_type",
+    "kdf",
+    "salt",
+    "wrapped_dek",
+    "nonce",
+    "argon2_params",
 ];
 
 /// Verification result for a single check
@@ -238,11 +267,23 @@ fn check_required_files(site_dir: &Path) -> CheckResult {
 fn check_config_schema(site_dir: &Path) -> CheckResult {
     let config_path = site_dir.join("config.json");
 
-    // Parse config
-    let config: ArchiveConfig = match File::open(&config_path)
-        .context("Failed to open config.json")
-        .and_then(|f| serde_json::from_reader(BufReader::new(f)).context("Failed to parse JSON"))
-    {
+    let content = match fs::read_to_string(&config_path).context("Failed to read config.json") {
+        Ok(content) => content,
+        Err(e) => return CheckResult::fail(format!("Failed to read config.json: {}", e)),
+    };
+
+    let config_json: Value =
+        match serde_json::from_str(&content).context("Failed to parse JSON syntax") {
+            Ok(json) => json,
+            Err(e) => return CheckResult::fail(format!("Failed to parse config.json: {}", e)),
+        };
+
+    let unknown_field_errors = find_unknown_config_fields(&config_json);
+    if !unknown_field_errors.is_empty() {
+        return CheckResult::fail(unknown_field_errors.join("; "));
+    }
+
+    let config: ArchiveConfig = match serde_json::from_value(config_json) {
         Ok(c) => c,
         Err(e) => return CheckResult::fail(format!("Failed to parse config.json: {}", e)),
     };
@@ -256,6 +297,64 @@ fn check_config_schema(site_dir: &Path) -> CheckResult {
         CheckResult::pass()
     } else {
         CheckResult::fail(errors.join("; "))
+    }
+}
+
+fn find_unknown_config_fields(value: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(root) = value.as_object() else {
+        return errors;
+    };
+
+    if root.contains_key("encrypted") {
+        collect_unknown_fields(root, UNENCRYPTED_CONFIG_KEYS, "", &mut errors);
+        if let Some(payload) = root.get("payload").and_then(Value::as_object) {
+            collect_unknown_fields(payload, UNENCRYPTED_PAYLOAD_KEYS, "payload", &mut errors);
+        }
+    } else {
+        collect_unknown_fields(root, ENCRYPTED_CONFIG_KEYS, "", &mut errors);
+        if let Some(payload) = root.get("payload").and_then(Value::as_object) {
+            collect_unknown_fields(payload, ENCRYPTED_PAYLOAD_KEYS, "payload", &mut errors);
+        }
+        if let Some(params) = root.get("kdf_defaults").and_then(Value::as_object) {
+            collect_unknown_fields(params, ARGON2_PARAM_KEYS, "kdf_defaults", &mut errors);
+        }
+        if let Some(slots) = root.get("key_slots").and_then(Value::as_array) {
+            for (idx, slot) in slots.iter().enumerate() {
+                if let Some(slot_obj) = slot.as_object() {
+                    let slot_path = format!("key_slots[{idx}]");
+                    collect_unknown_fields(slot_obj, KEY_SLOT_KEYS, &slot_path, &mut errors);
+                    if let Some(params) = slot_obj.get("argon2_params").and_then(Value::as_object) {
+                        collect_unknown_fields(
+                            params,
+                            ARGON2_PARAM_KEYS,
+                            &format!("{slot_path}.argon2_params"),
+                            &mut errors,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+fn collect_unknown_fields(
+    object: &Map<String, Value>,
+    allowed_keys: &[&str],
+    current_path: &str,
+    errors: &mut Vec<String>,
+) {
+    for key in object.keys() {
+        if !allowed_keys.contains(&key.as_str()) {
+            let path = if current_path.is_empty() {
+                key.clone()
+            } else {
+                format!("{current_path}.{key}")
+            };
+            errors.push(format!("config.json contains unknown field: {path}"));
+        }
     }
 }
 
@@ -1518,6 +1617,41 @@ mod tests {
 
         let result = verify_bundle(&site_dir, false).unwrap();
         assert!(!result.checks.config_schema.passed);
+    }
+
+    #[test]
+    fn test_verify_rejects_unknown_config_fields() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+
+        copy_fixture("valid", &site_dir).unwrap();
+        fs::write(
+            site_dir.join("config.json"),
+            r#"{
+                "encrypted": false,
+                "version": "1.0",
+                "payload": {
+                    "path": "payload/data.sqlite",
+                    "format": "sqlite"
+                },
+                "totally_unknown_field": 123
+            }"#,
+        )
+        .unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert!(!result.checks.config_schema.passed);
+        assert!(
+            result
+                .checks
+                .config_schema
+                .details
+                .as_ref()
+                .map(|details| details.contains("unknown field"))
+                .unwrap_or(false),
+            "unknown config fields should fail schema validation: {:?}",
+            result.checks.config_schema.details
+        );
     }
 
     #[test]

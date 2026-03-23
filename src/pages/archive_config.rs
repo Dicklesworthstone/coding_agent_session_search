@@ -41,6 +41,7 @@ impl ArchiveConfig {
 
 /// Unencrypted bundle configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnencryptedConfig {
     /// Whether the bundle is encrypted (must be false).
     pub encrypted: bool,
@@ -55,6 +56,7 @@ pub struct UnencryptedConfig {
 
 /// Unencrypted payload descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnencryptedPayload {
     /// Relative path to the SQLite database payload.
     pub path: String,
@@ -264,6 +266,36 @@ mod tests {
         assert!(!config.is_encrypted());
         let inner = config.as_unencrypted().expect("should be unencrypted");
         assert_eq!(inner.payload.path, "payload.sqlite");
+    }
+
+    #[test]
+    fn test_untagged_deserialize_rejects_unknown_top_level_field() {
+        let json = r#"{
+            "encrypted": false,
+            "version": "1.0",
+            "payload": {
+                "path": "payload.sqlite",
+                "format": "sqlite"
+            },
+            "totally_unknown_field": 123
+        }"#;
+
+        serde_json::from_str::<ArchiveConfig>(json).expect_err("should reject unknown");
+    }
+
+    #[test]
+    fn test_untagged_deserialize_rejects_unknown_nested_payload_field() {
+        let json = r#"{
+            "encrypted": false,
+            "version": "1.0",
+            "payload": {
+                "path": "payload.sqlite",
+                "format": "sqlite",
+                "extra_payload_field": true
+            }
+        }"#;
+
+        serde_json::from_str::<ArchiveConfig>(json).expect_err("should reject unknown");
     }
 
     // ==================== UnencryptedPayload tests ====================
