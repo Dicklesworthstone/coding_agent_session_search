@@ -85,7 +85,7 @@ async function getCurrentServiceWorkerRegistration() {
     }
 
     try {
-        return await navigator.serviceWorker.getRegistration();
+        return (await navigator.serviceWorker.getRegistration()) ?? null;
     } catch {
         return null;
     }
@@ -105,7 +105,7 @@ export function isCrossOriginIsolated() {
  */
 export async function isServiceWorkerActive() {
     const registration = await getCurrentServiceWorkerRegistration();
-    return registration?.active != null;
+    return registration?.active !== null && registration?.active !== undefined;
 }
 
 /**
@@ -113,7 +113,7 @@ export async function isServiceWorkerActive() {
  * @returns {Promise<boolean>}
  */
 export async function hasServiceWorkerRegistration() {
-    return (await getCurrentServiceWorkerRegistration()) != null;
+    return (await getCurrentServiceWorkerRegistration()) !== null;
 }
 
 /**
@@ -565,7 +565,9 @@ export function onServiceWorkerActivated(callback) {
                 console.log('[COI] Service worker activation detected:', reason);
                 [...serviceWorkerActivationCallbacks].forEach((registeredCallback) => {
                     try {
-                        registeredCallback();
+                        Promise.resolve(registeredCallback()).catch((error) => {
+                            console.error('[COI] Activation callback failed:', error);
+                        });
                     } catch (error) {
                         console.error('[COI] Activation callback failed:', error);
                     }

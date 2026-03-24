@@ -37,8 +37,21 @@ function getArchiveOpfsDbName() {
  * Handle messages from main thread
  */
 self.onmessage = async (event) => {
-    const { type, ...data } = event.data;
-    const { requestId } = data;
+    const payload = event?.data && typeof event.data === 'object' ? event.data : null;
+    const requestId = payload && 'requestId' in payload ? payload.requestId : null;
+    if (!payload || typeof payload.type !== 'string' || payload.type.length === 0) {
+        console.warn('Ignoring malformed worker request payload');
+        if (requestId !== null && requestId !== undefined) {
+            self.postMessage({
+                type: 'WORKER_ERROR',
+                error: 'Malformed worker request payload',
+                requestId,
+            });
+        }
+        return;
+    }
+
+    const { type, ...data } = payload;
 
     try {
         switch (type) {
@@ -59,17 +72,29 @@ self.onmessage = async (event) => {
                 break;
 
             default:
-                console.warn('Unknown message type:', type);
+                throw new Error(`Unknown worker message type: ${type}`);
         }
     } catch (error) {
         console.error('Worker error:', error);
         self.postMessage({
-            type: type.replace('UNLOCK', 'UNLOCK_FAILED').replace('DECRYPT', 'DECRYPT_FAILED'),
-            error: error.message,
+            type: getWorkerFailureMessageType(type),
+            error: error?.message || String(error),
             requestId,
         });
     }
 };
+
+function getWorkerFailureMessageType(type) {
+    switch (type) {
+        case 'UNLOCK_PASSWORD':
+        case 'UNLOCK_RECOVERY':
+            return 'UNLOCK_FAILED';
+        case 'DECRYPT_DATABASE':
+            return 'DECRYPT_FAILED';
+        default:
+            return 'WORKER_ERROR';
+    }
+}
 
 /**
  * Handle password-based unlock

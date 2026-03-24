@@ -512,6 +512,28 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_markup_stays_csp_safe_without_inline_styles() {
+        let stats_js = include_str!("../src/pages_assets/stats.js");
+        assert!(
+            !stats_js.contains("style=\"font-size:")
+                && !stats_js.contains("style=\"width: ${percent}%"),
+            "stats markup should not emit inline style attributes under the strict pages CSP"
+        );
+        assert!(
+            stats_js.contains("data-term-size=\"${size.toFixed(3)}\"")
+                && stats_js.contains("data-term-opacity=\"${opacity.toFixed(3)}\"")
+                && stats_js.contains("data-role-width=\"${percent}\""),
+            "stats markup should carry dynamic style values through data attributes instead"
+        );
+        assert!(
+            stats_js.contains("applyDynamicStatsStyles();")
+                && stats_js.contains("term.style.fontSize =")
+                && stats_js.contains("roleBar.style.width ="),
+            "stats renderer should apply dynamic sizing after insertion instead of through inline markup"
+        );
+    }
+
+    #[test]
     fn test_viewer_lock_paths_reset_hash_to_home() {
         let viewer_js = include_str!("../src/pages_assets/viewer.js");
         assert!(
@@ -688,11 +710,15 @@ mod tests {
             "storage mode changes should await the async settings rerender so rerender failures stay inside the handler error path"
         );
         assert!(
-            settings_js.contains("showNotification('Current storage cleared', 'success');\n        await render();"),
+            settings_js.contains(
+                "showNotification('Current storage cleared', 'success');\n        await render();"
+            ),
             "clear-current-storage should await the async settings rerender"
         );
         assert!(
-            settings_js.contains("showNotification('OPFS cache cleared', 'success');\n        await render();"),
+            settings_js.contains(
+                "showNotification('OPFS cache cleared', 'success');\n        await render();"
+            ),
             "clear-OPFS should await the async settings rerender"
         );
         assert!(
@@ -723,8 +749,8 @@ mod tests {
             "pages bundle should keep the strict CSP script policy"
         );
         assert!(
-            index_html.contains("id=\"auth-screen\" class=\"auth-container hidden\""),
-            "auth screen should start hidden in markup so startup no longer depends on an inline bootstrap script"
+            index_html.contains("id=\"auth-screen\" class=\"auth-container\""),
+            "auth screen should stay visible in static markup so a failed auth.js startup does not leave the page blank"
         );
         assert!(
             !index_html.contains("<script type=\"module\">"),
@@ -739,14 +765,79 @@ mod tests {
         assert!(
             auth_js.contains("registerServiceWorker().catch((error) => {")
                 && auth_js.contains("initCOIDetection({")
-                && auth_js.contains("onServiceWorkerActivated(async () => {"),
-            "auth.js should own service-worker registration, COI initialization, and activation rechecks"
+                && auth_js.contains("onServiceWorkerActivated(async () => {")
+                && auth_js.contains("authScreen?.classList.add('hidden');"),
+            "auth.js should own service-worker registration, initial auth hiding, COI initialization, and activation rechecks"
+        );
+        assert!(
+            auth_js.contains("const appScreen = document.getElementById('app-screen');")
+                && auth_js.contains("if (appScreen && !appScreen.classList.contains('hidden')) {")
+                && auth_js.contains("const revealAuthScreenIfLocked = () => {")
+                && auth_js.contains("revealAuthScreenIfLocked();"),
+            "COI bootstrap should only re-show the auth screen while the app is still locked, including late failure paths"
         );
         assert!(
             auth_js.contains("}).catch((error) => {")
                 && auth_js.contains("console.error('[App] COI initialization failed:', error);")
-                && auth_js.contains("authScreen?.classList.remove('hidden');"),
+                && auth_js.contains("revealAuthScreenIfLocked();"),
             "COI bootstrap failures should fall back to revealing the auth screen instead of leaving the page blank"
+        );
+    }
+
+    #[test]
+    fn test_service_worker_activation_callbacks_handle_async_rejections() {
+        let coi_detector_js = include_str!("../src/pages_assets/coi-detector.js");
+        assert!(
+            coi_detector_js.contains("Promise.resolve(registeredCallback()).catch((error) => {")
+                && coi_detector_js
+                    .contains("console.error('[COI] Activation callback failed:', error);"),
+            "service worker activation fanout should catch rejected async callbacks instead of leaking unhandled promise rejections"
+        );
+    }
+
+    #[test]
+    fn test_service_worker_message_handler_ignores_malformed_payloads() {
+        let sw_js = include_str!("../src/pages_assets/sw.js");
+        assert!(
+            sw_js.contains(
+                "const payload = event.data && typeof event.data === 'object' ? event.data : null;"
+            ) && sw_js.contains("if (!payload) {")
+                && sw_js.contains("Ignoring malformed message payload"),
+            "service worker message handling should guard against null or non-object payloads before destructuring"
+        );
+        assert!(
+            sw_js.contains("if (typeof type !== 'string' || type.length === 0) {")
+                && sw_js.contains("Ignoring message without a valid type"),
+            "service worker message handling should reject payloads without a valid string message type"
+        );
+    }
+
+    #[test]
+    fn test_worker_message_paths_guard_malformed_payloads_and_report_generic_failures() {
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains(
+                "const payload = event?.data && typeof event.data === 'object' ? event.data : null;"
+            ) && auth_js.contains("Ignoring malformed worker message payload")
+                && auth_js
+                    .contains("void handleWorkerError(new Error('Malformed worker response'));")
+                && auth_js.contains("case 'WORKER_ERROR':")
+                && auth_js.contains(
+                    "void handleWorkerError(new Error(`Unknown worker message type: ${type}`));"
+                ),
+            "auth-side worker message handling should fail closed on malformed or unknown payloads and surface generic worker failures"
+        );
+
+        let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
+        assert!(
+            crypto_worker_js.contains("Ignoring malformed worker request payload")
+                && crypto_worker_js.contains("type: 'WORKER_ERROR',")
+                && crypto_worker_js.contains("error: 'Malformed worker request payload',")
+                && crypto_worker_js
+                    .contains("throw new Error(`Unknown worker message type: ${type}`);")
+                && crypto_worker_js.contains("type: getWorkerFailureMessageType(type),")
+                && crypto_worker_js.contains("return 'WORKER_ERROR';"),
+            "crypto worker should report malformed or unknown payloads and fall back to a generic worker failure type"
         );
     }
 }

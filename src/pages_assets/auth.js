@@ -6,8 +6,10 @@
  */
 
 import { createStrengthMeter } from './password-strength.js';
+import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';
 import { StorageMode, getArchiveScopeId, getStorageMode, getStoredMode, isOpfsEnabled } from './storage.js';
 import { SESSION_CONFIG } from './session.js';
+import { registerServiceWorker } from './sw-register.js';
 
 // State
 let config = null;
@@ -702,7 +704,14 @@ function handleQrError(error) {
  * Handle messages from crypto worker
  */
 function handleWorkerMessage(event) {
-    const { type, ...data } = event.data;
+    const payload = event?.data && typeof event.data === 'object' ? event.data : null;
+    if (!payload || typeof payload.type !== 'string' || payload.type.length === 0) {
+        console.warn('Ignoring malformed worker message payload');
+        void handleWorkerError(new Error('Malformed worker response'));
+        return;
+    }
+
+    const { type, ...data } = payload;
 
     if (!isCurrentWorkerMessage(type, data.requestId)) {
         console.debug('Ignoring stale worker message:', type, data.requestId);
@@ -734,8 +743,13 @@ function handleWorkerMessage(event) {
             handleDatabaseReady(data);
             break;
 
+        case 'WORKER_ERROR':
+            void handleWorkerError(new Error(data.error || 'Worker error'));
+            break;
+
         default:
             console.warn('Unknown worker message type:', type);
+            void handleWorkerError(new Error(`Unknown worker message type: ${type}`));
     }
 }
 
@@ -1417,9 +1431,57 @@ function base64ToBytes(base64) {
     return bytes;
 }
 
+function bootstrapCrossOriginIsolation() {
+    const coiStatus = document.getElementById('coi-status');
+    const authScreen = document.getElementById('auth-screen');
+    const appScreen = document.getElementById('app-screen');
+
+    const revealAuthScreenIfLocked = () => {
+        if (!authScreen) {
+            return;
+        }
+        if (appScreen && !appScreen.classList.contains('hidden')) {
+            return;
+        }
+        authScreen.classList.remove('hidden');
+    };
+
+    authScreen?.classList.add('hidden');
+
+    registerServiceWorker().catch((error) => {
+        console.warn('Service worker registration failed:', error);
+    });
+
+    initCOIDetection({
+        statusContainer: coiStatus,
+        authContainer: authScreen,
+        onReady: revealAuthScreenIfLocked,
+        maxWaitMs: 3000,
+    }).then((state) => {
+        console.log('[App] COI initialization complete, state:', state);
+    }).catch((error) => {
+        console.error('[App] COI initialization failed:', error);
+        coiStatus?.classList.add('hidden');
+        revealAuthScreenIfLocked();
+    });
+
+    onServiceWorkerActivated(async () => {
+        const state = await getCOIState();
+        if (state === COI_STATE.READY && authScreen?.classList.contains('hidden')) {
+            coiStatus?.classList.add('hidden');
+            revealAuthScreenIfLocked();
+        }
+    });
+}
+
+function startApp() {
+    bootstrapCrossOriginIsolation();
+    void init();
+}
+
 // Initialize when DOM is ready
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
+    document.addEventListener('DOMContentLoaded', startApp);
 } else {
-    init();
+    startApp();
 }

@@ -149,48 +149,6 @@
         </main>
     </div>
 
-    <!-- Initialize app with COI detection -->
-    <script type="module">
-        import { registerServiceWorker } from './sw-register.js';
-        import { initCOIDetection, onServiceWorkerActivated, COI_STATE } from './coi-detector.js';
-
-        // Get container references
-        const coiStatus = document.getElementById('coi-status');
-        const authScreen = document.getElementById('auth-screen');
-
-        // Initially hide auth screen until COI check passes
-        authScreen.classList.add('hidden');
-
-        // Start service worker registration
-        registerServiceWorker().catch(err => {
-            console.warn('Service worker registration failed:', err);
-        });
-
-        // Initialize COI detection
-        initCOIDetection({
-            statusContainer: coiStatus,
-            authContainer: authScreen,
-            onReady: () => {
-                // COI ready - show auth screen
-                authScreen.classList.remove('hidden');
-            },
-            maxWaitMs: 3000,
-        }).then(state => {
-            console.log('[App] COI initialization complete, state:', state);
-        });
-
-        // Listen for SW activation in case we need to recheck
-        onServiceWorkerActivated(async () => {
-            // Recheck COI state when SW activates
-            const { getCOIState } = await import('./coi-detector.js');
-            const state = await getCOIState();
-            if (state === COI_STATE.READY && authScreen.classList.contains('hidden')) {
-                coiStatus.classList.add('hidden');
-                authScreen.classList.remove('hidden');
-            }
-        });
-    </script>
-
     <!-- Main authentication module -->
     <script type="module" src="auth.js"></script>
 </body>
