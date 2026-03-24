@@ -380,7 +380,7 @@ async function handleStorageModeChange(e) {
         await setStorageMode(newMode);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: newMode } }));
         showNotification(`Storage mode changed to ${newMode}`, 'success');
-        render(); // Re-render to update UI
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to change storage mode:', err);
         showNotification('Failed to change storage mode', 'error');
@@ -419,7 +419,7 @@ async function handleOPFSToggle(e) {
             const opfsCleared = await clearOPFS();
             if (!opfsCleared) {
                 showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');
-                render();
+                await render();
                 return;
             }
             setOpfsEnabled(false);
@@ -430,7 +430,12 @@ async function handleOPFSToggle(e) {
         }
     }
 
-    render(); // Re-render to update UI
+    try {
+        await render();
+    } catch (err) {
+        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);
+        showNotification('Failed to refresh settings', 'error');
+    }
 }
 
 /**
@@ -456,7 +461,7 @@ async function handleClearCurrentStorage() {
         }
 
         showNotification('Current storage cleared', 'success');
-        render();
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to clear storage:', err);
         showNotification('Failed to clear storage', 'error');
@@ -482,7 +487,7 @@ async function handleClearOPFS() {
         }
 
         showNotification('OPFS cache cleared', 'success');
-        render();
+        await render();
     } catch (err) {
         console.error('[Settings] Failed to clear OPFS:', err);
         showNotification('Failed to clear OPFS', 'error');

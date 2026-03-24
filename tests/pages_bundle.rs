@@ -652,4 +652,48 @@ mod tests {
             "auth QR teardown should clear any stale scanner markup from the reader container"
         );
     }
+
+    #[test]
+    fn test_conversation_load_has_error_boundary_for_render_failures() {
+        let conversation_js = include_str!("../src/pages_assets/conversation.js");
+        assert!(
+            conversation_js
+                .contains("console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);"),
+            "conversation load failures should be logged with conversation context"
+        );
+        assert!(
+            conversation_js.contains("showError('Failed to load conversation');"),
+            "conversation load failures should render a user-visible error panel instead of becoming unhandled promise rejections"
+        );
+        assert!(
+            conversation_js.contains("teardownDocumentListeners();")
+                && conversation_js.contains("destroyVirtualList();"),
+            "conversation load failures should tear down stale listeners and virtual-list state before showing the error panel"
+        );
+    }
+
+    #[test]
+    fn test_settings_async_handlers_await_rerender() {
+        let settings_js = include_str!("../src/pages_assets/settings.js");
+        assert!(
+            settings_js.contains("showNotification(`Storage mode changed to ${newMode}`, 'success');\n        await render();"),
+            "storage mode changes should await the async settings rerender so rerender failures stay inside the handler error path"
+        );
+        assert!(
+            settings_js.contains("showNotification('Current storage cleared', 'success');\n        await render();"),
+            "clear-current-storage should await the async settings rerender"
+        );
+        assert!(
+            settings_js.contains("showNotification('OPFS cache cleared', 'success');\n        await render();"),
+            "clear-OPFS should await the async settings rerender"
+        );
+        assert!(
+            settings_js.contains("await render();\n    } catch (err) {\n        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);"),
+            "OPFS toggle rerender should be awaited and caught instead of becoming an unhandled promise rejection"
+        );
+        assert!(
+            settings_js.contains("showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');\n                await render();"),
+            "the partial OPFS-clear path should also await the rerender before returning"
+        );
+    }
 }

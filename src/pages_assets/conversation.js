@@ -85,62 +85,75 @@ export function initConversationViewer(container, backCallback) {
  */
 export async function loadConversation(conversationId, highlightMessageId = null) {
     const loadId = ++activeConversationLoadId;
-    let conversation;
-    let messages;
+    try {
+        let conversation;
+        let messages;
 
-    // Check if conversation is already in cache
-    if (loadedConversations.has(conversationId)) {
-        const cached = loadedConversations.get(conversationId);
-        // Move to end of map (most recently used)
-        loadedConversations.delete(conversationId);
-        loadedConversations.set(conversationId, cached);
-        conversation = cached.conversation;
-        messages = cached.messages;
-        console.debug(`[Conversation] Using cached conversation ${conversationId}`);
-    } else {
-        // Unload oldest conversation if at limit
-        if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
-            unloadOldestConversation();
+        // Check if conversation is already in cache
+        if (loadedConversations.has(conversationId)) {
+            const cached = loadedConversations.get(conversationId);
+            // Move to end of map (most recently used)
+            loadedConversations.delete(conversationId);
+            loadedConversations.set(conversationId, cached);
+            conversation = cached.conversation;
+            messages = cached.messages;
+            console.debug(`[Conversation] Using cached conversation ${conversationId}`);
+        } else {
+            // Unload oldest conversation if at limit
+            if (loadedConversations.size >= MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS) {
+                unloadOldestConversation();
+            }
+
+            // Load conversation metadata
+            conversation = getConversation(conversationId);
+
+            if (!conversation) {
+                if (loadId === activeConversationLoadId) {
+                    showError('Conversation not found');
+                }
+                return;
+            }
+
+            // Load messages
+            messages = getConversationMessages(conversationId);
+
+            // Cache the loaded data
+            loadedConversations.set(conversationId, {
+                conversation,
+                messages,
+                loadedAt: Date.now(),
+            });
+            console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
         }
 
-        // Load conversation metadata
-        conversation = getConversation(conversationId);
+        // Check memory pressure
+        if (checkMemoryPressure()) {
+            showMemoryWarning();
+        }
 
-        if (!conversation) {
-            if (loadId === activeConversationLoadId) {
-                showError('Conversation not found');
-            }
+        await ensureAttachmentsReady(loadId);
+
+        if (loadId !== activeConversationLoadId) {
             return;
         }
 
-        // Load messages
-        messages = getConversationMessages(conversationId);
+        currentConversation = conversation;
+        currentMessages = messages;
 
-        // Cache the loaded data
-        loadedConversations.set(conversationId, {
-            conversation,
-            messages,
-            loadedAt: Date.now(),
-        });
-        console.debug(`[Conversation] Loaded and cached conversation ${conversationId} (cache size: ${loadedConversations.size})`);
+        // Render the view
+        render(conversation, messages, highlightMessageId);
+    } catch (error) {
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
+
+        console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
+        teardownDocumentListeners();
+        destroyVirtualList();
+        currentConversation = null;
+        currentMessages = [];
+        showError('Failed to load conversation');
     }
-
-    // Check memory pressure
-    if (checkMemoryPressure()) {
-        showMemoryWarning();
-    }
-
-    await ensureAttachmentsReady(loadId);
-
-    if (loadId !== activeConversationLoadId) {
-        return;
-    }
-
-    currentConversation = conversation;
-    currentMessages = messages;
-
-    // Render the view
-    render(conversation, messages, highlightMessageId);
 }
 
 function createAttachmentState() {
