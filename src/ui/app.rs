@@ -5068,6 +5068,16 @@ impl CassApp {
         self.data_dir.join(TUI_STATE_FILE_NAME)
     }
 
+    fn max_detail_scroll(&self) -> u32 {
+        self.detail_content_lines
+            .get()
+            .saturating_sub(self.detail_visible_height.get())
+    }
+
+    fn set_detail_scroll_clamped(&mut self, target: u32) {
+        self.detail_scroll = target.min(self.max_detail_scroll());
+    }
+
     fn apply_persisted_state(&mut self, state: &PersistedState, mark_first_run_dirty: bool) {
         self.search_mode = state.search_mode;
         self.match_mode = state.match_mode;
@@ -10059,7 +10069,7 @@ impl CassApp {
             self.detail_visible_height.set(content_area.height as u32);
 
             // Clamp scroll
-            let effective_scroll = scroll.min(total_lines.saturating_sub(1));
+            let effective_scroll = scroll.min(total_lines.saturating_sub(visible_height));
             let visible_lines: Vec<ftui::text::Line<'static>> = lines
                 .into_iter()
                 .skip(effective_scroll)
@@ -16244,11 +16254,11 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::DetailMessageJumped { forward, user_only } => {
+                let current = self.detail_scroll.min(self.max_detail_scroll());
                 let offsets = self.detail_message_offsets.borrow();
                 if offsets.is_empty() {
                     return ftui::Cmd::none();
                 }
-                let current = self.detail_scroll;
                 let target = if forward {
                     // Find first message offset strictly after current scroll
                     offsets
@@ -16273,8 +16283,9 @@ impl super::ftui_adapter::Model for CassApp {
                         .map(|(o, _)| *o)
                         .next()
                 };
+                drop(offsets);
                 if let Some(pos) = target {
-                    self.detail_scroll = pos;
+                    self.set_detail_scroll_clamped(pos);
                 }
                 ftui::Cmd::none()
             }
@@ -16331,7 +16342,7 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // Auto-scroll to bring current match into view
                     let target_line = find.matches[find.current];
-                    self.detail_scroll = target_line.saturating_sub(3);
+                    self.set_detail_scroll_clamped(target_line.saturating_sub(3));
                 }
                 ftui::Cmd::none()
             }
@@ -16374,7 +16385,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.detail_session_hit_current = current;
                 let target_line = cached_offsets[current];
-                self.detail_scroll = target_line.saturating_sub(3);
+                self.set_detail_scroll_clamped(target_line.saturating_sub(3));
                 ftui::Cmd::none()
             }
 
@@ -17939,7 +17950,9 @@ impl super::ftui_adapter::Model for CassApp {
                 if self.show_detail_modal {
                     if let Some(target) = self.detail_pending_scroll_to.get() {
                         self.detail_pending_scroll_to.set(None);
-                        self.detail_scroll = target;
+                        self.set_detail_scroll_clamped(target);
+                    } else {
+                        self.set_detail_scroll_clamped(self.detail_scroll);
                     }
                 } else {
                     self.detail_pending_scroll_to.set(None);
@@ -26951,6 +26964,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detail_find_navigation_clamps_scroll_to_last_full_page() {
+        let mut app = CassApp::default();
+        let _ = app.update(CassMsg::DetailFindToggled);
+        app.detail_content_lines.set(100);
+        app.detail_visible_height.set(20);
+        *app.detail_find_matches_cache.borrow_mut() = vec![95];
+        if let Some(ref mut find) = app.detail_find {
+            find.query = "test".to_string();
+        }
+
+        let _ = app.update(CassMsg::DetailFindNavigated { forward: true });
+
+        assert_eq!(
+            app.detail_scroll, 80,
+            "auto-scroll should clamp to the last full page instead of overshooting"
+        );
+    }
+
     /// Helper: populate cached_detail with messages containing a keyword for find tests.
     fn set_detail_with_keyword(app: &mut CassApp, keyword: &str) {
         let mut cv = make_test_conversation_view();
@@ -27431,6 +27463,43 @@ mod tests {
         assert!(
             !plain.contains("(10/2)"),
             "find bar should not render impossible stale match counters"
+        );
+    }
+
+    #[test]
+    fn tick_clamps_pending_detail_scroll_to_last_full_page() {
+        let mut app = CassApp::default();
+        app.show_detail_modal = true;
+        app.detail_content_lines.set(100);
+        app.detail_visible_height.set(20);
+        app.detail_pending_scroll_to.set(Some(95));
+
+        let _ = app.update(CassMsg::Tick);
+
+        assert_eq!(
+            app.detail_scroll, 80,
+            "pending scroll target should clamp to the last full page"
+        );
+        assert_eq!(
+            app.detail_pending_scroll_to.get(),
+            None,
+            "tick should consume the pending scroll target"
+        );
+    }
+
+    #[test]
+    fn tick_clamps_existing_oversized_detail_scroll_without_pending_target() {
+        let mut app = CassApp::default();
+        app.show_detail_modal = true;
+        app.detail_content_lines.set(100);
+        app.detail_visible_height.set(20);
+        app.detail_scroll = 95;
+
+        let _ = app.update(CassMsg::Tick);
+
+        assert_eq!(
+            app.detail_scroll, 80,
+            "tick should normalize an oversized detail scroll even without a pending target"
         );
     }
 
@@ -32702,6 +32771,30 @@ mod tests {
             user_only: false,
         });
         assert_eq!(app.detail_scroll, 10, "should jump to previous message");
+    }
+
+    #[test]
+    fn detail_message_jump_uses_clamped_current_scroll_when_state_is_oversized() {
+        let mut app = app_with_hits(3);
+        *app.detail_message_offsets.borrow_mut() = vec![
+            (0, crate::model::types::MessageRole::User),
+            (10, crate::model::types::MessageRole::Agent),
+            (25, crate::model::types::MessageRole::Tool),
+            (40, crate::model::types::MessageRole::User),
+        ];
+        app.detail_content_lines.set(100);
+        app.detail_visible_height.set(20);
+        app.detail_scroll = 95;
+
+        let _ = app.update(CassMsg::DetailMessageJumped {
+            forward: false,
+            user_only: false,
+        });
+
+        assert_eq!(
+            app.detail_scroll, 40,
+            "message jump should navigate from the clamped last full page, not a stale oversized scroll"
+        );
     }
 
     #[test]
@@ -39119,6 +39212,35 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let text = ftui_harness::buffer_to_text(&buf);
         assert!(text.contains("/ type to find"));
         assert_affordance_snapshot("cassapp_baseline_detail_find_empty_query", &buf);
+    }
+
+    #[test]
+    fn render_detail_pane_clamps_oversized_scroll_to_last_full_page() {
+        use ftui_harness::buffer_to_text;
+
+        let baseline = app_with_detail_snapshot_fixture();
+        let _ = render_detail_snapshot_buffer(&baseline, 96, 20);
+        let max_scroll = baseline
+            .detail_content_lines
+            .get()
+            .saturating_sub(baseline.detail_visible_height.get());
+        assert!(
+            max_scroll > 0,
+            "fixture should produce a scrollable detail pane"
+        );
+
+        let mut exact = app_with_detail_snapshot_fixture();
+        exact.detail_scroll = max_scroll;
+        let exact_text = buffer_to_text(&render_detail_snapshot_buffer(&exact, 96, 20));
+
+        let mut oversized = app_with_detail_snapshot_fixture();
+        oversized.detail_scroll = max_scroll + 50;
+        let oversized_text = buffer_to_text(&render_detail_snapshot_buffer(&oversized, 96, 20));
+
+        assert_eq!(
+            oversized_text, exact_text,
+            "rendering should clamp stale oversized scroll positions to the last full page"
+        );
     }
 
     #[test]
