@@ -528,6 +528,8 @@ function renderDashboard(data) {
         </div>
     `;
 
+    applyDynamicStatsStyles();
+
     // Set up timeline tab handlers
     setupTimelineControls(timeline);
 }
@@ -660,7 +662,8 @@ function renderTermsCloud(terms) {
 
         return `
             <span class="term-tag" role="listitem"
-                  style="font-size: ${size}em; opacity: ${opacity};"
+                  data-term-size="${size.toFixed(3)}"
+                  data-term-opacity="${opacity.toFixed(3)}"
                   title="${count} occurrences">
                 ${escapeHtml(term)}
             </span>
@@ -685,13 +688,38 @@ function renderRoleBars(roles) {
                 <div class="role-bar-item">
                     <span class="role-name">${escapeHtml(role)}</span>
                     <div class="role-bar-container">
-                        <div class="role-bar role-${toCssSlug(role)}" style="width: ${percent}%"
+                        <div class="role-bar role-${toCssSlug(role)}" data-role-width="${percent}"
                              aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100"></div>
                     </div>
                     <span class="role-count">${formatNumber(count)} (${percent}%)</span>
                 </div>
             `;
         }).join('');
+}
+
+function applyDynamicStatsStyles() {
+    if (!container) {
+        return;
+    }
+
+    container.querySelectorAll('[data-term-size]').forEach(term => {
+        const fontSize = Number.parseFloat(term.dataset.termSize || '');
+        const opacity = Number.parseFloat(term.dataset.termOpacity || '');
+
+        if (Number.isFinite(fontSize)) {
+            term.style.fontSize = `${Math.min(Math.max(fontSize, 0.8), 1.4)}em`;
+        }
+        if (Number.isFinite(opacity)) {
+            term.style.opacity = String(Math.min(Math.max(opacity, 0.6), 1));
+        }
+    });
+
+    container.querySelectorAll('[data-role-width]').forEach(roleBar => {
+        const width = Number.parseFloat(roleBar.dataset.roleWidth || '');
+        if (Number.isFinite(width)) {
+            roleBar.style.width = `${Math.min(Math.max(width, 0), 100)}%`;
+        }
+    });
 }
 
 /**

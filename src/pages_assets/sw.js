@@ -252,7 +252,17 @@ function addSecurityHeaders(response) {
  * Message event: Handle messages from clients
  */
 self.addEventListener('message', (event) => {
-    const { type, ...data } = event.data;
+    const payload = event.data && typeof event.data === 'object' ? event.data : null;
+    if (!payload) {
+        log(LOG.WARN, 'Ignoring malformed message payload');
+        return;
+    }
+
+    const { type, ...data } = payload;
+    if (typeof type !== 'string' || type.length === 0) {
+        log(LOG.WARN, 'Ignoring message without a valid type');
+        return;
+    }
 
     // Helper to respond - use MessageChannel port if available, otherwise event.source
     const respond = (message) => {
