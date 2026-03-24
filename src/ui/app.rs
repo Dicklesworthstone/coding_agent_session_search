@@ -19101,6 +19101,7 @@ impl super::ftui_adapter::Model for CassApp {
                     item.busy = false;
                     apply_source_sync_info_to_item(item, &sync_info);
                 }
+                let has_other_busy_source = self.sources_view.items.iter().any(|item| item.busy);
                 #[cfg(not(test))]
                 {
                     use crate::sources::SyncStatus;
@@ -19120,11 +19121,15 @@ impl super::ftui_adapter::Model for CassApp {
                             "{base_status_message} (warning: failed to load sync status: {error})"
                         ),
                     };
-                    self.sources_view.status = status_message;
+                    if !has_other_busy_source {
+                        self.sources_view.status = status_message;
+                    }
                 }
                 #[cfg(test)]
                 {
-                    self.sources_view.status = base_status_message;
+                    if !has_other_busy_source {
+                        self.sources_view.status = base_status_message;
+                    }
                 }
                 ftui::Cmd::none()
             }
@@ -19231,9 +19236,11 @@ impl super::ftui_adapter::Model for CassApp {
                     item.busy = false;
                     item.doctor_summary = Some((passed, warnings, failed));
                 }
-                self.sources_view.status = format!(
-                    "Doctor '{source_name}': {passed} pass, {warnings} warn, {failed} fail"
-                );
+                if !self.sources_view.items.iter().any(|item| item.busy) {
+                    self.sources_view.status = format!(
+                        "Doctor '{source_name}': {passed} pass, {warnings} warn, {failed} fail"
+                    );
+                }
                 ftui::Cmd::none()
             }
 
@@ -37645,6 +37652,61 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     }
 
     #[test]
+    fn sources_sync_completed_keeps_other_active_status_when_another_row_is_busy() {
+        let mut app = CassApp::default();
+        app.sources_view.status = "Syncing 'desktop'...".into();
+        app.sources_view.items = vec![
+            SourcesViewItem {
+                name: "laptop".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@laptop".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: true,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "desktop".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@desktop".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: true,
+                doctor_summary: None,
+                error: None,
+            },
+        ];
+
+        let report = make_sync_report(
+            "laptop",
+            vec![crate::sources::PathSyncResult {
+                remote_path: "~/sessions".into(),
+                files_transferred: 42,
+                bytes_transferred: 1024,
+                success: true,
+                duration_ms: 15,
+                ..Default::default()
+            }],
+            15,
+        );
+
+        let _ = app.update(CassMsg::SourceSyncCompleted { report });
+
+        assert!(!app.sources_view.items[0].busy);
+        assert!(app.sources_view.items[1].busy);
+        assert_eq!(app.sources_view.status, "Syncing 'desktop'...");
+    }
+
+    #[test]
     fn sources_sync_completed_updates_row_state_on_partial_failure() {
         let mut app = CassApp::default();
         app.sources_view.items = vec![SourcesViewItem {
@@ -37761,6 +37823,54 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         assert!(!app.sources_view.items[0].busy);
         assert_eq!(app.sources_view.items[0].doctor_summary, Some((3, 1, 0)));
         assert!(app.sources_view.status.contains("3 pass"));
+    }
+
+    #[test]
+    fn sources_doctor_completed_keeps_other_active_status_when_another_row_is_busy() {
+        let mut app = CassApp::default();
+        app.sources_view.status = "Syncing 'desktop'...".into();
+        app.sources_view.items = vec![
+            SourcesViewItem {
+                name: "laptop".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@laptop".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: true,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "desktop".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@desktop".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: true,
+                doctor_summary: None,
+                error: None,
+            },
+        ];
+
+        let _ = app.update(CassMsg::SourceDoctorCompleted {
+            source_name: "laptop".into(),
+            passed: 3,
+            warnings: 1,
+            failed: 0,
+        });
+
+        assert!(!app.sources_view.items[0].busy);
+        assert_eq!(app.sources_view.items[0].doctor_summary, Some((3, 1, 0)));
+        assert!(app.sources_view.items[1].busy);
+        assert_eq!(app.sources_view.status, "Syncing 'desktop'...");
     }
 
     #[test]
