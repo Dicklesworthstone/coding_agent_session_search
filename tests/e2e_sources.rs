@@ -11,7 +11,9 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 mod util;
 use util::EnvGuard;
@@ -32,6 +34,10 @@ fn create_sources_config(config_dir: &Path, toml_content: &str) {
 fn read_sources_config(config_dir: &Path) -> String {
     let config_file = config_dir.join("cass").join("sources.toml");
     fs::read_to_string(&config_file).unwrap_or_default()
+}
+
+fn cass_data_dir(data_root: &Path) -> std::path::PathBuf {
+    data_root.join("coding-agent-search")
 }
 
 // =============================================================================
@@ -560,6 +566,83 @@ fn sources_add_reserved_local_name_error() {
     tracker.complete();
 }
 
+/// Test: sources add rejects duplicate names that differ only by case.
+#[test]
+fn sources_add_duplicate_error_case_insensitive() {
+    let tracker = tracker_for("sources_add_duplicate_error_case_insensitive");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let start = tracker.start(
+        "setup",
+        Some("Create config with existing mixed-case source"),
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "Laptop"
+type = "ssh"
+host = "user@laptop.local"
+paths = ["~/.claude/projects"]
+"#,
+    );
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    tracker.end(
+        "setup",
+        Some("Create config with existing mixed-case source"),
+        start,
+    );
+
+    let start = tracker.start(
+        "run_sources_add_duplicate",
+        Some("Add source with duplicate name differing only by case"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "sources",
+            "add",
+            "other@other.local",
+            "--name",
+            "laptop",
+            "--preset",
+            "linux-defaults",
+            "--no-test",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources add command");
+    tracker.end(
+        "run_sources_add_duplicate",
+        Some("Add source with duplicate name differing only by case"),
+        start,
+    );
+
+    let start = tracker.start(
+        "verify_error",
+        Some("Verify case-insensitive duplicate error"),
+    );
+    assert!(
+        !output.status.success(),
+        "command should have failed but succeeded with: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already exists") || stderr.contains("duplicate"),
+        "Expected duplicate error, got: {stderr}"
+    );
+    tracker.end(
+        "verify_error",
+        Some("Verify case-insensitive duplicate error"),
+        start,
+    );
+
+    tracker.complete();
+}
+
 /// Test: sources add with invalid URL format.
 #[test]
 fn sources_add_invalid_url() {
@@ -870,7 +953,7 @@ fn sources_remove_with_purge() {
     fs::create_dir_all(&data_dir).unwrap();
 
     // Create source data directory
-    let source_data = data_dir.join("cass").join("remotes").join("laptop");
+    let source_data = cass_data_dir(&data_dir).join("remotes").join("laptop");
     fs::create_dir_all(&source_data).unwrap();
     fs::write(source_data.join("session.jsonl"), "test data").unwrap();
 
@@ -922,9 +1005,195 @@ paths = ["~/.claude/projects"]
         !config_content.contains("laptop"),
         "Removed source still in config"
     );
+    assert!(
+        !source_data.exists(),
+        "Synced source data should have been purged"
+    );
     tracker.end(
         "verify_removal",
         Some("Verify source removed from config"),
+        start,
+    );
+
+    tracker.complete();
+}
+
+/// Test: sources remove with --purge resolves the stored source name for data cleanup.
+#[test]
+fn sources_remove_with_purge_case_insensitive_uses_stored_name() {
+    let tracker = tracker_for("sources_remove_with_purge_case_insensitive_uses_stored_name");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let start = tracker.start(
+        "setup",
+        Some("Create mixed-case config and matching data directory for purge test"),
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let source_data = cass_data_dir(&data_dir).join("remotes").join("Laptop");
+    fs::create_dir_all(&source_data).unwrap();
+    fs::write(source_data.join("session.jsonl"), "test data").unwrap();
+
+    let sync_status_path = cass_data_dir(&data_dir).join("sync_status.json");
+    fs::create_dir_all(sync_status_path.parent().unwrap()).unwrap();
+    fs::write(
+        &sync_status_path,
+        r#"{
+  "sources": {
+    "Laptop": {
+      "last_sync": 1234567890,
+      "last_result": "success",
+      "files_synced": 1,
+      "bytes_transferred": 9,
+      "duration_ms": 12
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "Laptop"
+type = "ssh"
+host = "user@laptop.local"
+paths = ["~/.claude/projects"]
+"#,
+    );
+
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_data = EnvGuard::set("XDG_DATA_HOME", data_dir.to_string_lossy());
+    tracker.end(
+        "setup",
+        Some("Create mixed-case config and matching data directory for purge test"),
+        start,
+    );
+
+    let start = tracker.start(
+        "run_sources_remove_purge",
+        Some("Remove mixed-case source with lowercase filter and --purge"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "remove", "laptop", "--purge", "-y"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("XDG_DATA_HOME", &data_dir)
+        .output()
+        .expect("sources remove --purge command");
+    tracker.end(
+        "run_sources_remove_purge",
+        Some("Remove mixed-case source with lowercase filter and --purge"),
+        start,
+    );
+
+    let start = tracker.start(
+        "verify_removal",
+        Some("Verify mixed-case source config and mirror data were removed"),
+    );
+    assert!(
+        output.status.success(),
+        "sources remove --purge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_content = read_sources_config(&config_dir);
+    assert!(
+        !config_content.contains("name = \"Laptop\""),
+        "Removed source still in config"
+    );
+    assert!(
+        !source_data.exists(),
+        "Stored-name mirror directory should have been purged"
+    );
+    let sync_status_content = fs::read_to_string(&sync_status_path).expect("read sync status");
+    assert!(
+        !sync_status_content.contains("\"Laptop\""),
+        "Removed source should have been pruned from sync status"
+    );
+    tracker.end(
+        "verify_removal",
+        Some("Verify mixed-case source config and mirror data were removed"),
+        start,
+    );
+
+    tracker.complete();
+}
+
+/// Test: interactive remove prompt shows the canonical stored source name.
+#[test]
+fn sources_remove_prompt_uses_stored_name_case_insensitive() {
+    let tracker = tracker_for("sources_remove_prompt_uses_stored_name_case_insensitive");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let start = tracker.start("setup", Some("Create config with mixed-case source"));
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    create_sources_config(
+        &config_dir,
+        r#"
+[[sources]]
+name = "Laptop"
+type = "ssh"
+host = "user@laptop.local"
+paths = ["~/.claude/projects"]
+"#,
+    );
+
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    tracker.end("setup", Some("Create config with mixed-case source"), start);
+
+    let start = tracker.start(
+        "run_sources_remove_cancelled",
+        Some("Run interactive remove with lowercase filter and cancel it"),
+    );
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.args(["sources", "remove", "laptop"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn sources remove command");
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(b"n\n")
+        .expect("write cancel confirmation");
+    let output = child.wait_with_output().expect("wait for sources remove");
+    tracker.end(
+        "run_sources_remove_cancelled",
+        Some("Run interactive remove with lowercase filter and cancel it"),
+        start,
+    );
+
+    let start = tracker.start(
+        "verify_prompt",
+        Some("Verify prompt used the stored canonical source name"),
+    );
+    assert!(
+        output.status.success(),
+        "cancelled remove should exit successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Remove source 'Laptop' from configuration?"),
+        "Expected canonical stored name in prompt, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Cancelled."),
+        "Expected cancellation output: {stdout}"
+    );
+    tracker.end(
+        "verify_prompt",
+        Some("Verify prompt used the stored canonical source name"),
         start,
     );
 
