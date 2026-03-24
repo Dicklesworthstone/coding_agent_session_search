@@ -465,6 +465,7 @@ fn derive_message_model(extra_json: Option<&str>) -> Option<String> {
 
     [
         value.pointer("/model"),
+        value.pointer("/cass/model"),
         value.pointer("/model_id"),
         value.pointer("/message/model"),
         value.pointer("/message/model_id"),
@@ -484,6 +485,8 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
     [
         value.pointer("/attachment_refs"),
         value.pointer("/attachments"),
+        value.pointer("/cass/attachment_refs"),
+        value.pointer("/cass/attachments"),
         value.pointer("/attachmentRefs"),
         value.pointer("/message/attachment_refs"),
         value.pointer("/message/attachments"),
