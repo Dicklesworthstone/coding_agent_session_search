@@ -4254,6 +4254,8 @@ pub struct SourcesViewItem {
     pub error: Option<String>,
 }
 
+type SourcesRowEphemeralState = (bool, Option<(usize, usize, usize)>);
+
 /// State for the Sources management surface.
 #[derive(Clone, Debug, Default)]
 pub struct SourcesViewState {
@@ -12238,22 +12240,27 @@ impl CassApp {
         }
     }
 
-    /// Load sources configuration + sync status into `SourcesViewState`.
-    #[cfg(not(test))]
-    fn load_sources_view(&mut self) {
-        use crate::sources::{SourcesConfig, SyncStatus};
-
-        let config = SourcesConfig::load().unwrap_or_default();
-        let config_path = SourcesConfig::config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".into());
-
-        let data_dir = self.data_dir.clone();
-        let sync_status = SyncStatus::load(&data_dir).unwrap_or_default();
-
+    fn rebuild_sources_view(
+        &mut self,
+        config: &crate::sources::SourcesConfig,
+        sync_status: &crate::sources::SyncStatus,
+        config_path: String,
+    ) {
+        let previous_selected = self.sources_view.selected;
+        let previous_scroll = self.sources_view.scroll;
+        let previous_row_state: HashMap<String, SourcesRowEphemeralState> = self
+            .sources_view
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), (item.busy, item.doctor_summary)))
+            .collect();
         let mut items = Vec::new();
 
         // Always show the "local" pseudo-source first.
+        let (local_busy, local_doctor_summary) = previous_row_state
+            .get("local")
+            .copied()
+            .unwrap_or((false, None));
         items.push(SourcesViewItem {
             name: "local".into(),
             kind: crate::sources::SourceKind::Local,
@@ -12264,13 +12271,17 @@ impl CassApp {
             last_result: "n/a".into(),
             files_synced: 0,
             bytes_transferred: 0,
-            busy: false,
-            doctor_summary: None,
+            busy: local_busy,
+            doctor_summary: local_doctor_summary,
             error: None,
         });
 
         for src in &config.sources {
             let info = sync_status.sources.get(&src.name);
+            let (busy, doctor_summary) = previous_row_state
+                .get(&src.name)
+                .copied()
+                .unwrap_or((false, None));
             items.push(SourcesViewItem {
                 name: src.name.clone(),
                 kind: src.source_type,
@@ -12284,8 +12295,8 @@ impl CassApp {
                     .into(),
                 files_synced: info.map(|i| i.files_synced).unwrap_or(0),
                 bytes_transferred: info.map(|i| i.bytes_transferred).unwrap_or(0),
-                busy: false,
-                doctor_summary: None,
+                busy,
+                doctor_summary,
                 error: info.and_then(|i| i.last_result.error_message().map(str::to_owned)),
             });
         }
@@ -12293,34 +12304,65 @@ impl CassApp {
         let count = items.len();
         self.sources_view = SourcesViewState {
             items,
-            selected: self.sources_view.selected.min(count.saturating_sub(1)),
-            scroll: 0,
+            selected: previous_selected.min(count.saturating_sub(1)),
+            scroll: previous_scroll.min(count.saturating_sub(1)),
             busy: false,
             config_path,
             status: format!("{count} source(s) configured"),
         };
+        self.ensure_sources_selection_visible();
     }
 
-    fn ensure_sources_selection_visible(&mut self) {
-        let item_count = self.sources_view.items.len();
+    fn adjusted_sources_scroll(
+        selected: usize,
+        scroll: usize,
+        item_count: usize,
+        visible_rows: usize,
+    ) -> usize {
         if item_count == 0 {
-            self.sources_view.scroll = 0;
-            return;
+            return 0;
         }
 
-        let visible_rows = self.last_sources_visible_rows.get();
+        let mut scroll = scroll.min(item_count.saturating_sub(1));
         if visible_rows == 0 {
-            self.sources_view.scroll = self.sources_view.scroll.min(item_count.saturating_sub(1));
-            return;
+            if selected < scroll {
+                scroll = selected;
+            }
+            return scroll;
         }
 
         let max_scroll = item_count.saturating_sub(visible_rows);
-        if self.sources_view.selected < self.sources_view.scroll {
-            self.sources_view.scroll = self.sources_view.selected;
-        } else if self.sources_view.selected >= self.sources_view.scroll + visible_rows {
-            self.sources_view.scroll = self.sources_view.selected + 1 - visible_rows;
+        if selected < scroll {
+            scroll = selected;
+        } else if selected >= scroll + visible_rows {
+            scroll = selected + 1 - visible_rows;
         }
-        self.sources_view.scroll = self.sources_view.scroll.min(max_scroll);
+        scroll.min(max_scroll)
+    }
+
+    /// Load sources configuration + sync status into `SourcesViewState`.
+    #[cfg(not(test))]
+    fn load_sources_view(&mut self) {
+        use crate::sources::{SourcesConfig, SyncStatus};
+
+        let config = SourcesConfig::load().unwrap_or_default();
+        let config_path = SourcesConfig::config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+
+        let data_dir = self.data_dir.clone();
+        let sync_status = SyncStatus::load(&data_dir).unwrap_or_default();
+
+        self.rebuild_sources_view(&config, &sync_status, config_path);
+    }
+
+    fn ensure_sources_selection_visible(&mut self) {
+        self.sources_view.scroll = Self::adjusted_sources_scroll(
+            self.sources_view.selected,
+            self.sources_view.scroll,
+            self.sources_view.items.len(),
+            self.last_sources_visible_rows.get(),
+        );
     }
 
     /// Number of selectable items in the current analytics subview.
@@ -20468,8 +20510,6 @@ impl super::ftui_adapter::Model for CassApp {
                 content_block.render(vertical[1], frame);
                 self.last_sources_visible_rows
                     .set(content_inner.height as usize);
-                self.ensure_sources_selection_visible();
-
                 if render_content && !content_inner.is_empty() {
                     let sv = &self.sources_view;
                     if sv.items.is_empty() {
@@ -20481,7 +20521,12 @@ impl super::ftui_adapter::Model for CassApp {
                     } else {
                         // Render each source row.
                         let visible_rows = content_inner.height as usize;
-                        let start = sv.scroll;
+                        let start = Self::adjusted_sources_scroll(
+                            sv.selected,
+                            sv.scroll,
+                            sv.items.len(),
+                            visible_rows,
+                        );
                         let end = (start + visible_rows).min(sv.items.len());
 
                         for (vis_idx, src_idx) in (start..end).enumerate() {
@@ -37204,6 +37249,198 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     }
 
     #[test]
+    fn sources_selection_unknown_visible_rows_clamps_scroll_back_to_selection() {
+        let mut app = CassApp::default();
+        app.sources_view.items = (0..5)
+            .map(|idx| SourcesViewItem {
+                name: format!("host-{idx}"),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some(format!("user@host-{idx}")),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            })
+            .collect();
+        app.last_sources_visible_rows.set(0);
+        app.sources_view.selected = 1;
+        app.sources_view.scroll = 99;
+
+        app.ensure_sources_selection_visible();
+        assert_eq!(app.sources_view.scroll, 1);
+    }
+
+    #[test]
+    fn rebuild_sources_view_preserves_busy_doctor_and_visible_selection() {
+        let mut app = CassApp::default();
+        app.last_sources_visible_rows.set(2);
+        app.sources_view.items = vec![
+            SourcesViewItem {
+                name: "local".into(),
+                kind: crate::sources::SourceKind::Local,
+                host: None,
+                schedule: "always".into(),
+                path_count: 0,
+                last_sync: None,
+                last_result: "n/a".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "alpha".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@alpha".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "beta".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@beta".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: true,
+                doctor_summary: Some((3, 1, 0)),
+                error: None,
+            },
+            SourcesViewItem {
+                name: "gamma".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@gamma".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "delta".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@delta".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+        ];
+        app.sources_view.selected = 4;
+        app.sources_view.scroll = 0;
+
+        let config = crate::sources::SourcesConfig {
+            sources: vec![
+                crate::sources::SourceDefinition::ssh("alpha", "user@alpha"),
+                crate::sources::SourceDefinition::ssh("beta", "user@beta"),
+                crate::sources::SourceDefinition::ssh("gamma", "user@gamma"),
+                crate::sources::SourceDefinition::ssh("delta", "user@delta"),
+            ],
+        };
+        let sync_status = crate::sources::SyncStatus::default();
+
+        app.rebuild_sources_view(&config, &sync_status, "/tmp/sources.toml".into());
+
+        assert_eq!(app.sources_view.selected, 4);
+        assert_eq!(app.sources_view.scroll, 3);
+        let beta = app
+            .sources_view
+            .items
+            .iter()
+            .find(|item| item.name == "beta")
+            .expect("beta row should still exist");
+        assert!(beta.busy);
+        assert_eq!(beta.doctor_summary, Some((3, 1, 0)));
+    }
+
+    #[test]
+    fn rebuild_sources_view_clamps_selection_when_source_count_shrinks() {
+        let mut app = CassApp::default();
+        app.last_sources_visible_rows.set(3);
+        app.sources_view.items = vec![
+            SourcesViewItem {
+                name: "local".into(),
+                kind: crate::sources::SourceKind::Local,
+                host: None,
+                schedule: "always".into(),
+                path_count: 0,
+                last_sync: None,
+                last_result: "n/a".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "alpha".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@alpha".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+            SourcesViewItem {
+                name: "beta".into(),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some("user@beta".into()),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            },
+        ];
+        app.sources_view.selected = 2;
+        app.sources_view.scroll = 2;
+
+        let config = crate::sources::SourcesConfig::default();
+        let sync_status = crate::sources::SyncStatus::default();
+
+        app.rebuild_sources_view(&config, &sync_status, "/tmp/sources.toml".into());
+
+        assert_eq!(app.sources_view.items.len(), 1);
+        assert_eq!(app.sources_view.selected, 0);
+        assert_eq!(app.sources_view.scroll, 0);
+        assert_eq!(app.sources_view.items[0].name, "local");
+    }
+
+    #[test]
     fn sources_sync_requested_marks_busy() {
         let mut app = CassApp::default();
         app.sources_view.items = vec![SourcesViewItem {
@@ -37410,6 +37647,46 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let mut frame = ftui::Frame::new(80, 24, &mut pool);
         app.view(&mut frame);
         // No panic = pass.
+    }
+
+    #[test]
+    fn sources_view_render_keeps_selected_row_visible_after_resize() {
+        let mut app = CassApp::default();
+        app.surface = AppSurface::Sources;
+        app.sources_view.items = (0..5)
+            .map(|idx| SourcesViewItem {
+                name: format!("host-{idx}"),
+                kind: crate::sources::SourceKind::Ssh,
+                host: Some(format!("user@host-{idx}")),
+                schedule: "manual".into(),
+                path_count: 1,
+                last_sync: None,
+                last_result: "never".into(),
+                files_synced: 0,
+                bytes_transferred: 0,
+                busy: false,
+                doctor_summary: None,
+                error: None,
+            })
+            .collect();
+        app.sources_view.selected = 4;
+        app.sources_view.scroll = 0;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(80, 8, &mut pool);
+        app.view(&mut frame);
+
+        assert_eq!(app.last_sources_visible_rows.get(), 2);
+        assert_eq!(app.sources_view.scroll, 0);
+        assert_eq!(
+            CassApp::adjusted_sources_scroll(
+                app.sources_view.selected,
+                app.sources_view.scroll,
+                app.sources_view.items.len(),
+                app.last_sources_visible_rows.get(),
+            ),
+            3
+        );
     }
 
     #[test]
