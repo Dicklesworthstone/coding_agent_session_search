@@ -14,7 +14,7 @@
 //! The wizard supports resume capability via state persistence, allowing
 //! interrupted setups to continue where they left off.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,47 @@ impl Default for SetupOptions {
             json: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedHostNameConflict {
+    kept_host_name: String,
+    skipped_host_name: String,
+    kept_source_name: String,
+}
+
+fn generated_source_name_for_host(host_name: &str) -> String {
+    super::config::normalize_generated_remote_source_name(host_name)
+}
+
+fn generated_source_name_key_for_host(host_name: &str) -> String {
+    super::config::source_name_key(&generated_source_name_for_host(host_name))
+}
+
+fn dedupe_selected_hosts_by_generated_name(
+    selected_hosts: Vec<&HostProbeResult>,
+) -> (Vec<&HostProbeResult>, Vec<SelectedHostNameConflict>) {
+    let mut selected = Vec::new();
+    let mut conflicts = Vec::new();
+    let mut seen_name_keys: HashMap<String, (String, String)> = HashMap::new();
+
+    for host in selected_hosts {
+        let generated_name = generated_source_name_for_host(&host.host_name);
+        let generated_name_key = super::config::source_name_key(&generated_name);
+        if let Some((kept_host_name, kept_source_name)) = seen_name_keys.get(&generated_name_key) {
+            conflicts.push(SelectedHostNameConflict {
+                kept_host_name: kept_host_name.clone(),
+                skipped_host_name: host.host_name.clone(),
+                kept_source_name: kept_source_name.clone(),
+            });
+            continue;
+        }
+
+        seen_name_keys.insert(generated_name_key, (host.host_name.clone(), generated_name));
+        selected.push(host);
+    }
+
+    (selected, conflicts)
 }
 
 /// Persistent state for resumable setup.
@@ -460,7 +501,8 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
     // =========================================================================
     // Phase 3: Selection
     // =========================================================================
-    let selected_hosts: Vec<&HostProbeResult> = if !state.selection_complete {
+    let selection_performed = !state.selection_complete;
+    let mut selected_hosts: Vec<&HostProbeResult> = if !state.selection_complete {
         check_interrupted()?;
 
         if !opts.json {
@@ -468,22 +510,18 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         }
 
         let existing_config = SourcesConfig::load().unwrap_or_default();
-        let existing_names: HashSet<_> = existing_config.configured_names();
+        let existing_name_keys: HashSet<_> = existing_config.configured_name_keys();
 
-        let selected = if opts.non_interactive {
+        if opts.non_interactive {
             // Auto-select all reachable hosts not already configured
+            let mut selected_name_keys = existing_name_keys.clone();
             let auto_selected: Vec<_> = reachable_hosts
                 .iter()
-                .filter(|h| !existing_names.contains(&h.host_name))
+                .filter(|h| {
+                    selected_name_keys.insert(generated_source_name_key_for_host(&h.host_name))
+                })
                 .copied()
                 .collect();
-
-            if !opts.json {
-                print_phase_done(&format!(
-                    "Auto-selected {} hosts (non-interactive)",
-                    auto_selected.len()
-                ));
-            }
 
             auto_selected
         } else {
@@ -492,7 +530,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             let probes_for_selection: Vec<HostProbeResult> =
                 reachable_hosts.iter().map(|p| (*p).clone()).collect();
 
-            match run_host_selection(&probes_for_selection, &existing_names) {
+            match run_host_selection(&probes_for_selection, &existing_name_keys) {
                 Ok((result, display_infos)) => {
                     // Convert selected indices to host names
                     let selected: Vec<_> = result
@@ -507,8 +545,6 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                             })
                         })
                         .collect();
-
-                    print_phase_done(&format!("Selected {} hosts", selected.len()));
                     selected
                 }
                 Err(e) => {
@@ -516,13 +552,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                     return Err(SetupError::Interactive(e));
                 }
             }
-        };
-
-        state.selected_host_names = selected.iter().map(|h| h.host_name.clone()).collect();
-        state.selection_complete = true;
-        state.save()?;
-
-        selected
+        }
     } else {
         // Reconstruct from saved state
         state
@@ -531,6 +561,47 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             .filter_map(|name| probed_hosts.iter().find(|h| h.host_name == *name))
             .collect()
     };
+
+    let (deduped_selected_hosts, selection_conflicts) =
+        dedupe_selected_hosts_by_generated_name(selected_hosts);
+    selected_hosts = deduped_selected_hosts;
+
+    if selection_performed && !opts.json {
+        let selection_message = if opts.non_interactive {
+            format!(
+                "Auto-selected {} hosts (non-interactive)",
+                selected_hosts.len()
+            )
+        } else {
+            format!("Selected {} hosts", selected_hosts.len())
+        };
+        print_phase_done(&selection_message);
+    }
+
+    if !selection_conflicts.is_empty() && !opts.json {
+        println!(
+            "│ {} skipped {} host(s) because their generated source names conflict:",
+            "Warning:".yellow().bold(),
+            selection_conflicts.len()
+        );
+        for conflict in &selection_conflicts {
+            println!(
+                "│   - {} skipped; conflicts with {} as source '{}'",
+                conflict.skipped_host_name, conflict.kept_host_name, conflict.kept_source_name
+            );
+        }
+        println!(
+            "│   Edit host aliases or use 'cass sources add --name ...' later if you need distinct source IDs."
+        );
+    }
+
+    let selected_host_names: Vec<String> =
+        selected_hosts.iter().map(|h| h.host_name.clone()).collect();
+    if !state.selection_complete || state.selected_host_names != selected_host_names {
+        state.selected_host_names = selected_host_names;
+        state.selection_complete = true;
+        state.save()?;
+    }
 
     if selected_hosts.is_empty() {
         if !opts.json {
@@ -813,7 +884,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             .map(|h| (h.host_name.as_str(), *h))
             .collect();
 
-        let preview = generator.generate_preview(&probes, &config.configured_names());
+        let preview = generator.generate_preview(&probes, &config.configured_name_keys());
 
         if opts.dry_run {
             if !opts.json {
@@ -1105,6 +1176,51 @@ mod tests {
         };
         assert!(result.dry_run);
         assert_eq!(result.sources_added, 5);
+    }
+
+    fn make_selected_probe(host_name: &str) -> HostProbeResult {
+        HostProbeResult {
+            host_name: host_name.to_string(),
+            reachable: true,
+            connection_time_ms: 0,
+            cass_status: CassStatus::NotFound,
+            detected_agents: Vec::new(),
+            system_info: None,
+            resources: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_dedupe_selected_hosts_by_generated_name_case_insensitive() {
+        let laptop_upper = make_selected_probe("Laptop");
+        let laptop_lower = make_selected_probe("laptop");
+
+        let (selected, conflicts) =
+            dedupe_selected_hosts_by_generated_name(vec![&laptop_upper, &laptop_lower]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].host_name, "Laptop");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kept_host_name, "Laptop");
+        assert_eq!(conflicts[0].skipped_host_name, "laptop");
+        assert_eq!(conflicts[0].kept_source_name, "Laptop");
+    }
+
+    #[test]
+    fn test_dedupe_selected_hosts_by_generated_name_reserved_local_alias() {
+        let local_lower = make_selected_probe("local");
+        let local_upper = make_selected_probe("LOCAL");
+
+        let (selected, conflicts) =
+            dedupe_selected_hosts_by_generated_name(vec![&local_lower, &local_upper]);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].host_name, "local");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].kept_host_name, "local");
+        assert_eq!(conflicts[0].skipped_host_name, "LOCAL");
+        assert_eq!(conflicts[0].kept_source_name, "local-ssh");
     }
 
     #[test]

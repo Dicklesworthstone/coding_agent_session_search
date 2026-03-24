@@ -406,13 +406,15 @@ pub fn confirm_with_details(
 ///
 /// # Arguments
 /// * `probe` - The probe result from SSH probing
-/// * `already_configured` - Set of host names already in sources.toml
+/// * `already_configured` - Set of normalized source-name keys already configured
 pub fn probe_to_display_info(
     probe: &HostProbeResult,
     already_configured: &HashSet<String>,
 ) -> HostDisplayInfo {
+    let generated_name = super::config::normalize_generated_remote_source_name(&probe.host_name);
+
     // Determine host state
-    let state = if already_configured.contains(&probe.host_name) {
+    let state = if already_configured.contains(&super::config::source_name_key(&generated_name)) {
         HostState::AlreadyConfigured
     } else if !probe.reachable {
         HostState::Unreachable
@@ -505,7 +507,7 @@ pub fn probe_to_display_info(
 ///
 /// # Arguments
 /// * `probed_hosts` - Results from probing SSH hosts
-/// * `already_configured` - Set of host names already in sources.toml
+/// * `already_configured` - Set of normalized source-name keys already configured
 ///
 /// # Returns
 /// The selected hosts and their categorization, or an error if cancelled.
@@ -851,6 +853,54 @@ mod tests {
 
         let mut already_configured = HashSet::new();
         already_configured.insert("configured-host".into());
+        let display = probe_to_display_info(&probe, &already_configured);
+
+        assert_eq!(display.state, HostState::AlreadyConfigured);
+    }
+
+    #[test]
+    fn test_probe_to_display_info_already_configured_case_insensitive() {
+        let probe = HostProbeResult {
+            host_name: "Configured-Host".into(),
+            reachable: true,
+            connection_time_ms: 50,
+            cass_status: CassStatus::Indexed {
+                version: "0.1.50".into(),
+                session_count: 100,
+                last_indexed: None,
+            },
+            detected_agents: vec![],
+            system_info: None,
+            resources: None,
+            error: None,
+        };
+
+        let mut already_configured = HashSet::new();
+        already_configured.insert(super::super::config::source_name_key("configured-host"));
+        let display = probe_to_display_info(&probe, &already_configured);
+
+        assert_eq!(display.state, HostState::AlreadyConfigured);
+    }
+
+    #[test]
+    fn test_probe_to_display_info_reserved_local_ssh_alias_already_configured() {
+        let probe = HostProbeResult {
+            host_name: "local".into(),
+            reachable: true,
+            connection_time_ms: 50,
+            cass_status: CassStatus::Indexed {
+                version: "0.1.50".into(),
+                session_count: 100,
+                last_indexed: None,
+            },
+            detected_agents: vec![],
+            system_info: None,
+            resources: None,
+            error: None,
+        };
+
+        let mut already_configured = HashSet::new();
+        already_configured.insert(super::super::config::source_name_key("local-ssh"));
         let display = probe_to_display_info(&probe, &already_configured);
 
         assert_eq!(display.state, HostState::AlreadyConfigured);

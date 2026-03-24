@@ -636,6 +636,8 @@ pub enum MergeResult {
 pub enum SkipReason {
     /// Already configured in sources.toml.
     AlreadyConfigured,
+    /// Another selected host generates the same source name.
+    GeneratedNameConflict(String),
     /// Probe failed (unreachable, timeout, etc.).
     ProbeFailure(String),
     /// User deselected this host.
@@ -700,6 +702,15 @@ impl ConfigPreview {
             for (name, reason) in &self.sources_skipped {
                 let reason_str = match reason {
                     SkipReason::AlreadyConfigured => "already configured",
+                    SkipReason::GeneratedNameConflict(source_name) => {
+                        println!(
+                            "    {} - {}",
+                            name.dimmed(),
+                            format!("conflicts with generated source name '{source_name}'")
+                                .dimmed()
+                        );
+                        continue;
+                    }
                     SkipReason::ProbeFailure(e) => e.as_str(),
                     SkipReason::UserDeselected => "not selected",
                 };
@@ -860,6 +871,7 @@ impl SourceConfigGenerator {
             .iter()
             .map(|name| source_name_key(name))
             .collect();
+        let mut preview_name_keys = configured_name_keys.clone();
 
         for (host_name, probe) in probes {
             // Skip if probe failed
@@ -877,10 +889,18 @@ impl SourceConfigGenerator {
             // Generate source definition before duplicate checks so we compare
             // using the same canonical naming rules as the saved config.
             let source = self.generate_source(host_name, probe);
-            if configured_name_keys.contains(&source_name_key(&source.name)) {
+            let source_name_key = source_name_key(&source.name);
+            if configured_name_keys.contains(&source_name_key) {
                 preview
                     .sources_skipped
                     .push((source.name.clone(), SkipReason::AlreadyConfigured));
+                continue;
+            }
+            if !preview_name_keys.insert(source_name_key) {
+                preview.sources_skipped.push((
+                    host_name.to_string(),
+                    SkipReason::GeneratedNameConflict(source.name.clone()),
+                ));
                 continue;
             }
             preview.sources_to_add.push(source);
@@ -1756,6 +1776,28 @@ mod tests {
         assert!(matches!(
             preview.sources_skipped[0].1,
             SkipReason::AlreadyConfigured
+        ));
+    }
+
+    #[test]
+    fn test_generate_preview_skips_conflicting_generated_names_case_insensitive() {
+        let generator = SourceConfigGenerator::new();
+        let probe = make_test_probe(
+            true,
+            vec![make_test_agent("claude", "~/.claude/projects")],
+            Some(make_test_sys_info("linux", "/home/user")),
+        );
+
+        let probes: Vec<(&str, &HostProbeResult)> = vec![("Laptop", &probe), ("laptop", &probe)];
+        let preview = generator.generate_preview(&probes, &HashSet::new());
+
+        assert_eq!(preview.sources_to_add.len(), 1);
+        assert_eq!(preview.sources_to_add[0].name, "Laptop");
+        assert_eq!(preview.sources_skipped.len(), 1);
+        assert_eq!(preview.sources_skipped[0].0, "laptop");
+        assert!(matches!(
+            &preview.sources_skipped[0].1,
+            SkipReason::GeneratedNameConflict(name) if name == "laptop"
         ));
     }
 
