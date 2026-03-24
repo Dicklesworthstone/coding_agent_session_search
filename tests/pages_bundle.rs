@@ -817,6 +817,22 @@ mod tests {
     }
 
     #[test]
+    fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
+        let sw_js = include_str!("../src/pages_assets/sw.js");
+        assert!(
+            sw_js.contains("if (response.ok) {\n            try {")
+                && sw_js.contains("log(LOG.WARN, 'Cache open error:', cacheError);")
+                && sw_js.contains("return addSecurityHeaders(response);"),
+            "service worker fetch handling should treat cache-write failures as best-effort and still return a successful network response"
+        );
+        assert!(
+            sw_js.contains("if (request.mode === 'navigate') {\n            try {")
+                && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
+            "navigation fallback should not crash if the Cache API itself fails during offline fallback"
+        );
+    }
+
+    #[test]
     fn test_sw_register_handles_unsupported_or_missing_registrations_safely() {
         let sw_register_js = include_str!("../src/pages_assets/sw-register.js");
         assert!(

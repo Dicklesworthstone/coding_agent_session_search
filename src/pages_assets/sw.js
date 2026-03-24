@@ -165,11 +165,15 @@ async function handleFetch(request) {
 
         // Only cache successful responses
         if (response.ok) {
-            const cache = await caches.open(cacheName);
-            // Clone response for caching
-            cache.put(request, response.clone()).catch(e => {
-                log(LOG.WARN, 'Cache put error:', e);
-            });
+            try {
+                const cache = await caches.open(cacheName);
+                // Clone response for caching
+                cache.put(request, response.clone()).catch(e => {
+                    log(LOG.WARN, 'Cache put error:', e);
+                });
+            } catch (cacheError) {
+                log(LOG.WARN, 'Cache open error:', cacheError);
+            }
         }
 
         return addSecurityHeaders(response);
@@ -189,10 +193,14 @@ async function handleFetch(request) {
 
         // Try cache as fallback for navigation requests
         if (request.mode === 'navigate') {
-            const cachedIndex = await caches.match('./index.html');
-            if (cachedIndex) {
-                log(LOG.INFO, 'Serving cached index.html for offline navigation');
-                return addSecurityHeaders(cachedIndex.clone());
+            try {
+                const cachedIndex = await caches.match('./index.html');
+                if (cachedIndex) {
+                    log(LOG.INFO, 'Serving cached index.html for offline navigation');
+                    return addSecurityHeaders(cachedIndex.clone());
+                }
+            } catch (cacheError) {
+                log(LOG.WARN, 'Navigation cache fallback error:', cacheError);
             }
         }
 
