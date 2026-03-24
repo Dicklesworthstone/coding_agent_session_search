@@ -355,12 +355,16 @@ export function buildSearchPath(query = '', filters = {}) {
         params.set('agent', filters.agent);
     }
 
-    if (filters.since) {
-        params.set('since', filters.since);
-    }
+    if (filters.timePreset && filters.timePreset !== 'custom') {
+        params.set('time', filters.timePreset);
+    } else {
+        if (filters.since) {
+            params.set('since', filters.since);
+        }
 
-    if (filters.until) {
-        params.set('until', filters.until);
+        if (filters.until) {
+            params.set('until', filters.until);
+        }
     }
 
     const queryString = params.toString();
@@ -376,6 +380,7 @@ export function parseSearchParams(route) {
     return {
         query: route.query.q || '',
         agent: route.query.agent || null,
+        timePreset: route.query.time || null,
         since: route.query.since || null,
         until: route.query.until || null,
     };

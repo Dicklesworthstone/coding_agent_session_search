@@ -642,6 +642,54 @@ mod tests {
     }
 
     #[test]
+    fn test_search_paths_round_trip_symbolic_time_filters() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import { buildSearchPath, parseSearchParams } from './src/pages_assets/router.js';
+
+                const path = buildSearchPath('auth bug', {
+                    agent: 'claude',
+                    timePreset: 'week',
+                    since: 1,
+                    until: 2,
+                });
+                const url = new URL(`https://example.com#${path}`);
+                const params = new URLSearchParams(url.hash.split('?')[1] || '');
+
+                if (params.get('q') !== 'auth bug') {
+                    throw new Error(`expected q to round-trip, got ${params.get('q')}`);
+                }
+                if (params.get('agent') !== 'claude') {
+                    throw new Error(`expected agent to round-trip, got ${params.get('agent')}`);
+                }
+                if (params.get('time') !== 'week') {
+                    throw new Error(`expected symbolic time filter in URL, got ${params.toString()}`);
+                }
+                if (params.has('since') || params.has('until')) {
+                    throw new Error(`did not expect explicit timestamps when timePreset is present, got ${params.toString()}`);
+                }
+
+                const parsed = parseSearchParams({
+                    query: {
+                        q: 'auth bug',
+                        agent: 'claude',
+                        time: 'week',
+                    },
+                });
+
+                if (parsed.query !== 'auth bug' || parsed.agent !== 'claude' || parsed.timePreset !== 'week') {
+                    throw new Error(`expected parseSearchParams to restore symbolic filters, got ${JSON.stringify(parsed)}`);
+                }
+                if (parsed.since !== null || parsed.until !== null) {
+                    throw new Error(`did not expect parseSearchParams to synthesize timestamps, got ${JSON.stringify(parsed)}`);
+                }
+            "#,
+        )?;
+
+        Ok(())
+    }
+
+    #[test]
     fn test_search_cleanup_paths_reset_virtual_results_presentation() {
         let search_js = include_str!("../src/pages_assets/search.js");
         assert!(
@@ -655,6 +703,27 @@ mod tests {
                 && search_js.contains("destroyVirtualResultsView();\n    hideNoResults();")
                 && search_js.contains("destroyVirtualResultsView();\n    hideLoading();"),
             "search no-results, error, and clear/reset paths should all tear down virtual-results presentation"
+        );
+    }
+
+    #[test]
+    fn test_search_route_state_restores_filters_and_back_navigation() {
+        let viewer_js = include_str!("../src/pages_assets/viewer.js");
+        assert!(
+            viewer_js.contains("const searchParams = parseSearchParams(route);")
+                && viewer_js.contains("setSearchRoute(searchParams).catch")
+                && viewer_js.contains(
+                    "router.navigate(buildSearchPath(searchState.query, searchState.filters));"
+                ),
+            "viewer should restore routed search filters into the live search UI and preserve the current query/filter state when navigating back from a conversation"
+        );
+
+        let search_js = include_str!("../src/pages_assets/search.js");
+        assert!(
+            search_js.contains("export async function setSearchRoute(routeSearch = {}, options = {}) {")
+                && search_js.contains("currentFilters = normalizeRouteFilters(routeSearch);")
+                && search_js.contains("timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,"),
+            "search should expose a route-state application path that restores routed filters instead of keeping stale in-memory filters alive"
         );
     }
 
@@ -1048,6 +1117,13 @@ mod tests {
             "settings initialization should be async so the initial render can be awaited"
         );
         assert!(
+            settings_js.contains("async function rerenderSettingsUI(reason) {")
+                && settings_js.contains(
+                    "console.error(`[Settings] Failed to rerender settings after ${reason}:`, err);"
+                ),
+            "settings should have a shared safe rerender helper for rollback paths"
+        );
+        assert!(
             settings_js.contains("await render();"),
             "settings initialization and async handlers should await the async render path"
         );
@@ -1074,6 +1150,14 @@ mod tests {
         assert!(
             settings_js.contains("showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');\n                await render();"),
             "the partial OPFS-clear path should also await the rerender before returning"
+        );
+        assert!(
+            settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
+                && settings_js.contains("await rerenderSettingsUI('storage mode change failure');")
+                && settings_js.contains("await rerenderSettingsUI('OPFS enable cancellation');")
+                && settings_js.contains("await rerenderSettingsUI('OPFS enable failure');")
+                && settings_js.contains("await rerenderSettingsUI('OPFS disable failure');"),
+            "settings rollback paths should rerender the canonical UI after canceled or failed optimistic control changes"
         );
 
         let viewer_js = include_str!("../src/pages_assets/viewer.js");

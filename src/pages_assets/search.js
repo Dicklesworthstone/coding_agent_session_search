@@ -22,19 +22,25 @@ const SEARCH_CONFIG = {
     PAGE_SIZE: 50,
     SNIPPET_LENGTH: 64,
     MAX_RESULTS: 1000,
+    TIME_FILTER_CUSTOM_VALUE: 'custom',
     // Virtual list configuration
     RESULT_CARD_HEIGHT: 88, // Fixed height per result card
     VIRTUAL_LIST_OVERSCAN: 5, // Extra items to render above/below viewport
     VIRTUAL_LIST_THRESHOLD: 20, // Use virtual list above this count
 };
 
+function createEmptySearchFilters() {
+    return {
+        agent: null,
+        since: null,
+        until: null,
+        timePreset: null,
+    };
+}
+
 // Module state
 let currentQuery = '';
-let currentFilters = {
-    agent: null,
-    since: null,
-    until: null,
-};
+let currentFilters = createEmptySearchFilters();
 let currentSearchMode = 'auto'; // 'auto', 'prose', or 'code'
 let currentResults = [];
 let currentPage = 0;
@@ -116,6 +122,124 @@ function focusResultCardAtIndex(index, align = 'start') {
 
     card.focus();
     return true;
+}
+
+function parseTimestampFilterValue(value) {
+    if (value === undefined || value === null || value === '') {
+        return null;
+    }
+
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(Math.trunc(numeric))) {
+        return null;
+    }
+
+    return Math.trunc(numeric);
+}
+
+function calculateTimeFilterRange(value) {
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+
+    switch (value) {
+        case 'today':
+            return { since: now - day, until: now, timePreset: value };
+        case 'week':
+            return { since: now - (7 * day), until: now, timePreset: value };
+        case 'month':
+            return { since: now - (30 * day), until: now, timePreset: value };
+        case 'year':
+            return { since: now - (365 * day), until: now, timePreset: value };
+        default:
+            return createEmptySearchFilters();
+    }
+}
+
+function normalizeRouteFilters(routeSearch = {}) {
+    const agent = routeSearch.agent === undefined || routeSearch.agent === null || routeSearch.agent === ''
+        ? null
+        : String(routeSearch.agent);
+    const timePreset = typeof routeSearch.timePreset === 'string' && routeSearch.timePreset !== ''
+        ? routeSearch.timePreset
+        : typeof routeSearch.time === 'string' && routeSearch.time !== ''
+            ? routeSearch.time
+            : null;
+
+    if (timePreset === 'today' || timePreset === 'week' || timePreset === 'month' || timePreset === 'year') {
+        return {
+            agent,
+            ...calculateTimeFilterRange(timePreset),
+        };
+    }
+
+    const since = parseTimestampFilterValue(routeSearch.since);
+    const until = parseTimestampFilterValue(routeSearch.until);
+    if (since !== null && until !== null && since > until) {
+        return {
+            ...createEmptySearchFilters(),
+            agent,
+        };
+    }
+
+    return {
+        agent,
+        since,
+        until,
+        timePreset: since !== null || until !== null ? SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE : null,
+    };
+}
+
+function syncAgentFilterControl() {
+    if (!elements.agentFilter) {
+        return;
+    }
+
+    const agent = currentFilters.agent;
+    if (!agent) {
+        elements.agentFilter.value = '';
+        return;
+    }
+
+    const optionExists = Array.from(elements.agentFilter.options).some((option) => option.value === agent);
+    if (!optionExists) {
+        const option = document.createElement('option');
+        option.value = agent;
+        option.textContent = formatAgentName(agent);
+        elements.agentFilter.appendChild(option);
+    }
+
+    elements.agentFilter.value = agent;
+}
+
+function syncTimeFilterControl() {
+    if (!elements.timeFilter) {
+        return;
+    }
+
+    const customValue = SEARCH_CONFIG.TIME_FILTER_CUSTOM_VALUE;
+    let customOption = Array.from(elements.timeFilter.options).find((option) => option.value === customValue);
+
+    if (currentFilters.timePreset === customValue) {
+        if (!customOption) {
+            customOption = document.createElement('option');
+            customOption.value = customValue;
+            customOption.textContent = 'Custom range';
+            elements.timeFilter.appendChild(customOption);
+        }
+        elements.timeFilter.value = customValue;
+        return;
+    }
+
+    if (customOption) {
+        customOption.remove();
+    }
+
+    elements.timeFilter.value = currentFilters.timePreset || '';
+}
+
+function syncFilterControls() {
+    syncAgentFilterControl();
+    syncTimeFilterControl();
 }
 
 export function buildResultCardId(result, index = 0) {
@@ -386,6 +510,9 @@ async function populateFilters() {
         // Populate agent filter
         if (stats.agents && stats.agents.length > 0) {
             stats.agents.forEach(agent => {
+                if (Array.from(elements.agentFilter.options).some((option) => option.value === agent)) {
+                    return;
+                }
                 const option = document.createElement('option');
                 option.value = agent;
                 option.textContent = formatAgentName(agent);
@@ -449,30 +576,11 @@ function updateSearchModeIndicator(query) {
  * Update time filter values
  */
 function updateTimeFilter(value) {
-    const now = Date.now();
-    const day = 24 * 60 * 60 * 1000;
-
-    switch (value) {
-        case 'today':
-            currentFilters.since = now - day;
-            currentFilters.until = now;
-            break;
-        case 'week':
-            currentFilters.since = now - (7 * day);
-            currentFilters.until = now;
-            break;
-        case 'month':
-            currentFilters.since = now - (30 * day);
-            currentFilters.until = now;
-            break;
-        case 'year':
-            currentFilters.since = now - (365 * day);
-            currentFilters.until = now;
-            break;
-        default:
-            currentFilters.since = null;
-            currentFilters.until = null;
-    }
+    const nextFilters = calculateTimeFilterRange(value);
+    currentFilters.since = nextFilters.since;
+    currentFilters.until = nextFilters.until;
+    currentFilters.timePreset = nextFilters.timePreset;
+    syncTimeFilterControl();
 }
 
 /**
@@ -936,7 +1044,15 @@ function escapeHtml(text) {
  * Optionally triggers a search (default true).
  */
 export async function setSearchQuery(query, options = {}) {
-    const { runSearch = true } = options;
+    const { runSearch = true, filters } = options;
+    if (filters !== undefined) {
+        await setSearchRoute({
+            query,
+            ...filters,
+        }, { runSearch });
+        return;
+    }
+
     if (!elements.searchInput) {
         return;
     }
@@ -953,6 +1069,27 @@ export async function setSearchQuery(query, options = {}) {
     }
 }
 
+export async function setSearchRoute(routeSearch = {}, options = {}) {
+    const { runSearch = true } = options;
+    if (!elements.searchInput) {
+        return;
+    }
+
+    clearTimeout(searchTimeout);
+    currentFilters = normalizeRouteFilters(routeSearch);
+    syncFilterControls();
+
+    const normalizedQuery = (routeSearch.query ?? routeSearch.q ?? '').toString();
+    elements.searchInput.value = normalizedQuery;
+
+    if (runSearch) {
+        await handleSearch(normalizedQuery);
+    } else {
+        currentQuery = normalizedQuery.trim();
+        updateSearchModeIndicator(currentQuery);
+    }
+}
+
 /**
  * Clear search and reset to initial state
  */
@@ -962,7 +1099,7 @@ export function clearSearch(options = {}) {
     clearTimeout(searchTimeout);
     searchEpoch += 1;
     currentQuery = '';
-    currentFilters = { agent: null, since: null, until: null };
+    currentFilters = createEmptySearchFilters();
     currentSearchMode = 'auto';
     currentResults = [];
     currentPage = 0;
@@ -974,12 +1111,7 @@ export function clearSearch(options = {}) {
     if (elements.searchInput) {
         elements.searchInput.value = '';
     }
-    if (elements.agentFilter) {
-        elements.agentFilter.value = '';
-    }
-    if (elements.timeFilter) {
-        elements.timeFilter.value = '';
-    }
+    syncFilterControls();
     if (elements.searchModeIndicator) {
         elements.searchModeIndicator.classList.add('hidden');
     }
@@ -1021,4 +1153,6 @@ export default {
     initSearch,
     clearSearch,
     getSearchState,
+    setSearchQuery,
+    setSearchRoute,
 };

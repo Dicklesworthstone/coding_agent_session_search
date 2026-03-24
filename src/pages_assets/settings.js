@@ -274,6 +274,14 @@ export async function render() {
     setupEventHandlers(targetContainer);
 }
 
+async function rerenderSettingsUI(reason) {
+    try {
+        await render();
+    } catch (err) {
+        console.error(`[Settings] Failed to rerender settings after ${reason}:`, err);
+    }
+}
+
 /**
  * Set up settings event handlers
  */
@@ -369,9 +377,7 @@ async function handleStorageModeChange(e) {
             'Continue?'
         );
         if (!confirmed) {
-            // Reset radio to current mode
-            const currentRadio = settingsContainer.querySelector(`input[name="storage-mode"][value="${currentMode}"]`);
-            if (currentRadio) currentRadio.checked = true;
+            await rerenderSettingsUI('storage mode cancellation');
             return;
         }
     }
@@ -384,6 +390,7 @@ async function handleStorageModeChange(e) {
     } catch (err) {
         console.error('[Settings] Failed to change storage mode:', err);
         showNotification('Failed to change storage mode', 'error');
+        await rerenderSettingsUI('storage mode change failure');
     }
 }
 
@@ -401,7 +408,7 @@ async function handleOPFSToggle(e) {
         );
 
         if (!confirmed) {
-            e.target.checked = false;
+            await rerenderSettingsUI('OPFS enable cancellation');
             return;
         }
 
@@ -410,8 +417,9 @@ async function handleOPFSToggle(e) {
             showNotification('OPFS caching enabled', 'success');
         } catch (err) {
             console.error('[Settings] Failed to enable OPFS:', err);
-            e.target.checked = false;
             showNotification('Failed to enable OPFS caching', 'error');
+            await rerenderSettingsUI('OPFS enable failure');
+            return;
         }
     } else {
         // Switching away from OPFS - clear it first
@@ -427,6 +435,8 @@ async function handleOPFSToggle(e) {
         } catch (err) {
             console.error('[Settings] Failed to disable OPFS:', err);
             showNotification('Failed to disable OPFS caching', 'error');
+            await rerenderSettingsUI('OPFS disable failure');
+            return;
         }
     }
 

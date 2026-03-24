@@ -14,7 +14,7 @@
  */
 
 import { isDatabaseReady, getStatistics, closeDatabase } from './database.js';
-import { initSearch, clearSearch, getSearchState, setSearchQuery } from './search.js';
+import { initSearch, clearSearch, getSearchState, setSearchRoute } from './search.js';
 import {
     initConversationViewer,
     loadConversation,
@@ -22,7 +22,7 @@ import {
     cleanupConversationViewer,
     getCurrentConversation,
 } from './conversation.js';
-import { createRouter, getRouter, parseSearchParams, buildConversationPath } from './router.js';
+import { createRouter, getRouter, parseSearchParams, buildConversationPath, buildSearchPath } from './router.js';
 import { getConversationLink, copyConversationLink, isWebShareAvailable, shareConversation } from './share.js';
 import { initStats, renderStatsDashboard, clearStatsCache } from './stats.js';
 import { initStorage, StorageKeys } from './storage.js';
@@ -34,6 +34,12 @@ const state = {
     conversationId: null,
     messageId: null,
     searchQuery: '',
+    searchFilters: {
+        agent: null,
+        since: null,
+        until: null,
+        timePreset: null,
+    },
     initialized: false,
 };
 
@@ -190,7 +196,17 @@ function refreshAfterDatabaseReady() {
             break;
     }
 
-    handleSearchRoute({ q: state.searchQuery });
+    handleSearchRoute({
+        query: {
+            q: state.searchQuery,
+            agent: state.searchFilters.agent,
+            since: state.searchFilters.since,
+            until: state.searchFilters.until,
+            time: state.searchFilters.timePreset && state.searchFilters.timePreset !== 'custom'
+                ? state.searchFilters.timePreset
+                : null,
+        },
+    });
 }
 
 /**
@@ -278,7 +294,7 @@ function handleRouteChange(route) {
 
     switch (view) {
         case 'search':
-            handleSearchRoute(query);
+            handleSearchRoute(route);
             break;
 
         case 'conversation':
@@ -303,11 +319,19 @@ function handleRouteChange(route) {
 /**
  * Handle search route
  */
-function handleSearchRoute(query = {}) {
+function handleSearchRoute(route = { query: {} }) {
+    const searchParams = parseSearchParams(route);
+
     state.view = 'search';
     state.conversationId = null;
     state.messageId = null;
-    state.searchQuery = query.q || '';
+    state.searchQuery = searchParams.query;
+    state.searchFilters = {
+        agent: searchParams.agent,
+        since: searchParams.since,
+        until: searchParams.until,
+        timePreset: searchParams.timePreset,
+    };
 
     // Show search view
     showViewContainer('search');
@@ -318,10 +342,10 @@ function handleSearchRoute(query = {}) {
     // Update nav
     updateActiveNavLink('search');
 
-    if (state.searchQuery) {
-        console.debug('[Viewer] Search query from URL:', state.searchQuery);
-        setSearchQuery(state.searchQuery).catch((error) => {
-            console.warn('[Viewer] Failed to run search from URL:', error);
+    if (state.searchQuery || state.searchFilters.agent || state.searchFilters.since || state.searchFilters.until || state.searchFilters.timePreset) {
+        console.debug('[Viewer] Search route from URL:', searchParams);
+        setSearchRoute(searchParams).catch((error) => {
+            console.warn('[Viewer] Failed to run search route from URL:', error);
         });
         return;
     }
@@ -635,7 +659,8 @@ function handleBackToSearch() {
 
     // Navigate using router
     if (router) {
-        router.goHome();
+        const searchState = getSearchState();
+        router.navigate(buildSearchPath(searchState.query, searchState.filters));
     }
 }
 
@@ -644,6 +669,12 @@ function syncLockedViewerState() {
     state.conversationId = null;
     state.messageId = null;
     state.searchQuery = '';
+    state.searchFilters = {
+        agent: null,
+        since: null,
+        until: null,
+        timePreset: null,
+    };
 
     if (window?.location?.href) {
         const url = new URL(window.location.href);
@@ -685,9 +716,9 @@ export function navigateToConversation(conversationId, messageId = null) {
 /**
  * Navigate to search (public API)
  */
-export function navigateToSearch(query = null) {
+export function navigateToSearch(query = null, filters = {}) {
     if (router) {
-        router.goHome(query);
+        router.navigate(buildSearchPath(query || '', filters));
     }
 }
 
