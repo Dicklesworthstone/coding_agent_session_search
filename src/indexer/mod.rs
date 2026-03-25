@@ -1425,6 +1425,7 @@ pub fn run_index(
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let mut storage = storage;
+    persist::apply_index_writer_busy_timeout(&storage);
     let index_path = index_dir(&opts.data_dir)?;
 
     // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
@@ -1476,6 +1477,7 @@ pub fn run_index(
 
     if opts.full && !opened_fresh_for_full {
         storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
+        persist::apply_index_writer_busy_timeout(&storage);
         t_index.delete_all()?;
         t_index.commit()?;
     }
@@ -1490,6 +1492,7 @@ pub fn run_index(
             let (reopened_storage, seed_outcome) =
                 maybe_seed_empty_canonical_from_historical_bundle(storage, &opts.db_path)?;
             storage = reopened_storage;
+            persist::apply_index_writer_busy_timeout(&storage);
             if let Some(seed_outcome) = seed_outcome {
                 outcome.accumulate(seed_outcome);
             }
@@ -1688,7 +1691,15 @@ pub fn run_index(
     }
 
     // Update last_scan_ts after successful scan and commit
-    storage.set_last_scan_ts(scan_start_ts)?;
+    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+        storage.set_last_scan_ts(scan_start_ts)
+    })
+    .with_context(|| {
+        format!(
+            "updating last_scan_ts after index run for {}",
+            opts.db_path.display()
+        )
+    })?;
     tracing::info!(
         scan_start_ts,
         "updated last_scan_ts for incremental indexing"
@@ -1696,7 +1707,15 @@ pub fn run_index(
 
     // Update last_indexed_at so `cass status` reflects the latest index time
     let now_ms = FrankenStorage::now_millis();
-    storage.set_last_indexed_at(now_ms)?;
+    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+        storage.set_last_indexed_at(now_ms)
+    })
+    .with_context(|| {
+        format!(
+            "updating last_indexed_at after index run for {}",
+            opts.db_path.display()
+        )
+    })?;
     tracing::info!(now_ms, "updated last_indexed_at for status display");
 
     reset_progress_to_idle(opts.progress.as_ref());
@@ -3327,7 +3346,7 @@ pub mod persist {
             .unwrap_or(false)
     }
 
-    fn begin_concurrent_retry_limit() -> usize {
+    pub(super) fn begin_concurrent_retry_limit() -> usize {
         dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -3351,6 +3370,14 @@ pub mod persist {
             .unwrap_or(4096)
     }
 
+    fn index_writer_busy_timeout_ms() -> u64 {
+        dotenvy::var("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(60_000)
+    }
+
     fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage) {
         let cache_kib = begin_concurrent_writer_cache_kib();
         let pragma = format!("PRAGMA cache_size = -{cache_kib};");
@@ -3359,6 +3386,18 @@ pub mod persist {
                 cache_kib,
                 error = %err,
                 "failed_to_apply_begin_concurrent_writer_cache_size"
+            );
+        }
+    }
+
+    pub(super) fn apply_index_writer_busy_timeout(storage: &FrankenStorage) {
+        let busy_timeout_ms = index_writer_busy_timeout_ms();
+        let pragma = format!("PRAGMA busy_timeout = {busy_timeout_ms};");
+        if let Err(err) = storage.raw().execute(&pragma) {
+            tracing::debug!(
+                busy_timeout_ms,
+                error = %err,
+                "failed_to_apply_index_writer_busy_timeout"
             );
         }
     }
@@ -3382,7 +3421,7 @@ pub mod persist {
     }
 
     /// Retry wrapper for any retryable FrankenError (BusySnapshot, WriteConflict, etc.)
-    fn with_concurrent_retry<F, T>(max_retries: usize, mut f: F) -> Result<T>
+    pub(super) fn with_concurrent_retry<F, T>(max_retries: usize, mut f: F) -> Result<T>
     where
         F: FnMut() -> Result<T>,
     {

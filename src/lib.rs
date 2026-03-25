@@ -2533,7 +2533,60 @@ async fn execute_cli(
     } else if cli.verbose {
         EnvFilter::new("debug")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Suppress frankensqlite internal telemetry that spams at INFO level.
+            // EnvFilter uses "::" as the hierarchy separator, so "fsqlite=warn" covers
+            // fsqlite::runtime, fsqlite::cx, etc.  Crate-level targets like fsqlite_vdbe
+            // and fsqlite_core need their own directives.  Custom dot-separated targets
+            // (fsqlite.statement_reuse, fsqlite.compat, etc.) are NOT matched by the
+            // hierarchical prefix, so each must be listed explicitly.
+            EnvFilter::new(concat!(
+                "info",
+                // Hierarchical (::) targets
+                ",fsqlite=warn",
+                ",fsqlite_core=warn",
+                ",fsqlite_vdbe=warn",
+                ",fsqlite_mvcc=warn",
+                ",fsqlite_pager=warn",
+                ",fsqlite_func=warn",
+                ",fsqlite_vfs=warn",
+                ",fsqlite_wal=warn",
+                ",fsqlite_c_api=warn",
+                ",fsqlite_planner=warn",
+                ",fsqlite_types=warn",
+                ",fsqlite_observability=warn",
+                // Dot-separated custom targets
+                ",fsqlite.compat=warn",
+                ",fsqlite.compat_trace=warn",
+                ",fsqlite.statement_reuse=warn",
+                ",fsqlite.statement=warn",
+                ",fsqlite.execution=warn",
+                ",fsqlite.execute_path=warn",
+                ",fsqlite.plan=warn",
+                ",fsqlite.planner=warn",
+                ",fsqlite.planner_runtime=warn",
+                ",fsqlite.parse=warn",
+                ",fsqlite.provenance=warn",
+                ",fsqlite.dp=warn",
+                ",fsqlite.udf=warn",
+                ",fsqlite.vdbe=warn",
+                ",fsqlite.rcu=warn",
+                ",fsqlite.seqlock=warn",
+                ",fsqlite.left_right=warn",
+                ",fsqlite.flat_combine=warn",
+                ",fsqlite.commit_combine=warn",
+                ",fsqlite.snapshot_publication=warn",
+                ",fsqlite.wal_publication=warn",
+                ",fsqlite.storage_wiring=warn",
+                ",fsqlite.cx_propagation=warn",
+                ",fsqlite.sketch_telemetry=warn",
+                ",fsqlite.time_travel=warn",
+                ",fsqlite.trace_export=warn",
+                ",fsqlite.txn_slot=warn",
+                ",fsqlite.evidence=warn",
+                ",fsqlite.lab_schedule=warn",
+            ))
+        })
     };
 
     match &command {

@@ -1539,6 +1539,49 @@ fn historical_salvage_debug_enabled() -> bool {
     std::env::var_os("CASS_DEBUG_HISTORICAL_SALVAGE").is_some()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HistoricalImportBatchLimits {
+    conversations: usize,
+    messages: usize,
+    payload_chars: usize,
+}
+
+fn env_positive_usize(key: &str) -> Option<usize> {
+    dotenvy::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn historical_import_batch_limits() -> HistoricalImportBatchLimits {
+    let cpu_count = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+
+    let default_limits = if cpu_count >= 32 {
+        HistoricalImportBatchLimits {
+            conversations: 128,
+            messages: 16_384,
+            payload_chars: 12_000_000,
+        }
+    } else {
+        HistoricalImportBatchLimits {
+            conversations: 32,
+            messages: 4_096,
+            payload_chars: 3_000_000,
+        }
+    };
+
+    HistoricalImportBatchLimits {
+        conversations: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_CONVERSATIONS")
+            .unwrap_or(default_limits.conversations),
+        messages: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_MESSAGES")
+            .unwrap_or(default_limits.messages),
+        payload_chars: env_positive_usize("CASS_HISTORICAL_IMPORT_BATCH_CHARS")
+            .unwrap_or(default_limits.payload_chars),
+    }
+}
+
 fn json_value_size_hint(value: &serde_json::Value) -> usize {
     if let Some(raw) = historical_raw_json(value) {
         return raw.len();
@@ -3509,9 +3552,23 @@ impl FrankenStorage {
         &self,
         source_conn: &rusqlite::Connection,
     ) -> Result<(usize, usize)> {
-        const HISTORICAL_IMPORT_BATCH_CONVERSATIONS: usize = 32;
-        const HISTORICAL_IMPORT_BATCH_MESSAGES: usize = 4_096;
-        const HISTORICAL_IMPORT_BATCH_CHARS: usize = 3_000_000;
+        let batch_limits = historical_import_batch_limits();
+        let cache_enabled = IndexingCache::is_enabled();
+        let mut indexing_cache = IndexingCache::new();
+        let mut known_sources: HashSet<String> = self
+            .list_sources()?
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
+
+        tracing::info!(
+            target: "cass::historical_salvage",
+            batch_conversations = batch_limits.conversations,
+            batch_messages = batch_limits.messages,
+            batch_payload_chars = batch_limits.payload_chars,
+            cache_enabled,
+            "configured historical salvage batch limits"
+        );
 
         let mut conv_stmt = source_conn.prepare(
             "SELECT
@@ -3686,7 +3743,7 @@ impl FrankenStorage {
                 origin_host: row.get(11)?,
             };
 
-            if self.get_source(&conversation.source_id)?.is_none() {
+            if !known_sources.contains(&conversation.source_id) {
                 let placeholder = if conversation.source_id == LOCAL_SOURCE_ID {
                     Source::local()
                 } else {
@@ -3702,6 +3759,7 @@ impl FrankenStorage {
                     }
                 };
                 self.upsert_source(&placeholder)?;
+                known_sources.insert(conversation.source_id.clone());
             }
 
             let agent = Agent {
@@ -3711,19 +3769,27 @@ impl FrankenStorage {
                 version: None,
                 kind: AgentKind::Cli,
             };
-            let agent_id = self.ensure_agent(&agent)?;
+            let agent_id = if cache_enabled {
+                indexing_cache.get_or_insert_agent(self, &agent)?
+            } else {
+                self.ensure_agent(&agent)?
+            };
             let workspace_id = if let Some(workspace) = &conversation.workspace {
-                Some(self.ensure_workspace(workspace, None)?)
+                if cache_enabled {
+                    Some(indexing_cache.get_or_insert_workspace(self, workspace, None)?)
+                } else {
+                    Some(self.ensure_workspace(workspace, None)?)
+                }
             } else {
                 None
             };
 
             let exceeds_pending_limits = !pending_batch.is_empty()
-                && (pending_batch.len() >= HISTORICAL_IMPORT_BATCH_CONVERSATIONS
+                && (pending_batch.len() >= batch_limits.conversations
                     || pending_batch_messages.saturating_add(conversation_message_count)
-                        > HISTORICAL_IMPORT_BATCH_MESSAGES
+                        > batch_limits.messages
                     || pending_batch_chars.saturating_add(conversation_chars)
-                        > HISTORICAL_IMPORT_BATCH_CHARS);
+                        > batch_limits.payload_chars);
             if exceeds_pending_limits {
                 flush_batch(
                     self,
@@ -3746,9 +3812,9 @@ impl FrankenStorage {
             pending_batch_chars = pending_batch_chars.saturating_add(conversation_chars);
             pending_batch.push((agent_id, workspace_id, conversation));
 
-            if pending_batch.len() >= HISTORICAL_IMPORT_BATCH_CONVERSATIONS
-                || pending_batch_messages >= HISTORICAL_IMPORT_BATCH_MESSAGES
-                || pending_batch_chars >= HISTORICAL_IMPORT_BATCH_CHARS
+            if pending_batch.len() >= batch_limits.conversations
+                || pending_batch_messages >= batch_limits.messages
+                || pending_batch_chars >= batch_limits.payload_chars
             {
                 flush_batch(
                     self,
@@ -3773,6 +3839,20 @@ impl FrankenStorage {
             &mut imported_conversations,
             &mut imported_messages,
         )?;
+
+        if cache_enabled {
+            let (hits, misses, hit_rate) = indexing_cache.stats();
+            tracing::info!(
+                target: "cass::historical_salvage",
+                hits,
+                misses,
+                hit_rate = format!("{:.1}%", hit_rate * 100.0),
+                agents = indexing_cache.agent_count(),
+                workspaces = indexing_cache.workspace_count(),
+                sources = known_sources.len(),
+                "historical salvage cache stats"
+            );
+        }
 
         Ok((imported_conversations, imported_messages))
     }
