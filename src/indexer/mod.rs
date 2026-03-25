@@ -1931,7 +1931,10 @@ fn incremental_semantic_embed(
 ///
 /// Returns `(storage, rebuilt)` where `rebuilt=true` means we detected an
 /// incompatible/future schema, backed up + recreated the DB, and reopened it.
-fn open_storage_for_index(db_path: &Path, allow_full_recovery: bool) -> Result<(FrankenStorage, bool, bool)> {
+fn open_storage_for_index(
+    db_path: &Path,
+    allow_full_recovery: bool,
+) -> Result<(FrankenStorage, bool, bool)> {
     match FrankenStorage::open_or_rebuild(db_path) {
         Ok(storage) => Ok((storage, false, false)),
         Err(MigrationError::RebuildRequired {
@@ -1953,8 +1956,12 @@ fn open_storage_for_index(db_path: &Path, allow_full_recovery: bool) -> Result<(
                 error = %err,
                 "full rebuild storage open failed; backing up and reopening with a fresh canonical db"
             );
-            let backup_path = crate::storage::sqlite::create_backup(db_path)
-                .map_err(|backup_err| anyhow::anyhow!("backing up busy/corrupt canonical db before full rebuild: {backup_err}"))?;
+            let backup_path =
+                crate::storage::sqlite::create_backup(db_path).map_err(|backup_err| {
+                    anyhow::anyhow!(
+                        "backing up busy/corrupt canonical db before full rebuild: {backup_err}"
+                    )
+                })?;
             if db_path.exists() {
                 crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
                     format!(
@@ -1973,7 +1980,9 @@ fn open_storage_for_index(db_path: &Path, allow_full_recovery: bool) -> Result<(
             let storage = FrankenStorage::open(db_path)?;
             Ok((storage, true, true))
         }
-        Err(err) => Err(anyhow::anyhow!("failed to open frankensqlite storage: {err}")),
+        Err(err) => Err(anyhow::anyhow!(
+            "failed to open frankensqlite storage: {err}"
+        )),
     }
 }
 
@@ -2034,9 +2043,7 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    let backup_root = backups_dir.join(format!(
-        "{db_name}.{timestamp}.failed-baseline-seed.bak"
-    ));
+    let backup_root = backups_dir.join(format!("{db_name}.{timestamp}.failed-baseline-seed.bak"));
 
     for suffix in ["", "-wal", "-shm"] {
         let src = if suffix.is_empty() {
@@ -2097,26 +2104,37 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
                 error = %err,
                 "baseline historical seed import failed; falling back to incremental salvage"
             );
-            let failed_seed_backup = quarantine_failed_seed_bundle(db_path).with_context(|| {
-                format!(
-                    "quarantining failed baseline seed bundle before incremental salvage: {}",
-                    db_path.display()
-                )
-            })?;
-            if let Some(path) = failed_seed_backup {
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    backup_path = %path.display(),
-                    "moved failed baseline seed bundle aside before incremental salvage fallback"
-                );
+            match FrankenStorage::open(db_path) {
+                Ok(reopened) => Ok((reopened, None)),
+                Err(reopen_err) => {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        error = %reopen_err,
+                        "canonical database could not be reopened after failed baseline seed; quarantining partial bundle"
+                    );
+                    let failed_seed_backup =
+                        quarantine_failed_seed_bundle(db_path).with_context(|| {
+                            format!(
+                                "quarantining failed baseline seed bundle before incremental salvage: {}",
+                                db_path.display()
+                            )
+                        })?;
+                    if let Some(path) = failed_seed_backup {
+                        tracing::info!(
+                            db_path = %db_path.display(),
+                            backup_path = %path.display(),
+                            "moved failed baseline seed bundle aside before incremental salvage fallback"
+                        );
+                    }
+                    let reopened = FrankenStorage::open(db_path).with_context(|| {
+                        format!(
+                            "recreating fresh canonical database after failed baseline seed import: {}",
+                            db_path.display()
+                        )
+                    })?;
+                    Ok((reopened, None))
+                }
             }
-            let reopened = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "recreating fresh canonical database after failed baseline seed import: {}",
-                    db_path.display()
-                )
-            })?;
-            Ok((reopened, None))
         }
     }
 }
@@ -2235,6 +2253,13 @@ pub(crate) fn rebuild_tantivy_from_db(
 
         offset += page_size;
     }
+
+    storage.close().with_context(|| {
+        format!(
+            "closing readonly database after Tantivy rebuild: {}",
+            db_path.display()
+        )
+    })?;
 
     t_index.commit()?;
 
@@ -2548,7 +2573,9 @@ fn reset_storage(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
          DELETE FROM meta WHERE key = 'last_scan_ts';
          COMMIT;",
     )?;
-    let _ = storage.raw().execute_batch("DROP TABLE IF EXISTS fts_messages;");
+    let _ = storage
+        .raw()
+        .execute_batch("DROP TABLE IF EXISTS fts_messages;");
     crate::storage::sqlite::materialize_fresh_fts_schema_via_rusqlite(db_path)?;
     crate::storage::sqlite::register_fts5_on_connection(storage.raw())?;
     Ok(())

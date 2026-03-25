@@ -1101,7 +1101,9 @@ fn historical_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<b
 
 fn probe_historical_table_reads(conn: &rusqlite::Connection, table: &str) -> Result<()> {
     if !historical_table_exists(conn, table)? {
-        return Err(anyhow!("historical database missing required table {table}"));
+        return Err(anyhow!(
+            "historical database missing required table {table}"
+        ));
     }
 
     let sql = format!("SELECT rowid FROM {table} LIMIT 1");
@@ -1309,24 +1311,17 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
     canonical_db_path: &Path,
     bundle: &HistoricalDatabaseBundle,
 ) -> Result<()> {
-    if canonical_db_path.exists() {
-        remove_database_files(canonical_db_path).with_context(|| {
-            format!(
-                "removing canonical database before bulk historical seed import: {}",
-                canonical_db_path.display()
-            )
-        })?;
-    }
-    if let Some(parent) = canonical_db_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "creating canonical database directory before bulk historical seed import: {}",
-                parent.display()
-            )
-        })?;
-    }
-    let tempdir = tempfile::TempDir::new().context("creating temporary baseline seed directory")?;
+    let canonical_parent = canonical_db_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(canonical_parent).with_context(|| {
+        format!(
+            "creating canonical database directory before bulk historical seed import: {}",
+            canonical_parent.display()
+        )
+    })?;
+    let tempdir = tempfile::TempDir::new_in(canonical_parent)
+        .context("creating temporary baseline seed directory")?;
     let working_db = tempdir.path().join("baseline-seed-working.db");
+    let staged_seed_db = tempdir.path().join("baseline-seed-output.db");
 
     fs::copy(&bundle.root_path, &working_db).with_context(|| {
         format!(
@@ -1360,7 +1355,7 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
         "PRAGMA busy_timeout = 30000;
          PRAGMA writable_schema = ON;",
     )
-        .with_context(|| format!("configuring busy timeout for {}", working_db.display()))?;
+    .with_context(|| format!("configuring busy timeout for {}", working_db.display()))?;
 
     if let Some(schema_version) = read_meta_schema_version(&conn)? {
         if schema_version < CURRENT_SCHEMA_VERSION {
@@ -1369,15 +1364,13 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
                     "historical seed bundle schema_version {schema_version} is too old for baseline import"
                 );
             }
-            conn.execute_batch(
-                "DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';",
-            )
-            .with_context(|| {
-                format!(
-                    "clearing legacy FTS schema entries from working seed clone {}",
-                    working_db.display()
-                )
-            })?;
+            conn.execute_batch("DELETE FROM sqlite_master WHERE name LIKE 'fts_messages%';")
+                .with_context(|| {
+                    format!(
+                        "clearing legacy FTS schema entries from working seed clone {}",
+                        working_db.display()
+                    )
+                })?;
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .with_context(|| {
                     format!(
@@ -1390,22 +1383,25 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
     conn.execute_batch("PRAGMA writable_schema = OFF;")
         .with_context(|| format!("disabling writable_schema for {}", working_db.display()))?;
 
-    conn.execute("VACUUM INTO ?1", [canonical_db_path.to_string_lossy().as_ref()])
-        .with_context(|| {
-            format!(
-                "vacuuming cleaned working seed clone into canonical database {}",
-                canonical_db_path.display()
-            )
-        })?;
+    conn.execute(
+        "VACUUM INTO ?1",
+        [staged_seed_db.to_string_lossy().as_ref()],
+    )
+    .with_context(|| {
+        format!(
+            "vacuuming cleaned working seed clone into staged baseline seed database {}",
+            staged_seed_db.display()
+        )
+    })?;
 
     let seeded = rusqlite::Connection::open_with_flags(
-        canonical_db_path,
+        &staged_seed_db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| {
         format!(
-            "opening canonical database after vacuum baseline seed import: {}",
-            canonical_db_path.display()
+            "opening staged baseline seed database after vacuum import: {}",
+            staged_seed_db.display()
         )
     })?;
     let duplicate_fts_entries: i64 = seeded
@@ -1416,16 +1412,33 @@ fn seed_canonical_from_historical_bundle_via_bulk_copy(
         )
         .with_context(|| {
             format!(
-                "counting fts_messages sqlite_master rows after vacuum baseline seed import: {}",
-                canonical_db_path.display()
+                "counting fts_messages sqlite_master rows after staged baseline seed import: {}",
+                staged_seed_db.display()
             )
         })?;
     if duplicate_fts_entries > 1 {
         anyhow::bail!(
             "vacuum baseline seed preserved {duplicate_fts_entries} sqlite_master entries for fts_messages in {}",
-            canonical_db_path.display()
+            staged_seed_db.display()
         );
     }
+    drop(seeded);
+
+    if canonical_db_path.exists() {
+        remove_database_files(canonical_db_path).with_context(|| {
+            format!(
+                "removing canonical database before promoting staged historical seed import: {}",
+                canonical_db_path.display()
+            )
+        })?;
+    }
+    fs::rename(&staged_seed_db, canonical_db_path).with_context(|| {
+        format!(
+            "promoting staged historical seed database {} into canonical path {}",
+            staged_seed_db.display(),
+            canonical_db_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -1447,7 +1460,8 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
         })?;
         let (conversations_imported, messages_imported) = historical_bundle_counts(&source.conn)?;
 
-        if let Err(err) = seed_canonical_from_historical_bundle_via_bulk_copy(canonical_db_path, &bundle)
+        if let Err(err) =
+            seed_canonical_from_historical_bundle_via_bulk_copy(canonical_db_path, &bundle)
         {
             tracing::warn!(
                 path = %bundle.root_path.display(),
@@ -1455,7 +1469,6 @@ pub(crate) fn seed_canonical_from_best_historical_bundle(
                 "bulk baseline seed import from historical bundle failed; trying next candidate"
             );
             last_seed_error = Some(err);
-            let _ = remove_database_files(canonical_db_path);
             continue;
         }
 
@@ -1532,7 +1545,9 @@ fn json_value_size_hint(value: &serde_json::Value) -> usize {
     }
     match value {
         serde_json::Value::Null => 0,
-        other => serde_json::to_string(other).map(|raw| raw.len()).unwrap_or(0),
+        other => serde_json::to_string(other)
+            .map(|raw| raw.len())
+            .unwrap_or(0),
     }
 }
 
@@ -2145,8 +2160,14 @@ impl FrankenStorage {
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
         let storage = Self { conn };
-        storage.apply_config()?;
+        storage.apply_readonly_config()?;
         Ok(storage)
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.conn
+            .close()
+            .with_context(|| "closing frankensqlite connection")
     }
 
     /// Access the raw frankensqlite connection.
@@ -2201,6 +2222,22 @@ impl FrankenStorage {
         let _ = self.conn.execute("PRAGMA fsqlite.concurrent_mode = ON;");
         let _ = self.conn.execute("PRAGMA concurrent_mode = ON;");
 
+        Ok(())
+    }
+
+    fn apply_readonly_config(&self) -> Result<()> {
+        self.conn
+            .execute("PRAGMA query_only = 1;")
+            .with_context(|| "setting query_only")?;
+        self.conn
+            .execute("PRAGMA busy_timeout = 5000;")
+            .with_context(|| "setting busy_timeout")?;
+        self.conn
+            .execute("PRAGMA cache_size = -65536;")
+            .with_context(|| "setting cache_size")?;
+        self.conn
+            .execute("PRAGMA foreign_keys = ON;")
+            .with_context(|| "setting foreign_keys")?;
         Ok(())
     }
 
@@ -3548,7 +3585,9 @@ impl FrankenStorage {
 
             let borrowed_batch: Vec<(i64, Option<i64>, &Conversation)> = batch
                 .iter()
-                .map(|(agent_id, workspace_id, conversation)| (*agent_id, *workspace_id, conversation))
+                .map(|(agent_id, workspace_id, conversation)| {
+                    (*agent_id, *workspace_id, conversation)
+                })
                 .collect();
             let outcomes = storage
                 .insert_conversations_batched(&borrowed_batch)
@@ -3681,8 +3720,7 @@ impl FrankenStorage {
 
             let exceeds_pending_limits = !pending_batch.is_empty()
                 && (pending_batch.len() >= HISTORICAL_IMPORT_BATCH_CONVERSATIONS
-                    || pending_batch_messages
-                        .saturating_add(conversation_message_count)
+                    || pending_batch_messages.saturating_add(conversation_message_count)
                         > HISTORICAL_IMPORT_BATCH_MESSAGES
                     || pending_batch_chars.saturating_add(conversation_chars)
                         > HISTORICAL_IMPORT_BATCH_CHARS);
@@ -9900,13 +9938,14 @@ mod tests {
 
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let legacy = rusqlite::Connection::open(&source_db).unwrap();
-        legacy.execute_batch(
-            "DROP TABLE IF EXISTS fts_messages;
+        legacy
+            .execute_batch(
+                "DROP TABLE IF EXISTS fts_messages;
              UPDATE meta SET value = '13' WHERE key = 'schema_version';
              DELETE FROM _schema_migrations WHERE version = 14;
              PRAGMA writable_schema = ON;",
-        )
-        .unwrap();
+            )
+            .unwrap();
         legacy
             .execute(
                 "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
@@ -9985,10 +10024,18 @@ mod tests {
         assert_eq!(readonly_message_count, 1);
 
         let seeded = SqliteStorage::open(&canonical_db).unwrap();
-        assert_eq!(seeded.count_sessions_in_range(None, None, None, None).unwrap().0, 1);
+        assert_eq!(
+            seeded
+                .count_sessions_in_range(None, None, None, None)
+                .unwrap()
+                .0,
+            1
+        );
         let message_count: i64 = seeded
             .conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| row.get_typed(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(message_count, 1);
         assert_eq!(seeded.get_last_scan_ts().unwrap(), None);
@@ -10047,6 +10094,114 @@ mod tests {
             franken_fts_count, 1,
             "seeded canonical db should keep fts_messages queryable via frankensqlite"
         );
+    }
+
+    #[test]
+    fn failed_baseline_seed_preserves_existing_canonical_bundle() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let source_db = dir
+            .path()
+            .join("backups/agent_search.db.20260325T120000Z.bad-seed.bak");
+
+        fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+
+        let canonical = SqliteStorage::open(&canonical_db).unwrap();
+        canonical
+            .conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams!["sentinel", "keep-me"],
+            )
+            .unwrap();
+        drop(canonical);
+
+        let source = SqliteStorage::open(&source_db).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = source.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("bad-seed-conv".into()),
+            title: Some("Bad seed".into()),
+            source_path: PathBuf::from("/tmp/bad-seed.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::json!({"seed": "bad"}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "this seed should fail".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        source
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(source);
+
+        let legacy = rusqlite::Connection::open(&source_db).unwrap();
+        legacy
+            .execute(
+                "UPDATE meta SET value = '12' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let err = seed_canonical_from_best_historical_bundle(&canonical_db).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("schema_version 12 is too old for baseline import"),
+            "unexpected seed error: {err:#}"
+        );
+
+        let reopened = SqliteStorage::open(&canonical_db).unwrap();
+        let sentinel: Option<String> = reopened
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'sentinel'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(sentinel.as_deref(), Some("keep-me"));
+
+        let conversation_count: i64 = reopened
+            .conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 0);
+
+        let readonly = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        let readonly_conversation_count: i64 = readonly
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(readonly_conversation_count, 0);
     }
 
     #[test]
@@ -10160,8 +10315,10 @@ mod tests {
         drop(conn);
 
         let bundles = discover_historical_database_bundles(&canonical_db);
-        let ordered_paths: Vec<PathBuf> =
-            bundles.iter().map(|bundle| bundle.root_path.clone()).collect();
+        let ordered_paths: Vec<PathBuf> = bundles
+            .iter()
+            .map(|bundle| bundle.root_path.clone())
+            .collect();
 
         assert_eq!(ordered_paths, vec![smaller_healthy, larger_corrupt]);
         assert!(bundles[0].supports_direct_readonly);

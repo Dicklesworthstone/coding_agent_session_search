@@ -3721,10 +3721,27 @@ fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<frankensqlite::Connection> {
+    open_franken_cli_read_db(
+        analytics_db_path(data_dir, db_path_override),
+        "analytics",
+        Duration::from_secs(1),
+    )
+}
+
+fn analytics_db_path(data_dir: &Option<PathBuf>, db_path_override: Option<&PathBuf>) -> PathBuf {
     let data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
-    let path = db_path_override
+    db_path_override
         .cloned()
-        .unwrap_or_else(|| data_dir.join("agent_search.db"));
+        .unwrap_or_else(|| data_dir.join("agent_search.db"))
+}
+
+fn open_franken_cli_read_db(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+) -> CliResult<frankensqlite::Connection> {
+    use frankensqlite::compat::{OpenFlags, open_with_flags};
+
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -3737,12 +3754,43 @@ fn open_franken_analytics_db(
             retryable: true,
         });
     }
-    frankensqlite::Connection::open(path.to_string_lossy().as_ref()).map_err(|e| CliError {
+
+    let conn = open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| CliError {
         code: 9,
         kind: "db-open",
-        message: format!("Failed to open database at {}: {e}", path.display()),
+        message: format!(
+            "Failed to open {reason} database at {}: {e}",
+            path.display()
+        ),
         hint: None,
         retryable: false,
+    })?;
+
+    let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
+    let _ = conn.execute("PRAGMA query_only = 1;");
+
+    Ok(conn)
+}
+
+fn close_franken_cli_read_db(
+    conn: frankensqlite::Connection,
+    path: &Path,
+    reason: &str,
+) -> CliResult<()> {
+    conn.close().map_err(|e| CliError {
+        code: 9,
+        kind: "db-close",
+        message: format!(
+            "Failed to close {reason} database at {}: {e}",
+            path.display()
+        ),
+        hint: None,
+        retryable: true,
     })
 }
 
@@ -4224,65 +4272,49 @@ fn probe_state_db(
         return StateDbSnapshot::default();
     }
 
-    let path = db_path.to_path_buf();
-    let reason = reason.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut snapshot = StateDbSnapshot {
-            counts_skipped: !include_counts,
-            ..StateDbSnapshot::default()
-        };
-        let lazy = crate::storage::sqlite::LazyFrankenDb::new(path);
-        match lazy.get(&reason) {
-            Ok(conn) => {
-                use frankensqlite::compat::{ConnectionExt, RowExt};
-                use frankensqlite::params;
+    let mut snapshot = StateDbSnapshot {
+        counts_skipped: !include_counts,
+        ..StateDbSnapshot::default()
+    };
 
-                snapshot.opened = true;
-                snapshot.last_indexed_at = conn
-                    .query_row_map(
-                        "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-                        params![],
-                        |r| r.get_typed::<String>(0),
-                    )
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok());
-                if include_counts {
-                    snapshot.conversation_count = conn
-                        .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
-                            r.get_typed(0)
-                        })
-                        .unwrap_or(0);
-                    snapshot.message_count = conn
-                        .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
-                            r.get_typed(0)
-                        })
-                        .unwrap_or(0);
-                }
-            }
-            Err(err) => {
-                snapshot.open_error = Some(err.to_string());
-            }
+    let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
+        Ok(conn) => conn,
+        Err(err) => {
+            snapshot.open_error = Some(err.message);
+            return snapshot;
         }
-        let _ = tx.send(snapshot);
-    });
+    };
 
-    match rx.recv_timeout(timeout) {
-        Ok(snapshot) => snapshot,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => StateDbSnapshot {
-            open_error: Some(format!(
-                "database state probe timed out after {}s",
-                timeout.as_secs()
-            )),
-            counts_skipped: !include_counts,
-            ..StateDbSnapshot::default()
-        },
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => StateDbSnapshot {
-            open_error: Some("database state probe worker disconnected unexpectedly".to_string()),
-            counts_skipped: !include_counts,
-            ..StateDbSnapshot::default()
-        },
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::params;
+
+    snapshot.opened = true;
+    snapshot.last_indexed_at = conn
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+            params![],
+            |r| r.get_typed::<String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok());
+    if include_counts {
+        snapshot.conversation_count = conn
+            .query_row_map("SELECT COUNT(*) FROM conversations", params![], |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
+        snapshot.message_count = conn
+            .query_row_map("SELECT COUNT(*) FROM messages", params![], |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
     }
+
+    if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
+        snapshot.open_error = Some(err.message);
+    }
+
+    snapshot
 }
 
 fn state_meta_json(
@@ -8958,6 +8990,57 @@ mod doctor_fts_tests {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cli_read_db_tests {
+    use super::*;
+    use crate::storage::sqlite::FrankenStorage;
+    use tempfile::TempDir;
+
+    fn seed_cli_db() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open cass db");
+        storage
+            .set_last_indexed_at(1_733_000_000_000)
+            .expect("set last_indexed_at");
+        drop(storage);
+        (temp, db_path)
+    }
+
+    #[test]
+    fn analytics_db_open_is_readonly() {
+        let (temp, _db_path) = seed_cli_db();
+        let data_dir = Some(temp.path().to_path_buf());
+        let conn = open_franken_analytics_db(&data_dir, None).expect("open readonly analytics db");
+
+        let err = conn
+            .execute("CREATE TABLE cli_readonly_probe(id INTEGER PRIMARY KEY);")
+            .expect_err("analytics reader must not accept writes");
+        let message = err.to_string().to_lowercase();
+        assert!(
+            message.contains("readonly") || message.contains("query_only"),
+            "unexpected readonly failure surface: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_state_db_reads_meta_without_count_scan() {
+        let (_temp, db_path) = seed_cli_db();
+        let snapshot = probe_state_db(&db_path, "status", Duration::from_millis(250), false);
+
+        assert!(snapshot.opened, "state probe should open the database");
+        assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert!(snapshot.counts_skipped, "count scan should remain disabled");
+        assert_eq!(snapshot.conversation_count, 0);
+        assert_eq!(snapshot.message_count, 0);
+        assert!(
+            snapshot.open_error.is_none(),
+            "state probe should not report an error: {:?}",
+            snapshot.open_error
+        );
     }
 }
 
@@ -15073,6 +15156,7 @@ fn run_timeline(
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
+    let db_path = analytics_db_path(data_dir, db_override.as_ref());
     let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
     let now = Local::now();
@@ -15177,6 +15261,7 @@ fn run_timeline(
         Option<String>,
         Option<String>,
     )> = rows;
+    close_franken_cli_read_db(conn, &db_path, "timeline")?;
 
     let structured_format = if json {
         Some(RobotFormat::Json)
