@@ -9,7 +9,7 @@ use frankensqlite::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
         Transaction as FrankenTransaction, TransactionExt as FrankenTransactionExt,
-        open_with_flags as open_franken_with_flags, param_slice_to_values,
+        open_with_flags as open_franken_with_flags, param_slice_to_values, params_from_iter,
     },
     migrate::MigrationRunner,
 };
@@ -725,9 +725,18 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
         &db_path.to_string_lossy(),
         FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
     )
-    .and_then(|conn| {
+    .and_then(|mut conn| {
         let path_str = backup_path.to_string_lossy();
-        conn.execute_compat("VACUUM INTO ?", fparams![path_str.as_ref()])
+        let result = conn.execute_compat("VACUUM INTO ?", fparams![path_str.as_ref()]);
+        if let Err(close_err) = conn.close_in_place() {
+            tracing::warn!(
+                error = %close_err,
+                db_path = %db_path.display(),
+                "create_backup: close_in_place failed after VACUUM INTO; falling back to best-effort close"
+            );
+            conn.close_best_effort_in_place();
+        }
+        result
     })
     .is_ok();
 
@@ -1694,62 +1703,75 @@ fn unique_backup_path(path: &Path) -> PathBuf {
 fn check_schema_compatibility(
     path: &Path,
 ) -> std::result::Result<SchemaCheck, frankensqlite::FrankenError> {
-    let conn = open_franken_with_flags(
+    let mut conn = open_franken_with_flags(
         &path.to_string_lossy(),
         FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
 
-    // Check if meta table exists
-    let meta_exists: i32 = conn.query_row_map(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
-        fparams![],
-        |row| row.get_typed(0),
-    )?;
-
-    if meta_exists == 0 {
-        // No meta table - could be empty or very old schema, needs rebuild
-        // But first check if there are any tables at all
-        let table_count: i32 = conn.query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+    let result = (|| {
+        // Check if meta table exists
+        let meta_exists: i32 = conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
             fparams![],
             |row| row.get_typed(0),
         )?;
 
-        if table_count == 0 {
-            // Empty database, will be initialized fresh
-            return Ok(SchemaCheck::NeedsMigration);
+        if meta_exists == 0 {
+            // No meta table - could be empty or very old schema, needs rebuild
+            // But first check if there are any tables at all
+            let table_count: i32 = conn.query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+
+            if table_count == 0 {
+                // Empty database, will be initialized fresh
+                return Ok(SchemaCheck::NeedsMigration);
+            }
+
+            // Has tables but no meta - very old or corrupted
+            return Ok(SchemaCheck::NeedsRebuild(
+                "Database missing schema version metadata".to_string(),
+            ));
         }
 
-        // Has tables but no meta - very old or corrupted
-        return Ok(SchemaCheck::NeedsRebuild(
-            "Database missing schema version metadata".to_string(),
-        ));
-    }
+        // Get the schema version
+        let version: Option<i64> = conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                fparams![],
+                |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
+            )
+            .ok()
+            .flatten();
 
-    // Get the schema version
-    let version: Option<i64> = conn
-        .query_row_map(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            fparams![],
-            |row| Ok(row.get_typed::<String>(0)?.parse().ok()),
-        )
-        .ok()
-        .flatten();
-
-    match version {
-        Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
-        Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
-        Some(v) => {
-            // v > SCHEMA_VERSION - database is from a newer version
-            Ok(SchemaCheck::NeedsRebuild(format!(
-                "Schema version {} is newer than supported version {}",
-                v, SCHEMA_VERSION
-            )))
+        match version {
+            Some(v) if v == SCHEMA_VERSION => Ok(SchemaCheck::Compatible),
+            Some(v) if v < SCHEMA_VERSION => Ok(SchemaCheck::NeedsMigration),
+            Some(v) => {
+                // v > SCHEMA_VERSION - database is from a newer version
+                Ok(SchemaCheck::NeedsRebuild(format!(
+                    "Schema version {} is newer than supported version {}",
+                    v, SCHEMA_VERSION
+                )))
+            }
+            None => Ok(SchemaCheck::NeedsRebuild(
+                "Schema version not found or invalid".to_string(),
+            )),
         }
-        None => Ok(SchemaCheck::NeedsRebuild(
-            "Schema version not found or invalid".to_string(),
-        )),
+    })();
+
+    if let Err(close_err) = conn.close_in_place() {
+        tracing::warn!(
+            error = %close_err,
+            db_path = %path.display(),
+            "check_schema_compatibility: close_in_place failed; falling back to best-effort close"
+        );
+        conn.close_best_effort_in_place();
     }
+
+    result
 }
 
 const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -4841,38 +4863,30 @@ impl FrankenStorage {
 
     /// Check health of daily stats table.
     pub fn daily_stats_health(&self) -> Result<DailyStatsHealth> {
-        let row_count: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap_or(0);
+        let row_count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
 
-        let oldest_update: Option<i64> = self
-            .conn
-            .query_row_map(
-                "SELECT MIN(last_updated) FROM daily_stats",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .ok();
+        let oldest_update: Option<i64> = self.conn.query_row_map(
+            "SELECT MIN(last_updated) FROM daily_stats",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
 
-        let conversation_count: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .unwrap_or(0);
+        let conversation_count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
 
-        let materialized_total: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
+        let materialized_total: i64 = self.conn.query_row_map(
+            "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats
                  WHERE agent_slug = 'all' AND source_id = 'all'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap_or(0);
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
 
         Ok(DailyStatsHealth {
             populated: row_count > 0,
@@ -6572,99 +6586,96 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 400;
+
+        let mut aggregate = StatsAggregator::new();
+        let mut last_conversation_id = 0_i64;
+        let mut conversations_processed = 0_usize;
+        let mut batch_count = 0_usize;
+
+        loop {
+            let batch_start_conversation_id = last_conversation_id;
+            let conversation_rows = self.conn.query_with_params(
+                "SELECT c.id, c.started_at, a.slug, c.source_id
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 WHERE c.id > ?1
+                 ORDER BY c.id
+                 LIMIT ?2",
+                &params_from_iter([
+                    ParamValue::from(last_conversation_id),
+                    ParamValue::from(DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE as i64),
+                ]),
+            )?;
+            if conversation_rows.is_empty() {
+                break;
+            }
+
+            let mut conversations: Vec<(i64, Option<i64>, String, String)> =
+                Vec::with_capacity(conversation_rows.len());
+            let mut conversation_ids: Vec<i64> = Vec::with_capacity(conversation_rows.len());
+
+            for row in &conversation_rows {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let started_at: Option<i64> = row.get_typed(1)?;
+                let agent_slug: String = row.get_typed(2)?;
+                let source_id: String = row.get_typed(3)?;
+                last_conversation_id = conversation_id;
+                conversation_ids.push(conversation_id);
+                conversations.push((conversation_id, started_at, agent_slug, source_id));
+            }
+
+            let mut message_totals: HashMap<i64, (i64, i64)> =
+                HashMap::with_capacity(conversation_ids.len().max(1));
+            if last_conversation_id > batch_start_conversation_id {
+                let message_rows = self.conn.query_with_params(
+                    "SELECT conversation_id, COUNT(*), COALESCE(SUM(LENGTH(content)), 0)
+                     FROM messages
+                     WHERE conversation_id > ?1 AND conversation_id <= ?2
+                     GROUP BY conversation_id",
+                    &params_from_iter([
+                        ParamValue::from(batch_start_conversation_id),
+                        ParamValue::from(last_conversation_id),
+                    ]),
+                )?;
+                for row in &message_rows {
+                    let conversation_id: i64 = row.get_typed(0)?;
+                    let message_count: i64 = row.get_typed(1)?;
+                    let total_chars: i64 = row.get_typed(2)?;
+                    message_totals.insert(conversation_id, (message_count, total_chars));
+                }
+            }
+
+            for (conversation_id, started_at, agent_slug, source_id) in conversations {
+                let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                let (message_count, total_chars) =
+                    message_totals.remove(&conversation_id).unwrap_or((0, 0));
+                aggregate.record(&agent_slug, &source_id, day_id, message_count, total_chars);
+                conversations_processed += 1;
+            }
+
+            batch_count += 1;
+            if batch_count % 25 == 0 {
+                tracing::info!(
+                    target: "cass::perf::daily_stats",
+                    conversations_processed,
+                    batches = batch_count,
+                    last_conversation_id,
+                    raw_entries = aggregate.raw_entry_count(),
+                    "daily_stats rebuild scan progress"
+                );
+            }
+        }
+
+        let raw_entries = aggregate.raw_entry_count();
+        let entries = aggregate.expand();
+        let expanded_entries = entries.len();
+
         let mut tx = self.conn.transaction()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
-
         tx.execute("DELETE FROM daily_stats")?;
-
-        tx.execute_compat(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  a.slug as agent_slug,
-                  c.source_id,
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ?1 as last_updated
-              FROM conversations c
-              JOIN agents a ON c.agent_id = a.id
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, a.slug, c.source_id",
-            fparams![now],
-        )?;
-
-        tx.execute_compat(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  'all',
-                  c.source_id,
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ?1 as last_updated
-              FROM conversations c
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, c.source_id",
-            fparams![now],
-        )?;
-
-        tx.execute_compat(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  a.slug,
-                  'all',
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ?1 as last_updated
-              FROM conversations c
-              JOIN agents a ON c.agent_id = a.id
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id, a.slug",
-            fparams![now],
-        )?;
-
-        tx.execute_compat(
-            r"INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
-              SELECT
-                  COALESCE(
-                  CASE
-                    WHEN (c.started_at / 1000 - 1577836800) >= 0 THEN (c.started_at / 1000 - 1577836800) / 86400
-                    ELSE (c.started_at / 1000 - 1577836800 - 86399) / 86400
-                  END,
-                0) as day_id,
-                  'all',
-                  'all',
-                  COUNT(DISTINCT c.id) as session_count,
-                  COUNT(m.id) as message_count,
-                  COALESCE(SUM(LENGTH(m.content)), 0) as total_chars,
-                  ?1 as last_updated
-              FROM conversations c
-              LEFT JOIN messages m ON m.conversation_id = c.id
-              GROUP BY day_id",
-            fparams![now],
-        )?;
+        if !entries.is_empty() {
+            franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+        }
 
         let rows_created: i64 =
             tx.query_row_map("SELECT COUNT(*) FROM daily_stats", fparams![], |row| {
@@ -6682,6 +6693,10 @@ impl FrankenStorage {
             target: "cass::perf::daily_stats",
             rows_created,
             total_sessions,
+            conversations_processed,
+            batches = batch_count,
+            raw_entries,
+            expanded_entries,
             "Daily stats rebuilt from conversations"
         );
 
@@ -9267,6 +9282,120 @@ mod tests {
 
         assert_eq!(message_count, conv.messages.len() as i64);
         assert_eq!(fts_count, conv.messages.len() as i64);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_recomputes_materialized_totals_without_monolithic_group_by() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let codex_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let claude_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude".into(),
+                name: "Claude".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        let conv_a = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace-a")),
+            external_id: Some("daily-a".into()),
+            title: Some("Daily A".into()),
+            source_path: PathBuf::from("/tmp/daily-a.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_200),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: "hello".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_100),
+                    content: "response".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let conv_b = Conversation {
+            id: None,
+            agent_slug: "claude".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace-b")),
+            external_id: Some("daily-b".into()),
+            title: Some("Daily B".into()),
+            source_path: PathBuf::from("/tmp/daily-b.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: "abc".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        storage
+            .insert_conversations_batched(&[(codex_id, None, &conv_a), (claude_id, None, &conv_b)])
+            .unwrap();
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 2);
+
+        let health = storage.daily_stats_health().unwrap();
+        assert_eq!(health.conversation_count, 2);
+        assert_eq!(health.materialized_total, 2);
+        assert_eq!(health.drift, 0);
+
+        let total_messages: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT message_count FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(total_messages, 3);
     }
 
     #[test]
