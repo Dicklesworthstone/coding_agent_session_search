@@ -1946,6 +1946,7 @@ dependencies = [
  "chrono",
  "dirs",
  "dotenvy",
+ "fsqlite",
  "once_cell",
  "rusqlite",
  "serde",

@@ -45,6 +45,25 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE NUMBER 2: ABSOLUTELY NO RUSQLITE IN NEW CODE — FRANKENSQLITE ONLY
+
+**THIS IS A HARD, NON-NEGOTIABLE RULE. IT HAS BEEN VIOLATED OVER 10 TIMES AND THE OWNER IS DONE TOLERATING IT.**
+
+- **ALL new SQLite code MUST use `frankensqlite` (`fsqlite`).** This applies to CASS, franken_agent_detection, and ANY project in this ecosystem.
+- **NEVER add `rusqlite` as a dependency.** NEVER write `use rusqlite::`. NEVER use `rusqlite::Connection`. Not even "temporarily." Not even "to match the existing pattern."
+- **The existing rusqlite usage is LEGACY DEBT**, not a pattern to follow. Do NOT copy it. Do NOT extend it.
+- **If frankensqlite is missing a feature you need, FIX FRANKENSQLITE.** It lives at `/data/projects/frankensqlite`. Add the missing API there. That is the entire point of the project.
+- **The frankensqlite API** uses `frankensqlite::Connection`, `fsqlite::compat::{ConnectionExt, RowExt, OpenFlags, open_with_flags, ParamValue}`, and `row.get_typed::<T>(idx)` instead of rusqlite's `row.get(idx)`.
+- **For franken_agent_detection connectors**: use `frankensqlite` with the compat layer. Import pattern:
+  ```rust
+  use frankensqlite::Connection as FrankenConnection;
+  use frankensqlite::compat::{ConnectionExt, RowExt, OpenFlags, open_with_flags, param_slice_to_values};
+  ```
+
+**If you are an AI agent reading this and you write `rusqlite` in new code, you are wasting the owner's time and money. This rule exists because agents have repeatedly ignored it. DO NOT BE THE NEXT ONE.**
+
+---
+
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.

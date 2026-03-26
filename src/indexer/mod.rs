@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use frankensqlite::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -36,6 +36,7 @@ use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     FrankenStorage, HistoricalSalvageOutcome, MigrationError,
+    best_historical_bundle_message_watermark, probe_database_health_via_rusqlite,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{EmbeddingInput, SemanticIndexer};
@@ -738,8 +739,9 @@ fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
 fn should_salvage_historical_databases(
     storage_rebuilt: bool,
     canonical_sessions_before_salvage: usize,
+    has_pending_historical_bundles: bool,
 ) -> bool {
-    storage_rebuilt || canonical_sessions_before_salvage == 0
+    storage_rebuilt || canonical_sessions_before_salvage == 0 || has_pending_historical_bundles
 }
 
 fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i64> {
@@ -758,8 +760,8 @@ fn full_rebuild_requires_historical_restart(
     db_path: &Path,
     canonical_sessions_before_salvage: usize,
 ) -> Result<bool> {
-    let bundle_count = crate::storage::sqlite::discover_historical_database_bundles(db_path).len();
-    if bundle_count == 0 {
+    let bundles = crate::storage::sqlite::discover_historical_database_bundles(db_path);
+    if bundles.is_empty() {
         return Ok(false);
     }
 
@@ -768,27 +770,46 @@ fn full_rebuild_requires_historical_restart(
         return Ok(true);
     }
 
+    let canonical_health = match probe_database_health_via_rusqlite(db_path) {
+        Ok(health) => health,
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "full rebuild could not verify canonical database health via rusqlite; restarting from a fresh canonical database"
+            );
+            return Ok(canonical_sessions_before_salvage > 0);
+        }
+    };
+    if canonical_sessions_before_salvage > 0 && !canonical_health.quick_check_ok {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            "full rebuild detected canonical sqlite quick_check failure; restarting from a fresh canonical database"
+        );
+        return Ok(true);
+    }
+
     let imported = count_meta_entries_like(storage, "historical_bundle_salvaged:%")?;
-    let schema_version: Option<String> = storage
-        .raw()
-        .query_row_map(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .optional()
-        .context("reading canonical meta.schema_version during full rebuild restart probe")?;
-    let fts_rows: i64 = storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            &[] as &[ParamValue],
-            |row| row.get_typed(0),
-        )
-        .context("counting canonical fts_messages rows during full rebuild restart probe")?;
+    let best_historical_watermark = best_historical_bundle_message_watermark(&bundles).unwrap_or(0);
+    let behind_best_historical_bundle = imported > 0
+        && canonical_sessions_before_salvage > 0
+        && best_historical_watermark > canonical_health.max_message_id;
+
+    if behind_best_historical_bundle {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            canonical_max_message_id = canonical_health.max_message_id,
+            best_historical_max_message_id = best_historical_watermark,
+            "full rebuild detected canonical database behind healthiest historical bundle; restarting from a fresh canonical database"
+        );
+    }
 
     Ok(canonical_sessions_before_salvage > 0
-        && (imported == 0 || schema_version.as_deref() != Some("14") || fts_rows != 1))
+        && (imported == 0
+            || canonical_health.schema_version != Some(14)
+            || canonical_health.fts_schema_rows != 1
+            || !canonical_health.fts_queryable
+            || behind_best_historical_bundle))
 }
 
 fn lexical_rebuild_db_state(
@@ -2040,11 +2061,15 @@ pub fn run_index(
         }
 
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
-        let should_salvage_historical =
-            should_salvage_historical_databases(storage_rebuilt, canonical_sessions_before_salvage);
+        let mut has_pending_historical_bundles =
+            storage.has_pending_historical_bundles(&opts.db_path)?;
+        let should_salvage_historical = should_salvage_historical_databases(
+            storage_rebuilt,
+            canonical_sessions_before_salvage,
+            has_pending_historical_bundles,
+        );
         let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
             let mut outcome = HistoricalSalvageOutcome::default();
-            let mut seeded_historical_baseline = false;
             if canonical_sessions_before_salvage == 0 {
                 let (reopened_storage, seed_outcome) =
                     maybe_seed_empty_canonical_from_historical_bundle(storage, &opts.db_path)?;
@@ -2052,15 +2077,16 @@ pub fn run_index(
                 persist::apply_index_writer_busy_timeout(&storage);
                 if let Some(seed_outcome) = seed_outcome {
                     outcome.accumulate(seed_outcome);
-                    seeded_historical_baseline = true;
+                    has_pending_historical_bundles =
+                        storage.has_pending_historical_bundles(&opts.db_path)?;
                 }
             }
-            if !seeded_historical_baseline {
+            if has_pending_historical_bundles {
                 outcome.accumulate(storage.salvage_historical_databases(&opts.db_path)?);
             } else {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
-                    "skipping incremental historical salvage because a baseline bundle seed already populated the canonical database"
+                    "skipping incremental historical salvage because all discoverable historical bundles are already recorded in the canonical database"
                 );
             }
             outcome
@@ -2068,7 +2094,8 @@ pub fn run_index(
             tracing::info!(
                 db_path = %opts.db_path.display(),
                 conversations = canonical_sessions_before_salvage,
-                "skipping historical salvage because canonical database is already populated"
+                pending_historical_bundles = has_pending_historical_bundles,
+                "skipping historical salvage because canonical database is already populated and no additional historical bundles are pending"
             );
             HistoricalSalvageOutcome::default()
         };
@@ -2320,18 +2347,40 @@ pub fn run_index(
     tracing::info!(now_ms, "updated last_indexed_at for status display");
 
     if opts.full {
-        let rebuilt_rows = crate::storage::sqlite::rebuild_fts_via_rusqlite(&opts.db_path)
+        let repair = crate::storage::sqlite::ensure_fts_consistency_via_rusqlite(&opts.db_path)
             .with_context(|| {
                 format!(
-                    "rebuilding stock-compatible FTS table after full index run for {}",
+                    "repairing stock-compatible FTS table after full index run for {}",
                     opts.db_path.display()
                 )
             })?;
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            rebuilt_rows,
-            "rebuilt stock-compatible FTS table after full index run"
-        );
+        match repair {
+            crate::storage::sqlite::FtsConsistencyRepair::AlreadyHealthy { rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    rows,
+                    "stock-compatible FTS table already matched canonical messages after full index run"
+                );
+            }
+            crate::storage::sqlite::FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows,
+            } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    total_rows,
+                    "incrementally repaired missing stock-compatible FTS rows after full index run"
+                );
+            }
+            crate::storage::sqlite::FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    "fully rebuilt stock-compatible FTS table after full index run"
+                );
+            }
+        }
     }
 
     reset_progress_to_idle(opts.progress.as_ref());
@@ -2903,7 +2952,6 @@ pub(crate) fn rebuild_tantivy_from_db(
             format!("creating rebuilt index directory {}", index_path.display())
         })?;
         rebuild_state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
     }
 
     let mut t_index = match TantivyIndex::open_or_create(&index_path) {
@@ -2931,11 +2979,14 @@ pub(crate) fn rebuild_tantivy_from_db(
                 lexical_rebuild_db_state(&storage, db_path)?,
                 LEXICAL_REBUILD_PAGE_SIZE,
             );
-            persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
             TantivyIndex::open_or_create(&index_path)?
         }
         Err(err) => return Err(err),
     };
+
+    if !lexical_rebuild_state_path(&index_path).exists() {
+        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+    }
 
     if let Some(p) = &progress {
         p.phase.store(2, Ordering::Relaxed);
@@ -2997,10 +3048,6 @@ pub(crate) fn rebuild_tantivy_from_db(
             break;
         }
 
-        let batch_conversation_ids: Vec<i64> = batch.iter().filter_map(|conv| conv.id).collect();
-        let mut batch_messages =
-            storage.fetch_messages_for_lexical_rebuild_batch(&batch_conversation_ids)?;
-
         for conv in batch {
             offset = offset.saturating_add(1);
             processed_conversations = processed_conversations.saturating_add(1);
@@ -3012,7 +3059,11 @@ pub(crate) fn rebuild_tantivy_from_db(
                 }
                 continue;
             };
-            let messages = batch_messages.remove(&conv_id).unwrap_or_default();
+            // Querying each conversation separately avoids a pathological
+            // frankensqlite execution path for the batched `IN (...) ORDER BY`
+            // rebuild query that can consume enormous heap before the first
+            // lexical checkpoint is committed.
+            let messages = storage.fetch_messages_for_lexical_rebuild(conv_id)?;
 
             let mut metadata = conv.metadata_json.clone();
             let (kind, host_label) =
@@ -5983,15 +6034,103 @@ mod tests {
 
     #[test]
     fn historical_salvage_decision_skips_populated_canonical_db() {
-        assert!(!should_salvage_historical_databases(false, 1));
-        assert!(!should_salvage_historical_databases(false, 43_678));
+        assert!(!should_salvage_historical_databases(false, 1, false));
+        assert!(!should_salvage_historical_databases(false, 43_678, false));
     }
 
     #[test]
     fn historical_salvage_decision_keeps_empty_or_rebuilt_storage() {
-        assert!(should_salvage_historical_databases(false, 0));
-        assert!(should_salvage_historical_databases(true, 0));
-        assert!(should_salvage_historical_databases(true, 43_678));
+        assert!(should_salvage_historical_databases(false, 0, false));
+        assert!(should_salvage_historical_databases(true, 0, false));
+        assert!(should_salvage_historical_databases(true, 43_678, false));
+    }
+
+    #[test]
+    fn historical_salvage_decision_keeps_populated_canonical_when_more_bundles_are_pending() {
+        assert!(should_salvage_historical_databases(false, 43_678, true));
+    }
+
+    #[test]
+    fn full_rebuild_restart_when_canonical_is_behind_best_historical_bundle() {
+        fn insert_demo_conversation(db_path: &Path, external_id: &str, msg_idx: i64, ts: i64) {
+            let storage = crate::storage::sqlite::SqliteStorage::open(db_path).unwrap();
+            let agent = crate::model::types::Agent {
+                id: None,
+                slug: "tester".into(),
+                name: "Tester".into(),
+                version: None,
+                kind: crate::model::types::AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conv = norm_conv(Some(external_id), vec![norm_msg(msg_idx, ts)]);
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &crate::model::types::Conversation {
+                        id: None,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace: conv.workspace.clone(),
+                        external_id: conv.external_id.clone(),
+                        title: conv.title.clone(),
+                        source_path: conv.source_path.clone(),
+                        started_at: conv.started_at,
+                        ended_at: conv.ended_at,
+                        approx_tokens: None,
+                        metadata_json: conv.metadata.clone(),
+                        messages: conv
+                            .messages
+                            .iter()
+                            .map(|m| crate::model::types::Message {
+                                id: None,
+                                idx: m.idx,
+                                role: crate::model::types::MessageRole::User,
+                                author: m.author.clone(),
+                                created_at: m.created_at,
+                                content: m.content.clone(),
+                                extra_json: m.extra.clone(),
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: "local".to_string(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+            drop(storage);
+            crate::storage::sqlite::rebuild_fts_via_rusqlite(db_path).unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let canonical_db = tmp.path().join("agent_search.db");
+        let backups_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+        let healthy_backup = backups_dir.join("agent_search.db.20260322T020200.bak");
+
+        insert_demo_conversation(&canonical_db, "canonical-only", 0, 1_700_000_000_000);
+        insert_demo_conversation(&healthy_backup, "backup-1", 0, 1_700_000_000_100);
+        insert_demo_conversation(&healthy_backup, "backup-2", 1, 1_700_000_000_200);
+
+        let conn = rusqlite::Connection::open(&canonical_db).unwrap();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+            rusqlite::params![
+                "historical_bundle_salvaged:test",
+                "{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}"
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = FrankenStorage::open(&canonical_db).unwrap();
+        let canonical_sessions = count_total_conversations_exact(&storage).unwrap();
+        assert_eq!(canonical_sessions, 1);
+
+        assert!(
+            full_rebuild_requires_historical_restart(&storage, &canonical_db, canonical_sessions)
+                .unwrap(),
+            "full rebuild should restart from the healthier historical baseline when canonical lags behind it"
+        );
     }
 
     #[test]

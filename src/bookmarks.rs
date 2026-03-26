@@ -158,11 +158,7 @@ impl BookmarkStore {
             ],
         )?;
 
-        let rowid: i64 = self.conn.query_row_map(
-            "SELECT last_insert_rowid()",
-            &[],
-            |row: &frankensqlite::Row| row.get_typed(0),
-        )?;
+        let rowid = self.conn.last_insert_rowid();
         Ok(rowid)
     }
 

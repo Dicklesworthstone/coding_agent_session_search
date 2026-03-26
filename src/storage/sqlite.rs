@@ -706,6 +706,108 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
     Ok(inserted)
 }
 
+fn rusqlite_fts_schema_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        [],
+        |row| row.get(0),
+    )
+    .context("counting sqlite_master rows for fts_messages")
+}
+
+fn rusqlite_fts_limit_probe(conn: &rusqlite::Connection) -> bool {
+    conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
+        .and_then(|mut stmt| stmt.exists([]))
+        .is_ok()
+}
+
+pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "opening rusqlite db at {} for FTS consistency check",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for FTS consistency check at {}",
+                db_path.display()
+            )
+        })?;
+
+    let schema_version = read_meta_schema_version(&conn)?;
+    let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
+    let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
+
+    if schema_version != Some(CURRENT_SCHEMA_VERSION) || !fts_queryable {
+        drop(conn);
+        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+    }
+
+    let total_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .context("counting canonical messages for FTS consistency check")?;
+    let indexed_messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
+        .context("counting canonical FTS rows for FTS consistency check")?;
+
+    if indexed_messages == total_messages {
+        return Ok(FtsConsistencyRepair::AlreadyHealthy {
+            rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
+        });
+    }
+
+    if indexed_messages > total_messages {
+        drop(conn);
+        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+    }
+
+    let mut conn = conn;
+    let tx = conn.transaction().with_context(|| {
+        format!(
+            "starting incremental FTS consistency repair for {}",
+            db_path.display()
+        )
+    })?;
+    let inserted_rows = tx
+        .execute(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             LEFT JOIN fts_messages f ON f.rowid = m.id
+             WHERE f.rowid IS NULL
+             ORDER BY m.rowid",
+            [],
+        )
+        .with_context(|| format!("incrementally repairing missing FTS rows in {}", db_path.display()))?;
+    tx.commit().with_context(|| {
+        format!(
+            "committing incremental FTS consistency repair in {}",
+            db_path.display()
+        )
+    })?;
+
+    let repaired_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
+        .context("counting repaired canonical FTS rows")?;
+    if repaired_rows == total_messages {
+        return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+            inserted_rows,
+            total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+        });
+    }
+
+    drop(conn);
+    let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
+    Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
+}
+
 fn fast_forward_schema_v13_fts_via_rusqlite(db_path: &Path) -> Result<bool> {
     if !db_path.exists() {
         return Ok(false);
@@ -983,6 +1085,39 @@ pub(crate) struct HistoricalDatabaseBundle {
     total_bytes: u64,
     modified_at_ms: i64,
     supports_direct_readonly: bool,
+    probe: HistoricalBundleProbe,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HistoricalBundleProbe {
+    schema_version: Option<i64>,
+    fts_schema_rows: Option<i64>,
+    fts_queryable: bool,
+    max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SqliteDatabaseHealthProbe {
+    pub schema_version: Option<i64>,
+    pub quick_check_ok: bool,
+    pub fts_schema_rows: i64,
+    pub fts_queryable: bool,
+    pub message_count: i64,
+    pub max_message_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsConsistencyRepair {
+    AlreadyHealthy {
+        rows: usize,
+    },
+    IncrementalCatchUp {
+        inserted_rows: usize,
+        total_rows: usize,
+    },
+    Rebuilt {
+        inserted_rows: usize,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1217,11 +1352,18 @@ pub(crate) fn discover_historical_database_bundles(
     let mut bundles: Vec<_> = historical_bundle_root_paths(db_path)
         .into_iter()
         .filter(|root| root.exists())
-        .map(|root_path| HistoricalDatabaseBundle {
-            modified_at_ms: file_mtime_ms(&root_path),
-            total_bytes: bundle_total_bytes(&root_path),
-            supports_direct_readonly: historical_bundle_supports_direct_readonly(&root_path),
-            root_path,
+        .map(|root_path| {
+            let modified_at_ms = file_mtime_ms(&root_path);
+            let total_bytes = bundle_total_bytes(&root_path);
+            let supports_direct_readonly = historical_bundle_supports_direct_readonly(&root_path);
+            let probe = probe_historical_bundle(&root_path, supports_direct_readonly);
+            HistoricalDatabaseBundle {
+                modified_at_ms,
+                total_bytes,
+                supports_direct_readonly,
+                root_path,
+                probe,
+            }
         })
         .filter(|bundle| bundle.total_bytes > 0)
         .collect();
@@ -1243,19 +1385,96 @@ pub(crate) fn discover_historical_database_bundles(
         1
     }
 
+    fn bundle_health_rank(bundle: &HistoricalDatabaseBundle) -> i32 {
+        let clean_schema14_fts = bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
+            && bundle.probe.fts_schema_rows == Some(1)
+            && bundle.probe.fts_queryable;
+        if clean_schema14_fts {
+            return 5;
+        }
+
+        let clean_fts = bundle.probe.fts_schema_rows == Some(1) && bundle.probe.fts_queryable;
+        if clean_fts {
+            return 4;
+        }
+
+        if bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
+            && bundle.supports_direct_readonly
+        {
+            return 3;
+        }
+
+        if bundle.supports_direct_readonly {
+            return 2;
+        }
+
+        1
+    }
+
     bundles.sort_by(|left, right| {
-        bundle_priority(&right.root_path)
-            .cmp(&bundle_priority(&left.root_path))
+        bundle_health_rank(right)
+            .cmp(&bundle_health_rank(left))
+            .then_with(|| right.probe.max_message_id.cmp(&left.probe.max_message_id))
+            .then_with(|| bundle_priority(&right.root_path).cmp(&bundle_priority(&left.root_path)))
             .then_with(|| {
-        right
-            .supports_direct_readonly
-            .cmp(&left.supports_direct_readonly)
+                right
+                    .supports_direct_readonly
+                    .cmp(&left.supports_direct_readonly)
             })
             .then_with(|| right.total_bytes.cmp(&left.total_bytes))
             .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
             .then_with(|| right.root_path.cmp(&left.root_path))
     });
     bundles
+}
+
+pub(crate) fn best_historical_bundle_message_watermark(
+    bundles: &[HistoricalDatabaseBundle],
+) -> Option<i64> {
+    bundles
+        .iter()
+        .filter(|bundle| bundle.supports_direct_readonly)
+        .map(|bundle| bundle.probe.max_message_id)
+        .find(|watermark| *watermark > 0)
+}
+
+fn probe_historical_bundle(
+    root_path: &Path,
+    supports_direct_readonly: bool,
+) -> HistoricalBundleProbe {
+    if !supports_direct_readonly {
+        return HistoricalBundleProbe::default();
+    }
+
+    let Ok(conn) = open_historical_bundle_readonly(root_path) else {
+        return HistoricalBundleProbe::default();
+    };
+
+    let schema_version = read_meta_schema_version(&conn).ok().flatten();
+    let fts_schema_rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let fts_queryable = matches!(fts_schema_rows, Some(1))
+        && conn
+            .prepare("SELECT rowid FROM fts_messages LIMIT 1")
+            .and_then(|mut stmt| stmt.exists([]))
+            .is_ok();
+    let max_message_id = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+
+    HistoricalBundleProbe {
+        schema_version,
+        fts_schema_rows,
+        fts_queryable,
+        max_message_id,
+    }
 }
 
 fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
@@ -1577,6 +1796,61 @@ fn read_meta_schema_version(conn: &rusqlite::Connection) -> Result<Option<i64>> 
         .optional()?
         .and_then(|raw| raw.parse::<i64>().ok());
     Ok(version)
+}
+
+pub(crate) fn probe_database_health_via_rusqlite(
+    db_path: &Path,
+) -> Result<SqliteDatabaseHealthProbe> {
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "opening rusqlite db at {} for database health probe",
+            db_path.display()
+        )
+    })?;
+    conn.execute_batch("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
+            format!(
+                "configuring rusqlite busy timeout for database health probe at {}",
+                db_path.display()
+            )
+        })?;
+
+    let schema_version = read_meta_schema_version(&conn)?;
+    let quick_check_status: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
+    let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
+    let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
+    let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
+
+    if !quick_check_ok {
+        return Ok(SqliteDatabaseHealthProbe {
+            schema_version,
+            quick_check_ok,
+            fts_schema_rows,
+            fts_queryable,
+            message_count: 0,
+            max_message_id: 0,
+        });
+    }
+
+    let message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .context("counting messages during rusqlite database health probe")?;
+    let max_message_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
+            row.get(0)
+        })
+        .context("reading max message id during rusqlite database health probe")?;
+
+    Ok(SqliteDatabaseHealthProbe {
+        schema_version,
+        quick_check_ok,
+        fts_schema_rows,
+        fts_queryable,
+        message_count,
+        max_message_id,
+    })
 }
 
 fn seed_canonical_from_historical_bundle_via_bulk_copy(
@@ -3845,6 +4119,15 @@ impl FrankenStorage {
         Ok(false)
     }
 
+    pub(crate) fn has_pending_historical_bundles(&self, canonical_db_path: &Path) -> Result<bool> {
+        for bundle in discover_historical_database_bundles(canonical_db_path) {
+            if !self.historical_bundle_already_imported(&bundle)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn load_historical_bundle_progress(
         &self,
         bundle: &HistoricalDatabaseBundle,
@@ -4896,11 +5179,16 @@ impl FrankenStorage {
              DO UPDATE SET total_docs=excluded.total_docs",
             fparams![db_path, model_id, total_docs],
         )?;
-        let rows = self.conn.query("SELECT last_insert_rowid();")?;
-        rows.first()
-            .and_then(|r| r.get_typed::<i64>(0).ok())
-            .filter(|&id| id > 0)
-            .with_context(|| "last_insert_rowid() returned NULL or 0 after embedding job INSERT")
+        self.conn
+            .query_row_map(
+                "SELECT id FROM embedding_jobs
+                 WHERE db_path = ?1 AND model_id = ?2 AND status IN ('pending', 'running')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                fparams![db_path, model_id],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "resolving embedding job id after upsert")
     }
 
     /// Mark an embedding job as started.
@@ -5686,9 +5974,8 @@ impl FrankenStorage {
 
 /// Get last_insert_rowid from a frankensqlite transaction.
 fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
-    let rows = tx.query("SELECT last_insert_rowid();")?;
-    rows.first()
-        .and_then(|r| r.get_typed::<i64>(0).ok())
+    tx.last_insert_rowid()
+        .ok()
         .filter(|&id| id > 0)
         .with_context(|| "last_insert_rowid() returned NULL or 0 after INSERT")
 }
@@ -11932,6 +12219,211 @@ mod tests {
                 .any(|path| path.file_name().and_then(|name| name.to_str())
                     == Some("agent_search.rebuild-test.db"))
         );
+    }
+
+    #[test]
+    fn discover_historical_database_bundles_prefers_healthy_backup_over_replay_priority() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        fs::write(&canonical_db, b"canonical").unwrap();
+
+        let replay_dir = dir
+            .path()
+            .join("repair-lab")
+            .join("replay-20260324T070101Z");
+        fs::create_dir_all(&replay_dir).unwrap();
+        let replay_db = replay_dir.join("agent_search.db");
+        let replay_storage = SqliteStorage::open(&replay_db).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = replay_storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("replay-conv".into()),
+            title: Some("Replay bundle".into()),
+            source_path: PathBuf::from("/tmp/replay.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "replay message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        replay_storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(replay_storage);
+
+        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+        let replay_legacy = rusqlite::Connection::open(&replay_db).unwrap();
+        replay_legacy
+            .execute_batch(
+                "DROP TABLE IF EXISTS fts_messages;
+                 UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                 DELETE FROM _schema_migrations WHERE version = 14;
+                 PRAGMA writable_schema = ON;",
+            )
+            .unwrap();
+        replay_legacy
+            .execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [duplicate_legacy_fts_sql],
+            )
+            .unwrap();
+        replay_legacy
+            .execute_batch(
+                "PRAGMA writable_schema = OFF;
+                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+                     content,
+                     title,
+                     agent,
+                     workspace,
+                     source_path,
+                     created_at UNINDEXED,
+                     message_id UNINDEXED,
+                     tokenize='porter'
+                 );
+                 INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
+                 SELECT
+                     m.content,
+                     c.title,
+                     a.slug,
+                     w.path,
+                     c.source_path,
+                     m.created_at,
+                     m.id
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id;",
+            )
+            .unwrap();
+        drop(replay_legacy);
+
+        let backups_dir = dir.path().join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+        let clean_backup = backups_dir.join("agent_search.db.20260322T020200.bak");
+        let clean_storage = SqliteStorage::open(&clean_backup).unwrap();
+        let clean_agent_id = clean_storage.ensure_agent(&agent).unwrap();
+        clean_storage
+            .insert_conversation_tree(clean_agent_id, None, &conversation)
+            .unwrap();
+        drop(clean_storage);
+
+        let bundles = discover_historical_database_bundles(&canonical_db);
+        let ordered_paths: Vec<PathBuf> = bundles
+            .iter()
+            .map(|bundle| bundle.root_path.clone())
+            .collect();
+
+        assert_eq!(ordered_paths[0], clean_backup);
+        assert_eq!(ordered_paths[1], replay_db);
+        assert_eq!(
+            bundles[0].probe.schema_version,
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
+        assert!(bundles[0].probe.fts_queryable);
+        assert_eq!(bundles[1].probe.schema_version, Some(13));
+        assert_eq!(bundles[1].probe.fts_schema_rows, Some(2));
+    }
+
+    #[test]
+    fn ensure_fts_consistency_via_rusqlite_catches_up_missing_rows() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-catchup.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("fts-catchup".into()),
+            title: Some("FTS catchup".into()),
+            source_path: PathBuf::from("/tmp/fts-catchup.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_050),
+                content: "initial message".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(storage);
+
+        rebuild_fts_via_rusqlite(&db_path).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conversation_id: i64 = conn
+            .query_row("SELECT id FROM conversations LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+             VALUES(2, ?1, 1, 'assistant', 'assistant', 1700000000060, 'authentication catchup', NULL, NULL)",
+            rusqlite::params![conversation_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repair = ensure_fts_consistency_via_rusqlite(&db_path).unwrap();
+        assert_eq!(
+            repair,
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 1,
+                total_rows: 2
+            }
+        );
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let auth_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'authentication'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auth_hits, 1);
     }
 
     // =========================================================================
