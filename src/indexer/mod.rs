@@ -628,6 +628,17 @@ fn persist_lexical_rebuild_state(index_path: &Path, state: &LexicalRebuildState)
     write_json_pretty_atomically(&path, state)
 }
 
+fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
+    let path = lexical_rebuild_state_path(index_path);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("removing lexical rebuild state {}", path.display()))
+        }
+    }
+}
+
 fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
     let meta_path = index_path.join("meta.json");
     match fs::read(&meta_path) {
@@ -683,14 +694,25 @@ fn count_total_messages(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
+fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
+    let total_conversations: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM conversations",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("counting canonical conversations for lexical rebuild state")?;
+    Ok(usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX))
+}
+
 fn lexical_rebuild_db_state(
     storage: &FrankenStorage,
     db_path: &Path,
-    total_conversations: usize,
 ) -> Result<LexicalRebuildDbState> {
     Ok(LexicalRebuildDbState {
         db_path: db_path.to_string_lossy().into_owned(),
-        total_conversations,
+        total_conversations: count_total_conversations_exact(storage)?,
         total_messages: count_total_messages(storage)?,
     })
 }
@@ -703,6 +725,81 @@ fn has_pending_lexical_rebuild(
         return Ok(false);
     };
     Ok(state.matches_run(db_state, LEXICAL_REBUILD_PAGE_SIZE) && state.is_incomplete())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct LexicalRebuildSnapshot {
+    pub db_path: String,
+    pub total_conversations: usize,
+    pub total_messages: usize,
+    pub committed_offset: i64,
+    pub processed_conversations: usize,
+    pub indexed_docs: usize,
+    pub completed: bool,
+    pub updated_at_ms: i64,
+}
+
+pub(crate) fn load_lexical_rebuild_snapshot(
+    index_path: &Path,
+    db_path: &Path,
+) -> Result<Option<LexicalRebuildSnapshot>> {
+    let Some(state) = load_lexical_rebuild_state(index_path)? else {
+        return Ok(None);
+    };
+
+    if state.completed || state.db.db_path != db_path.to_string_lossy() {
+        return Ok(None);
+    }
+
+    Ok(Some(LexicalRebuildSnapshot {
+        db_path: state.db.db_path,
+        total_conversations: state.db.total_conversations,
+        total_messages: state.db.total_messages,
+        committed_offset: state.committed_offset,
+        processed_conversations: state.processed_conversations,
+        indexed_docs: state.indexed_docs,
+        completed: state.completed,
+        updated_at_ms: state.updated_at_ms,
+    }))
+}
+
+fn repair_daily_stats_if_drifted(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
+    let health = storage.daily_stats_health().with_context(|| {
+        format!(
+            "checking daily_stats health before index planning for {}",
+            db_path.display()
+        )
+    })?;
+
+    if health.populated && health.drift == 0 {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        db_path = %db_path.display(),
+        populated = health.populated,
+        row_count = health.row_count,
+        conversation_count = health.conversation_count,
+        materialized_total = health.materialized_total,
+        drift = health.drift,
+        "daily_stats is missing or drifted; rebuilding from canonical conversations"
+    );
+
+    let rebuilt = storage.rebuild_daily_stats().with_context(|| {
+        format!(
+            "rebuilding daily_stats before index planning for {}",
+            db_path.display()
+        )
+    })?;
+
+    tracing::info!(
+        db_path = %db_path.display(),
+        rows_created = rebuilt.rows_created,
+        total_sessions = rebuilt.total_sessions,
+        "rebuilt daily_stats before index planning"
+    );
+
+    Ok(())
 }
 
 // =============================================================================
@@ -1728,20 +1825,19 @@ pub fn run_index(
     let mut storage = storage;
     persist::apply_index_writer_busy_timeout(&storage);
     let index_path = index_dir(&opts.data_dir)?;
-    let initial_canonical_sessions_before_salvage =
-        storage.count_sessions_in_range(None, None, None, None)?.0;
-    let initial_canonical_sessions_before_salvage =
-        usize::try_from(initial_canonical_sessions_before_salvage.max(0)).unwrap_or(usize::MAX);
+    let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     let resume_lexical_rebuild = if initial_canonical_sessions_before_salvage > 0 {
-        let db_state = lexical_rebuild_db_state(
-            &storage,
-            &opts.db_path,
-            initial_canonical_sessions_before_salvage,
-        )?;
+        let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
         has_pending_lexical_rebuild(&index_path, &db_state)?
     } else {
         false
     };
+    if opts.full && !resume_lexical_rebuild {
+        clear_lexical_rebuild_state(&index_path)?;
+    }
+    if opts.full {
+        repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+    }
     let mut performed_scan = false;
 
     // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
@@ -1827,10 +1923,7 @@ pub fn run_index(
             t_index.commit()?;
         }
 
-        let canonical_sessions_before_salvage =
-            storage.count_sessions_in_range(None, None, None, None)?.0;
-        let canonical_sessions_before_salvage =
-            usize::try_from(canonical_sessions_before_salvage.max(0)).unwrap_or(usize::MAX);
+        let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
         let should_salvage_historical =
             opts.full || storage_rebuilt || canonical_sessions_before_salvage == 0;
         let historical_salvage: HistoricalSalvageOutcome = if should_salvage_historical {
@@ -1857,6 +1950,9 @@ pub fn run_index(
                 "historical cass bundles merged into canonical database before scan"
             );
         }
+        if opts.full || historical_salvage.conversations_imported > 0 {
+            repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+        }
 
         let rebuild_from_canonical_only = opts.full
             && initial_canonical_sessions_before_salvage > 0
@@ -1871,12 +1967,11 @@ pub fn run_index(
         }
 
         if rebuild_from_canonical_only {
-            let total_conversations = storage.count_sessions_in_range(None, None, None, None)?.0;
             drop(t_index);
             rebuild_tantivy_from_db(
                 &opts.db_path,
                 &opts.data_dir,
-                usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+                count_total_conversations_exact(&storage)?,
                 opts.progress.clone(),
             )?;
             t_index = TantivyIndex::open_or_create(&index_path)?;
@@ -1928,13 +2023,11 @@ pub fn run_index(
             t_index.commit()?;
 
             if opts.full || historical_salvage.messages_imported > 0 {
-                let total_conversations =
-                    storage.count_sessions_in_range(None, None, None, None)?.0;
                 drop(t_index);
                 rebuild_tantivy_from_db(
                     &opts.db_path,
                     &opts.data_dir,
-                    usize::try_from(total_conversations.max(0)).unwrap_or(usize::MAX),
+                    count_total_conversations_exact(&storage)?,
                     opts.progress.clone(),
                 )?;
                 t_index = TantivyIndex::open_or_create(&index_path)?;
@@ -2537,7 +2630,7 @@ fn maybe_seed_empty_canonical_from_historical_bundle(
     storage: FrankenStorage,
     db_path: &Path,
 ) -> Result<(FrankenStorage, Option<HistoricalSalvageOutcome>)> {
-    let conversation_count = storage.count_sessions_in_range(None, None, None, None)?.0;
+    let conversation_count = count_total_conversations_exact(&storage)?;
     if conversation_count > 0 {
         return Ok((storage, None));
     }
@@ -2621,7 +2714,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     }
 
     let index_path = index_dir(data_dir)?;
-    let db_state = lexical_rebuild_db_state(&storage, db_path, total_conversations)?;
+    let db_state = lexical_rebuild_db_state(&storage, db_path)?;
     let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
         Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
             reconcile_pending_lexical_commit(&index_path, state)?
@@ -2677,7 +2770,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                 )
             })?;
             rebuild_state = LexicalRebuildState::new(
-                lexical_rebuild_db_state(&storage, db_path, total_conversations)?,
+                lexical_rebuild_db_state(&storage, db_path)?,
                 LEXICAL_REBUILD_PAGE_SIZE,
             );
             persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
@@ -3114,6 +3207,7 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool)>(
     Ok(())
 }
 
+#[cfg(test)]
 fn reset_storage(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
     // Wrap the canonical-table reset in a transaction so partial clears roll back.
     // The derived FTS table is recreated explicitly afterward because the
@@ -5605,6 +5699,69 @@ mod tests {
     }
 
     #[test]
+    fn repair_daily_stats_if_drifted_rebuilds_materialized_totals() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some("daily-stats-repair".into()),
+            title: Some("repair".into()),
+            source_path: std::path::PathBuf::from("/tmp/repair.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO daily_stats(day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+                 VALUES(0, 'all', 'all', 99, 99, 99, 0)",
+            )
+            .unwrap();
+
+        let before = storage.daily_stats_health().unwrap();
+        assert_eq!(before.materialized_total, 99);
+        assert!(before.drift > 0);
+
+        repair_daily_stats_if_drifted(&storage, &db_path).unwrap();
+        let after = storage.daily_stats_health().unwrap();
+        assert_eq!(after.conversation_count, 1);
+        assert_eq!(after.materialized_total, 1);
+        assert_eq!(after.drift, 0);
+    }
+
+    #[test]
     fn reopen_fresh_storage_for_full_rebuild_preserves_backup_and_starts_empty() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
@@ -6779,6 +6936,35 @@ mod tests {
         assert_eq!(reconciled.indexed_docs, 250);
         assert!(reconciled.pending.is_none());
         assert!(has_pending_lexical_rebuild(&index_path, &db_state).unwrap());
+    }
+
+    #[test]
+    fn clear_lexical_rebuild_state_removes_stale_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                total_messages: 34,
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        assert!(
+            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
+                .unwrap()
+                .is_some()
+        );
+
+        clear_lexical_rebuild_state(&index_path).unwrap();
+        assert!(
+            load_lexical_rebuild_snapshot(&index_path, Path::new("/tmp/agent_search.db"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

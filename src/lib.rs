@@ -22,11 +22,12 @@ use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use fs2::FileExt;
 use indexer::IndexOptions;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -4405,6 +4406,57 @@ fn probe_state_db(
     snapshot
 }
 
+#[derive(Debug, Default)]
+struct IndexRunSnapshot {
+    active: bool,
+    pid: Option<u32>,
+    started_at_ms: Option<i64>,
+}
+
+fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
+    let lock_path = data_dir.join("index-run.lock");
+    let mut file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(_) => return IndexRunSnapshot::default(),
+    };
+
+    let mut raw = String::new();
+    let _ = file.read_to_string(&mut raw);
+
+    let mut pid = None;
+    let mut started_at_ms = None;
+    let mut lock_db_path = None::<String>;
+    for line in raw.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "pid" => pid = value.trim().parse::<u32>().ok(),
+            "started_at_ms" => started_at_ms = value.trim().parse::<i64>().ok(),
+            "db_path" => lock_db_path = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    if lock_db_path.as_deref() != Some(db_path.to_string_lossy().as_ref()) {
+        return IndexRunSnapshot::default();
+    }
+
+    let active = match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    };
+
+    IndexRunSnapshot {
+        active,
+        pid,
+        started_at_ms,
+    }
+}
+
 fn state_meta_json(
     data_dir: &Path,
     db_path: &Path,
@@ -4420,14 +4472,23 @@ fn state_meta_json(
     let index_exists = index_path.exists();
     let db_exists = db_path.exists();
     let watch_state_path = data_dir.join("watch_state.json");
+    let rebuild_snapshot = crate::indexer::load_lexical_rebuild_snapshot(&index_path, db_path)
+        .ok()
+        .flatten();
+    let index_run = probe_index_run_lock(data_dir, db_path);
+    let rebuild_active = index_run.active && rebuild_snapshot.is_some();
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let db_size_bytes = fs::metadata(db_path).map(|m| m.len()).ok();
+    let include_counts = db_size_bytes
+        .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
+        .unwrap_or(false);
     let db_snapshot = if allow_db_open && db_exists {
-        probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, false)
+        probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
     } else {
         StateDbSnapshot::default()
     };
@@ -4474,6 +4535,9 @@ fn state_meta_json(
         Some(age) => age > stale_threshold,
     };
     let fresh = index_exists && !is_stale;
+    let rebuild_updated_at = rebuild_snapshot
+        .as_ref()
+        .and_then(|snapshot| (snapshot.updated_at_ms > 0).then_some(snapshot.updated_at_ms));
 
     let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -4490,7 +4554,13 @@ fn state_meta_json(
             }),
             "age_seconds": index_age_secs,
             "stale": is_stale,
-            "stale_threshold_seconds": stale_threshold
+            "stale_threshold_seconds": stale_threshold,
+            "rebuilding": rebuild_active,
+            "activity_at": rebuild_updated_at.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            })
         },
         "database": {
             "exists": db_exists,
@@ -4503,6 +4573,27 @@ fn state_meta_json(
         "pending": {
             "sessions": pending_sessions,
             "watch_active": watch_state_path.exists()
+        },
+        "rebuild": {
+            "active": rebuild_active,
+            "pid": index_run.pid,
+            "started_at": index_run.started_at_ms.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "updated_at": rebuild_updated_at.map(|ts| {
+                chrono::DateTime::from_timestamp_millis(ts)
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339()
+            }),
+            "processed_conversations": rebuild_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.processed_conversations),
+            "total_conversations": rebuild_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.total_conversations),
+            "indexed_docs": rebuild_snapshot.as_ref().map(|snapshot| snapshot.indexed_docs)
         },
         "_meta": {
             "timestamp": ts_str,
@@ -4522,6 +4613,7 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "age_seconds": index.get("age_seconds"),
         "stale": index.get("stale"),
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
+        "rebuilding": index.get("rebuilding"),
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
 }
@@ -8229,66 +8321,73 @@ fn run_status(
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Use the actual versioned index path (index/v4, not tantivy_index)
-    let index_path = crate::search::tantivy::index_dir(&data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
-    let watch_state_path = data_dir.join("watch_state.json");
+    let state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
 
-    // Check if database exists
-    let db_exists = db_path.exists();
-    let index_exists = index_path.exists();
-
-    // Get current timestamp
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+    let index_exists = state
+        .get("index")
+        .and_then(|i| i.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_fresh = state
+        .get("index")
+        .and_then(|i| i.get("fresh"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_age_secs = state
+        .get("index")
+        .and_then(|i| i.get("age_seconds"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let is_stale = state
+        .get("index")
+        .and_then(|i| i.get("stale"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let rebuild_processed = state
+        .get("rebuild")
+        .and_then(|r| r.get("processed_conversations"))
+        .and_then(|v| v.as_u64());
+    let rebuild_total = state
+        .get("rebuild")
+        .and_then(|r| r.get("total_conversations"))
+        .and_then(|v| v.as_u64());
+    let db_exists = state
+        .get("database")
+        .and_then(|d| d.get("exists"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_opened = state
+        .get("database")
+        .and_then(|d| d.get("opened"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_open_error = state
+        .get("database")
+        .and_then(|d| d.get("open_error"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let counts_skipped = state
+        .get("database")
+        .and_then(|d| d.get("counts_skipped"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let pending_sessions = state
+        .get("pending")
+        .and_then(|p| p.get("sessions"))
+        .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Default values if db doesn't exist
-    let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).ok();
-    let include_counts = db_size_bytes
-        .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
-        .unwrap_or(false);
-    let db_snapshot = if db_exists {
-        probe_state_db(&db_path, "status", STATE_DB_OPEN_TIMEOUT, include_counts)
-    } else {
-        StateDbSnapshot::default()
-    };
-    let conversation_count = db_snapshot.conversation_count;
-    let message_count = db_snapshot.message_count;
-    let last_indexed_at = db_snapshot.last_indexed_at;
-    let db_opened = db_snapshot.opened;
-    let db_open_error = db_snapshot.open_error;
-    let counts_skipped = db_snapshot.counts_skipped;
-
-    // Calculate index age and staleness
-    let index_age_secs = last_indexed_at.map(|ts| {
-        let ts_secs = ts / 1000; // Convert millis to secs
-        now_secs.saturating_sub(ts_secs.max(0) as u64)
-    });
-    let is_stale = match index_age_secs {
-        None => true,
-        Some(age) => age > stale_threshold,
-    };
-
-    // Check for pending sessions from watch_state.json
-    let pending_sessions = if watch_state_path.exists() {
-        std::fs::read_to_string(&watch_state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|v| v.get("pending_count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    // Determine overall health
-    let healthy = db_exists && db_opened && index_exists && !is_stale;
-    let status = if healthy {
+    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
         "healthy"
     } else if db_exists && !db_opened {
         "degraded"
@@ -8297,7 +8396,9 @@ fn run_status(
     };
 
     // Build recommended action
-    let recommended_action = if !db_exists {
+    let recommended_action = if rebuild_active {
+        Some("Index rebuild is already in progress".to_string())
+    } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_opened {
         Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
@@ -8330,49 +8431,37 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
-        let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "index": {
-                "exists": index_exists,
-                "fresh": !is_stale,
-                "last_indexed_at": last_indexed_at.map(|ts| {
-                    chrono::DateTime::from_timestamp_millis(ts)
-                        .map(|d| d.to_rfc3339())
-                }),
-                "age_seconds": index_age_secs,
-                "stale": is_stale,
-                "stale_threshold_seconds": stale_threshold,
-            },
-            "database": {
+            "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            "database": serde_json::json!({
                 "exists": db_exists,
                 "opened": db_opened,
-                "conversations": state_db_count_json(conversation_count, counts_skipped),
-                "messages": state_db_count_json(message_count, counts_skipped),
+                "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
+                "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
                 "path": db_path.display().to_string(),
                 "open_error": db_open_error,
                 "counts_skipped": counts_skipped,
-            },
-            "pending": {
-                "sessions": pending_sessions,
-                "watch_active": watch_state_path.exists(),
-            },
+            }),
+            "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "recommended_action": recommended_action,
-            "_meta": {
-                "timestamp": ts_str,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-            },
+            "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
     }
 
-    // Human-readable output
-    let status_icon = if healthy { "✓" } else { "!" };
-    let status_word = if healthy {
+    let status_icon = if healthy {
+        "✓"
+    } else if rebuild_active {
+        "~"
+    } else {
+        "!"
+    };
+    let status_word = if rebuild_active {
+        "Rebuilding"
+    } else if healthy {
         "Healthy"
     } else {
         "Attention needed"
@@ -8384,7 +8473,7 @@ fn run_status(
     // Index info
     println!("Index:");
     if index_exists {
-        if let Some(age) = index_age_secs {
+        if let Some(age) = index_age_secs.as_u64() {
             let age_str = if age < 60 {
                 format!("{age} seconds ago")
             } else if age < 3600 {
@@ -8399,6 +8488,14 @@ fn run_status(
         } else {
             println!("  Last indexed: unknown");
         }
+        if rebuild_active {
+            match (rebuild_processed, rebuild_total) {
+                (Some(processed), Some(total)) => {
+                    println!("  Rebuild progress: {processed}/{total} conversations committed");
+                }
+                _ => println!("  Rebuild progress: in progress"),
+            }
+        }
     } else {
         println!("  Not found - run 'cass index --full'");
     }
@@ -8411,8 +8508,20 @@ fn run_status(
             if counts_skipped {
                 println!("  Counts skipped for fast status on large database");
             } else {
-                println!("  Conversations: {conversation_count}");
-                println!("  Messages: {message_count}");
+                if let Some(conversations) = state
+                    .get("database")
+                    .and_then(|d| d.get("conversations"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Conversations: {conversations}");
+                }
+                if let Some(messages) = state
+                    .get("database")
+                    .and_then(|d| d.get("messages"))
+                    .and_then(|v| v.as_i64())
+                {
+                    println!("  Messages: {messages}");
+                }
             }
         } else {
             println!("  Exists, but could not be opened");
@@ -8468,6 +8577,11 @@ fn run_health(
         .and_then(|i| i.get("fresh"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let db_exists = state
         .get("database")
         .and_then(|d| d.get("exists"))
@@ -8490,12 +8604,8 @@ fn run_health(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // Core operational health: the DB must exist AND be openable.
-    // A DB that exists on disk but cannot be opened (e.g. WAL corruption) is NOT healthy.
-    // Freshness and pending sessions are informational but don't block basic operation.
-    // If DB exists but couldn't be opened, it is degraded.
     let db_degraded = db_exists && !db_opened;
-    let healthy = db_exists && db_opened && index_exists;
+    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
@@ -8508,9 +8618,17 @@ fn run_health(
     if !index_exists {
         errors.push("index not found".to_string());
     }
+    if !index_fresh {
+        errors.push("index stale".to_string());
+    }
+    if rebuild_active {
+        errors.push("index rebuild in progress".to_string());
+    }
 
     // Determine status string for structured output.
-    let status = if healthy {
+    let status = if rebuild_active {
+        "rebuilding"
+    } else if healthy {
         "healthy"
     } else if db_degraded {
         "degraded"
@@ -8558,13 +8676,12 @@ fn run_health(
         output_structured_value(payload, fmt)?;
     } else if healthy {
         println!("✓ Healthy ({latency_ms}ms)");
-        // Show informational warnings even when healthy
-        if !index_fresh {
-            println!("  Note: index stale (older than {}s)", stale_threshold);
-        }
         if pending_sessions > 0 {
             println!("  Note: {pending_sessions} sessions pending reindex");
         }
+    } else if rebuild_active {
+        println!("~ Rebuilding ({latency_ms}ms)");
+        println!("  - index rebuild is in progress");
     } else if db_degraded {
         println!("⚠ Degraded ({latency_ms}ms) - database exists but could not be opened");
         for err in &errors {
@@ -8584,6 +8701,14 @@ fn run_health(
 
     if healthy {
         Ok(())
+    } else if rebuild_active {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: "Index rebuild is still in progress".to_string(),
+            hint: Some("Wait for the active 'cass index' run to finish.".to_string()),
+            retryable: true,
+        })
     } else if db_degraded {
         Err(CliError {
             code: 1,
@@ -9085,6 +9210,7 @@ mod doctor_fts_tests {
 mod cli_read_db_tests {
     use super::*;
     use crate::storage::sqlite::FrankenStorage;
+    use fs2::FileExt;
     use tempfile::TempDir;
 
     fn seed_cli_db() -> (TempDir, PathBuf) {
@@ -9129,6 +9255,63 @@ mod cli_read_db_tests {
             "state probe should not report an error: {:?}",
             snapshot.open_error
         );
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "total_messages": 42
+                },
+                "page_size": 200,
+                "committed_offset": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": false,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
     }
 }
 
