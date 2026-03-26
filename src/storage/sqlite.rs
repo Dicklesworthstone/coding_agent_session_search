@@ -3369,6 +3369,51 @@ impl FrankenStorage {
             .with_context(|| "listing conversations")
     }
 
+    /// List conversations in primary-key order for full lexical rebuilds.
+    ///
+    /// This avoids the user-facing recency sort, which forces SQLite to build a
+    /// temp B-tree on every page. Rebuilds only need a stable traversal order,
+    /// not reverse-chronological presentation.
+    pub fn list_conversations_for_lexical_rebuild(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Conversation>> {
+        self.conn
+            .query_map_collect(
+                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
+                       c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                       c.source_id, c.origin_host, c.metadata_bin
+                FROM conversations c
+                JOIN agents a ON c.agent_id = a.id
+                LEFT JOIN workspaces w ON c.workspace_id = w.id
+                ORDER BY c.id ASC
+                LIMIT ?1 OFFSET ?2",
+                fparams![limit, offset],
+                |row| {
+                    let workspace_path: Option<String> = row.get_typed(2)?;
+                    let source_path: String = row.get_typed(5)?;
+                    let source_id: Option<String> = row.get_typed(10)?;
+                    Ok(Conversation {
+                        id: Some(row.get_typed(0)?),
+                        agent_slug: row.get_typed(1)?,
+                        workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
+                        external_id: row.get_typed(3)?,
+                        title: row.get_typed(4)?,
+                        source_path: Path::new(&source_path).to_path_buf(),
+                        started_at: row.get_typed(6)?,
+                        ended_at: row.get_typed(7)?,
+                        approx_tokens: row.get_typed(8)?,
+                        metadata_json: franken_read_metadata_compat(row, 9, 12),
+                        messages: Vec::new(),
+                        source_id: source_id.unwrap_or_else(|| "local".to_string()),
+                        origin_host: row.get_typed(11)?,
+                    })
+                },
+            )
+            .with_context(|| "listing conversations for lexical rebuild")
+    }
+
     /// Fetch messages for a conversation.
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
         self.conn
@@ -6586,16 +6631,49 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
-        const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 400;
+        const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
+        const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
 
-        let mut aggregate = StatsAggregator::new();
+        let mut conversation_batch_size = rebuild_batch_size_env(
+            "CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE",
+            DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE,
+        );
+        let mut message_batch_size = rebuild_batch_size_env(
+            "CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE",
+            DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE,
+        );
+
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        let message_metrics_rows: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        let use_message_metrics = total_messages > 0 && total_messages == message_metrics_rows;
+
+        tracing::info!(
+            target: "cass::perf::daily_stats",
+            total_messages,
+            message_metrics_rows,
+            use_message_metrics,
+            "daily_stats rebuild selected message source"
+        );
+
+        let mut tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM daily_stats")?;
+
         let mut last_conversation_id = 0_i64;
+        let mut conversation_batch_count = 0_usize;
         let mut conversations_processed = 0_usize;
-        let mut batch_count = 0_usize;
+        let mut raw_entries_flushed = 0_usize;
+        let mut expanded_entries_flushed = 0_usize;
 
         loop {
-            let batch_start_conversation_id = last_conversation_id;
-            let conversation_rows = self.conn.query_with_params(
+            let conversation_rows = match self.conn.query_with_params(
                 "SELECT c.id, c.started_at, a.slug, c.source_id
                  FROM conversations c
                  JOIN agents a ON c.agent_id = a.id
@@ -6604,77 +6682,141 @@ impl FrankenStorage {
                  LIMIT ?2",
                 &params_from_iter([
                     ParamValue::from(last_conversation_id),
-                    ParamValue::from(DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE as i64),
+                    ParamValue::from(conversation_batch_size as i64),
                 ]),
-            )?;
+            ) {
+                Ok(rows) => rows,
+                Err(err) if is_out_of_memory_error(&err) && conversation_batch_size > 1 => {
+                    let previous_batch_size = conversation_batch_size;
+                    conversation_batch_size = (conversation_batch_size / 2).max(1);
+                    tracing::warn!(
+                        previous_batch_size,
+                        conversation_batch_size,
+                        last_conversation_id,
+                        "daily_stats conversation scan ran out of memory; retrying with smaller batch"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             if conversation_rows.is_empty() {
                 break;
             }
 
-            let mut conversations: Vec<(i64, Option<i64>, String, String)> =
-                Vec::with_capacity(conversation_rows.len());
-            let mut conversation_ids: Vec<i64> = Vec::with_capacity(conversation_rows.len());
-
+            let mut aggregate = StatsAggregator::new();
             for row in &conversation_rows {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let started_at: Option<i64> = row.get_typed(1)?;
                 let agent_slug: String = row.get_typed(2)?;
                 let source_id: String = row.get_typed(3)?;
                 last_conversation_id = conversation_id;
-                conversation_ids.push(conversation_id);
-                conversations.push((conversation_id, started_at, agent_slug, source_id));
-            }
-
-            let mut message_totals: HashMap<i64, (i64, i64)> =
-                HashMap::with_capacity(conversation_ids.len().max(1));
-            if last_conversation_id > batch_start_conversation_id {
-                let message_rows = self.conn.query_with_params(
-                    "SELECT conversation_id, COUNT(*), COALESCE(SUM(LENGTH(content)), 0)
-                     FROM messages
-                     WHERE conversation_id > ?1 AND conversation_id <= ?2
-                     GROUP BY conversation_id",
-                    &params_from_iter([
-                        ParamValue::from(batch_start_conversation_id),
-                        ParamValue::from(last_conversation_id),
-                    ]),
-                )?;
-                for row in &message_rows {
-                    let conversation_id: i64 = row.get_typed(0)?;
-                    let message_count: i64 = row.get_typed(1)?;
-                    let total_chars: i64 = row.get_typed(2)?;
-                    message_totals.insert(conversation_id, (message_count, total_chars));
-                }
-            }
-
-            for (conversation_id, started_at, agent_slug, source_id) in conversations {
                 let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
-                let (message_count, total_chars) =
-                    message_totals.remove(&conversation_id).unwrap_or((0, 0));
-                aggregate.record(&agent_slug, &source_id, day_id, message_count, total_chars);
+                aggregate.record_delta(&agent_slug, &source_id, day_id, 1, 0, 0);
                 conversations_processed += 1;
             }
 
-            batch_count += 1;
-            if batch_count % 25 == 0 {
+            conversation_batch_count += 1;
+            raw_entries_flushed += aggregate.raw_entry_count();
+            let entries = aggregate.expand();
+            expanded_entries_flushed += entries.len();
+            if !entries.is_empty() {
+                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+            }
+            if conversation_batch_count % 25 == 0 {
                 tracing::info!(
                     target: "cass::perf::daily_stats",
                     conversations_processed,
-                    batches = batch_count,
+                    batches = conversation_batch_count,
+                    batch_size = conversation_batch_size,
                     last_conversation_id,
-                    raw_entries = aggregate.raw_entry_count(),
-                    "daily_stats rebuild scan progress"
+                    "daily_stats rebuild conversation scan progress"
                 );
             }
         }
 
-        let raw_entries = aggregate.raw_entry_count();
-        let entries = aggregate.expand();
-        let expanded_entries = entries.len();
+        let mut last_message_id = 0_i64;
+        let mut messages_processed = 0_usize;
+        let mut message_batch_count = 0_usize;
+        let message_scan_sql = if use_message_metrics {
+            "SELECT mm.message_id, c.started_at, a.slug, c.source_id, mm.content_chars
+             FROM message_metrics mm
+             JOIN messages m ON m.id = mm.message_id
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             WHERE mm.message_id > ?1
+             ORDER BY mm.message_id
+             LIMIT ?2"
+        } else {
+            "SELECT m.id, c.started_at, a.slug, c.source_id, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+             FROM messages m
+             JOIN conversations c ON m.conversation_id = c.id
+             JOIN agents a ON c.agent_id = a.id
+             WHERE m.id > ?1
+             ORDER BY m.id
+             LIMIT ?2"
+        };
 
-        let mut tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM daily_stats")?;
-        if !entries.is_empty() {
-            franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+        loop {
+            let message_rows = match self.conn.query_with_params(
+                message_scan_sql,
+                &params_from_iter([
+                    ParamValue::from(last_message_id),
+                    ParamValue::from(message_batch_size as i64),
+                ]),
+            ) {
+                Ok(rows) => rows,
+                Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
+                    let previous_batch_size = message_batch_size;
+                    message_batch_size = (message_batch_size / 2).max(1);
+                    tracing::warn!(
+                        previous_batch_size,
+                        message_batch_size,
+                        last_message_id,
+                        "daily_stats message scan ran out of memory; retrying with smaller batch"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if message_rows.is_empty() {
+                break;
+            }
+
+            let mut aggregate = StatsAggregator::new();
+            for row in &message_rows {
+                let message_id: i64 = row.get_typed(0)?;
+                let started_at: Option<i64> = row.get_typed(1)?;
+                let agent_slug: String = row.get_typed(2)?;
+                let source_id: String = row.get_typed(3)?;
+                let content_len: i64 = row.get_typed(4)?;
+                last_message_id = message_id;
+                let day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
+                messages_processed += 1;
+            }
+
+            message_batch_count += 1;
+            raw_entries_flushed += aggregate.raw_entry_count();
+            let entries = aggregate.expand();
+            expanded_entries_flushed += entries.len();
+            if !entries.is_empty() {
+                franken_update_daily_stats_batched_in_tx(&tx, &entries)?;
+            }
+            if message_batch_count % 50 == 0 {
+                tracing::info!(
+                    target: "cass::perf::daily_stats",
+                    messages_processed,
+                    batches = message_batch_count,
+                    batch_size = message_batch_size,
+                    source = if use_message_metrics {
+                        "message_metrics"
+                    } else {
+                        "messages"
+                    },
+                    last_message_id,
+                    "daily_stats rebuild message scan progress"
+                );
+            }
         }
 
         let rows_created: i64 =
@@ -6694,9 +6836,14 @@ impl FrankenStorage {
             rows_created,
             total_sessions,
             conversations_processed,
-            batches = batch_count,
-            raw_entries,
-            expanded_entries,
+            conversation_batches = conversation_batch_count,
+            conversation_batch_size,
+            message_batches = message_batch_count,
+            message_batch_size,
+            messages_processed,
+            use_message_metrics,
+            raw_entries_flushed,
+            expanded_entries_flushed,
             "Daily stats rebuilt from conversations"
         );
 
@@ -7710,6 +7857,20 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
         }
         c => !val.is_empty() && val[0] == c && sql_like_match_bytes(&val[1..], &pat[1..]),
     }
+}
+
+fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn is_out_of_memory_error(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("out of memory")
 }
 
 // Second SqliteStorage impl block removed: SqliteStorage is now a type alias for FrankenStorage.
@@ -9286,96 +9447,149 @@ mod tests {
 
     #[test]
     fn rebuild_daily_stats_recomputes_materialized_totals_without_monolithic_group_by() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use std::path::PathBuf;
-
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
-
-        let codex_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-        let claude_id = storage
-            .ensure_agent(&Agent {
-                id: None,
-                slug: "claude".into(),
-                name: "Claude".into(),
-                version: None,
-                kind: AgentKind::Cli,
-            })
-            .unwrap();
-
-        let conv_a = Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace-a")),
-            external_id: Some("daily-a".into()),
-            title: Some("Daily A".into()),
-            source_path: PathBuf::from("/tmp/daily-a.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_200),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![
-                Message {
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(1_700_000_000_000),
-                    content: "hello".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-                Message {
-                    id: None,
-                    idx: 1,
-                    role: MessageRole::Agent,
-                    author: None,
-                    created_at: Some(1_700_000_000_100),
-                    content: "response".into(),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                },
-            ],
-            source_id: "local".into(),
-            origin_host: None,
-        };
-        let conv_b = Conversation {
-            id: None,
-            agent_slug: "claude".into(),
-            workspace: Some(PathBuf::from("/tmp/workspace-b")),
-            external_id: Some("daily-b".into()),
-            title: Some("Daily B".into()),
-            source_path: PathBuf::from("/tmp/daily-b.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_000_300),
-            approx_tokens: None,
-            metadata_json: serde_json::Value::Null,
-            messages: vec![Message {
-                id: None,
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(1_700_000_000_050),
-                content: "abc".into(),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            }],
-            source_id: LOCAL_SOURCE_ID.into(),
-            origin_host: None,
-        };
+        let started_at = 1_700_000_000_000_i64;
+        let day_id = FrankenStorage::day_id_from_millis(started_at);
+        let hour_id = FrankenStorage::hour_id_from_millis(started_at);
 
         storage
-            .insert_conversations_batched(&[(codex_id, None, &conv_a), (claude_id, None, &conv_b)])
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "codex", "Codex", "cli"],
+            )
             .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![2_i64, "claude", "Claude", "cli"],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "daily-a",
+                    "Daily A",
+                    "/tmp/daily-a.jsonl",
+                    started_at,
+                    started_at + 200,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, NULL, NULL)",
+                fparams![
+                    2_i64,
+                    2_i64,
+                    LOCAL_SOURCE_ID,
+                    "daily-b",
+                    "Daily B",
+                    "/tmp/daily-b.jsonl",
+                    started_at,
+                    started_at + 300,
+                    "{}"
+                ],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, "hello"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![2_i64, 1_i64, 1_i64, "assistant", started_at + 100, "response"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![3_i64, 2_i64, 0_i64, "user", started_at + 50, "abc"],
+            )
+            .unwrap();
+
+        for (message_id, agent_slug, role, content_len) in [
+            (1_i64, "codex", "user", 5_i64),
+            (2_i64, "codex", "assistant", 8_i64),
+            (3_i64, "claude", "user", 3_i64),
+        ] {
+            storage
+                .conn
+                .execute_compat(
+                    "INSERT INTO message_metrics (
+                        message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id, source_id,
+                        role, content_chars, content_tokens_est, api_input_tokens, api_output_tokens,
+                        api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                        api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan,
+                        model_name, model_family, model_tier, provider
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15,
+                        ?16, ?17, ?18, ?19, ?20,
+                        ?21, ?22, ?23, ?24
+                     )",
+                    fparams![
+                        message_id,
+                        started_at,
+                        hour_id,
+                        day_id,
+                        agent_slug,
+                        0_i64,
+                        LOCAL_SOURCE_ID,
+                        role,
+                        content_len,
+                        content_len / 4,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        "",
+                        "estimated",
+                        0_i64,
+                        0_i64,
+                        0_i64,
+                        "",
+                        "unknown",
+                        "unknown",
+                        "unknown"
+                    ],
+                )
+                .unwrap();
+        }
 
         storage.conn.execute("DELETE FROM daily_stats").unwrap();
 
@@ -9396,6 +9610,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total_messages, 3);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_preserves_byte_counts_with_message_metrics() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let content = "ASCII🙂é漢字";
+        let expected_bytes = content.len() as i64;
+        let started_at = 1_704_067_200_000_i64;
+        let day_id = FrankenStorage::day_id_from_millis(started_at);
+        let hour_id = FrankenStorage::hour_id_from_millis(started_at);
+
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "tester", "Tester", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "unicode-metrics",
+                    "Unicode Metrics",
+                    "/tmp/unicode-metrics.jsonl",
+                    started_at,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "user", started_at, content],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO message_metrics (
+                    message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id, source_id,
+                    role, content_chars, content_tokens_est, api_input_tokens, api_output_tokens,
+                    api_cache_read_tokens, api_cache_creation_tokens, api_thinking_tokens,
+                    api_service_tier, api_data_source, tool_call_count, has_tool_calls, has_plan,
+                    model_name, model_family, model_tier, provider
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15,
+                    ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24
+                 )",
+                fparams![
+                    1_i64,
+                    started_at,
+                    hour_id,
+                    day_id,
+                    "tester",
+                    0_i64,
+                    LOCAL_SOURCE_ID,
+                    "user",
+                    expected_bytes,
+                    expected_bytes / 4,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    "",
+                    "estimated",
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    "",
+                    "unknown",
+                    "unknown",
+                    "unknown"
+                ],
+            )
+            .unwrap();
+
+        let mut tx = storage.conn.transaction().unwrap();
+        franken_update_daily_stats_in_tx(
+            &tx,
+            "tester",
+            LOCAL_SOURCE_ID,
+            Some(started_at),
+            1,
+            1,
+            expected_bytes,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let inline_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(inline_total, expected_bytes);
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 1);
+
+        let rebuilt_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_total, expected_bytes);
+    }
+
+    #[test]
+    fn rebuild_daily_stats_raw_fallback_preserves_byte_counts() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let content = "fallback🙂é漢字";
+        let expected_bytes = content.len() as i64;
+        let started_at = 1_704_067_200_000_i64;
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 0, 0)",
+                fparams![1_i64, "tester", "Tester", "cli"],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, NULL)",
+                fparams![
+                    1_i64,
+                    1_i64,
+                    LOCAL_SOURCE_ID,
+                    "unicode-fallback",
+                    "Unicode Fallback",
+                    "/tmp/unicode-fallback.jsonl",
+                    started_at,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "INSERT INTO messages (
+                    id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
+                fparams![1_i64, 1_i64, 0_i64, "assistant", started_at, content],
+            )
+            .unwrap();
+
+        let mut tx = storage.conn.transaction().unwrap();
+        franken_update_daily_stats_in_tx(
+            &tx,
+            "tester",
+            LOCAL_SOURCE_ID,
+            Some(started_at),
+            1,
+            1,
+            expected_bytes,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        storage.conn.execute("DELETE FROM daily_stats").unwrap();
+
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 1);
+
+        let rebuilt_total: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_total, expected_bytes);
     }
 
     #[test]
@@ -10628,6 +11049,93 @@ mod tests {
         let second = storage.salvage_historical_databases(&canonical_db).unwrap();
         assert_eq!(second.bundles_imported, 0);
         assert_eq!(second.messages_imported, 0);
+    }
+
+    #[test]
+    fn list_conversations_for_lexical_rebuild_uses_stable_id_order() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |source_path: &str, started_at: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(source_path.to_string()),
+            title: Some(source_path.to_string()),
+            source_path: PathBuf::from(source_path),
+            started_at: Some(started_at),
+            ended_at: Some(started_at + 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(started_at),
+                content: format!("message for {source_path}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let conv_a = make_conv("/tmp/a.jsonl", 3_000);
+        let conv_b = make_conv("/tmp/b.jsonl", 1_000);
+        let conv_c = make_conv("/tmp/c.jsonl", 2_000);
+
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_a)
+            .unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_b)
+            .unwrap();
+        storage
+            .insert_conversation_tree(agent_id, None, &conv_c)
+            .unwrap();
+
+        let user_order: Vec<PathBuf> = storage
+            .list_conversations(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.source_path)
+            .collect();
+        assert_eq!(
+            user_order,
+            vec![
+                PathBuf::from("/tmp/a.jsonl"),
+                PathBuf::from("/tmp/c.jsonl"),
+                PathBuf::from("/tmp/b.jsonl"),
+            ]
+        );
+
+        let rebuild_order: Vec<PathBuf> = storage
+            .list_conversations_for_lexical_rebuild(10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.source_path)
+            .collect();
+        assert_eq!(
+            rebuild_order,
+            vec![
+                PathBuf::from("/tmp/a.jsonl"),
+                PathBuf::from("/tmp/b.jsonl"),
+                PathBuf::from("/tmp/c.jsonl"),
+            ]
+        );
     }
 
     #[test]

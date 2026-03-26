@@ -2812,7 +2812,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut conversations_since_commit = 0usize;
 
     loop {
-        let batch = storage.list_conversations(page_size, offset)?;
+        let batch = storage.list_conversations_for_lexical_rebuild(page_size, offset)?;
         if batch.is_empty() {
             break;
         }

@@ -4476,7 +4476,10 @@ fn state_meta_json(
         .ok()
         .flatten();
     let index_run = probe_index_run_lock(data_dir, db_path);
-    let rebuild_active = index_run.active && rebuild_snapshot.is_some();
+    // The index-run lock covers the full `cass index` lifecycle, not just the
+    // later lexical checkpointing phase. Treat a live lock as authoritative so
+    // `cass status` reports early rebuild work honestly.
+    let rebuild_active = index_run.active;
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4537,7 +4540,8 @@ fn state_meta_json(
     let fresh = index_exists && !is_stale;
     let rebuild_updated_at = rebuild_snapshot
         .as_ref()
-        .and_then(|snapshot| (snapshot.updated_at_ms > 0).then_some(snapshot.updated_at_ms));
+        .and_then(|snapshot| (snapshot.updated_at_ms > 0).then_some(snapshot.updated_at_ms))
+        .or(index_run.started_at_ms);
 
     let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap_or_else(chrono::Utc::now)
@@ -9312,6 +9316,45 @@ mod cli_read_db_tests {
             Some(4)
         );
         assert_eq!(state["rebuild"]["total_conversations"].as_u64(), Some(10));
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            std::process::id(),
+            1_733_000_555_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+        assert_eq!(
+            state["rebuild"]["processed_conversations"],
+            serde_json::Value::Null
+        );
+        assert!(state["rebuild"]["updated_at"].as_str().is_some());
     }
 }
 
