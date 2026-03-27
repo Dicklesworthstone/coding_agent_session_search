@@ -172,3 +172,6 @@ storage.sqlite3.bak
 storage.sqlite3.corrupt-*
 storage.sqlite3-shm.corrupt-*
 storage.sqlite3-wal.corrupt-*
+
+# Recovery build artifacts
+.target_cass_recovery/
