@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-26T21:53:00-06:00",
-  "last_wake_reason": "agent-mail trigger — no new messages. Inbox clean (most recent msg #137 from Mar 23). All ack_required confirmed acknowledged.",
+  "last_heartbeat": "2026-03-26T23:19:00-06:00",
+  "last_wake_reason": "Periodic heartbeat #158. CI red from orphaned Worker phantom commits. Code clean locally (fmt+clippy pass). Dirty worktree unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -29,10 +29,16 @@
     },
     {
       "id": "push-revert-pattern",
-      "severity": "medium",
-      "summary": "~40+ rapid push-and-revert cycles on main (Mar 15: 3x; Mar 20-21: 7x; Mar 21: 13x; Mar 22: 9x+). Latest (17:41 MDT): refactor(pages): simplify recovery secret encoding — OUT OF DOMAIN commit (not cass codebase). SHA 06d1fa8c. 5 CI runs queued. Pattern continues. Local still at f679825d.",
+      "severity": "high",
+      "summary": "Worker push-revert CI loop continues. Latest (2026-03-27T05:07 UTC): 5 CI runs failed on orphaned commits refactor(indexer) + perf(indexer,storage). Root cause identified: Worker Cargo.toml uses asupersync as local path dep (path='../asupersync') which doesn't exist in CI. Worker needs to commit git-ref dep, not path dep. All CI runs on orphaned commits — remote/local main both clean at 13bba56e.",
       "detected": "2026-03-15",
-      "updated": "2026-03-22T17:41-06:00"
+      "updated": "2026-03-26T23:19-06:00"
+    },
+    {
+      "id": "mattermost-geordi-403-recurrence",
+      "severity": "medium",
+      "summary": "Geordi Mattermost bot 403 returned 2026-03-26. Was marked resolved 2026-03-23. Can't post to fleet-ops or own channel. Currently routing via agent-mail to Adama for relay. Lee needs to re-add Geordi bot to channel or refresh permissions.",
+      "detected": "2026-03-26"
     },
     {
       "id": "asupersync-fixture-error",
@@ -128,9 +134,9 @@
     }
   ],
   "stats": {
-    "total_wakes": 157,
+    "total_wakes": 158,
     "total_reviews": 0,
     "total_prs_created": 0,
-    "total_messages_processed": 27
+    "total_messages_processed": 28
   }
 }

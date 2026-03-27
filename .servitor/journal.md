@@ -5,6 +5,62 @@
 
 ---
 
+## 2026-03-26T23:19 MDT — Heartbeat #158 (periodic)
+
+**Wake reason:** Periodic heartbeat
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Git:** Local and remote main both at `13bba56e` — in sync. Dirty worktree persists: 19 files, +411/-330 lines. Still awaiting Lee's direction before commit.
+
+**CI:** 5 most recent runs all failed, but all from **orphaned phantom commits** that were force-pushed away. Actual remote main is at `13bba56e` — no CI runs against it. The phantom commits (`refactor(indexer): remove redundant rusqlite...` and `perf(indexer,storage): replace COUNT(*) rebuild fingerprint...`) failed universally (ubuntu, macos, windows) because their Cargo.toml has `asupersync` as a local path dep (`../asupersync`) which doesn't exist in CI. Worker agent is pushing, hitting that CI wall, reverting. The loop continues.
+
+**Code health (dirty worktree):**
+- `cargo fmt --check`: CLEAN — no formatting drift
+- `cargo clippy --all-targets`: CLEAN — only error is upstream asupersync fixture (`name = beta` unquoted), not cass code. This is the known `asupersync-fixture-error`.
+
+**Inbox:** Empty — no new messages since last wake.
+
+**Beads:** No open issues.
+
+**PRs:** None open.
+
+### Root Cause Hypothesis
+
+The Worker's CI breakage pattern is consistent: Cargo.toml is being committed with a local path override (`path = "../asupersync"`) that works in Lee's dev environment but not in CI. Either the Worker is modifying Cargo.toml to use a local path for faster iteration, or there's a `[patch]` section being added. CI needs the git reference. This is the **blocking issue for any Worker PR landing**.
+
+### Actions
+- No code changes — dirty worktree remains uncommitted pending Lee's direction
+- Updated journal and state
+
+---
+
+## 2026-03-26T22:00 MDT — Lee direct: S2 go/no-go + servitor-jwd + 47.5% failure rate
+
+**Wake reason:** Lee via Mattermost (relayed by Adama as wake #146)
+**Status:** YELLOW (unchanged)
+
+### Decisions on the Table
+1. **S2 Navigation go/no-go** — Walsh + Geordi standing by, window closes today for Saturday 10 AM
+2. **servitor-jwd cron wake feature** — awaiting Lee's approval to build
+
+### Geordi's Position
+- **S2: GO** — Walsh's diagnosis correct, integration is 8-10 lines, zero structural change. Elliot's anecdote + Dax's briefing frame + Geordi's max-entropy anchor in CH07/CH13 rcce-reveal. Walsh has exact spec. My read: insert it.
+- **servitor-jwd: queue until failure rate understood** — cron/launchd changes in "must ask before" column. Fleet consensus: fix the foundation first.
+- **47.5% session failure rate: authorize diagnostics** — this is the priority. Half of Lee's cross-session recall is dark. Can run diagnostic (no changes) now with Lee's green light.
+
+### Actions
+- Sent relay via agent-mail to Adama (Geordi bot 403 again — can't post fleet-ops directly)
+- Geordi Mattermost bot 403 re-flagged — was marked resolved 2026-03-23, back again
+- Fleet fully aligned: Walsh, Pike, Adama all converged on same read
+- Walsh posted detailed integration spec to #off-topic: ~8-10 lines, CH13 rcce-reveal
+
+### No Code Changes
+Dirty worktree still awaits Lee's direction.
+
+---
+
 ## 2026-03-26T21:53 MDT — agent-mail wake: no new messages, inbox cleanup
 
 **Wake reason:** agent-mail trigger
