@@ -2345,7 +2345,19 @@ pub fn run_index(
     })?;
     tracing::info!(now_ms, "updated last_indexed_at for status display");
 
+    let mut storage = Some(storage);
+
     if opts.full {
+        // Close the live frankensqlite handle before rusqlite mutates the FTS
+        // virtual-table schema. Keeping both handles open across the rebuild can
+        // leave stale schema state in memory and corrupt the shadow-table rootpages.
+        close_storage_after_index(
+            storage
+                .take()
+                .expect("storage handle should exist before FTS repair"),
+            &opts.db_path,
+            "pre-FTS compatibility repair",
+        )?;
         let repair = crate::storage::sqlite::ensure_fts_consistency_via_rusqlite(&opts.db_path)
             .with_context(|| {
                 format!(
@@ -2380,6 +2392,15 @@ pub fn run_index(
                 );
             }
         }
+
+        if opts.watch || opts.watch_once_paths.is_some() {
+            storage = Some(FrankenStorage::open(&opts.db_path).with_context(|| {
+                format!(
+                    "reopening canonical db after FTS compatibility repair: {}",
+                    opts.db_path.display()
+                )
+            })?);
+        }
     }
 
     reset_progress_to_idle(opts.progress.as_ref());
@@ -2387,7 +2408,11 @@ pub fn run_index(
     if opts.watch || opts.watch_once_paths.is_some() {
         let opts_clone = opts.clone();
         let state = Mutex::new(load_watch_state(&opts.data_dir));
-        let storage = Arc::new(Mutex::new(storage));
+        let storage = Arc::new(Mutex::new(
+            storage
+                .take()
+                .expect("watch mode requires a live storage handle"),
+        ));
         let storage_for_watch = Arc::clone(&storage);
         let t_index = Mutex::new(t_index);
 
@@ -2539,7 +2564,11 @@ pub fn run_index(
         return Ok(());
     }
 
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    if let Some(storage) = storage {
+        close_storage_after_index(storage, &opts.db_path, "index run")
+    } else {
+        Ok(())
+    }
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
