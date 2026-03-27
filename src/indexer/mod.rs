@@ -35,7 +35,7 @@ use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
-    FrankenStorage, HistoricalSalvageOutcome, MigrationError, probe_database_health_via_rusqlite,
+    FrankenStorage, HistoricalSalvageOutcome, MigrationError,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{EmbeddingInput, SemanticIndexer};
@@ -783,26 +783,7 @@ fn full_rebuild_requires_historical_restart(
     }
 
     let in_progress = count_meta_entries_like(storage, "historical_bundle_progress:%")? > 0;
-
-    let canonical_health = match probe_database_health_via_rusqlite(db_path) {
-        Ok(health) => health,
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "full rebuild could not verify canonical database health via rusqlite; preserving the already-open canonical database and continuing"
-            );
-            return Ok(false);
-        }
-    };
-    if canonical_sessions_before_salvage > 0 && !canonical_health.quick_check_ok {
-        tracing::warn!(
-            db_path = %db_path.display(),
-            "full rebuild detected canonical sqlite quick_check anomalies, but automatic canonical replacement is disabled; preserving the populated database"
-        );
-        return Ok(false);
-    }
-    if in_progress && canonical_sessions_before_salvage > 0 && canonical_health.quick_check_ok {
+    if in_progress && canonical_sessions_before_salvage > 0 {
         tracing::warn!(
             db_path = %db_path.display(),
             "ignoring stale historical salvage progress markers because the canonical database is already healthy and populated"
