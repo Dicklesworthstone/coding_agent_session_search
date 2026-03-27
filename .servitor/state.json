@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-22T17:41:00-06:00",
-  "last_wake_reason": "Periodic heartbeat. New upstream commit 06d1fa8c (refactor/pages/recovery-secret) on main — out-of-domain push-revert cycle entry #9 for Mar 22. No inbox mail. No beads issues. No PRs. Dirty worktree (17 files) unchanged.",
+  "last_heartbeat": "2026-03-26T21:53:00-06:00",
+  "last_wake_reason": "agent-mail trigger — no new messages. Inbox clean (most recent msg #137 from Mar 23). All ack_required confirmed acknowledged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -33,12 +33,6 @@
       "summary": "~40+ rapid push-and-revert cycles on main (Mar 15: 3x; Mar 20-21: 7x; Mar 21: 13x; Mar 22: 9x+). Latest (17:41 MDT): refactor(pages): simplify recovery secret encoding — OUT OF DOMAIN commit (not cass codebase). SHA 06d1fa8c. 5 CI runs queued. Pattern continues. Local still at f679825d.",
       "detected": "2026-03-15",
       "updated": "2026-03-22T17:41-06:00"
-    },
-    {
-      "id": "mattermost-403",
-      "severity": "medium",
-      "summary": "DeepWatch bot can READ Mattermost channels but cannot POST (403) — not added as channel member. Affects fleet-ops and off-topic. Action needed: Lee adds bot to channels.",
-      "detected": "2026-03-22"
     },
     {
       "id": "asupersync-fixture-error",
@@ -77,6 +71,11 @@
       "id": "beads-issue-77",
       "summary": "Beads tracker now clean — no open issues",
       "resolved": "2026-03-15"
+    },
+    {
+      "id": "mattermost-403",
+      "summary": "Mattermost 403 resolved — post to default channel succeeded 2026-03-23",
+      "resolved": "2026-03-23"
     }
   ],
   "tech_debt": [
@@ -104,7 +103,7 @@
     },
     {
       "agent": "QuillKeeper",
-      "role": "substack repo servitor — contact established (their side); reply failed (not in our project). Need BrassAdama to broker or QuillKeeper to send from substack project key.",
+      "role": "substack repo servitor — contact fully established both ways (Burke sent from substack project key 2026-03-22, acknowledged 2026-03-23)",
       "established": "2026-03-22"
     },
     {
@@ -132,6 +131,6 @@
     "total_wakes": 157,
     "total_reviews": 0,
     "total_prs_created": 0,
-    "total_messages_processed": 17
+    "total_messages_processed": 27
   }
 }
