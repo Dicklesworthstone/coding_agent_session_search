@@ -2624,6 +2624,7 @@ impl FrankenStorage {
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self { conn };
         storage.run_migrations()?;
+        storage.repair_missing_current_schema_objects()?;
         if !db_existed {
             storage.close().with_context(|| {
                 format!(
@@ -2789,6 +2790,38 @@ impl FrankenStorage {
         // Keep meta.schema_version in sync for backward compatibility.
         self.sync_meta_schema_version(result.current)?;
 
+        Ok(())
+    }
+
+    /// Some historical canonical rebuild paths produced databases whose
+    /// version markers claim the current schema while post-V10 analytics
+    /// tables were never materialized. Detect that drift and backfill the
+    /// idempotent table/index set from the combined schema migration.
+    fn repair_missing_current_schema_objects(&self) -> Result<()> {
+        let mut missing_tables = Vec::new();
+        for &(table_name, probe_sql) in REQUIRED_CURRENT_SCHEMA_TABLE_PROBES {
+            if let Err(err) = self.conn.query(probe_sql) {
+                if error_indicates_missing_table(&err) {
+                    missing_tables.push(table_name);
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!("probing required schema table {table_name} for completeness")
+                });
+            }
+        }
+
+        if missing_tables.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            missing_tables = ?missing_tables,
+            "repairing missing current-schema tables on an already-versioned cass database"
+        );
+        self.conn
+            .execute_batch(MIGRATION_FRESH_SCHEMA)
+            .with_context(|| "repairing missing current-schema tables")?;
         Ok(())
     }
 
@@ -3382,6 +3415,37 @@ fn transition_from_meta_version(conn: &FrankenConnection) -> Result<()> {
     );
 
     Ok(())
+}
+
+const REQUIRED_CURRENT_SCHEMA_TABLE_PROBES: &[(&str, &str)] = &[
+    ("sources", "SELECT id FROM sources LIMIT 1;"),
+    ("daily_stats", "SELECT day_id FROM daily_stats LIMIT 1;"),
+    ("embedding_jobs", "SELECT id FROM embedding_jobs LIMIT 1;"),
+    ("token_usage", "SELECT id FROM token_usage LIMIT 1;"),
+    (
+        "token_daily_stats",
+        "SELECT day_id FROM token_daily_stats LIMIT 1;",
+    ),
+    (
+        "model_pricing",
+        "SELECT model_pattern FROM model_pricing LIMIT 1;",
+    ),
+    (
+        "message_metrics",
+        "SELECT message_id FROM message_metrics LIMIT 1;",
+    ),
+    ("usage_hourly", "SELECT hour_id FROM usage_hourly LIMIT 1;"),
+    ("usage_daily", "SELECT day_id FROM usage_daily LIMIT 1;"),
+    (
+        "usage_models_daily",
+        "SELECT day_id FROM usage_models_daily LIMIT 1;",
+    ),
+];
+
+fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
 }
 
 pub struct InsertOutcome {
@@ -13606,6 +13670,66 @@ mod tests {
             .unwrap();
         let versions: Vec<i64> = rows.iter().filter_map(|r| r.get_typed(0).ok()).collect();
         assert_eq!(versions, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    fn franken_storage_open_repairs_missing_analytics_tables_when_version_markers_lie() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test_repair_missing_analytics.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        }
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS usage_models_daily;
+                 DROP TABLE IF EXISTS usage_daily;
+                 DROP TABLE IF EXISTS usage_hourly;
+                 DROP TABLE IF EXISTS message_metrics;
+                 DROP TABLE IF EXISTS token_daily_stats;
+                 DROP TABLE IF EXISTS token_usage;
+                 DROP TABLE IF EXISTS model_pricing;
+                 DROP TABLE IF EXISTS embedding_jobs;
+                 DROP TABLE IF EXISTS daily_stats;",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+            )
+            .unwrap();
+        }
+
+        let repaired = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(repaired.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let analytics_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table'
+                   AND name IN (
+                     'daily_stats',
+                     'embedding_jobs',
+                     'token_usage',
+                     'token_daily_stats',
+                     'model_pricing',
+                     'message_metrics',
+                     'usage_hourly',
+                     'usage_daily',
+                     'usage_models_daily'
+                   )",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            analytics_count, 9,
+            "open() should recreate the missing analytics tables even when schema_version already says current"
+        );
     }
 
     #[test]
