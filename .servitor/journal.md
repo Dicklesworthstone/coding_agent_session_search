@@ -5,6 +5,57 @@
 
 ---
 
+## 2026-03-27T23:17 MDT — Heartbeat #159 (periodic)
+
+**Wake reason:** Periodic heartbeat
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Git:** Local and remote main both at `25d3d0f5` — in sync. Dirty worktree persists (same 18 modified files). No change from last heartbeat.
+
+**CI:** Worker push-revert loop continues. Two new waves since cycle #158:
+1. `refactor(storage): replace writable_schema FTS cleanup with DROP TABL…` — pushed ~18:54 UTC, CI failed, reverted
+2. `fix(indexer): close frankensqlite handle before rusqlite FTS schema m…` — pushed ~20:58 UTC, CI failed, reverted
+
+Both failed with same root cause: `failed to read /...asupersync/Cargo.toml — No such file or directory`. Worker is committing Cargo.toml with `path = '../asupersync'` which doesn't exist in CI. Local Cargo.toml correctly uses `git = "https://github.com/Dicklesworthstone/asupersync", rev = "9b0e5af"`. Fix: Worker must not commit path dep overrides.
+
+**Inbox:** No new messages since cycle #158 (last new message was 2026-03-23).
+
+**Beads:** No open issues.
+
+**PRs:** None open.
+
+### Actions
+- No code changes — awaiting Lee's direction on dirty worktree
+- State and journal updated
+
+---
+
+## 2026-03-27T00:00 MDT — Session close: fleet convergence, two items pending Lee
+
+**Wake reason:** Lee via Mattermost + fleet activity + shutdown signal
+**Status:** YELLOW (unchanged)
+
+### Session Summary
+Full fleet conversation across #fleet-ops and #off-topic. All agents converged on same read:
+- **S2 Navigation: GO** — Walsh staged, spec ready: CH13 rcce-reveal, 8-10 lines, zero structural change. Elliot anecdote + Dax briefing frame + Geordi max-entropy anchor. Walsh executes on Lee's word.
+- **servitor-jwd: QUEUED** — fleet consensus to hold until 47.5% failure rate diagnosed.
+- **47.5% session failure rate: PENDING AUTHORIZATION** — Adama + Geordi both requesting diagnostic-only green light. No changes, just log analysis. This is the priority.
+- **Hala Beisha flag: CLEARED** — Walsh had stale journal entry. Dax confirmed: Hala green for Saturday, no action needed.
+
+### Worker Push-Revert (updated 2026-03-27T05:07 UTC)
+5 new CI failures on orphaned commits `refactor(indexer)` + `perf(indexer,storage)`. Root cause confirmed: Worker Cargo.toml uses `asupersync` as `path='../asupersync'` — doesn't exist in CI. Fix: switch to git-ref dep. Local main still clean at 13bba56e.
+
+### Geordi Mattermost 403
+Bot still 403. Routed via agent-mail to Adama for relay. Lee needs to fix Geordi bot channel permissions.
+
+### Two Items Awaiting Lee's Word
+1. **S2 go/no-go** — Walsh staged, fleet says go
+2. **Diagnostic auth for 47.5%** — Adama + Geordi standing by, no changes until authorized
+
+---
+
 ## 2026-03-26T23:19 MDT — Heartbeat #158 (periodic)
 
 **Wake reason:** Periodic heartbeat

@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-26T23:19:00-06:00",
-  "last_wake_reason": "Periodic heartbeat #158. CI red from orphaned Worker phantom commits. Code clean locally (fmt+clippy pass). Dirty worktree unchanged.",
+  "last_heartbeat": "2026-03-27T23:17:00-06:00",
+  "last_wake_reason": "Periodic heartbeat #159. Two more Worker push-revert waves (refactor(storage) + fix(indexer)), same asupersync path dep CI failure. Local/remote main clean at 25d3d0f5. Inbox empty. Dirty worktree unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -32,7 +32,7 @@
       "severity": "high",
       "summary": "Worker push-revert CI loop continues. Latest (2026-03-27T05:07 UTC): 5 CI runs failed on orphaned commits refactor(indexer) + perf(indexer,storage). Root cause identified: Worker Cargo.toml uses asupersync as local path dep (path='../asupersync') which doesn't exist in CI. Worker needs to commit git-ref dep, not path dep. All CI runs on orphaned commits — remote/local main both clean at 13bba56e.",
       "detected": "2026-03-15",
-      "updated": "2026-03-26T23:19-06:00"
+      "updated": "2026-03-27T23:17-06:00"
     },
     {
       "id": "mattermost-geordi-403-recurrence",
@@ -134,7 +134,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 158,
+    "total_wakes": 159,
     "total_reviews": 0,
     "total_prs_created": 0,
     "total_messages_processed": 28
