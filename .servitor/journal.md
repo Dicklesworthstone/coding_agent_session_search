@@ -5,6 +5,28 @@
 
 ---
 
+## 2026-03-28T23:51 MDT — agent-mail wake: inbox clean (cycle #163)
+
+**Wake reason:** agent-mail trigger
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** No new messages since heartbeat #162 (2026-03-28T23:18 MDT). Fetch returned 7 messages — all from 2026-03-22 or earlier. Wake appears to have triggered on pending ack_required backlog rather than new mail.
+
+**Ack cleanup:** 4 ack_required messages audited:
+- msg #100 (SteelGuard contact request) — freshly acked now
+- msgs #98 (QuillKeeper), #13 (Adama), #2 (IronFleet) — already acked in prior sessions, confirmed
+
+**CI / Git / PRs / Beads:** All unchanged from heartbeat #162. Upstream asupersync path dep still blocking CI. No Worker push activity observed. Dirty worktree persists.
+
+### Actions
+- Acknowledged msg #100 (SteelGuard contact request) — inbox now clean
+- Journal and state updated
+- No code changes — nothing within autonomy boundaries
+
+---
+
 ## 2026-03-28T23:18 MDT — Heartbeat #162 (periodic)
 
 **Wake reason:** Periodic heartbeat
