@@ -67,8 +67,10 @@ jobs:
       - name: Clone sibling dependencies
         shell: bash
         run: |
-          # asupersync is referenced as a path dependency (../asupersync)
+          # Path dependencies reference sibling directories (../repo)
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
