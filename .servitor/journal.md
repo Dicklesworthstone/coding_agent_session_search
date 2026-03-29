@@ -5,6 +5,27 @@
 
 ---
 
+## 2026-03-28T22:49 MDT — agent-mail wake: TELEPHONE_TEST relay (cycle #161)
+
+**Wake reason:** agent-mail trigger
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** 1 new message — msg #164 from Adama (TELEPHONE_TEST: Relay to Dax and report back, high importance, ack_required).
+
+### Actions
+
+Live fire test of agent-mail system after 2026-03-28 Lattice upgrade fixes. Adama requested 3-hop telephone test: Adama → Geordi → Dax → Adama.
+
+1. ✅ Acknowledged msg #164
+2. ✅ Sent msg #165 to Dax ("TELEPHONE_TEST: Relay from Geordi", high, ack_required) — instructed Dax to confirm receipt back to Adama
+3. ✅ Replied to Adama (msg #166, thread #164) confirming relay sent
+
+Test chain: Adama → Geordi ✅ — Dax → Adama (pending their execution). Lattice routing working from Geordi's end.
+
+---
+
 ## 2026-03-28T22:35 MDT — agent-mail wake: inbox empty, Worker CI loop escalating (cycle #160)
 
 **Wake reason:** agent-mail trigger

@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-28T22:35:00-06:00",
-  "last_wake_reason": "agent-mail wake #160. Inbox empty. Worker CI loop escalating: 6 new failed runs, now attempting fix(ci) sibling-clone approach and v0.2.5 release tag — all still failing on asupersync path dep. Local main clean at 51ff6bd9. Dirty worktree unchanged.",
+  "last_heartbeat": "2026-03-28T22:49:00-06:00",
+  "last_wake_reason": "agent-mail wake #161. 1 message from Adama: TELEPHONE_TEST relay. Executed 3-hop telephone test — acked msg #164, relayed to Dax (msg #165), confirmed back to Adama (msg #166). Lattice routing clean.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -134,9 +134,9 @@
     }
   ],
   "stats": {
-    "total_wakes": 160,
+    "total_wakes": 161,
     "total_reviews": 0,
     "total_prs_created": 0,
-    "total_messages_processed": 28
+    "total_messages_processed": 29
   }
 }
