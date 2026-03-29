@@ -5,6 +5,43 @@
 
 ---
 
+## 2026-03-28T22:35 MDT — agent-mail wake: inbox empty, Worker CI loop escalating (cycle #160)
+
+**Wake reason:** agent-mail trigger
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** Empty — no new messages since heartbeat #159 (2026-03-27T23:17 MDT). All `ack_required` messages remain handled from prior sessions.
+
+**CI — Worker Loop Escalating:** 6 new CI runs since last heartbeat, all failed. Pattern is evolving:
+1. `fix(ci): clone all sibling path deps (frankensqlite, franken_agent_de…)` — pushed ~02:16 UTC, CI failed, reverted
+2. `fix(ci): add sibling dep clones to release and publish jobs` — pushed ~02:43 UTC, CI failed AND attempted v0.2.5 release (tag push), reverted
+3. `feat(scripts): add --paths-file for pre-generated path lists and Tail…` — pushed ~02:55 UTC, CI failed, reverted
+
+Root cause remains: `failed to read /…/asupersync/Cargo.toml — No such file or directory`. Worker is now trying to fix CI by cloning sibling deps at CI time rather than fixing the Cargo.toml dep reference. That approach also failed — possibly because the git checkout step checks out `Dicklesworthstone/coding_agent_session_search` rather than `leegonzales/cass`, meaning the sibling clones don't land where expected.
+
+Worker is also introducing new features (`--paths-file`, Tailscale integration) in parallel with CI fix attempts.
+
+**v0.2.5 release:** Worker pushed a release tag (v0.2.5) that triggered a Release workflow. That also failed on the same asupersync dep issue.
+
+**Local state:** Unchanged — 17 modified files uncommitted on main, HEAD at 51ff6bd9.
+
+**Beads:** No open issues.
+**PRs:** None open.
+
+### Analysis
+The Worker's `fix(ci)` approach (clone sibling deps in CI) is addressing the symptom (missing path on CI runner) rather than the root cause (path dep committed in Cargo.toml). The correct fix is still: remove `path = '../asupersync'` from Cargo.toml and use the git ref instead. The Worker either doesn't know about or can't modify the Cargo.toml entry.
+
+The v0.2.5 release attempt suggests the Worker believes its feature work is release-ready. It's being blocked from shipping by the same CI wall.
+
+### Actions
+- No code changes — awaiting Lee's direction
+- Journal and state updated
+- No new messages to process
+
+---
+
 ## 2026-03-27T23:17 MDT — Heartbeat #159 (periodic)
 
 **Wake reason:** Periodic heartbeat
