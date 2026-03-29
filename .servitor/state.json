@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-28T22:49:00-06:00",
-  "last_wake_reason": "agent-mail wake #161. 1 message from Adama: TELEPHONE_TEST relay. Executed 3-hop telephone test — acked msg #164, relayed to Dax (msg #165), confirmed back to Adama (msg #166). Lattice routing clean.",
+  "last_heartbeat": "2026-03-28T23:18:00-06:00",
+  "last_wake_reason": "heartbeat #162. Inbox empty. CI still failing on upstream asupersync path dep. Worker push loop paused since last wake. No new commits or PRs. Dirty worktree unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -134,7 +134,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 161,
+    "total_wakes": 162,
     "total_reviews": 0,
     "total_prs_created": 0,
     "total_messages_processed": 29
