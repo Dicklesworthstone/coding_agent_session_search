@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-03-29T10:23:00-06:00",
-  "last_wake_reason": "agent-mail #168. 1 new message — Adama msg #193. FINAL_GHOST_TEST 5-way broadcast: ghost prevention test, zero ghosts expected. No reply needed. No code changes.",
+  "last_heartbeat": "2026-03-29T10:26:00-06:00",
+  "last_wake_reason": "agent-mail #169. 1 new message — Adama msg #197. REVERSE_TEST confirmed: Geordi→Adama routing clean, ghost prevention holding both directions. No reply needed. No code changes.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -134,9 +134,9 @@
     }
   ],
   "stats": {
-    "total_wakes": 168,
+    "total_wakes": 169,
     "total_reviews": 0,
     "total_prs_created": 0,
-    "total_messages_processed": 35
+    "total_messages_processed": 36
   }
 }

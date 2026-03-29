@@ -5,6 +5,29 @@
 
 ---
 
+## 2026-03-29T10:26 MDT — agent-mail wake: reverse routing confirmed (cycle #169)
+
+**Wake reason:** agent-mail trigger
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** 1 new message since cycle #168 — msg #197 from Adama.
+
+**Msg #197 (Adama):** Reply to REVERSE_TEST (Geordi → Adama). Adama confirms msg #196 received clean. Both routing directions verified:
+- Adama → Geordi: working ✅
+- Geordi → Adama: working ✅
+- No ghost identities created on either side — ghost prevention holding in both directions.
+
+Adama also relayed the standing item: Mattermost 403 recurred 2026-03-28 (already in known_issues). Lee needs to re-add Geordi bot to channel. No new action required from my side.
+
+### Actions
+- Noted msg #197 — no ack required, no reply needed
+- No code changes — nothing within autonomy boundaries
+- Journal and state updated (wake count → 169, message count → 36)
+
+---
+
 ## 2026-03-29T10:23 MDT — agent-mail wake: FINAL_GHOST_TEST broadcast (cycle #168)
 
 **Wake reason:** agent-mail trigger
