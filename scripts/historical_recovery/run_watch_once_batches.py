@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +18,7 @@ LEGACY_LOG_BASENAME = "watch_once_batches_log.jsonl"
 MIN_MEMORY_BUDGET_KB = 256 * 1024
 TOTAL_MEMORY_SOFT_CAP_FRACTION = 0.10
 TOTAL_MEMORY_HARD_CAP_FRACTION = 0.18
+STREAM_TAIL_CHARS = 20_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,14 +41,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         action="append",
-        required=True,
+        default=[],
         help="Root to scan for raw session files. Repeatable.",
     )
     parser.add_argument(
         "--pattern",
         action="append",
-        required=True,
+        default=[],
         help="Glob pattern relative to each root, e.g. '**/*.jsonl'. Repeatable.",
+    )
+    parser.add_argument(
+        "--paths-file",
+        action="append",
+        default=[],
+        help="Newline-delimited file containing exact paths to process. Repeatable.",
     )
     parser.add_argument(
         "--batch-size",
@@ -141,11 +150,38 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Do not set CASS_DEFER_LEXICAL_UPDATES.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.paths_file and (not args.root or not args.pattern):
+        parser.error(
+            "provide either at least one --paths-file or both --root and --pattern"
+        )
+    return args
 
 
-def collect_paths(roots: List[str], patterns: List[str]) -> List[Path]:
+def read_explicit_paths(paths_files: List[str]) -> List[Path]:
+    explicit_paths: List[Path] = []
+    for path_file_text in paths_files:
+        path_file = Path(path_file_text).expanduser().resolve()
+        if not path_file.exists():
+            continue
+        for raw_line in path_file.read_text(encoding="utf-8").splitlines():
+            entry = raw_line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            path = Path(entry).expanduser()
+            if not path.is_absolute():
+                path = (path_file.parent / path).resolve()
+            else:
+                path = path.resolve()
+            if path.is_file():
+                explicit_paths.append(path)
+    return explicit_paths
+
+
+def collect_paths(roots: List[str], patterns: List[str], paths_files: List[str]) -> List[Path]:
     seen: Dict[str, Path] = {}
+    for path in read_explicit_paths(paths_files):
+        seen[str(path)] = path
     for root_text in roots:
         root = Path(root_text).expanduser().resolve()
         if not root.exists():
@@ -157,10 +193,15 @@ def collect_paths(roots: List[str], patterns: List[str]) -> List[Path]:
     return [seen[key] for key in sorted(seen.keys())]
 
 
-def config_signature(roots: List[str], patterns: List[str]) -> Tuple[Dict[str, List[str]], str]:
+def config_signature(
+    roots: List[str], patterns: List[str], paths_files: List[str]
+) -> Tuple[Dict[str, List[str]], str]:
     payload = {
         "roots": sorted(str(Path(root).expanduser().resolve()) for root in roots),
         "patterns": sorted(patterns),
+        "paths_files": sorted(
+            str(Path(path_file).expanduser().resolve()) for path_file in paths_files
+        ),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return payload, hashlib.sha256(encoded).hexdigest()[:16]
@@ -170,7 +211,9 @@ def state_paths(args: argparse.Namespace) -> tuple[Path, Path, Dict[str, List[st
     data_dir = Path(args.data_dir).expanduser().resolve()
     recovery_dir = data_dir / "recovery_state"
     recovery_dir.mkdir(parents=True, exist_ok=True)
-    signature_payload, signature_id = config_signature(args.root, args.pattern)
+    signature_payload, signature_id = config_signature(
+        args.root, args.pattern, args.paths_file
+    )
     if args.state_file is not None:
         state_file = Path(args.state_file).expanduser().resolve()
     else:
@@ -324,6 +367,41 @@ def compute_memory_budgets_kb(
     return soft_budget, hard_budget
 
 
+class TailBuffer:
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max_chars
+        self.chunks: deque[str] = deque()
+        self.total_chars = 0
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self.chunks.append(chunk)
+        self.total_chars += len(chunk)
+        while self.total_chars > self.max_chars and self.chunks:
+            removed = self.chunks.popleft()
+            self.total_chars -= len(removed)
+
+    def text(self) -> str:
+        combined = "".join(self.chunks)
+        if len(combined) <= self.max_chars:
+            return combined
+        return combined[-self.max_chars :]
+
+
+def drain_stream(stream: Optional[Any], tail: TailBuffer) -> None:
+    if stream is None:
+        return
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            tail.append(chunk)
+    finally:
+        stream.close()
+
+
 def run_batch(
     cass_binary: Path,
     data_dir: Path,
@@ -356,6 +434,20 @@ def run_batch(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    stdout_tail = TailBuffer(STREAM_TAIL_CHARS)
+    stderr_tail = TailBuffer(STREAM_TAIL_CHARS)
+    stdout_thread = threading.Thread(
+        target=drain_stream,
+        args=(proc.stdout, stdout_tail),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain_stream,
+        args=(proc.stderr, stderr_tail),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
     peak_rss_kb = 0
     peak_hwm_kb = 0
     samples = 0
@@ -367,14 +459,15 @@ def run_batch(
         if proc.poll() is not None:
             break
         time.sleep(max(sample_interval_ms, 10) / 1000.0)
-    stdout, stderr = proc.communicate()
+    stdout_thread.join()
+    stderr_thread.join()
     mem_after = read_meminfo_kb()
     return {
         "proc": subprocess.CompletedProcess(
             args=cmd,
             returncode=proc.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=stdout_tail.text(),
+            stderr=stderr_tail.text(),
         ),
         "peak_rss_kb": peak_rss_kb,
         "peak_hwm_kb": peak_hwm_kb,
@@ -412,20 +505,30 @@ def autotune_after_success(
         best_batch_size = batch_size
 
     near_hard_limit = peak_memory_kb > 0 and peak_memory_kb >= hard_budget_kb
+    above_soft_limit = peak_memory_kb > 0 and peak_memory_kb > soft_budget_kb
     very_safe = peak_memory_kb == 0 or peak_memory_kb <= int(soft_budget_kb * 0.60)
+    comfortably_safe = peak_memory_kb == 0 or peak_memory_kb <= int(soft_budget_kb * 0.75)
     throughput_regressed = best_throughput > 0 and throughput < (best_throughput * 0.85)
 
     if near_hard_limit:
         next_batch_size = max(args.min_batch_size, batch_size // 2)
         reason = "decrease_high_rss"
-    elif throughput_regressed and batch_size > best_batch_size:
-        next_batch_size = max(args.min_batch_size, best_batch_size)
-        reason = "return_to_best_throughput"
+    elif above_soft_limit and batch_size > args.min_batch_size:
+        next_batch_size = max(args.min_batch_size, batch_size - max(1, batch_size // 4))
+        reason = "decrease_soft_rss"
+    elif comfortably_safe and batch_size < args.max_batch_size:
+        growth_step = max(1, min(32, batch_size // 2))
+        grown = batch_size + growth_step
+        next_batch_size = min(args.max_batch_size, grown)
+        reason = "increase_safe_headroom"
     elif very_safe and batch_size < args.max_batch_size:
         growth_step = max(1, min(16, batch_size // 4))
         grown = batch_size + growth_step
         next_batch_size = min(args.max_batch_size, grown)
         reason = "increase_safe_headroom"
+    elif throughput_regressed and batch_size > best_batch_size and peak_memory_kb >= int(soft_budget_kb * 0.85):
+        next_batch_size = max(args.min_batch_size, best_batch_size)
+        reason = "return_to_best_throughput"
     else:
         next_batch_size = batch_size
         reason = "hold_steady"
@@ -458,7 +561,7 @@ def main() -> int:
         legacy_log_file,
     ) = state_paths(args)
 
-    paths = collect_paths(args.root, args.pattern)
+    paths = collect_paths(args.root, args.pattern, args.paths_file)
     if not paths:
         print(json.dumps({"status": "no_paths", "roots": args.root, "patterns": args.pattern}))
         return 0
