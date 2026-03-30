@@ -156,6 +156,15 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Do not set CASS_DEFER_LEXICAL_UPDATES.",
     )
+    parser.add_argument(
+        "--allow-begin-concurrent",
+        action="store_true",
+        help=(
+            "Allow the cass subprocess to inherit CASS_INDEXER_BEGIN_CONCURRENT* from the "
+            "parent environment. By default the recovery driver unsets those variables so "
+            "large historical replays stay on the safer serial writer path."
+        ),
+    )
     args = parser.parse_args()
     if not args.paths_file and (not args.root or not args.pattern):
         parser.error(
@@ -347,7 +356,10 @@ def normalize_state_metadata(
     normalized["log_file"] = str(log_file)
     normalized.setdefault("current_batch_size", fallback_batch_size)
     normalized.setdefault("max_batch_size", fallback_max_batch_size)
-    normalized.setdefault("max_batch_bytes", fallback_max_batch_bytes)
+    if fallback_max_batch_bytes is not None:
+        normalized["max_batch_bytes"] = fallback_max_batch_bytes
+    else:
+        normalized.setdefault("max_batch_bytes", None)
     normalized.setdefault("successful_batches_this_run", 0)
     tuning = dict(normalized.get("tuning", {}))
     tuning.setdefault("best_batch_size", int(normalized["current_batch_size"]))
@@ -396,58 +408,147 @@ def build_state_snapshot(
     return state
 
 
-def db_counts(cass_binary: Path, data_dir: Path) -> Dict[str, Any]:
+def run_cass_json(
+    cass_binary: Path,
+    data_dir: Path,
+    subcommand: str,
+    *,
+    timeout_seconds: int,
+) -> Dict[str, Any]:
     try:
         proc = subprocess.run(
             [
                 str(cass_binary),
                 "--color=never",
-                "stats",
+                subcommand,
                 "--json",
                 "--data-dir",
                 str(data_dir),
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_seconds,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        return {
-            "conversations": None,
-            "messages": None,
-            "error": f"cass_stats_timeout: {exc}",
-        }
+        return {"ok": False, "error": f"cass_{subcommand}_timeout: {exc}"}
 
     if proc.returncode != 0:
         return {
-            "conversations": None,
-            "messages": None,
-            "error": f"cass_stats_failed: rc={proc.returncode}",
+            "ok": False,
+            "error": f"cass_{subcommand}_failed: rc={proc.returncode}",
             "stderr_tail": proc.stderr[-1000:],
         }
 
-    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
-        return {
-            "conversations": None,
-            "messages": None,
-            "error": "cass_stats_failed: empty_stdout",
-        }
+    stdout = proc.stdout.strip()
+    if not stdout:
+        return {"ok": False, "error": f"cass_{subcommand}_failed: empty_stdout"}
 
     try:
-        payload = json.loads(lines[-1])
-    except json.JSONDecodeError as exc:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            return {"ok": False, "error": f"cass_{subcommand}_failed: empty_stdout"}
+        try:
+            payload = json.loads(lines[-1])
+        except json.JSONDecodeError as exc:
+            return {
+                "ok": False,
+                "error": f"cass_{subcommand}_failed: invalid_json: {exc}",
+                "stdout_tail": proc.stdout[-1000:],
+            }
+
+    return {"ok": True, "payload": payload}
+
+
+def db_counts(cass_binary: Path, data_dir: Path) -> Dict[str, Any]:
+    diag_result = run_cass_json(
+        cass_binary,
+        data_dir,
+        "diag",
+        timeout_seconds=15,
+    )
+    if diag_result.get("ok"):
+        payload = diag_result["payload"]
+        database = payload.get("database", {})
+        conversations = database.get("conversations")
+        messages = database.get("messages")
+        if conversations is not None and messages is not None:
+            return {
+                "conversations": int(conversations),
+                "messages": int(messages),
+                "counts_skipped": False,
+                "rebuild_active": False,
+                "count_source": "diag",
+            }
+
+    status_result = run_cass_json(
+        cass_binary,
+        data_dir,
+        "status",
+        timeout_seconds=10,
+    )
+    if status_result.get("ok"):
+        payload = status_result["payload"]
+        database = payload.get("database", {})
+        rebuild = payload.get("rebuild", {})
+        conversations = database.get("conversations")
+        messages = database.get("messages")
+        counts_skipped = bool(database.get("counts_skipped"))
+        rebuild_active = bool(rebuild.get("active"))
+        result = {
+            "conversations": conversations,
+            "messages": messages,
+            "counts_skipped": counts_skipped,
+            "rebuild_active": rebuild_active,
+            "count_source": "status",
+        }
+        if conversations is not None and messages is not None:
+            result["conversations"] = int(conversations)
+            result["messages"] = int(messages)
+        return result
+
+    stats_result = run_cass_json(
+        cass_binary,
+        data_dir,
+        "stats",
+        timeout_seconds=10,
+    )
+    if stats_result.get("ok"):
+        payload = stats_result["payload"]
         return {
-            "conversations": None,
-            "messages": None,
-            "error": f"cass_stats_failed: invalid_json: {exc}",
-            "stdout_tail": proc.stdout[-1000:],
+            "conversations": int(payload.get("conversations", 0)),
+            "messages": int(payload.get("messages", 0)),
+            "counts_skipped": False,
+            "rebuild_active": False,
+            "count_source": "stats",
         }
 
+    error_result: Dict[str, Any] = {
+        "conversations": None,
+        "messages": None,
+        "error": diag_result.get("error")
+        or status_result.get("error")
+        or stats_result.get("error"),
+        "count_source": "unavailable",
+    }
+    if diag_result.get("stderr_tail"):
+        error_result["stderr_tail"] = diag_result["stderr_tail"]
+    elif status_result.get("stderr_tail"):
+        error_result["stderr_tail"] = status_result["stderr_tail"]
+    elif stats_result.get("stderr_tail"):
+        error_result["stderr_tail"] = stats_result["stderr_tail"]
+    if diag_result.get("stdout_tail"):
+        error_result["stdout_tail"] = diag_result["stdout_tail"]
+    elif status_result.get("stdout_tail"):
+        error_result["stdout_tail"] = status_result["stdout_tail"]
+    elif stats_result.get("stdout_tail"):
+        error_result["stdout_tail"] = stats_result["stdout_tail"]
     return {
-        "conversations": int(payload.get("conversations", 0)),
-        "messages": int(payload.get("messages", 0)),
+        **error_result,
+        "counts_skipped": True,
+        "rebuild_active": False,
     }
 
 
@@ -550,6 +651,7 @@ def run_batch(
     defer_lexical_updates: bool,
     serial_chunk_size: int,
     sample_interval_ms: int,
+    allow_begin_concurrent: bool,
 ) -> Dict[str, Any]:
     cmd = [
         str(cass_binary),
@@ -563,6 +665,9 @@ def run_batch(
     ]
     env = os.environ.copy()
     env["CASS_INDEXER_SERIAL_CHUNK_SIZE"] = str(serial_chunk_size)
+    if not allow_begin_concurrent:
+        env.pop("CASS_INDEXER_BEGIN_CONCURRENT", None)
+        env.pop("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", None)
     if defer_lexical_updates:
         env["CASS_DEFER_LEXICAL_UPDATES"] = "1"
         env["CASS_DEFER_ANALYTICS_UPDATES"] = "1"
@@ -791,6 +896,7 @@ def main() -> int:
             defer_lexical_updates=args.defer_lexical_updates,
             serial_chunk_size=args.serial_chunk_size,
             sample_interval_ms=args.sample_interval_ms,
+            allow_begin_concurrent=args.allow_begin_concurrent,
         )
         proc = batch_result["proc"]
         elapsed_ms = int((time.time() - started_at) * 1000)

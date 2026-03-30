@@ -2418,6 +2418,12 @@ pub fn run_index(
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
+        // Startup watch ingest defers WAL auto-checkpoints for bulk import.
+        // Before entering the long-lived watch loop, restore the steady-state
+        // policy so idle watch sessions do not leave auto-checkpointing
+        // disabled indefinitely.
+        restore_watch_steady_state_checkpoint_policy(&storage, opts.watch);
+
         let opts_clone = opts.clone();
         let state = Mutex::new(load_watch_state(&opts.data_dir));
         let storage = Rc::new(Mutex::new(storage));
@@ -2611,6 +2617,12 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
             db_path.display()
         )
     })
+}
+
+fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_enabled: bool) {
+    if watch_enabled {
+        persist::apply_index_writer_checkpoint_policy(storage, false);
+    }
 }
 
 fn release_watch_storage_after_index(
@@ -3541,13 +3553,10 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                 ReindexCommand::Full => {
                     // Full rebuild commands bypass cooldown for responsive
                     // operator-initiated rebuilds.
-                    if !pending.is_empty() {
-                        if let Err(error) = callback(std::mem::take(&mut pending), &roots, false) {
-                            tracing::warn!(
-                                error = %error,
-                                "watch incremental callback failed"
-                            );
-                        }
+                    if !pending.is_empty()
+                        && let Err(error) = callback(std::mem::take(&mut pending), &roots, false)
+                    {
+                        tracing::warn!(error = %error, "watch incremental callback failed");
                     }
                     if let Err(error) = callback(vec![], &roots, true) {
                         tracing::warn!(error = %error, "watch rebuild callback failed");
@@ -6167,6 +6176,31 @@ mod tests {
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+    }
+
+    #[test]
+    fn restore_watch_steady_state_checkpoint_policy_only_reenables_autocheckpoint_for_live_watch() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("watch-steady-state.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        persist::apply_index_writer_checkpoint_policy(&storage, true);
+        restore_watch_steady_state_checkpoint_policy(&storage, true);
+
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1000));
+
+        persist::apply_index_writer_checkpoint_policy(&storage, true);
+        restore_watch_steady_state_checkpoint_policy(&storage, false);
+
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
     }
 
     #[test]

@@ -2185,7 +2185,12 @@ pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
 
     for hit in hits {
         // Skip tool invocation noise
-        if !hit.content.is_empty() && is_tool_invocation_noise(&hit.content) {
+        let content_to_check = if hit.content.is_empty() {
+            &hit.snippet
+        } else {
+            &hit.content
+        };
+        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
             continue;
         }
 

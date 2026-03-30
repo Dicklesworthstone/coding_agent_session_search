@@ -42,6 +42,7 @@ These scripts are for:
 - Learns a per-root batch size automatically by growing on safe headroom and shrinking on OOM or high RSS
 - Treats stderr-side `watch reindex failed` diagnostics as hard failures even if an older `cass` binary exits `0`
 - Persists per-root/per-pattern state so Claude, Codex, Gemini, and backup roots can all resume independently
+- Unsets `CASS_INDEXER_BEGIN_CONCURRENT*` by default so historical recovery stays on the safer serial writer path; pass `--allow-begin-concurrent` only if you explicitly want to benchmark that mode
 
 ## Typical usage
 
@@ -101,3 +102,4 @@ python3 scripts/historical_recovery/recover_historical_bundle.py \
 - These scripts do not delete or overwrite source bundles.
 - Recovered DBs should be treated as staging inputs for later dedup/merge work.
 - The source of truth should remain the final canonical `agent_search.db`, rebuilt only after staged salvage is complete.
+- For large recovery passes, leave BEGIN CONCURRENT disabled unless you have already proven that specific DB + workload is stable with `--allow-begin-concurrent`.
