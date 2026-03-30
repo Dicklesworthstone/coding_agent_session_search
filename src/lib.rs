@@ -4411,9 +4411,85 @@ struct IndexRunSnapshot {
     active: bool,
     pid: Option<u32>,
     started_at_ms: Option<i64>,
+    db_path: Option<PathBuf>,
 }
 
-fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveIndexRunDetails {
+    pid: Option<u32>,
+    started_at_ms: Option<i64>,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+}
+
+impl ActiveIndexRunDetails {
+    fn from_snapshot(data_dir: &Path, db_path: &Path, snapshot: IndexRunSnapshot) -> Option<Self> {
+        snapshot.active.then(|| Self {
+            pid: snapshot.pid,
+            started_at_ms: snapshot.started_at_ms,
+            data_dir: data_dir.to_path_buf(),
+            db_path: snapshot.db_path.unwrap_or_else(|| db_path.to_path_buf()),
+        })
+    }
+
+    fn without_owner(data_dir: &Path, db_path: &Path) -> Self {
+        Self {
+            pid: None,
+            started_at_ms: None,
+            data_dir: data_dir.to_path_buf(),
+            db_path: db_path.to_path_buf(),
+        }
+    }
+
+    fn started_at_rfc3339(&self) -> Option<String> {
+        self.started_at_ms.and_then(format_timestamp_millis_rfc3339)
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "data_dir": self.data_dir.display().to_string(),
+            "db_path": self.db_path.display().to_string(),
+            "pid": self.pid,
+            "started_at": self.started_at_rfc3339(),
+        })
+    }
+
+    fn to_cli_error(&self) -> CliError {
+        let mut details = Vec::new();
+        if let Some(pid) = self.pid {
+            details.push(format!("pid {pid}"));
+        }
+        if let Some(started_at) = self.started_at_rfc3339() {
+            details.push(format!("started {started_at}"));
+        }
+        details.push(format!("db {}", self.db_path.display()));
+
+        let mut message = format!(
+            "another 'cass index' run is already active for data dir {}",
+            self.data_dir.display()
+        );
+        if !details.is_empty() {
+            message.push_str(&format!(" ({})", details.join(", ")));
+        }
+
+        CliError {
+            code: 7,
+            kind: "index_busy",
+            message,
+            hint: Some(
+                "Wait for the active run to finish or point --data-dir/--db at a different cass dataset."
+                    .to_string(),
+            ),
+            retryable: true,
+        }
+    }
+}
+
+fn format_timestamp_millis_rfc3339(ts: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+}
+
+fn read_index_run_lock_snapshot(data_dir: &Path) -> IndexRunSnapshot {
     let lock_path = data_dir.join("index-run.lock");
     let mut file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
@@ -4425,7 +4501,7 @@ fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
 
     let mut pid = None;
     let mut started_at_ms = None;
-    let mut lock_db_path = None::<String>;
+    let mut lock_db_path = None::<PathBuf>;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -4433,13 +4509,9 @@ fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
         match key.trim() {
             "pid" => pid = value.trim().parse::<u32>().ok(),
             "started_at_ms" => started_at_ms = value.trim().parse::<i64>().ok(),
-            "db_path" => lock_db_path = Some(value.trim().to_string()),
+            "db_path" => lock_db_path = Some(PathBuf::from(value.trim())),
             _ => {}
         }
-    }
-
-    if lock_db_path.as_deref() != Some(db_path.to_string_lossy().as_ref()) {
-        return IndexRunSnapshot::default();
     }
 
     let active = match file.try_lock_exclusive() {
@@ -4454,7 +4526,39 @@ fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
         active,
         pid,
         started_at_ms,
+        db_path: lock_db_path,
     }
+}
+
+fn probe_index_run_lock(data_dir: &Path, db_path: &Path) -> IndexRunSnapshot {
+    let snapshot = read_index_run_lock_snapshot(data_dir);
+    if snapshot.db_path.as_deref() != Some(db_path) {
+        return IndexRunSnapshot::default();
+    }
+    snapshot
+}
+
+fn active_index_run_details(data_dir: &Path, db_path: &Path) -> Option<ActiveIndexRunDetails> {
+    ActiveIndexRunDetails::from_snapshot(data_dir, db_path, read_index_run_lock_snapshot(data_dir))
+}
+
+fn error_chain_indicates_active_cass_index(chain: &str) -> bool {
+    chain.contains("another cass index process already holds")
+}
+
+fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "success": false,
+        "error": err.message,
+        "elapsed_ms": elapsed_ms,
+        "code": err.code,
+        "kind": err.kind,
+        "retryable": err.retryable,
+    });
+    if let Some(hint) = &err.hint {
+        payload["hint"] = serde_json::json!(hint);
+    }
+    payload
 }
 
 fn state_meta_json(
@@ -9241,6 +9345,114 @@ mod cli_read_db_tests {
         );
         assert!(state["rebuild"]["updated_at"].as_str().is_some());
     }
+
+    #[test]
+    fn active_index_run_details_reads_matching_lock_metadata() {
+        let (temp, db_path) = seed_cli_db();
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            4242_u32,
+            1_733_001_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let details =
+            active_index_run_details(temp.path(), &db_path).expect("matching active index run");
+        assert_eq!(details.pid, Some(4242));
+        assert_eq!(details.started_at_ms, Some(1_733_001_111_000));
+        assert_eq!(details.data_dir, temp.path());
+        assert_eq!(details.db_path, db_path);
+        assert_eq!(
+            details.started_at_rfc3339().as_deref(),
+            Some("2024-11-30T21:11:51+00:00")
+        );
+    }
+
+    #[test]
+    fn active_index_run_details_reports_owner_for_other_db_in_same_data_dir() {
+        let (temp, db_path) = seed_cli_db();
+        let other_db_path = temp.path().join("other-agent-search.db");
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            31337_u32,
+            1_733_001_222_000_i64,
+            other_db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let details = active_index_run_details(temp.path(), &db_path)
+            .expect("active lock in same data dir should still be reported");
+        assert_eq!(details.pid, Some(31337));
+        assert_eq!(details.db_path, other_db_path);
+    }
+
+    #[test]
+    fn active_index_busy_cli_error_is_clean_and_structured() {
+        let details = ActiveIndexRunDetails {
+            pid: Some(777),
+            started_at_ms: Some(1_733_001_333_000_i64),
+            data_dir: PathBuf::from("/tmp/cass-data"),
+            db_path: PathBuf::from("/tmp/cass-data/agent_search.db"),
+        };
+
+        let err = details.to_cli_error();
+        assert_eq!(err.code, 7);
+        assert_eq!(err.kind, "index_busy");
+        assert!(err.retryable);
+        assert!(
+            err.message
+                .contains("another 'cass index' run is already active"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("pid 777"),
+            "pid should be surfaced cleanly: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("/tmp/cass-data"),
+            "data dir/db should be surfaced cleanly: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("--data-dir/--db")),
+            "unexpected hint: {:?}",
+            err.hint
+        );
+
+        let payload = cli_error_json_payload(&err, 1234);
+        assert_eq!(payload["success"].as_bool(), Some(false));
+        assert_eq!(payload["elapsed_ms"].as_u64(), Some(1234));
+        assert_eq!(payload["code"].as_i64(), Some(7));
+        assert_eq!(payload["kind"].as_str(), Some("index_busy"));
+        assert_eq!(payload["retryable"].as_bool(), Some(true));
+    }
 }
 
 /// Comprehensive diagnostic and repair tool for cass installation.
@@ -12165,6 +12377,16 @@ fn run_index_with_data(
         .filter(|paths| !paths.is_empty())
         .or_else(read_watch_once_paths_env);
 
+    if let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
+        let err = active_index.to_cli_error();
+        if let Some(fmt) = structured_format {
+            let mut payload = cli_error_json_payload(&err, 0);
+            payload["active_index"] = active_index.to_json();
+            output_structured_value(payload, fmt)?;
+        }
+        return Err(err);
+    }
+
     // Create progress tracker for real-time feedback
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
 
@@ -12387,6 +12609,7 @@ fn run_index_with_data(
     }
 
     // Get the result from the indexer thread
+    let mut active_index_error = None::<ActiveIndexRunDetails>;
     let res = match index_handle.join() {
         Ok(result) => result.map_err(|e| {
             let chain = e
@@ -12394,6 +12617,13 @@ fn run_index_with_data(
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(" | ");
+            if error_chain_indicates_active_cass_index(&chain) {
+                let details = active_index_run_details(&data_dir, &db_path)
+                    .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path));
+                let err = details.to_cli_error();
+                active_index_error = Some(details);
+                return err;
+            }
             CliError {
                 code: 9,
                 kind: "index",
@@ -12425,14 +12655,13 @@ fn run_index_with_data(
 
     if let Err(err) = &res {
         if let Some(fmt) = structured_format {
-            let payload = serde_json::json!({
-                "success": false,
-                "error": err.message,
-                "elapsed_ms": elapsed_ms,
-            });
+            let mut payload = cli_error_json_payload(err, elapsed_ms);
+            if let Some(active_index) = &active_index_error {
+                payload["active_index"] = active_index.to_json();
+            }
             output_structured_value(payload, fmt)?;
         } else {
-            eprintln!("index debug error: {err:?}");
+            tracing::debug!(?err, "index command failed");
         }
     } else if let Some(fmt) = structured_format {
         // Get stats after successful indexing
