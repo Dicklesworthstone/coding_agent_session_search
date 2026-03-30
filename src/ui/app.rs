@@ -2867,6 +2867,15 @@ fn display_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+/// Extract the last component of a path string, supporting both Unix and Windows separators.
+fn last_path_component(path: &str) -> &str {
+    if let Some(idx) = path.rfind(['/', '\\']) {
+        &path[idx + 1..]
+    } else {
+        path
+    }
+}
+
 fn elide_text(text: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
@@ -4699,6 +4708,8 @@ pub struct CassApp {
     pub last_split_handle_area: RefCell<Option<Rect>>,
     /// Last rendered saved-view list row hit areas.
     pub last_saved_view_row_areas: RefCell<Vec<(Rect, usize)>>,
+    /// Last rendered suggestion hit areas (Did-you-mean).
+    pub last_suggestion_rects: RefCell<Vec<(Rect, usize)>>,
     /// Last rendered visible row count for the Sources list.
     last_sources_visible_rows: Cell<usize>,
     /// Active pane split drag state for mouse-based resize.
@@ -4933,6 +4944,7 @@ impl Default for CassApp {
             last_content_area: RefCell::new(None),
             last_split_handle_area: RefCell::new(None),
             last_saved_view_row_areas: RefCell::new(Vec::new()),
+            last_suggestion_rects: RefCell::new(Vec::new()),
             last_sources_visible_rows: Cell::new(0),
             pane_split_drag: None,
             last_mouse_pos: None,
@@ -5428,6 +5440,15 @@ impl CassApp {
             && rect.contains(x, y)
         {
             return MouseHitRegion::SplitHandle;
+        }
+
+        if let Some((_, idx)) = self
+            .last_suggestion_rects
+            .borrow()
+            .iter()
+            .find(|(rect, _)| rect.contains(x, y))
+        {
+            return MouseHitRegion::Suggestion { idx: *idx };
         }
 
         // Pane-aware hit testing: when multi-pane is active, each pane gets its own
@@ -6424,18 +6445,14 @@ impl CassApp {
                 ResultsGrouping::Agent => hit.agent.clone(),
                 ResultsGrouping::Conversation => {
                     // Use last path component of source_path as conversation key.
-                    hit.source_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&hit.source_path)
-                        .to_string()
+                    last_path_component(&hit.source_path).to_string()
                 }
                 ResultsGrouping::Workspace => {
                     let w = &hit.workspace;
                     if w.is_empty() {
                         "(none)".to_string()
                     } else {
-                        w.rsplit('/').next().unwrap_or(w).to_string()
+                        last_path_component(w).to_string()
                     }
                 }
                 ResultsGrouping::Flat => "All".to_string(),
@@ -7669,6 +7686,8 @@ impl CassApp {
             inner
         };
 
+        self.last_suggestion_rects.borrow_mut().clear();
+
         if self.panes.is_empty() {
             // Show a loading spinner when a search is in flight.
             if self.search_in_flight {
@@ -7718,6 +7737,8 @@ impl CassApp {
                 !self.query.is_empty() && self.last_search_ms.is_some() && !self.search_in_flight;
 
             let mut lines: Vec<ftui::text::Line<'static>> = Vec::new();
+            let mut rendered_suggestions: Vec<(usize, String)> = Vec::new();
+            let mut suggestion_line_offset = None::<u16>;
             lines.push(ftui::text::Line::from(""));
             if has_completed_search {
                 // Zero results for a real query.
@@ -7733,11 +7754,16 @@ impl CassApp {
                     lines.push(ftui::text::Line::from_spans(vec![
                         ftui::text::Span::styled("  Try instead:", info_s),
                     ]));
-                    for suggestion in self.suggestions.iter().take(3) {
+                    suggestion_line_offset = Some(lines.len() as u16);
+
+                    for (i, suggestion) in self.suggestions.iter().take(3).enumerate() {
                         let shortcut_label = suggestion
                             .shortcut
                             .map(|n| format!(" {} ", n))
                             .unwrap_or_else(|| " \u{2022} ".to_string());
+                        let line_text = format!("{} {}", shortcut_label, suggestion.message);
+                        rendered_suggestions.push((i + 1, line_text));
+
                         lines.push(ftui::text::Line::from_spans(vec![
                             ftui::text::Span::styled(shortcut_label, pill_s),
                             ftui::text::Span::styled(format!(" {}", suggestion.message), subtle_s),
@@ -7888,6 +7914,17 @@ impl CassApp {
             let y_offset = inner.height.saturating_sub(lines.len() as u16) / 3;
             let avail = inner.height.saturating_sub(y_offset);
             if avail > 0 {
+                if let Some(offset) = suggestion_line_offset {
+                    let mut suggestion_areas = self.last_suggestion_rects.borrow_mut();
+                    for (row, (idx, line_text)) in rendered_suggestions.iter().enumerate() {
+                        let line_w = display_width(line_text).min(inner.width as usize) as u16;
+                        let line_x = inner.x + (inner.width.saturating_sub(line_w) / 2);
+                        let line_y = inner.y + y_offset + offset + row as u16;
+                        if line_y < inner.y + inner.height {
+                            suggestion_areas.push((Rect::new(line_x, line_y, line_w, 1), *idx));
+                        }
+                    }
+                }
                 let block_area = Rect::new(
                     inner.x,
                     inner.y + y_offset,
@@ -7914,6 +7951,7 @@ impl CassApp {
                 let subtle_s = styles.style(style_system::STYLE_TEXT_SUBTLE);
                 let pill_s = styles.style(style_system::STYLE_PILL_ACTIVE);
                 let mut zero_lines: Vec<ftui::text::Line<'static>> = Vec::new();
+                let mut rendered_suggestions: Vec<(usize, String)> = Vec::new();
                 zero_lines.push(ftui::text::Line::from(""));
                 zero_lines.push(ftui::text::Line::from_spans(vec![
                     ftui::text::Span::styled(
@@ -7929,11 +7967,14 @@ impl CassApp {
                         zero_lines.push(ftui::text::Line::from_spans(vec![
                             ftui::text::Span::styled("  Try instead:", accent_s),
                         ]));
-                        for suggestion in self.suggestions.iter().take(3) {
+
+                        for (i, suggestion) in self.suggestions.iter().take(3).enumerate() {
                             let shortcut_label = suggestion
                                 .shortcut
                                 .map(|n| format!(" {} ", n))
                                 .unwrap_or_else(|| " \u{2022} ".to_string());
+                            let line_text = format!("{} {}", shortcut_label, suggestion.message);
+                            rendered_suggestions.push((i + 1, line_text));
                             zero_lines.push(ftui::text::Line::from_spans(vec![
                                 ftui::text::Span::styled(shortcut_label, pill_s),
                                 ftui::text::Span::styled(
@@ -7970,6 +8011,17 @@ impl CassApp {
                         .saturating_sub(y_off)
                         .min(zero_lines.len() as u16),
                 );
+                let mut suggestion_areas = self.last_suggestion_rects.borrow_mut();
+                suggestion_areas.clear();
+                let suggestions_start_y = inner.y + y_off + 4;
+                for (offset, (idx, line_text)) in rendered_suggestions.iter().enumerate() {
+                    let line_w = display_width(line_text) as u16;
+                    let line_x = inner.x + (inner.width.saturating_sub(line_w) / 2);
+                    let line_y = suggestions_start_y + offset as u16;
+                    if line_y < inner.y + inner.height {
+                        suggestion_areas.push((Rect::new(line_x, line_y, line_w, 1), *idx));
+                    }
+                }
                 Paragraph::new(ftui::text::Text::from_lines(zero_lines))
                     .style(text_muted_style)
                     .alignment(Alignment::Center)
@@ -13171,6 +13223,8 @@ enum MouseHitRegion {
     SearchBar,
     /// Click/scroll landed in the status footer.
     StatusBar,
+    /// Click on a search suggestion (Did-you-mean).
+    Suggestion { idx: usize },
     /// Click/scroll landed outside any tracked region.
     None,
 }
@@ -15427,6 +15481,16 @@ impl super::ftui_adapter::Model for CassApp {
                         self.cursor_pos = new_cursor;
                     }
                 } else {
+                    // Special case: apply did-you-mean suggestion if query is empty
+                    // and user types 1, 2, or 3.
+                    if self.query.is_empty()
+                        && !self.suggestions.is_empty()
+                        && matches!(text.as_str(), "1" | "2" | "3")
+                    {
+                        let idx = text.as_bytes()[0] - b'0';
+                        return self.update(CassMsg::SuggestionApplied(idx));
+                    }
+
                     self.query.insert_str(cursor, &text);
                     self.cursor_pos = cursor + text.len();
                 }
@@ -18337,6 +18401,10 @@ impl super::ftui_adapter::Model for CassApp {
                         let _ = self.apply_panel_ratio_from_mouse_x(x);
                         ftui::Cmd::none()
                     }
+                    // ── Left click on a search suggestion (Did-you-mean) ──
+                    (MouseEventKind::LeftClick, MouseHitRegion::Suggestion { idx }) => {
+                        self.update(CassMsg::SuggestionApplied(idx as u8))
+                    }
                     // ── Left click on a filter pill: edit that filter ──
                     (MouseEventKind::LeftClick, MouseHitRegion::Pill { index }) => {
                         let pill = {
@@ -20280,6 +20348,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.last_pane_rects.borrow_mut().clear();
                 *self.last_pane_first_index.borrow_mut() = 0;
                 self.last_saved_view_row_areas.borrow_mut().clear();
+                self.last_suggestion_rects.borrow_mut().clear();
 
                 // ── Analytics surface layout ─────────────────────────────
                 let atopo = breakpoint.analytics_topology();
@@ -20549,6 +20618,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.last_pane_rects.borrow_mut().clear();
                 *self.last_pane_first_index.borrow_mut() = 0;
                 self.last_saved_view_row_areas.borrow_mut().clear();
+                self.last_suggestion_rects.borrow_mut().clear();
 
                 // ── Sources surface layout ─────────────────────────────
                 let vertical = Flex::vertical()
