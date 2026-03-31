@@ -4,7 +4,7 @@ pub mod semantic;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -415,16 +415,71 @@ impl Drop for RunIndexProgressReset {
 const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
 const LEXICAL_REBUILD_PAGE_SIZE: i64 = 200;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexRunMode {
+    Index,
+    WatchStartup,
+    Watch,
+    WatchOnce,
+}
+
+impl IndexRunMode {
+    fn as_lock_value(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::WatchStartup => "watch_startup",
+            Self::Watch => "watch",
+            Self::WatchOnce => "watch_once",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
-    _file: File,
+    file: File,
     _path: PathBuf,
+    started_at_ms: i64,
+    db_path: PathBuf,
 }
 
 impl Drop for IndexRunLockGuard {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        let _ = self.file.unlock();
+    }
+}
+
+impl IndexRunLockGuard {
+    fn write_metadata(&mut self, mode: IndexRunMode) -> Result<()> {
+        self.file.set_len(0).with_context(|| {
+            format!(
+                "truncating index-run lock file before metadata update: {}",
+                self._path.display()
+            )
+        })?;
+        self.file.rewind().with_context(|| {
+            format!(
+                "rewinding index-run lock file after truncation: {}",
+                self._path.display()
+            )
+        })?;
+        writeln!(
+            self.file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode={}",
+            std::process::id(),
+            self.started_at_ms,
+            self.db_path.display(),
+            mode.as_lock_value()
+        )
+        .with_context(|| format!("writing index-run metadata to {}", self._path.display()))?;
+        self.file
+            .flush()
+            .with_context(|| format!("flushing index-run lock file {}", self._path.display()))?;
+        Ok(())
+    }
+
+    fn set_mode(&mut self, mode: IndexRunMode) -> Result<()> {
+        self.write_metadata(mode)
     }
 }
 
@@ -530,11 +585,15 @@ impl LexicalRebuildState {
     }
 }
 
-fn acquire_index_run_lock(data_dir: &Path, db_path: &Path) -> Result<IndexRunLockGuard> {
+fn acquire_index_run_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    mode: IndexRunMode,
+) -> Result<IndexRunLockGuard> {
     fs::create_dir_all(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
     let lock_path = data_dir.join("index-run.lock");
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -542,34 +601,25 @@ fn acquire_index_run_lock(data_dir: &Path, db_path: &Path) -> Result<IndexRunLoc
         .open(&lock_path)
         .with_context(|| format!("opening index-run lock file {}", lock_path.display()))?;
 
-    file.try_lock_exclusive().with_context(|| {
-        format!(
-            "another cass index process already holds {}",
-            lock_path.display()
-        )
-    })?;
+    if let Err(err) = file.try_lock_exclusive() {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "another cass index process already holds {}",
+                lock_path.display()
+            );
+        }
+        return Err(err)
+            .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
+    }
 
-    file.set_len(0).with_context(|| {
-        format!(
-            "truncating index-run lock file after acquisition: {}",
-            lock_path.display()
-        )
-    })?;
-    writeln!(
+    let mut guard = IndexRunLockGuard {
         file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}",
-        std::process::id(),
-        FrankenStorage::now_millis(),
-        db_path.display()
-    )
-    .with_context(|| format!("writing index-run metadata to {}", lock_path.display()))?;
-    file.flush()
-        .with_context(|| format!("flushing index-run lock file {}", lock_path.display()))?;
-
-    Ok(IndexRunLockGuard {
-        _file: file,
         _path: lock_path,
-    })
+        started_at_ms: FrankenStorage::now_millis(),
+        db_path: db_path.to_path_buf(),
+    };
+    guard.write_metadata(mode)?;
+    Ok(guard)
 }
 
 fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
@@ -1945,7 +1995,19 @@ pub fn run_index(
 ) -> Result<()> {
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
     set_progress_last_error(opts.progress.as_ref(), None);
-    let _index_run_lock = acquire_index_run_lock(&opts.data_dir, &opts.db_path)?;
+    let initial_lock_mode = if opts.watch {
+        IndexRunMode::WatchStartup
+    } else if opts
+        .watch_once_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty())
+    {
+        IndexRunMode::WatchOnce
+    } else {
+        IndexRunMode::Index
+    };
+    let mut index_run_lock =
+        acquire_index_run_lock(&opts.data_dir, &opts.db_path, initial_lock_mode)?;
 
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
@@ -1980,8 +2042,12 @@ pub fn run_index(
     let canonical_only_full_rebuild = opts.full
         && initial_canonical_sessions_before_salvage > 0
         && !storage_rebuilt
-        && !opened_fresh_for_full;
-    let resume_lexical_rebuild = if initial_canonical_sessions_before_salvage > 0 {
+        && !opened_fresh_for_full
+        && !opts.force_rebuild;
+    let resume_lexical_rebuild = if opts.force_rebuild {
+        // force_rebuild always starts from scratch; never resume a stale checkpoint.
+        false
+    } else if initial_canonical_sessions_before_salvage > 0 {
         let db_state = lexical_rebuild_db_state(&storage, &opts.db_path)?;
         has_pending_lexical_rebuild(&index_path, &db_state)?
     } else {
@@ -2091,7 +2157,8 @@ pub fn run_index(
         let canonical_only_full_rebuild = opts.full
             && canonical_sessions_before_salvage > 0
             && !storage_rebuilt
-            && !opened_fresh_for_full;
+            && !opened_fresh_for_full
+            && !opts.force_rebuild;
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             opts.watch_once_paths
                 .as_ref()
@@ -2423,6 +2490,9 @@ pub fn run_index(
         // policy so idle watch sessions do not leave auto-checkpointing
         // disabled indefinitely.
         restore_watch_steady_state_checkpoint_policy(&storage, opts.watch);
+        if opts.watch {
+            index_run_lock.set_mode(IndexRunMode::Watch)?;
+        }
 
         let opts_clone = opts.clone();
         let state = Mutex::new(load_watch_state(&opts.data_dir));
@@ -3219,6 +3289,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                         content: msg.content,
                         extra: msg.extra_json,
                         snippets: Vec::new(),
+                        invocations: Vec::new(),
                     }
                 })
                 .collect();
@@ -3457,8 +3528,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
     let (tx, rx) = event_channel.unwrap_or_else(crossbeam_channel::unbounded);
     let tx_clone = tx.clone();
 
-    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
+    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(event) => {
             if event.need_rescan() {
                 let _ = tx_clone.send(IndexerEvent::Command(ReindexCommand::Full));
                 return;
@@ -3467,6 +3538,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                 return;
             }
             let _ = tx_clone.send(IndexerEvent::Notify(event.paths));
+        }
+        Err(e) => {
+            tracing::warn!("filesystem watcher error: {}", e);
         }
     })?;
 
@@ -3795,7 +3869,11 @@ fn reindex_paths(
         // Track total indexed for stale detection
         total_indexed += conv_count;
 
-        if conv_count > 0
+        // Explicit watch-once imports are one-shot recovery/replay work, not
+        // live daemon watch progress. Do not let them advance the persistent
+        // watch_state high-water marks that steady-state watch mode consumes.
+        if !explicit_watch_once
+            && conv_count > 0
             && let Some(ts_val) = max_ts
         {
             let mut guard = state
@@ -5228,6 +5306,7 @@ pub mod persist {
                                 content: format!("begin-concurrent-test conv={i} msg={j}"),
                                 extra: serde_json::json!({}),
                                 snippets: vec![],
+                                invocations: Vec::new(),
                             })
                             .collect(),
                     }
@@ -5305,6 +5384,7 @@ pub mod persist {
                     content: "single-conv-begin-concurrent-test".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             }];
 
@@ -5389,6 +5469,7 @@ pub mod persist {
                         content: "third".into(),
                         extra: serde_json::json!({}),
                         snippets: vec![],
+                        invocations: Vec::new(),
                     }],
                 },
                 NormalizedConversation {
@@ -5409,6 +5490,7 @@ pub mod persist {
                             content: "first".into(),
                             extra: serde_json::json!({}),
                             snippets: vec![],
+                            invocations: Vec::new(),
                         },
                         NormalizedMessage {
                             idx: 1,
@@ -5418,6 +5500,7 @@ pub mod persist {
                             content: "second".into(),
                             extra: serde_json::json!({}),
                             snippets: vec![],
+                            invocations: Vec::new(),
                         },
                     ],
                 },
@@ -5468,6 +5551,7 @@ pub mod persist {
                         content: "first".into(),
                         extra: serde_json::json!({}),
                         snippets: vec![],
+                        invocations: Vec::new(),
                     }],
                 },
                 NormalizedConversation {
@@ -5487,6 +5571,7 @@ pub mod persist {
                         content: "second".into(),
                         extra: serde_json::json!({}),
                         snippets: vec![],
+                        invocations: Vec::new(),
                     }],
                 },
             ];
@@ -5569,6 +5654,7 @@ mod tests {
             content: format!("msg-{idx}"),
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         }
     }
 
@@ -5634,6 +5720,7 @@ mod tests {
                     serde_json::json!({})
                 },
                 snippets: Vec::new(),
+                invocations: Vec::new(),
             });
         }
 
@@ -7588,6 +7675,80 @@ mod tests {
             indexed, 1,
             "explicit watch_once imports should ignore file mtime watermarks"
         );
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_does_not_advance_persistent_watch_state() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_once_state_isolation");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-watch-once.json");
+        std::fs::write(
+            &amp_file,
+            r#"{"id":"watch-once","messages":[{"role":"user","text":"p","createdAt":1700000000100}]}"#,
+        )
+        .unwrap();
+
+        let persisted_ts = 123_456_i64;
+        let mut persisted_state = HashMap::new();
+        persisted_state.insert(ConnectorKind::Amp, persisted_ts);
+        save_watch_state(&data_dir, &persisted_state).unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![amp_file.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
+        let state = Mutex::new(persisted_state.clone());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(t_index);
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![amp_file],
+            &[(ConnectorKind::Amp, ScanRoot::local(amp_dir))],
+            &state,
+            &storage,
+            &t_index,
+            false,
+        )
+        .unwrap();
+        assert_eq!(indexed, 1);
+
+        let in_memory = state.lock().unwrap();
+        assert_eq!(
+            in_memory.get(&ConnectorKind::Amp).copied(),
+            Some(persisted_ts)
+        );
+        drop(in_memory);
+
+        let loaded = load_watch_state(&data_dir);
+        assert_eq!(loaded.get(&ConnectorKind::Amp).copied(), Some(persisted_ts));
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
