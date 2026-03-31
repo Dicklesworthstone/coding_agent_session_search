@@ -1292,8 +1292,12 @@ pub fn rrf_fuse_hits(
         &FsRrfConfig::default(),
     );
 
-    // Dedup by (source_id, content_hash) — consistent with deduplicate_hits.
-    let mut seen_content: HashSet<(String, u64)> = HashSet::with_capacity(fused.len());
+    // Dedup by (source_id, source_path, content_hash) while preserving RRF order.
+    let mut source_ids: HashMap<String, u32> = HashMap::new();
+    let mut path_ids: HashMap<String, u32> = HashMap::new();
+    let mut next_source_id: u32 = 0;
+    let mut next_path_id: u32 = 0;
+    let mut seen_content: HashSet<(u32, u32, u64)> = HashSet::with_capacity(fused.len());
     let mut unique_hits = Vec::with_capacity(fused.len());
 
     for fused_hit in fused {
@@ -1302,14 +1306,36 @@ pub fn rrf_fuse_hits(
             None => continue,
         };
         // Skip tool noise if present (though inputs should be clean)
-        if !hit.content.is_empty() && is_tool_invocation_noise(&hit.content) {
+        let content_to_check = if hit.content.is_empty() {
+            &hit.snippet
+        } else {
+            &hit.content
+        };
+        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
             continue;
         }
 
-        // Dedup key: (source_id, content_hash) — consistent with deduplicate_hits.
-        let key = (hit.source_id.clone(), hit.content_hash);
-        if !seen_content.contains(&key) {
-            seen_content.insert(key);
+        // Intern IDs for the seen set key to avoid String clones.
+        let source_key = if let Some(id) = source_ids.get(hit.source_id.as_str()) {
+            *id
+        } else {
+            let id = next_source_id;
+            next_source_id = next_source_id.saturating_add(1);
+            source_ids.insert(hit.source_id.clone(), id);
+            id
+        };
+        let path_key = if let Some(id) = path_ids.get(hit.source_path.as_str()) {
+            *id
+        } else {
+            let id = next_path_id;
+            next_path_id = next_path_id.saturating_add(1);
+            path_ids.insert(hit.source_path.clone(), id);
+            id
+        };
+        let key = (source_key, path_key, hit.content_hash);
+
+        if seen_content.insert(key) {
+            // Update hit score to the fused RRF score
             hit.score = fused_hit.rrf_score as f32;
             unique_hits.push(hit);
         }
@@ -2161,11 +2187,13 @@ pub(crate) fn is_tool_invocation_noise(content: &str) -> bool {
 
 fn snippet_from_content(content: &str) -> String {
     let trimmed = content.trim();
-    if trimmed.chars().count() <= 200 {
-        return trimmed.to_string();
+    let mut chars = trimmed.chars();
+    let preview: String = chars.by_ref().take(200).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
     }
-    let preview: String = trimmed.chars().take(200).collect();
-    format!("{preview}...")
 }
 
 /// Deduplicate search hits by (source_id, content), keeping only the highest-scored hit
@@ -2176,11 +2204,13 @@ fn snippet_from_content(content: &str) -> String {
 ///
 /// Also filters out tool invocation noise that isn't useful for search results.
 pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
-    // Key: (source_numeric_id, content_hash) -> index in deduped.
-    // Intern source IDs to avoid cloning source_id for every hit.
+    // Key: (source_numeric_id, source_path_numeric_id, content_hash) -> index in deduped.
+    // Intern IDs to avoid cloning strings for every hit.
     let mut source_ids: HashMap<String, u32> = HashMap::new();
+    let mut path_ids: HashMap<String, u32> = HashMap::new();
     let mut next_source_id: u32 = 0;
-    let mut seen: HashMap<(u32, u64), usize> = HashMap::new();
+    let mut next_path_id: u32 = 0;
+    let mut seen: HashMap<(u32, u32, u64), usize> = HashMap::new();
     let mut deduped: Vec<SearchHit> = Vec::new();
 
     for hit in hits {
@@ -2194,7 +2224,7 @@ pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
             continue;
         }
 
-        // Include source_id in the key so different sources keep their results.
+        // Include source_id AND source_path in the key so different sessions keep their results.
         let source_key = if let Some(id) = source_ids.get(hit.source_id.as_str()) {
             *id
         } else {
@@ -2203,7 +2233,15 @@ pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
             source_ids.insert(hit.source_id.clone(), id);
             id
         };
-        let key = (source_key, hit.content_hash);
+        let path_key = if let Some(id) = path_ids.get(hit.source_path.as_str()) {
+            *id
+        } else {
+            let id = next_path_id;
+            next_path_id = next_path_id.saturating_add(1);
+            path_ids.insert(hit.source_path.clone(), id);
+            id
+        };
+        let key = (source_key, path_key, hit.content_hash);
 
         if let Some(&existing_idx) = seen.get(&key) {
             // If existing hit has lower score, replace it
@@ -2748,75 +2786,81 @@ impl SearchClient {
             .as_ref()
             .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
 
-        let mut sql = String::from(
-            "SELECT c.source_id, c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             WHERE ",
-        );
-        let mut params = Vec::with_capacity(unique_keys.len().saturating_mul(3));
-        for (idx, (source_id, source_path, line_idx)) in unique_keys.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(" OR ");
+        let mut resolved_by_key = HashMap::new();
+
+        // SQLite has a maximum parameter limit (usually 999). Each key uses 3 params.
+        // Chunk to avoid hitting this limit.
+        const CHUNK_SIZE: usize = 300;
+        for chunk in unique_keys.chunks(CHUNK_SIZE) {
+            let mut sql = String::from(
+                "SELECT c.source_id, c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 WHERE ",
+            );
+            let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
+            for (idx, (source_id, source_path, line_idx)) in chunk.iter().enumerate() {
+                if idx > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str("(c.source_id = ? AND c.source_path = ? AND m.idx = ?)");
+                params.push(ParamValue::from(source_id.clone()));
+                params.push(ParamValue::from(source_path.clone()));
+                params.push(ParamValue::from(*line_idx));
             }
-            sql.push_str("(c.source_id = ? AND c.source_path = ? AND m.idx = ?)");
-            params.push(ParamValue::from(source_id.clone()));
-            params.push(ParamValue::from(source_path.clone()));
-            params.push(ParamValue::from(*line_idx));
-        }
 
-        let rows: Vec<ResolvedSemanticLookupRow> =
-            conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
-                let source_id: String = row.get_typed(0)?;
-                let source_path: String = row.get_typed(1)?;
-                let idx: i64 = row.get_typed(2)?;
-                let message_id_raw: i64 = row.get_typed(3)?;
-                let agent_id_raw: i64 = row.get_typed(4)?;
-                let workspace_id_raw: Option<i64> = row.get_typed(5)?;
-                let role_raw: String = row.get_typed(6)?;
-                let created_at_ms: Option<i64> = row.get_typed(7)?;
-                let content: String = row.get_typed(8)?;
+            let chunk_rows: Vec<ResolvedSemanticLookupRow> =
+                conn.query_map_collect(&sql, &params, |row: &frankensqlite::Row| {
+                    let source_id: String = row.get_typed(0)?;
+                    let source_path: String = row.get_typed(1)?;
+                    let idx: i64 = row.get_typed(2)?;
+                    let message_id_raw: i64 = row.get_typed(3)?;
+                    let agent_id_raw: i64 = row.get_typed(4)?;
+                    let workspace_id_raw: Option<i64> = row.get_typed(5)?;
+                    let role_raw: String = row.get_typed(6)?;
+                    let created_at_ms: Option<i64> = row.get_typed(7)?;
+                    let content: String = row.get_typed(8)?;
 
-                let canonical = canonicalize_for_embedding(&content);
-                if canonical.is_empty() {
-                    return Ok(None);
-                }
+                    let canonical = canonicalize_for_embedding(&content);
+                    if canonical.is_empty() {
+                        return Ok(None);
+                    }
 
-                let message_id = u64::try_from(message_id_raw).map_err(|_| {
-                    std::io::Error::other("message id out of range for progressive doc_id")
+                    let message_id = u64::try_from(message_id_raw).map_err(|_| {
+                        std::io::Error::other("message id out of range for progressive doc_id")
+                    })?;
+                    let agent_id = if agent_id_raw < 0 {
+                        0
+                    } else {
+                        u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
+                    };
+                    let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
+                        0
+                    } else {
+                        u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
+                    };
+                    let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
+                    let doc_id = SemanticDocId {
+                        message_id,
+                        chunk_idx: 0,
+                        agent_id,
+                        workspace_id,
+                        source_id: crc32fast::hash(source_id.as_bytes()),
+                        role,
+                        created_at_ms: created_at_ms.unwrap_or(0),
+                        content_hash: Some(content_hash(&canonical)),
+                    }
+                    .to_doc_id_string();
+
+                    Ok(Some((
+                        (source_id, source_path, idx),
+                        ResolvedSemanticDocId { message_id, doc_id },
+                    )))
                 })?;
-                let agent_id = if agent_id_raw < 0 {
-                    0
-                } else {
-                    u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
-                };
-                let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
-                    0
-                } else {
-                    u32::try_from(workspace_id_raw.unwrap_or(0)).unwrap_or(u32::MAX)
-                };
-                let role = role_code_from_str(&role_raw).unwrap_or(ROLE_USER);
-                let doc_id = SemanticDocId {
-                    message_id,
-                    chunk_idx: 0,
-                    agent_id,
-                    workspace_id,
-                    source_id: crc32fast::hash(source_id.as_bytes()),
-                    role,
-                    created_at_ms: created_at_ms.unwrap_or(0),
-                    content_hash: Some(content_hash(&canonical)),
-                }
-                .to_doc_id_string();
 
-                Ok(Some((
-                    (source_id, source_path, idx),
-                    ResolvedSemanticDocId { message_id, doc_id },
-                )))
-            })?;
-
-        let mut resolved_by_key = HashMap::with_capacity(rows.len());
-        for row in rows.into_iter().flatten() {
-            resolved_by_key.insert(row.0, row.1);
+            for row in chunk_rows.into_iter().flatten() {
+                resolved_by_key.insert(row.0, row.1);
+            }
         }
 
         Ok(lookup_keys
@@ -4689,12 +4733,11 @@ fn is_prefix_only(query: &str) -> bool {
 }
 
 fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String {
-    let content_char_count = content.chars().count();
-
     // Handle empty query case first
     if query.is_empty() {
-        let snippet: String = content.chars().take(max_chars).collect();
-        return if content_char_count > max_chars {
+        let mut chars = content.chars();
+        let snippet: String = chars.by_ref().take(max_chars).collect();
+        return if chars.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -4703,23 +4746,54 @@ fn quick_prefix_snippet(content: &str, query: &str, max_chars: usize) -> String 
 
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
+
     if let Some(pos) = lc_content.find(&lc_query) {
         // Convert byte index in the lowercased string to a character index.
-        // IMPORTANT: Use lc_content[..pos], not content[..pos], because pos is a byte
-        // index valid only for the lowercased string (Unicode case mappings can change
-        // byte lengths, e.g., German ß → SS).
-        let start_char = lc_content[..pos].chars().count().saturating_sub(15);
-        let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
-        let snippet_char_count = snippet.chars().count();
-        if start_char + snippet_char_count < content_char_count {
+        let match_start_char_idx = lc_content[..pos].chars().count();
+        let query_char_len = lc_query.chars().count();
+
+        // Determine where to start the snippet (aim for 15 chars before match)
+        let start_char = match_start_char_idx.saturating_sub(15);
+        let mut chars_iter = content.chars().skip(start_char);
+        let mut snippet = String::new();
+        let mut chars_taken = 0;
+        let mut current_idx = start_char;
+
+        while chars_taken < max_chars {
+            if current_idx == match_start_char_idx {
+                snippet.push_str("**");
+                for _ in 0..query_char_len {
+                    if let Some(ch) = chars_iter.next() {
+                        snippet.push(ch);
+                        chars_taken += 1;
+                        current_idx += 1;
+                    }
+                }
+                snippet.push_str("**");
+                if chars_taken >= max_chars {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(ch) = chars_iter.next() {
+                snippet.push(ch);
+                chars_taken += 1;
+                current_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if chars_iter.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
         }
     } else {
-        let snippet: String = content.chars().take(max_chars).collect();
-        if content_char_count > max_chars {
+        let mut chars = content.chars();
+        let snippet: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -4733,17 +4807,43 @@ fn cached_prefix_snippet(content: &str, query: &str, max_chars: usize) -> Option
     }
     let lc_content = content.to_lowercase();
     let lc_query = query.to_lowercase();
-    let content_char_count = content.chars().count();
     lc_content.find(&lc_query).map(|pos| {
-        // Convert byte index in the lowercased string to a character index.
-        // IMPORTANT: Use lc_content[..pos], not content[..pos], because pos is a byte
-        // index valid only for the lowercased string (Unicode case mappings can change
-        // byte lengths, e.g., German ß → SS).
-        let start_char = lc_content[..pos].chars().count().saturating_sub(15);
-        let snippet: String = content.chars().skip(start_char).take(max_chars).collect();
-        // Check if we truncated: snippet covers chars [start_char, start_char + snippet_len)
-        let snippet_char_count = snippet.chars().count();
-        if start_char + snippet_char_count < content_char_count {
+        let match_start_char_idx = lc_content[..pos].chars().count();
+        let query_char_len = lc_query.chars().count();
+
+        let start_char = match_start_char_idx.saturating_sub(15);
+        let mut chars_iter = content.chars().skip(start_char);
+        let mut snippet = String::new();
+        let mut chars_taken = 0;
+        let mut current_idx = start_char;
+
+        while chars_taken < max_chars {
+            if current_idx == match_start_char_idx {
+                snippet.push_str("**");
+                for _ in 0..query_char_len {
+                    if let Some(ch) = chars_iter.next() {
+                        snippet.push(ch);
+                        chars_taken += 1;
+                        current_idx += 1;
+                    }
+                }
+                snippet.push_str("**");
+                if chars_taken >= max_chars {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(ch) = chars_iter.next() {
+                snippet.push(ch);
+                chars_taken += 1;
+                current_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if chars_iter.next().is_some() {
             format!("{snippet}…")
         } else {
             snippet
@@ -5250,6 +5350,7 @@ mod tests {
                     content,
                     extra: json!({}),
                     snippets: Vec::new(),
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&normalized)?;
@@ -5918,6 +6019,7 @@ mod tests {
             content: "duplicate content".into(),
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         };
         let conv1 = NormalizedConversation {
             agent_slug: "agent1".into(),
@@ -5939,6 +6041,7 @@ mod tests {
             content: "duplicate content".into(), // SAME content
             extra: serde_json::json!({}),
             snippets: Vec::new(),
+            invocations: Vec::new(),
         };
         let conv2 = NormalizedConversation {
             agent_slug: "agent1".into(),
@@ -6248,6 +6351,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6292,6 +6396,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         let conv_b = NormalizedConversation {
@@ -6317,6 +6422,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -6365,6 +6471,7 @@ mod tests {
                         language: None,
                         snippet_text: None,
                     }],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -6410,6 +6517,7 @@ mod tests {
                     language: None,
                     snippet_text: None,
                 }],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6443,6 +6551,7 @@ mod tests {
                 content: "please calculate the entropy".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6483,6 +6592,7 @@ mod tests {
                 content: "check the my_variable_name please".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6528,6 +6638,7 @@ mod tests {
                 content: "working with c++ and foo.bar today".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6568,6 +6679,7 @@ mod tests {
                 content: "the request handler delegates".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -6613,6 +6725,7 @@ mod tests {
                 content: "the request handler delegates".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -7580,6 +7693,7 @@ mod tests {
                 content: "apple banana".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -7618,6 +7732,7 @@ mod tests {
                 content: "apricot".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv2)?;
@@ -8464,6 +8579,7 @@ mod tests {
                     content: format!("apple fruit number {i} is delicious and healthy"),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -8511,6 +8627,7 @@ mod tests {
                 content: "configuration management system".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -8557,6 +8674,7 @@ mod tests {
                 content: "testing data".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -8609,6 +8727,7 @@ mod tests {
                     content: body.to_string(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -8715,6 +8834,7 @@ mod tests {
                 content: "testing data".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -9078,6 +9198,7 @@ mod tests {
                 content: "hello world findme alpha".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Agent B (claude)
@@ -9098,6 +9219,7 @@ mod tests {
                 content: "hello world findme beta".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -9155,6 +9277,7 @@ mod tests {
                 content: "workspace test needle".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Workspace B
@@ -9175,6 +9298,7 @@ mod tests {
                 content: "workspace test needle".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_a)?;
@@ -9235,6 +9359,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Middle doc (ts=500)
@@ -9255,6 +9380,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Late doc (ts=900)
@@ -9275,6 +9401,7 @@ mod tests {
                 content: "date range test".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv_early)?;
@@ -9351,6 +9478,7 @@ mod tests {
                     content: "hello world combotest query".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -9410,6 +9538,7 @@ mod tests {
                 content: "source filter test local".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         // Remote source doc (would need to be indexed with ssh origin_kind)
@@ -9732,6 +9861,7 @@ mod tests {
                 content: "alpha beta gamma".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -9751,6 +9881,7 @@ mod tests {
                 content: "alpha delta".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -9806,6 +9937,7 @@ mod tests {
                 content: "unique xyzzy term".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -9825,6 +9957,7 @@ mod tests {
                 content: "unique plugh term".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -9868,6 +10001,7 @@ mod tests {
                 content: "nottest keep this".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -9887,6 +10021,7 @@ mod tests {
                 content: "nottest exclude this".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -9949,6 +10084,7 @@ mod tests {
                 content: "the quick brown fox".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         let conv2 = NormalizedConversation {
@@ -9968,6 +10104,7 @@ mod tests {
                 content: "the brown quick fox".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv1)?;
@@ -10022,6 +10159,7 @@ mod tests {
                 content: "foo bar baz".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -10217,6 +10355,7 @@ mod tests {
                     content: (*content).into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -10270,6 +10409,7 @@ mod tests {
                     content: format!("needle from {agent}"),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -10405,6 +10545,7 @@ mod tests {
                 content: "unique specific term here".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
 
@@ -10425,6 +10566,7 @@ mod tests {
                 content: "unique specific also here".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
 
@@ -10468,6 +10610,7 @@ mod tests {
                 content: "authentication authorization oauth".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;
@@ -10524,6 +10667,7 @@ mod tests {
                     content: "Help me implement JWT authentication for my Express API".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 },
                 NormalizedMessage {
                     idx: 1,
@@ -10539,6 +10683,7 @@ mod tests {
                         language: Some("json".into()),
                         snippet_text: Some(r#"{"dependencies":{"jsonwebtoken":"^9.0.0"}}"#.into()),
                     }],
+                    invocations: Vec::new(),
                 },
                 NormalizedMessage {
                     idx: 2,
@@ -10548,6 +10693,7 @@ mod tests {
                     content: "Can you also add refresh token support?".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 },
             ],
         };
@@ -10623,6 +10769,7 @@ mod tests {
                     content: "implement the sorting algorithm".into(),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -10681,6 +10828,7 @@ mod tests {
                     content: format!("needle content for session {}", i),
                     extra: serde_json::json!({}),
                     snippets: vec![],
+                    invocations: Vec::new(),
                 }],
             };
             index.add_conversation(&conv)?;
@@ -10744,6 +10892,7 @@ mod tests {
                 content: "needle content".into(),
                 extra: serde_json::json!({}),
                 snippets: vec![],
+                invocations: Vec::new(),
             }],
         };
         index.add_conversation(&conv)?;

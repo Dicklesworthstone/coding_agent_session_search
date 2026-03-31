@@ -927,12 +927,18 @@ impl ModelDownloader {
         let file_timeout = self.file_timeout;
 
         run_download_with_cx(move |cx| async move {
+            // Allow up to 500 MB for model downloads. The default 16 MiB
+            // limit in asupersync's HTTP client is too small for embedding
+            // models (e.g., all-MiniLM-L6-v2 is ~86 MB).
+            const MODEL_MAX_BODY_SIZE: usize = 500 * 1024 * 1024;
+
             let client = asupersync::http::h1::HttpClient::builder()
                 .user_agent(concat!(
                     "cass/",
                     env!("CARGO_PKG_VERSION"),
                     " (model-download)"
                 ))
+                .max_body_size(MODEL_MAX_BODY_SIZE)
                 .build();
             let mut headers = vec![("Accept".to_string(), "application/octet-stream".to_string())];
 

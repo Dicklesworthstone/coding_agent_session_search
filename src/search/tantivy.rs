@@ -247,6 +247,7 @@ mod tests {
                 content: format!("{i}-{content}"),
                 extra: Value::Null,
                 snippets: Vec::new(),
+                invocations: Vec::new(),
             })
             .collect();
         let conv = NormalizedConversation {
