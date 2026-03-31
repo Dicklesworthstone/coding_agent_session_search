@@ -2880,13 +2880,18 @@ fn elide_text(text: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
-    if display_width(text) <= max_cols {
+
+    // First pass: measure total width. If it fits, return as-is.
+    let total_w = display_width(text);
+    if total_w <= max_cols {
         return text.to_string();
     }
+
     if max_cols <= 3 {
         return ".".repeat(max_cols);
     }
-    // Take characters until we fill the budget (minus 3 for "...").
+
+    // Second pass: truncate to fit (budget - 3 for "...")
     let budget = max_cols - 3;
     let mut kept = String::new();
     let mut w = 0;
@@ -4452,6 +4457,8 @@ pub struct CassApp {
     pub suggestions: Vec<QuerySuggestion>,
     /// Elapsed time of the last search (for latency badge).
     pub last_search_ms: Option<u128>,
+    /// Error from the most recent failed search for the current settled query.
+    pub search_error_message: Option<String>,
     /// Monotonic generation id for the current query so stale async results can be ignored.
     pub search_generation: u64,
     /// TUI page size for incremental search loading (infinite scroll).
@@ -4812,6 +4819,7 @@ impl Default for CassApp {
             wildcard_fallback: false,
             suggestions: Vec::new(),
             last_search_ms: None,
+            search_error_message: None,
             search_generation: 0,
             search_page_size: 250,
             search_backend_offset: 0,
@@ -5422,6 +5430,56 @@ impl CassApp {
         hits
     }
 
+    fn settled_zero_results_visible(&self) -> bool {
+        !self.query.is_empty()
+            && self.results.is_empty()
+            && self.last_search_ms.is_some()
+            && !self.search_in_flight
+            && !self.search_refining
+            && self.search_dirty_since.is_none()
+            && self.search_error_message.is_none()
+    }
+
+    fn pending_query_search_visible(&self) -> bool {
+        !self.query.is_empty()
+            && self.results.is_empty()
+            && !self.search_in_flight
+            && !self.search_refining
+            && self.search_dirty_since.is_some()
+    }
+
+    fn active_empty_results_search_visible(&self) -> bool {
+        self.results.is_empty() && (self.search_in_flight || self.search_refining)
+    }
+
+    fn failed_empty_results_visible(&self) -> bool {
+        !self.query.is_empty()
+            && self.results.is_empty()
+            && !self.search_in_flight
+            && !self.search_refining
+            && self.search_dirty_since.is_none()
+            && self.search_error_message.is_some()
+    }
+
+    fn visible_query_suggestion_count(&self) -> usize {
+        if self.settled_zero_results_visible() {
+            self.suggestions.len().min(3)
+        } else {
+            0
+        }
+    }
+
+    fn visible_query_suggestion_row_for_shortcut(&self, shortcut: u8) -> Option<u8> {
+        let visible_count = self.visible_query_suggestion_count();
+        self.suggestions
+            .iter()
+            .take(visible_count)
+            .enumerate()
+            .find_map(|(row, suggestion)| {
+                (suggestion.shortcut == Some(shortcut)).then_some((row + 1) as u8)
+            })
+    }
+
     /// Determine which UI region a mouse coordinate falls in.
     fn hit_test(&self, x: u16, y: u16) -> MouseHitRegion {
         if self.show_saved_views_modal {
@@ -5442,11 +5500,12 @@ impl CassApp {
             return MouseHitRegion::SplitHandle;
         }
 
-        if let Some((_, idx)) = self
-            .last_suggestion_rects
-            .borrow()
-            .iter()
-            .find(|(rect, _)| rect.contains(x, y))
+        if self.visible_query_suggestion_count() > 0
+            && let Some((_, idx)) = self
+                .last_suggestion_rects
+                .borrow()
+                .iter()
+                .find(|(rect, _)| rect.contains(x, y))
         {
             return MouseHitRegion::Suggestion { idx: *idx };
         }
@@ -7689,8 +7748,9 @@ impl CassApp {
         self.last_suggestion_rects.borrow_mut().clear();
 
         if self.panes.is_empty() {
-            // Show a loading spinner when a search is in flight.
-            if self.search_in_flight {
+            // Show a loading spinner while the empty state is still being
+            // actively searched or refined.
+            if self.active_empty_results_search_visible() {
                 let accent_s = styles.style(style_system::STYLE_STATUS_INFO);
                 let subtle_s = styles.style(style_system::STYLE_TEXT_SUBTLE);
                 let spinner = self.loading_spinner_glyph();
@@ -7698,7 +7758,11 @@ impl CassApp {
                 lines.push(ftui::text::Line::from(""));
                 lines.push(ftui::text::Line::from_spans(vec![
                     ftui::text::Span::styled(
-                        format!("{spinner} Searching\u{2026}"),
+                        if self.search_refining {
+                            format!("{spinner} Refining search\u{2026}")
+                        } else {
+                            format!("{spinner} Searching\u{2026}")
+                        },
                         accent_s.bold(),
                     ),
                 ]));
@@ -7731,16 +7795,53 @@ impl CassApp {
             let subtle_s = styles.style(style_system::STYLE_TEXT_SUBTLE);
             let info_s = styles.style(style_system::STYLE_STATUS_INFO);
             let pill_s = styles.style(style_system::STYLE_PILL_ACTIVE);
-
-            // Distinguish "no query yet" from "query returned zero results".
-            let has_completed_search =
-                !self.query.is_empty() && self.last_search_ms.is_some() && !self.search_in_flight;
+            let visible_suggestion_count = self.visible_query_suggestion_count();
+            let pending_search = self.pending_query_search_visible();
+            let failed_search = self.failed_empty_results_visible();
+            let settled_zero_results = self.settled_zero_results_visible();
 
             let mut lines: Vec<ftui::text::Line<'static>> = Vec::new();
             let mut rendered_suggestions: Vec<(usize, String)> = Vec::new();
             let mut suggestion_line_offset = None::<u16>;
             lines.push(ftui::text::Line::from(""));
-            if has_completed_search {
+            if pending_search {
+                let spinner = self.loading_spinner_glyph();
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled(
+                        format!("{spinner} Updating search\u{2026}"),
+                        info_s.bold(),
+                    ),
+                ]));
+                if inner.height >= 6 {
+                    lines.push(ftui::text::Line::from(""));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            format!("\u{201c}{}\u{201d}", self.query),
+                            subtle_s.italic(),
+                        ),
+                    ]));
+                }
+            } else if failed_search {
+                let error_s = styles.style(style_system::STYLE_STATUS_ERROR);
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("Search failed", error_s.bold()),
+                ]));
+                if inner.height >= 6 && !self.query.is_empty() {
+                    lines.push(ftui::text::Line::from(""));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            format!("\u{201c}{}\u{201d}", self.query),
+                            subtle_s.italic(),
+                        ),
+                    ]));
+                }
+                if let Some(error) = self.search_error_message.as_deref() {
+                    lines.push(ftui::text::Line::from(""));
+                    lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(error.to_string(), subtle_s),
+                    ]));
+                }
+            } else if settled_zero_results {
                 // Zero results for a real query.
                 lines.push(ftui::text::Line::from_spans(vec![
                     ftui::text::Span::styled(
@@ -7749,14 +7850,19 @@ impl CassApp {
                     ),
                 ]));
                 // Show backend did-you-mean suggestions when available.
-                if inner.height >= 8 && !self.suggestions.is_empty() {
+                if inner.height >= 8 && visible_suggestion_count > 0 {
                     lines.push(ftui::text::Line::from(""));
                     lines.push(ftui::text::Line::from_spans(vec![
                         ftui::text::Span::styled("  Try instead:", info_s),
                     ]));
                     suggestion_line_offset = Some(lines.len() as u16);
 
-                    for (i, suggestion) in self.suggestions.iter().take(3).enumerate() {
+                    for (i, suggestion) in self
+                        .suggestions
+                        .iter()
+                        .take(visible_suggestion_count)
+                        .enumerate()
+                    {
                         let shortcut_label = suggestion
                             .shortcut
                             .map(|n| format!(" {} ", n))
@@ -7950,25 +8056,47 @@ impl CassApp {
             if pane.hits.is_empty() {
                 let subtle_s = styles.style(style_system::STYLE_TEXT_SUBTLE);
                 let pill_s = styles.style(style_system::STYLE_PILL_ACTIVE);
+                let visible_suggestion_count = self.visible_query_suggestion_count();
+                let failed_search = self.failed_empty_results_visible();
                 let mut zero_lines: Vec<ftui::text::Line<'static>> = Vec::new();
                 let mut rendered_suggestions: Vec<(usize, String)> = Vec::new();
+                let mut suggestion_line_offset = None::<u16>;
                 zero_lines.push(ftui::text::Line::from(""));
-                zero_lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled(
-                        "\u{2205} No results match your query",
-                        text_muted_style,
-                    ),
-                ]));
-                if inner.height >= 8 {
+                if failed_search {
+                    let error_s = styles.style(style_system::STYLE_STATUS_ERROR);
+                    zero_lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled("Search failed", error_s.bold()),
+                    ]));
+                    if let Some(error) = self.search_error_message.as_deref() {
+                        zero_lines.push(ftui::text::Line::from(""));
+                        zero_lines.push(ftui::text::Line::from_spans(vec![
+                            ftui::text::Span::styled(error.to_string(), subtle_s),
+                        ]));
+                    }
+                } else {
+                    zero_lines.push(ftui::text::Line::from_spans(vec![
+                        ftui::text::Span::styled(
+                            "\u{2205} No results match your query",
+                            text_muted_style,
+                        ),
+                    ]));
+                }
+                if inner.height >= 8 && !failed_search {
                     let accent_s = styles.style(style_system::STYLE_STATUS_INFO);
                     // Show backend did-you-mean suggestions when available.
-                    if !self.suggestions.is_empty() {
+                    if visible_suggestion_count > 0 {
                         zero_lines.push(ftui::text::Line::from(""));
                         zero_lines.push(ftui::text::Line::from_spans(vec![
                             ftui::text::Span::styled("  Try instead:", accent_s),
                         ]));
+                        suggestion_line_offset = Some(zero_lines.len() as u16);
 
-                        for (i, suggestion) in self.suggestions.iter().take(3).enumerate() {
+                        for (i, suggestion) in self
+                            .suggestions
+                            .iter()
+                            .take(visible_suggestion_count)
+                            .enumerate()
+                        {
                             let shortcut_label = suggestion
                                 .shortcut
                                 .map(|n| format!(" {} ", n))
@@ -8013,13 +8141,14 @@ impl CassApp {
                 );
                 let mut suggestion_areas = self.last_suggestion_rects.borrow_mut();
                 suggestion_areas.clear();
-                let suggestions_start_y = inner.y + y_off + 4;
-                for (offset, (idx, line_text)) in rendered_suggestions.iter().enumerate() {
-                    let line_w = display_width(line_text) as u16;
-                    let line_x = inner.x + (inner.width.saturating_sub(line_w) / 2);
-                    let line_y = suggestions_start_y + offset as u16;
-                    if line_y < inner.y + inner.height {
-                        suggestion_areas.push((Rect::new(line_x, line_y, line_w, 1), *idx));
+                if let Some(offset) = suggestion_line_offset {
+                    for (row, (idx, line_text)) in rendered_suggestions.iter().enumerate() {
+                        let line_w = display_width(line_text).min(inner.width as usize) as u16;
+                        let line_x = inner.x + (inner.width.saturating_sub(line_w) / 2);
+                        let line_y = inner.y + y_off + offset + row as u16;
+                        if line_y < inner.y + inner.height {
+                            suggestion_areas.push((Rect::new(line_x, line_y, line_w, 1), *idx));
+                        }
                     }
                 }
                 Paragraph::new(ftui::text::Text::from_lines(zero_lines))
@@ -15481,14 +15610,19 @@ impl super::ftui_adapter::Model for CassApp {
                         self.cursor_pos = new_cursor;
                     }
                 } else {
-                    // Special case: apply did-you-mean suggestion if query is empty
-                    // and user types 1, 2, or 3.
-                    if self.query.is_empty()
-                        && !self.suggestions.is_empty()
-                        && matches!(text.as_str(), "1" | "2" | "3")
+                    // Apply numbered did-you-mean shortcuts while the no-results
+                    // suggestion UI is actually visible.
+                    let suggestion_shortcut = match text.as_str() {
+                        "1" => Some(1_u8),
+                        "2" => Some(2_u8),
+                        "3" => Some(3_u8),
+                        _ => None,
+                    };
+                    if let Some(shortcut) = suggestion_shortcut
+                        && let Some(row_idx) =
+                            self.visible_query_suggestion_row_for_shortcut(shortcut)
                     {
-                        let idx = text.as_bytes()[0] - b'0';
-                        return self.update(CassMsg::SuggestionApplied(idx));
+                        return self.update(CassMsg::SuggestionApplied(row_idx));
                     }
 
                     self.query.insert_str(cursor, &text);
@@ -15590,6 +15724,7 @@ impl super::ftui_adapter::Model for CassApp {
                     params.limit,
                 );
                 self.search_dirty_since = None;
+                self.search_error_message = None;
                 if self.progressive_search_service.is_some() && progressive {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
@@ -15639,6 +15774,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.search_refining = progressive_initial;
                 self.clear_loading_context(LoadingContext::Search);
                 self.last_search_ms = Some(elapsed_ms);
+                self.search_error_message = None;
                 let page_size = requested_limit.max(1);
                 if append {
                     let backend_returned = hits.len();
@@ -15776,6 +15912,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.search_in_flight = false;
                 self.search_refining = false;
+                self.search_error_message = Some(error.clone());
                 self.trace_search_failed(generation, &error);
                 if self
                     .live_search_request
@@ -16349,6 +16486,19 @@ impl super::ftui_adapter::Model for CassApp {
                     Ok(db) => match load_conversation(&db, &source_path) {
                         Ok(Some(view)) => {
                             self.cached_detail = Some((loaded_path.clone(), view));
+                            // Auto-collapse tool/system messages on fresh load
+                            self.collapsed_tools.clear();
+                            if let Some((_, ref cv)) = self.cached_detail {
+                                for (idx, msg) in cv.messages.iter().enumerate() {
+                                    if matches!(
+                                        msg.role,
+                                        crate::model::types::MessageRole::Tool
+                                            | crate::model::types::MessageRole::System
+                                    ) {
+                                        self.collapsed_tools.insert(idx);
+                                    }
+                                }
+                            }
                         }
                         Ok(None) => {
                             // Keep fallback rendering from SearchHit content.
@@ -18403,7 +18553,7 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     // ── Left click on a search suggestion (Did-you-mean) ──
                     (MouseEventKind::LeftClick, MouseHitRegion::Suggestion { idx }) => {
-                        self.update(CassMsg::SuggestionApplied(idx as u8))
+                        self.update(CassMsg::SuggestionApplied((idx + 1) as u8))
                     }
                     // ── Left click on a filter pill: edit that filter ──
                     (MouseEventKind::LeftClick, MouseHitRegion::Pill { index }) => {
@@ -21163,7 +21313,15 @@ fn export_session_markdown_task(
             Err(err) => return CassMsg::ExportFailed(format!("Cannot open session: {err}")),
         };
         let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(line) => line,
+                Err(err) => {
+                    return CassMsg::ExportFailed(format!(
+                        "Failed to read session: {err}. The session file may be truncated or contain invalid UTF-8."
+                    ));
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -24305,6 +24463,279 @@ mod tests {
     }
 
     #[test]
+    fn query_changed_numeric_shortcut_applies_visible_zero_result_suggestion() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.last_search_ms = Some(42);
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        let cmd = app.update(CassMsg::QueryChanged("1".into()));
+
+        assert_eq!(app.query, "codex");
+        assert_eq!(app.cursor_pos, "codex".len());
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn query_changed_numeric_shortcut_inserts_text_when_suggestion_ui_is_not_visible() {
+        let mut app = CassApp::default();
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        let cmd = app.update(CassMsg::QueryChanged("1".into()));
+
+        assert_eq!(app.query, "1");
+        assert_eq!(app.cursor_pos, 1);
+        assert!(!matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn query_changed_numeric_shortcut_does_not_apply_stale_suggestions_after_edit() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.last_search_ms = Some(42);
+        app.search_dirty_since = Some(Instant::now());
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        let cmd = app.update(CassMsg::QueryChanged("1".into()));
+
+        assert_eq!(app.query, "codxe1");
+        assert_eq!(app.cursor_pos, "codxe1".len());
+        assert!(!matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn visible_query_suggestion_count_is_zero_while_query_is_dirty() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.search_dirty_since = Some(Instant::now());
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        assert_eq!(app.visible_query_suggestion_count(), 0);
+    }
+
+    #[test]
+    fn visible_query_suggestion_count_is_zero_while_refinement_is_in_flight() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.search_refining = true;
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        assert_eq!(app.visible_query_suggestion_count(), 0);
+    }
+
+    #[test]
+    fn settled_zero_results_visible_is_false_while_query_is_dirty() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.search_dirty_since = Some(Instant::now());
+
+        assert!(!app.settled_zero_results_visible());
+    }
+
+    #[test]
+    fn pending_query_search_visible_is_true_while_query_is_dirty() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.search_dirty_since = Some(Instant::now());
+
+        assert!(app.pending_query_search_visible());
+    }
+
+    #[test]
+    fn pending_query_search_visible_is_false_while_refinement_is_in_flight() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.search_dirty_since = Some(Instant::now());
+        app.search_refining = true;
+
+        assert!(!app.pending_query_search_visible());
+    }
+
+    #[test]
+    fn active_empty_results_search_visible_is_true_while_refining() {
+        let mut app = CassApp::default();
+        app.search_refining = true;
+
+        assert!(app.active_empty_results_search_visible());
+    }
+
+    #[test]
+    fn failed_empty_results_visible_is_true_after_search_failed() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+
+        let _ = app.update(CassMsg::SearchFailed {
+            generation: app.search_generation,
+            error: "backend exploded".to_string(),
+        });
+
+        assert!(app.failed_empty_results_visible());
+        assert!(!app.settled_zero_results_visible());
+        assert_eq!(
+            app.search_error_message.as_deref(),
+            Some("backend exploded")
+        );
+    }
+
+    #[test]
+    fn query_changed_numeric_shortcut_falls_back_to_text_when_index_is_not_available() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.last_search_ms = Some(42);
+        app.suggestions = vec![QuerySuggestion {
+            kind: crate::search::query::SuggestionKind::SpellingFix,
+            message: "Did you mean: \"codex\"?".to_string(),
+            suggested_query: Some("codex".to_string()),
+            suggested_filters: None,
+            shortcut: Some(1),
+        }];
+
+        let cmd = app.update(CassMsg::QueryChanged("2".into()));
+
+        assert_eq!(app.query, "codxe2");
+        assert_eq!(app.cursor_pos, "codxe2".len());
+        assert!(!matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn visible_query_suggestion_count_caps_to_three() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.last_search_ms = Some(42);
+        app.suggestions = (1..=4)
+            .map(|n| QuerySuggestion {
+                kind: crate::search::query::SuggestionKind::SpellingFix,
+                message: format!("Suggestion {n}"),
+                suggested_query: Some(format!("codex-{n}")),
+                suggested_filters: None,
+                shortcut: Some(n),
+            })
+            .collect();
+
+        assert_eq!(app.visible_query_suggestion_count(), 3);
+    }
+
+    #[test]
+    fn query_changed_numeric_shortcut_uses_displayed_shortcut_not_row_position() {
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.last_search_ms = Some(42);
+        app.suggestions = vec![
+            QuerySuggestion {
+                kind: crate::search::query::SuggestionKind::SpellingFix,
+                message: "No shortcut on this row".to_string(),
+                suggested_query: Some("ignore-me".to_string()),
+                suggested_filters: None,
+                shortcut: None,
+            },
+            QuerySuggestion {
+                kind: crate::search::query::SuggestionKind::SpellingFix,
+                message: "Did you mean: \"codex\"?".to_string(),
+                suggested_query: Some("codex".to_string()),
+                suggested_filters: None,
+                shortcut: Some(2),
+            },
+        ];
+
+        let cmd = app.update(CassMsg::QueryChanged("1".into()));
+        assert_eq!(app.query, "codxe1");
+        assert!(!matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.search_dirty_since = None;
+
+        let cmd = app.update(CassMsg::QueryChanged("2".into()));
+        assert_eq!(app.query, "codex");
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
+    fn mouse_click_on_second_suggestion_applies_second_suggestion() {
+        use ftui::Model;
+
+        let mut app = CassApp::default();
+        app.query = "codxe".to_string();
+        app.cursor_pos = app.query.len();
+        app.last_search_ms = Some(42);
+        app.suggestions = vec![
+            QuerySuggestion {
+                kind: crate::search::query::SuggestionKind::SpellingFix,
+                message: "Did you mean: \"codex\"?".to_string(),
+                suggested_query: Some("codex".to_string()),
+                suggested_filters: None,
+                shortcut: Some(1),
+            },
+            QuerySuggestion {
+                kind: crate::search::query::SuggestionKind::SpellingFix,
+                message: "Did you mean: \"codec\"?".to_string(),
+                suggested_query: Some("codec".to_string()),
+                suggested_filters: None,
+                shortcut: Some(2),
+            },
+        ];
+
+        render_at_degradation(&app, 120, 24, ftui::render::budget::DegradationLevel::Full);
+        let suggestion_rects = app.last_suggestion_rects.borrow().clone();
+        assert_eq!(
+            suggestion_rects.len(),
+            2,
+            "expected two visible suggestion hitboxes"
+        );
+        let second_rect = suggestion_rects[1].0;
+
+        let cmd = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: second_rect.x,
+            y: second_rect.y,
+        });
+
+        assert_eq!(app.query, "codec");
+        assert_eq!(app.cursor_pos, "codec".len());
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+    }
+
+    #[test]
     fn query_cleared_empties_and_marks_dirty() {
         let mut app = CassApp::default();
         app.query = "hello world".to_string();
@@ -25322,6 +25753,18 @@ mod tests {
             "expected Cmd::None without service, got: {debug}"
         );
         assert!(app.loading_context.is_none());
+    }
+
+    #[test]
+    fn search_requested_clears_search_error_message() {
+        let mut app = CassApp::default();
+        app.query = "test query".to_string();
+        app.search_service = None;
+        app.search_error_message = Some("boom".to_string());
+
+        let _ = app.update(CassMsg::SearchRequested);
+
+        assert!(app.search_error_message.is_none());
     }
 
     #[test]
