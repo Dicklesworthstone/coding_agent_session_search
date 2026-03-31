@@ -6298,7 +6298,9 @@ impl CassApp {
                 }
             };
             self.search_refining = false;
-            self.set_loading_context(LoadingContext::Search);
+            if self.surface == AppSurface::Search {
+                self.set_loading_context(LoadingContext::Search);
+            }
             ftui::Cmd::task(move || match svc.execute(&params) {
                 Ok(result) => CassMsg::SearchCompleted {
                     generation,
@@ -14685,7 +14687,11 @@ impl super::ftui_adapter::Model for CassApp {
             // Startup already applied persisted state synchronously, so begin
             // initial browse/search immediately instead of showing a transient
             // default frame and waiting for an async state-load task.
-            ftui::Cmd::msg(CassMsg::SearchRequested)
+            if self.surface == AppSurface::Analytics {
+                self.schedule_analytics_reload()
+            } else {
+                ftui::Cmd::msg(CassMsg::SearchRequested)
+            }
         } else {
             // Request state load on startup.
             ftui::Cmd::msg(CassMsg::StateLoadRequested)
@@ -15737,7 +15743,9 @@ impl super::ftui_adapter::Model for CassApp {
                         progressive: true,
                     });
                     self.status = "Searching…".to_string();
-                    self.set_loading_context(LoadingContext::Search);
+                    if self.surface == AppSurface::Search {
+                        self.set_loading_context(LoadingContext::Search);
+                    }
                     return ftui::Cmd::none();
                 }
                 self.live_search_request = None;
@@ -16014,20 +16022,35 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Filters ------------------------------------------------------
             CassMsg::FilterAgentSet(agents) => {
-                self.push_undo("Set agent filter");
-                self.filters.agents = agents;
-                ftui::Cmd::msg(CassMsg::SearchRequested)
+                if self.surface == AppSurface::Analytics {
+                    ftui::Cmd::msg(CassMsg::AnalyticsAgentFilterSet(agents))
+                } else {
+                    self.push_undo("Set agent filter");
+                    self.filters.agents = agents;
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::FilterWorkspaceSet(workspaces) => {
-                self.push_undo("Set workspace filter");
-                self.filters.workspaces = workspaces;
-                ftui::Cmd::msg(CassMsg::SearchRequested)
+                if self.surface == AppSurface::Analytics {
+                    ftui::Cmd::msg(CassMsg::AnalyticsWorkspaceFilterSet(workspaces))
+                } else {
+                    self.push_undo("Set workspace filter");
+                    self.filters.workspaces = workspaces;
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::FilterTimeSet { from, to } => {
-                self.push_undo("Set time filter");
-                self.filters.created_from = from;
-                self.filters.created_to = to;
-                ftui::Cmd::msg(CassMsg::SearchRequested)
+                if self.surface == AppSurface::Analytics {
+                    ftui::Cmd::msg(CassMsg::AnalyticsTimeRangeSet {
+                        since_ms: from,
+                        until_ms: to,
+                    })
+                } else {
+                    self.push_undo("Set time filter");
+                    self.filters.created_from = from;
+                    self.filters.created_to = to;
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::FilterSourceSet(source) => {
                 self.push_undo("Set source filter");
@@ -16035,10 +16058,14 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::FiltersClearAll => {
-                self.push_undo("Clear all filters");
-                self.filters = SearchFilters::default();
-                self.time_preset = TimePreset::All;
-                ftui::Cmd::msg(CassMsg::SearchRequested)
+                if self.surface == AppSurface::Analytics {
+                    ftui::Cmd::msg(CassMsg::AnalyticsFiltersClearAll)
+                } else {
+                    self.push_undo("Clear all filters");
+                    self.filters = SearchFilters::default();
+                    self.time_preset = TimePreset::All;
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::TimePresetCycled => {
                 self.push_undo("Cycle time preset");
@@ -17135,31 +17162,50 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::InputModeApplied => {
                 let buf = self.input_buffer.trim().to_string();
+                let is_analytics = self.surface == AppSurface::Analytics;
+
                 let cmd = match self.input_mode {
                     InputMode::Agent if !buf.is_empty() => {
                         // Parse comma-separated agent names.
                         let agents: HashSet<String> =
                             buf.split(',').map(|s| s.trim().to_string()).collect();
-                        ftui::Cmd::msg(CassMsg::FilterAgentSet(agents))
+                        if is_analytics {
+                            ftui::Cmd::msg(CassMsg::AnalyticsAgentFilterSet(agents))
+                        } else {
+                            ftui::Cmd::msg(CassMsg::FilterAgentSet(agents))
+                        }
                     }
                     InputMode::Workspace if !buf.is_empty() => {
                         let workspaces: HashSet<String> =
                             buf.split(',').map(|s| s.trim().to_string()).collect();
-                        ftui::Cmd::msg(CassMsg::FilterWorkspaceSet(workspaces))
+                        if is_analytics {
+                            ftui::Cmd::msg(CassMsg::AnalyticsWorkspaceFilterSet(workspaces))
+                        } else {
+                            ftui::Cmd::msg(CassMsg::FilterWorkspaceSet(workspaces))
+                        }
                     }
                     InputMode::CreatedFrom => {
                         let ts = parse_time_input(&buf);
                         if ts.is_some() || buf.is_empty() {
-                            self.time_preset = if ts.is_some() || self.filters.created_to.is_some()
-                            {
+                            let to_ms = if is_analytics {
+                                self.analytics_filters.until_ms
+                            } else {
+                                self.filters.created_to
+                            };
+
+                            self.time_preset = if ts.is_some() || to_ms.is_some() {
                                 TimePreset::Custom
                             } else {
                                 TimePreset::All
                             };
-                            ftui::Cmd::msg(CassMsg::FilterTimeSet {
-                                from: ts,
-                                to: self.filters.created_to,
-                            })
+                            if is_analytics {
+                                ftui::Cmd::msg(CassMsg::AnalyticsTimeRangeSet {
+                                    since_ms: ts,
+                                    until_ms: to_ms,
+                                })
+                            } else {
+                                ftui::Cmd::msg(CassMsg::FilterTimeSet { from: ts, to: to_ms })
+                            }
                         } else {
                             self.status = format!("Invalid date: {buf}");
                             ftui::Cmd::none()
@@ -17168,16 +17214,25 @@ impl super::ftui_adapter::Model for CassApp {
                     InputMode::CreatedTo => {
                         let ts = parse_time_input(&buf);
                         if ts.is_some() || buf.is_empty() {
-                            self.time_preset =
-                                if ts.is_some() || self.filters.created_from.is_some() {
-                                    TimePreset::Custom
-                                } else {
-                                    TimePreset::All
-                                };
-                            ftui::Cmd::msg(CassMsg::FilterTimeSet {
-                                from: self.filters.created_from,
-                                to: ts,
-                            })
+                            let from_ms = if is_analytics {
+                                self.analytics_filters.since_ms
+                            } else {
+                                self.filters.created_from
+                            };
+
+                            self.time_preset = if ts.is_some() || from_ms.is_some() {
+                                TimePreset::Custom
+                            } else {
+                                TimePreset::All
+                            };
+                            if is_analytics {
+                                ftui::Cmd::msg(CassMsg::AnalyticsTimeRangeSet {
+                                    since_ms: from_ms,
+                                    until_ms: ts,
+                                })
+                            } else {
+                                ftui::Cmd::msg(CassMsg::FilterTimeSet { from: from_ms, to: ts })
+                            }
                         } else {
                             self.status = format!("Invalid date: {buf}");
                             ftui::Cmd::none()
@@ -17858,7 +17913,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.regroup_panes();
                 self.dirty_since = Some(Instant::now());
-                ftui::Cmd::none()
+                ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::PaneShrunk => {
                 self.per_pane_limit = if self.per_pane_limit == 0 {
@@ -17868,7 +17923,7 @@ impl super::ftui_adapter::Model for CassApp {
                 };
                 self.regroup_panes();
                 self.dirty_since = Some(Instant::now());
-                ftui::Cmd::none()
+                ftui::Cmd::msg(CassMsg::SearchRequested)
             }
 
             // -- Saved views --------------------------------------------------
@@ -18137,7 +18192,14 @@ impl super::ftui_adapter::Model for CassApp {
                     .push(crate::ui::components::toast::Toast::success(
                         "Index refresh complete",
                     ));
-                ftui::Cmd::none()
+
+                // Trigger reload of the current surface.
+                if self.surface == AppSurface::Analytics {
+                    self.analytics_cache = None;
+                    self.schedule_analytics_reload()
+                } else {
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::IndexRefreshFailed(err) => {
                 self.index_refresh_in_flight = false;
@@ -18169,7 +18231,11 @@ impl super::ftui_adapter::Model for CassApp {
                 // Fix #79: Trigger an initial search/browse on startup so the
                 // TUI is populated with recent sessions immediately, even when
                 // the query is empty.
-                ftui::Cmd::msg(CassMsg::SearchRequested)
+                if self.surface == AppSurface::Analytics {
+                    self.schedule_analytics_reload()
+                } else {
+                    ftui::Cmd::msg(CassMsg::SearchRequested)
+                }
             }
             CassMsg::StateLoadFailed(err) => {
                 self.clear_loading_context(LoadingContext::StateLoad);
@@ -18264,11 +18330,25 @@ impl super::ftui_adapter::Model for CassApp {
 
             // -- Window & terminal --------------------------------------------
             CassMsg::Resized { width, height } => {
-                // Frame dimensions update automatically via ftui runtime
+                let old_size = self.last_terminal_size.get();
+                let new_size = (width.max(1), height.max(1));
+                self.last_terminal_size.set(new_size);
+
+                // If breakpoint changed, invalidate analytics cache (layout change).
+                let old_bp = LayoutBreakpoint::from_width(old_size.0);
+                let new_bp = LayoutBreakpoint::from_width(new_size.0);
+                if old_bp != new_bp {
+                    self.analytics_cache = None;
+                }
+
                 self.pane_split_drag = None;
-                self.last_terminal_size.set((width.max(1), height.max(1)));
-                // Capture latest resize evidence after coalescer processes the event.
                 self.evidence.refresh();
+
+                // If vertical size increased, we might need more hits to fill the panes.
+                if new_size.1 > old_size.1 && !self.results.is_empty() {
+                    return ftui::Cmd::msg(CassMsg::SearchRequested);
+                }
+
                 ftui::Cmd::none()
             }
             CassMsg::TerminalFocusChanged(gained) => {

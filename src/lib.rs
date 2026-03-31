@@ -1576,6 +1576,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "until",
         "days",
         "today",
+        "yesterday",
         "week",
         "full",
         "watch",
@@ -1613,6 +1614,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "theme",
         // Added flags
         "watch-once",
+        "watch-interval",
         "semantic",
         "embedder",
         "idempotency-key",
@@ -1644,6 +1646,31 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "i-understand-unencrypted-risks",
         "include-attachments",
         "no-open",
+        "stale-threshold",
+        "by-source",
+        "robot-meta",
+        "robot-format",
+        "max-content-length",
+        "fast-only",
+        "quality-only",
+        "once",
+        "reset-state",
+        "asciicast",
+        "inline",
+        "ui-height",
+        "anchor",
+        "record-macro",
+        "play-macro",
+        "group-by",
+        "mirror",
+        "from-file",
+        "repair",
+        "purge",
+        "preset",
+        "no-test",
+        "no-index",
+        "skip-existing",
+        "hosts",
     ];
 
     // Subcommand aliases for common mistakes
@@ -6042,13 +6069,28 @@ fn run_cli_search(
             let roles = context.roles;
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
-                use crate::search::daemon_client::{
-                    DaemonFallbackEmbedder, DaemonRetryConfig, NoopDaemonClient,
-                };
+                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
 
-                let daemon = Arc::new(NoopDaemonClient::new("daemon-unconfigured"));
-                let config = DaemonRetryConfig::from_env();
-                Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                #[cfg(unix)]
+                {
+                    let daemon = crate::daemon::client::try_connect()
+                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                        .unwrap_or_else(|| {
+                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                                "daemon-unconfigured",
+                            ))
+                        });
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
+                #[cfg(not(unix))]
+                {
+                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                        "daemon-unconfigured",
+                    ));
+                    let config = DaemonRetryConfig::from_env();
+                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
+                }
             } else {
                 embedder
             };
@@ -6360,9 +6402,6 @@ fn run_cli_search(
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
     let result = if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::daemon_client::{
-            DaemonFallbackReranker, DaemonRetryConfig, NoopDaemonClient,
-        };
         use crate::search::fastembed_reranker::FastEmbedReranker;
         use crate::search::reranker::{Reranker, rerank_texts};
 
@@ -6379,13 +6418,36 @@ fn run_cli_search(
             };
 
         let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            let daemon = Arc::new(NoopDaemonClient::new("daemon-unconfigured"));
-            let config = DaemonRetryConfig::from_env();
-            Some(Arc::new(DaemonFallbackReranker::new(
-                daemon,
-                local_reranker,
-                config,
-            )))
+            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
+
+            #[cfg(unix)]
+            {
+                let daemon = crate::daemon::client::try_connect()
+                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                            "daemon-unconfigured",
+                        ))
+                    });
+                let config = DaemonRetryConfig::from_env();
+                Some(Arc::new(DaemonFallbackReranker::new(
+                    daemon,
+                    local_reranker,
+                    config,
+                )))
+            }
+            #[cfg(not(unix))]
+            {
+                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
+                    "daemon-unconfigured",
+                ));
+                let config = DaemonRetryConfig::from_env();
+                Some(Arc::new(DaemonFallbackReranker::new(
+                    daemon,
+                    local_reranker,
+                    config,
+                )))
+            }
         } else {
             local_reranker
         };
