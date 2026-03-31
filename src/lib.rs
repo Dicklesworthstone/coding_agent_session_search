@@ -797,6 +797,23 @@ pub enum Commands {
     /// ```
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
+
+    /// Run the semantic model daemon (Unix only)
+    #[cfg(unix)]
+    Daemon {
+        /// Socket path to listen on (default comes from env or built-in config)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Idle timeout in seconds before auto-shutdown (0 = never; default comes from env or built-in config)
+        #[arg(long)]
+        idle_timeout: Option<u64>,
+        /// Maximum concurrent connections (default comes from env or built-in config)
+        #[arg(long)]
+        max_connections: Option<usize>,
+        /// Override data dir for model storage
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Subcommands for importing external data
@@ -2758,6 +2775,7 @@ async fn execute_cli(
         | Commands::Status { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
+        | Commands::Daemon { .. }
         | Commands::Import(..)
         | Commands::Analytics(..) => {
             tracing_subscriber::fmt()
@@ -3482,6 +3500,15 @@ async fn execute_cli(
                 }
                 Commands::Analytics(subcmd) => {
                     run_analytics(subcmd, cli.db.clone())?;
+                }
+                #[cfg(unix)]
+                Commands::Daemon {
+                    socket,
+                    idle_timeout,
+                    max_connections,
+                    data_dir,
+                } => {
+                    run_daemon(socket, idle_timeout, max_connections, data_dir)?;
                 }
                 _ => {}
             }
@@ -4406,12 +4433,33 @@ fn probe_state_db(
     snapshot
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexRunMode {
+    Index,
+    WatchStartup,
+    Watch,
+    WatchOnce,
+}
+
+impl IndexRunMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "index" => Some(Self::Index),
+            "watch_startup" => Some(Self::WatchStartup),
+            "watch" => Some(Self::Watch),
+            "watch_once" => Some(Self::WatchOnce),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct IndexRunSnapshot {
     active: bool,
     pid: Option<u32>,
     started_at_ms: Option<i64>,
     db_path: Option<PathBuf>,
+    mode: Option<IndexRunMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4502,6 +4550,7 @@ fn read_index_run_lock_snapshot(data_dir: &Path) -> IndexRunSnapshot {
     let mut pid = None;
     let mut started_at_ms = None;
     let mut lock_db_path = None::<PathBuf>;
+    let mut mode = None;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -4510,6 +4559,7 @@ fn read_index_run_lock_snapshot(data_dir: &Path) -> IndexRunSnapshot {
             "pid" => pid = value.trim().parse::<u32>().ok(),
             "started_at_ms" => started_at_ms = value.trim().parse::<i64>().ok(),
             "db_path" => lock_db_path = Some(PathBuf::from(value.trim())),
+            "mode" => mode = IndexRunMode::parse(value),
             _ => {}
         }
     }
@@ -4519,7 +4569,8 @@ fn read_index_run_lock_snapshot(data_dir: &Path) -> IndexRunSnapshot {
             let _ = file.unlock();
             false
         }
-        Err(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
     };
 
     IndexRunSnapshot {
@@ -4527,6 +4578,7 @@ fn read_index_run_lock_snapshot(data_dir: &Path) -> IndexRunSnapshot {
         pid,
         started_at_ms,
         db_path: lock_db_path,
+        mode,
     }
 }
 
@@ -4575,15 +4627,19 @@ fn state_meta_json(
         .unwrap_or_else(|_| data_dir.join("index").join("v4"));
     let index_exists = index_path.exists();
     let db_exists = db_path.exists();
-    let watch_state_path = data_dir.join("watch_state.json");
     let rebuild_snapshot = crate::indexer::load_lexical_rebuild_snapshot(&index_path, db_path)
         .ok()
         .flatten();
     let index_run = probe_index_run_lock(data_dir, db_path);
-    // The index-run lock covers the full `cass index` lifecycle, not just the
-    // later lexical checkpointing phase. Treat a live lock as authoritative so
-    // `cass status` reports early rebuild work honestly.
-    let rebuild_active = index_run.active;
+    let watch_active = index_run.active
+        && matches!(
+            index_run.mode,
+            Some(IndexRunMode::WatchStartup | IndexRunMode::Watch)
+        );
+    // The index-run lock covers the full `cass index` lifecycle. Distinguish
+    // steady-state watch mode from rebuild work so `cass status` does not
+    // report an idle watcher as perpetually rebuilding.
+    let rebuild_active = index_run.active && !matches!(index_run.mode, Some(IndexRunMode::Watch));
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4620,15 +4676,14 @@ fn state_meta_json(
             .map(|d| d.as_millis() as i64);
     }
 
-    let pending_sessions = if watch_state_path.exists() {
-        std::fs::read_to_string(&watch_state_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|v| v.get("pending_count").and_then(serde_json::Value::as_u64))
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let pending_sessions = rebuild_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .total_conversations
+                .saturating_sub(snapshot.processed_conversations)
+        })
+        .unwrap_or(0);
 
     let index_age_secs = last_indexed_at.and_then(|ts| {
         if ts <= 0 {
@@ -4680,7 +4735,7 @@ fn state_meta_json(
         },
         "pending": {
             "sessions": pending_sessions,
-            "watch_active": watch_state_path.exists()
+            "watch_active": watch_active
         },
         "rebuild": {
             "active": rebuild_active,
@@ -4921,6 +4976,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
+        Some(Commands::Daemon { .. }) => "daemon".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
@@ -9288,7 +9344,7 @@ mod cli_read_db_tests {
         lock_file.try_lock_exclusive().expect("hold index lock");
         writeln!(
             lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
             std::process::id(),
             1_733_000_111_000_i64,
             db_path.display()
@@ -9299,6 +9355,7 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(6));
         assert_eq!(
             state["rebuild"]["processed_conversations"].as_u64(),
             Some(4)
@@ -9324,7 +9381,7 @@ mod cli_read_db_tests {
         lock_file.try_lock_exclusive().expect("hold index lock");
         writeln!(
             lock_file,
-            "pid={}\nstarted_at_ms={}\ndb_path={}",
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
             std::process::id(),
             1_733_000_555_000_i64,
             db_path.display()
@@ -9344,6 +9401,56 @@ mod cli_read_db_tests {
             serde_json::Value::Null
         );
         assert!(state["rebuild"]["updated_at"].as_str().is_some());
+    }
+
+    #[test]
+    fn state_meta_json_reports_watch_active_without_marking_rebuild() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=watch",
+            std::process::id(),
+            1_733_000_777_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["pending"]["watch_active"].as_bool(), Some(true));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(false));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn state_meta_json_does_not_infer_watch_activity_from_watch_state_file() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            temp.path().join("watch_state.json"),
+            br#"{"amp":1700000000000}"#,
+        )
+        .expect("write watch state");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
     }
 
     #[test]
@@ -12130,12 +12237,32 @@ fn run_view(path: &PathBuf, line: Option<usize>, context: usize, json: bool) -> 
             retryable: false,
         })?;
         let reader = BufReader::new(file);
-        reader.lines().map_while(Result::ok).collect()
+        reader
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| CliError {
+                code: 9,
+                kind: "file-read",
+                message: format!("Failed to read file: {e}"),
+                hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
+                retryable: false,
+            })?
     } else if let Some(view) = try_load_indexed_conversation(path) {
         conversation_view_to_raw_messages(&view)
             .into_iter()
-            .filter_map(|msg| serde_json::to_string(&msg).ok())
-            .collect()
+            .map(|msg| {
+                serde_json::to_string(&msg).map_err(|e| CliError {
+                    code: 9,
+                    kind: "serialize-message",
+                    message: format!("Failed to serialize indexed message: {e}"),
+                    hint: Some(
+                        "The indexed conversation contains unexpected data that could not be re-rendered as JSON."
+                            .into(),
+                    ),
+                    retryable: false,
+                })
+            })
+            .collect::<CliResult<Vec<_>>>()?
     } else {
         return Err(CliError {
             code: 3,
@@ -12764,12 +12891,15 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
         Box::new(BufReader::new(std::fs::File::open(source)?))
     };
 
-    let paths: HashSet<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
+    let mut paths = HashSet::new();
+    for line_result in reader.lines() {
+        let line = line_result?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        paths.insert(trimmed.to_string());
+    }
 
     Ok(paths)
 }
@@ -13123,7 +13253,14 @@ fn run_export(
 
         let reader = BufReader::new(file);
 
-        for line in reader.lines().map_while(Result::ok) {
+        for line_result in reader.lines() {
+            let line = line_result.map_err(|e| CliError {
+                code: 9,
+                kind: "file-read",
+                message: format!("Failed to read file: {e}"),
+                hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
+                retryable: false,
+            })?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -13402,7 +13539,14 @@ fn run_export_html(
             })?;
 
             let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
+            for line_result in reader.lines() {
+                let line = line_result.map_err(|e| CliError {
+                    code: 9,
+                    kind: "file_read",
+                    message: format!("Failed to read session file: {e}"),
+                    hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
+                    retryable: false,
+                })?;
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -14393,8 +14537,10 @@ mod opencode_export_tests {
 
 #[cfg(test)]
 mod export_timestamp_tests {
-    use super::extract_message_timestamp;
+    use super::{extract_message_timestamp, run_export_html};
     use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn extract_message_timestamp_parses_multiple_shapes() {
@@ -14417,6 +14563,43 @@ mod export_timestamp_tests {
         assert_eq!(
             extract_message_timestamp(&nested_payload),
             Some(1_733_000_123_000)
+        );
+    }
+
+    #[test]
+    fn export_html_reports_file_read_errors_instead_of_truncating() {
+        let temp = TempDir::new().expect("temp dir");
+        let session_path = temp.path().join("broken-session.jsonl");
+        fs::write(
+            &session_path,
+            b"{\"role\":\"user\",\"content\":\"hello\"}\n\xff\n",
+        )
+        .expect("write invalid session");
+
+        let err = run_export_html(
+            &session_path,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect_err("invalid utf-8 should fail explicitly");
+
+        assert_eq!(err.kind, "file_read");
+        assert!(
+            err.message.contains("Failed to read session file"),
+            "unexpected error: {}",
+            err.message
         );
     }
 }
@@ -15282,7 +15465,14 @@ fn run_expand(path: &Path, line: usize, context: usize, json: bool) -> CliResult
     let mut target_msg_idx: Option<usize> = None;
     let mut current_line: usize = 0;
 
-    for raw_line in reader.lines().map_while(Result::ok) {
+    for line_result in reader.lines() {
+        let raw_line = line_result.map_err(|e| CliError {
+            code: 9,
+            kind: "file-read",
+            message: format!("Failed to read file: {e}"),
+            hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
+            retryable: false,
+        })?;
         current_line += 1;
         if raw_line.trim().is_empty() {
             continue;
@@ -17424,15 +17614,126 @@ fn run_models_install(
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
 
-    // Check if from_file is specified
-    if let Some(file_path) = from_file {
-        return Err(CliError {
-            code: 21,
-            kind: "model",
-            message: format!("--from-file not yet implemented: {}", file_path.display()),
-            hint: Some("Download from HuggingFace instead".into()),
+    // Install from local directory (for air-gapped environments)
+    if let Some(source_path) = from_file {
+        use crate::search::model_download::compute_sha256;
+
+        if !source_path.is_dir() {
+            return Err(CliError {
+                code: 21,
+                kind: "model",
+                message: format!(
+                    "--from-file path is not a directory: {}",
+                    source_path.display()
+                ),
+                hint: Some(
+                    "Provide a directory containing model files (model.onnx, tokenizer.json, etc.)"
+                        .into(),
+                ),
+                retryable: false,
+            });
+        }
+
+        println!(
+            "Installing model from local directory: {}",
+            source_path.display()
+        );
+
+        // Verify all required files exist and match checksums
+        for mfile in &manifest.files {
+            let local_name = mfile.local_name();
+            let src = source_path.join(local_name);
+            if !src.is_file() {
+                return Err(CliError {
+                    code: 21,
+                    kind: "model",
+                    message: format!(
+                        "Required file '{}' not found in {}",
+                        local_name,
+                        source_path.display()
+                    ),
+                    hint: Some(format!(
+                        "Expected files: {}",
+                        manifest
+                            .files
+                            .iter()
+                            .map(|f| f.local_name().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    retryable: false,
+                });
+            }
+
+            // Verify SHA256
+            println!("  Verifying {}...", local_name);
+            let actual_hash = compute_sha256(&src).map_err(|e| CliError {
+                code: 22,
+                kind: "io",
+                message: format!("Failed to hash {}: {}", local_name, e),
+                hint: None,
+                retryable: false,
+            })?;
+            if actual_hash != mfile.sha256 {
+                return Err(CliError {
+                    code: 21,
+                    kind: "model",
+                    message: format!(
+                        "SHA256 mismatch for '{}': expected {}, got {}",
+                        local_name, mfile.sha256, actual_hash
+                    ),
+                    hint: Some(
+                        "The file may be corrupted or from a different model version".into(),
+                    ),
+                    retryable: false,
+                });
+            }
+        }
+
+        // All verified -- copy to model directory
+        std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
+            code: 22,
+            kind: "io",
+            message: format!("Failed to create model directory: {}", e),
+            hint: None,
             retryable: false,
-        });
+        })?;
+
+        for mfile in &manifest.files {
+            let local_name = mfile.local_name();
+            let src = source_path.join(local_name);
+            let dst = model_dir.join(local_name);
+            std::fs::copy(&src, &dst).map_err(|e| CliError {
+                code: 22,
+                kind: "io",
+                message: format!("Failed to copy {}: {}", local_name, e),
+                hint: None,
+                retryable: false,
+            })?;
+        }
+
+        // Write verified marker
+        let marker_path = model_dir.join(".verified");
+        let content = format!(
+            "revision={}\nverified_at={}\n",
+            manifest.revision,
+            chrono::Utc::now().to_rfc3339()
+        );
+        std::fs::write(&marker_path, content).map_err(|e| CliError {
+            code: 22,
+            kind: "io",
+            message: format!("Failed to write verified marker: {}", e),
+            hint: None,
+            retryable: false,
+        })?;
+
+        println!();
+        println!(
+            "{} Model installed successfully from local files!",
+            "✓".green()
+        );
+        println!("  Location: {}", model_dir.display());
+        return Ok(());
     }
 
     // Check if mirror is specified
@@ -18192,5 +18493,156 @@ fn parse_datetime_flexible(s: &str) -> Option<i64> {
             }
             None
         }
+    }
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(unix)]
+fn resolved_daemon_config(
+    socket: Option<PathBuf>,
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+) -> crate::daemon::DaemonConfig {
+    use std::time::Duration;
+
+    let mut config = crate::daemon::DaemonConfig::from_env();
+    if idle_timeout.is_none() && dotenvy::var("CASS_DAEMON_IDLE_TIMEOUT_SECS").is_err() {
+        config.idle_timeout = Duration::from_secs(3600);
+    }
+
+    if let Some(socket_path) = socket {
+        config.socket_path = socket_path;
+    }
+    if let Some(idle_timeout_secs) = idle_timeout {
+        config.idle_timeout = Duration::from_secs(idle_timeout_secs);
+    }
+    if let Some(max_connections) = max_connections {
+        config.max_connections = max_connections;
+    }
+
+    config
+}
+
+/// Run the semantic model daemon (Unix only)
+#[cfg(unix)]
+fn run_daemon(
+    socket: Option<PathBuf>,
+    idle_timeout: Option<u64>,
+    max_connections: Option<usize>,
+    data_dir: Option<PathBuf>,
+) -> CliResult<()> {
+    use crate::daemon::{ModelDaemon, ModelManager};
+
+    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    let config = resolved_daemon_config(socket, idle_timeout, max_connections);
+
+    let models = ModelManager::new(&data_dir);
+    let daemon = ModelDaemon::new(config, models);
+
+    daemon.run().map_err(|e| CliError {
+        code: 9,
+        kind: "daemon",
+        message: format!("Daemon failed: {e}"),
+        hint: None,
+        retryable: false,
+    })
+}
+
+#[cfg(all(test, unix))]
+mod daemon_cli_config_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::time::Duration;
+
+    fn with_env_vars(vars: &[(&str, Option<&str>)], test: impl FnOnce()) {
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), dotenvy::var(key).ok()))
+            .collect();
+
+        for (key, value) in vars {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+
+        test();
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_uses_env_defaults_when_flags_are_absent() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", Some("/tmp/cass-daemon-env.sock")),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", Some("42")),
+                ("CASS_DAEMON_MAX_CONNECTIONS", Some("7")),
+                ("CASS_DAEMON_REQUEST_TIMEOUT_SECS", Some("9")),
+                ("CASS_DAEMON_MEMORY_LIMIT", Some("12345")),
+            ],
+            || {
+                let config = resolved_daemon_config(None, None, None);
+                assert_eq!(
+                    config.socket_path,
+                    PathBuf::from("/tmp/cass-daemon-env.sock")
+                );
+                assert_eq!(config.idle_timeout, Duration::from_secs(42));
+                assert_eq!(config.max_connections, 7);
+                assert_eq!(config.request_timeout, Duration::from_secs(9));
+                assert_eq!(config.memory_limit, 12_345);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_uses_one_hour_idle_default_without_env_or_flags() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", None),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", None),
+                ("CASS_DAEMON_MAX_CONNECTIONS", None),
+            ],
+            || {
+                let config = resolved_daemon_config(None, None, None);
+                assert_eq!(config.idle_timeout, Duration::from_secs(3600));
+                assert_eq!(config.max_connections, 16);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_cli_flags_override_env_selected_fields_only() {
+        with_env_vars(
+            &[
+                ("CASS_DAEMON_SOCKET", Some("/tmp/cass-daemon-env.sock")),
+                ("CASS_DAEMON_IDLE_TIMEOUT_SECS", Some("42")),
+                ("CASS_DAEMON_MAX_CONNECTIONS", Some("7")),
+                ("CASS_DAEMON_REQUEST_TIMEOUT_SECS", Some("9")),
+            ],
+            || {
+                let config = resolved_daemon_config(
+                    Some(PathBuf::from("/tmp/cass-daemon-cli.sock")),
+                    Some(0),
+                    Some(3),
+                );
+                assert_eq!(
+                    config.socket_path,
+                    PathBuf::from("/tmp/cass-daemon-cli.sock")
+                );
+                assert_eq!(config.idle_timeout, Duration::from_secs(0));
+                assert_eq!(config.max_connections, 3);
+                assert_eq!(config.request_timeout, Duration::from_secs(9));
+            },
+        );
     }
 }
