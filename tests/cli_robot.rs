@@ -1936,6 +1936,7 @@ fn status_human_readable_output() {
     // Should contain human-readable sections
     assert!(stdout.contains("CASS Status"), "Should have status header");
     assert!(stdout.contains("Database"), "Should have database section");
+    assert!(stdout.contains("Semantic"), "Should have semantic section");
     assert!(
         stdout.contains("Conversations"),
         "Should show conversation count"

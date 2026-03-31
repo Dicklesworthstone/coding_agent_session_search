@@ -4448,7 +4448,6 @@ fn probe_state_db(
     snapshot
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveIndexRunDetails {
     pid: Option<u32>,
@@ -8762,6 +8761,16 @@ fn run_status(
 
     Ok(())
 }
+
+/// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
+/// Designed for agent pre-flight checks before complex operations.
+///
+/// Invariant: when --json is requested, this function ALWAYS emits valid JSON
+/// to stdout before returning, even if the database is corrupt or WAL-damaged.
+fn run_health(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
@@ -9489,6 +9498,60 @@ mod cli_read_db_tests {
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["watch_active"].as_bool(), Some(false));
         assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn state_meta_json_marks_lexical_fingerprint_mismatch_stale() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "stale-fingerprint"
+                },
+                "page_size": 200,
+                "committed_offset": 10,
+                "processed_conversations": 10,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": true,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["status"].as_str(), Some("stale"));
+        assert_eq!(state["index"]["stale"].as_bool(), Some(true));
+        assert_eq!(
+            state["index"]["fingerprint"]["matches_current_db_fingerprint"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            state["index"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("fingerprint"))
+        );
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(0));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"],
+            serde_json::Value::Null
+        );
+        assert_eq!(state["rebuild"]["total_conversations"], serde_json::Value::Null);
+        assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
+        assert_eq!(
+            state["semantic"]["fallback_mode"].as_str(),
+            Some("lexical")
+        );
     }
 
     #[test]
