@@ -115,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         help="How often to sample the cass subprocess memory usage from /proc.",
     )
     parser.add_argument(
+        "--batch-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Kill a single cass batch if it runs longer than this many seconds. Use 0 to disable the timeout.",
+    )
+    parser.add_argument(
         "--memory-soft-fraction",
         type=float,
         default=0.20,
@@ -170,6 +176,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "provide either at least one --paths-file or both --root and --pattern"
         )
+    if args.batch_timeout_seconds < 0:
+        parser.error("--batch-timeout-seconds must be >= 0")
     return args
 
 
@@ -298,12 +306,22 @@ def state_paths(args: argparse.Namespace) -> tuple[Path, Path, Dict[str, List[st
 def load_state(state_file: Path) -> Dict[str, object]:
     if not state_file.exists():
         return {}
-    return json.loads(state_file.read_text())
+    try:
+        with state_file.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except OSError as exc:
+        raise SystemExit(f"failed to read state file {state_file}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"state file {state_file} is not valid JSON: {exc}. "
+            "Either repair it or move it aside before resuming."
+        ) from exc
 
 
 def save_state(state_file: Path, state: Dict[str, object]) -> None:
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    with state_file.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 def append_log(log_file: Path, payload: Dict[str, object]) -> None:
@@ -651,6 +669,7 @@ def run_batch(
     defer_lexical_updates: bool,
     serial_chunk_size: int,
     sample_interval_ms: int,
+    timeout_seconds: int,
     allow_begin_concurrent: bool,
 ) -> Dict[str, Any]:
     cmd = [
@@ -699,12 +718,29 @@ def run_batch(
     peak_rss_kb = 0
     peak_hwm_kb = 0
     samples = 0
+    started_at = time.monotonic()
+    timed_out = False
     while True:
         status = read_proc_status_kb(proc.pid)
         peak_rss_kb = max(peak_rss_kb, status.get("VmRSS", 0))
         peak_hwm_kb = max(peak_hwm_kb, status.get("VmHWM", 0))
         samples += 1
         if proc.poll() is not None:
+            break
+        if timeout_seconds > 0 and (time.monotonic() - started_at) >= timeout_seconds:
+            timed_out = True
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
             break
         time.sleep(max(sample_interval_ms, 10) / 1000.0)
     stdout_thread.join()
@@ -723,6 +759,7 @@ def run_batch(
         "mem_total_kb": mem_before.get("MemTotal", 0),
         "mem_available_start_kb": mem_before.get("MemAvailable", 0),
         "mem_available_end_kb": mem_after.get("MemAvailable", 0),
+        "timed_out": timed_out,
     }
 
 
@@ -732,6 +769,21 @@ def failure_text(proc: subprocess.CompletedProcess[str]) -> str:
 
 def has_masked_watch_failure(proc: subprocess.CompletedProcess[str]) -> bool:
     return "watch reindex failed" in failure_text(proc)
+
+
+def is_out_of_memory_failure(
+    proc: subprocess.CompletedProcess[str],
+    combined_failure: str,
+    peak_memory_kb: int,
+    hard_budget_kb: int,
+) -> bool:
+    if "out of memory" in combined_failure:
+        return True
+    if proc.returncode in (-9, 137):
+        return peak_memory_kb > 0 and peak_memory_kb >= int(hard_budget_kb * 0.90)
+    if "killed" in combined_failure and peak_memory_kb > 0:
+        return peak_memory_kb >= int(hard_budget_kb * 0.90)
+    return False
 
 
 def autotune_after_success(
@@ -896,13 +948,19 @@ def main() -> int:
             defer_lexical_updates=args.defer_lexical_updates,
             serial_chunk_size=args.serial_chunk_size,
             sample_interval_ms=args.sample_interval_ms,
+            timeout_seconds=args.batch_timeout_seconds,
             allow_begin_concurrent=args.allow_begin_concurrent,
         )
         proc = batch_result["proc"]
         elapsed_ms = int((time.time() - started_at) * 1000)
+        timed_out = bool(batch_result.get("timed_out"))
         combined_failure = failure_text(proc)
-        masked_watch_failure = has_masked_watch_failure(proc)
-        effective_returncode = proc.returncode if not masked_watch_failure else 90
+        masked_watch_failure = False if timed_out else has_masked_watch_failure(proc)
+        effective_returncode = (
+            124
+            if timed_out
+            else proc.returncode if not masked_watch_failure else 90
+        )
         peak_memory_kb = max(
             int(batch_result.get("peak_rss_kb", 0)),
             int(batch_result.get("peak_hwm_kb", 0)),
@@ -914,6 +972,16 @@ def main() -> int:
             hard_fraction=args.memory_hard_fraction,
             soft_cap_gb=args.memory_soft_cap_gb,
             hard_cap_gb=args.memory_hard_cap_gb,
+        )
+        out_of_memory_failure = (
+            False
+            if timed_out
+            else is_out_of_memory_failure(
+                proc,
+                combined_failure,
+                peak_memory_kb,
+                hard_budget_kb,
+            )
         )
 
         log_entry: Dict[str, object] = {
@@ -929,7 +997,10 @@ def main() -> int:
             "elapsed_ms": elapsed_ms,
             "stdout_tail": proc.stdout[-2000:],
             "stderr_tail": proc.stderr[-2000:],
+            "timed_out": timed_out,
+            "batch_timeout_seconds": args.batch_timeout_seconds,
             "masked_watch_failure": masked_watch_failure,
+            "out_of_memory_failure": out_of_memory_failure,
             "peak_rss_kb": int(batch_result.get("peak_rss_kb", 0)),
             "peak_hwm_kb": int(batch_result.get("peak_hwm_kb", 0)),
             "mem_total_kb": int(batch_result.get("mem_total_kb", 0)),
@@ -1009,7 +1080,49 @@ def main() -> int:
             continue
 
         append_log(log_file, log_entry)
-        if "out of memory" in combined_failure and batch_size > args.min_batch_size:
+        if timed_out:
+            state = build_state_snapshot(
+                signature_payload=signature_payload,
+                signature_id=signature_id,
+                total_paths=len(paths),
+                next_index=next_index,
+                current_batch_size=current_batch_size,
+                max_batch_size=args.max_batch_size,
+                max_batch_bytes=max_batch_bytes,
+                successful_batches=successful_batches,
+                run_started_at=run_started_at,
+                baseline_counts=baseline_counts,
+                path_stats=path_stats,
+                latest_counts=db_counts(cass_binary, data_dir),
+                tuning=tuning,
+                extra={
+                    "last_failure": {
+                        "reason": "subprocess_timeout",
+                        "exit_code": proc.returncode,
+                        "effective_exit_code": effective_returncode,
+                        "batch_size": batch_size,
+                        "timeout_seconds": args.batch_timeout_seconds,
+                        "first_path": str(batch[0]),
+                        "last_path": str(batch[-1]),
+                    }
+                },
+            )
+            save_state(state_file, state)
+            print(
+                json.dumps(
+                    {
+                        "status": "batch_timeout",
+                        "effective_exit_code": effective_returncode,
+                        "timeout_seconds": args.batch_timeout_seconds,
+                        "next_index": next_index,
+                        "batch_size": batch_size,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            return effective_returncode
+        if out_of_memory_failure and batch_size > args.min_batch_size:
             current_batch_size = max(args.min_batch_size, batch_size // 2)
             tuning.update(
                 {
