@@ -279,7 +279,7 @@ See [`models/README.md`](models/README.md) for full documentation.
 |----------|-------------|
 | `agent_search.db` | Pre-populated SQLite database |
 | `index/v1/` | Legacy index format (migration testing) |
-| `index/v6/` | Current index format |
+| `index/v7/` | Current index format |
 | `watch_state.json` | File watcher state fixture |
 
 **Tested by:** `tests/e2e_search_index.rs`, `src/search/query.rs`

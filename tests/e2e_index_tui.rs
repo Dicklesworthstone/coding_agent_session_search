@@ -149,7 +149,7 @@ fn index_then_tui_once_headless() {
     // Phase: verify artifacts
     let verify_start = tracker.start("verify_artifacts", Some("Checking index artifacts exist"));
     assert!(data_dir.join("agent_search.db").exists());
-    assert!(data_dir.join("index/v6").exists());
+    assert!(data_dir.join("index/v7").exists());
     let verify_ms = verify_start.elapsed().as_millis() as u64;
     tracker.end(
         "verify_artifacts",

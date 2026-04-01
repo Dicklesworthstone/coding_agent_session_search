@@ -112,7 +112,7 @@ fn tui_headless_launches_with_valid_index() {
 
     // Verify index artifacts exist
     assert!(data_dir.join("agent_search.db").exists(), "DB should exist");
-    assert!(data_dir.join("index/v6").exists(), "Index should exist");
+    assert!(data_dir.join("index/v7").exists(), "Index should exist");
 
     // Log test completion
     eprintln!("[SMOKE] tui_headless_launches_with_valid_index: PASSED");
