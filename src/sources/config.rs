@@ -371,9 +371,27 @@ impl SourcesConfig {
             return Ok(PathBuf::from(xdg_config).join("cass").join("sources.toml"));
         }
 
-        dirs::config_dir()
-            .map(|p| p.join("cass").join("sources.toml"))
-            .ok_or(ConfigError::NoConfigDir)
+        // Check the platform-specific config dir (e.g. ~/Library/Application Support/ on macOS)
+        let platform_path = dirs::config_dir().map(|p| p.join("cass").join("sources.toml"));
+
+        // If the platform path exists, use it
+        if let Some(ref p) = platform_path {
+            if p.exists() {
+                return Ok(p.clone());
+            }
+        }
+
+        // Fallback: check ~/.config/cass/sources.toml (common on macOS for users
+        // who follow XDG conventions without setting XDG_CONFIG_HOME)
+        if let Some(home) = dirs::home_dir() {
+            let dot_config_path = home.join(".config").join("cass").join("sources.toml");
+            if dot_config_path.exists() {
+                return Ok(dot_config_path);
+            }
+        }
+
+        // Neither exists — return the platform path for creation (original behavior)
+        platform_path.ok_or(ConfigError::NoConfigDir)
     }
 
     /// Validate all sources in the configuration.

@@ -116,6 +116,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticPreference {
     DefaultModel,
@@ -183,16 +184,31 @@ pub(crate) struct SemanticAssetState {
     pub hint: Option<String>,
 }
 
+pub(crate) struct InspectSearchAssetsInput<'a> {
+    pub data_dir: &'a Path,
+    pub db_path: &'a Path,
+    pub stale_threshold: u64,
+    pub last_indexed_at_ms: Option<i64>,
+    pub now_secs: u64,
+    pub maintenance: SearchMaintenanceSnapshot,
+    pub semantic_preference: SemanticPreference,
+    pub db_available: bool,
+}
+
 pub(crate) fn inspect_search_assets(
-    data_dir: &Path,
-    db_path: &Path,
-    stale_threshold: u64,
-    last_indexed_at_ms: Option<i64>,
-    now_secs: u64,
-    maintenance: SearchMaintenanceSnapshot,
-    semantic_preference: SemanticPreference,
-    db_available: bool,
+    input: InspectSearchAssetsInput<'_>,
 ) -> Result<SearchAssetSnapshot> {
+    let InspectSearchAssetsInput {
+        data_dir,
+        db_path,
+        stale_threshold,
+        last_indexed_at_ms,
+        now_secs,
+        maintenance,
+        semantic_preference,
+        db_available,
+    } = input;
+
     Ok(SearchAssetSnapshot {
         lexical: inspect_lexical_assets(
             data_dir,
@@ -349,9 +365,17 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         && maintenance
             .mode
             .is_some_and(SearchMaintenanceMode::rebuild_active);
-    let stale =
-        !exists || age_stale || checkpoint_incomplete || contract_mismatch || fingerprint_mismatch;
-    let fresh = exists && !stale;
+    let rebuild_db_matches = maintenance
+        .db_path
+        .as_ref()
+        .is_some_and(|lock_db_path| lock_db_path == db_path);
+    let active_rebuild_progress = rebuilding && rebuild_db_matches;
+    let stale = if rebuilding {
+        !exists || contract_mismatch
+    } else {
+        !exists || age_stale || checkpoint_incomplete || contract_mismatch || fingerprint_mismatch
+    };
+    let fresh = exists && !stale && !rebuilding;
     let status = if rebuilding {
         "building"
     } else if !exists {
@@ -361,7 +385,9 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     } else {
         "ready"
     };
-    let status_reason = if !exists {
+    let status_reason = if rebuilding {
+        Some("lexical rebuild is in progress".to_string())
+    } else if !exists {
         Some("lexical index directory missing".to_string())
     } else if contract_mismatch {
         Some("lexical rebuild checkpoint no longer matches the active lexical contract".to_string())
@@ -375,11 +401,14 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         None
     };
     let checkpoint_progress_usable = checkpoint.is_some()
-        && current_db_fingerprint.is_some()
         && checkpoint_db_matches == Some(true)
         && schema_matches == Some(true)
         && page_size_matches == Some(true)
-        && fingerprint_matches == Some(true);
+        && if active_rebuild_progress {
+            true
+        } else {
+            current_db_fingerprint.is_some() && fingerprint_matches == Some(true)
+        };
     let pending_sessions = checkpoint
         .filter(|_| checkpoint_progress_usable)
         .map(|state| {
@@ -612,6 +641,57 @@ mod tests {
     }
 
     #[test]
+    fn lexical_state_keeps_progress_visible_during_active_rebuild_despite_fingerprint_drift() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "before".to_string(),
+            committed_offset: 4,
+            processed_conversations: 4,
+            indexed_docs: 20,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: false,
+            updated_at_ms: 1_733_000_123_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(1_733_000_111_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+            },
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("after"),
+        });
+
+        assert_eq!(state.status, "building");
+        assert_eq!(state.stale, false);
+        assert_eq!(state.fresh, false);
+        assert_eq!(state.pending_sessions, 6);
+        assert_eq!(state.processed_conversations, Some(4));
+        assert_eq!(state.total_conversations, Some(10));
+        assert_eq!(state.indexed_docs, Some(20));
+        assert_eq!(
+            state.status_reason.as_deref(),
+            Some("lexical rebuild is in progress")
+        );
+    }
+
+    #[test]
     fn inspect_search_assets_preserves_semantic_database_unavailable_signal() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
@@ -626,16 +706,16 @@ mod tests {
             .expect("create vector dir");
         std::fs::write(&vector_path, b"index").expect("write vector index");
 
-        let snapshot = inspect_search_assets(
-            temp.path(),
-            &db_path,
-            60,
-            Some(1_733_000_000_000),
-            1_733_000_001,
-            SearchMaintenanceSnapshot::default(),
-            SemanticPreference::HashFallback,
-            false,
-        )
+        let snapshot = inspect_search_assets(InspectSearchAssetsInput {
+            data_dir: temp.path(),
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            semantic_preference: SemanticPreference::HashFallback,
+            db_available: false,
+        })
         .expect("asset inspection should not fail when db availability is already known");
 
         assert_ne!(snapshot.lexical.status, "error");

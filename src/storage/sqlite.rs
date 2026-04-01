@@ -2696,9 +2696,20 @@ impl FrankenStorage {
             "repairing missing current-schema tables on an already-versioned cass database"
         );
 
-        self.conn
-            .execute_batch(MIGRATION_FRESH_SCHEMA)
-            .with_context(|| "repairing missing current-schema tables")?;
+        for batch in current_schema_repair_batches_for_missing_tables(&missing_tables)? {
+            self.conn
+                .execute_batch(batch.sql)
+                .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+        }
+
+        for &(table_name, probe_sql) in REQUIRED_CURRENT_SCHEMA_TABLE_PROBES {
+            if !missing_tables.contains(&table_name) {
+                continue;
+            }
+            self.conn
+                .query(probe_sql)
+                .with_context(|| format!("verifying repaired schema table {table_name}"))?;
+        }
         Ok(())
     }
 
@@ -3185,6 +3196,339 @@ CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, d
 CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
 CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
 ";
+
+#[derive(Clone, Copy)]
+struct SchemaRepairBatch {
+    name: &'static str,
+    tables: &'static [&'static str],
+    sql: &'static str,
+}
+
+const CURRENT_SCHEMA_REPAIR_SOURCES_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS sources (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    host_label TEXT,
+    machine_id TEXT,
+    platform TEXT,
+    config_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at)
+VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
+";
+
+const CURRENT_SCHEMA_REPAIR_DAILY_STATS_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    session_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    total_chars INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL,
+    PRIMARY KEY (day_id, agent_slug, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_stats_agent ON daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_source ON daily_stats(source_id, day_id);
+";
+
+const CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    db_path TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total_docs INTEGER NOT NULL DEFAULT 0,
+    completed_docs INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_jobs_active
+ON embedding_jobs(db_path, model_id)
+WHERE status IN ('pending', 'running');
+";
+
+const CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL,
+    agent_id INTEGER NOT NULL,
+    workspace_id INTEGER,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    timestamp_ms INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+    model_name TEXT,
+    model_family TEXT,
+    model_tier TEXT,
+    service_tier TEXT,
+    provider TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_creation_tokens INTEGER,
+    thinking_tokens INTEGER,
+    total_tokens INTEGER,
+    estimated_cost_usd REAL,
+    role TEXT NOT NULL,
+    content_chars INTEGER NOT NULL,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    data_source TEXT NOT NULL DEFAULT 'api',
+    UNIQUE(message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage(day_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_conv ON token_usage(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_workspace ON token_usage(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp_ms);
+
+CREATE TABLE IF NOT EXISTS token_daily_stats (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT 'all',
+    model_family TEXT NOT NULL DEFAULT 'all',
+    api_call_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_message_count INTEGER NOT NULL DEFAULT 0,
+    total_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    total_thinking_tokens INTEGER NOT NULL DEFAULT 0,
+    grand_total_tokens INTEGER NOT NULL DEFAULT 0,
+    total_content_chars INTEGER NOT NULL DEFAULT 0,
+    total_tool_calls INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+    session_count INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL,
+    PRIMARY KEY (day_id, agent_slug, source_id, model_family)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_agent ON token_daily_stats(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_token_daily_stats_model ON token_daily_stats(model_family, day_id);
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+    model_pattern TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    input_cost_per_mtok REAL NOT NULL,
+    output_cost_per_mtok REAL NOT NULL,
+    cache_read_cost_per_mtok REAL,
+    cache_creation_cost_per_mtok REAL,
+    effective_date TEXT NOT NULL,
+    PRIMARY KEY (model_pattern, effective_date)
+);
+
+INSERT OR IGNORE INTO model_pricing VALUES
+    ('claude-opus-4%', 'anthropic', 15.0, 75.0, 1.5, 18.75, '2025-10-01'),
+    ('claude-sonnet-4%', 'anthropic', 3.0, 15.0, 0.3, 3.75, '2025-10-01'),
+    ('claude-haiku-4%', 'anthropic', 0.80, 4.0, 0.08, 1.0, '2025-10-01'),
+    ('gpt-4o%', 'openai', 2.50, 10.0, NULL, NULL, '2025-01-01'),
+    ('gpt-4-turbo%', 'openai', 10.0, 30.0, NULL, NULL, '2024-04-01'),
+    ('gpt-4.1%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o3%', 'openai', 2.0, 8.0, NULL, NULL, '2025-04-01'),
+    ('o4-mini%', 'openai', 1.10, 4.40, NULL, NULL, '2025-04-01'),
+    ('gemini-2%flash%', 'google', 0.075, 0.30, NULL, NULL, '2025-01-01'),
+    ('gemini-2%pro%', 'google', 1.25, 10.0, NULL, NULL, '2025-01-01');
+";
+
+const CURRENT_SCHEMA_REPAIR_MESSAGE_METRICS_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS message_metrics (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    created_at_ms INTEGER NOT NULL,
+    hour_id INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    role TEXT NOT NULL,
+    content_chars INTEGER NOT NULL,
+    content_tokens_est INTEGER NOT NULL,
+    api_input_tokens INTEGER,
+    api_output_tokens INTEGER,
+    api_cache_read_tokens INTEGER,
+    api_cache_creation_tokens INTEGER,
+    api_thinking_tokens INTEGER,
+    api_service_tier TEXT,
+    api_data_source TEXT NOT NULL DEFAULT 'estimated',
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    has_tool_calls INTEGER NOT NULL DEFAULT 0,
+    has_plan INTEGER NOT NULL DEFAULT 0,
+    model_name TEXT,
+    model_family TEXT NOT NULL DEFAULT 'unknown',
+    model_tier TEXT NOT NULL DEFAULT 'unknown',
+    provider TEXT NOT NULL DEFAULT 'unknown'
+);
+
+CREATE TABLE IF NOT EXISTS usage_hourly (
+    hour_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_id, agent_slug, workspace_id, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    plan_content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    plan_api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS usage_models_daily (
+    day_id INTEGER NOT NULL,
+    agent_slug TEXT NOT NULL,
+    workspace_id INTEGER NOT NULL DEFAULT 0,
+    source_id TEXT NOT NULL DEFAULT 'local',
+    model_family TEXT NOT NULL DEFAULT 'unknown',
+    model_tier TEXT NOT NULL DEFAULT 'unknown',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    plan_message_count INTEGER NOT NULL DEFAULT 0,
+    api_coverage_message_count INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_total INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_user INTEGER NOT NULL DEFAULT 0,
+    content_tokens_est_assistant INTEGER NOT NULL DEFAULT 0,
+    api_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_input_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_output_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_read_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_cache_creation_tokens_total INTEGER NOT NULL DEFAULT 0,
+    api_thinking_tokens_total INTEGER NOT NULL DEFAULT 0,
+    last_updated INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day_id, agent_slug, workspace_id, source_id, model_family, model_tier)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mm_hour ON message_metrics(hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_day ON message_metrics(day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_agent_hour ON message_metrics(agent_slug, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_agent_day ON message_metrics(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_workspace_hour ON message_metrics(workspace_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_source_hour ON message_metrics(source_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_mm_model_family_day ON message_metrics(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_mm_provider_day ON message_metrics(provider, day_id);
+CREATE INDEX IF NOT EXISTS idx_uh_agent ON usage_hourly(agent_slug, hour_id);
+CREATE INDEX IF NOT EXISTS idx_uh_workspace ON usage_hourly(workspace_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_uh_source ON usage_hourly(source_id, hour_id);
+CREATE INDEX IF NOT EXISTS idx_ud_agent ON usage_daily(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_ud_workspace ON usage_daily(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_ud_source ON usage_daily(source_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_model_day ON usage_models_daily(model_family, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_agent_day ON usage_models_daily(agent_slug, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_workspace_day ON usage_models_daily(workspace_id, day_id);
+CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, day_id);
+";
+
+const CURRENT_SCHEMA_REPAIR_BATCHES: &[SchemaRepairBatch] = &[
+    SchemaRepairBatch {
+        name: "sources",
+        tables: &["sources"],
+        sql: CURRENT_SCHEMA_REPAIR_SOURCES_SQL,
+    },
+    SchemaRepairBatch {
+        name: "daily_stats",
+        tables: &["daily_stats"],
+        sql: CURRENT_SCHEMA_REPAIR_DAILY_STATS_SQL,
+    },
+    SchemaRepairBatch {
+        name: "embedding_jobs",
+        tables: &["embedding_jobs"],
+        sql: CURRENT_SCHEMA_REPAIR_EMBEDDING_JOBS_SQL,
+    },
+    SchemaRepairBatch {
+        name: "token_analytics",
+        tables: &["token_usage", "token_daily_stats", "model_pricing"],
+        sql: CURRENT_SCHEMA_REPAIR_TOKEN_ANALYTICS_SQL,
+    },
+    SchemaRepairBatch {
+        name: "message_rollups",
+        tables: &[
+            "message_metrics",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ],
+        sql: CURRENT_SCHEMA_REPAIR_MESSAGE_METRICS_SQL,
+    },
+];
+
+fn current_schema_repair_batches_for_missing_tables(
+    missing_tables: &[&'static str],
+) -> Result<Vec<&'static SchemaRepairBatch>> {
+    let missing_set: HashSet<&'static str> = missing_tables.iter().copied().collect();
+    let mut selected_batches = Vec::new();
+    let mut covered_tables = HashSet::new();
+
+    for batch in CURRENT_SCHEMA_REPAIR_BATCHES {
+        if !batch
+            .tables
+            .iter()
+            .any(|table_name| missing_set.contains(table_name))
+        {
+            continue;
+        }
+        selected_batches.push(batch);
+        covered_tables.extend(batch.tables.iter().copied());
+    }
+
+    for &table_name in missing_tables {
+        if !covered_tables.contains(table_name) {
+            return Err(anyhow!(
+                "no current-schema repair batch registered for missing table {table_name}"
+            ));
+        }
+    }
+
+    Ok(selected_batches)
+}
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
 const MIGRATION_NAMES: [(i64, &str); 14] = [
@@ -13897,6 +14241,75 @@ mod tests {
             analytics_count, 9,
             "open() should recreate the missing analytics tables even when schema_version already says current"
         );
+    }
+
+    #[test]
+    fn current_schema_repair_batches_cover_every_required_probe() {
+        let missing_tables: Vec<&'static str> = REQUIRED_CURRENT_SCHEMA_TABLE_PROBES
+            .iter()
+            .map(|(table_name, _)| *table_name)
+            .collect();
+
+        let batches = current_schema_repair_batches_for_missing_tables(&missing_tables).unwrap();
+        let covered_tables: HashSet<&'static str> = batches
+            .iter()
+            .flat_map(|batch| batch.tables.iter().copied())
+            .collect();
+
+        for table_name in missing_tables {
+            assert!(
+                covered_tables.contains(table_name),
+                "missing repair coverage for {table_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_schema_repair_batches_do_not_replay_core_schema_bootstrap() {
+        for batch in CURRENT_SCHEMA_REPAIR_BATCHES {
+            assert!(
+                !batch.sql.contains("CREATE TABLE IF NOT EXISTS meta"),
+                "repair batch {} should not recreate meta",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("CREATE TABLE IF NOT EXISTS agents"),
+                "repair batch {} should not recreate agents",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("CREATE TABLE IF NOT EXISTS workspaces"),
+                "repair batch {} should not recreate workspaces",
+                batch.name
+            );
+            assert!(
+                !batch
+                    .sql
+                    .contains("CREATE TABLE IF NOT EXISTS conversations"),
+                "repair batch {} should not recreate conversations",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("CREATE TABLE IF NOT EXISTS messages"),
+                "repair batch {} should not recreate messages",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("CREATE TABLE IF NOT EXISTS snippets"),
+                "repair batch {} should not recreate snippets",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("CREATE VIRTUAL TABLE fts_messages"),
+                "repair batch {} should not recreate FTS tables",
+                batch.name
+            );
+            assert!(
+                !batch.sql.contains("DROP TABLE"),
+                "repair batch {} should never drop tables",
+                batch.name
+            );
+        }
     }
 
     #[test]

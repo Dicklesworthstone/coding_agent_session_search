@@ -2538,15 +2538,17 @@ async fn execute_cli(
         ));
     }
 
-    // Auto-quiet in robot mode: suppress INFO logs for clean JSON output
-    // This ensures AI agents get parseable stdout without log noise on stderr
+    // Auto-quiet in robot mode: suppress INFO/WARN logs for clean JSON output.
+    // WARN was previously allowed through, but even on stderr it breaks JSON
+    // consumers that merge stderr into stdout (e.g., `cass index --json 2>&1`).
+    // Only errors are important enough to surface in machine-readable mode.
     let robot_mode = is_robot_mode(&command, cli);
     let filter = if cli.quiet || robot_mode {
         // Robot mode implies quiet unless verbose is explicitly requested
         if cli.verbose {
             EnvFilter::new("debug")
         } else {
-            EnvFilter::new("warn")
+            EnvFilter::new("error")
         }
     } else if cli.verbose {
         EnvFilter::new("debug")
@@ -4619,14 +4621,16 @@ fn state_meta_json(
             .map(|d| d.as_millis() as i64);
     }
     let assets = crate::search::asset_state::inspect_search_assets(
-        data_dir,
-        db_path,
-        stale_threshold,
-        last_indexed_at,
-        now_secs,
-        index_run.clone(),
-        crate::search::asset_state::SemanticPreference::DefaultModel,
-        db_opened,
+        crate::search::asset_state::InspectSearchAssetsInput {
+            data_dir,
+            db_path,
+            stale_threshold,
+            last_indexed_at_ms: last_indexed_at,
+            now_secs,
+            maintenance: index_run.clone(),
+            semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
+            db_available: db_opened,
+        },
     )
     .unwrap_or_else(|err| {
         let summary = err.to_string();
@@ -5023,14 +5027,14 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Expand { .. }
         | Commands::ExportHtml { .. }
         | Commands::Timeline { .. } => cli.robot_format.is_some() || env_robot_mode,
-        Commands::Sources(cmd) => match cmd {
+        Commands::Sources(
             SourcesCommand::List { .. }
             | SourcesCommand::Doctor { .. }
             | SourcesCommand::Sync { .. }
             | SourcesCommand::Discover { .. }
-            | SourcesCommand::Setup { .. } => cli.robot_format.is_some() || env_robot_mode,
-            _ => false,
-        },
+            | SourcesCommand::Setup { .. },
+        ) => cli.robot_format.is_some() || env_robot_mode,
+        Commands::Sources(_) => false,
         Commands::Import(cmd) => match cmd {
             ImportCommand::Chatgpt { .. } => cli.robot_format.is_some() || env_robot_mode,
         },
@@ -6345,6 +6349,7 @@ fn run_cli_search(
                 cache_stats: crate::search::query::CacheStats::default(),
                 suggestions: Vec::new(),
                 ann_stats,
+                total_count: None,
             }
         }
         SearchMode::Hybrid => client
@@ -6489,6 +6494,7 @@ fn run_cli_search(
                             cache_stats: result.cache_stats,
                             suggestions: result.suggestions,
                             ann_stats: result.ann_stats,
+                            total_count: result.total_count,
                         }
                     }
                     Err(e) => {
@@ -6553,6 +6559,7 @@ fn run_cli_search(
             cache_stats: result.cache_stats,
             suggestions: result.suggestions.clone(),
             ann_stats: result.ann_stats.clone(),
+            total_count: result.total_count,
         };
         let has_more = total > offset_val + display.hits.len();
         (aggs, display, total, has_more)
@@ -6566,15 +6573,20 @@ fn run_cli_search(
             limit_val
         };
         let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
-        let known_total = offset_val
-            .saturating_add(display_hits.len())
-            .saturating_add(usize::from(has_more));
+        // Use the true total from Tantivy's Count collector when available;
+        // fall back to the page-window lower bound for semantic/hybrid/cached paths.
+        let known_total = result.total_count.unwrap_or_else(|| {
+            offset_val
+                .saturating_add(display_hits.len())
+                .saturating_add(usize::from(has_more))
+        });
         let display = crate::search::query::SearchResult {
             hits: display_hits,
             wildcard_fallback: result.wildcard_fallback,
             cache_stats: result.cache_stats,
             suggestions: result.suggestions,
             ann_stats: result.ann_stats,
+            total_count: result.total_count,
         };
         (Aggregations::default(), display, known_total, has_more)
     };
@@ -12294,7 +12306,12 @@ fn try_load_indexed_conversation_from_db(
         return None;
     }
     let storage = crate::storage::sqlite::FrankenStorage::open(db_path).ok()?;
-    crate::ui::data::load_conversation(&storage, &source_path.to_string_lossy()).ok()?
+    crate::ui::data::load_conversation_for_source(
+        &storage,
+        crate::sources::provenance::LOCAL_SOURCE_ID,
+        &source_path.to_string_lossy(),
+    )
+    .ok()?
 }
 
 fn try_load_indexed_conversation(source_path: &Path) -> Option<crate::ui::data::ConversationView> {
@@ -14768,6 +14785,88 @@ mod indexed_conversation_fallback_tests {
             extract_message_timestamp(&raw_messages[0]),
             Some(1_733_000_000_000)
         );
+    }
+
+    #[test]
+    fn try_load_indexed_conversation_from_db_prefers_local_source_for_shared_path() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::storage::sqlite::FrankenStorage;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent = Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).expect("ensure agent");
+        let synthetic_path = PathBuf::from("/same/path/session.jsonl");
+
+        let remote = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("remote-123".to_string()),
+            title: Some("Remote Session".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_000_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("remote".to_string()),
+                created_at: Some(1_700_000_000_001),
+                content: "remote body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "work-laptop".to_string(),
+            origin_host: Some("work-laptop".to_string()),
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &remote)
+            .expect("insert remote conversation");
+
+        let local = Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some("local-123".to_string()),
+            title: Some("Local Session".to_string()),
+            source_path: synthetic_path.clone(),
+            started_at: Some(1_700_000_100_000),
+            ended_at: None,
+            approx_tokens: Some(10),
+            metadata_json: serde_json::json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("local".to_string()),
+                created_at: Some(1_700_000_100_001),
+                content: "local body".to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &local)
+            .expect("insert local conversation");
+
+        let loaded = try_load_indexed_conversation_from_db(&synthetic_path, &db_path)
+            .expect("conversation should load via db fallback");
+        assert_eq!(loaded.convo.source_id, crate::sources::provenance::LOCAL_SOURCE_ID);
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("local-123"));
+        assert_eq!(loaded.messages[0].content, "local body");
     }
 }
 

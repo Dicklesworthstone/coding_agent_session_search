@@ -1015,6 +1015,12 @@ pub struct SearchResult {
     pub suggestions: Vec<QuerySuggestion>,
     /// ANN search statistics (present when --approximate was used)
     pub ann_stats: Option<crate::search::ann_index::AnnSearchStats>,
+    /// True total matching documents from the search engine (when available).
+    /// For lexical searches this comes from Tantivy's `Count` collector and
+    /// reflects the total number of documents matching the query, independent
+    /// of limit/offset pagination. `None` for semantic/hybrid/cached paths
+    /// where the true total is unknown.
+    pub total_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1802,6 +1808,10 @@ pub struct SearchClient {
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
+    /// Total count from the most recent Tantivy query (via `Count` collector).
+    /// Populated by `search_tantivy`, read by `search_with_fallback` to report
+    /// the true total matching documents for `total_matches` in JSON output.
+    last_tantivy_total_count: Mutex<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2324,6 +2334,7 @@ impl SearchClient {
             metrics,
             cache_namespace,
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         }))
     }
 
@@ -3139,6 +3150,7 @@ impl SearchClient {
             cache_stats: self.cache_stats(),
             suggestions,
             ann_stats: None,
+            total_count: None,
         })
     }
 
@@ -3668,6 +3680,12 @@ impl SearchClient {
         // First, try the normal search
         let hits = self.search(query, filters.clone(), limit, offset, field_mask)?;
         let baseline_stats = self.cache_stats();
+        // Capture the true total from Tantivy's Count collector (set during search_tantivy).
+        let tantivy_total = self
+            .last_tantivy_total_count
+            .lock()
+            .ok()
+            .and_then(|guard| *guard);
 
         // Check if we should try wildcard fallback
         let query_has_wildcards = query.contains('*');
@@ -3689,6 +3707,7 @@ impl SearchClient {
                 cache_stats: baseline_stats,
                 suggestions,
                 ann_stats: None,
+                total_count: tantivy_total,
             });
         }
 
@@ -3709,6 +3728,12 @@ impl SearchClient {
         let mut fallback_hits =
             self.search(&wildcard_query, filters.clone(), limit, offset, field_mask)?;
         let fallback_stats = self.cache_stats();
+        // Re-capture total_count after wildcard search (may have changed)
+        let fallback_tantivy_total = self
+            .last_tantivy_total_count
+            .lock()
+            .ok()
+            .and_then(|guard| *guard);
 
         // Use fallback results if they're better
         if fallback_hits.len() > hits.len() {
@@ -3728,6 +3753,7 @@ impl SearchClient {
                 cache_stats: fallback_stats,
                 suggestions,
                 ann_stats: None,
+                total_count: fallback_tantivy_total,
             })
         } else {
             // Keep original results even if sparse
@@ -3743,6 +3769,7 @@ impl SearchClient {
                 cache_stats: baseline_stats,
                 suggestions,
                 ann_stats: None,
+                total_count: tantivy_total,
             })
         }
     }
@@ -3803,6 +3830,7 @@ impl SearchClient {
                 cache_stats: self.cache_stats(),
                 suggestions: Vec::new(),
                 ann_stats: None,
+                total_count: None,
             });
         }
 
@@ -3848,6 +3876,7 @@ impl SearchClient {
             cache_stats: lexical.cache_stats,
             suggestions,
             ann_stats: semantic_ann_stats,
+            total_count: None,
         })
     }
 
@@ -4009,6 +4038,7 @@ impl SearchClient {
         };
 
         let top_docs = fs_execute_query_with_offset(&searcher, &*q, limit, offset)?;
+        let tantivy_total_count = top_docs.total_count;
         // Compute match type once for all results (not per-hit)
         let query_match_type = dominant_match_type(sanitized_query);
         let mut hits = Vec::new();
@@ -4112,6 +4142,11 @@ impl SearchClient {
                 origin_kind,
                 origin_host,
             });
+        }
+        // Store the true total from Tantivy's Count collector so
+        // search_with_fallback can report it as total_matches.
+        if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+            *tc = Some(tantivy_total_count);
         }
         Ok(hits)
     }
@@ -5449,6 +5484,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -6115,6 +6151,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -6165,6 +6202,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -6282,6 +6320,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -6787,6 +6826,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -6866,6 +6906,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -6952,6 +6993,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -7029,6 +7071,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -7156,6 +7199,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let all_hits = client.search("br-123", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
@@ -7301,6 +7345,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -7382,6 +7427,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -7480,6 +7526,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let local_hits = client.search(
@@ -7600,6 +7647,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -7668,6 +7716,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -7797,6 +7846,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -7854,6 +7904,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -7907,6 +7958,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -7941,6 +7993,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -8005,6 +8058,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -8801,6 +8855,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -8893,6 +8948,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -8937,6 +8993,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -9625,6 +9682,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -10474,6 +10532,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -10512,6 +10571,7 @@ mod tests {
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();

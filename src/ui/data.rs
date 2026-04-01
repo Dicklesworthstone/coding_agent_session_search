@@ -106,11 +106,12 @@ impl ConversationCache {
         }
     }
 
-    /// Hash a source path to a u64 key using rustc-hash's FxHasher.
+    /// Hash a source identity to a u64 key using rustc-hash's FxHasher.
     #[inline]
-    fn hash_key(source_path: &str) -> u64 {
+    fn hash_key(source_id: Option<&str>, source_path: &str) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
+        source_id.unwrap_or("").hash(&mut hasher);
         source_path.hash(&mut hasher);
         hasher.finish()
     }
@@ -121,9 +122,9 @@ impl ConversationCache {
         (hash as usize) % NUM_SHARDS
     }
 
-    /// Get a cached conversation view by source path.
-    pub fn get(&self, source_path: &str) -> Option<Arc<ConversationView>> {
-        let hash = Self::hash_key(source_path);
+    /// Get a cached conversation view by source identity.
+    pub fn get(&self, source_id: Option<&str>, source_path: &str) -> Option<Arc<ConversationView>> {
+        let hash = Self::hash_key(source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let mut shard = self.shards[shard_idx].write();
 
@@ -137,8 +138,13 @@ impl ConversationCache {
     }
 
     /// Insert a conversation view into the cache.
-    pub fn insert(&self, source_path: &str, view: ConversationView) -> Arc<ConversationView> {
-        let hash = Self::hash_key(source_path);
+    pub fn insert(
+        &self,
+        source_id: Option<&str>,
+        source_path: &str,
+        view: ConversationView,
+    ) -> Arc<ConversationView> {
+        let hash = Self::hash_key(source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let arc = Arc::new(view);
 
@@ -152,9 +158,9 @@ impl ConversationCache {
         arc
     }
 
-    /// Invalidate a specific cache entry by source path.
-    pub fn invalidate(&self, source_path: &str) {
-        let hash = Self::hash_key(source_path);
+    /// Invalidate a specific cache entry by source identity.
+    pub fn invalidate(&self, source_id: Option<&str>, source_path: &str) {
+        let hash = Self::hash_key(source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let mut shard = self.shards[shard_idx].write();
         shard.pop(&hash);
@@ -197,20 +203,38 @@ pub static CONVERSATION_CACHE: Lazy<ConversationCache> = Lazy::new(|| {
 // -------------------------------------------------------------------------
 
 /// Load a conversation from the database (bypassing cache).
-/// Use `load_conversation` for cached access.
+/// Use `load_conversation` or `load_conversation_for_source` for cached access.
 pub(crate) fn load_conversation_uncached(
     storage: &FrankenStorage,
+    source_id: Option<&str>,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
+    let (sql, params) = if let Some(source_id) = source_id {
+        (
+            "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                    c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             WHERE c.source_path = ?1 AND COALESCE(c.source_id, 'local') = ?2
+             ORDER BY c.started_at DESC LIMIT 1",
+            frankensqlite::params![source_path, source_id],
+        )
+    } else {
+        (
+            "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                    c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+             FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN workspaces w ON c.workspace_id = w.id
+             WHERE c.source_path = ?1
+             ORDER BY c.started_at DESC LIMIT 1",
+            frankensqlite::params![source_path],
+        )
+    };
     let rows = storage.raw().query_map_collect(
-        "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
-                c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
-         FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
-         LEFT JOIN workspaces w ON c.workspace_id = w.id
-         WHERE c.source_path = ?1
-         ORDER BY c.started_at DESC LIMIT 1",
-        frankensqlite::params![source_path],
+        sql,
+        params,
         |row: &Row| {
             let convo_id: i64 = row.get_typed(0)?;
             let workspace_path = row
@@ -272,7 +296,7 @@ pub(crate) fn load_conversation_uncached(
 /// - Hit: Returns cached Arc<ConversationView> (fast path)
 /// - Miss: Queries database, parses JSON, caches result
 ///
-/// The cache is keyed by source_path and has a configurable capacity
+/// The cache is keyed by source identity and has a configurable capacity
 /// via the CASS_CONV_CACHE_SIZE environment variable (default: 256 per shard,
 /// 4096 total entries across 16 shards).
 pub fn load_conversation(
@@ -280,17 +304,37 @@ pub fn load_conversation(
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
     // Fast path: check cache first
-    if let Some(cached) = CONVERSATION_CACHE.get(source_path) {
+    if let Some(cached) = CONVERSATION_CACHE.get(None, source_path) {
         // Clone out of Arc for API compatibility
         return Ok(Some((*cached).clone()));
     }
 
     // Cache miss: load from database
-    let view = load_conversation_uncached(storage, source_path)?;
+    let view = load_conversation_uncached(storage, None, source_path)?;
 
     // Cache the result if found
     if let Some(v) = view {
-        CONVERSATION_CACHE.insert(source_path, v.clone());
+        CONVERSATION_CACHE.insert(None, source_path, v.clone());
+        return Ok(Some(v));
+    }
+
+    Ok(None)
+}
+
+/// Load a conversation for a specific source with caching.
+pub fn load_conversation_for_source(
+    storage: &FrankenStorage,
+    source_id: &str,
+    source_path: &str,
+) -> Result<Option<ConversationView>> {
+    if let Some(cached) = CONVERSATION_CACHE.get(Some(source_id), source_path) {
+        return Ok(Some((*cached).clone()));
+    }
+
+    let view = load_conversation_uncached(storage, Some(source_id), source_path)?;
+
+    if let Some(v) = view {
+        CONVERSATION_CACHE.insert(Some(source_id), source_path, v.clone());
         return Ok(Some(v));
     }
 
@@ -306,16 +350,16 @@ pub fn load_conversation_arc(
     source_path: &str,
 ) -> Result<Option<Arc<ConversationView>>> {
     // Fast path: check cache first
-    if let Some(cached) = CONVERSATION_CACHE.get(source_path) {
+    if let Some(cached) = CONVERSATION_CACHE.get(None, source_path) {
         return Ok(Some(cached));
     }
 
     // Cache miss: load from database
-    let view = load_conversation_uncached(storage, source_path)?;
+    let view = load_conversation_uncached(storage, None, source_path)?;
 
     // Cache and return the Arc
     if let Some(v) = view {
-        let arc = CONVERSATION_CACHE.insert(source_path, v);
+        let arc = CONVERSATION_CACHE.insert(None, source_path, v);
         return Ok(Some(arc));
     }
 
@@ -861,11 +905,11 @@ mod tests {
         let source_path = "/test/path/1.jsonl";
 
         // Insert into cache
-        let arc = cache.insert(source_path, view.clone());
+        let arc = cache.insert(None, source_path, view.clone());
         assert_eq!(arc.convo.id, Some(1));
 
         // Get from cache
-        let cached = cache.get(source_path);
+        let cached = cache.get(None, source_path);
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().convo.id, Some(1));
 
@@ -876,11 +920,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_distinguishes_same_path_across_sources() {
+        let cache = ConversationCache::new(10);
+        let source_path = "/test/shared/session.jsonl";
+
+        let mut local = make_test_view(1);
+        local.convo.source_path = PathBuf::from(source_path);
+        local.convo.source_id = "local".to_string();
+        let mut remote = make_test_view(2);
+        remote.convo.source_path = PathBuf::from(source_path);
+        remote.convo.source_id = "work-laptop".to_string();
+
+        cache.insert(Some("local"), source_path, local);
+        cache.insert(Some("work-laptop"), source_path, remote);
+
+        let local_cached = cache.get(Some("local"), source_path).expect("local cached");
+        let remote_cached = cache
+            .get(Some("work-laptop"), source_path)
+            .expect("remote cached");
+
+        assert_eq!(local_cached.convo.source_id, "local");
+        assert_eq!(remote_cached.convo.source_id, "work-laptop");
+        assert_ne!(local_cached.convo.id, remote_cached.convo.id);
+    }
+
+    #[test]
+    fn load_conversation_for_source_selects_exact_source_id() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/session.jsonl";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, 'local', 200)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert local conversation");
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert remote conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local body')",
+        )
+        .expect("insert local message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote body')",
+        )
+        .expect("insert remote message");
+
+        let local = load_conversation_for_source(&storage, "local", shared_path)
+            .expect("load local")
+            .expect("local conversation");
+        let remote = load_conversation_for_source(&storage, "work-laptop", shared_path)
+            .expect("load remote")
+            .expect("remote conversation");
+
+        assert_eq!(local.convo.source_id, "local");
+        assert_eq!(local.convo.title.as_deref(), Some("Local Session"));
+        assert_eq!(local.messages[0].content, "local body");
+
+        assert_eq!(remote.convo.source_id, "work-laptop");
+        assert_eq!(remote.convo.title.as_deref(), Some("Remote Session"));
+        assert_eq!(remote.messages[0].content, "remote body");
+    }
+
+    #[test]
     fn test_cache_miss() {
         let cache = ConversationCache::new(10);
 
         // Get from empty cache
-        let cached = cache.get("/nonexistent/path.jsonl");
+        let cached = cache.get(None, "/nonexistent/path.jsonl");
         assert!(cached.is_none());
 
         // Check stats
@@ -896,12 +1016,12 @@ mod tests {
         let source_path = "/test/path/1.jsonl";
 
         // Insert and verify
-        cache.insert(source_path, view);
-        assert!(cache.get(source_path).is_some());
+        cache.insert(None, source_path, view);
+        assert!(cache.get(None, source_path).is_some());
 
         // Invalidate
-        cache.invalidate(source_path);
-        assert!(cache.get(source_path).is_none());
+        cache.invalidate(None, source_path);
+        assert!(cache.get(None, source_path).is_none());
     }
 
     #[test]
@@ -912,7 +1032,7 @@ mod tests {
         for i in 0..5 {
             let view = make_test_view(i);
             let source_path = format!("/test/path/{}.jsonl", i);
-            cache.insert(&source_path, view);
+            cache.insert(None, &source_path, view);
         }
 
         assert_eq!(cache.len(), 5);
@@ -933,7 +1053,7 @@ mod tests {
         for i in 0..100 {
             let view = make_test_view(i);
             let source_path = format!("/test/path/{}.jsonl", i);
-            cache.insert(&source_path, view);
+            cache.insert(None, &source_path, view);
         }
 
         // Some early entries should have been evicted
@@ -951,9 +1071,9 @@ mod tests {
         assert_eq!(cache.stats().hit_rate(), 0.0);
 
         // Insert and access twice (1 miss on insert lookup, then 2 hits)
-        cache.insert(source_path, view);
-        let _ = cache.get(source_path);
-        let _ = cache.get(source_path);
+        cache.insert(None, source_path, view);
+        let _ = cache.get(None, source_path);
+        let _ = cache.get(None, source_path);
 
         // Hit rate should be positive (2 hits / 2 total)
         let hit_rate = cache.stats().hit_rate();
@@ -972,7 +1092,7 @@ mod tests {
         for i in 0..1000 {
             let view = make_test_view(i);
             let source_path = format!("/various/paths/{}/session.jsonl", i);
-            cache.insert(&source_path, view);
+            cache.insert(None, &source_path, view);
         }
 
         // All entries should be cached
@@ -994,7 +1114,7 @@ mod tests {
                     let id = t * 250 + i;
                     let view = make_test_view(id);
                     let source_path = format!("/test/path/{}.jsonl", id);
-                    cache.insert(&source_path, view);
+                    cache.insert(None, &source_path, view);
                 }
             }));
         }
@@ -1005,7 +1125,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..1000 {
                     let source_path = format!("/test/path/{}.jsonl", i);
-                    let _ = cache.get(&source_path);
+                    let _ = cache.get(None, &source_path);
                 }
             }));
         }

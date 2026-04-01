@@ -2143,11 +2143,11 @@ pub fn run_index(
         persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
         initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     }
-    let canonical_only_full_rebuild = opts.full
-        && initial_canonical_sessions_before_salvage > 0
-        && !storage_rebuilt
-        && !opened_fresh_for_full
-        && !opts.force_rebuild;
+    // canonical_only_full_rebuild is disabled: --full must always rescan the
+    // filesystem for new session files, not just rebuild Tantivy from existing
+    // DB rows.  The previous shortcut caused `cass index --full` to silently
+    // skip any session files added after the initial DB population (CASS #153).
+    let canonical_only_full_rebuild = false;
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
@@ -2265,11 +2265,8 @@ pub fn run_index(
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
         let mut has_pending_historical_bundles =
             storage.has_pending_historical_bundles(&opts.db_path)?;
-        let canonical_only_full_rebuild = opts.full
-            && canonical_sessions_before_salvage > 0
-            && !storage_rebuilt
-            && !opened_fresh_for_full
-            && !opts.force_rebuild;
+        // See CASS #153: --full must always rescan the filesystem.
+        let canonical_only_full_rebuild = false;
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             opts.watch_once_paths
                 .as_ref()
@@ -2362,6 +2359,7 @@ pub fn run_index(
 
         if rebuild_from_canonical_only {
             drop(t_index);
+            let rebuild_start = std::time::Instant::now();
             let rebuild_convs = count_total_conversations_exact(&storage)?;
             let rebuild_docs = rebuild_tantivy_from_db(
                 &opts.db_path,
@@ -2369,10 +2367,16 @@ pub fn run_index(
                 rebuild_convs,
                 opts.progress.clone(),
             )?;
-            // Populate stats for canonical-only rebuild path (no scan occurs)
+            let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
+            // Populate stats for canonical-only rebuild path (no scan occurs).
+            // Without this, indexing_stats in JSON output would be all zeros
+            // because the scan/batch code paths that normally populate stats
+            // are bypassed entirely.
             if let Some(p) = &opts.progress
                 && let Ok(mut stats) = p.stats.lock()
             {
+                stats.scan_ms = 0; // no scan phase in canonical-only rebuild
+                stats.index_ms = rebuild_ms;
                 stats.total_conversations = rebuild_convs;
                 stats.total_messages = rebuild_docs;
             }

@@ -14,6 +14,8 @@
 //! - **[`daemon_client`]**: Daemon client wrappers for warm embedder/reranker (bd-1lps).
 //! - **[`model_manager`]**: Semantic model detection + context wiring (no downloads).
 //! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
+//! - **[`policy`]**: Semantic policy contract: model defaults, tiers, budgets, invalidation.
+//! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
 //! - **[`ann_index`]**: HNSW-based approximate nearest neighbor index (Opt 9).
 //! - **[`two_tier_search`]**: Two-tier progressive search with fast/quality embeddings (bd-3dcw).
@@ -29,9 +31,11 @@ pub mod fastembed_reranker;
 pub mod hash_embedder;
 pub mod model_download;
 pub mod model_manager;
+pub mod policy;
 pub mod query;
 pub mod reranker;
 pub mod reranker_registry;
+pub mod semantic_manifest;
 pub mod tantivy;
 pub mod two_tier_search;
 pub mod vector_index;
