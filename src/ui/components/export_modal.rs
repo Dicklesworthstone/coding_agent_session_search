@@ -164,8 +164,23 @@ fn timestamp_to_utc(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 impl ExportModalState {
     /// Create new export modal state from a search hit and conversation view.
     pub fn from_hit(hit: &SearchHit, view: &ConversationView) -> Self {
-        let agent = &hit.agent;
-        let workspace = &hit.workspace;
+        let agent = if view.convo.agent_slug.trim().is_empty() {
+            hit.agent.trim().to_string()
+        } else {
+            view.convo.agent_slug.trim().to_string()
+        };
+        let workspace = view
+            .workspace
+            .as_ref()
+            .map(|ws| ws.path.display().to_string())
+            .or_else(|| {
+                view.convo
+                    .workspace
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            .filter(|workspace| !workspace.trim().is_empty())
+            .unwrap_or_else(|| hit.workspace.trim().to_string());
         let started_at = view
             .convo
             .started_at
@@ -173,24 +188,36 @@ impl ExportModalState {
             .or(hit.created_at);
         let message_count = view.messages.len();
 
-        // Extract title from first message or use fallback
+        // Prefer stable session metadata over first-message text so export titles and
+        // filenames do not drift when the indexed conversation already has a real title.
         let title_preview = view
-            .messages
-            .first()
-            .map(|m| {
-                let content = m.content.trim();
-                // Use char_indices to safely truncate at UTF-8 boundary (57 chars + "...")
-                if content.chars().count() > 60 {
-                    let end_idx = content
-                        .char_indices()
-                        .nth(56)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(content.len());
-                    format!("{}...", &content[..end_idx])
-                } else {
-                    content.to_string()
-                }
+            .convo
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let hit_title = hit.title.trim();
+                (!hit_title.is_empty()).then(|| hit_title.to_string())
             })
+            .or_else(|| {
+                view.messages.first().map(|m| {
+                    let content = m.content.trim();
+                    // Use char_indices to safely truncate at UTF-8 boundary (57 chars + "...")
+                    if content.chars().count() > 60 {
+                        let end_idx = content
+                            .char_indices()
+                            .nth(56)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(content.len());
+                        format!("{}...", &content[..end_idx])
+                    } else {
+                        content.to_string()
+                    }
+                })
+            })
+            .filter(|title| !title.trim().is_empty())
             .unwrap_or_else(|| "Untitled Session".to_string());
 
         // Format date for filename
@@ -199,9 +226,9 @@ impl ExportModalState {
 
         // Generate filename preview
         let metadata = FilenameMetadata {
-            agent: Some(agent.clone()),
+            agent: (!agent.is_empty()).then(|| agent.clone()),
             date: date_str,
-            project: Some(workspace.clone()),
+            project: (!workspace.is_empty()).then(|| workspace.clone()),
             topic: Some(title_preview.clone()),
             title: None,
         };
@@ -373,6 +400,7 @@ mod tests {
             snippet: "s".to_string(),
             content: "content".to_string(),
             content_hash: 1,
+            conversation_id: None,
             score: 1.0,
             source_path: "/tmp/session.jsonl".to_string(),
             agent: "codex".to_string(),
@@ -484,6 +512,95 @@ mod tests {
         state.toggle_current();
         assert!(!state.encrypt);
         assert!(state.password.is_empty());
+    }
+
+    #[test]
+    fn from_hit_prefers_conversation_agent_and_workspace_metadata() {
+        let mut hit = make_hit(None);
+        hit.agent = "stale-agent".to_string();
+        hit.workspace = "/stale/ws".to_string();
+
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.agent_slug = "cursor".to_string();
+        view.convo.workspace = Some(PathBuf::from("/canonical/ws"));
+
+        let state = ExportModalState::from_hit(&hit, &view);
+
+        assert_eq!(state.agent_name, "cursor");
+        assert_eq!(state.workspace, "/canonical/ws");
+        assert!(
+            state.filename_preview.contains("cursor") || state.filename_preview.contains("Cursor"),
+            "filename should use canonical agent metadata"
+        );
+        assert!(
+            state.filename_preview.contains("canonical-ws")
+                || state.filename_preview.contains("canonical_ws")
+                || state.filename_preview.contains("canonical"),
+            "filename should use canonical workspace metadata"
+        );
+    }
+
+    #[test]
+    fn from_hit_prefers_conversation_title_for_title_preview() {
+        let hit = make_hit(None);
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.title = Some("Canonical Session Title".to_string());
+        view.messages[0].content = "hello export".to_string();
+
+        let state = ExportModalState::from_hit(&hit, &view);
+
+        assert_eq!(state.title_preview, "Canonical Session Title");
+        assert!(
+            state.filename_preview.contains("canonical-session-title")
+                || state.filename_preview.contains("Canonical-Session-Title")
+                || state.filename_preview.contains("canonical_session_title"),
+            "filename should derive from the canonical conversation title"
+        );
+    }
+
+    #[test]
+    fn from_hit_trims_whitespace_hit_agent_and_workspace_when_view_metadata_missing() {
+        let mut hit = make_hit(None);
+        hit.agent = "   codex   ".to_string();
+        hit.workspace = "   /tmp/ws   ".to_string();
+
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.agent_slug.clear();
+        view.convo.workspace = None;
+        view.workspace = None;
+
+        let state = ExportModalState::from_hit(&hit, &view);
+
+        assert_eq!(state.agent_name, "codex");
+        assert_eq!(state.workspace, "/tmp/ws");
+    }
+
+    #[test]
+    fn from_hit_falls_back_to_search_hit_title_when_conversation_title_missing() {
+        let mut hit = make_hit(None);
+        hit.title = "Search Hit Title".to_string();
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.title = None;
+        view.messages[0].content = "first user message body".to_string();
+
+        let state = ExportModalState::from_hit(&hit, &view);
+
+        assert_eq!(state.title_preview, "Search Hit Title");
+    }
+
+    #[test]
+    fn from_hit_ignores_whitespace_first_message_when_deriving_title_preview() {
+        let mut hit = make_hit(None);
+        hit.title = "   ".to_string();
+        let mut view = make_view(None, Some(1_700_000_000));
+        view.convo.title = None;
+        view.messages[0].content = "   
+	  "
+        .to_string();
+
+        let state = ExportModalState::from_hit(&hit, &view);
+
+        assert_eq!(state.title_preview, "Untitled Session");
     }
 
     #[test]

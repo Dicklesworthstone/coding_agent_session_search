@@ -111,6 +111,7 @@ use ftui::runtime::{StopSignal, SubId, Subscription};
 use crate::model::types::MessageRole;
 use crate::search::model_manager::SemanticAvailability;
 use crate::search::query::{MatchType, QuerySuggestion, SearchFilters, SearchHit, SearchMode};
+use crate::sources::config::SourcesConfig;
 use crate::sources::provenance::SourceFilter;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::export_modal::{ExportField, ExportModalState, ExportProgress};
@@ -122,7 +123,8 @@ use crate::ui::components::pills::Pill;
 use crate::ui::components::toast::ToastManager;
 use crate::ui::data::{
     BudgetHealthContract, CockpitState, ConversationView, DiffStrategyContract, InputMode,
-    ResizeRegimeContract, format_time_short, load_conversation_for_source,
+    ResizeRegimeContract, conversation_view_matches_hit, format_time_short,
+    load_conversation_for_hit, search_hit_has_identity_hint,
 };
 use crate::ui::shortcuts;
 use crate::ui::time_parser::parse_time_input;
@@ -2599,21 +2601,31 @@ pub struct AgentPane {
 
 /// Stable identity for a selected search hit.
 ///
-/// Uses source/path/line/hash so selection survives pane reorder and reranking.
+/// Uses source/path/conversation-or-title/line/hash so selection survives pane reorder and reranking.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SelectedHitKey {
     pub source_id: String,
     pub source_path: String,
+    pub conversation_id: Option<i64>,
+    pub title: String,
     pub line_number: Option<usize>,
+    pub created_at: Option<i64>,
     pub content_hash: u64,
 }
 
 impl SelectedHitKey {
     fn from_hit(hit: &SearchHit) -> Self {
         Self {
-            source_id: hit.source_id.clone(),
+            source_id: hit_source_id_display(hit).to_string(),
             source_path: hit.source_path.clone(),
+            conversation_id: hit.conversation_id,
+            title: if hit.conversation_id.is_some() {
+                String::new()
+            } else {
+                hit.title.trim().to_string()
+            },
             line_number: hit.line_number,
+            created_at: hit.created_at,
             content_hash: hit.content_hash,
         }
     }
@@ -2679,16 +2691,66 @@ pub struct RowMiniAnalytics {
     pub matched_messages: usize,
 }
 
+type ResultSessionSummaryKey = (String, String, Option<i64>, String);
+
+fn result_session_summary_key(hit: &SearchHit) -> ResultSessionSummaryKey {
+    (
+        hit_source_id_display(hit).to_string(),
+        hit.source_path.clone(),
+        hit.conversation_id,
+        if hit.conversation_id.is_some() {
+            String::new()
+        } else {
+            hit.title.trim().to_string()
+        },
+    )
+}
+
+fn trimmed_non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn trimmed_option_non_empty(value: Option<&str>) -> Option<&str> {
+    value.and_then(trimmed_non_empty)
+}
+
+fn hit_title_display(hit: &SearchHit) -> Option<&str> {
+    trimmed_non_empty(hit.title.as_str())
+}
+
+fn hit_agent_display(hit: &SearchHit) -> &str {
+    trimmed_non_empty(hit.agent.as_str()).unwrap_or("unknown")
+}
+
+fn hit_source_id_display(hit: &SearchHit) -> &str {
+    if let Some(source_id) = trimmed_non_empty(hit.source_id.as_str()) {
+        return source_id;
+    }
+    if normalized_source_kind(Some(hit.origin_kind.as_str()), hit.source_id.as_str()) == "remote" {
+        return trimmed_option_non_empty(hit.origin_host.as_deref()).unwrap_or("remote");
+    }
+    crate::sources::provenance::LOCAL_SOURCE_ID
+}
+
 fn source_display_label(source_id: &str, origin_host: Option<&str>) -> String {
-    if source_id == "local" {
-        "local".to_string()
+    let source_id =
+        trimmed_non_empty(source_id).unwrap_or(crate::sources::provenance::LOCAL_SOURCE_ID);
+    if source_id == crate::sources::provenance::LOCAL_SOURCE_ID {
+        crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
     } else {
-        origin_host.unwrap_or(source_id).to_string()
+        trimmed_option_non_empty(origin_host)
+            .unwrap_or(source_id)
+            .to_string()
     }
 }
 
+fn hit_is_local_source(hit: &SearchHit) -> bool {
+    hit_source_id_display(hit) == crate::sources::provenance::LOCAL_SOURCE_ID
+}
+
 fn normalized_source_kind(origin_kind: Option<&str>, source_id: &str) -> String {
-    if let Some(kind) = origin_kind.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(kind) = origin_kind.and_then(trimmed_non_empty) {
         if kind.eq_ignore_ascii_case("local") {
             return "local".to_string();
         }
@@ -2697,7 +2759,9 @@ fn normalized_source_kind(origin_kind: Option<&str>, source_id: &str) -> String 
         }
         return kind.to_ascii_lowercase();
     }
-    if source_id == "local" {
+    if trimmed_non_empty(source_id).unwrap_or(crate::sources::provenance::LOCAL_SOURCE_ID)
+        == crate::sources::provenance::LOCAL_SOURCE_ID
+    {
         "local".to_string()
     } else {
         "remote".to_string()
@@ -2709,7 +2773,21 @@ fn workspace_original_from_metadata(metadata: &serde_json::Value) -> Option<Stri
         .get("cass")
         .and_then(|cass| cass.get("workspace_original"))
         .and_then(|v| v.as_str())
+        .and_then(trimmed_non_empty)
         .map(ToOwned::to_owned)
+}
+
+fn conversation_view_workspace_display(view: &ConversationView) -> Option<String> {
+    view.workspace
+        .as_ref()
+        .map(|workspace| workspace.path.display().to_string())
+        .or_else(|| {
+            view.convo
+                .workspace
+                .as_ref()
+                .map(|path| path.display().to_string())
+        })
+        .filter(|workspace| !workspace.trim().is_empty())
 }
 
 fn display_group_name(key: &str) -> String {
@@ -2770,17 +2848,35 @@ fn max_visible_panes_for_width(width: u16) -> usize {
 }
 
 fn pane_filter_matches_hit(hit: &SearchHit, filter: &str) -> bool {
-    if filter.trim().is_empty() {
+    let needle = filter.trim();
+    if needle.is_empty() {
         return true;
     }
-    let needle = filter.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let display_title = hit_title_display(hit).unwrap_or("<untitled>");
+    let display_workspace = trimmed_non_empty(hit.workspace.as_str()).unwrap_or("(none)");
+    let display_workspace_original = trimmed_option_non_empty(hit.workspace_original.as_deref());
+    let display_agent = hit_agent_display(hit);
+    let display_source_id = hit_source_id_display(hit);
+    let display_source_label = source_display_label(display_source_id, hit.origin_host.as_deref());
+    let display_origin_host = trimmed_option_non_empty(hit.origin_host.as_deref()).unwrap_or("");
+    let display_origin_kind =
+        normalized_source_kind(Some(hit.origin_kind.as_str()), hit.source_id.as_str());
+    let raw_origin_kind = trimmed_non_empty(hit.origin_kind.as_str()).unwrap_or("");
+
     [
-        hit.title.as_str(),
+        display_title,
         hit.snippet.as_str(),
         hit.content.as_str(),
         hit.source_path.as_str(),
-        hit.workspace.as_str(),
-        hit.agent.as_str(),
+        display_workspace,
+        display_workspace_original.unwrap_or(""),
+        display_agent,
+        display_source_id,
+        display_source_label.as_str(),
+        display_origin_host,
+        raw_origin_kind,
+        display_origin_kind.as_str(),
     ]
     .iter()
     .any(|field| field.to_ascii_lowercase().contains(&needle))
@@ -2979,6 +3075,26 @@ fn strip_markdown_bold(text: &str) -> String {
     out
 }
 
+fn search_hit_snippet_fallback_text_opt(hit: &SearchHit) -> Option<&str> {
+    let snippet = hit.snippet.trim();
+    if !snippet.is_empty() {
+        return Some(snippet);
+    }
+    let content = hit.content.trim();
+    if !content.is_empty() {
+        return Some(content);
+    }
+    let title = hit.title.trim();
+    if !title.is_empty() {
+        return Some(title);
+    }
+    None
+}
+
+fn search_hit_snippet_fallback_text(hit: &SearchHit) -> &str {
+    search_hit_snippet_fallback_text_opt(hit).unwrap_or("<no snippet>")
+}
+
 fn clamp_cursor_boundary(text: &str, cursor: usize) -> usize {
     let mut idx = cursor.min(text.len());
     while idx > 0 && !text.is_char_boundary(idx) {
@@ -3109,12 +3225,15 @@ impl ResultItem {
     fn source_badge(&self) -> String {
         format!(
             "[{}]",
-            source_display_label(&self.hit.source_id, self.hit.origin_host.as_deref())
+            source_display_label(
+                hit_source_id_display(&self.hit),
+                self.hit.origin_host.as_deref()
+            )
         )
     }
 
     fn source_kind(&self) -> &'static str {
-        if self.hit.source_id == "local" || self.hit.origin_kind.eq_ignore_ascii_case("local") {
+        if hit_is_local_source(&self.hit) {
             "local"
         } else {
             "remote"
@@ -3126,6 +3245,19 @@ impl ResultItem {
             "\u{21c4}"
         } else {
             "\u{2302}"
+        }
+    }
+
+    fn display_agent_slug(&self) -> &str {
+        hit_agent_display(&self.hit)
+    }
+
+    fn display_workspace_label(&self, max_cols: usize) -> String {
+        let workspace = trimmed_non_empty(self.hit.workspace.as_str()).unwrap_or("(none)");
+        if workspace == "(none)" {
+            workspace.to_string()
+        } else {
+            elide_path_for_metadata(workspace, max_cols)
         }
     }
 
@@ -3149,19 +3281,7 @@ impl ResultItem {
     }
 
     fn snippet_source_raw(&self) -> &str {
-        let snippet = self.hit.snippet.trim();
-        if !snippet.is_empty() {
-            return snippet;
-        }
-        let content = self.hit.content.trim();
-        if !content.is_empty() {
-            return content;
-        }
-        let title = self.hit.title.trim();
-        if !title.is_empty() {
-            return title;
-        }
-        "<no snippet>"
+        search_hit_snippet_fallback_text(&self.hit)
     }
 
     fn char_boundary_at(text: &str, char_limit: usize) -> usize {
@@ -3373,8 +3493,9 @@ impl RenderItem for ResultItem {
         } else {
             ftui::text::Span::styled(" ", bg_style)
         };
-        let agent_icon = super::components::theme::ThemePalette::agent_icon(&hit.agent);
-        let agent_name = format!("@{}", elide_text(&hit.agent, 18));
+        let agent_slug = self.display_agent_slug();
+        let agent_icon = super::components::theme::ThemePalette::agent_icon(agent_slug);
+        let agent_name = format!("@{}", elide_text(agent_slug, 18));
         let mut title_spans = vec![
             ftui::text::Span::styled(format!("{sel_mark}{reveal_lead}"), bg_style),
             queue_span,
@@ -3467,7 +3588,7 @@ impl RenderItem for ResultItem {
         } else {
             // Structured metadata with per-field styling for visual hierarchy
             let hit = &self.hit;
-            let ws_label = elide_path_for_metadata(&hit.workspace, 32);
+            let ws_label = self.display_workspace_label(32);
             meta_spans.push(ftui::text::Span::styled(" ", bg_style));
             meta_spans.push(ftui::text::Span::styled(match_chip, match_chip_style));
             meta_spans.push(ftui::text::Span::styled(
@@ -5321,9 +5442,9 @@ impl CassApp {
     }
 
     fn cached_detail_for_hit(&self, hit: &SearchHit) -> Option<&ConversationView> {
-        self.cached_detail.as_ref().and_then(|(cached_path, cv)| {
-            (cached_path == &hit.source_path && cv.convo.source_id == hit.source_id).then_some(cv)
-        })
+        self.cached_detail
+            .as_ref()
+            .and_then(|(_, cv)| conversation_view_matches_hit(cv, hit).then_some(cv))
     }
 
     fn collect_session_hit_lines(&self, selected_hit: &SearchHit) -> Vec<usize> {
@@ -5335,12 +5456,23 @@ impl CassApp {
                 .flat_map(|pane| pane.hits.iter())
                 .collect::<Vec<_>>()
         };
+        let cached_detail = self.cached_detail_for_hit(selected_hit);
+        let selected_key = SelectedHitKey::from_hit(selected_hit);
+        let selected_has_identity_hint = search_hit_has_identity_hint(selected_hit);
 
         let mut lines: Vec<usize> = iter
             .into_iter()
             .filter(|hit| {
-                hit.source_path == selected_hit.source_path
-                    && hit.source_id == selected_hit.source_id
+                if let Some(cv) = cached_detail {
+                    conversation_view_matches_hit(cv, hit)
+                } else if let Some(selected_conversation_id) = selected_hit.conversation_id {
+                    hit.conversation_id == Some(selected_conversation_id)
+                } else if selected_has_identity_hint {
+                    SelectedHitKey::from_hit(hit) == selected_key
+                } else {
+                    hit.source_path == selected_hit.source_path
+                        && hit_source_id_display(hit) == hit_source_id_display(selected_hit)
+                }
             })
             .filter_map(|hit| hit.line_number)
             .filter(|line| *line > 0)
@@ -5349,7 +5481,7 @@ impl CassApp {
         // Prefer an on-the-fly scan of the loaded conversation when available so the
         // detail modal can navigate all in-session hits, even if the results list
         // is paged/incomplete.
-        if let Some(cv) = self.cached_detail_for_hit(selected_hit) {
+        if let Some(cv) = cached_detail {
             let terms = extract_query_terms(&self.query);
             if !terms.is_empty() {
                 let mut term_lowers: Vec<String> =
@@ -6507,13 +6639,15 @@ impl CassApp {
                 continue;
             }
             let key = match self.grouping_mode {
-                ResultsGrouping::Agent => hit.agent.clone(),
+                ResultsGrouping::Agent => trimmed_non_empty(hit.agent.as_str())
+                    .unwrap_or("(none)")
+                    .to_string(),
                 ResultsGrouping::Conversation => {
                     // Use last path component of source_path as conversation key.
                     last_path_component(&hit.source_path).to_string()
                 }
                 ResultsGrouping::Workspace => {
-                    let w = &hit.workspace;
+                    let w = hit.workspace.trim();
                     if w.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -6729,8 +6863,8 @@ impl CassApp {
     fn refresh_available_source_ids(&mut self) {
         let mut ids = BTreeSet::new();
         for hit in &self.results {
-            if hit.source_id != "local" {
-                ids.insert(hit.source_id.clone());
+            if !hit_is_local_source(hit) {
+                ids.insert(hit_source_id_display(hit).to_string());
             }
         }
         if let SourceFilter::SourceId(id) = &self.filters.source_filter {
@@ -7364,11 +7498,14 @@ impl CassApp {
         }
     }
 
-    fn build_result_row_mini_analytics_map(&self) -> HashMap<(String, String), RowMiniAnalytics> {
-        let mut by_session: HashMap<(String, String), RowMiniAnalytics> = HashMap::new();
+    fn build_result_row_mini_analytics_map(
+        &self,
+    ) -> HashMap<ResultSessionSummaryKey, RowMiniAnalytics> {
+        let mut by_session: HashMap<ResultSessionSummaryKey, RowMiniAnalytics> = HashMap::new();
         for hit in self.filtered_result_hits_for_stats() {
-            let key = (hit.source_id.clone(), hit.source_path.clone());
-            let entry = by_session.entry(key).or_default();
+            let entry = by_session
+                .entry(result_session_summary_key(hit))
+                .or_default();
             entry.matched_messages += 1;
         }
         by_session
@@ -7382,10 +7519,10 @@ impl CassApp {
         let stats_hits = self.filtered_result_hits_for_stats();
 
         let total_messages: usize = stats_hits.len();
-        let mut session_keys: HashSet<(String, String)> = HashSet::new();
+        let mut session_keys: HashSet<ResultSessionSummaryKey> = HashSet::new();
         let mut timestamps: Vec<i64> = Vec::new();
         for hit in &stats_hits {
-            session_keys.insert((hit.source_id.clone(), hit.source_path.clone()));
+            session_keys.insert(result_session_summary_key(hit));
             if let Some(ts) = hit.created_at {
                 timestamps.push(ts);
             }
@@ -8170,7 +8307,7 @@ impl CassApp {
                     let even = i % 2 == 0;
                     let queued = self.selected.contains(&SelectedHitKey::from_hit(hit));
                     let mini_analytics = mini_analytics_by_session
-                        .get(&(hit.source_id.clone(), hit.source_path.clone()))
+                        .get(&result_session_summary_key(hit))
                         .copied();
                     ResultItem {
                         index: i + 1,
@@ -8337,7 +8474,7 @@ impl CassApp {
                     let even = i % 2 == 0;
                     let queued = self.selected.contains(&SelectedHitKey::from_hit(hit));
                     let mini_analytics = mini_analytics_by_session
-                        .get(&(hit.source_id.clone(), hit.source_path.clone()))
+                        .get(&result_session_summary_key(hit))
                         .copied();
                     ResultItem {
                         index: i + 1,
@@ -8477,9 +8614,27 @@ impl CassApp {
         let info_style = styles.style(style_system::STYLE_STATUS_INFO);
         let success_style = styles.style(style_system::STYLE_STATUS_SUCCESS);
         let warning_style = styles.style(style_system::STYLE_STATUS_WARNING);
-        let agent_style = styles.agent_accent_style(&hit.agent);
+        let cached_detail = self.cached_detail_for_hit(hit);
+        let display_agent = cached_detail
+            .map(|cv| cv.convo.agent_slug.as_str())
+            .filter(|agent| !agent.trim().is_empty())
+            .unwrap_or_else(|| hit_agent_display(hit));
+        let display_workspace = cached_detail
+            .and_then(conversation_view_workspace_display)
+            .unwrap_or_else(|| hit.workspace.trim().to_string());
+        let loaded_source_id =
+            cached_detail.and_then(|cv| trimmed_non_empty(cv.convo.source_id.as_str()));
+        let display_source_id = loaded_source_id.unwrap_or_else(|| hit_source_id_display(hit));
+        let display_origin_host = cached_detail
+            .and_then(|cv| trimmed_option_non_empty(cv.convo.origin_host.as_deref()))
+            .or_else(|| trimmed_option_non_empty(hit.origin_host.as_deref()));
+        let agent_style = styles.agent_accent_style(display_agent);
         let mut lines: Vec<ftui::text::Line> = Vec::new();
-        let source_kind = normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id);
+        let source_kind = if loaded_source_id.is_some() {
+            normalized_source_kind(None, display_source_id)
+        } else {
+            normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id)
+        };
         let source_style = if source_kind == "remote" {
             styles.style(style_system::STYLE_SOURCE_REMOTE).bold()
         } else {
@@ -8490,10 +8645,10 @@ impl CassApp {
         } else {
             "\u{2302}"
         };
-        let source_label = source_display_label(&hit.source_id, hit.origin_host.as_deref());
+        let source_label = source_display_label(display_source_id, display_origin_host);
         let source_chip = format!("{source_icon} {source_label}");
         let workspace_room = inner_width.saturating_sub(44).clamp(16, 56) as usize;
-        let workspace_chip = elide_path_for_metadata(&hit.workspace, workspace_room);
+        let workspace_chip = elide_path_for_metadata(&display_workspace, workspace_room);
         let score_style = styles.score_style(normalize_score_for_visuals(hit.score));
         let (match_label, match_style) = match hit.match_type {
             MatchType::Exact => ("exact", success_style.bold()),
@@ -8506,7 +8661,7 @@ impl CassApp {
         let top_lanes = vec![
             FooterHudLane {
                 key: "agent",
-                value: format!("\u{2713} {}", hit.agent),
+                value: format!("\u{2713} {}", display_agent),
                 value_style: agent_style.bold(),
             },
             FooterHudLane {
@@ -8687,6 +8842,39 @@ impl CassApp {
         styles: &StyleContext,
     ) -> Vec<ftui::text::Line<'_>> {
         let mut lines: Vec<ftui::text::Line> = Vec::new();
+        let cached_detail = self.cached_detail_for_hit(hit);
+        let display_title = cached_detail
+            .and_then(|cv| cv.convo.title.as_deref())
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .or_else(|| hit_title_display(hit))
+            .unwrap_or("(untitled)");
+        let display_agent = cached_detail
+            .map(|cv| cv.convo.agent_slug.as_str())
+            .filter(|agent| !agent.trim().is_empty())
+            .unwrap_or_else(|| hit_agent_display(hit));
+        let display_workspace = cached_detail
+            .and_then(conversation_view_workspace_display)
+            .unwrap_or_else(|| hit.workspace.trim().to_string());
+        let loaded_source_id =
+            cached_detail.and_then(|cv| trimmed_non_empty(cv.convo.source_id.as_str()));
+        let display_source_id = loaded_source_id.unwrap_or_else(|| hit_source_id_display(hit));
+        let display_origin_host = cached_detail
+            .and_then(|cv| trimmed_option_non_empty(cv.convo.origin_host.as_deref()))
+            .or_else(|| trimmed_option_non_empty(hit.origin_host.as_deref()));
+        let display_source_kind = if loaded_source_id.is_some() {
+            normalized_source_kind(None, display_source_id)
+        } else {
+            normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id)
+        };
+        let display_workspace_original = cached_detail
+            .and_then(|cv| workspace_original_from_metadata(&cv.convo.metadata_json))
+            .or_else(|| {
+                hit.workspace_original
+                    .as_deref()
+                    .and_then(trimmed_non_empty)
+                    .map(ToOwned::to_owned)
+            });
         let session_hit_lines = &self.detail_session_hit_lines;
         let session_hit_total = session_hit_lines.len();
         let session_hit_lookup: HashSet<usize> = session_hit_lines.iter().copied().collect();
@@ -8707,30 +8895,25 @@ impl CassApp {
         };
 
         // Header: title + metadata
-        let title = if hit.title.is_empty() {
-            "(untitled)"
-        } else {
-            &hit.title
-        };
         let header_style = styles.style(style_system::STYLE_TEXT_PRIMARY).bold();
         lines.push(ftui::text::Line::from_spans(vec![
-            ftui::text::Span::styled(title.to_string(), header_style),
+            ftui::text::Span::styled(display_title.to_string(), header_style),
         ]));
 
         // Metadata line: agent, workspace, timestamp, score — with per-field styling
         let meta_style = styles.style(style_system::STYLE_TEXT_MUTED);
         let label_style = styles.style(style_system::STYLE_TEXT_SUBTLE);
-        let agent_style = styles.agent_accent_style(&hit.agent);
+        let agent_style = styles.agent_accent_style(display_agent);
         let score_s = styles.score_style(normalize_score_for_visuals(hit.score));
-        let source_label = source_display_label(&hit.source_id, hit.origin_host.as_deref());
-        let source_kind = normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id);
+        let source_label = source_display_label(display_source_id, display_origin_host);
+        let source_kind = display_source_kind;
         let sep = ftui::text::Span::styled(" \u{2502} ", label_style);
         let mut meta_spans = vec![
             ftui::text::Span::styled("agent=", label_style),
-            ftui::text::Span::styled(hit.agent.clone(), agent_style),
+            ftui::text::Span::styled(display_agent.to_string(), agent_style),
             sep.clone(),
             ftui::text::Span::styled("ws=", label_style),
-            ftui::text::Span::styled(hit.workspace.clone(), meta_style),
+            ftui::text::Span::styled(display_workspace.clone(), meta_style),
             sep.clone(),
             ftui::text::Span::styled("source=", label_style),
             ftui::text::Span::styled(
@@ -8745,8 +8928,8 @@ impl CassApp {
             ftui::text::Span::styled("score=", label_style),
             ftui::text::Span::styled(score_display_label(hit.score), score_s),
         ];
-        if let Some(ws_original) = hit.workspace_original.as_deref()
-            && ws_original != hit.workspace
+        if let Some(ws_original) = display_workspace_original.as_deref()
+            && ws_original != display_workspace
         {
             meta_spans.push(sep.clone());
             meta_spans.push(ftui::text::Span::styled(
@@ -8948,18 +9131,25 @@ impl CassApp {
             self.detail_message_offsets.borrow_mut().clear();
             self.detail_session_hit_offsets_cache.borrow_mut().clear();
             let content = if hit.content.trim().is_empty() {
-                &hit.snippet
+                hit.snippet.as_str()
             } else {
-                &hit.content
+                hit.content.as_str()
             };
-            let md_w = inner_width.saturating_sub(4);
-            let md_renderer = MarkdownRenderer::new(styles.markdown_theme())
-                .with_syntax_theme(styles.syntax_highlight_theme())
-                .rule_width(md_w)
-                .table_max_width(md_w);
-            let rendered = md_renderer.render(content);
-            for line in rendered.into_iter() {
-                lines.push(line);
+            if content.trim().is_empty() {
+                let meta_style = styles.style(style_system::STYLE_TEXT_MUTED);
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("No message content available.", meta_style),
+                ]));
+            } else {
+                let md_w = inner_width.saturating_sub(4);
+                let md_renderer = MarkdownRenderer::new(styles.markdown_theme())
+                    .with_syntax_theme(styles.syntax_highlight_theme())
+                    .rule_width(md_w)
+                    .table_max_width(md_w);
+                let rendered = md_renderer.render(content);
+                for line in rendered.into_iter() {
+                    lines.push(line);
+                }
             }
         }
 
@@ -9016,16 +9206,15 @@ impl CassApp {
                 ]));
             }
         } else {
-            // Fallback: show the search snippet
-            let snippet = &hit.snippet;
-            if snippet.trim().is_empty() {
-                lines.push(ftui::text::Line::from_spans(vec![
-                    ftui::text::Span::styled("No snippet available.", meta_style),
-                ]));
-            } else {
+            // Fallback: show the same snippet/content/title excerpt used in the results list.
+            if let Some(snippet) = search_hit_snippet_fallback_text_opt(hit) {
                 for line in snippet.lines() {
                     lines.push(ftui::text::Line::from(line.to_string()));
                 }
+            } else {
+                lines.push(ftui::text::Line::from_spans(vec![
+                    ftui::text::Span::styled("No snippet available.", meta_style),
+                ]));
             }
         }
 
@@ -9045,20 +9234,52 @@ impl CassApp {
 
         // If we have a cached conversation, serialize the full conversation
         if let Some(cv) = self.cached_detail_for_hit(hit) {
-            let source_kind = normalized_source_kind(None, &cv.convo.source_id);
-            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json);
+            let display_agent = if cv.convo.agent_slug.trim().is_empty() {
+                hit_agent_display(hit)
+            } else {
+                cv.convo.agent_slug.as_str()
+            };
+            let display_title = cv
+                .convo
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .or_else(|| hit_title_display(hit).map(str::to_string));
+            let workspace = conversation_view_workspace_display(cv).or_else(|| {
+                let workspace = hit.workspace.trim();
+                (!workspace.is_empty()).then(|| workspace.to_string())
+            });
+            let loaded_source_id = trimmed_non_empty(cv.convo.source_id.as_str());
+            let display_source_id = loaded_source_id.unwrap_or_else(|| hit_source_id_display(hit));
+            let source_kind = if loaded_source_id.is_some() {
+                normalized_source_kind(None, display_source_id)
+            } else {
+                normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id)
+            };
+            let display_origin_host = trimmed_option_non_empty(cv.convo.origin_host.as_deref())
+                .or_else(|| trimmed_option_non_empty(hit.origin_host.as_deref()));
+            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json)
+                .or_else(|| {
+                    hit.workspace_original
+                        .as_deref()
+                        .and_then(trimmed_non_empty)
+                        .map(ToOwned::to_owned)
+                });
             // Show conversation metadata as JSON
             let json = serde_json::json!({
-                "agent": cv.convo.agent_slug,
+                "agent": display_agent,
                 "external_id": cv.convo.external_id,
-                "title": cv.convo.title,
+                "title": display_title,
+                "workspace": workspace,
                 "source_path": cv.convo.source_path.display().to_string(),
                 "started_at": cv.convo.started_at,
                 "ended_at": cv.convo.ended_at,
                 "approx_tokens": cv.convo.approx_tokens,
-                "source_id": cv.convo.source_id,
+                "source_id": display_source_id,
                 "source_kind": source_kind,
-                "origin_host": cv.convo.origin_host,
+                "origin_host": display_origin_host,
                 "workspace_original": workspace_original,
                 "message_count": cv.messages.len(),
             });
@@ -9096,6 +9317,10 @@ impl CassApp {
             }
         } else {
             // Fallback: show the hit itself as JSON
+            let display_source_id = hit_source_id_display(hit);
+            let source_kind =
+                normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id);
+            let display_origin_host = trimmed_option_non_empty(hit.origin_host.as_deref());
             let hit_json = serde_json::json!({
                 "title": hit.title,
                 "agent": hit.agent,
@@ -9104,10 +9329,10 @@ impl CassApp {
                 "source_path": hit.source_path,
                 "score": if hit.score.is_finite() { hit.score } else { 0.0 },
                 "content_length": hit.content.len(),
-                "source_id": hit.source_id,
-                "source_kind": normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id),
-                "origin_kind": hit.origin_kind,
-                "origin_host": hit.origin_host,
+                "source_id": display_source_id,
+                "source_kind": source_kind,
+                "origin_kind": source_kind,
+                "origin_host": display_origin_host,
                 "created_at": hit.created_at,
             });
             if let Ok(pretty) = serde_json::to_string_pretty(&hit_json) {
@@ -9168,8 +9393,39 @@ impl CassApp {
 
         if let Some(cv) = self.cached_detail_for_hit(hit) {
             // Build the full conversation JSON including metadata and messages
-            let source_kind = normalized_source_kind(None, &cv.convo.source_id);
-            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json);
+            let display_agent = if cv.convo.agent_slug.trim().is_empty() {
+                hit_agent_display(hit)
+            } else {
+                cv.convo.agent_slug.as_str()
+            };
+            let display_title = cv
+                .convo
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .or_else(|| hit_title_display(hit).map(str::to_string));
+            let workspace = conversation_view_workspace_display(cv).or_else(|| {
+                let workspace = hit.workspace.trim();
+                (!workspace.is_empty()).then(|| workspace.to_string())
+            });
+            let loaded_source_id = trimmed_non_empty(cv.convo.source_id.as_str());
+            let display_source_id = loaded_source_id.unwrap_or_else(|| hit_source_id_display(hit));
+            let source_kind = if loaded_source_id.is_some() {
+                normalized_source_kind(None, display_source_id)
+            } else {
+                normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id)
+            };
+            let display_origin_host = trimmed_option_non_empty(cv.convo.origin_host.as_deref())
+                .or_else(|| trimmed_option_non_empty(hit.origin_host.as_deref()));
+            let workspace_original = workspace_original_from_metadata(&cv.convo.metadata_json)
+                .or_else(|| {
+                    hit.workspace_original
+                        .as_deref()
+                        .and_then(trimmed_non_empty)
+                        .map(ToOwned::to_owned)
+                });
 
             let mut messages_json = Vec::new();
             for msg in &cv.messages {
@@ -9183,16 +9439,17 @@ impl CassApp {
             }
 
             let full_json = serde_json::json!({
-                "agent": cv.convo.agent_slug,
+                "agent": display_agent,
                 "external_id": cv.convo.external_id,
-                "title": cv.convo.title,
+                "title": display_title,
+                "workspace": workspace,
                 "source_path": cv.convo.source_path.display().to_string(),
                 "started_at": cv.convo.started_at,
                 "ended_at": cv.convo.ended_at,
                 "approx_tokens": cv.convo.approx_tokens,
-                "source_id": cv.convo.source_id,
+                "source_id": display_source_id,
                 "source_kind": source_kind,
-                "origin_host": cv.convo.origin_host,
+                "origin_host": display_origin_host,
                 "workspace_original": workspace_original,
                 "message_count": cv.messages.len(),
                 "messages": messages_json,
@@ -9211,6 +9468,10 @@ impl CassApp {
             }
         } else {
             // Fallback: show the hit as JSON
+            let display_source_id = hit_source_id_display(hit);
+            let source_kind =
+                normalized_source_kind(Some(hit.origin_kind.as_str()), display_source_id);
+            let display_origin_host = trimmed_option_non_empty(hit.origin_host.as_deref());
             let hit_json = serde_json::json!({
                 "title": hit.title,
                 "agent": hit.agent,
@@ -9219,10 +9480,10 @@ impl CassApp {
                 "source_path": hit.source_path,
                 "score": if hit.score.is_finite() { hit.score } else { 0.0 },
                 "content_length": hit.content.len(),
-                "source_id": hit.source_id,
-                "source_kind": normalized_source_kind(Some(hit.origin_kind.as_str()), &hit.source_id),
-                "origin_kind": hit.origin_kind,
-                "origin_host": hit.origin_host,
+                "source_id": display_source_id,
+                "source_kind": source_kind,
+                "origin_kind": source_kind,
+                "origin_host": display_origin_host,
                 "created_at": hit.created_at,
             });
 
@@ -9683,13 +9944,26 @@ impl CassApp {
         }
 
         // -- Footer: help text ------------------------------------------------
+        let display_agent = if cv.convo.agent_slug.trim().is_empty() {
+            hit_agent_display(hit)
+        } else {
+            cv.convo.agent_slug.as_str()
+        };
+        let display_workspace = conversation_view_workspace_display(cv).unwrap_or_else(|| {
+            let workspace = hit.workspace.trim();
+            if workspace.is_empty() {
+                String::new()
+            } else {
+                workspace.to_string()
+            }
+        });
         lines.push(ftui::text::Line::from_spans(vec![
             ftui::text::Span::styled(
                 format!(
                     "Session: {} \u{2502} {} messages \u{2502} {}",
-                    hit.agent,
+                    display_agent,
                     cv.messages.len(),
-                    hit.workspace,
+                    display_workspace,
                 ),
                 muted_style,
             ),
@@ -9706,14 +9980,12 @@ impl CassApp {
         }
 
         let downloads = get_downloads_dir();
-        let fallback_title = if hit.title.trim().is_empty() {
-            if hit.snippet.trim().is_empty() {
-                "Untitled Session".to_string()
-            } else {
-                smart_truncate(&hit.snippet, 60)
-            }
+        let fallback_title = if let Some(title) = hit_title_display(hit) {
+            smart_truncate(title, 60)
         } else {
-            smart_truncate(&hit.title, 60)
+            search_hit_snippet_fallback_text_opt(hit)
+                .map(|text| smart_truncate(text, 60))
+                .unwrap_or_else(|| "Untitled Session".to_string())
         };
         let created_date = hit
             .created_at
@@ -9725,10 +9997,13 @@ impl CassApp {
             .map(|dt| dt.format("%b %d, %Y at %I:%M %p").to_string())
             .unwrap_or_else(|| "Unknown date".to_string());
 
+        let agent_name = hit.agent.trim().to_string();
+        let workspace = hit.workspace.trim().to_string();
+
         let metadata = FilenameMetadata {
-            agent: Some(hit.agent.clone()),
+            agent: (!agent_name.is_empty()).then(|| agent_name.clone()),
             date: created_date,
-            project: Some(hit.workspace.clone()),
+            project: (!workspace.is_empty()).then(|| workspace.clone()),
             topic: Some(fallback_title.clone()),
             title: None,
         };
@@ -9750,8 +10025,8 @@ impl CassApp {
             output_dir_buffer: downloads.display().to_string(),
             output_dir: downloads,
             filename_preview,
-            agent_name: hit.agent.clone(),
-            workspace: hit.workspace.clone(),
+            agent_name,
+            workspace,
             timestamp,
             message_count: 0,
             title_preview: fallback_title,
@@ -9791,6 +10066,73 @@ impl CassApp {
         state.timestamp = refreshed.timestamp;
         state.message_count = refreshed.message_count;
         state.title_preview = refreshed.title_preview;
+    }
+
+    fn detail_clipboard_width(&self) -> u16 {
+        self.last_detail_area
+            .borrow()
+            .map(|rect| rect.width.saturating_sub(2))
+            .unwrap_or(96)
+            .max(24)
+    }
+
+    fn flatten_detail_lines(lines: &[ftui::text::Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans()
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rendered_detail_text_for_hit(&self, hit: &SearchHit) -> String {
+        let styles = self.resolved_style_context();
+        let inner_width = self.detail_clipboard_width();
+
+        match self.detail_tab {
+            DetailTab::Messages => {
+                let previous_offsets = self.detail_message_offsets.borrow().clone();
+                let previous_session_offsets =
+                    self.detail_session_hit_offsets_cache.borrow().clone();
+                let previous_pending_scroll = self.detail_pending_scroll_to.get();
+                let previous_scroll_pending = self.detail_session_hit_scroll_pending.get();
+
+                let lines = self.build_messages_lines(hit, inner_width, &styles);
+                let flattened = Self::flatten_detail_lines(&lines);
+
+                *self.detail_message_offsets.borrow_mut() = previous_offsets;
+                *self.detail_session_hit_offsets_cache.borrow_mut() = previous_session_offsets;
+                self.detail_pending_scroll_to.set(previous_pending_scroll);
+                self.detail_session_hit_scroll_pending
+                    .set(previous_scroll_pending);
+
+                flattened
+            }
+            DetailTab::Snippets => {
+                let lines = self.build_snippets_lines(hit, &styles);
+                Self::flatten_detail_lines(&lines)
+            }
+            DetailTab::Raw => {
+                let lines = self.build_raw_lines(hit, &styles);
+                Self::flatten_detail_lines(&lines)
+            }
+            DetailTab::Json => {
+                let lines = self.build_json_lines(hit, &styles);
+                Self::flatten_detail_lines(&lines)
+            }
+            DetailTab::Analytics => {
+                let lines = self.build_analytics_lines(hit, inner_width, &styles);
+                Self::flatten_detail_lines(&lines)
+            }
+            DetailTab::Export => {
+                let lines = self.build_export_lines(hit, inner_width, &styles);
+                Self::flatten_detail_lines(&lines)
+            }
+        }
     }
 
     /// Build rendered lines for the Export tab in the detail modal.
@@ -12869,8 +13211,8 @@ pub enum CassMsg {
     // -- Detail view ------------------------------------------------------
     /// Open the detail modal for the currently selected result.
     DetailOpened,
-    /// Load full conversation detail for the selected source identity.
-    DetailLoadRequested { source_id: String, source_path: String },
+    /// Load full conversation detail for the selected search hit.
+    DetailLoadRequested { hit: SearchHit },
     /// Close the detail modal.
     DetailClosed,
     /// Switch detail tab.
@@ -13745,7 +14087,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     #[cfg(windows)]
     {
         match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
                 if final_path.exists()
                     && matches!(
@@ -13767,13 +14109,14 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
                 match std::fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&backup_path);
-                        Ok(())
+                        sync_parent_directory(final_path)
                     }
                     Err(second_err) => {
                         let restore_result = std::fs::rename(&backup_path, final_path);
                         match restore_result {
                             Ok(()) => {
                                 let _ = std::fs::remove_file(temp_path);
+                                sync_parent_directory(final_path)?;
                                 Err(format!(
                                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
                                     final_path.display(),
@@ -13805,8 +14148,30 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), Str
     #[cfg(not(windows))]
     {
         std::fs::rename(temp_path, final_path)
-            .map_err(|e| format!("failed replacing {}: {e}", final_path.display()))
+            .map_err(|e| format!("failed replacing {}: {e}", final_path.display()))?;
+        sync_parent_directory(final_path)
     }
+}
+
+fn sync_file_path(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("failed syncing {}: {e}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("failed syncing {}: {e}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {
@@ -13849,6 +14214,7 @@ fn save_persisted_state_to_path(path: &Path, state: &PersistedState) -> Result<(
         .map_err(|e| format!("failed serializing state: {e}"))?;
     std::fs::write(&tmp_path, payload)
         .map_err(|e| format!("failed writing {}: {e}", tmp_path.display()))?;
+    sync_file_path(&tmp_path)?;
     replace_file_from_temp(&tmp_path, path)?;
     Ok(())
 }
@@ -16458,28 +16824,21 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 self.focus_manager.push_trap(focus_ids::GROUP_DETAIL_MODAL);
                 self.focus_manager.focus(focus_ids::DETAIL_MODAL);
-                let source_id = selected_hit.source_id.clone();
-                let source_path = selected_hit.source_path.clone();
                 let needs_reload = self.cached_detail_for_hit(&selected_hit).is_none();
                 if needs_reload {
                     self.cached_detail = None;
                     self.set_loading_context(LoadingContext::DetailModal);
-                    return ftui::Cmd::msg(CassMsg::DetailLoadRequested {
-                        source_id,
-                        source_path,
-                    });
+                    return ftui::Cmd::msg(CassMsg::DetailLoadRequested { hit: selected_hit });
                 }
                 self.clear_loading_context(LoadingContext::DetailModal);
                 ftui::Cmd::none()
             }
-            CassMsg::DetailLoadRequested {
-                source_id,
-                source_path,
-            } => {
-                let loaded_source_id = source_id.clone();
-                let loaded_path = source_path.clone();
+            CassMsg::DetailLoadRequested { hit } => {
+                let loaded_source_id = hit_source_id_display(&hit).to_string();
+                let loaded_path = hit.source_path.clone();
+                let loaded_key = SelectedHitKey::from_hit(&hit);
                 match crate::storage::sqlite::FrankenStorage::open_readonly(&self.db_path) {
-                    Ok(db) => match load_conversation_for_source(&db, &source_id, &source_path) {
+                    Ok(db) => match load_conversation_for_hit(&db, &hit) {
                         Ok(Some(view)) => {
                             self.cached_detail = Some((loaded_path.clone(), view));
                             // Auto-collapse tool/system messages on fresh load
@@ -16512,9 +16871,10 @@ impl super::ftui_adapter::Model for CassApp {
                 // based on the full content so navigation can cover all hits, even when
                 // the results list is paged.
                 if self.show_detail_modal
+                    && self.active_hit_key().as_ref() == Some(&loaded_key)
                     && let Some(hit) = self.selected_hit().cloned()
                     && hit.source_path == loaded_path
-                    && hit.source_id == loaded_source_id
+                    && hit_source_id_display(&hit) == loaded_source_id
                 {
                     self.sync_detail_session_hit_state(&hit);
                     self.refresh_open_export_modal_for_hit(&hit);
@@ -16602,17 +16962,27 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::ToolCollapseAll => {
-                // Collapse all tool/system messages from the cached detail.
-                if let Some((_, ref cv)) = self.cached_detail {
-                    for (idx, msg) in cv.messages.iter().enumerate() {
-                        if matches!(
-                            msg.role,
-                            crate::model::types::MessageRole::Tool
-                                | crate::model::types::MessageRole::System
-                        ) {
-                            self.collapsed_tools.insert(idx);
-                        }
-                    }
+                // Collapse all tool/system messages from the active cached detail only.
+                let collapse_indices = self
+                    .selected_hit()
+                    .and_then(|hit| self.cached_detail_for_hit(hit))
+                    .map(|cv| {
+                        cv.messages
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, msg)| {
+                                matches!(
+                                    msg.role,
+                                    crate::model::types::MessageRole::Tool
+                                        | crate::model::types::MessageRole::System
+                                )
+                            })
+                            .map(|(idx, _)| idx)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for idx in collapse_indices {
+                    self.collapsed_tools.insert(idx);
                 }
                 ftui::Cmd::none()
             }
@@ -16840,9 +17210,12 @@ impl super::ftui_adapter::Model for CassApp {
                     }
                     1 => {
                         let selected_hits = self.selected_hits();
+                        let sources_config = SourcesConfig::load().ok();
                         let paths: Vec<String> = selected_hits
                             .iter()
-                            .map(|h| h.source_path.clone())
+                            .map(|hit| {
+                                actionable_path_for_hit_with_config(sources_config.as_ref(), hit)
+                            })
                             .collect();
                         let text = paths.join("\n");
                         let count = paths.len();
@@ -16874,8 +17247,13 @@ impl super::ftui_adapter::Model for CassApp {
                             .iter()
                             .map(|h| {
                                 serde_json::json!({
+                                    "source_id": h.source_id,
+                                    "origin_kind": h.origin_kind,
+                                    "origin_host": h.origin_host,
                                     "source_path": h.source_path,
                                     "line_number": h.line_number,
+                                    "created_at": h.created_at,
+                                    "content_hash": h.content_hash,
                                     "title": h.title,
                                     "agent": h.agent,
                                     "workspace": h.workspace,
@@ -16924,7 +17302,8 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::CopySnippet => {
                 use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    match copy_to_clipboard(hit.snippet.as_str()) {
+                    let snippet = search_hit_snippet_fallback_text(hit);
+                    match copy_to_clipboard(snippet) {
                         Ok(()) => {
                             self.status = "Copied snippet to clipboard".to_string();
                             self.toast_manager
@@ -16944,7 +17323,10 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::CopyPath => {
                 use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    match copy_to_clipboard(hit.source_path.as_str()) {
+                    let sources_config = SourcesConfig::load().ok();
+                    let actionable_path =
+                        actionable_path_for_hit_with_config(sources_config.as_ref(), hit);
+                    match copy_to_clipboard(actionable_path.as_str()) {
                         Ok(()) => {
                             self.status = "Copied path to clipboard".to_string();
                             self.toast_manager
@@ -16964,7 +17346,8 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::CopyContent => {
                 use crate::ui::components::toast::{Toast, ToastType};
                 if let Some(hit) = self.selected_hit() {
-                    match copy_to_clipboard(hit.content.as_str()) {
+                    let rendered = self.rendered_detail_text_for_hit(hit);
+                    match copy_to_clipboard(&rendered) {
                         Ok(()) => {
                             self.status = "Copied content to clipboard".to_string();
                             self.toast_manager
@@ -17458,8 +17841,7 @@ impl super::ftui_adapter::Model for CassApp {
                     .clone()
                     .unwrap_or_else(|| self.detail_export_state_for_hit(&hit));
                 let db_path = self.db_path.clone();
-                let source_id = hit.source_id.clone();
-                let source_path = hit.source_path.clone();
+                let export_hit = hit.clone();
                 let output_dir = export_state.output_dir.clone();
                 let output_filename =
                     Self::markdown_filename_from_html(&export_state.filename_preview);
@@ -17467,21 +17849,14 @@ impl super::ftui_adapter::Model for CassApp {
                 let include_tools = export_state.include_tools;
                 self.status = "Exporting markdown...".to_string();
                 ftui::Cmd::task(move || {
-                    export_session_markdown_task(
-                        &db_path,
-                        &source_id,
-                        &source_path,
-                        &output_path,
-                        include_tools,
-                    )
+                    export_session_markdown_task(&db_path, &export_hit, &output_path, include_tools)
                 })
             }
             CassMsg::ExportExecuted => {
-                // Extract source_path before mutable borrow of export_modal_state.
-                let (source_id, source_path) = self
-                    .selected_hit()
-                    .map(|h| (h.source_id.clone(), h.source_path.clone()))
-                    .unwrap_or_default();
+                let Some(export_hit) = self.selected_hit().cloned() else {
+                    self.status = "No active result to export.".to_string();
+                    return ftui::Cmd::none();
+                };
                 if let Some(ref mut state) = self.export_modal_state {
                     if !state.can_export() {
                         return ftui::Cmd::none();
@@ -17507,8 +17882,7 @@ impl super::ftui_adapter::Model for CassApp {
                     return ftui::Cmd::task(move || {
                         export_session_task(
                             &db_path,
-                            &source_id,
-                            &source_path,
+                            &export_hit,
                             &output_path,
                             encrypt,
                             password.as_deref(),
@@ -20409,15 +20783,14 @@ impl super::ftui_adapter::Model for CassApp {
                         ""
                     }
                 );
+                let detail_cache_warm = self
+                    .selected_hit()
+                    .is_some_and(|hit| self.cached_detail_for_hit(hit).is_some());
                 let perf_lane = format!(
                     "lat:{} cache:{}",
                     self.last_search_ms
                         .map_or_else(|| "—".to_string(), |ms| format!("{ms}ms")),
-                    if self.cached_detail.is_some() {
-                        "warm"
-                    } else {
-                        "cold"
-                    }
+                    if detail_cache_warm { "warm" } else { "cold" }
                 );
                 let perf_lane_style = match self.last_search_ms {
                     Some(ms) if ms >= 1000 => status_error_s,
@@ -21213,14 +21586,95 @@ fn write_export_bytes_no_overwrite(
     ))
 }
 
+fn tui_prefers_direct_followup_file(hit: &SearchHit) -> bool {
+    if !hit_is_local_source(hit) {
+        return false;
+    }
+
+    let path = std::path::Path::new(&hit.source_path);
+    if !path.exists() {
+        return false;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("jsonl")
+    )
+}
+
+fn load_local_export_raw_messages(
+    session_path: &std::path::Path,
+) -> Result<(Vec<serde_json::Value>, Option<String>, Option<i64>), String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    if !session_path.exists() {
+        return Err(format!("Session not found: {}", session_path.display()));
+    }
+
+    if crate::detect_opencode_session(session_path) {
+        return crate::load_opencode_session_for_export(session_path)
+            .map(|(title, start, _end, msgs)| (msgs, title, start))
+            .map_err(|err| format!("Failed to parse OpenCode session: {err}"));
+    }
+
+    let file = File::open(session_path).map_err(|err| format!("Cannot open session: {err}"))?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    let mut session_start = None;
+
+    for (line_number, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|err| {
+            format!(
+                "Failed to read session: {err}. The session file may be truncated or contain invalid UTF-8."
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message = serde_json::from_str::<serde_json::Value>(&line).map_err(|err| {
+            format!(
+                "Failed to parse session JSONL at line {}: {err}",
+                line_number + 1
+            )
+        })?;
+        if let Some(ts) = crate::extract_message_timestamp(&message)
+            && session_start.is_none_or(|start| ts < start)
+        {
+            session_start = Some(ts);
+        }
+        messages.push(message);
+    }
+
+    Ok((messages, None, session_start))
+}
+
+fn load_indexed_export_view(
+    db_path: &std::path::Path,
+    hit: &SearchHit,
+) -> Result<Option<crate::ui::data::ConversationView>, String> {
+    use crate::storage::sqlite::FrankenStorage;
+    use crate::ui::data::load_conversation_for_hit;
+
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let storage =
+        FrankenStorage::open(db_path).map_err(|err| format!("Failed to open database: {err}"))?;
+    load_conversation_for_hit(&storage, hit).map_err(|err| format!("Failed to load session: {err}"))
+}
+
 /// Background task: export a session to HTML.
 ///
 /// Runs on a background thread via `Cmd::task` so the UI stays responsive.
 #[allow(clippy::too_many_arguments)]
 fn export_session_task(
     db_path: &std::path::Path,
-    source_id: &str,
-    source_path: &str,
+    hit: &SearchHit,
     output_path: &std::path::Path,
     encrypt: bool,
     password: Option<&str>,
@@ -21232,59 +21686,111 @@ fn export_session_task(
     use crate::html_export::{
         ExportOptions as HtmlExportOptions, HtmlExporter, Message as HtmlMessage, TemplateMetadata,
     };
-    use crate::storage::sqlite::FrankenStorage;
-    use crate::ui::data::load_conversation_uncached;
     use chrono::DateTime;
 
-    let storage = match FrankenStorage::open_readonly(db_path) {
-        Ok(s) => s,
-        Err(e) => return CassMsg::ExportFailed(format!("Failed to open database: {e}")),
+    let session_path = std::path::Path::new(&hit.source_path);
+    let allow_direct_file = hit_is_local_source(hit);
+    let prefer_direct_file = tui_prefers_direct_followup_file(hit);
+
+    let html_messages_from_view = |view: crate::ui::data::ConversationView| {
+        view.messages
+            .into_iter()
+            .filter_map(|msg| {
+                let content = msg.content;
+                if content.is_empty() && !include_tools {
+                    return None;
+                }
+
+                let role = match msg.role {
+                    crate::model::types::MessageRole::User => "user",
+                    crate::model::types::MessageRole::Agent => "assistant",
+                    crate::model::types::MessageRole::System => "system",
+                    crate::model::types::MessageRole::Tool => "tool",
+                    crate::model::types::MessageRole::Other(_) => "unknown",
+                }
+                .to_string();
+
+                let timestamp = msg
+                    .created_at
+                    .and_then(|ts| DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339()));
+
+                Some(HtmlMessage {
+                    role,
+                    content,
+                    timestamp,
+                    tool_call: None,
+                    index: Some(msg.idx.max(0) as usize),
+                    author: msg.author,
+                })
+            })
+            .collect::<Vec<HtmlMessage>>()
     };
 
-    let view = match load_conversation_uncached(&storage, Some(source_id), source_path) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return CassMsg::ExportFailed(format!("Session not found in index: {source_path}"));
+    let indexed_view = if !prefer_direct_file {
+        match load_indexed_export_view(db_path, hit) {
+            Ok(view) => view,
+            Err(err) => {
+                if allow_direct_file && session_path.exists() {
+                    None
+                } else {
+                    return CassMsg::ExportFailed(err);
+                }
+            }
         }
-        Err(e) => return CassMsg::ExportFailed(format!("Failed to load session: {e}")),
+    } else {
+        None
     };
 
-    let mut messages: Vec<HtmlMessage> = Vec::new();
+    let messages: Vec<HtmlMessage> = if let Some(view) = indexed_view {
+        html_messages_from_view(view)
+    } else if allow_direct_file && session_path.exists() {
+        match load_local_export_raw_messages(session_path) {
+            Ok((raw_messages, _, _)) => raw_messages
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, msg)| {
+                    let role = crate::extract_role(&msg);
+                    let content = crate::extract_text_content(&msg);
+                    if content.is_empty() && !include_tools {
+                        return None;
+                    }
 
-    for msg in view.messages {
-        let content = msg.content;
-        if content.is_empty() && !include_tools {
-            continue;
+                    let timestamp = crate::extract_message_timestamp(&msg).and_then(|ts| {
+                        DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+                    });
+                    let author = msg
+                        .get("author")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+
+                    Some(HtmlMessage {
+                        role,
+                        content,
+                        timestamp,
+                        tool_call: None,
+                        index: Some(idx),
+                        author,
+                    })
+                })
+                .collect(),
+            Err(local_err) => match load_indexed_export_view(db_path, hit) {
+                Ok(Some(view)) => html_messages_from_view(view),
+                Ok(None) => return CassMsg::ExportFailed(local_err),
+                Err(index_err) => {
+                    return CassMsg::ExportFailed(format!(
+                        "{local_err}; indexed fallback failed: {index_err}"
+                    ));
+                }
+            },
         }
-
-        let role_str = match msg.role {
-            crate::model::types::MessageRole::User => "user",
-            crate::model::types::MessageRole::Agent => "assistant",
-            crate::model::types::MessageRole::System => "system",
-            crate::model::types::MessageRole::Tool => "tool",
-            crate::model::types::MessageRole::Other(_) => "unknown",
-        }
-        .to_string();
-
-        let timestamp_str = msg
-            .created_at
-            .and_then(|ts| DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339()));
-
-        messages.push(HtmlMessage {
-            role: role_str,
-            content,
-            timestamp: timestamp_str,
-            tool_call: None,
-            index: Some(msg.idx.max(0) as usize),
-            author: msg.author,
-        });
-    }
+    } else {
+        return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
+    };
 
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
     }
 
-    // Build export options and generate HTML.
     let options = HtmlExportOptions {
         title: Some(title.to_string()),
         include_cdn: true,
@@ -21316,7 +21822,6 @@ fn export_session_task(
         Err(e) => return CassMsg::ExportFailed(format!("HTML generation failed: {e}")),
     };
 
-    // Write output file without clobbering an existing export.
     match write_export_bytes_no_overwrite(output_path, html.as_bytes()) {
         Ok(final_path) => CassMsg::ExportCompleted {
             output_path: final_path,
@@ -21333,76 +21838,81 @@ fn export_session_task(
 /// stays consistent with `cass export --format markdown`.
 fn export_session_markdown_task(
     db_path: &std::path::Path,
-    source_id: &str,
-    source_path: &str,
+    hit: &SearchHit,
     output_path: &std::path::Path,
     include_tools: bool,
 ) -> CassMsg {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
+    let session_path = std::path::Path::new(&hit.source_path);
+    let allow_direct_file = hit_is_local_source(hit);
+    let prefer_direct_file = tui_prefers_direct_followup_file(hit);
 
-    let session_path = std::path::Path::new(source_path);
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    let mut session_title: Option<String> = None;
-    let mut session_start: Option<i64> = None;
+    let indexed_markdown_view = |view: crate::ui::data::ConversationView| {
+        (
+            crate::conversation_view_to_raw_messages(&view),
+            view.convo.title.clone(),
+            view.convo.started_at,
+        )
+    };
 
-    if db_path.exists()
-        && let Ok(storage) = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
-        && let Ok(Some(view)) = crate::ui::data::load_conversation_uncached(&storage, Some(source_id), source_path)
-    {
-        session_title = view.convo.title.clone();
-        session_start = view.convo.started_at;
-        messages = crate::conversation_view_to_raw_messages(&view);
+    let (messages, mut session_title, session_start) = if prefer_direct_file {
+        match load_local_export_raw_messages(session_path) {
+            Ok(loaded) => loaded,
+            Err(local_err) => match load_indexed_export_view(db_path, hit) {
+                Ok(Some(view)) => indexed_markdown_view(view),
+                Ok(None) => return CassMsg::ExportFailed(local_err),
+                Err(index_err) => {
+                    return CassMsg::ExportFailed(format!(
+                        "{local_err}; indexed fallback failed: {index_err}"
+                    ));
+                }
+            },
+        }
+    } else if db_path.exists() {
+        match load_indexed_export_view(db_path, hit) {
+            Ok(Some(view)) => indexed_markdown_view(view),
+            Ok(None) => {
+                if allow_direct_file && session_path.exists() {
+                    match load_local_export_raw_messages(session_path) {
+                        Ok(loaded) => loaded,
+                        Err(err) => return CassMsg::ExportFailed(err),
+                    }
+                } else {
+                    return CassMsg::ExportFailed(format!(
+                        "Session not found in index: {}",
+                        hit.source_path
+                    ));
+                }
+            }
+            Err(err) => {
+                if allow_direct_file && session_path.exists() {
+                    match load_local_export_raw_messages(session_path) {
+                        Ok(loaded) => loaded,
+                        Err(fallback_err) => {
+                            return CassMsg::ExportFailed(format!(
+                                "{fallback_err}; indexed fallback failed: {err}"
+                            ));
+                        }
+                    }
+                } else {
+                    return CassMsg::ExportFailed(err);
+                }
+            }
+        }
+    } else if allow_direct_file && session_path.exists() {
+        match load_local_export_raw_messages(session_path) {
+            Ok(loaded) => loaded,
+            Err(err) => return CassMsg::ExportFailed(err),
+        }
     } else {
-        if !session_path.exists() {
-            return CassMsg::ExportFailed(format!("Session not found: {source_path}"));
-        }
-
-        let is_opencode = crate::detect_opencode_session(session_path);
-        if is_opencode {
-            match crate::load_opencode_session_for_export(session_path) {
-                Ok((title, start, end, msgs)) => {
-                    session_title = title;
-                    session_start = start;
-                    let _ = end;
-                    messages = msgs;
-                }
-                Err(err) => {
-                    return CassMsg::ExportFailed(format!("Failed to parse OpenCode session: {err}"));
-                }
-            }
-        } else {
-            let file = match File::open(session_path) {
-                Ok(file) => file,
-                Err(err) => return CassMsg::ExportFailed(format!("Cannot open session: {err}")),
-            };
-            let reader = BufReader::new(file);
-            for line_result in reader.lines() {
-                let line = match line_result {
-                    Ok(line) => line,
-                    Err(err) => {
-                        return CassMsg::ExportFailed(format!(
-                            "Failed to read session: {err}. The session file may be truncated or contain invalid UTF-8."
-                        ));
-                    }
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(ts) = crate::extract_message_timestamp(&message)
-                        && session_start.is_none_or(|start| ts < start)
-                    {
-                        session_start = Some(ts);
-                    }
-                    messages.push(message);
-                }
-            }
-        }
-    }
+        return CassMsg::ExportFailed(format!("Session not found: {}", hit.source_path));
+    };
 
     if messages.is_empty() {
         return CassMsg::ExportFailed("No messages found in session".to_string());
+    }
+
+    if session_title.is_none() && !hit.title.trim().is_empty() {
+        session_title = Some(hit.title.trim().to_string());
     }
 
     if session_title.is_none() {
@@ -22292,8 +22802,22 @@ fn split_editor_command(editor: &str) -> (String, Vec<String>) {
 }
 
 #[cfg(test)]
-fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut guard = TEST_CLIPBOARD.lock().map_err(|e| e.to_string())?;
+    *guard = Some(text.to_string());
     Ok(())
+}
+
+#[cfg(test)]
+static TEST_CLIPBOARD: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+fn take_test_clipboard() -> Option<String> {
+    TEST_CLIPBOARD
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
 }
 
 /// Copy text to the system clipboard using OSC52 with fallback to external tools.
@@ -22327,8 +22851,26 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-fn run_editor_command(_cmd: &mut StdCommand) -> Result<(), String> {
+fn run_editor_command(cmd: &mut StdCommand) -> Result<(), String> {
+    let invocation = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+        .chain(cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    let mut guard = TEST_EDITOR_INVOCATIONS.lock().map_err(|e| e.to_string())?;
+    guard.push(invocation);
     Ok(())
+}
+
+#[cfg(test)]
+static TEST_EDITOR_INVOCATIONS: std::sync::LazyLock<std::sync::Mutex<Vec<Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn take_test_editor_invocations() -> Vec<Vec<String>> {
+    TEST_EDITOR_INVOCATIONS
+        .lock()
+        .ok()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default()
 }
 
 #[cfg(not(test))]
@@ -22350,14 +22892,16 @@ fn open_hits_in_editor(hits: &[SearchHit], editor_cmd: &str) -> Result<(usize, S
         return Ok((0, String::new()));
     }
     let (editor_bin, editor_args) = split_editor_command(editor_cmd);
+    let sources_config = SourcesConfig::load().ok();
     for hit in hits {
+        let actionable_path = actionable_path_for_hit_with_config(sources_config.as_ref(), hit);
         let mut cmd = StdCommand::new(&editor_bin);
         cmd.args(&editor_args);
         if editor_bin == "code" {
             if let Some(line) = hit.line_number {
-                cmd.arg("--goto").arg(format!("{}:{line}", hit.source_path));
+                cmd.arg("--goto").arg(format!("{actionable_path}:{line}"));
             } else {
-                cmd.arg(&hit.source_path);
+                cmd.arg(&actionable_path);
             }
         } else if editor_bin == "vim"
             || editor_bin == "vi"
@@ -22367,13 +22911,25 @@ fn open_hits_in_editor(hits: &[SearchHit], editor_cmd: &str) -> Result<(usize, S
             if let Some(line) = hit.line_number {
                 cmd.arg(format!("+{line}"));
             }
-            cmd.arg(&hit.source_path);
+            cmd.arg(&actionable_path);
         } else {
-            cmd.arg(&hit.source_path);
+            cmd.arg(&actionable_path);
         }
         run_editor_command(&mut cmd)?;
     }
     Ok((hits.len(), editor_bin))
+}
+
+fn actionable_path_for_hit_with_config(config: Option<&SourcesConfig>, hit: &SearchHit) -> String {
+    let Some(config) = config else {
+        return hit.source_path.clone();
+    };
+    let source_id = hit_source_id_display(hit);
+    let Some(source) = config.find_source(source_id) else {
+        return hit.source_path.clone();
+    };
+    let agent = trimmed_non_empty(hit.agent.as_str());
+    source.rewrite_path_for_agent(&hit.source_path, agent)
 }
 
 // =========================================================================
@@ -22387,7 +22943,10 @@ mod tests {
     use crate::ftui_harness;
     use crate::model::types::Message;
     use crate::search::query::MatchType;
+    use crate::sources::config::{PathMapping, SourceDefinition};
     use crate::ui::components::palette::PaletteAction;
+    use serial_test::serial;
+    use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -22423,6 +22982,42 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, f);
         String::from_utf8(sink.lock().map(|b| b.clone()).unwrap_or_default()).unwrap_or_default()
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn write_test_sources_config(config_root: &std::path::Path, config: &SourcesConfig) {
+        let path = config_root.join("cass").join("sources.toml");
+        let parent = path.parent().expect("sources config parent");
+        std::fs::create_dir_all(parent).expect("create test sources config dir");
+        config.save_to(&path).expect("write test sources config");
     }
 
     #[test]
@@ -24893,6 +25488,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 agent: "codex".into(),
@@ -24910,6 +25506,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 agent: "claude_code".into(),
@@ -24927,6 +25524,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
         ];
         let _ = app.update(CassMsg::SearchCompleted {
@@ -25985,6 +26583,7 @@ mod tests {
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
         };
         for mode in [
             DensityMode::Compact,
@@ -26043,6 +26642,7 @@ mod tests {
                     source_id: "local".into(),
                     origin_kind: "local".into(),
                     origin_host: None,
+                    conversation_id: None,
                 },
                 SearchHit {
                     title: "B".into(),
@@ -26060,6 +26660,7 @@ mod tests {
                     source_id: "local".into(),
                     origin_kind: "local".into(),
                     origin_host: None,
+                    conversation_id: None,
                 },
                 SearchHit {
                     title: "C".into(),
@@ -26077,6 +26678,7 @@ mod tests {
                     source_id: "local".into(),
                     origin_kind: "local".into(),
                     origin_host: None,
+                    conversation_id: None,
                 },
             ],
             selected: 0,
@@ -26131,6 +26733,7 @@ mod tests {
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
         }];
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
@@ -26165,6 +26768,7 @@ mod tests {
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
         };
         let queued_item = ResultItem {
             index: 1,
@@ -26218,6 +26822,72 @@ mod tests {
         };
         assert!(queued_item.queued);
         assert!(!not_queued.queued);
+    }
+
+    #[test]
+    fn tui_prefers_direct_followup_file_treats_blank_local_source_as_local() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &session_path,
+            b"{}
+",
+        )
+        .expect("write session");
+
+        let mut hit = make_test_hit();
+        hit.source_path = session_path.display().to_string();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "local".to_string();
+        hit.origin_host = None;
+
+        assert!(tui_prefers_direct_followup_file(&hit));
+    }
+
+    #[test]
+    fn actionable_path_for_hit_with_config_trims_agent_before_rewrite() {
+        let mut hit = make_test_hit();
+        hit.source_id = "work-laptop".to_string();
+        hit.agent = "   claude-code   ".to_string();
+        hit.source_path = "/home/user/projects/app".to_string();
+
+        let config = crate::sources::config::SourcesConfig {
+            sources: vec![crate::sources::config::SourceDefinition {
+                name: "work-laptop".to_string(),
+                path_mappings: vec![crate::sources::config::PathMapping::with_agents(
+                    "/home/user/projects",
+                    "/Volumes/Claude",
+                    vec!["claude-code".into()],
+                )],
+                ..Default::default()
+            }],
+        };
+
+        let rewritten = actionable_path_for_hit_with_config(Some(&config), &hit);
+        assert_eq!(rewritten, "/Volumes/Claude/app");
+    }
+
+    #[test]
+    fn actionable_path_for_hit_with_config_normalizes_source_id_before_rewrite() {
+        let mut hit = make_test_hit();
+        hit.source_id = "  work-laptop  ".to_string();
+        hit.agent = "claude-code".to_string();
+        hit.source_path = "/home/user/projects/app".to_string();
+
+        let config = crate::sources::config::SourcesConfig {
+            sources: vec![crate::sources::config::SourceDefinition {
+                name: "work-laptop".to_string(),
+                path_mappings: vec![crate::sources::config::PathMapping::with_agents(
+                    "/home/user/projects",
+                    "/Volumes/Claude",
+                    vec!["claude-code".into()],
+                )],
+                ..Default::default()
+            }],
+        };
+
+        let rewritten = actionable_path_for_hit_with_config(Some(&config), &hit);
+        assert_eq!(rewritten, "/Volumes/Claude/app");
     }
 
     #[test]
@@ -26283,6 +26953,101 @@ mod tests {
             hovered: false,
         };
         assert_eq!(remote_item.source_badge(), "[laptop]");
+    }
+
+    #[test]
+    fn result_item_source_badge_uses_remote_label_when_source_id_and_host_are_missing() {
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.source_badge(), "[remote]");
+        assert_eq!(item.source_kind(), "remote");
+    }
+
+    #[test]
+    fn result_item_source_badge_treats_blank_metadata_as_local() {
+        let mut hit = make_test_hit();
+        hit.source_id = "  	  ".to_string();
+        hit.origin_kind = "   ".to_string();
+        hit.origin_host = Some("   ".to_string());
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.source_badge(), "[local]");
+        assert_eq!(item.source_kind(), "local");
+    }
+
+    #[test]
+    fn result_item_source_kind_prefers_displayed_local_badge_when_origin_kind_conflicts() {
+        let mut hit = make_test_hit();
+        hit.source_id = " local ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.source_badge(), "[local]");
+        assert_eq!(item.source_kind(), "local");
+    }
+
+    #[test]
+    fn result_item_source_kind_prefers_displayed_remote_badge_when_origin_kind_conflicts() {
+        let mut hit = make_test_hit();
+        hit.source_id = " work-laptop ".to_string();
+        hit.origin_kind = "local".to_string();
+        hit.origin_host = None;
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.source_badge(), "[work-laptop]");
+        assert_eq!(item.source_kind(), "remote");
+    }
+
+    #[test]
+    fn pane_filter_matches_visible_normalized_metadata() {
+        let mut hit = make_test_hit();
+        hit.title = "   ".to_string();
+        hit.agent = "   codex   ".to_string();
+        hit.workspace = "   ".to_string();
+        hit.workspace_original = Some("   /srv/cass   ".to_string());
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+
+        assert!(pane_filter_matches_hit(&hit, "codex"));
+        assert!(pane_filter_matches_hit(&hit, "/srv/cass"));
+        assert!(pane_filter_matches_hit(&hit, "remote"));
+        assert!(pane_filter_matches_hit(&hit, "untitled"));
+    }
+
+    #[test]
+    fn pane_filter_matches_remote_source_host_and_source_id() {
+        let mut hit = make_test_hit();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("Laptop-01".to_string());
+
+        assert!(pane_filter_matches_hit(&hit, "laptop-01"));
+        assert!(pane_filter_matches_hit(&hit, "work-laptop"));
+        assert!(pane_filter_matches_hit(&hit, "ssh"));
+    }
+
+    #[test]
+    fn result_item_display_agent_slug_trims_whitespace() {
+        let mut hit = make_test_hit();
+        hit.agent = "   codex   ".to_string();
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.display_agent_slug(), "codex");
+    }
+
+    #[test]
+    fn result_item_display_workspace_label_uses_none_for_blank_workspace() {
+        let mut hit = make_test_hit();
+        hit.workspace = "   ".to_string();
+        let item = make_result_item(hit, 1);
+
+        assert_eq!(item.display_workspace_label(32), "(none)");
     }
 
     #[test]
@@ -27325,6 +28090,25 @@ mod tests {
     }
 
     #[test]
+    fn refresh_available_source_ids_ignores_normalized_local_and_keeps_normalized_remote() {
+        let mut app = CassApp::default();
+        let mut local = make_test_hit();
+        local.source_id = "   ".to_string();
+        local.origin_kind = "local".to_string();
+        local.origin_host = None;
+
+        let mut remote = make_test_hit();
+        remote.source_id = "   ".to_string();
+        remote.origin_kind = "ssh".to_string();
+        remote.origin_host = Some("laptop".to_string());
+
+        app.results = vec![local, remote];
+        app.refresh_available_source_ids();
+
+        assert_eq!(app.available_source_ids, vec!["laptop".to_string()]);
+    }
+
+    #[test]
     fn source_filter_menu_applies_selected_source_id() {
         let mut app = CassApp::default();
         let mut local = make_test_hit();
@@ -28080,13 +28864,8 @@ mod tests {
         std::fs::write(&existing_path, "existing").expect("seed existing export");
 
         let missing_db = tmp.path().join("missing.db");
-        let msg = export_session_markdown_task(
-            &missing_db,
-            "local",
-            &session_path.display().to_string(),
-            &existing_path,
-            false,
-        );
+        let export_hit = make_exact_hit(&session_path.display().to_string(), "local", 1, "hello");
+        let msg = export_session_markdown_task(&missing_db, &export_hit, &existing_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
@@ -28125,6 +28904,10 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared-md.jsonl', 'work-laptop', 10)",
         )
         .unwrap();
@@ -28138,22 +28921,238 @@ mod tests {
         .unwrap();
 
         let output_path = tmp.path().join("shared.md");
-        let msg = export_session_markdown_task(
-            &db_path,
-            "work-laptop",
+        let export_hit = make_exact_hit(
             "/fake/shared-md.jsonl",
-            &output_path,
-            false,
+            "work-laptop",
+            1,
+            "remote markdown body",
         );
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
         let exported_path = match msg {
             CassMsg::ExportCompleted { output_path, .. } => output_path,
             other => panic!("expected ExportCompleted, got: {other:?}"),
         };
         let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
-        assert!(markdown.contains("remote markdown body"), "expected remote conversation content in markdown export");
+        assert!(
+            markdown.contains("remote markdown body"),
+            "expected remote conversation content in markdown export"
+        );
         assert!(
             !markdown.contains("local markdown body"),
             "wrong-source conversation content leaked into markdown export"
+        );
+    }
+
+    #[test]
+    fn export_session_markdown_task_uses_exact_hit_for_shared_path_within_same_source() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-md-same-source.jsonl', 'local', 10)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old markdown body')"
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new markdown body')"
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("shared-same-source.md");
+        let export_hit = make_exact_hit(
+            "/fake/shared-md-same-source.jsonl",
+            "local",
+            1,
+            "new markdown body",
+        );
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
+        assert!(
+            markdown.contains("new markdown body"),
+            "expected selected conversation content in markdown export"
+        );
+        assert!(
+            !markdown.contains("old markdown body"),
+            "same-source older conversation content leaked into markdown export"
+        );
+    }
+
+    #[test]
+    fn export_session_markdown_task_prefers_local_jsonl_over_stale_index() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("fresh-session.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"role":"user","content":"fresh local markdown body"}
+{"role":"assistant","content":"fresh local reply"}"#,
+        )
+        .expect("write local session");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed markdown body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("fresh-session.md");
+        let mut export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "stale indexed markdown body",
+        );
+        export_hit.title = "Indexed Session".to_string();
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
+        assert!(
+            markdown.contains("# Indexed Session"),
+            "markdown export should preserve the indexed/search-hit title when local JSONL content is preferred"
+        );
+        assert!(
+            markdown.contains("fresh local markdown body"),
+            "local JSONL content should outrank stale indexed content for TUI markdown export"
+        );
+        assert!(
+            !markdown.contains("stale indexed markdown body"),
+            "stale indexed content should not leak into local JSONL markdown export"
+        );
+    }
+
+    #[test]
+    fn export_session_markdown_task_falls_back_to_index_when_local_jsonl_is_invalid() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("broken-session.jsonl");
+        std::fs::write(&session_path, "this is not valid jsonl\n").expect("write invalid session");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed markdown fallback body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("broken-session.md");
+        let export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "indexed markdown fallback body",
+        );
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
+        assert!(
+            markdown.contains("indexed markdown fallback body"),
+            "indexed conversation should rescue markdown export when the local JSONL is invalid"
+        );
+    }
+
+    #[test]
+    fn export_session_markdown_task_keeps_index_for_local_markdown_files() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("aider-session.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+not jsonl",
+        )
+        .expect("write local markdown file");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider markdown body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("aider-session-export.md");
+        let export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "indexed aider markdown body",
+        );
+        let msg = export_session_markdown_task(&db_path, &export_hit, &output_path, false);
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let markdown = std::fs::read_to_string(exported_path).expect("read exported markdown");
+        assert!(
+            markdown.contains("indexed aider markdown body"),
+            "local markdown files should keep using indexed conversation data for export"
         );
     }
 
@@ -28184,10 +29183,10 @@ mod tests {
         let existing_path = tmp.path().join("session.html");
         std::fs::write(&existing_path, "existing").expect("seed existing html export");
 
+        let export_hit = make_exact_hit(session_path, "local", 1, "hello");
         let msg = export_session_task(
             &db_path,
-            "local",
-            session_path,
+            &export_hit,
             &existing_path,
             false,
             None,
@@ -28234,6 +29233,10 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'remote-ext', 'Remote Session', '/fake/shared.jsonl', 'work-laptop', 10)",
         )
         .unwrap();
@@ -28247,10 +29250,11 @@ mod tests {
         .unwrap();
 
         let output_path = tmp.path().join("shared.html");
+        let export_hit =
+            make_exact_hit("/fake/shared.jsonl", "work-laptop", 1, "remote export body");
         let msg = export_session_task(
             &db_path,
-            "work-laptop",
-            "/fake/shared.jsonl",
+            &export_hit,
             &output_path,
             false,
             None,
@@ -28264,11 +29268,413 @@ mod tests {
             other => panic!("expected ExportCompleted, got: {other:?}"),
         };
         let html = std::fs::read_to_string(exported_path).expect("read exported html");
-        assert!(html.contains("remote export body"), "expected remote conversation content in export");
+        assert!(
+            html.contains("remote export body"),
+            "expected remote conversation content in export"
+        );
         assert!(
             !html.contains("local export body"),
             "wrong-source conversation content leaked into HTML export"
         );
+    }
+
+    #[test]
+    fn export_session_html_task_uses_exact_hit_for_shared_path_within_same_source() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'remote', 0, 0)").unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (1, 1, 'old-ext', 'Old Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (2, 1, 'new-ext', 'New Session', '/fake/shared-same-source.jsonl', 'local', 10)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old export body')"
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new export body')"
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("shared-same-source.html");
+        let export_hit = make_exact_hit(
+            "/fake/shared-same-source.jsonl",
+            "local",
+            1,
+            "new export body",
+        );
+        let msg = export_session_task(
+            &db_path,
+            &export_hit,
+            &output_path,
+            false,
+            None,
+            true,
+            false,
+            "Shared Session",
+            "claude_code",
+        );
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let html = std::fs::read_to_string(exported_path).expect("read exported html");
+        assert!(
+            html.contains("new export body"),
+            "expected selected conversation content in HTML export"
+        );
+        assert!(
+            !html.contains("old export body"),
+            "same-source older conversation content leaked into HTML export"
+        );
+    }
+
+    #[test]
+    fn export_session_html_task_prefers_local_jsonl_over_stale_index() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("fresh-session.html-source.jsonl");
+        std::fs::write(
+            &session_path,
+            r#"{"role":"user","content":"fresh local html body"}
+{"role":"assistant","content":"fresh local html reply"}"#,
+        )
+        .expect("write local session");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'stale-ext', 'Stale Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'stale indexed html body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("fresh-session.html");
+        let export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "stale indexed html body",
+        );
+        let msg = export_session_task(
+            &db_path,
+            &export_hit,
+            &output_path,
+            false,
+            None,
+            true,
+            false,
+            "Fresh Session",
+            "claude_code",
+        );
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let html = std::fs::read_to_string(exported_path).expect("read exported html");
+        assert!(
+            html.contains("fresh local html body"),
+            "local JSONL content should outrank stale indexed content for TUI HTML export"
+        );
+        assert!(
+            !html.contains("stale indexed html body"),
+            "stale indexed content should not leak into local JSONL HTML export"
+        );
+    }
+
+    #[test]
+    fn export_session_html_task_falls_back_to_index_when_local_jsonl_is_invalid() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("broken-session-html.jsonl");
+        std::fs::write(&session_path, "this is not valid jsonl\n").expect("write invalid session");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'indexed-ext', 'Indexed Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed html fallback body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("broken-session.html");
+        let export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "indexed html fallback body",
+        );
+        let msg = export_session_task(
+            &db_path,
+            &export_hit,
+            &output_path,
+            false,
+            None,
+            true,
+            false,
+            "Indexed Session",
+            "claude_code",
+        );
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let html = std::fs::read_to_string(exported_path).expect("read exported html");
+        assert!(
+            html.contains("indexed html fallback body"),
+            "indexed conversation should rescue HTML export when the local JSONL is invalid"
+        );
+    }
+
+    #[test]
+    fn export_session_html_task_keeps_index_for_local_markdown_files() {
+        use crate::storage::sqlite::FrankenStorage;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+
+        let session_path = tmp.path().join("aider-session-html.md");
+        std::fs::write(
+            &session_path,
+            "# raw aider markdown
+
+not jsonl",
+        )
+        .expect("write local markdown file");
+
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'aider', 'Aider', 'local', 0, 0)").unwrap();
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let params = [
+                ParamValue::from(1_i64),
+                ParamValue::from(session_path.display().to_string()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, approx_tokens) VALUES (?1, 1, 'aider-ext', 'Aider Session', ?2, 'local', 10)",
+                &param_slice_to_values(&params),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'indexed aider html body')",
+        )
+        .unwrap();
+
+        let output_path = tmp.path().join("aider-session-export.html");
+        let export_hit = make_exact_hit(
+            &session_path.display().to_string(),
+            "local",
+            1,
+            "indexed aider html body",
+        );
+        let msg = export_session_task(
+            &db_path,
+            &export_hit,
+            &output_path,
+            false,
+            None,
+            true,
+            false,
+            "Aider Session",
+            "aider",
+        );
+        let exported_path = match msg {
+            CassMsg::ExportCompleted { output_path, .. } => output_path,
+            other => panic!("expected ExportCompleted, got: {other:?}"),
+        };
+        let html = std::fs::read_to_string(exported_path).expect("read exported html");
+        assert!(
+            html.contains("indexed aider html body"),
+            "local markdown files should keep using indexed conversation data for HTML export"
+        );
+    }
+
+    #[test]
+    fn detail_session_hit_lines_ignore_other_conversations_in_same_source_and_path() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = CassApp::default();
+        let mut selected_hit = make_exact_hit(
+            "/shared/session.sqlite",
+            "local",
+            2,
+            "selected conversation body",
+        );
+        selected_hit.created_at = Some(200);
+
+        let mut other_hit = make_exact_hit(
+            "/shared/session.sqlite",
+            "local",
+            9,
+            "other conversation body",
+        );
+        other_hit.created_at = Some(100);
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 2,
+            hits: vec![selected_hit.clone(), other_hit],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        let mut cached_view = make_test_conversation_view();
+        cached_view.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
+        cached_view.convo.source_id = selected_hit.source_id.clone();
+        cached_view.messages = vec![Message {
+            id: Some(1),
+            idx: 1,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(200),
+            content: "selected conversation body".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((selected_hit.source_path.clone(), cached_view));
+
+        assert_eq!(app.collect_session_hit_lines(&selected_hit), vec![2]);
+    }
+
+    #[test]
+    fn detail_session_hit_lines_without_cached_detail_do_not_mix_other_conversations() {
+        let mut app = CassApp::default();
+        let mut selected_hit = make_exact_hit(
+            "/shared/session.sqlite",
+            "local",
+            2,
+            "selected conversation body",
+        );
+        selected_hit.created_at = Some(200);
+
+        let mut other_hit = make_exact_hit(
+            "/shared/session.sqlite",
+            "local",
+            9,
+            "other conversation body",
+        );
+        other_hit.created_at = Some(100);
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 2,
+            hits: vec![selected_hit.clone(), other_hit],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        assert_eq!(
+            app.collect_session_hit_lines(&selected_hit),
+            vec![2],
+            "without cached detail, shared-path same-source hits should stay anchored to the selected hit until the exact conversation loads"
+        );
+    }
+
+    #[test]
+    fn detail_session_hit_lines_without_cached_detail_normalize_blank_local_source_ids() {
+        let mut app = CassApp::default();
+
+        let mut selected_hit = make_test_hit();
+        selected_hit.source_path = "/shared/session.sqlite".into();
+        selected_hit.source_id = "   ".into();
+        selected_hit.origin_kind = "local".into();
+        selected_hit.origin_host = None;
+        selected_hit.line_number = None;
+        selected_hit.created_at = None;
+        selected_hit.content.clear();
+        selected_hit.snippet.clear();
+        selected_hit.title.clear();
+        selected_hit.conversation_id = None;
+
+        let mut sibling_hit = make_exact_hit("/shared/session.sqlite", "local", 5, "same source");
+        sibling_hit.origin_kind = "   ".into();
+        sibling_hit.origin_host = None;
+        sibling_hit.created_at = Some(200);
+
+        let mut other_hit =
+            make_exact_hit("/shared/session.sqlite", "work-laptop", 9, "other source");
+        other_hit.origin_kind = "ssh".into();
+        other_hit.origin_host = Some("laptop".into());
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 3,
+            hits: vec![selected_hit.clone(), sibling_hit, other_hit],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        assert_eq!(app.collect_session_hit_lines(&selected_hit), vec![5]);
+    }
+
+    #[test]
+    fn detail_session_hit_lines_without_cached_detail_include_same_conversation_id_hits() {
+        let mut app = CassApp::default();
+
+        let mut selected_hit = make_exact_hit("/shared/session.sqlite", "local", 2, "first body");
+        selected_hit.conversation_id = Some(77);
+        selected_hit.title = "Shared Session".into();
+        selected_hit.content_hash = 1001;
+        selected_hit.created_at = Some(200);
+
+        let mut sibling_hit = make_exact_hit("/shared/session.sqlite", "local", 5, "second body");
+        sibling_hit.conversation_id = Some(77);
+        sibling_hit.title = "Renamed Shared Session".into();
+        sibling_hit.content_hash = 1002;
+        sibling_hit.created_at = Some(210);
+
+        let mut other_hit = make_exact_hit("/shared/session.sqlite", "local", 9, "other body");
+        other_hit.conversation_id = Some(88);
+        other_hit.title = "Other Session".into();
+        other_hit.content_hash = 1003;
+        other_hit.created_at = Some(220);
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 3,
+            hits: vec![selected_hit.clone(), sibling_hit, other_hit],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        assert_eq!(app.collect_session_hit_lines(&selected_hit), vec![2, 5]);
     }
 
     #[test]
@@ -28755,7 +30161,24 @@ mod tests {
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
         }
+    }
+
+    fn make_exact_hit(
+        source_path: &str,
+        source_id: &str,
+        line_number: usize,
+        content: &str,
+    ) -> SearchHit {
+        let mut hit = make_test_hit();
+        hit.source_path = source_path.to_string();
+        hit.source_id = source_id.to_string();
+        hit.created_at = None;
+        hit.line_number = Some(line_number);
+        hit.content = content.to_string();
+        hit.snippet = content.to_string();
+        hit
     }
 
     fn make_result_item(hit: SearchHit, row_height: u16) -> ResultItem {
@@ -28839,6 +30262,22 @@ mod tests {
     }
 
     #[test]
+    fn build_messages_lines_treat_whitespace_hit_title_as_untitled() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "   	  ".to_string();
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 80, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("(untitled)"));
+    }
+
+    #[test]
     fn build_messages_lines_include_source_provenance_fields() {
         let app = CassApp::default();
         let mut hit = make_test_hit();
@@ -28864,6 +30303,823 @@ mod tests {
             "source kind should appear parenthesized: {text}"
         );
         assert!(text.contains("ws_orig=/home/user/projects/test"));
+    }
+
+    #[test]
+    fn build_messages_lines_fall_back_to_hit_source_provenance_when_loaded_metadata_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.workspace_original = Some("/indexed/original".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = Some("   ".to_string());
+        cv.convo.metadata_json = serde_json::json!({
+            "cass": { "workspace_original": "   " }
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("source=laptop (remote)"),
+            "expected hit provenance fallback, got: {text}"
+        );
+        assert!(
+            text.contains("ws_orig=/indexed/original"),
+            "expected workspace_original fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_messages_lines_trim_hit_title_and_agent_fallbacks() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "   Indexed Title   ".to_string();
+        hit.agent = "   codex   ".to_string();
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Indexed Title"));
+        assert!(text.contains("codex"));
+        assert!(!text.contains("   Indexed Title   "));
+        assert!(!text.contains("   codex   "));
+    }
+
+    #[test]
+    fn build_messages_lines_use_remote_origin_host_when_source_id_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("source=laptop (remote)"),
+            "expected remote host fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_messages_lines_use_remote_label_when_source_id_and_host_are_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("source=remote (remote)"),
+            "expected remote label fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_messages_lines_prefer_loaded_metadata_over_stale_hit() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "Stale Indexed Title".to_string();
+        hit.agent = "stale_agent".to_string();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("stale-host".to_string());
+        hit.workspace_original = Some("/stale/original".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.title = Some("Loaded Conversation".to_string());
+        cv.convo.agent_slug = "claude_code".to_string();
+        cv.convo.workspace = Some(std::path::PathBuf::from("/loaded/workspace"));
+        cv.convo.source_id = "local".to_string();
+        cv.convo.origin_host = None;
+        cv.convo.metadata_json = serde_json::json!({
+            "cass": { "workspace_original": "/loaded/original" }
+        });
+        cv.messages = vec![crate::model::types::Message {
+            id: Some(1),
+            idx: 0,
+            role: crate::model::types::MessageRole::User,
+            author: None,
+            created_at: Some(1_700_000_000),
+            content: "loaded body".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Loaded Conversation"));
+        assert!(text.contains("claude_code"));
+        assert!(text.contains("/loaded/workspace"));
+        assert!(text.contains("source=local (local)"));
+        assert!(text.contains("ws_orig=/loaded/original"));
+        assert!(!text.contains("Stale Indexed Title"));
+        assert!(!text.contains("stale_agent"));
+        assert!(!text.contains("/stale/workspace"));
+        assert!(!text.contains("stale-host"));
+    }
+
+    #[test]
+    fn build_detail_header_lines_fall_back_to_hit_source_provenance_when_loaded_metadata_is_blank()
+    {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = Some("   ".to_string());
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("⇄ laptop"),
+            "expected hit provenance fallback in detail header, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_detail_header_lines_trim_hit_agent_fallback_when_loaded_metadata_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.agent = "   codex   ".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.agent_slug = "   ".to_string();
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("✓ codex"));
+        assert!(!text.contains("✓    codex   "));
+    }
+
+    #[test]
+    fn build_detail_header_lines_use_remote_origin_host_when_source_id_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("⇄ laptop"),
+            "expected remote host fallback in detail header, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_detail_header_lines_use_remote_label_when_source_id_and_host_are_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("⇄ remote"),
+            "expected remote label fallback in detail header, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_detail_header_lines_prefer_loaded_metadata_over_stale_hit() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.agent = "stale_agent".to_string();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("stale-host".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.agent_slug = "claude_code".to_string();
+        cv.convo.workspace = Some(std::path::PathBuf::from("/loaded/workspace"));
+        cv.convo.source_id = "local".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("✓ claude_code"));
+        assert!(text.contains("/loaded/workspace"));
+        assert!(text.contains("⌂ local"));
+        assert!(!text.contains("stale_agent"));
+        assert!(!text.contains("/stale/workspace"));
+        assert!(!text.contains("stale-host"));
+    }
+
+    #[test]
+    fn build_messages_lines_prefer_loaded_view_workspace_over_stale_hit_workspace() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = Some(crate::model::types::Workspace {
+            id: Some(7),
+            path: std::path::PathBuf::from("/loaded/view-workspace"),
+            display_name: Some("Loaded View Workspace".to_string()),
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_messages_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("/loaded/view-workspace"));
+        assert!(!text.contains("/stale/workspace"));
+    }
+
+    #[test]
+    fn build_detail_header_lines_prefer_loaded_view_workspace_over_stale_hit_workspace() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = Some(crate::model::types::Workspace {
+            id: Some(7),
+            path: std::path::PathBuf::from("/loaded/view-workspace"),
+            display_name: Some("Loaded View Workspace".to_string()),
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_detail_header_lines(&hit, 100, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("/loaded/view-workspace"));
+        assert!(!text.contains("/stale/workspace"));
+    }
+
+    #[test]
+    fn build_raw_lines_include_loaded_view_workspace_over_stale_hit_workspace() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = Some(crate::model::types::Workspace {
+            id: Some(7),
+            path: std::path::PathBuf::from("/loaded/view-workspace"),
+            display_name: Some("Loaded View Workspace".to_string()),
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("workspace"));
+        assert!(text.contains("/loaded/view-workspace"));
+        assert!(!text.contains("/stale/workspace"));
+    }
+
+    #[test]
+    fn build_json_lines_include_loaded_view_workspace_over_stale_hit_workspace() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = Some(crate::model::types::Workspace {
+            id: Some(7),
+            path: std::path::PathBuf::from("/loaded/view-workspace"),
+            display_name: Some("Loaded View Workspace".to_string()),
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("workspace"));
+        assert!(text.contains("/loaded/view-workspace"));
+        assert!(!text.contains("/stale/workspace"));
+    }
+
+    #[test]
+    fn build_raw_lines_fall_back_to_hit_source_provenance_when_loaded_metadata_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace_original = Some("/indexed/original".to_string());
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = Some("   ".to_string());
+        cv.convo.metadata_json = serde_json::json!({
+            "cass": { "workspace_original": "   " }
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("work-laptop"));
+        assert!(text.contains("laptop"));
+        assert!(text.contains("remote"));
+        assert!(text.contains("/indexed/original"));
+    }
+
+    #[test]
+    fn build_raw_lines_use_remote_origin_host_when_source_id_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"laptop\""),
+            "expected remote host fallback source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"remote\""),
+            "expected remote source kind, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_raw_lines_use_remote_label_when_source_id_and_host_are_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"remote\""),
+            "expected remote label fallback source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"remote\""),
+            "expected remote source kind, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_raw_lines_fallback_normalizes_blank_local_source_id_without_cached_detail() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "local".to_string();
+        hit.origin_host = None;
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"local\""),
+            "expected normalized local source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"local\""),
+            "expected local source kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_kind\": \"local\""),
+            "expected normalized local origin_kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_host\": null"),
+            "expected null origin_host for blank local fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_raw_lines_fallback_normalizes_remote_origin_kind_and_blank_origin_host() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("   ".to_string());
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"remote\""),
+            "expected fallback remote source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_kind\": \"remote\""),
+            "expected normalized remote origin_kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_host\": null"),
+            "expected null origin_host for blank remote fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_raw_lines_fall_back_to_hit_metadata_when_loaded_metadata_is_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "Indexed Title".to_string();
+        hit.agent = "codex".to_string();
+        hit.workspace = "/indexed/workspace".to_string();
+        hit.workspace_original = Some("/indexed/original".to_string());
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.title = None;
+        cv.convo.agent_slug.clear();
+        cv.convo.workspace = None;
+        cv.workspace = None;
+        cv.convo.source_id.clear();
+        cv.convo.origin_host = None;
+        cv.convo.metadata_json = serde_json::json!({});
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_raw_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Indexed Title"));
+        assert!(text.contains("codex"));
+        assert!(text.contains("/indexed/workspace"));
+        assert!(text.contains("/indexed/original"));
+        assert!(text.contains("work-laptop"));
+        assert!(text.contains("laptop"));
+        assert!(text.contains("remote"));
+    }
+
+    #[test]
+    fn build_json_lines_fall_back_to_hit_source_provenance_when_loaded_metadata_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.workspace_original = Some("/indexed/original".to_string());
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = Some("   ".to_string());
+        cv.convo.metadata_json = serde_json::json!({
+            "cass": { "workspace_original": "   " }
+        });
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("work-laptop"));
+        assert!(text.contains("laptop"));
+        assert!(text.contains("remote"));
+        assert!(text.contains("/indexed/original"));
+    }
+
+    #[test]
+    fn build_json_lines_use_remote_origin_host_when_source_id_is_blank() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"laptop\""),
+            "expected remote host fallback source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"remote\""),
+            "expected remote source kind, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_json_lines_use_remote_label_when_source_id_and_host_are_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = None;
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.source_id = "   ".to_string();
+        cv.convo.origin_host = None;
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"remote\""),
+            "expected remote label fallback source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"remote\""),
+            "expected remote source kind, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_json_lines_fallback_normalizes_blank_local_source_id_without_cached_detail() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "local".to_string();
+        hit.origin_host = None;
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"local\""),
+            "expected normalized local source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"source_kind\": \"local\""),
+            "expected local source kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_kind\": \"local\""),
+            "expected normalized local origin_kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_host\":null") || text.contains("\"origin_host\": null"),
+            "expected null origin_host for blank local fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_json_lines_fallback_normalizes_remote_origin_kind_and_blank_origin_host() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.source_id = "   ".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("   ".to_string());
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(
+            text.contains("\"source_id\": \"remote\""),
+            "expected fallback remote source_id, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_kind\": \"remote\""),
+            "expected normalized remote origin_kind, got: {text}"
+        );
+        assert!(
+            text.contains("\"origin_host\":null") || text.contains("\"origin_host\": null"),
+            "expected null origin_host for blank remote fallback, got: {text}"
+        );
+    }
+
+    #[test]
+    fn build_json_lines_fall_back_to_hit_metadata_when_loaded_metadata_is_missing() {
+        let mut app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "Indexed Title".to_string();
+        hit.agent = "codex".to_string();
+        hit.workspace = "/indexed/workspace".to_string();
+        hit.workspace_original = Some("/indexed/original".to_string());
+        hit.source_id = "work-laptop".to_string();
+        hit.origin_kind = "ssh".to_string();
+        hit.origin_host = Some("laptop".to_string());
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.title = None;
+        cv.convo.agent_slug.clear();
+        cv.convo.workspace = None;
+        cv.workspace = None;
+        cv.convo.source_id.clear();
+        cv.convo.origin_host = None;
+        cv.convo.metadata_json = serde_json::json!({});
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_json_lines(&hit, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Indexed Title"));
+        assert!(text.contains("codex"));
+        assert!(text.contains("/indexed/workspace"));
+        assert!(text.contains("/indexed/original"));
+        assert!(text.contains("work-laptop"));
+        assert!(text.contains("laptop"));
+        assert!(text.contains("remote"));
     }
 
     #[test]
@@ -28902,7 +31158,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("remote hit body"), "expected selected hit fallback body, got: {text}");
+        assert!(
+            text.contains("remote hit body"),
+            "expected selected hit fallback body, got: {text}"
+        );
         assert!(
             !text.contains("wrong cached detail body"),
             "wrong-source cached detail must not leak into the preview: {text}"
@@ -28925,7 +31184,8 @@ mod tests {
 
         let mut hit = make_test_hit();
         hit.snippet = "  
-	  ".to_string();
+	  "
+        .to_string();
 
         let styles = StyleContext::from_options(StyleOptions::default());
         let lines = app.build_snippets_lines(&hit, &styles);
@@ -28938,6 +31198,80 @@ mod tests {
             rendered.contains("No snippet available."),
             "whitespace-only fallback snippets should not render as a blank pane"
         );
+    }
+
+    #[test]
+    fn build_snippets_lines_falls_back_to_visible_content_excerpt() {
+        let mut app = CassApp::default();
+        app.cached_detail = None;
+
+        let mut hit = make_test_hit();
+        hit.title.clear();
+        hit.snippet = "
+	"
+        .to_string();
+        hit.content = "content fallback excerpt".to_string();
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let lines = app.build_snippets_lines(&hit, &styles);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans().iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("content fallback excerpt"),
+            "snippets tab should reuse the visible content fallback when snippet text is empty"
+        );
+        assert!(
+            !rendered.contains("No snippet available."),
+            "snippets tab should not hide the available fallback excerpt"
+        );
+    }
+
+    #[test]
+    fn detail_export_state_uses_visible_excerpt_when_title_and_snippet_are_empty() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title.clear();
+        hit.snippet = " 
+	 "
+        .to_string();
+        hit.content = "export preview content fallback".to_string();
+
+        let state = app.detail_export_state_for_hit(&hit);
+
+        assert!(
+            state
+                .title_preview
+                .contains("export preview content fallback"),
+            "export title preview should reuse the same fallback excerpt the user already sees"
+        );
+    }
+
+    #[test]
+    fn detail_export_state_trims_whitespace_hit_title_when_no_cached_detail() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.title = "   Export Session   ".to_string();
+
+        let state = app.detail_export_state_for_hit(&hit);
+
+        assert_eq!(state.title_preview, "Export Session");
+    }
+
+    #[test]
+    fn detail_export_state_trims_whitespace_hit_agent_and_workspace() {
+        let app = CassApp::default();
+        let mut hit = make_test_hit();
+        hit.agent = "   codex   ".to_string();
+        hit.workspace = "   /tmp/ws   ".to_string();
+        hit.title = "Export Session".to_string();
+
+        let state = app.detail_export_state_for_hit(&hit);
+
+        assert_eq!(state.agent_name, "codex");
+        assert_eq!(state.workspace, "/tmp/ws");
     }
 
     #[test]
@@ -29042,16 +31376,15 @@ mod tests {
         assert!(
             matches!(
                 msg,
-                Some(CassMsg::DetailLoadRequested { source_id, source_path })
-                    if source_id == expected_source_id && source_path == expected_path
+                Some(CassMsg::DetailLoadRequested { hit })
+                    if hit.source_id == expected_source_id && hit.source_path == expected_path
             ),
             "detail open on cache miss should dispatch detail load request"
         );
         assert_eq!(app.loading_context, Some(LoadingContext::DetailModal));
 
         let _ = app.update(CassMsg::DetailLoadRequested {
-            source_id: expected_source_id,
-            source_path: expected_path,
+            hit: app.panes[0].hits[0].clone(),
         });
         assert!(app.loading_context.is_none());
     }
@@ -29099,10 +31432,7 @@ mod tests {
         ];
         app.cached_detail = Some((hit.source_path.clone(), loaded_view));
 
-        let _ = app.update(CassMsg::DetailLoadRequested {
-            source_id: hit.source_id.clone(),
-            source_path: hit.source_path.clone(),
-        });
+        let _ = app.update(CassMsg::DetailLoadRequested { hit: hit.clone() });
 
         let refreshed = app.export_modal_state.expect("refreshed export state");
         assert_eq!(refreshed.message_count, 2);
@@ -29137,12 +31467,120 @@ mod tests {
         assert!(
             matches!(
                 msg,
-                Some(CassMsg::DetailLoadRequested { source_id, source_path })
-                    if source_id == remote_hit.source_id && source_path == remote_hit.source_path
+                Some(CassMsg::DetailLoadRequested { hit })
+                    if hit.source_id == remote_hit.source_id
+                        && hit.source_path == remote_hit.source_path
             ),
             "detail open should reload when source_id differs even if source_path matches"
         );
         assert_eq!(app.loading_context, Some(LoadingContext::DetailModal));
+    }
+
+    #[test]
+    fn detail_opened_same_path_and_source_but_different_conversation_dispatches_reload() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = CassApp::default();
+        let mut selected_hit = make_test_hit();
+        selected_hit.source_path = "/shared/session.sqlite".to_string();
+        selected_hit.source_id = "local".to_string();
+        selected_hit.line_number = Some(1);
+        selected_hit.created_at = Some(200);
+        selected_hit.content = "new conversation body".to_string();
+        selected_hit.snippet = "new conversation body".to_string();
+
+        let mut cached_view = make_test_conversation_view();
+        cached_view.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
+        cached_view.convo.source_id = selected_hit.source_id.clone();
+        cached_view.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(100),
+            content: "old conversation body".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((selected_hit.source_path.clone(), cached_view));
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 1,
+            hits: vec![selected_hit.clone()],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        let msg = extract_msg(app.update(CassMsg::DetailOpened));
+        assert!(
+            matches!(
+                msg,
+                Some(CassMsg::DetailLoadRequested { hit })
+                    if hit.source_id == selected_hit.source_id
+                        && hit.source_path == selected_hit.source_path
+                        && hit.created_at == selected_hit.created_at
+                        && hit.content == selected_hit.content
+            ),
+            "detail open should reload when cached detail belongs to another conversation in the same source"
+        );
+        assert_eq!(app.loading_context, Some(LoadingContext::DetailModal));
+    }
+
+    #[test]
+    fn detail_load_ignores_completed_request_when_selection_switched_to_other_conversation() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = CassApp::default();
+        let mut first_hit = make_test_hit();
+        first_hit.source_path = "/shared/session.sqlite".to_string();
+        first_hit.source_id = "local".to_string();
+        first_hit.line_number = Some(1);
+        first_hit.created_at = Some(100);
+        first_hit.content = "first conversation body".to_string();
+        first_hit.snippet = "first conversation body".to_string();
+        first_hit.content_hash = 77;
+
+        let mut second_hit = first_hit.clone();
+        second_hit.line_number = Some(9);
+        second_hit.created_at = Some(200);
+        second_hit.content = "second conversation body".to_string();
+        second_hit.snippet = "second conversation body".to_string();
+
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 2,
+            hits: vec![first_hit.clone(), second_hit.clone()],
+            selected: 1,
+        });
+        app.active_pane = 0;
+        app.show_detail_modal = true;
+
+        let mut loaded_view = make_test_conversation_view();
+        loaded_view.convo.source_path = std::path::PathBuf::from(&first_hit.source_path);
+        loaded_view.convo.source_id = first_hit.source_id.clone();
+        loaded_view.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(100),
+            content: "first conversation body".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((first_hit.source_path.clone(), loaded_view));
+        app.detail_session_hit_lines = vec![9];
+        app.detail_session_hit_current = 0;
+        app.detail_session_hit_scroll_pending.set(false);
+
+        let _ = app.update(CassMsg::DetailLoadRequested { hit: first_hit });
+
+        assert_eq!(app.detail_session_hit_lines, vec![9]);
+        assert!(
+            !app.detail_session_hit_scroll_pending.get(),
+            "stale detail loads must not disturb the newly selected conversation"
+        );
     }
 
     #[test]
@@ -29169,7 +31607,10 @@ mod tests {
         app.cached_detail = Some((hit.source_path.clone(), cached_view));
 
         let export = app.detail_export_state_for_hit(&hit);
-        assert_eq!(export.message_count, 0, "wrong-source cached detail must not be reused");
+        assert_eq!(
+            export.message_count, 0,
+            "wrong-source cached detail must not be reused"
+        );
     }
 
     #[test]
@@ -29197,6 +31638,249 @@ mod tests {
         assert!(
             app.status.contains("Copied snippet"),
             "detail modal should not swallow copy-snippet action"
+        );
+    }
+
+    #[test]
+    fn copy_content_uses_rendered_detail_messages_instead_of_raw_hit_fragment() {
+        let mut app = CassApp::default();
+        app.show_detail_modal = true;
+        app.detail_tab = DetailTab::Messages;
+
+        let mut hit = make_test_hit();
+        hit.content = "stale search fragment".to_string();
+        app.panes.push(AgentPane {
+            agent: "claude_code".into(),
+            total_count: 1,
+            hits: vec![hit.clone()],
+            selected: 0,
+        });
+        app.active_pane = 0;
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.source_path = std::path::PathBuf::from(&hit.source_path);
+        cv.convo.source_id = hit.source_id.clone();
+        cv.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::Agent,
+            author: Some("cass".to_string()),
+            created_at: Some(1_700_000_000),
+            content: "full rendered conversation body".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let _ = app.update(CassMsg::CopyContent);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert!(
+            copied.contains("full rendered conversation body"),
+            "copy content should use the rendered detail conversation, not the raw search hit"
+        );
+        assert!(
+            !copied.contains("stale search fragment"),
+            "raw search-hit fragments must not override loaded detail content"
+        );
+    }
+
+    #[test]
+    fn copy_content_uses_messages_fallback_placeholder_when_detail_is_empty() {
+        let mut app = app_with_hits(1);
+        app.show_detail_modal = true;
+        app.detail_tab = DetailTab::Messages;
+        app.cached_detail = None;
+        app.panes[0].hits[0].content = "   ".to_string();
+        app.panes[0].hits[0].snippet = "\n\t".to_string();
+
+        let _ = app.update(CassMsg::CopyContent);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert!(
+            copied.contains("No message content available."),
+            "copy content should mirror the rendered empty-detail placeholder instead of copying blank text"
+        );
+    }
+
+    #[test]
+    fn copy_snippet_uses_visible_content_fallback_when_snippet_is_empty() {
+        let mut app = app_with_hits(1);
+        app.panes[0].hits[0].snippet.clear();
+        app.panes[0].hits[0].content = "fallback content body".to_string();
+
+        let _ = app.update(CassMsg::CopySnippet);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert_eq!(copied, "fallback content body");
+    }
+
+    #[test]
+    fn copy_snippet_uses_title_when_snippet_and_content_are_empty() {
+        let mut app = app_with_hits(1);
+        app.panes[0].hits[0].snippet.clear();
+        app.panes[0].hits[0].content = "   ".to_string();
+        app.panes[0].hits[0].title = "Fallback title".to_string();
+
+        let _ = app.update(CassMsg::CopySnippet);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert_eq!(copied, "Fallback title");
+    }
+
+    #[test]
+    #[serial]
+    fn copy_path_rewrites_configured_remote_source_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _config_guard = EnvVarGuard::set_path("XDG_CONFIG_HOME", temp.path());
+
+        let mut config = SourcesConfig::default();
+        let mut source = SourceDefinition::ssh("work-laptop", "user@work-laptop");
+        source
+            .path_mappings
+            .push(PathMapping::new("/remote/root", "/local/root"));
+        config.sources.push(source);
+        write_test_sources_config(temp.path(), &config);
+
+        let mut app = app_with_hits(1);
+        app.panes[0].hits[0].source_id = "work-laptop".to_string();
+        app.panes[0].hits[0].origin_kind = "ssh".to_string();
+        app.panes[0].hits[0].source_path = "/remote/root/project/session.jsonl".to_string();
+
+        let _ = app.update(CassMsg::CopyPath);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert_eq!(copied, "/local/root/project/session.jsonl");
+    }
+
+    #[test]
+    #[serial]
+    fn copy_path_rewrites_hyphenated_agent_mappings_for_underscored_hits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _config_guard = EnvVarGuard::set_path("XDG_CONFIG_HOME", temp.path());
+
+        let mut config = SourcesConfig::default();
+        let mut source = SourceDefinition::ssh("work-laptop", "user@work-laptop");
+        source.path_mappings.push(PathMapping::with_agents(
+            "/remote/root",
+            "/local/root",
+            vec!["claude-code".to_string()],
+        ));
+        config.sources.push(source);
+        write_test_sources_config(temp.path(), &config);
+
+        let mut app = app_with_hits(1);
+        app.panes[0].hits[0].agent = "claude_code".to_string();
+        app.panes[0].hits[0].source_id = "work-laptop".to_string();
+        app.panes[0].hits[0].origin_kind = "ssh".to_string();
+        app.panes[0].hits[0].source_path = "/remote/root/project/session.jsonl".to_string();
+
+        let _ = app.update(CassMsg::CopyPath);
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert_eq!(copied, "/local/root/project/session.jsonl");
+    }
+
+    #[test]
+    #[serial]
+    fn bulk_copy_paths_rewrites_configured_remote_source_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _config_guard = EnvVarGuard::set_path("XDG_CONFIG_HOME", temp.path());
+
+        let mut config = SourcesConfig::default();
+        let mut source = SourceDefinition::ssh("work-laptop", "user@work-laptop");
+        source
+            .path_mappings
+            .push(PathMapping::new("/remote/root", "/local/root"));
+        config.sources.push(source);
+        write_test_sources_config(temp.path(), &config);
+
+        let mut app = app_with_hits(2);
+        for (idx, hit) in app.panes[0].hits.iter_mut().enumerate() {
+            hit.source_id = "work-laptop".to_string();
+            hit.origin_kind = "ssh".to_string();
+            hit.source_path = format!("/remote/root/session-{idx}.jsonl");
+        }
+        app.selected = app.panes[0]
+            .hits
+            .iter()
+            .map(SelectedHitKey::from_hit)
+            .collect();
+
+        let _ = app.update(CassMsg::BulkActionExecuted { action_index: 1 });
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        assert_eq!(
+            copied,
+            "/local/root/session-0.jsonl
+/local/root/session-1.jsonl"
+        );
+    }
+
+    #[test]
+    fn bulk_json_export_preserves_source_provenance_for_same_path_hits() {
+        let mut app = app_with_hits(2);
+        app.panes[0].hits[0].source_path = "/shared/session.jsonl".to_string();
+        app.panes[0].hits[0].source_id = "local".to_string();
+        app.panes[0].hits[0].origin_kind = "local".to_string();
+
+        app.panes[0].hits[1].source_path = "/shared/session.jsonl".to_string();
+        app.panes[0].hits[1].source_id = "work-laptop".to_string();
+        app.panes[0].hits[1].origin_kind = "ssh".to_string();
+        app.panes[0].hits[1].origin_host = Some("work-laptop".to_string());
+
+        app.selected = app.panes[0]
+            .hits
+            .iter()
+            .map(SelectedHitKey::from_hit)
+            .collect();
+
+        let _ = app.update(CassMsg::BulkActionExecuted { action_index: 2 });
+
+        let copied = take_test_clipboard().expect("clipboard payload");
+        let exported: serde_json::Value = serde_json::from_str(&copied).expect("json export");
+        let rows = exported.as_array().expect("exported rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["source_id"], "local");
+        assert_eq!(rows[1]["source_id"], "work-laptop");
+        assert_eq!(rows[1]["origin_kind"], "ssh");
+        assert_eq!(rows[1]["origin_host"], "work-laptop");
+        assert!(rows[0].get("content_hash").is_some());
+        assert!(rows[1].get("created_at").is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn open_in_editor_rewrites_configured_remote_source_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _config_guard = EnvVarGuard::set_path("XDG_CONFIG_HOME", temp.path());
+        let _editor_guard = EnvVarGuard::set_str("EDITOR", "code");
+
+        let mut config = SourcesConfig::default();
+        let mut source = SourceDefinition::ssh("work-laptop", "user@work-laptop");
+        source
+            .path_mappings
+            .push(PathMapping::new("/remote/root", "/local/root"));
+        config.sources.push(source);
+        write_test_sources_config(temp.path(), &config);
+
+        let mut app = app_with_hits(1);
+        app.panes[0].hits[0].source_id = "work-laptop".to_string();
+        app.panes[0].hits[0].origin_kind = "ssh".to_string();
+        app.panes[0].hits[0].source_path = "/remote/root/project/session.jsonl".to_string();
+        app.panes[0].hits[0].line_number = Some(42);
+
+        let _ = app.update(CassMsg::OpenInEditor);
+
+        let invocations = take_test_editor_invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(
+            invocations[0],
+            vec![
+                "code".to_string(),
+                "--goto".to_string(),
+                "/local/root/project/session.jsonl:42".to_string(),
+            ]
         );
     }
 
@@ -29518,6 +32202,29 @@ mod tests {
         let code_fg = markdown_span_fg_for_text(&lines, "cass search --json")
             .expect("whitespace-only content should fall back to snippet markdown");
         assert_eq!(Some(code_fg), styles.markdown_theme().code_inline.fg);
+    }
+
+    #[test]
+    fn detail_modal_empty_fallback_content_reports_placeholder() {
+        let mut app = CassApp::default();
+        app.cached_detail = None;
+        app.show_detail_modal = true;
+
+        let mut hit = make_test_hit();
+        hit.content = "   ".to_string();
+        hit.snippet = "\n\t".to_string();
+
+        let styles = app.resolved_style_context();
+        let lines = app.build_messages_lines(&hit, 96, &styles);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans().iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+
+        assert!(
+            rendered.contains("No message content available."),
+            "empty fallback content should render an explicit placeholder instead of a blank detail pane"
+        );
     }
 
     #[test]
@@ -30815,6 +33522,7 @@ mod tests {
             snippet: String::new(),
             content: String::new(),
             content_hash: id,
+            conversation_id: Some(id as i64),
             score: 1.0 - (id as f32 * 0.1),
             agent: "claude_code".into(),
             source_path: path.into(),
@@ -30848,6 +33556,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 title: "Search ranking tuning notes".into(),
@@ -30865,6 +33574,7 @@ mod tests {
                 source_id: "workstation-west".into(),
                 origin_kind: "ssh".into(),
                 origin_host: Some("workstation-west".into()),
+                conversation_id: None,
             },
             SearchHit {
                 title: "Theme audit and contrast findings".into(),
@@ -30882,6 +33592,7 @@ mod tests {
                 source_id: "remote-ci".into(),
                 origin_kind: "remote".into(),
                 origin_host: Some("runner-17".into()),
+                conversation_id: None,
             },
             SearchHit {
                 title: "Multi-agent coordination transcript".into(),
@@ -30899,6 +33610,7 @@ mod tests {
                 source_id: "laptop-east".into(),
                 origin_kind: "ssh".into(),
                 origin_host: Some("laptop-east".into()),
+                conversation_id: None,
             },
             SearchHit {
                 title: "Large-snippet rendering edge case".into(),
@@ -30916,6 +33628,7 @@ mod tests {
                 source_id: "ci-linux".into(),
                 origin_kind: "remote".into(),
                 origin_host: Some("ci-linux".into()),
+                conversation_id: None,
             },
             SearchHit {
                 title: "JSON payload decode failure".into(),
@@ -30933,6 +33646,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 title: "Legacy migration checklist".into(),
@@ -30950,6 +33664,7 @@ mod tests {
                 source_id: "docs-host".into(),
                 origin_kind: "remote".into(),
                 origin_host: Some("docs-host".into()),
+                conversation_id: None,
             },
             SearchHit {
                 title: "Background telemetry heartbeat".into(),
@@ -30967,6 +33682,7 @@ mod tests {
                 source_id: "daemon".into(),
                 origin_kind: "service".into(),
                 origin_host: Some("daemon-1".into()),
+                conversation_id: None,
             },
         ]
     }
@@ -31063,11 +33779,15 @@ mod tests {
 
     #[test]
     fn selected_hit_key_from_hit_captures_stable_fields() {
-        let hit = make_hit(42, "/some/path");
+        let mut hit = make_hit(42, "/some/path");
+        hit.created_at = Some(42_000);
         let key = SelectedHitKey::from_hit(&hit);
         assert_eq!(key.source_id, "local");
         assert_eq!(key.source_path, "/some/path");
+        assert_eq!(key.conversation_id, Some(42));
+        assert!(key.title.is_empty());
         assert_eq!(key.line_number, Some(42));
+        assert_eq!(key.created_at, Some(42_000));
         assert_eq!(key.content_hash, 42);
     }
 
@@ -31078,6 +33798,65 @@ mod tests {
         let h3 = make_hit(2, "/b");
         assert_eq!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
         assert_ne!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h3));
+    }
+
+    #[test]
+    fn selected_hit_key_normalizes_blank_source_id_variants() {
+        let mut h1 = make_hit(1, "/a");
+        h1.source_id = "   ".into();
+        h1.origin_kind = "local".into();
+        h1.origin_host = None;
+
+        let mut h2 = make_hit(1, "/a");
+        h2.source_id = "local".into();
+        h2.origin_kind = "   ".into();
+        h2.origin_host = None;
+
+        assert_eq!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
+        assert_eq!(SelectedHitKey::from_hit(&h1).source_id, "local");
+    }
+
+    #[test]
+    fn selected_hit_key_distinguishes_same_path_line_hash_by_timestamp() {
+        let mut h1 = make_hit(1, "/a");
+        let mut h2 = make_hit(1, "/a");
+        h1.content_hash = 7;
+        h2.content_hash = 7;
+        h1.created_at = Some(1000);
+        h2.created_at = Some(2000);
+
+        assert_ne!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
+    }
+
+    #[test]
+    fn selected_hit_key_distinguishes_same_path_line_hash_by_title() {
+        let mut h1 = make_hit(1, "/a");
+        let mut h2 = make_hit(1, "/a");
+        h1.content_hash = 7;
+        h2.content_hash = 7;
+        h1.created_at = None;
+        h2.created_at = None;
+        h1.conversation_id = None;
+        h2.conversation_id = None;
+        h2.title = "Different Session".into();
+
+        assert_ne!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
+    }
+
+    #[test]
+    fn selected_hit_key_distinguishes_same_path_title_by_conversation_id() {
+        let mut h1 = make_hit(1, "/a");
+        let mut h2 = make_hit(1, "/a");
+        h1.content_hash = 7;
+        h2.content_hash = 7;
+        h1.created_at = Some(1000);
+        h2.created_at = Some(1000);
+        h1.title = "Shared Session".into();
+        h2.title = "Shared Session".into();
+        h1.conversation_id = Some(1);
+        h2.conversation_id = Some(2);
+
+        assert_ne!(SelectedHitKey::from_hit(&h1), SelectedHitKey::from_hit(&h2));
     }
 
     #[test]
@@ -31418,10 +34197,10 @@ mod tests {
         let mut app = app_with_hits(3);
         app.status = "indexing 3/9".to_string();
         app.last_search_ms = Some(42);
-        app.cached_detail = Some((
-            "/test/session.jsonl".to_string(),
-            make_test_conversation_view(),
-        ));
+        let mut cv = make_test_conversation_view();
+        cv.convo.source_path = std::path::PathBuf::from("/path/0");
+        cv.convo.source_id = "local".to_string();
+        app.cached_detail = Some(("/path/0".to_string(), cv));
 
         let text = buffer_to_text(&render_at_degradation(
             &app,
@@ -31440,6 +34219,30 @@ mod tests {
         assert!(
             text.contains("runtime deg:SimpleBorders"),
             "footer should surface degradation state lane"
+        );
+    }
+
+    #[test]
+    fn status_footer_hud_marks_wrong_source_cached_detail_as_cold() {
+        use ftui::render::budget::DegradationLevel;
+        use ftui_harness::buffer_to_text;
+
+        let mut app = app_with_hits(3);
+        app.last_search_ms = Some(42);
+        let mut cv = make_test_conversation_view();
+        cv.convo.source_path = std::path::PathBuf::from("/path/0");
+        cv.convo.source_id = "work-laptop".to_string();
+        app.cached_detail = Some(("/path/0".to_string(), cv));
+
+        let text = buffer_to_text(&render_at_degradation(
+            &app,
+            120,
+            24,
+            DegradationLevel::SimpleBorders,
+        ));
+        assert!(
+            text.contains("perf lat:42ms cache:cold"),
+            "footer should treat stale wrong-source cached detail as cold: {text}"
         );
     }
 
@@ -33661,13 +36464,15 @@ mod tests {
         }
 
         let mut cv = make_test_conversation_view();
+        cv.convo.source_path = std::path::PathBuf::from("/path/0");
+        cv.convo.source_id = "local".to_string();
         cv.messages = vec![
             msg(MessageRole::User, "hello"),
             msg(MessageRole::Agent, "hi there"),
             msg(MessageRole::Tool, "tool output here"),
             msg(MessageRole::System, "system note"),
         ];
-        app.cached_detail = Some(("test-id".to_string(), cv));
+        app.cached_detail = Some(("/path/0".to_string(), cv));
 
         let _ = app.update(CassMsg::ToolCollapseAll);
         // Indices 2 (Tool) and 3 (System) should be collapsed
@@ -33681,6 +36486,41 @@ mod tests {
     // -- End collapsible tool call tests --------------------------------------
 
     // -- Detail header tests --------------------------------------------------
+
+    #[test]
+    fn tool_collapse_all_ignores_cached_detail_from_other_source_same_path() {
+        use crate::model::types::{Message, MessageRole};
+        let mut app = app_with_hits(3);
+
+        fn msg(role: MessageRole, content: &str) -> Message {
+            Message {
+                id: None,
+                idx: 0,
+                role,
+                author: None,
+                created_at: None,
+                content: content.to_string(),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }
+        }
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.source_path = std::path::PathBuf::from("/path/0");
+        cv.convo.source_id = "work-laptop".to_string();
+        cv.messages = vec![
+            msg(MessageRole::User, "hello"),
+            msg(MessageRole::Tool, "tool output here"),
+            msg(MessageRole::System, "system note"),
+        ];
+        app.cached_detail = Some(("/path/0".to_string(), cv));
+
+        let _ = app.update(CassMsg::ToolCollapseAll);
+        assert!(
+            app.collapsed_tools.is_empty(),
+            "tool collapse should ignore cached detail from another source even if the path matches"
+        );
+    }
 
     #[test]
     fn build_detail_header_lines_without_cached_detail() {
@@ -33717,9 +36557,14 @@ mod tests {
             msg(MessageRole::Tool, "result", Some(1_700_020)),
             msg(MessageRole::User, "thanks", Some(1_700_030)),
         ];
-        app.cached_detail = Some(("test-id".to_string(), cv));
+        let mut hit = make_test_hit();
+        hit.line_number = Some(1);
+        hit.created_at = Some(1_700_000);
+        hit.content = "hello".to_string();
+        hit.snippet = "hello".to_string();
+        app.cached_detail = Some((hit.source_path.clone(), cv));
 
-        let hit = make_test_hit();
+        let hit = hit;
         let styles = StyleContext::from_options(StyleOptions::default());
         let lines = app.build_detail_header_lines(&hit, 80, &styles);
         // Should have: agent line, metadata line, sparkline, separator = 4 lines
@@ -33819,9 +36664,14 @@ mod tests {
             msg(MessageRole::User, "thanks for help", Some(4_000)),
             msg(MessageRole::Agent, "you are welcome", Some(5_000)),
         ];
-        app.cached_detail = Some(("test-id".to_string(), cv));
+        let mut hit = make_test_hit();
+        hit.line_number = Some(1);
+        hit.created_at = Some(1_000);
+        hit.content = "hello world".to_string();
+        hit.snippet = "hello world".to_string();
+        app.cached_detail = Some((hit.source_path.clone(), cv));
 
-        let hit = make_test_hit();
+        let hit = hit;
         let styles = StyleContext::from_options(StyleOptions::default());
         let lines = app.build_analytics_lines(&hit, 80, &styles);
 
@@ -33843,6 +36693,150 @@ mod tests {
         assert!(text.contains("User"), "should show User role");
         assert!(text.contains("Agent"), "should show Agent role");
         assert!(text.contains("Tool"), "should show Tool role");
+    }
+
+    #[test]
+    fn build_analytics_lines_prefer_loaded_view_workspace_over_stale_hit_workspace() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = app_with_hits(1);
+        let mut hit = make_test_hit();
+        hit.workspace = "/stale/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = Some(crate::model::types::Workspace {
+            id: Some(7),
+            path: std::path::PathBuf::from("/loaded/view-workspace"),
+            display_name: Some("Loaded View Workspace".to_string()),
+        });
+        cv.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_700_000_000),
+            content: "hello".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_analytics_lines(&hit, 80, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("/loaded/view-workspace"));
+        assert!(!text.contains("/stale/workspace"));
+    }
+
+    #[test]
+    fn build_analytics_lines_trim_hit_agent_when_loaded_metadata_is_missing() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = app_with_hits(1);
+        let mut hit = make_test_hit();
+        hit.agent = "   codex   ".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.agent_slug.clear();
+        cv.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_700_000_000),
+            content: "hello".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_analytics_lines(&hit, 80, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Session: codex"));
+        assert!(!text.contains("Session:    codex"));
+    }
+
+    #[test]
+    fn build_analytics_lines_fall_back_to_hit_agent_when_loaded_metadata_is_missing() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = app_with_hits(1);
+        let mut hit = make_test_hit();
+        hit.agent = "codex".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.agent_slug.clear();
+        cv.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_700_000_000),
+            content: "hello".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_analytics_lines(&hit, 80, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("Session: codex"));
+    }
+
+    #[test]
+    fn build_analytics_lines_fall_back_to_hit_workspace_when_loaded_metadata_is_missing() {
+        use crate::model::types::{Message, MessageRole};
+
+        let mut app = app_with_hits(1);
+        let mut hit = make_test_hit();
+        hit.workspace = "/indexed/workspace".to_string();
+        hit.conversation_id = Some(42);
+
+        let mut cv = make_test_conversation_view();
+        cv.convo.id = Some(42);
+        cv.convo.workspace = None;
+        cv.workspace = None;
+        cv.messages = vec![Message {
+            id: Some(1),
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_700_000_000),
+            content: "hello".to_string(),
+            extra_json: serde_json::json!({}),
+            snippets: Vec::new(),
+        }];
+        app.cached_detail = Some((hit.source_path.clone(), cv));
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        let text: String = app
+            .build_analytics_lines(&hit, 80, &styles)
+            .iter()
+            .flat_map(|l| l.spans().iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+
+        assert!(text.contains("/indexed/workspace"));
     }
 
     #[test]
@@ -34051,6 +37045,74 @@ mod tests {
     }
 
     #[test]
+    fn build_result_row_mini_analytics_map_distinguishes_same_path_sessions_by_title() {
+        let mut app = CassApp::default();
+
+        let mut first = make_hit(1, "/session/shared");
+        first.source_id = "local".into();
+        first.conversation_id = None;
+        first.title = "First session".into();
+
+        let mut second = make_hit(2, "/session/shared");
+        second.source_id = "local".into();
+        second.conversation_id = None;
+        second.title = "Second session".into();
+
+        app.results = vec![first.clone(), second.clone()];
+        let by_session = app.build_result_row_mini_analytics_map();
+
+        assert_eq!(
+            by_session.len(),
+            2,
+            "same-path sessions should stay distinct when titles differ"
+        );
+        assert!(by_session.contains_key(&(
+            String::from("local"),
+            String::from("/session/shared"),
+            None,
+            first.title.clone(),
+        )));
+        assert!(by_session.contains_key(&(
+            String::from("local"),
+            String::from("/session/shared"),
+            None,
+            second.title.clone(),
+        )));
+    }
+
+    #[test]
+    fn build_result_row_mini_analytics_map_distinguishes_same_path_same_title_by_conversation_id() {
+        let mut app = CassApp::default();
+
+        let mut first = make_hit(1, "/session/shared");
+        first.source_id = "local".into();
+        first.title = "Shared session".into();
+        first.line_number = Some(1);
+
+        let mut second = make_hit(2, "/session/shared");
+        second.source_id = "local".into();
+        second.title = "Shared session".into();
+        second.line_number = Some(1);
+
+        app.results = vec![first.clone(), second.clone()];
+        let by_session = app.build_result_row_mini_analytics_map();
+
+        assert_eq!(by_session.len(), 2);
+        assert!(by_session.contains_key(&(
+            String::from("local"),
+            String::from("/session/shared"),
+            first.conversation_id,
+            String::new(),
+        )));
+        assert!(by_session.contains_key(&(
+            String::from("local"),
+            String::from("/session/shared"),
+            second.conversation_id,
+            String::new(),
+        )));
+    }
+
+    #[test]
     fn build_result_row_mini_analytics_map_aggregates_by_session() {
         let mut app = CassApp::default();
 
@@ -34063,25 +37125,76 @@ mod tests {
         a2.content = "b".repeat(2_000); // ~500 tok
         a2.source_id = "local".into();
         a2.line_number = Some(2);
+        a2.title = a1.title.clone();
+        a2.conversation_id = a1.conversation_id;
 
         let mut b1 = make_hit(3, "/session/b");
         b1.content = "c".repeat(800); // ~200 tok
         b1.source_id = "remote-ci".into();
         b1.line_number = Some(1);
 
+        let a1_conversation_id = a1.conversation_id;
+        let b1_conversation_id = b1.conversation_id;
         app.results = vec![a1, a2, b1];
         let by_session = app.build_result_row_mini_analytics_map();
 
         assert_eq!(by_session.len(), 2, "expected two unique sessions");
         let a_metrics = by_session
-            .get(&(String::from("local"), String::from("/session/a")))
+            .get(&(
+                String::from("local"),
+                String::from("/session/a"),
+                a1_conversation_id,
+                String::new(),
+            ))
             .expect("missing session a metrics");
         assert_eq!(a_metrics.matched_messages, 2);
 
         let b_metrics = by_session
-            .get(&(String::from("remote-ci"), String::from("/session/b")))
+            .get(&(
+                String::from("remote-ci"),
+                String::from("/session/b"),
+                b1_conversation_id,
+                String::new(),
+            ))
             .expect("missing session b metrics");
         assert_eq!(b_metrics.matched_messages, 1);
+    }
+
+    #[test]
+    fn build_result_row_mini_analytics_map_normalizes_blank_local_source_id() {
+        let mut app = CassApp::default();
+
+        let mut first = make_hit(1, "/session/a");
+        first.content = "a".repeat(1_000);
+        first.source_id = "local".into();
+        first.origin_kind = "local".into();
+        first.line_number = Some(1);
+
+        let mut second = first.clone();
+        second.content = "b".repeat(1_000);
+        second.source_id = "   ".into();
+        second.origin_kind = "local".into();
+        second.line_number = Some(2);
+        second.score = 0.5;
+
+        let conversation_id = first.conversation_id;
+        app.results = vec![first, second];
+        let by_session = app.build_result_row_mini_analytics_map();
+
+        assert_eq!(
+            by_session.len(),
+            1,
+            "blank local source ids should coalesce"
+        );
+        let metrics = by_session
+            .get(&(
+                String::from("local"),
+                String::from("/session/a"),
+                conversation_id,
+                String::new(),
+            ))
+            .expect("missing normalized local session metrics");
+        assert_eq!(metrics.matched_messages, 2);
     }
 
     // -- End stats bar tests --------------------------------------------------
@@ -34173,6 +37286,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 title: "second".into(),
@@ -34190,6 +37304,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
             SearchHit {
                 title: "other".into(),
@@ -34207,6 +37322,7 @@ mod tests {
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             },
         ];
         app.panes.push(AgentPane {
@@ -35035,6 +38151,40 @@ mod tests {
         assert_eq!(app.panes[0].agent, "project-a");
         assert_eq!(app.panes[0].hits.len(), 2);
         assert_eq!(app.panes[1].agent, "project-b");
+    }
+
+    #[test]
+    fn regroup_panes_by_agent_trims_whitespace_and_coalesces_groups() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.agent = "  codex  ".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.agent = "codex".into();
+        app.results = vec![h1, h2];
+        app.grouping_mode = ResultsGrouping::Agent;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].agent, "codex");
+        assert_eq!(app.panes[0].hits.len(), 2);
+    }
+
+    #[test]
+    fn regroup_panes_by_workspace_trims_whitespace_and_blank_values() {
+        let mut app = CassApp::default();
+        let mut h1 = make_hit(1, "/a");
+        h1.workspace = "  /home/user/project-a  ".into();
+        let mut h2 = make_hit(2, "/b");
+        h2.workspace = "/home/user/project-a".into();
+        let mut h3 = make_hit(3, "/c");
+        h3.workspace = "   ".into();
+        app.results = vec![h1, h2, h3];
+        app.grouping_mode = ResultsGrouping::Workspace;
+        app.regroup_panes();
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[0].agent, "(none)");
+        assert_eq!(app.panes[0].hits.len(), 1);
+        assert_eq!(app.panes[1].agent, "project-a");
+        assert_eq!(app.panes[1].hits.len(), 2);
     }
 
     #[test]
@@ -37674,6 +40824,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
         }];
         app.panes = vec![AgentPane {
             agent: "test".into(),
@@ -41669,13 +44820,19 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         app.selected.insert(SelectedHitKey {
             source_id: "local".into(),
             source_path: "/path/0".into(),
+            conversation_id: Some(0),
+            title: String::new(),
             line_number: None,
+            created_at: None,
             content_hash: 0,
         });
         app.selected.insert(SelectedHitKey {
             source_id: "local".into(),
             source_path: "/path/1".into(),
+            conversation_id: Some(1),
+            title: String::new(),
             line_number: None,
+            created_at: None,
             content_hash: 1,
         });
 
@@ -42337,6 +45494,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 source_id: "local".into(),
                 origin_kind: "local".into(),
                 origin_host: None,
+                conversation_id: None,
             })
             .collect();
         app.panes.push(AgentPane {

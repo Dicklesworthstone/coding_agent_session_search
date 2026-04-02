@@ -1,4 +1,5 @@
 use crate::model::types::{Conversation, Message, MessageRole, Workspace};
+use crate::search::query::SearchHit;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
@@ -36,6 +37,66 @@ pub struct ConversationView {
     pub convo: Conversation,
     pub messages: Vec<Message>,
     pub workspace: Option<Workspace>,
+}
+
+fn normalized_ui_source_identity_sql_expr(
+    source_id_column: &str,
+    origin_host_column: &str,
+) -> String {
+    format!(
+        "CASE WHEN TRIM(COALESCE({source_id_column}, '')) = '' THEN CASE WHEN TRIM(COALESCE({origin_host_column}, '')) = '' THEN '{local}' ELSE TRIM(COALESCE({origin_host_column}, '')) END \
+         WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+         ELSE TRIM(COALESCE({source_id_column}, '')) END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
+fn normalize_ui_source_id_value(source_id: Option<&str>) -> String {
+    let trimmed = source_id.unwrap_or_default().trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID)
+    {
+        crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_ui_source_id_parts(source_id: Option<&str>, origin_host: Option<&str>) -> String {
+    let trimmed_source_id = source_id.unwrap_or_default().trim();
+    if !trimmed_source_id.is_empty() {
+        return normalize_ui_source_id_value(Some(trimmed_source_id));
+    }
+
+    origin_host
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::sources::provenance::LOCAL_SOURCE_ID.to_string())
+}
+
+fn normalize_ui_hit_source_id(hit: &SearchHit) -> String {
+    let trimmed_source_id = hit.source_id.trim();
+    if !trimmed_source_id.is_empty() {
+        return normalize_ui_source_id_value(Some(trimmed_source_id));
+    }
+
+    if let Some(host) = hit
+        .origin_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return host.to_string();
+    }
+
+    if hit.origin_kind.trim().eq_ignore_ascii_case("ssh")
+        || hit.origin_kind.trim().eq_ignore_ascii_case("remote")
+    {
+        return "remote".to_string();
+    }
+
+    crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
 }
 
 // -------------------------------------------------------------------------
@@ -106,12 +167,17 @@ impl ConversationCache {
         }
     }
 
-    /// Hash a source identity to a u64 key using rustc-hash's FxHasher.
+    /// Hash a cache scope + source identity to a u64 key using rustc-hash's FxHasher.
     #[inline]
-    fn hash_key(source_id: Option<&str>, source_path: &str) -> u64 {
+    fn hash_key(cache_scope: Option<&str>, source_id: Option<&str>, source_path: &str) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
-        source_id.unwrap_or("").hash(&mut hasher);
+        cache_scope.unwrap_or("").hash(&mut hasher);
+        if let Some(source_id) = source_id {
+            normalize_ui_source_id_value(Some(source_id)).hash(&mut hasher);
+        } else {
+            "".hash(&mut hasher);
+        }
         source_path.hash(&mut hasher);
         hasher.finish()
     }
@@ -124,7 +190,17 @@ impl ConversationCache {
 
     /// Get a cached conversation view by source identity.
     pub fn get(&self, source_id: Option<&str>, source_path: &str) -> Option<Arc<ConversationView>> {
-        let hash = Self::hash_key(source_id, source_path);
+        self.get_scoped("", source_id, source_path)
+    }
+
+    /// Get a cached conversation view scoped to a specific database identity.
+    pub fn get_scoped(
+        &self,
+        cache_scope: &str,
+        source_id: Option<&str>,
+        source_path: &str,
+    ) -> Option<Arc<ConversationView>> {
+        let hash = Self::hash_key(Some(cache_scope), source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let mut shard = self.shards[shard_idx].write();
 
@@ -144,7 +220,18 @@ impl ConversationCache {
         source_path: &str,
         view: ConversationView,
     ) -> Arc<ConversationView> {
-        let hash = Self::hash_key(source_id, source_path);
+        self.insert_scoped("", source_id, source_path, view)
+    }
+
+    /// Insert a conversation view into the cache scoped to a specific database identity.
+    pub fn insert_scoped(
+        &self,
+        cache_scope: &str,
+        source_id: Option<&str>,
+        source_path: &str,
+        view: ConversationView,
+    ) -> Arc<ConversationView> {
+        let hash = Self::hash_key(Some(cache_scope), source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let arc = Arc::new(view);
 
@@ -160,7 +247,12 @@ impl ConversationCache {
 
     /// Invalidate a specific cache entry by source identity.
     pub fn invalidate(&self, source_id: Option<&str>, source_path: &str) {
-        let hash = Self::hash_key(source_id, source_path);
+        self.invalidate_scoped("", source_id, source_path)
+    }
+
+    /// Invalidate a specific cache entry scoped to a specific database identity.
+    pub fn invalidate_scoped(&self, cache_scope: &str, source_id: Option<&str>, source_path: &str) {
+        let hash = Self::hash_key(Some(cache_scope), source_id, source_path);
         let shard_idx = Self::shard_index(hash);
         let mut shard = self.shards[shard_idx].write();
         shard.pop(&hash);
@@ -198,43 +290,26 @@ pub static CONVERSATION_CACHE: Lazy<ConversationCache> = Lazy::new(|| {
     ConversationCache::new(capacity)
 });
 
-// -------------------------------------------------------------------------
-// Load Conversation (with caching)
-// -------------------------------------------------------------------------
+fn storage_cache_scope(storage: &FrankenStorage) -> Option<String> {
+    storage
+        .database_path()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
 
-/// Load a conversation from the database (bypassing cache).
-/// Use `load_conversation` or `load_conversation_for_source` for cached access.
-pub(crate) fn load_conversation_uncached(
+fn load_conversation_by_id_uncached(
     storage: &FrankenStorage,
-    source_id: Option<&str>,
-    source_path: &str,
+    conversation_id: i64,
 ) -> Result<Option<ConversationView>> {
-    let (sql, params) = if let Some(source_id) = source_id {
-        (
-            "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
-                    c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
-             FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE c.source_path = ?1 AND COALESCE(c.source_id, 'local') = ?2
-             ORDER BY c.started_at DESC LIMIT 1",
-            frankensqlite::params![source_path, source_id],
-        )
-    } else {
-        (
-            "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
-                    c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
-             FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE c.source_path = ?1
-             ORDER BY c.started_at DESC LIMIT 1",
-            frankensqlite::params![source_path],
-        )
-    };
     let rows = storage.raw().query_map_collect(
-        sql,
-        params,
+        "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+         FROM conversations c
+         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN workspaces w ON c.workspace_id = w.id
+         WHERE c.id = ?1
+         LIMIT 1",
+        frankensqlite::params![conversation_id],
         |row: &Row| {
             let convo_id: i64 = row.get_typed(0)?;
             let workspace_path = row
@@ -262,9 +337,10 @@ pub(crate) fn load_conversation_uncached(
                 approx_tokens: row.get_typed(10)?,
                 metadata_json,
                 messages: Vec::new(),
-                source_id: row
-                    .get_typed::<Option<String>>(12)?
-                    .unwrap_or_else(|| "local".to_string()),
+                source_id: normalize_ui_source_id_parts(
+                    row.get_typed::<Option<String>>(12)?.as_deref(),
+                    row.get_typed::<Option<String>>(13)?.as_deref(),
+                ),
                 origin_host: row.get_typed(13)?,
             };
             let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
@@ -275,6 +351,100 @@ pub(crate) fn load_conversation_uncached(
             Ok((convo_id, convo, workspace))
         },
     )?;
+    if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
+        let messages = storage.fetch_messages(convo_id)?;
+        return Ok(Some(ConversationView {
+            convo,
+            messages,
+            workspace,
+        }));
+    }
+    Ok(None)
+}
+
+// -------------------------------------------------------------------------
+// Load Conversation (with caching)
+// -------------------------------------------------------------------------
+
+/// Load a conversation from the database (bypassing cache).
+/// Use `load_conversation` or `load_conversation_for_source` for cached access.
+pub(crate) fn load_conversation_uncached(
+    storage: &FrankenStorage,
+    source_id: Option<&str>,
+    source_path: &str,
+) -> Result<Option<ConversationView>> {
+    let normalized_source_sql =
+        normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let (sql, params) = if let Some(source_id) = source_id {
+        (
+            format!(
+                "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                        c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
+                 ORDER BY c.started_at DESC LIMIT 1"
+            ),
+            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+        )
+    } else {
+        (
+            format!(
+                "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                        c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+                 FROM conversations c
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 WHERE c.source_path = ?1
+                 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END,
+                          c.started_at DESC
+                 LIMIT 1",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ),
+            frankensqlite::params![source_path],
+        )
+    };
+    let rows = storage.raw().query_map_collect(&sql, params, |row: &Row| {
+        let convo_id: i64 = row.get_typed(0)?;
+        let workspace_path = row
+            .get_typed::<Option<String>>(3)?
+            .map(std::path::PathBuf::from);
+        let metadata_json = row
+            .get_typed::<Option<String>>(11)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .or_else(|| {
+                row.get_typed::<Option<Vec<u8>>>(14)
+                    .ok()
+                    .flatten()
+                    .and_then(|b| rmp_serde::from_slice(&b).ok())
+            })
+            .unwrap_or_default();
+        let convo = Conversation {
+            id: Some(convo_id),
+            agent_slug: row.get_typed(1)?,
+            workspace: workspace_path.clone(),
+            external_id: row.get_typed(5)?,
+            title: row.get_typed(6)?,
+            source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
+            started_at: row.get_typed(8)?,
+            ended_at: row.get_typed(9)?,
+            approx_tokens: row.get_typed(10)?,
+            metadata_json,
+            messages: Vec::new(),
+            source_id: normalize_ui_source_id_parts(
+                row.get_typed::<Option<String>>(12)?.as_deref(),
+                row.get_typed::<Option<String>>(13)?.as_deref(),
+            ),
+            origin_host: row.get_typed(13)?,
+        };
+        let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
+            id: Some(id),
+            path: workspace_path.unwrap_or_default(),
+            display_name: row.get_typed(4).ok().flatten(),
+        });
+        Ok((convo_id, convo, workspace))
+    })?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
         let messages = storage.fetch_messages(convo_id)?;
         return Ok(Some(ConversationView {
@@ -299,14 +469,65 @@ pub(crate) fn load_conversation_uncached(
 /// The cache is keyed by source identity and has a configurable capacity
 /// via the CASS_CONV_CACHE_SIZE environment variable (default: 256 per shard,
 /// 4096 total entries across 16 shards).
+fn cached_conversation_matches_lookup_head(
+    storage: &FrankenStorage,
+    source_id: Option<&str>,
+    source_path: &str,
+    cached: &ConversationView,
+) -> Result<bool> {
+    let Some(cached_id) = cached.convo.id else {
+        return Ok(false);
+    };
+
+    let normalized_source_sql = normalized_ui_source_identity_sql_expr("source_id", "origin_host");
+    let (sql, params) = if let Some(source_id) = source_id {
+        (
+            format!(
+                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
+            ),
+            frankensqlite::params![source_path, normalize_ui_source_id_value(Some(source_id))],
+        )
+    } else {
+        (
+            format!(
+                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, started_at DESC LIMIT 1",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            ),
+            frankensqlite::params![source_path],
+        )
+    };
+
+    let rows = storage.raw().query_map_collect(&sql, params, |row: &Row| {
+        Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
+    })?;
+
+    Ok(
+        matches!(rows.into_iter().next(), Some((latest_id, latest_source_id)) if latest_id == cached_id && latest_source_id == cached.convo.source_id),
+    )
+}
+
 pub fn load_conversation(
     storage: &FrankenStorage,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
+    let cache_scope = storage_cache_scope(storage);
+
     // Fast path: check cache first
-    if let Some(cached) = CONVERSATION_CACHE.get(None, source_path) {
-        // Clone out of Arc for API compatibility
-        return Ok(Some((*cached).clone()));
+    if let Some(scope) = cache_scope.as_deref()
+        && let Some(cached) = CONVERSATION_CACHE.get_scoped(scope, None, source_path)
+    {
+        match cached_conversation_matches_lookup_head(storage, None, source_path, &cached) {
+            Ok(true) => {
+                // Clone out of Arc for API compatibility
+                return Ok(Some((*cached).clone()));
+            }
+            Ok(false) => {
+                CONVERSATION_CACHE.invalidate_scoped(scope, None, source_path);
+            }
+            Err(_) => {
+                return Ok(Some((*cached).clone()));
+            }
+        }
     }
 
     // Cache miss: load from database
@@ -314,7 +535,9 @@ pub fn load_conversation(
 
     // Cache the result if found
     if let Some(v) = view {
-        CONVERSATION_CACHE.insert(None, source_path, v.clone());
+        if let Some(scope) = cache_scope.as_deref() {
+            CONVERSATION_CACHE.insert_scoped(scope, None, source_path, v.clone());
+        }
         return Ok(Some(v));
     }
 
@@ -327,18 +550,247 @@ pub fn load_conversation_for_source(
     source_id: &str,
     source_path: &str,
 ) -> Result<Option<ConversationView>> {
-    if let Some(cached) = CONVERSATION_CACHE.get(Some(source_id), source_path) {
-        return Ok(Some((*cached).clone()));
+    let cache_scope = storage_cache_scope(storage);
+
+    if let Some(scope) = cache_scope.as_deref()
+        && let Some(cached) = CONVERSATION_CACHE.get_scoped(scope, Some(source_id), source_path)
+    {
+        match cached_conversation_matches_lookup_head(
+            storage,
+            Some(source_id),
+            source_path,
+            &cached,
+        ) {
+            Ok(true) => {
+                return Ok(Some((*cached).clone()));
+            }
+            Ok(false) => {
+                CONVERSATION_CACHE.invalidate_scoped(scope, Some(source_id), source_path);
+            }
+            Err(_) => {
+                return Ok(Some((*cached).clone()));
+            }
+        }
     }
 
     let view = load_conversation_uncached(storage, Some(source_id), source_path)?;
 
     if let Some(v) = view {
-        CONVERSATION_CACHE.insert(Some(source_id), source_path, v.clone());
+        if let Some(scope) = cache_scope.as_deref() {
+            CONVERSATION_CACHE.insert_scoped(scope, Some(source_id), source_path, v.clone());
+        }
         return Ok(Some(v));
     }
 
     Ok(None)
+}
+
+pub(crate) fn search_hit_has_identity_hint(hit: &SearchHit) -> bool {
+    let snippet = hit.snippet.trim();
+    let snippet_prefix = snippet.strip_suffix("...").unwrap_or(snippet).trim();
+    let title = hit.title.trim();
+    hit.conversation_id.is_some()
+        || hit.line_number.is_some()
+        || hit.created_at.is_some()
+        || !hit.content.is_empty()
+        || !snippet_prefix.is_empty()
+        || !title.is_empty()
+}
+
+pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &SearchHit) -> bool {
+    if let Some(expected_conversation_id) = hit.conversation_id {
+        return view.convo.id == Some(expected_conversation_id);
+    }
+    let normalized_hit_source_id = normalize_ui_hit_source_id(hit);
+    if view.convo.source_id != normalized_hit_source_id
+        || view.convo.source_path != std::path::Path::new(&hit.source_path)
+    {
+        return false;
+    }
+
+    let snippet = hit.snippet.trim();
+    let snippet_prefix = snippet.strip_suffix("...").unwrap_or(snippet).trim();
+    let hit_title = hit.title.trim();
+    let convo_title = view
+        .convo
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let has_identity_hint = search_hit_has_identity_hint(hit);
+    if !has_identity_hint {
+        return true;
+    }
+
+    if !hit_title.is_empty() {
+        match convo_title {
+            Some(title) if title != hit_title => return false,
+            None if hit.line_number.is_none()
+                && hit.created_at.is_none()
+                && hit.content.is_empty()
+                && snippet_prefix.is_empty() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    view.messages.iter().enumerate().any(|(pos, msg)| {
+        let line_from_idx = (msg.idx >= 0).then_some((msg.idx as usize) + 1);
+        let line_from_pos = pos + 1;
+
+        if let Some(expected_line) = hit.line_number
+            && line_from_idx != Some(expected_line)
+            && line_from_pos != expected_line
+        {
+            return false;
+        }
+
+        if let Some(expected_created_at) = hit.created_at {
+            let created_matches = msg.created_at == Some(expected_created_at)
+                || (msg.created_at.is_none()
+                    && view.convo.started_at == Some(expected_created_at)
+                    && hit
+                        .line_number
+                        .is_some_and(|line| line == line_from_idx.unwrap_or(line_from_pos)));
+            if !created_matches {
+                return false;
+            }
+
+            // A timestamp match is a stronger identity signal than the search-hit payload,
+            // which may be truncated or normalized for display.
+            return true;
+        }
+
+        if !hit.content.is_empty() {
+            return msg.content == hit.content;
+        }
+
+        if !snippet_prefix.is_empty() {
+            return msg.content.contains(snippet_prefix);
+        }
+
+        true
+    })
+}
+
+pub fn load_conversation_for_hit(
+    storage: &FrankenStorage,
+    hit: &SearchHit,
+) -> Result<Option<ConversationView>> {
+    let cache_scope = storage_cache_scope(storage);
+    if let Some(scope) = cache_scope.as_deref()
+        && let Some(cached) = CONVERSATION_CACHE.get_scoped(
+            scope,
+            Some(normalize_ui_hit_source_id(hit).as_str()),
+            &hit.source_path,
+        )
+    {
+        if conversation_view_matches_hit(&cached, hit) {
+            return Ok(Some((*cached).clone()));
+        }
+        let normalized_hit_source_id = normalize_ui_hit_source_id(hit);
+        CONVERSATION_CACHE.invalidate_scoped(
+            scope,
+            Some(normalized_hit_source_id.as_str()),
+            &hit.source_path,
+        );
+    }
+
+    let fallback_hit = if let Some(conversation_id) = hit.conversation_id {
+        if let Some(view) = load_conversation_by_id_uncached(storage, conversation_id)?
+            && conversation_view_matches_hit(&view, hit)
+        {
+            return Ok(Some(view));
+        }
+        let mut fallback_hit = hit.clone();
+        fallback_hit.conversation_id = None;
+        fallback_hit
+    } else {
+        hit.clone()
+    };
+
+    let normalized_source_sql =
+        normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let sql = format!(
+        "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+         FROM conversations c
+         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN workspaces w ON c.workspace_id = w.id
+         WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
+         ORDER BY c.started_at DESC"
+    );
+    let rows = storage.raw().query_map_collect(
+        &sql,
+        frankensqlite::params![
+            fallback_hit.source_path.as_str(),
+            normalize_ui_hit_source_id(&fallback_hit)
+        ],
+        |row: &Row| {
+            let convo_id: i64 = row.get_typed(0)?;
+            let workspace_path = row
+                .get_typed::<Option<String>>(3)?
+                .map(std::path::PathBuf::from);
+            let metadata_json = row
+                .get_typed::<Option<String>>(11)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .or_else(|| {
+                    row.get_typed::<Option<Vec<u8>>>(14)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| rmp_serde::from_slice(&b).ok())
+                })
+                .unwrap_or_default();
+            let convo = Conversation {
+                id: Some(convo_id),
+                agent_slug: row.get_typed(1)?,
+                workspace: workspace_path.clone(),
+                external_id: row.get_typed(5)?,
+                title: row.get_typed(6)?,
+                source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
+                started_at: row.get_typed(8)?,
+                ended_at: row.get_typed(9)?,
+                approx_tokens: row.get_typed(10)?,
+                metadata_json,
+                messages: Vec::new(),
+                source_id: normalize_ui_source_id_parts(
+                    row.get_typed::<Option<String>>(12)?.as_deref(),
+                    row.get_typed::<Option<String>>(13)?.as_deref(),
+                ),
+                origin_host: row.get_typed(13)?,
+            };
+            let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
+                id: Some(id),
+                path: workspace_path.unwrap_or_default(),
+                display_name: row.get_typed(4).ok().flatten(),
+            });
+            Ok((convo_id, convo, workspace))
+        },
+    )?;
+
+    for (convo_id, convo, workspace) in rows {
+        let messages = storage.fetch_messages(convo_id)?;
+        let view = ConversationView {
+            convo,
+            messages,
+            workspace,
+        };
+        if conversation_view_matches_hit(&view, &fallback_hit) {
+            return Ok(Some(view));
+        }
+    }
+
+    if search_hit_has_identity_hint(&fallback_hit) {
+        Ok(None)
+    } else {
+        load_conversation_uncached(
+            storage,
+            Some(normalize_ui_hit_source_id(&fallback_hit).as_str()),
+            &fallback_hit.source_path,
+        )
+    }
 }
 
 /// Load a conversation with caching, returning Arc for efficiency.
@@ -349,9 +801,23 @@ pub fn load_conversation_arc(
     storage: &FrankenStorage,
     source_path: &str,
 ) -> Result<Option<Arc<ConversationView>>> {
+    let cache_scope = storage_cache_scope(storage);
+
     // Fast path: check cache first
-    if let Some(cached) = CONVERSATION_CACHE.get(None, source_path) {
-        return Ok(Some(cached));
+    if let Some(scope) = cache_scope.as_deref()
+        && let Some(cached) = CONVERSATION_CACHE.get_scoped(scope, None, source_path)
+    {
+        match cached_conversation_matches_lookup_head(storage, None, source_path, &cached) {
+            Ok(true) => {
+                return Ok(Some(cached));
+            }
+            Ok(false) => {
+                CONVERSATION_CACHE.invalidate_scoped(scope, None, source_path);
+            }
+            Err(_) => {
+                return Ok(Some(cached));
+            }
+        }
     }
 
     // Cache miss: load from database
@@ -359,8 +825,11 @@ pub fn load_conversation_arc(
 
     // Cache and return the Arc
     if let Some(v) = view {
-        let arc = CONVERSATION_CACHE.insert(None, source_path, v);
-        return Ok(Some(arc));
+        if let Some(scope) = cache_scope.as_deref() {
+            let arc = CONVERSATION_CACHE.insert_scoped(scope, None, source_path, v);
+            return Ok(Some(arc));
+        }
+        return Ok(Some(Arc::new(v)));
     }
 
     Ok(None)
@@ -861,7 +1330,9 @@ impl CockpitState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::query::MatchType;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn make_test_view(id: i64) -> ConversationView {
         ConversationView {
@@ -945,6 +1416,107 @@ mod tests {
     }
 
     #[test]
+    fn load_conversation_cache_is_scoped_by_database_path() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        CONVERSATION_CACHE.invalidate_all();
+
+        let tmp_a = tempfile::TempDir::new().expect("tempdir a");
+        let db_path_a = tmp_a.path().join("cass-a.db");
+        let storage_a = FrankenStorage::open(&db_path_a).expect("open storage a");
+        let conn_a = storage_a.raw();
+
+        let tmp_b = tempfile::TempDir::new().expect("tempdir b");
+        let db_path_b = tmp_b.path().join("cass-b.db");
+        let storage_b = FrankenStorage::open(&db_path_b).expect("open storage b");
+        let conn_b = storage_b.raw();
+
+        let shared_path = "/shared/cross-db-session.jsonl";
+
+        for conn in [&conn_a, &conn_b] {
+            conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+                .expect("insert agent");
+        }
+
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn_a.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'db-a', 'DB A Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert db a conversation");
+            conn_b.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'db-b', 'DB B Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert db b conversation");
+        }
+        conn_a.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'db a body')",
+        )
+        .expect("insert db a message");
+        conn_b.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'db b body')",
+        )
+        .expect("insert db b message");
+
+        let from_a = load_conversation(&storage_a, shared_path)
+            .expect("load from db a")
+            .expect("db a conversation present");
+        assert_eq!(from_a.convo.title.as_deref(), Some("DB A Session"));
+        assert_eq!(from_a.messages[0].content, "db a body");
+
+        let from_b = load_conversation(&storage_b, shared_path)
+            .expect("load from db b")
+            .expect("db b conversation present");
+        assert_eq!(from_b.convo.title.as_deref(), Some("DB B Session"));
+        assert_eq!(from_b.messages[0].content, "db b body");
+
+        CONVERSATION_CACHE.invalidate_all();
+    }
+
+    #[test]
+    fn load_conversation_for_source_selects_blank_remote_source_id_via_origin_host() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/session.jsonl";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('   ', 'ssh', 'user@laptop', 0, 0)",
+        )
+        .expect("insert blank-id remote source");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, origin_host, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, '   ', 'user@laptop', 200)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert remote conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'remote body')",
+        )
+        .expect("insert remote message");
+
+        let loaded = load_conversation_for_source(&storage, "user@laptop", shared_path)
+            .expect("load conversation")
+            .expect("conversation present");
+
+        assert_eq!(loaded.convo.source_id, "user@laptop");
+        assert_eq!(loaded.convo.origin_host.as_deref(), Some("user@laptop"));
+        assert_eq!(loaded.convo.title.as_deref(), Some("Remote Session"));
+        assert_eq!(loaded.messages[0].content, "remote body");
+    }
+
+    #[test]
     fn load_conversation_for_source_selects_exact_source_id() {
         use crate::storage::sqlite::FrankenStorage;
 
@@ -956,11 +1528,19 @@ mod tests {
 
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
+        )
+        .expect("insert local source");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+        )
+        .expect("insert source");
         {
             use frankensqlite::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
-                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, 'local', 200)",
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 200)",
                 &param_slice_to_values(&p),
             )
             .expect("insert local conversation");
@@ -993,6 +1573,803 @@ mod tests {
         assert_eq!(remote.convo.source_id, "work-laptop");
         assert_eq!(remote.convo.title.as_deref(), Some("Remote Session"));
         assert_eq!(remote.messages[0].content, "remote body");
+    }
+
+    #[test]
+    fn load_conversation_for_source_invalidates_cache_when_newer_conversation_arrives() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/source-specific-session.jsonl";
+
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert old conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old body')",
+        )
+        .expect("insert old message");
+
+        let first = load_conversation_for_source(&storage, "local", shared_path)
+            .expect("load old conversation")
+            .expect("old conversation present");
+        assert_eq!(first.convo.title.as_deref(), Some("Old Session"));
+        assert_eq!(first.messages[0].content, "old body");
+
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', ?1, 'local', 200)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert new conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new body')",
+        )
+        .expect("insert new message");
+
+        let second = load_conversation_for_source(&storage, "local", shared_path)
+            .expect("load new conversation")
+            .expect("new conversation present");
+
+        assert_eq!(second.convo.title.as_deref(), Some("New Session"));
+        assert_eq!(second.messages[0].content, "new body");
+
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+    }
+
+    #[test]
+    fn load_conversation_prefers_local_source_for_shared_path() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/session.jsonl";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
+        )
+        .expect("insert local source");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+        )
+        .expect("insert source");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert local conversation");
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 200)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert remote conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'local body')",
+        )
+        .expect("insert local message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'remote body')",
+        )
+        .expect("insert remote message");
+
+        let loaded = load_conversation(&storage, shared_path)
+            .expect("load conversation")
+            .expect("conversation present");
+
+        assert_eq!(loaded.convo.source_id, "local");
+        assert_eq!(loaded.convo.title.as_deref(), Some("Local Session"));
+        assert_eq!(loaded.messages[0].content, "local body");
+    }
+
+    #[test]
+    fn load_conversation_uses_cached_value_when_validation_query_fails() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cached-when-db-breaks.jsonl";
+
+        CONVERSATION_CACHE.invalidate(None, shared_path);
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert local conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'cached body')",
+        )
+        .expect("insert local message");
+
+        let cached = load_conversation(&storage, shared_path)
+            .expect("load initial conversation")
+            .expect("conversation present");
+        assert_eq!(cached.convo.title.as_deref(), Some("Cached Session"));
+        assert_eq!(cached.messages[0].content, "cached body");
+
+        conn.execute("DROP TABLE conversations")
+            .expect("drop conversations to force validation failure");
+
+        let still_cached = load_conversation(&storage, shared_path)
+            .expect("use cached conversation after validation failure")
+            .expect("cached conversation still present");
+
+        assert_eq!(still_cached.convo.title.as_deref(), Some("Cached Session"));
+        assert_eq!(still_cached.messages[0].content, "cached body");
+
+        CONVERSATION_CACHE.invalidate(None, shared_path);
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+    }
+
+    #[test]
+    fn conversation_view_matches_hit_normalizes_blank_remote_source_id_via_origin_host() {
+        let view = ConversationView {
+            convo: Conversation {
+                id: Some(1),
+                agent_slug: "claude_code".to_string(),
+                workspace: None,
+                external_id: Some("ext-1".to_string()),
+                title: Some("Session".to_string()),
+                source_path: std::path::PathBuf::from("/shared/session.jsonl"),
+                started_at: Some(100),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: "user@laptop".to_string(),
+                origin_host: Some("user@laptop".to_string()),
+            },
+            messages: vec![Message {
+                id: Some(1),
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(101),
+                content: "body".to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            workspace: None,
+        };
+
+        let hit = SearchHit {
+            title: "Session".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            score: 0.0,
+            conversation_id: None,
+            source_path: "/shared/session.jsonl".to_string(),
+            agent: "claude_code".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "   ".to_string(),
+            origin_kind: "remote".to_string(),
+            origin_host: Some("user@laptop".to_string()),
+        };
+
+        assert!(conversation_view_matches_hit(&view, &hit));
+    }
+
+    #[test]
+    fn conversation_view_matches_hit_normalizes_local_source_id_variants() {
+        let view = ConversationView {
+            convo: Conversation {
+                id: Some(1),
+                agent_slug: "claude_code".to_string(),
+                workspace: None,
+                external_id: Some("ext-1".to_string()),
+                title: Some("Session".to_string()),
+                source_path: std::path::PathBuf::from("/shared/session.jsonl"),
+                started_at: Some(100),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: "local".to_string(),
+                origin_host: None,
+            },
+            messages: vec![Message {
+                id: Some(1),
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(101),
+                content: "body".to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            workspace: None,
+        };
+
+        let hit = SearchHit {
+            title: "Session".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            score: 0.0,
+            conversation_id: None,
+            source_path: "/shared/session.jsonl".to_string(),
+            agent: "claude_code".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "  LOCAL  ".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        assert!(conversation_view_matches_hit(&view, &hit));
+    }
+
+    #[test]
+    fn load_conversation_for_source_uses_cached_value_when_validation_query_fails() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/source-cache-when-db-breaks.jsonl";
+
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Cached Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert local conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'cached body')",
+        )
+        .expect("insert local message");
+
+        let cached = load_conversation_for_source(&storage, "local", shared_path)
+            .expect("load initial conversation")
+            .expect("conversation present");
+        assert_eq!(cached.convo.title.as_deref(), Some("Cached Session"));
+        assert_eq!(cached.messages[0].content, "cached body");
+
+        conn.execute("DROP TABLE conversations")
+            .expect("drop conversations to force validation failure");
+
+        let still_cached = load_conversation_for_source(&storage, "  LOCAL  ", shared_path)
+            .expect("use cached conversation after validation failure")
+            .expect("cached conversation still present");
+
+        assert_eq!(still_cached.convo.title.as_deref(), Some("Cached Session"));
+        assert_eq!(still_cached.messages[0].content, "cached body");
+
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+    }
+
+    #[test]
+    fn load_conversation_invalidates_path_only_cache_when_local_source_appears() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/late-local-session.jsonl";
+
+        CONVERSATION_CACHE.invalidate(None, shared_path);
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+        CONVERSATION_CACHE.invalidate(Some("work-laptop"), shared_path);
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
+        )
+        .expect("insert source");
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', ?1, 'work-laptop', 200)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert remote conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'remote body')",
+        )
+        .expect("insert remote message");
+
+        let first = load_conversation(&storage, shared_path)
+            .expect("load remote conversation")
+            .expect("remote conversation present");
+        assert_eq!(first.convo.source_id, "work-laptop");
+        assert_eq!(first.messages[0].content, "remote body");
+
+        {
+            use frankensqlite::compat::{ParamValue, param_slice_to_values};
+            let p = [ParamValue::from(shared_path.to_string())];
+            conn.execute_with_params(
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'local-ext', 'Local Session', ?1, 'local', 100)",
+                &param_slice_to_values(&p),
+            )
+            .expect("insert local conversation");
+        }
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'local body')",
+        )
+        .expect("insert local message");
+
+        let second = load_conversation(&storage, shared_path)
+            .expect("load local conversation")
+            .expect("local conversation present");
+
+        assert_eq!(second.convo.source_id, "local");
+        assert_eq!(second.convo.title.as_deref(), Some("Local Session"));
+        assert_eq!(second.messages[0].content, "local body");
+
+        CONVERSATION_CACHE.invalidate(None, shared_path);
+        CONVERSATION_CACHE.invalidate(Some("local"), shared_path);
+        CONVERSATION_CACHE.invalidate(Some("work-laptop"), shared_path);
+    }
+
+    #[test]
+    fn load_conversation_for_hit_selects_exact_conversation_within_same_source_and_path() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
+        )
+        .expect("insert old conversation");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert new conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 101, 'old conversation body')",
+        )
+        .expect("insert old message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (2, 2, 0, 'user', 201, 'new conversation body')",
+        )
+        .expect("insert new message");
+
+        let hit = SearchHit {
+            title: "New Session".to_string(),
+            snippet: "new conversation body".to_string(),
+            content: "new conversation body".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(201),
+            line_number: Some(1),
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("new-ext"));
+        assert_eq!(loaded.convo.title.as_deref(), Some("New Session"));
+        assert_eq!(loaded.messages[0].content, "new conversation body");
+    }
+
+    #[test]
+    fn load_conversation_for_hit_accepts_matching_timestamp_even_when_hit_content_is_stale() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'new conversation body')",
+        )
+        .expect("insert message");
+
+        let hit = SearchHit {
+            title: "New Session".to_string(),
+            snippet: "rendered fragment".to_string(),
+            content: "stale search fragment".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(201),
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("new-ext"));
+        assert_eq!(loaded.messages[0].content, "new conversation body");
+    }
+
+    #[test]
+    fn load_conversation_for_hit_falls_back_when_conversation_id_is_stale() {
+        let tmp = tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let conn = storage.raw();
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
+        )
+        .expect("insert message");
+
+        let hit = SearchHit {
+            title: "Database Title".to_string(),
+            snippet: "db body".to_string(),
+            content: "db body".to_string(),
+            content_hash: 0,
+            conversation_id: Some(999),
+            score: 1.0,
+            source_path: "/shared/cursor.sqlite".to_string(),
+            agent: "claude_code".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(201),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load attempt succeeds")
+            .expect("should fall back to provenance match after stale conversation id misses");
+
+        assert_eq!(loaded.convo.id, Some(1));
+        assert_eq!(
+            loaded.convo.source_path,
+            std::path::Path::new("/shared/cursor.sqlite")
+        );
+    }
+
+    #[test]
+    fn load_conversation_for_hit_uses_origin_host_when_db_source_id_is_blank_remote() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/remote.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('   ', 'ssh', 'user@laptop', 0, 0)",
+        )
+        .expect("insert blank-id remote source");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, origin_host, started_at) VALUES (1, 1, 'remote-ext', 'Remote Session', '/shared/remote.sqlite', '   ', 'user@laptop', 200)",
+        )
+        .expect("insert conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
+        )
+        .expect("insert message");
+
+        let hit = SearchHit {
+            title: "Remote Session".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            conversation_id: Some(1),
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "   ".to_string(),
+            origin_kind: "remote".to_string(),
+            origin_host: Some("user@laptop".to_string()),
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.id, Some(1));
+        assert_eq!(loaded.convo.source_id, "user@laptop");
+        assert_eq!(loaded.convo.origin_host.as_deref(), Some("user@laptop"));
+    }
+
+    #[test]
+    fn load_conversation_for_hit_prefers_exact_conversation_id_over_stale_path() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
+        )
+        .expect("insert local source");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/db/real/path.sqlite', '  local  ', 200)",
+        )
+        .expect("insert conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
+        )
+        .expect("insert message");
+
+        let hit = SearchHit {
+            title: "Stale Indexed Title".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            conversation_id: Some(1),
+            score: 0.0,
+            source_path: "/stale/index/path.sqlite".to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "remote-laptop".to_string(),
+            origin_kind: "remote".to_string(),
+            origin_host: Some("dev@laptop".to_string()),
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.id, Some(1));
+        assert_eq!(
+            loaded.convo.source_path.to_string_lossy(),
+            "/db/real/path.sqlite"
+        );
+        assert_eq!(loaded.convo.source_id, "local");
+    }
+
+    #[test]
+    fn load_conversation_for_hit_prefers_exact_conversation_id_over_stale_title() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'exact-ext', 'Database Title', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 201, 'db body')",
+        )
+        .expect("insert message");
+
+        let hit = SearchHit {
+            title: "Stale Indexed Title".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            conversation_id: Some(1),
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.id, Some(1));
+        assert_eq!(loaded.convo.title.as_deref(), Some("Database Title"));
+    }
+
+    #[test]
+    fn load_conversation_for_hit_uses_title_only_identity_hint() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
+        )
+        .expect("insert old conversation");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert new conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old conversation body')",
+        )
+        .expect("insert old message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new conversation body')",
+        )
+        .expect("insert new message");
+
+        let hit = SearchHit {
+            title: "Old Session".to_string(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load attempt succeeds")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("old-ext"));
+        assert_eq!(loaded.convo.title.as_deref(), Some("Old Session"));
+    }
+
+    #[test]
+    fn load_conversation_for_hit_does_not_fall_back_to_wrong_conversation_when_identity_misses() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
+        )
+        .expect("insert old conversation");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert new conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (1, 1, 0, 'user', 101, 'old conversation body')",
+        )
+        .expect("insert old message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, created_at, content) VALUES (2, 2, 0, 'user', 201, 'new conversation body')",
+        )
+        .expect("insert new message");
+
+        let hit = SearchHit {
+            title: "Missing Session".to_string(),
+            snippet: "missing conversation body".to_string(),
+            content: "missing conversation body".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(999),
+            line_number: Some(1),
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit).expect("load attempt succeeds");
+        assert!(
+            loaded.is_none(),
+            "identity-mismatched hits must not fall back to an arbitrary conversation"
+        );
     }
 
     #[test]
