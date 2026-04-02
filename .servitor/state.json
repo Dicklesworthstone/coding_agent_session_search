@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-02T01:26:00-06:00",
-  "last_wake_reason": "agent-mail #174. Inbox clean. CI still failing (asupersync path dep). Dirty worktree unchanged. No actionable work within autonomy.",
+  "last_heartbeat": "2026-04-02T06:32:00-06:00",
+  "last_wake_reason": "heartbeat #175. Inbox clean (latest msg #197, 2026-03-29). CI still failing (asupersync path dep). Dirty worktree unchanged. No actionable work within autonomy.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -134,7 +134,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 174,
+    "total_wakes": 175,
     "total_reviews": 0,
     "total_prs_created": 0,
     "total_messages_processed": 36
