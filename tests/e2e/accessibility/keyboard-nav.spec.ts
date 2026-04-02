@@ -49,9 +49,7 @@ test.describe('Keyboard Accessibility', () => {
       );
     });
 
-    // Focus should be visible (or element has its own styles)
-    // This is a soft check as styling varies
-    expect(hasFocusStyles !== undefined).toBe(true);
+    expect(hasFocusStyles).toBe(true);
   });
 
   test('Escape closes modals/popups', async ({ page, exportPath }) => {
@@ -69,10 +67,11 @@ test.describe('Keyboard Accessibility', () => {
       // Press Escape
       await page.keyboard.press('Escape');
 
-      // Check if input is cleared or modal closed
       const value = await searchInput.first().inputValue();
-      // Should be empty or the element should be blurred
-      expect(value === '' || value === 'test').toBe(true);
+      const stillFocused = await searchInput
+        .first()
+        .evaluate((el) => el === document.activeElement);
+      expect(value === '' || !stillFocused).toBe(true);
     }
   });
 
@@ -90,16 +89,27 @@ test.describe('Keyboard Accessibility', () => {
       await button.focus();
       await expect(button).toBeFocused();
 
-      // Track if something happened
-      const initialState = await page.content();
+      await button.evaluate((el) => {
+        (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount = 0;
+        el.addEventListener(
+          'click',
+          () => {
+            (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount =
+              ((el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ?? 0) +
+              1;
+          },
+          { once: false }
+        );
+      });
 
       // Press Enter
       await page.keyboard.press('Enter');
       await page.waitForTimeout(200);
 
-      // Page state might have changed (theme, search, etc.)
-      // Just verify no crash
-      expect(true).toBe(true);
+      const activationCount = await button.evaluate(
+        (el) => (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ?? 0
+      );
+      expect(activationCount).toBeGreaterThan(0);
     }
   });
 

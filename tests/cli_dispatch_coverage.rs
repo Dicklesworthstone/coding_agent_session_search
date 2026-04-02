@@ -9,11 +9,13 @@
 
 use assert_cmd::Command;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -115,6 +117,167 @@ fn sample_conversation(
         source_id: "local".to_string(),
         origin_host: None,
     }
+}
+
+fn seed_analytics_workspace_fixture(temp_home: &TempDir) -> (PathBuf, PathBuf) {
+    let data_dir = temp_home.path().join(".local/share/coding-agent-search");
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace_a = temp_home.path().join("workspace-a");
+    let workspace_b = temp_home.path().join("workspace-b");
+    fs::create_dir_all(&workspace_a).unwrap();
+    fs::create_dir_all(&workspace_b).unwrap();
+
+    let session_a = workspace_a.join("analytics-a.jsonl");
+    let session_b = workspace_b.join("analytics-b.jsonl");
+    fs::write(&session_a, "{}\n").unwrap();
+    fs::write(&session_b, "{}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_a_id = storage
+        .ensure_workspace(&workspace_a, Some("workspace-a"))
+        .unwrap();
+    let workspace_b_id = storage
+        .ensure_workspace(&workspace_b, Some("workspace-b"))
+        .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    storage
+        .insert_conversation_tree(
+            codex_id,
+            Some(workspace_a_id),
+            &sample_conversation(
+                "codex",
+                &workspace_a,
+                &session_a,
+                "analytics-workspace-a",
+                "Workspace A Analytics Session",
+                now_ms,
+                vec![
+                    sample_message(0, MessageRole::User, now_ms, "question-a"),
+                    sample_message(1, MessageRole::Agent, now_ms + 1, "answer-a"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    storage
+        .insert_conversation_tree(
+            codex_id,
+            Some(workspace_b_id),
+            &sample_conversation(
+                "codex",
+                &workspace_b,
+                &session_b,
+                "analytics-workspace-b",
+                "Workspace B Analytics Session",
+                now_ms + 10,
+                vec![sample_message(
+                    0,
+                    MessageRole::User,
+                    now_ms + 10,
+                    "question-b",
+                )],
+            ),
+        )
+        .unwrap();
+
+    storage.rebuild_analytics().unwrap();
+
+    (workspace_a, workspace_b)
+}
+
+fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
+    let (workspace_a, _workspace_b) = seed_analytics_workspace_fixture(temp_home);
+    let db_path = temp_home
+        .path()
+        .join(".local/share/coding-agent-search/agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
+
+    let workspace_rows = conn
+        .query_map_collect(
+            "SELECT path, id FROM workspaces",
+            &[],
+            |row: &frankensqlite::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )
+        .unwrap();
+    let workspace_a_id = workspace_rows
+        .into_iter()
+        .find(|(path, _)| path == &workspace_a.to_string_lossy())
+        .map(|(_, id)| id)
+        .expect("workspace-a id");
+
+    let message_rows = conn
+        .query_map_collect(
+            "SELECT m.id, m.conversation_id, c.workspace_id, c.agent_id, m.role, COALESCE(m.created_at, 0), LENGTH(m.content)
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             ORDER BY m.id",
+            &[],
+            |row: &frankensqlite::Row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<Option<i64>>(2)?.expect("workspace id"),
+                    row.get_typed::<i64>(3)?,
+                    row.get_typed::<String>(4)?,
+                    row.get_typed::<i64>(5)?,
+                    row.get_typed::<i64>(6)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    let mut workspace_a_totals = vec![12_i64, 17_i64].into_iter();
+    for (message_id, conversation_id, workspace_id, agent_id, role, created_at, content_chars) in
+        message_rows
+    {
+        let (model_name, model_family, total_tokens) = if workspace_id == workspace_a_id {
+            (
+                Some("gpt-4o-mini".to_string()),
+                Some("gpt-4o".to_string()),
+                workspace_a_totals.next().expect("workspace-a token total"),
+            )
+        } else {
+            (
+                Some("claude-3-5-sonnet".to_string()),
+                Some("claude".to_string()),
+                11,
+            )
+        };
+        let day_id =
+            coding_agent_search::storage::sqlite::FrankenStorage::day_id_from_millis(created_at);
+        conn.execute_compat(
+            "INSERT OR REPLACE INTO token_usage (
+                message_id, conversation_id, agent_id, workspace_id, source_id, timestamp_ms, day_id,
+                model_name, model_family, total_tokens, role, content_chars, data_source
+             ) VALUES (?1, ?2, ?3, ?4, 'local', ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'api')",
+            frankensqlite::params![
+                message_id,
+                conversation_id,
+                agent_id,
+                workspace_id,
+                created_at,
+                day_id,
+                model_name,
+                model_family,
+                total_tokens,
+                role,
+                content_chars,
+            ],
+        )
+        .unwrap();
+    }
+
+    workspace_a
 }
 
 // =============================================================================
@@ -2225,6 +2388,177 @@ fn analytics_tokens_with_agent_filter() {
         has_agent_filter,
         "should include agent filter in _meta.filters_applied"
     );
+}
+
+#[test]
+fn analytics_tokens_workspace_filter_applies_and_normalizes_filters() {
+    let tmp = TempDir::new().unwrap();
+    let (workspace_a, _workspace_b) = seed_analytics_workspace_fixture(&tmp);
+    let workspace_arg = format!("  {}  ", workspace_a.display());
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--workspace",
+        &workspace_arg,
+        "--agent",
+        "  codex  ",
+        "--source",
+        "  LOCAL  ",
+        "--json",
+    ]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert_eq!(json["data"]["totals"]["counts"]["message_count"], 2);
+
+    let filters: Vec<String> = json["_meta"]["filters_applied"]
+        .as_array()
+        .expect("filters_applied array")
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    assert!(filters.iter().any(|value| value == "agent=codex"));
+    assert!(filters.iter().any(|value| value == "source=local"));
+    assert!(
+        filters
+            .iter()
+            .any(|value| value == &format!("workspace={}", workspace_a.display()))
+    );
+}
+
+#[test]
+fn analytics_status_workspace_filter_applies_and_normalizes_filters() {
+    let tmp = TempDir::new().unwrap();
+    let (workspace_a, _workspace_b) = seed_analytics_workspace_fixture(&tmp);
+    let workspace_arg = format!("  {}  ", workspace_a.display());
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "status",
+        "--workspace",
+        &workspace_arg,
+        "--agent",
+        "  codex  ",
+        "--source",
+        "  LOCAL  ",
+        "--json",
+    ]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON: {e}
+stdout={stdout}"
+        )
+    });
+
+    assert_eq!(json["data"]["coverage"]["total_messages"], 2);
+
+    let message_metrics = json["data"]["tables"]
+        .as_array()
+        .expect("tables array")
+        .iter()
+        .find(|table| table["table"] == "message_metrics")
+        .expect("message_metrics table entry");
+    assert_eq!(message_metrics["row_count"], 2);
+
+    let filters: Vec<String> = json["_meta"]["filters_applied"]
+        .as_array()
+        .expect("filters_applied array")
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    assert!(filters.iter().any(|value| value == "agent=codex"));
+    assert!(filters.iter().any(|value| value == "source=local"));
+    assert!(
+        filters
+            .iter()
+            .any(|value| value == &format!("workspace={}", workspace_a.display()))
+    );
+}
+
+#[test]
+fn analytics_models_workspace_filter_applies_and_uses_workspace_scoped_breakdown() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_a = seed_analytics_models_workspace_fixture(&tmp);
+    let workspace_arg = format!("  {}  ", workspace_a.display());
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "models",
+        "--workspace",
+        &workspace_arg,
+        "--agent",
+        "  codex  ",
+        "--source",
+        "  LOCAL  ",
+        "--json",
+    ]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert_eq!(
+        json["data"]["by_api_tokens"]["_meta"]["source_table"],
+        "token_usage"
+    );
+    let rows = json["data"]["by_api_tokens"]["rows"]
+        .as_array()
+        .expect("breakdown rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["key"], "gpt-4o");
+    assert_eq!(rows[0]["value"], 29);
+
+    let filters: Vec<String> = json["_meta"]["filters_applied"]
+        .as_array()
+        .expect("filters_applied array")
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+
+    assert!(filters.iter().any(|value| value == "agent=codex"));
+    assert!(filters.iter().any(|value| value == "source=local"));
+    assert!(
+        filters
+            .iter()
+            .any(|value| value == &format!("workspace={}", workspace_a.display()))
+    );
+}
+
+#[test]
+fn analytics_tokens_unknown_workspace_filter_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let _ = seed_analytics_workspace_fixture(&tmp);
+    let missing_workspace = tmp.path().join("missing-workspace");
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--workspace",
+        missing_workspace.to_string_lossy().as_ref(),
+        "--json",
+    ]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert_eq!(json["data"]["bucket_count"], 0);
+    assert_eq!(json["data"]["totals"]["counts"]["message_count"], 0);
 }
 
 #[test]

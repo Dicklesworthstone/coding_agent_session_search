@@ -125,9 +125,11 @@ test.describe('Online to Offline Transitions', () => {
           return null;
         }
       });
+      const feedbackVisible = await page
+        .locator('.copied, .copy-success, [data-copied="true"]')
+        .count();
 
-      // Either clipboard has content or action completed without error
-      expect(clipboardContent !== undefined).toBe(true);
+      expect(feedbackVisible > 0 || (clipboardContent?.trim().length ?? 0) > 0).toBe(true);
     }
 
     await page.context().setOffline(false);

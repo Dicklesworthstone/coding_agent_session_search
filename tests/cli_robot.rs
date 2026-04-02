@@ -694,7 +694,15 @@ fn search_empty_query_returns_all() {
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
     // Empty query should return results (recent conversations)
-    assert!(json["hits"].is_array(), "Should return hits array");
+    let hits = json["hits"].as_array().expect("Should return hits array");
+    assert!(
+        json["count"].is_number(),
+        "empty-query robot output should still report total count"
+    );
+    assert!(
+        hits.len() <= json["count"].as_u64().unwrap() as usize,
+        "reported count should be at least the returned page length"
+    );
 }
 
 #[test]

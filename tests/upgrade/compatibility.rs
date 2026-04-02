@@ -129,8 +129,10 @@ fn test_ignores_unknown_tables() {
     // Should still be able to open and use the database
     let storage = SqliteStorage::open(&db_path).unwrap();
     let agents = storage.list_agents().unwrap();
-    // Should work fine even with extra tables
-    assert!(agents.is_empty() || !agents.is_empty()); // Just verify it doesn't panic
+    assert!(
+        agents.is_empty(),
+        "forward-compatible extra tables should not invent agent rows"
+    );
 }
 
 /// Test that missing optional columns are handled.

@@ -9,7 +9,9 @@
 //!
 //! All tests use real Tantivy indexes and SQLite metadata - no mocks.
 
-use coding_agent_search::search::query::{FieldMask, MatchType, SearchClient, SearchFilters};
+use coding_agent_search::search::query::{
+    FieldMask, MatchType, SearchClient, SearchFilters, SearchHit,
+};
 use coding_agent_search::search::tantivy::TantivyIndex;
 use tempfile::TempDir;
 
@@ -613,8 +615,12 @@ fn title_field_is_searchable() {
 fn empty_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
     let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let source_path = dir.path().join("empty-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
+        .title("empty query title")
+        .source_path(source_path.clone())
+        .messages(1)
         .with_content(0, "some content")
         .build_normalized();
 
@@ -626,9 +632,15 @@ fn empty_query_does_not_panic() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // Empty query should not panic - behavior may vary (returns all or none)
-    let result = client.search("", filters, 10, 0, FieldMask::FULL);
-    assert!(result.is_ok(), "empty query should not error or panic");
+    let hits = client.search("", filters, 10, 0, FieldMask::FULL).unwrap();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "empty query should surface indexed conversations"
+    );
+    assert_eq!(hits[0].source_path, source_path);
+    assert_eq!(hits[0].title, "empty query title");
 }
 
 /// Whitespace-only query behavior is implementation-defined.
@@ -636,8 +648,12 @@ fn empty_query_does_not_panic() {
 fn whitespace_query_does_not_panic() {
     let dir = TempDir::new().unwrap();
     let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+    let source_path = dir.path().join("whitespace-query.jsonl");
 
     let conv = util::ConversationFixtureBuilder::new("tester")
+        .title("whitespace query title")
+        .source_path(source_path)
+        .messages(1)
         .with_content(0, "some content")
         .build_normalized();
 
@@ -649,9 +665,31 @@ fn whitespace_query_does_not_panic() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // Whitespace query should not panic - behavior may vary
-    let result = client.search("   ", filters, 10, 0, FieldMask::FULL);
-    assert!(result.is_ok(), "whitespace query should not error or panic");
+    let empty_hits = client
+        .search("", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let whitespace_hits = client
+        .search("   ", filters, 10, 0, FieldMask::FULL)
+        .unwrap();
+
+    let summarize = |hits: &[SearchHit]| {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.title.clone(),
+                    hit.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        summarize(&whitespace_hits),
+        summarize(&empty_hits),
+        "whitespace-only queries should behave the same as empty queries"
+    );
 }
 
 /// Special characters in query are handled gracefully.
@@ -676,12 +714,33 @@ fn special_characters_handled() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // These should not panic
-    let _ = client.search("c++", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("std::vector", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("foo::bar", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("(test)", filters.clone(), 10, 0, FieldMask::FULL);
-    let _ = client.search("[brackets]", filters.clone(), 10, 0, FieldMask::FULL);
+    let std_hits = client
+        .search("std::vector", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let foo_hits = client
+        .search("foo::bar", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+
+    assert_eq!(
+        std_hits.len(),
+        1,
+        "namespaced queries should still find the document"
+    );
+    assert_eq!(
+        foo_hits.len(),
+        1,
+        "double-colon code tokens should still find the document"
+    );
+    assert_eq!(std_hits[0].title, "special chars");
+    assert_eq!(foo_hits[0].title, "special chars");
+
+    for query in ["c++", "(test)", "[brackets]"] {
+        client
+            .search(query, filters.clone(), 10, 0, FieldMask::FULL)
+            .unwrap_or_else(|err| {
+                panic!("query {query:?} should be sanitized without error: {err}")
+            });
+    }
 }
 
 /// Query with only wildcards.
@@ -702,10 +761,29 @@ fn only_wildcard_query() {
         .expect("client");
     let filters = SearchFilters::default();
 
-    // "*" alone should be handled (may return all or none depending on implementation)
-    let result = client.search("*", filters, 10, 0, FieldMask::FULL);
-    // Should not panic regardless of what it returns
-    assert!(result.is_ok(), "wildcard-only query should not panic");
+    let first = client
+        .search("*", filters.clone(), 10, 0, FieldMask::FULL)
+        .unwrap();
+    let second = client.search("*", filters, 10, 0, FieldMask::FULL).unwrap();
+
+    let summarize = |hits: &[SearchHit]| {
+        hits.iter()
+            .map(|hit| {
+                (
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.title.clone(),
+                    hit.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        summarize(&first),
+        summarize(&second),
+        "wildcard-only queries should be stable across repeated execution"
+    );
 }
 
 // =============================================================================

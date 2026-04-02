@@ -118,7 +118,10 @@ test.describe('Search Functionality', () => {
 
     await test.step('Verify search cleared or left intact', async () => {
       const value = await searchInput.first().inputValue();
-      expect(value === '' || value === 'test query').toBe(true);
+      const stillFocused = await searchInput
+        .first()
+        .evaluate((el) => el === document.activeElement);
+      expect(value === '' || !stillFocused).toBe(true);
     });
   });
 

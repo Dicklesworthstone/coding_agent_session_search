@@ -1126,10 +1126,17 @@ fn empty_query_returns_recent() {
         .output()
         .expect("search command");
 
-    // Empty query might return recent or error - both are valid behaviors
-    // Just verify it doesn't crash
     assert!(
-        output.status.success() || output.status.code() == Some(0),
-        "Empty query should not crash"
+        output.status.success(),
+        "Empty query should succeed after a successful index: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("empty-query search JSON");
+    let hits = json["hits"].as_array().expect("hits array");
+    assert!(
+        !hits.is_empty(),
+        "Empty query should return recent indexed conversations"
     );
 }

@@ -121,8 +121,7 @@ test.describe('Virtual Keyboard Behavior', () => {
       return highlights.length > 0;
     });
 
-    // Either search state changed or action completed without error
-    expect(searchTriggered !== undefined).toBe(true);
+    expect(searchTriggered).toBe(true);
   });
 
   test('password input masks characters', async ({ page, encryptedExportPath }) => {
@@ -178,8 +177,13 @@ test.describe('Virtual Keyboard Behavior', () => {
       await page.waitForTimeout(100);
 
       const value = await searchInput.first().inputValue();
-      // Value should be cleared or search should be reset
-      expect(value === '' || value === 'test').toBe(true);
+      const searchStateReset = await page.evaluate(() => {
+        const url = new URL(window.location.href);
+        const hasQueryParam = url.searchParams.has('q') || url.searchParams.has('search');
+        const highlights = document.querySelectorAll('mark, .highlight, .search-match');
+        return !hasQueryParam && highlights.length === 0;
+      });
+      expect(value === '' || searchStateReset).toBe(true);
     }
   });
 
@@ -278,9 +282,9 @@ test.describe('Form Field Navigation', () => {
       await page.keyboard.press('Shift+Tab');
       await page.waitForTimeout(100);
 
-      // Should be on different element
       const newEl = await page.evaluate(() => document.activeElement?.tagName);
-      expect(newEl !== undefined).toBe(true);
+      expect(newEl).toBeDefined();
+      expect(newEl).not.toBe(secondEl);
     }
   });
 

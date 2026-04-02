@@ -88,7 +88,7 @@ test.describe('High Contrast Mode', () => {
       return style.outline !== 'none' || el.matches(':focus-visible');
     });
 
-    expect(hasFocus !== undefined).toBe(true);
+    expect(hasFocus).toBe(true);
   });
 
   test('buttons are visible in high contrast', async ({ page, exportPath }) => {
