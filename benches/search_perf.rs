@@ -153,6 +153,7 @@ fn make_bench_hit(id: &str, score: f32) -> SearchHit {
         source_id: "local".to_string(),
         origin_kind: "local".to_string(),
         origin_host: None,
+        conversation_id: None,
     }
 }
 

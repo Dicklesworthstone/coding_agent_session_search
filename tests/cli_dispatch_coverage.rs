@@ -507,6 +507,8 @@ fn timeline_json_outputs_valid_structure() {
         "timeline",
         "--json",
         "--today",
+        "--group-by",
+        "none",
         "--data-dir",
         data_dir.to_str().unwrap(),
     ]);
@@ -518,6 +520,253 @@ fn timeline_json_outputs_valid_structure() {
     if !stdout.trim().is_empty() {
         let _json: Value = serde_json::from_str(stdout.trim()).expect("valid timeline json");
     }
+}
+
+#[test]
+fn timeline_json_normalizes_remote_provenance_without_source_row() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("timeline-remote-no-source-row.jsonl");
+    fs::write(&session, "{\"session\":\"timeline-remote\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source::remote(
+            "work-laptop",
+            "user@work-laptop",
+        ))
+        .unwrap();
+    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("UPDATE sources SET kind = '' WHERE id = 'work-laptop'")
+        .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "timeline-remote-no-source-row",
+        "Remote Timeline Session",
+        now_ms,
+        vec![
+            sample_message(0, MessageRole::User, now_ms, "question"),
+            sample_message(1, MessageRole::Agent, now_ms + 1, "answer"),
+        ],
+    );
+    conversation.source_id = "work-laptop".to_string();
+    conversation.origin_host = Some("   ".to_string());
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "timeline",
+        "--json",
+        "--today",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid timeline json");
+    let sessions: Vec<&Value> = if let Some(items) = json.as_array() {
+        items.iter().collect()
+    } else if let Some(items) = json["sessions"].as_array() {
+        items.iter().collect()
+    } else {
+        json["groups"]
+            .as_object()
+            .expect("timeline groups object")
+            .values()
+            .flat_map(|value| value.as_array().into_iter().flatten())
+            .collect()
+    };
+    let entry = sessions
+        .into_iter()
+        .find(|entry| entry["source_path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("remote timeline session entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("work-laptop"));
+    assert_eq!(entry["origin_kind"].as_str(), Some("remote"));
+    assert!(entry["origin_host"].is_null());
+}
+
+#[test]
+fn timeline_json_derives_remote_source_id_from_origin_host_when_source_id_blank() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("timeline-blank-source-id.jsonl");
+    fs::write(&session, "{\"session\":\"timeline-blank-remote\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute(
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
+    )
+    .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "timeline-blank-source-id",
+        "Timeline Blank Source Id",
+        now_ms,
+        vec![
+            sample_message(0, MessageRole::User, now_ms, "question"),
+            sample_message(1, MessageRole::Agent, now_ms + 1, "answer"),
+        ],
+    );
+    conversation.source_id = "   ".to_string();
+    conversation.origin_host = Some("user@work-laptop".to_string());
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "timeline",
+        "--json",
+        "--today",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid timeline json");
+    let sessions: Vec<&Value> = if let Some(items) = json.as_array() {
+        items.iter().collect()
+    } else if let Some(items) = json["sessions"].as_array() {
+        items.iter().collect()
+    } else {
+        json["groups"]
+            .as_object()
+            .expect("timeline groups object")
+            .values()
+            .flat_map(|value| value.as_array().into_iter().flatten())
+            .collect()
+    };
+    let entry = sessions
+        .into_iter()
+        .find(|entry| entry["source_path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("blank source timeline entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("user@work-laptop"));
+    assert_eq!(entry["origin_kind"].as_str(), Some("remote"));
+    assert_eq!(entry["origin_host"].as_str(), Some("user@work-laptop"));
+}
+
+#[test]
+fn timeline_human_output_does_not_badge_trimmed_local_source_id() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("timeline-trimmed-local.jsonl");
+    fs::write(&session, "{\"session\":\"timeline-trimmed-local\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source {
+            id: "  local  ".to_string(),
+            kind: coding_agent_search::sources::provenance::SourceKind::Local,
+            host_label: None,
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "timeline-trimmed-local",
+        "Timeline Trimmed Local",
+        1_700_000_000_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_000_000, "question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_000_001, "answer"),
+        ],
+    );
+    conversation.source_id = "  local  ".to_string();
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "timeline",
+        "--since",
+        "2020-01-01",
+        "--until",
+        "2030-01-01",
+        "--group-by",
+        "none",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Timeline Trimmed Local"));
+    assert!(
+        !stdout.contains("[  local  ]"),
+        "unexpected raw local badge: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[local]"),
+        "unexpected normalized local badge: {stdout}"
+    );
 }
 
 #[test]
@@ -1024,6 +1273,8 @@ fn sessions_json_reports_recent_and_current_workspace_sessions() {
     );
     assert_eq!(all_sessions[0]["message_count"], 2);
     assert_eq!(all_sessions[0]["human_turns"], 1);
+    assert_eq!(all_sessions[0]["source_id"].as_str(), Some("local"));
+    assert!(all_sessions[0]["origin_host"].is_null());
     assert!(all_sessions[0]["size_bytes"].is_number());
 
     let mut current_cmd = base_cmd(tmp.path());
@@ -1052,6 +1303,389 @@ fn sessions_json_reports_recent_and_current_workspace_sessions() {
     assert_eq!(
         current_sessions[0]["workspace"].as_str().unwrap(),
         workspace_a.to_string_lossy()
+    );
+}
+
+#[test]
+fn sessions_json_keeps_local_file_metadata_for_trimmed_local_source_id() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("trimmed-local.jsonl");
+    fs::write(&session, "{\"session\":\"trimmed-local\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source {
+            id: "  local  ".to_string(),
+            kind: coding_agent_search::sources::provenance::SourceKind::Local,
+            host_label: None,
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        })
+        .unwrap();
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "trimmed-local",
+        "Trimmed Local Session",
+        1_700_000_000_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_000_000, "question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_000_001, "answer"),
+        ],
+    );
+    conversation.source_id = "  local  ".to_string();
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    let entry = sessions
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("trimmed local session entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("local"));
+    assert!(
+        entry["size_bytes"].is_number(),
+        "expected local metadata for trimmed local source"
+    );
+    assert!(
+        entry["modified"].is_string(),
+        "expected modified timestamp for trimmed local source"
+    );
+}
+
+#[test]
+fn sessions_json_derives_remote_source_id_from_origin_host_when_source_id_blank() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("remote-blank-source-id.jsonl");
+    fs::write(&session, "{\"session\":\"remote\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute(
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'remote', 'user@work-laptop', 0, 0)",
+    )
+    .unwrap();
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "remote-blank-source-id",
+        "Remote Blank Source Id",
+        1_700_000_000_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_000_000, "question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_000_001, "answer"),
+        ],
+    );
+    conversation.source_id = "   ".to_string();
+    conversation.origin_host = Some("user@work-laptop".to_string());
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    let entry = sessions
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("remote blank source session entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("user@work-laptop"));
+    assert_eq!(entry["origin_host"].as_str(), Some("user@work-laptop"));
+    assert!(
+        entry["size_bytes"].is_null(),
+        "remote fallback source_id must not be treated as local metadata"
+    );
+}
+
+#[test]
+fn sessions_json_keeps_local_file_metadata_for_blank_source_id() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("blank-local-source-id.jsonl");
+    fs::write(&session, "{\"session\":\"blank-local\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    let conn = frankensqlite::Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute(
+        "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES ('   ', 'local', NULL, 0, 0)",
+    )
+    .unwrap();
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "blank-local-source-id",
+        "Blank Local Source Id",
+        1_700_000_000_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_000_000, "question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_000_001, "answer"),
+        ],
+    );
+    conversation.source_id = "   ".to_string();
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    let entry = sessions
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("blank local session entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("local"));
+    assert!(
+        entry["size_bytes"].is_number(),
+        "blank local source_id should still resolve to local file metadata"
+    );
+    assert!(entry["modified"].is_string());
+}
+
+#[test]
+fn sessions_json_trims_blank_remote_origin_host() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let session = tmp.path().join("remote-blank-origin-host.jsonl");
+    fs::write(&session, "{\"session\":\"remote\"}\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source::remote(
+            "work-laptop",
+            "user@work-laptop",
+        ))
+        .unwrap();
+
+    let mut conversation = sample_conversation(
+        "codex",
+        &workspace,
+        &session,
+        "remote-blank-origin-host",
+        "Remote Blank Origin Host",
+        1_700_000_000_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_000_000, "question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_000_001, "answer"),
+        ],
+    );
+    conversation.source_id = "work-laptop".to_string();
+    conversation.origin_host = Some("   ".to_string());
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &conversation)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    let entry = sessions
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(session.to_string_lossy().as_ref()))
+        .expect("remote session entry");
+
+    assert_eq!(entry["source_id"].as_str(), Some("work-laptop"));
+    assert!(
+        entry["origin_host"].is_null(),
+        "blank origin_host should be trimmed away so downstream displays fall back to source_id"
+    );
+}
+
+#[test]
+fn sessions_json_distinguishes_same_path_across_sources() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
+
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let shared_path = tmp.path().join("shared-session.jsonl");
+    fs::write(&shared_path, "{\"session\":\"shared\"}\\n").unwrap();
+
+    let codex_id = storage
+        .ensure_agent(&sample_agent("codex", "Codex"))
+        .unwrap();
+    let workspace_id = storage
+        .ensure_workspace(&workspace, Some("workspace"))
+        .unwrap();
+    storage
+        .upsert_source(&coding_agent_search::sources::provenance::Source::remote(
+            "laptop",
+            "user@laptop",
+        ))
+        .unwrap();
+
+    storage
+        .insert_conversation_tree(
+            codex_id,
+            Some(workspace_id),
+            &sample_conversation(
+                "codex",
+                &workspace,
+                &shared_path,
+                "shared-local",
+                "Shared Session",
+                1_700_000_000_000,
+                vec![
+                    sample_message(0, MessageRole::User, 1_700_000_000_000, "local question"),
+                    sample_message(1, MessageRole::Agent, 1_700_000_000_001, "local answer"),
+                ],
+            ),
+        )
+        .unwrap();
+
+    let mut remote = sample_conversation(
+        "codex",
+        &workspace,
+        &shared_path,
+        "shared-remote",
+        "Shared Session",
+        1_700_000_100_000,
+        vec![
+            sample_message(0, MessageRole::User, 1_700_000_100_000, "remote question"),
+            sample_message(1, MessageRole::Agent, 1_700_000_100_001, "remote answer"),
+        ],
+    );
+    remote.source_id = "laptop".to_string();
+    remote.origin_host = Some("user@laptop".to_string());
+    storage
+        .insert_conversation_tree(codex_id, Some(workspace_id), &remote)
+        .unwrap();
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "sessions",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid sessions json");
+    let sessions = json["sessions"].as_array().expect("sessions array");
+    let shared: Vec<&Value> = sessions
+        .iter()
+        .filter(|entry| entry["path"].as_str() == Some(shared_path.to_string_lossy().as_ref()))
+        .collect();
+
+    assert_eq!(shared.len(), 2, "same-path sessions should both be visible");
+    assert!(
+        shared
+            .iter()
+            .any(|entry| entry["source_id"].as_str() == Some("local"))
+    );
+    assert!(
+        shared
+            .iter()
+            .any(|entry| entry["source_id"].as_str() == Some("laptop"))
+    );
+    assert!(
+        shared
+            .iter()
+            .any(|entry| entry["origin_host"].as_str() == Some("user@laptop"))
     );
 }
 

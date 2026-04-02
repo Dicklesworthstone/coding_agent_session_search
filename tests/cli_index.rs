@@ -3,8 +3,12 @@ use clap::Parser;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::{Cli, Commands};
 use predicates::str::contains;
+use serial_test::serial;
 use std::fs;
 use tempfile::TempDir;
+
+mod util;
+use util::EnvGuard;
 
 fn base_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -194,6 +198,258 @@ fn make_codex_session(root: &std::path::Path, date_path: &str, filename: &str, c
         ts + 1000
     );
     fs::write(file, sample).unwrap();
+}
+
+#[test]
+#[serial]
+fn index_json_reports_full_refresh_lexical_strategy() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "strategy-full.jsonl",
+        "full_strategy_content",
+    );
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = cmd.output().expect("run full index");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "full index should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "full index --json should emit stdout. stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let stats = payload
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+
+    assert_eq!(
+        stats
+            .get("lexical_strategy")
+            .and_then(|value| value.as_str()),
+        Some("deferred_authoritative_db_rebuild")
+    );
+    assert_eq!(
+        stats
+            .get("lexical_strategy_reason")
+            .and_then(|value| value.as_str()),
+        Some("full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild")
+    );
+}
+
+#[test]
+#[serial]
+fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "strategy-canonical.jsonl",
+        "canonical_only_strategy_content",
+    );
+
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir);
+    initial_index.assert().success();
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = cmd.output().expect("run canonical-only full rebuild");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "canonical-only full rebuild should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "canonical-only full rebuild --json should emit stdout. stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let stats = payload
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+
+    assert_eq!(
+        stats
+            .get("lexical_strategy")
+            .and_then(|value| value.as_str()),
+        Some("deferred_authoritative_db_rebuild")
+    );
+    assert_eq!(
+        stats
+            .get("lexical_strategy_reason")
+            .and_then(|value| value.as_str()),
+        Some("full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild")
+    );
+}
+
+#[test]
+#[serial]
+fn index_json_reports_incremental_lexical_strategy() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "strategy-incremental-1.jsonl",
+        "incremental_strategy_content_alpha",
+    );
+
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir);
+    initial_index.assert().success();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    make_codex_session(
+        &codex_home,
+        "2025/11/25",
+        "strategy-incremental-2.jsonl",
+        "incremental_strategy_content_beta",
+    );
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--json", "--data-dir"]).arg(&data_dir);
+    let output = cmd.output().expect("run incremental index");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "incremental index should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "incremental index --json should emit stdout. stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let stats = payload
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+
+    assert_eq!(
+        stats
+            .get("lexical_strategy")
+            .and_then(|value| value.as_str()),
+        Some("incremental_inline")
+    );
+    assert_eq!(
+        stats
+            .get("lexical_strategy_reason")
+            .and_then(|value| value.as_str()),
+        Some("incremental_scan_applies_inline_lexical_updates_only_for_new_messages")
+    );
+}
+
+#[test]
+#[serial]
+fn index_json_reports_watch_once_incremental_lexical_strategy() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "strategy-watch-once-1.jsonl",
+        "watch_once_strategy_seed",
+    );
+
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir);
+    initial_index.assert().success();
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let targeted_path = codex_home.join("sessions/2025/11/25/strategy-watch-once-2.jsonl");
+    make_codex_session(
+        &codex_home,
+        "2025/11/25",
+        "strategy-watch-once-2.jsonl",
+        "watch_once_strategy_delta",
+    );
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--watch-once"])
+        .arg(&targeted_path)
+        .args(["--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = cmd.output().expect("run targeted watch-once index");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "watch-once incremental index should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        !stdout.trim().is_empty(),
+        "watch-once incremental index --json should emit stdout. stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let stats = payload
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+
+    assert_eq!(
+        stats
+            .get("lexical_strategy")
+            .and_then(|value| value.as_str()),
+        Some("incremental_inline")
+    );
+    assert_eq!(
+        stats
+            .get("lexical_strategy_reason")
+            .and_then(|value| value.as_str()),
+        Some("watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths")
+    );
 }
 
 /// Test incremental indexing: creates sessions, indexes, adds more, re-indexes,
