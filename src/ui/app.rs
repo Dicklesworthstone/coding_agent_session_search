@@ -12078,11 +12078,12 @@ impl CassApp {
         let visible = inner.height as usize;
         let start = selected.saturating_sub(visible.saturating_sub(1));
 
+        let current_filter = normalize_source_filter(self.filters.source_filter.clone());
         for (row, (label, filter)) in items.iter().enumerate().skip(start).take(visible) {
             let y = inner.y + (row - start) as u16;
             let row_area = Rect::new(inner.x, y, inner.width, 1);
             let pointer = if row == selected { "> " } else { "  " };
-            let active = if *filter == self.filters.source_filter {
+            let active = if *filter == current_filter {
                 "* "
             } else {
                 "  "
@@ -12090,7 +12091,7 @@ impl CassApp {
             let line = format!("{pointer}{active}{label}");
             let style = if row == selected {
                 selected_style
-            } else if *filter == self.filters.source_filter {
+            } else if *filter == current_filter {
                 muted_style
             } else {
                 text_style
@@ -13935,8 +13936,9 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
         .saved_views
         .iter()
         .map(|view| {
+            let normalized_source_filter = normalize_source_filter(view.source_filter.clone());
             let (source_filter_kind, source_filter_value) =
-                source_filter_to_parts(&view.source_filter);
+                source_filter_to_parts(&normalized_source_filter);
             PersistedSavedView {
                 slot: view.slot,
                 label: view.label.clone(),
@@ -13947,12 +13949,16 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
                 ranking: Some(ranking_mode_str(view.ranking).to_string()),
                 source_filter_kind: Some(source_filter_kind),
                 source_filter_value,
-                source_filter: Some(serde_json::Value::String(view.source_filter.to_string())),
+                source_filter: Some(serde_json::Value::String(
+                    normalized_source_filter.to_string(),
+                )),
             }
         })
         .collect();
+    let normalized_analytics_source_filter =
+        normalize_source_filter(state.analytics_source_filter.clone());
     let (analytics_source_filter_kind, analytics_source_filter_value) =
-        source_filter_to_parts(&state.analytics_source_filter);
+        source_filter_to_parts(&normalized_analytics_source_filter);
     PersistedStateFile {
         version: 1,
         search_mode: Some(search_mode_str(state.search_mode).to_string()),
@@ -13971,7 +13977,7 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
         analytics_source_filter_kind: Some(analytics_source_filter_kind),
         analytics_source_filter_value,
         analytics_source_filter: Some(serde_json::Value::String(
-            state.analytics_source_filter.to_string(),
+            normalized_analytics_source_filter.to_string(),
         )),
         fancy_borders: Some(state.fancy_borders),
         help_pinned: Some(state.help_pinned),
@@ -18439,7 +18445,7 @@ impl super::ftui_adapter::Model for CassApp {
                     created_from: self.filters.created_from,
                     created_to: self.filters.created_to,
                     ranking: self.ranking_mode,
-                    source_filter: self.filters.source_filter.clone(),
+                    source_filter: normalize_source_filter(self.filters.source_filter.clone()),
                 };
                 // Replace existing slot or push
                 let mut replaced = false;
@@ -18471,7 +18477,8 @@ impl super::ftui_adapter::Model for CassApp {
                     self.filters.created_from = view.created_from;
                     self.filters.created_to = view.created_to;
                     self.ranking_mode = view.ranking;
-                    self.filters.source_filter = view.source_filter.clone();
+                    self.filters.source_filter =
+                        normalize_source_filter(view.source_filter.clone());
                     let modal_was_open = self.show_saved_views_modal;
                     self.show_saved_views_modal = false;
                     self.saved_view_drag = None;
@@ -20781,10 +20788,12 @@ impl super::ftui_adapter::Model for CassApp {
                     search_mode_token(self.search_mode),
                     match_mode_token(self.match_mode)
                 );
-                let source_scope = if self.filters.source_filter.is_all() {
+                let display_source_filter =
+                    normalize_source_filter(self.filters.source_filter.clone());
+                let source_scope = if display_source_filter.is_all() {
                     "all".to_string()
                 } else {
-                    self.filters.source_filter.to_string()
+                    display_source_filter.to_string()
                 };
                 let scope_lane = format!(
                     "rank:{} ctx:{} src:{}{}",
@@ -22955,6 +22964,7 @@ fn actionable_path_for_hit_with_config(config: Option<&SourcesConfig>, hit: &Sea
 mod tests {
     use super::*;
     use crate::ftui_harness;
+    use crate::ftui_harness::buffer_to_text;
     use crate::model::types::Message;
     use crate::search::query::MatchType;
     use crate::sources::config::{PathMapping, SourceDefinition};
@@ -23585,6 +23595,45 @@ mod tests {
             source_filter_from_parts(Some("source_id"), Some("   "), None),
             SourceFilter::All
         );
+    }
+
+    #[test]
+    fn persisted_state_file_from_state_normalizes_source_filter_strings() {
+        let state = PersistedState {
+            saved_views: vec![SavedView {
+                slot: 1,
+                label: None,
+                agents: HashSet::new(),
+                workspaces: HashSet::new(),
+                created_from: None,
+                created_to: None,
+                ranking: RankingMode::Balanced,
+                source_filter: SourceFilter::SourceId("  work-laptop  ".to_string()),
+            }],
+            analytics_source_filter: SourceFilter::SourceId("  LOCAL  ".to_string()),
+            ..persisted_state_defaults()
+        };
+
+        let file = persisted_state_file_from_state(&state);
+
+        assert_eq!(
+            file.saved_views[0].source_filter,
+            Some(serde_json::Value::String("work-laptop".to_string()))
+        );
+        assert_eq!(
+            file.saved_views[0].source_filter_kind.as_deref(),
+            Some("source_id")
+        );
+        assert_eq!(
+            file.saved_views[0].source_filter_value.as_deref(),
+            Some("work-laptop")
+        );
+        assert_eq!(
+            file.analytics_source_filter,
+            Some(serde_json::Value::String("local".to_string()))
+        );
+        assert_eq!(file.analytics_source_filter_kind.as_deref(), Some("local"));
+        assert_eq!(file.analytics_source_filter_value, None);
     }
 
     #[test]
@@ -24952,6 +25001,38 @@ mod tests {
             "loading a saved view from modal should release focus trap"
         );
         assert!(matches!(extract_msg(cmd), Some(CassMsg::ViewLoaded(3))));
+    }
+
+    #[test]
+    fn view_saved_normalizes_source_filter_before_storing_saved_view() {
+        let mut app = CassApp::default();
+        app.filters.source_filter = SourceFilter::SourceId("  LOCAL  ".to_string());
+
+        let _ = app.update(CassMsg::ViewSaved(1));
+
+        assert!(matches!(
+            app.saved_views[0].source_filter,
+            SourceFilter::Local
+        ));
+    }
+
+    #[test]
+    fn view_loaded_normalizes_source_filter_from_saved_view() {
+        let mut app = CassApp::default();
+        app.saved_views.push(SavedView {
+            slot: 7,
+            label: None,
+            agents: HashSet::new(),
+            workspaces: HashSet::new(),
+            created_from: None,
+            created_to: None,
+            ranking: RankingMode::Balanced,
+            source_filter: SourceFilter::SourceId("  LOCAL  ".to_string()),
+        });
+
+        let _ = app.update(CassMsg::ViewLoaded(7));
+
+        assert!(matches!(app.filters.source_filter, SourceFilter::Local));
     }
 
     #[test]
@@ -27248,7 +27329,6 @@ mod tests {
     #[test]
     fn compact_density_results_row_includes_inline_snippet_preview() {
         use ftui::render::budget::DegradationLevel;
-        use ftui_harness::buffer_to_text;
 
         let mut app = CassApp::default();
         let mut hit = make_test_hit();
@@ -27264,7 +27344,7 @@ mod tests {
         app.active_pane = 0;
         app.density_mode = DensityMode::Compact;
 
-        let text = buffer_to_text(&render_at_degradation(
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
             &app,
             120,
             24,
@@ -27371,7 +27451,6 @@ mod tests {
     #[test]
     fn density_effective_wired_in_view_rendering() {
         use ftui::render::budget::DegradationLevel;
-        use ftui_harness::buffer_to_text;
 
         let mut app = CassApp::default();
         let mut hit = make_test_hit();
@@ -27423,7 +27502,6 @@ mod tests {
     fn results_surface_density_theme_matrix_preserves_core_cues() {
         use crate::ui::style_system::UiThemePreset;
         use ftui::render::budget::DegradationLevel;
-        use ftui_harness::buffer_to_text;
 
         for preset in [UiThemePreset::TokyoNight, UiThemePreset::Daylight] {
             for density in [
@@ -27441,7 +27519,7 @@ mod tests {
                 app.style_options.preset = preset;
                 app.style_options.dark_mode = app.theme_dark;
 
-                let text = buffer_to_text(&render_at_degradation(
+                let text = ftui_harness::buffer_to_text(&render_at_degradation(
                     &app,
                     140,
                     24,
@@ -27948,7 +28026,6 @@ mod tests {
     #[test]
     fn results_metadata_includes_match_type_cue_for_scanning() {
         use ftui::render::budget::DegradationLevel;
-        use ftui_harness::buffer_to_text;
 
         let mut app = app_with_hits(1);
         app.panes[0].hits[0].match_type = MatchType::ImplicitWildcard;
@@ -27957,7 +28034,7 @@ mod tests {
         app.active_pane = 0;
         app.density_mode = DensityMode::Cozy;
 
-        let text = buffer_to_text(&render_at_degradation(
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
             &app,
             120,
             24,
@@ -28252,6 +28329,24 @@ mod tests {
     }
 
     #[test]
+    fn search_footer_hud_normalizes_trimmed_source_filter_scope() {
+        let mut app = search_surface_fixture_app();
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
+            &app,
+            120,
+            24,
+            ftui::render::budget::DegradationLevel::Full,
+        ));
+
+        assert!(
+            text.contains("src:work-laptop"),
+            "expected normalized source scope in footer, got: {text}"
+        );
+    }
+
+    #[test]
     fn source_filter_menu_quit_requested_closes_and_releases_trap() {
         let mut app = CassApp::default();
         let _ = app.update(CassMsg::SourceFilterMenuToggled);
@@ -28263,6 +28358,27 @@ mod tests {
         assert!(
             !app.focus_manager.is_trapped(),
             "closing source menu should release modal trap"
+        );
+    }
+
+    #[test]
+    fn source_filter_menu_overlay_marks_normalized_source_filter_active() {
+        let mut app = CassApp::default();
+        app.source_filter_menu_open = true;
+        app.source_filter_menu_selection = 3;
+        app.available_source_ids = vec!["work-laptop".to_string()];
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+
+        let text = ftui_harness::buffer_to_text(&render_at_degradation(
+            &app,
+            90,
+            24,
+            ftui::render::budget::DegradationLevel::Full,
+        ));
+
+        assert!(
+            text.contains("* Source: work-laptop"),
+            "expected normalized active source row, got: {text}"
         );
     }
 
