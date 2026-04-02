@@ -791,6 +791,10 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     .is_ok();
 
     if vacuum_success {
+        sync_file_if_exists(&backup_path)?;
+        if let Some(parent) = backup_path.parent() {
+            sync_parent_directory(parent)?;
+        }
         return Ok(Some(backup_path));
     }
 
@@ -798,6 +802,7 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     // We strictly assume this is a single-user tool; if another process is writing,
     // this raw copy might be inconsistent, but it's better than nothing.
     fs::copy(db_path, &backup_path)?;
+    sync_file_if_exists(&backup_path)?;
 
     // Best-effort copy of WAL/SHM sidecar files if they exist
     // SQLite sidecars are named: <path>-wal and <path>-shm
@@ -805,10 +810,17 @@ pub fn create_backup(db_path: &Path) -> Result<Option<std::path::PathBuf>, Migra
     let shm_src = database_sidecar_path(db_path, "-shm");
 
     if wal_src.exists() {
-        let _ = fs::copy(&wal_src, database_sidecar_path(&backup_path, "-wal"));
+        let wal_backup = database_sidecar_path(&backup_path, "-wal");
+        let _ = fs::copy(&wal_src, &wal_backup);
+        let _ = sync_file_if_exists(&wal_backup);
     }
     if shm_src.exists() {
-        let _ = fs::copy(&shm_src, database_sidecar_path(&backup_path, "-shm"));
+        let shm_backup = database_sidecar_path(&backup_path, "-shm");
+        let _ = fs::copy(&shm_src, &shm_backup);
+        let _ = sync_file_if_exists(&shm_backup);
+    }
+    if let Some(parent) = backup_path.parent() {
+        sync_parent_directory(parent)?;
     }
 
     Ok(Some(backup_path))
@@ -842,6 +854,10 @@ pub(crate) fn move_database_bundle(
     destination_root: &Path,
 ) -> std::io::Result<DatabaseBundleMoveResult> {
     let mut moved = DatabaseBundleMoveResult::default();
+    if let Some(parent) = destination_root.parent() {
+        fs::create_dir_all(parent)?;
+        sync_parent_directory(parent)?;
+    }
 
     if source_root.exists() {
         fs::rename(source_root, destination_root)?;
@@ -860,14 +876,40 @@ pub(crate) fn move_database_bundle(
         moved.shm = true;
     }
 
+    if moved.moved_any() {
+        if let Some(parent) = source_root.parent() {
+            sync_parent_directory(parent)?;
+        }
+        if let Some(parent) = destination_root.parent() {
+            sync_parent_directory(parent)?;
+        }
+    }
+
     Ok(moved)
 }
 
 fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<()> {
+    if let Some(parent) = destination_root.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating destination directory for database bundle copy: {}",
+                parent.display()
+            )
+        })?;
+        sync_parent_directory(parent)
+            .with_context(|| format!("syncing destination directory {}", parent.display()))?;
+    }
+
     fs::copy(source_root, destination_root).with_context(|| {
         format!(
             "copying database bundle {} -> {}",
             source_root.display(),
+            destination_root.display()
+        )
+    })?;
+    sync_file_if_exists(destination_root).with_context(|| {
+        format!(
+            "syncing copied database bundle {}",
             destination_root.display()
         )
     })?;
@@ -885,6 +927,17 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
                 destination_sidecar.display()
             )
         })?;
+        sync_file_if_exists(&destination_sidecar).with_context(|| {
+            format!(
+                "syncing copied database bundle sidecar {}",
+                destination_sidecar.display()
+            )
+        })?;
+    }
+
+    if let Some(parent) = destination_root.parent() {
+        sync_parent_directory(parent)
+            .with_context(|| format!("syncing destination directory {}", parent.display()))?;
     }
 
     Ok(())
@@ -892,13 +945,44 @@ fn copy_database_bundle(source_root: &Path, destination_root: &Path) -> Result<(
 
 /// Helper to safely remove a database file and its potential WAL/SHM sidecars.
 pub(crate) fn remove_database_files(path: &Path) -> std::io::Result<()> {
-    // Remove the main database file
-    fs::remove_file(path)?;
+    let mut removed_any = false;
+
+    match fs::remove_file(path) {
+        Ok(()) => removed_any = true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
 
     // Best-effort removal of sidecar files (ignore errors if they don't exist)
-    let _ = fs::remove_file(database_sidecar_path(path, "-wal"));
-    let _ = fs::remove_file(database_sidecar_path(path, "-shm"));
+    for suffix in ["-wal", "-shm"] {
+        match fs::remove_file(database_sidecar_path(path, suffix)) {
+            Ok(()) => removed_any = true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
 
+    if removed_any && let Some(parent) = path.parent() {
+        sync_parent_directory(parent)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        fs::File::open(path)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -9112,6 +9196,26 @@ mod tests {
         assert_eq!(backup_content, original_content);
     }
 
+    #[test]
+    fn create_backup_copies_sidecars_when_present() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        let backup_path = create_backup(&db_path).unwrap().unwrap();
+
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
+            b"shm"
+        );
+    }
+
     // =========================================================================
     // Backup cleanup tests (bead yln.4)
     // =========================================================================
@@ -9251,6 +9355,95 @@ mod tests {
             std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
             b"shm"
         );
+    }
+
+    #[test]
+    fn copy_database_bundle_copies_database_and_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let copied_path = dir.path().join("copy.db");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        copy_database_bundle(&db_path, &copied_path).unwrap();
+
+        assert_eq!(std::fs::read(&copied_path).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&copied_path, "-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&copied_path, "-shm")).unwrap(),
+            b"shm"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"db");
+    }
+
+    #[test]
+    fn copy_database_bundle_creates_destination_parent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let copied_path = dir.path().join("nested/copies/copy.db");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+
+        copy_database_bundle(&db_path, &copied_path).unwrap();
+
+        assert!(copied_path.parent().unwrap().is_dir());
+        assert_eq!(std::fs::read(&copied_path).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&copied_path, "-wal")).unwrap(),
+            b"wal"
+        );
+    }
+
+    #[test]
+    fn move_database_bundle_creates_destination_parent_and_moves_sidecars() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let backup_path = dir.path().join("nested/backups/test.db.corrupt");
+
+        std::fs::write(&db_path, b"db").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        let moved = move_database_bundle(&db_path, &backup_path).unwrap();
+        assert_eq!(
+            moved,
+            DatabaseBundleMoveResult {
+                database: true,
+                wal: true,
+                shm: true
+            }
+        );
+        assert!(backup_path.parent().unwrap().is_dir());
+        assert_eq!(std::fs::read(&backup_path).unwrap(), b"db");
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-wal")).unwrap(),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(database_sidecar_path(&backup_path, "-shm")).unwrap(),
+            b"shm"
+        );
+    }
+
+    #[test]
+    fn remove_database_files_removes_orphan_sidecars_without_main_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        std::fs::write(database_sidecar_path(&db_path, "-wal"), b"wal").unwrap();
+        std::fs::write(database_sidecar_path(&db_path, "-shm"), b"shm").unwrap();
+
+        remove_database_files(&db_path).unwrap();
+
+        assert!(!db_path.exists());
+        assert!(!database_sidecar_path(&db_path, "-wal").exists());
+        assert!(!database_sidecar_path(&db_path, "-shm").exists());
     }
 
     #[test]

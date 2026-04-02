@@ -1212,6 +1212,26 @@ impl From<AnalyticsBucketing> for analytics::GroupBy {
     }
 }
 
+fn normalized_analytics_agent_arg(agent: &str) -> String {
+    let trimmed = agent.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn analytics_source_filter_from_common_input(source: Option<&str>) -> analytics::SourceFilter {
+    match source.map(crate::sources::provenance::SourceFilter::parse) {
+        None | Some(crate::sources::provenance::SourceFilter::All) => analytics::SourceFilter::All,
+        Some(crate::sources::provenance::SourceFilter::Local) => analytics::SourceFilter::Local,
+        Some(crate::sources::provenance::SourceFilter::Remote) => analytics::SourceFilter::Remote,
+        Some(crate::sources::provenance::SourceFilter::SourceId(source_id)) => {
+            analytics::SourceFilter::Specific(source_id)
+        }
+    }
+}
+
 impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
     fn from(common: &AnalyticsCommon) -> Self {
         let now_ms = std::time::SystemTime::now()
@@ -1227,19 +1247,16 @@ impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
 
         let until_ms: Option<i64> = common.until.as_deref().and_then(parse_datetime_str);
 
-        let source = match common.source.as_deref() {
-            None | Some("all") => analytics::SourceFilter::All,
-            Some("local") => analytics::SourceFilter::Local,
-            Some("remote") => analytics::SourceFilter::Remote,
-            Some(specific) => analytics::SourceFilter::Specific(specific.into()),
-        };
-
         analytics::AnalyticsFilter {
             since_ms,
             until_ms,
-            agents: common.agent.clone(),
-            source,
-            workspace_ids: vec![], // workspace lookup not yet wired
+            agents: common
+                .agent
+                .iter()
+                .map(|agent| normalized_analytics_agent_arg(agent))
+                .collect(),
+            source: analytics_source_filter_from_common_input(common.source.as_deref()),
+            workspace_ids: vec![],
         }
     }
 }
@@ -3874,15 +3891,80 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
         f.push(format!("days={d}"));
     }
     for a in &common.agent {
-        f.push(format!("agent={a}"));
+        f.push(format!("agent={}", normalized_analytics_agent_arg(a)));
     }
     for w in &common.workspace {
-        f.push(format!("workspace={w}"));
+        let trimmed = w.trim();
+        if !trimmed.is_empty() {
+            f.push(format!("workspace={trimmed}"));
+        }
     }
-    if let Some(s) = &common.source {
-        f.push(format!("source={s}"));
+    if common.source.is_some() {
+        let source_label = match analytics_source_filter_from_common_input(common.source.as_deref())
+        {
+            analytics::SourceFilter::All => "all".to_string(),
+            analytics::SourceFilter::Local => "local".to_string(),
+            analytics::SourceFilter::Remote => "remote".to_string(),
+            analytics::SourceFilter::Specific(source_id) => source_id,
+        };
+        f.push(format!("source={source_label}"));
     }
     f
+}
+
+fn resolve_analytics_workspace_ids(
+    conn: &frankensqlite::Connection,
+    workspace_paths: &[String],
+) -> CliResult<Vec<i64>> {
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+    let requested_paths: Vec<String> = workspace_paths
+        .iter()
+        .map(|workspace| workspace.trim())
+        .filter(|workspace| !workspace.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if requested_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !analytics::query::table_exists(conn, "workspaces") {
+        return Ok(vec![-1]);
+    }
+
+    let mut workspace_ids = std::collections::BTreeSet::new();
+    for workspace in requested_paths {
+        let ids: Vec<i64> = conn
+            .query_map_collect(
+                "SELECT id FROM workspaces WHERE path = ?1",
+                &[ParamValue::from(workspace.as_str())],
+                |row: &frankensqlite::Row| row.get_typed(0),
+            )
+            .map_err(|e| CliError {
+                code: 9,
+                kind: "db-error",
+                message: format!("Failed to resolve analytics workspace filter '{workspace}': {e}"),
+                hint: Some("Check that the workspaces table exists and is readable.".into()),
+                retryable: false,
+            })?;
+        workspace_ids.extend(ids);
+    }
+
+    if workspace_ids.is_empty() {
+        Ok(vec![-1])
+    } else {
+        Ok(workspace_ids.into_iter().collect())
+    }
+}
+
+fn analytics_query_filter(
+    conn: &frankensqlite::Connection,
+    common: &AnalyticsCommon,
+) -> CliResult<analytics::AnalyticsFilter> {
+    let mut filter = analytics::AnalyticsFilter::from(common);
+    filter.workspace_ids = resolve_analytics_workspace_ids(conn, &common.workspace)?;
+    Ok(filter)
 }
 
 /// Open a read-only frankensqlite connection for analytics queries.
@@ -3973,7 +4055,7 @@ fn run_analytics_status(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_status(&conn, &filter)
         .map(|r| r.to_json())
@@ -3997,7 +4079,7 @@ fn run_analytics_tokens(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_tokens_timeseries(&conn, &filter, group_by.into())
         .map(|r| r.to_cli_json())
@@ -4098,7 +4180,7 @@ fn run_analytics_tools(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_tools(&conn, &filter, group_by.into(), limit)
         .map(|r| r.to_cli_json())
@@ -4224,7 +4306,7 @@ fn run_analytics_models(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics::AnalyticsFilter::from(common);
+    let filter = analytics_query_filter(&conn, common)?;
     let db_err = |e: crate::analytics::AnalyticsError| CliError {
         code: 9,
         kind: "db-error",

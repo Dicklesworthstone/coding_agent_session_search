@@ -3283,12 +3283,8 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
             backups_dir.display()
         )
     })?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let backup_root = backups_dir.join(format!("{db_name}.{timestamp}.failed-baseline-seed.bak"));
+    sync_parent_directory(&backups_dir)?;
+    let backup_root = unique_failed_seed_backup_root(&backups_dir, db_name);
 
     for suffix in ["", "-wal", "-shm"] {
         let src = if suffix.is_empty() {
@@ -3319,6 +3315,8 @@ fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
             )
         })?;
     }
+    sync_parent_directory(db_path)?;
+    sync_parent_directory(&backup_root)?;
 
     Ok(Some(backup_root))
 }
@@ -4390,6 +4388,22 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
         ".{file_name}.{suffix}.{}.{}.{}",
         std::process::id(),
         timestamp,
+        nonce
+    ))
+}
+
+fn unique_failed_seed_backup_root(backups_dir: &Path, db_name: &str) -> PathBuf {
+    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    backups_dir.join(format!(
+        "{db_name}.{timestamp}.{}.{}.failed-baseline-seed.bak",
+        std::process::id(),
         nonce
     ))
 }
@@ -9278,5 +9292,49 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("consecutive_zero_scans"));
         assert!(json.contains("total_ingests"));
+    }
+
+    #[test]
+    fn quarantine_failed_seed_bundle_moves_sidecars_and_uses_unique_paths() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+
+        std::fs::write(&db_path, b"db-one").unwrap();
+        std::fs::write(tmp.path().join("agent_search.db-wal"), b"wal-one").unwrap();
+        std::fs::write(tmp.path().join("agent_search.db-shm"), b"shm-one").unwrap();
+
+        let first_backup = quarantine_failed_seed_bundle(&db_path)
+            .unwrap()
+            .expect("first quarantine path");
+        let first_name = first_backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(std::fs::read(&first_backup).unwrap(), b"db-one");
+        assert_eq!(
+            std::fs::read(first_backup.with_file_name(format!("{first_name}-wal"))).unwrap(),
+            b"wal-one"
+        );
+        assert_eq!(
+            std::fs::read(first_backup.with_file_name(format!("{first_name}-shm"))).unwrap(),
+            b"shm-one"
+        );
+        assert!(!db_path.exists());
+        assert!(!tmp.path().join("agent_search.db-wal").exists());
+        assert!(!tmp.path().join("agent_search.db-shm").exists());
+
+        std::fs::write(&db_path, b"db-two").unwrap();
+        std::fs::write(tmp.path().join("agent_search.db-wal"), b"wal-two").unwrap();
+        std::fs::write(tmp.path().join("agent_search.db-shm"), b"shm-two").unwrap();
+
+        let second_backup = quarantine_failed_seed_bundle(&db_path)
+            .unwrap()
+            .expect("second quarantine path");
+        assert_ne!(
+            first_backup, second_backup,
+            "repeated quarantines should not collide on backup path"
+        );
+        assert_eq!(std::fs::read(&second_backup).unwrap(), b"db-two");
     }
 }

@@ -565,10 +565,16 @@ impl EffectiveSettings {
         );
 
         // Fields without CLI overrides — only env vs default.
-        // Note: fast_tier_embedder has no env var override (always "hash").
+        // Note: fast_tier_embedder and reranker have no env var overrides.
         settings.push(EffectiveSetting {
             name: "fast_tier_embedder".to_owned(),
             value: final_policy.fast_tier_embedder.clone(),
+            source: SettingSource::CompiledDefault,
+            env_var: None,
+        });
+        settings.push(EffectiveSetting {
+            name: "reranker".to_owned(),
+            value: final_policy.reranker.clone(),
             source: SettingSource::CompiledDefault,
             env_var: None,
         });
@@ -847,6 +853,11 @@ impl BudgetDecision {
 
 impl SemanticPolicy {
     /// Check whether a proposed write of `write_size_mb` is within budget.
+    ///
+    /// This is intended for **model downloads** — the first check compares
+    /// against `max_model_size_mb`.  For vector index writes (which are much
+    /// smaller), prefer skipping the per-model cap or calling with a separate
+    /// budget method when one is needed.
     ///
     /// `current_semantic_usage_mb` is the total disk used by semantic artifacts
     /// right now.  `free_disk_mb` is the free space on the volume.
@@ -1421,6 +1432,12 @@ mod tests {
 
         let budget = settings.get("semantic_budget_mb").unwrap();
         assert_eq!(budget.value, "500");
+
+        // Verify all policy fields are represented, including those
+        // without env vars.
+        assert!(settings.get("fast_tier_embedder").is_some());
+        assert!(settings.get("reranker").is_some());
+        assert_eq!(settings.get("reranker").unwrap().value, "ms-marco-minilm");
     }
 
     #[test]

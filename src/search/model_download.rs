@@ -1069,21 +1069,8 @@ impl ModelDownloader {
     /// 2. Rename temp to target
     /// 3. Remove backup on success, or restore on failure
     fn atomic_install(&self) -> Result<(), DownloadError> {
-        // Fix: Use safer backup path construction that appends .bak instead of replacing extension.
-        // This handles cases like "model.v2" correctly (-> "model.v2.bak", not "model.bak").
-        let backup_dir = if let Some(name) = self.target_dir.file_name() {
-            let mut p = self.target_dir.clone();
-            let new_name = format!("{}.bak", name.to_string_lossy());
-            p.set_file_name(new_name);
-            p
-        } else {
-            self.target_dir.with_extension("bak")
-        };
-
-        // Clean up any stale backup from previous failed install
-        if backup_dir.exists() {
-            let _ = fs::remove_dir_all(&backup_dir);
-        }
+        let backup_dir = unique_model_backup_dir(&self.target_dir);
+        sync_tree(&self.temp_dir)?;
 
         // Move existing target to backup (preserves it until new install succeeds)
         let had_existing = if self.target_dir.exists() {
@@ -1096,25 +1083,39 @@ impl ModelDownloader {
         // Rename temp to target
         match fs::rename(&self.temp_dir, &self.target_dir) {
             Ok(()) => {
+                sync_parent_directory(&self.target_dir)?;
                 // Success: remove backup
                 if had_existing {
                     let _ = fs::remove_dir_all(&backup_dir);
+                    sync_parent_directory(&self.target_dir)?;
                 }
             }
             Err(e) => {
                 // Failed: try to restore from backup
                 if had_existing && backup_dir.exists() {
-                    let _ = fs::rename(&backup_dir, &self.target_dir);
+                    match fs::rename(&backup_dir, &self.target_dir) {
+                        Ok(()) => {
+                            sync_parent_directory(&self.target_dir)?;
+                            return Err(std::io::Error::other(format!(
+                                "failed installing {} from {}: {e}; restored original model",
+                                self.target_dir.display(),
+                                self.temp_dir.display()
+                            ))
+                            .into());
+                        }
+                        Err(restore_err) => {
+                            return Err(std::io::Error::other(format!(
+                                "failed installing {} from {}: {e}; restore error: {restore_err}; temp model retained at {}",
+                                self.target_dir.display(),
+                                self.temp_dir.display(),
+                                self.temp_dir.display()
+                            ))
+                            .into());
+                        }
+                    }
                 }
                 return Err(e.into());
             }
-        }
-
-        // Sync directory
-        if let Some(parent) = self.target_dir.parent()
-            && let Ok(dir) = File::open(parent)
-        {
-            let _ = dir.sync_all();
         }
 
         Ok(())
@@ -1128,7 +1129,12 @@ impl ModelDownloader {
             manifest.revision,
             chrono::Utc::now().to_rfc3339()
         );
-        fs::write(marker_path, content)?;
+        let temp_path = unique_model_temp_path(&marker_path);
+        let mut file = File::create(&temp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        replace_file_from_temp(&temp_path, &marker_path)?;
+        sync_parent_directory(&marker_path)?;
         Ok(())
     }
 
@@ -1221,6 +1227,133 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
     } else {
         None
     }
+}
+
+fn unique_model_temp_path(path: &Path) -> PathBuf {
+    unique_model_sidecar_path(path, "tmp", ".verified")
+}
+
+fn unique_model_backup_dir(path: &Path) -> PathBuf {
+    unique_model_sidecar_path(path, "bak", "model")
+}
+
+fn unique_model_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
+    static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+
+    path.with_file_name(format!(
+        ".{file_name}.{suffix}.{}.{}.{}",
+        std::process::id(),
+        timestamp,
+        nonce
+    ))
+}
+
+fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), DownloadError> {
+    #[cfg(windows)]
+    {
+        match fs::rename(temp_path, final_path) {
+            Ok(()) => sync_parent_directory(final_path),
+            Err(first_err)
+                if final_path.exists()
+                    && matches!(
+                        first_err.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                let backup_path = unique_model_backup_dir(final_path);
+                fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = fs::remove_file(temp_path);
+                    DownloadError::IoError(std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {first_err}; backup error: {backup_err}",
+                        backup_path.display(),
+                        final_path.display()
+                    )))
+                })?;
+                match fs::rename(temp_path, final_path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&backup_path);
+                        sync_parent_directory(final_path)
+                    }
+                    Err(second_err) => match fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(temp_path);
+                            sync_parent_directory(final_path)?;
+                            Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {first_err}; second error: {second_err}; restored original file",
+                                final_path.display(),
+                                temp_path.display()
+                            ))
+                            .into())
+                        }
+                        Err(restore_err) => Err(std::io::Error::other(format!(
+                            "failed replacing {} with {}: first error: {first_err}; second error: {second_err}; restore error: {restore_err}; temp file retained at {}",
+                            final_path.display(),
+                            temp_path.display(),
+                            temp_path.display()
+                        ))
+                        .into()),
+                    },
+                }
+            }
+            Err(rename_err) => Err(rename_err.into()),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp_path, final_path)?;
+        sync_parent_directory(final_path)
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_tree(path: &Path) -> Result<(), DownloadError> {
+    sync_tree_inner(path)?;
+    sync_parent_directory(path)
+}
+
+#[cfg(not(windows))]
+fn sync_tree_inner(path: &Path) -> Result<(), DownloadError> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            sync_tree_inner(&entry.path())?;
+        }
+        File::open(path)?.sync_all()?;
+    } else if metadata.is_file() {
+        File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_tree(_path: &Path) -> Result<(), DownloadError> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<(), DownloadError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), DownloadError> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1393,6 +1526,49 @@ mod tests {
         let manifest = ModelManifest::minilm_v2();
         let result = check_version_mismatch(&model_dir, &manifest);
         assert!(matches!(result, Some(ModelState::UpdateAvailable { .. })));
+    }
+
+    #[test]
+    fn test_atomic_install_preserves_preexisting_legacy_backup_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("model");
+        copy_model_fixtures(&target_dir).unwrap();
+        fs::write(target_dir.join(".verified"), "revision=old\n").unwrap();
+
+        let legacy_backup_dir = tmp.path().join("model.bak");
+        fs::create_dir_all(&legacy_backup_dir).unwrap();
+        fs::write(legacy_backup_dir.join("sentinel.txt"), "keep me").unwrap();
+
+        let downloader = ModelDownloader::new(target_dir.clone());
+        copy_model_fixtures(&downloader.temp_dir).unwrap();
+        fs::write(downloader.temp_dir.join(".verified"), "revision=new\n").unwrap();
+
+        downloader.atomic_install().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(legacy_backup_dir.join("sentinel.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            fs::read_to_string(target_dir.join(".verified")).unwrap(),
+            "revision=new\n"
+        );
+    }
+
+    #[test]
+    fn test_write_verified_marker_overwrites_existing_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_dir = tmp.path().join("model");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(target_dir.join(".verified"), "revision=old\n").unwrap();
+
+        let downloader = ModelDownloader::new(target_dir.clone());
+        let manifest = ModelManifest::minilm_v2();
+        downloader.write_verified_marker(&manifest).unwrap();
+
+        let marker = fs::read_to_string(target_dir.join(".verified")).unwrap();
+        assert!(marker.contains(&format!("revision={}", manifest.revision)));
+        assert!(marker.contains("verified_at="));
     }
 
     #[test]

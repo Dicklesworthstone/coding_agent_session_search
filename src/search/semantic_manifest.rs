@@ -765,7 +765,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
     #[cfg(windows)]
     {
         match fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
                 if final_path.exists()
                     && matches!(
@@ -776,20 +776,41 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
                 let backup_path = unique_manifest_backup_path(final_path);
                 fs::rename(final_path, &backup_path).map_err(|backup_err| {
                     let _ = fs::remove_file(temp_path);
-                    backup_err
+                    std::io::Error::other(format!(
+                        "failed preparing backup {} before replacing {}: first error: {}; backup error: {}",
+                        backup_path.display(),
+                        final_path.display(),
+                        first_err,
+                        backup_err
+                    ))
                 })?;
                 match fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = fs::remove_file(&backup_path);
-                        Ok(())
+                        sync_parent_directory(final_path)
                     }
-                    Err(second_err) => {
-                        if fs::rename(&backup_path, final_path).is_ok() {
+                    Err(second_err) => match fs::rename(&backup_path, final_path) {
+                        Ok(()) => {
                             let _ = fs::remove_file(temp_path);
                             sync_parent_directory(final_path)?;
+                            Err(std::io::Error::other(format!(
+                                "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
+                                final_path.display(),
+                                temp_path.display(),
+                                first_err,
+                                second_err
+                            )))
                         }
-                        Err(second_err)
-                    }
+                        Err(restore_err) => Err(std::io::Error::other(format!(
+                            "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                            final_path.display(),
+                            temp_path.display(),
+                            first_err,
+                            second_err,
+                            restore_err,
+                            temp_path.display()
+                        ))),
+                    },
                 }
             }
             Err(err) => Err(err),
