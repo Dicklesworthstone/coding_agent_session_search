@@ -32,7 +32,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e3f57c9a", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "ff6a114b", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -133,7 +133,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "e3f57c9a", package = "fsqlite-types" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "ff6a114b", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
