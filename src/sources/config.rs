@@ -339,6 +339,7 @@ impl SourcesConfig {
         let _: SourcesConfig = toml::from_str(&content)?;
         let temp_path = unique_atomic_temp_path(&config_path);
         std::fs::write(&temp_path, content)?;
+        sync_file_path(&temp_path)?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(())
@@ -355,6 +356,7 @@ impl SourcesConfig {
         let _: SourcesConfig = toml::from_str(&content)?;
         let temp_path = unique_atomic_temp_path(path);
         std::fs::write(&temp_path, content)?;
+        sync_file_path(&temp_path)?;
         replace_file_from_temp(&temp_path, path)?;
 
         Ok(())
@@ -965,6 +967,7 @@ impl SourcesConfig {
         // Write atomically (temp file + rename)
         let temp_path = unique_atomic_temp_path(&config_path);
         std::fs::write(&temp_path, &toml_str)?;
+        sync_file_path(&temp_path)?;
         replace_file_from_temp(&temp_path, &config_path)?;
 
         Ok(BackupInfo {
@@ -1033,7 +1036,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
     #[cfg(windows)]
     {
         match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(final_path),
             Err(first_err)
                 if final_path.exists()
                     && matches!(
@@ -1055,13 +1058,23 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
                 match std::fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&backup_path);
-                        Ok(())
+                        sync_parent_directory(final_path)
                     }
                     Err(second_err) => {
                         let restore_result = std::fs::rename(&backup_path, final_path);
                         match restore_result {
                             Ok(()) => {
                                 let _ = std::fs::remove_file(temp_path);
+                                sync_parent_directory(final_path).map_err(|sync_err| {
+                                    std::io::Error::other(format!(
+                                        "failed replacing {} with {}: first error: {}; second error: {}; restored original file but failed syncing parent directory: {}",
+                                        final_path.display(),
+                                        temp_path.display(),
+                                        first_err,
+                                        second_err,
+                                        sync_err
+                                    ))
+                                })?;
                                 Err(std::io::Error::new(
                                     second_err.kind(),
                                     format!(
@@ -1092,8 +1105,26 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<(), std
 
     #[cfg(not(windows))]
     {
-        std::fs::rename(temp_path, final_path)
+        std::fs::rename(temp_path, final_path)?;
+        sync_parent_directory(final_path)
     }
+}
+
+fn sync_file_path(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<(), std::io::Error> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 fn unique_atomic_temp_path(path: &Path) -> PathBuf {

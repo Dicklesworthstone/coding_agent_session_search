@@ -2768,6 +2768,13 @@ fn normalized_source_kind(origin_kind: Option<&str>, source_id: &str) -> String 
     }
 }
 
+fn normalize_source_filter(filter: SourceFilter) -> SourceFilter {
+    match filter {
+        SourceFilter::SourceId(id) => SourceFilter::parse(&id),
+        other => other,
+    }
+}
+
 fn workspace_original_from_metadata(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("cass")
@@ -6867,8 +6874,10 @@ impl CassApp {
                 ids.insert(hit_source_id_display(hit).to_string());
             }
         }
-        if let SourceFilter::SourceId(id) = &self.filters.source_filter {
-            ids.insert(id.clone());
+        if let SourceFilter::SourceId(id) =
+            normalize_source_filter(self.filters.source_filter.clone())
+        {
+            ids.insert(id);
         }
         self.available_source_ids = ids.into_iter().collect();
     }
@@ -6899,7 +6908,7 @@ impl CassApp {
     }
 
     fn source_filter_from_menu_selection(&self) -> SourceFilter {
-        match self.source_filter_menu_selection {
+        normalize_source_filter(match self.source_filter_menu_selection {
             0 => SourceFilter::All,
             1 => SourceFilter::Local,
             2 => SourceFilter::Remote,
@@ -6909,11 +6918,11 @@ impl CassApp {
                 .cloned()
                 .map(SourceFilter::SourceId)
                 .unwrap_or(SourceFilter::All),
-        }
+        })
     }
 
     fn source_filter_status(filter: &SourceFilter) -> String {
-        match filter {
+        match normalize_source_filter(filter.clone()) {
             SourceFilter::All => "all sources".to_string(),
             SourceFilter::Local => "local only".to_string(),
             SourceFilter::Remote => "remote only".to_string(),
@@ -6976,10 +6985,11 @@ impl CassApp {
         }
 
         // Source filter
-        if !self.filters.source_filter.is_all() {
+        let display_source_filter = normalize_source_filter(self.filters.source_filter.clone());
+        if !display_source_filter.is_all() {
             pills.push(Pill {
                 label: "source".to_string(),
-                value: self.filters.source_filter.to_string(),
+                value: display_source_filter.to_string(),
                 active: true,
                 editable: true,
             });
@@ -7659,10 +7669,11 @@ impl CassApp {
                 pane_count
             )
         };
-        let source_scope = if self.filters.source_filter.is_all() {
+        let display_source_filter = normalize_source_filter(self.filters.source_filter.clone());
+        let source_scope = if display_source_filter.is_all() {
             "all".to_string()
         } else {
-            self.filters.source_filter.to_string()
+            display_source_filter.to_string()
         };
 
         // Current row position within the active pane (1-based display).
@@ -13846,11 +13857,11 @@ fn density_mode_str(value: DensityMode) -> &'static str {
 }
 
 fn source_filter_to_parts(filter: &SourceFilter) -> (String, Option<String>) {
-    match filter {
+    match normalize_source_filter(filter.clone()) {
         SourceFilter::All => ("all".to_string(), None),
         SourceFilter::Local => ("local".to_string(), None),
         SourceFilter::Remote => ("remote".to_string(), None),
-        SourceFilter::SourceId(id) => ("source_id".to_string(), Some(id.clone())),
+        SourceFilter::SourceId(id) => ("source_id".to_string(), Some(id)),
     }
 }
 
@@ -13859,10 +13870,10 @@ fn parse_legacy_source_filter(value: &serde_json::Value) -> Option<SourceFilter>
         serde_json::Value::String(s) => Some(SourceFilter::parse(s)),
         serde_json::Value::Object(map) => {
             if let Some(v) = map.get("source_id").and_then(|v| v.as_str()) {
-                return Some(SourceFilter::SourceId(v.to_string()));
+                return Some(SourceFilter::parse(v));
             }
             if let Some(v) = map.get("SourceId").and_then(|v| v.as_str()) {
-                return Some(SourceFilter::SourceId(v.to_string()));
+                return Some(SourceFilter::parse(v));
             }
             if map.contains_key("local") || map.contains_key("Local") {
                 return Some(SourceFilter::Local);
@@ -13884,17 +13895,15 @@ fn source_filter_from_parts(
     value: Option<&str>,
     legacy: Option<&serde_json::Value>,
 ) -> SourceFilter {
-    let legacy_filter = || parse_legacy_source_filter(legacy?);
+    let legacy_filter = || parse_legacy_source_filter(legacy?).map(normalize_source_filter);
     if let Some(kind) = kind {
-        return match kind.to_ascii_lowercase().as_str() {
+        return normalize_source_filter(match kind.to_ascii_lowercase().as_str() {
             "all" => SourceFilter::All,
             "local" => SourceFilter::Local,
             "remote" => SourceFilter::Remote,
-            "source_id" => value
-                .map(|v| SourceFilter::SourceId(v.to_string()))
-                .unwrap_or(SourceFilter::All),
+            "source_id" => value.map(SourceFilter::parse).unwrap_or(SourceFilter::All),
             _ => legacy_filter().unwrap_or(SourceFilter::All),
-        };
+        });
     }
     legacy_filter().unwrap_or(SourceFilter::All)
 }
@@ -16377,7 +16386,7 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::FilterSourceSet(source) => {
                 self.push_undo("Set source filter");
-                self.filters.source_filter = source;
+                self.filters.source_filter = normalize_source_filter(source);
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
             CassMsg::FiltersClearAll => {
@@ -18102,17 +18111,18 @@ impl super::ftui_adapter::Model for CassApp {
                     self.source_filter_menu_open = true;
                     self.focus_manager.push_trap(focus_ids::GROUP_SOURCE_FILTER);
                     self.focus_manager.focus(focus_ids::SOURCE_FILTER_MENU);
-                    self.source_filter_menu_selection = match &self.filters.source_filter {
-                        SourceFilter::All => 0,
-                        SourceFilter::Local => 1,
-                        SourceFilter::Remote => 2,
-                        SourceFilter::SourceId(id) => self
-                            .available_source_ids
-                            .iter()
-                            .position(|s| s == id)
-                            .map(|idx| idx + 3)
-                            .unwrap_or(0),
-                    };
+                    self.source_filter_menu_selection =
+                        match normalize_source_filter(self.filters.source_filter.clone()) {
+                            SourceFilter::All => 0,
+                            SourceFilter::Local => 1,
+                            SourceFilter::Remote => 2,
+                            SourceFilter::SourceId(id) => self
+                                .available_source_ids
+                                .iter()
+                                .position(|s| s == &id)
+                                .map(|idx| idx + 3)
+                                .unwrap_or(0),
+                        };
                     self.status =
                         "Source filter menu (↑/↓ select, Enter apply, Esc close)".to_string();
                 }
@@ -19050,16 +19060,19 @@ impl super::ftui_adapter::Model for CassApp {
                                         "Edit from timestamp (Enter apply, Esc cancel)".to_string();
                                 }
                                 "source" => {
+                                    self.refresh_available_source_ids();
                                     self.source_filter_menu_open = true;
                                     self.source_filter_menu_selection =
-                                        match &self.filters.source_filter {
+                                        match normalize_source_filter(
+                                            self.filters.source_filter.clone(),
+                                        ) {
                                             SourceFilter::All => 0,
                                             SourceFilter::Local => 1,
                                             SourceFilter::Remote => 2,
                                             SourceFilter::SourceId(id) => self
                                                 .available_source_ids
                                                 .iter()
-                                                .position(|s| s == id)
+                                                .position(|s| s == &id)
                                                 .map(|i| i + 3)
                                                 .unwrap_or(0),
                                         };
@@ -19497,7 +19510,7 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::AnalyticsSourceFilterSet(sf) => {
-                self.analytics_filters.source_filter = sf;
+                self.analytics_filters.source_filter = normalize_source_filter(sf);
                 self.dirty_since = Some(Instant::now());
                 self.analytics_cache = None;
                 if self.surface == AppSurface::Analytics {
@@ -19555,7 +19568,8 @@ impl super::ftui_adapter::Model for CassApp {
                 // Start from analytics filters to avoid leaking stale search filters.
                 self.filters.agents = self.analytics_filters.agents.clone();
                 self.filters.workspaces = self.analytics_filters.workspaces.clone();
-                self.filters.source_filter = self.analytics_filters.source_filter.clone();
+                self.filters.source_filter =
+                    normalize_source_filter(self.analytics_filters.source_filter.clone());
                 self.filters.session_paths.clear();
 
                 // Apply selected dimension filter (agent) on top of inherited globals.
@@ -19570,7 +19584,7 @@ impl super::ftui_adapter::Model for CassApp {
                 }
                 // Apply selected source filter on top of inherited globals.
                 if let Some(source_filter) = drill_source_filter {
-                    self.filters.source_filter = source_filter;
+                    self.filters.source_filter = normalize_source_filter(source_filter);
                 }
                 // Seed the query for model-driven drilldowns so analytics selections
                 // immediately narrow to relevant sessions.
@@ -23555,6 +23569,22 @@ mod tests {
             loaded.analytics_source_filter,
             SourceFilter::Remote
         ));
+    }
+
+    #[test]
+    fn source_filter_from_parts_normalizes_source_id_values() {
+        assert_eq!(
+            source_filter_from_parts(Some("source_id"), Some("  work-laptop  "), None),
+            SourceFilter::SourceId("work-laptop".to_string())
+        );
+        assert_eq!(
+            source_filter_from_parts(Some("source_id"), Some("  LOCAL  "), None),
+            SourceFilter::Local
+        );
+        assert_eq!(
+            source_filter_from_parts(Some("source_id"), Some("   "), None),
+            SourceFilter::All
+        );
     }
 
     #[test]
@@ -28109,6 +28139,21 @@ mod tests {
     }
 
     #[test]
+    fn refresh_available_source_ids_deduplicates_trimmed_active_source_filter() {
+        let mut app = CassApp::default();
+        let mut remote = make_test_hit();
+        remote.source_id = "work-laptop".to_string();
+        remote.origin_kind = "ssh".to_string();
+        remote.origin_host = Some("laptop".to_string());
+
+        app.results = vec![remote];
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+        app.refresh_available_source_ids();
+
+        assert_eq!(app.available_source_ids, vec!["work-laptop".to_string()]);
+    }
+
+    #[test]
     fn source_filter_menu_applies_selected_source_id() {
         let mut app = CassApp::default();
         let mut local = make_test_hit();
@@ -28140,6 +28185,70 @@ mod tests {
             SourceFilter::SourceId("work-laptop".to_string())
         );
         assert!(!app.source_filter_menu_open);
+    }
+
+    #[test]
+    fn source_filter_menu_toggled_preselects_normalized_trimmed_source_id() {
+        let mut app = CassApp::default();
+        let mut remote = make_test_hit();
+        remote.source_id = "work-laptop".to_string();
+        remote.origin_kind = "ssh".to_string();
+        remote.origin_host = Some("laptop".to_string());
+
+        app.results = vec![remote];
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+
+        let _ = app.update(CassMsg::SourceFilterMenuToggled);
+
+        assert!(app.source_filter_menu_open);
+        assert_eq!(app.available_source_ids, vec!["work-laptop".to_string()]);
+        assert_eq!(app.source_filter_menu_selection, 3);
+    }
+
+    #[test]
+    fn filter_pills_normalize_trimmed_source_filter_value() {
+        let mut app = CassApp::default();
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+
+        let source_pill = app
+            .filter_pills()
+            .into_iter()
+            .find(|pill| pill.label == "source")
+            .expect("source pill");
+
+        assert_eq!(source_pill.value, "work-laptop");
+        assert!(source_pill.active);
+    }
+
+    #[test]
+    fn source_filter_pill_click_refreshes_ids_and_preselects_normalized_source_id() {
+        let mut app = CassApp::default();
+        let mut remote = make_test_hit();
+        remote.source_id = "work-laptop".to_string();
+        remote.origin_kind = "ssh".to_string();
+        remote.origin_host = Some("laptop".to_string());
+
+        app.results = vec![remote];
+        app.filters.source_filter = SourceFilter::SourceId("  work-laptop  ".to_string());
+        app.last_pill_rects.borrow_mut().push((
+            Rect::new(2, 1, 8, 1),
+            Pill {
+                label: "source".to_string(),
+                value: "ignored".to_string(),
+                active: true,
+                editable: true,
+            },
+        ));
+
+        let _ = app.update(CassMsg::MouseEvent {
+            kind: MouseEventKind::LeftClick,
+            x: 2,
+            y: 1,
+        });
+
+        assert!(app.source_filter_menu_open);
+        assert_eq!(app.available_source_ids, vec!["work-laptop".to_string()]);
+        assert_eq!(app.source_filter_menu_selection, 3);
     }
 
     #[test]

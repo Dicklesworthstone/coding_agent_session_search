@@ -200,6 +200,7 @@ impl ProfilePreferences {
         let temp_path = unique_atomic_temp_path(&path);
         std::fs::write(&temp_path, &content)
             .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+        sync_file_path(&temp_path)?;
         replace_file_from_temp(&temp_path, &path)?;
 
         Ok(())
@@ -225,10 +226,14 @@ impl ProfilePreferences {
 fn replace_file_from_temp(temp_path: &std::path::Path, final_path: &std::path::Path) -> Result<()> {
     if cfg!(windows) {
         match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Ok(())
+            }
             Err(first_err) if final_path.exists() => {
                 let backup_path = unique_atomic_backup_path(final_path);
                 std::fs::rename(final_path, &backup_path).with_context(|| {
+                    let _ = std::fs::remove_file(temp_path);
                     format!(
                         "Failed preparing backup {} before replacing {} after {}",
                         backup_path.display(),
@@ -240,11 +245,13 @@ fn replace_file_from_temp(temp_path: &std::path::Path, final_path: &std::path::P
                 match std::fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&backup_path);
+                        sync_parent_directory(final_path)?;
                         Ok(())
                     }
                     Err(second_err) => match std::fs::rename(&backup_path, final_path) {
                         Ok(()) => {
                             let _ = std::fs::remove_file(temp_path);
+                            sync_parent_directory(final_path)?;
                             anyhow::bail!(
                                 "Failed replacing {} with {}: {}; restored original preferences",
                                 final_path.display(),
@@ -280,8 +287,32 @@ fn replace_file_from_temp(temp_path: &std::path::Path, final_path: &std::path::P
                 temp_path.display(),
                 final_path.display()
             )
-        })
+        })?;
+        sync_parent_directory(final_path)
     }
+}
+
+fn sync_file_path(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("Failed to reopen {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("Failed to sync {}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &std::path::Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .with_context(|| format!("Failed to open {} for sync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("Failed to sync {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 fn unique_atomic_temp_path(path: &std::path::Path) -> PathBuf {

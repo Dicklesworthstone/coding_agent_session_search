@@ -804,6 +804,7 @@ fn write_json_pretty_atomically<T: Serialize>(path: &Path, value: &T) -> Result<
         let mut writer = BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, value)?;
         writer.flush()?;
+        writer.get_ref().sync_all()?;
     }
     replace_file_from_temp(&temp_path, path)
 }
@@ -813,16 +814,21 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, value)?;
     writer.flush()?;
+    writer.get_ref().sync_all()?;
     Ok(())
 }
 
 fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
     if cfg!(windows) {
         match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Ok(())
+            }
             Err(first_err) if final_path.exists() => {
                 let backup_path = unique_atomic_backup_path(final_path);
                 std::fs::rename(final_path, &backup_path).map_err(|backup_err| {
+                    let _ = std::fs::remove_file(temp_path);
                     anyhow::anyhow!(
                         "failed replacing {} with {}: {}; failed moving existing file to backup {}: {}",
                         final_path.display(),
@@ -836,11 +842,13 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 match std::fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&backup_path);
+                        sync_parent_directory(final_path)?;
                         Ok(())
                     }
                     Err(second_err) => match std::fs::rename(&backup_path, final_path) {
                         Ok(()) => {
                             let _ = std::fs::remove_file(temp_path);
+                            sync_parent_directory(final_path)?;
                             anyhow::bail!(
                                 "failed replacing {} with {}: {}; restored original file",
                                 final_path.display(),
@@ -865,8 +873,23 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
         }
     } else {
         std::fs::rename(temp_path, final_path)?;
+        sync_parent_directory(final_path)?;
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn unique_atomic_temp_path(path: &Path) -> std::path::PathBuf {

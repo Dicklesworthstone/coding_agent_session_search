@@ -612,7 +612,10 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         match std::fs::rename(temp_path, final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                sync_parent_directory(final_path)?;
+                Ok(())
+            }
             Err(first_err)
                 if final_path.exists()
                     && matches!(
@@ -622,6 +625,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
             {
                 let backup_path = unique_replace_backup_path(final_path);
                 std::fs::rename(final_path, &backup_path).with_context(|| {
+                    let _ = std::fs::remove_file(temp_path);
                     format!(
                         "failed preparing backup {} before replacing {} after initial rename error: {}",
                         backup_path.display(),
@@ -633,11 +637,13 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 match std::fs::rename(temp_path, final_path) {
                     Ok(()) => {
                         let _ = std::fs::remove_file(&backup_path);
+                        sync_parent_directory(final_path)?;
                         Ok(())
                     }
                     Err(second_err) => match std::fs::rename(&backup_path, final_path) {
                         Ok(()) => {
                             let _ = std::fs::remove_file(temp_path);
+                            sync_parent_directory(final_path)?;
                             bail!(
                                 "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
                                 final_path.display(),
@@ -678,8 +684,25 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 temp_path.display(),
                 final_path.display()
             )
-        })
+        })?;
+        sync_parent_directory(final_path)
     }
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .with_context(|| format!("failed opening parent directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("failed syncing parent directory {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1266,5 +1289,27 @@ mod tests {
 
         assert!(engine.source_db_path.starts_with(temp_dir.path()));
         assert!(engine.output_path.starts_with(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_replace_file_from_temp_overwrites_existing_file() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let final_path = temp_dir.path().join("export.db");
+        let first_tmp = temp_dir.path().join("first.tmp");
+        let second_tmp = temp_dir.path().join("second.tmp");
+
+        std::fs::write(&first_tmp, b"first").expect("write first temp");
+        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        assert_eq!(
+            std::fs::read(&final_path).expect("read first final"),
+            b"first"
+        );
+
+        std::fs::write(&second_tmp, b"second").expect("write second temp");
+        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        assert_eq!(
+            std::fs::read(&final_path).expect("read second final"),
+            b"second"
+        );
     }
 }

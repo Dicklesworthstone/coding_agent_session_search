@@ -268,8 +268,16 @@ test.describe('Mobile Button Interactions', () => {
 
       // Check for feedback (tooltip, text change, etc.)
       const feedback = page.locator('.copied, .copy-success, [data-copied="true"]');
-      const hasFeedback = (await feedback.count()) > 0 || true; // Some implementations don't show feedback
-      expect(hasFeedback).toBe(true);
+      const hasFeedback = (await feedback.count()) > 0;
+      const clipboardText = await page.evaluate(async () => {
+        try {
+          return await navigator.clipboard.readText();
+        } catch {
+          return '';
+        }
+      });
+
+      expect(hasFeedback || clipboardText.trim().length > 0).toBe(true);
     }
   });
 

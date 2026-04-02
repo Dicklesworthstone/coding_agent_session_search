@@ -81,9 +81,15 @@ test.describe('Search Functionality', () => {
     // Search input should be focused (or browser search appears)
     const isFocused = await searchInput.first().evaluate((el) => el === document.activeElement);
 
-    // Either our search is focused or browser took over
-    // We can't fully test browser takeover, so just verify the action worked
-    expect(isFocused || true).toBe(true);
+    if (!isFocused) {
+      test.info().annotations.push({
+        type: 'info',
+        description: 'Browser handled Ctrl+F instead of the in-app search input',
+      });
+      return;
+    }
+
+    expect(isFocused).toBe(true);
   });
 
   test('Escape clears search', async ({ page, exportPath }) => {

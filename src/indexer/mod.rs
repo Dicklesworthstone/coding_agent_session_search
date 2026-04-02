@@ -4330,6 +4330,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                         match restore_result {
                             Ok(()) => {
                                 let _ = fs::remove_file(temp_path);
+                                sync_parent_directory(final_path)?;
                                 Err(anyhow::anyhow!(
                                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
                                     final_path.display(),

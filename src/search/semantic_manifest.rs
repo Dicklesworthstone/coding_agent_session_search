@@ -786,6 +786,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
                     Err(second_err) => {
                         if fs::rename(&backup_path, final_path).is_ok() {
                             let _ = fs::remove_file(temp_path);
+                            sync_parent_directory(final_path)?;
                         }
                         Err(second_err)
                     }

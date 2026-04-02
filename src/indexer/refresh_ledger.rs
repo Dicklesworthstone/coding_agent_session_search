@@ -510,7 +510,14 @@ mod tests {
 
         assert!(ledger.all_phases_succeeded());
         assert_eq!(ledger.total_items_processed(), 100 + 95 + 450 + 1);
-        assert!(ledger.total_duration_ms > 0 || true); // may be 0 in fast tests
+        assert!(ledger.completed_at_ms >= ledger.started_at_ms);
+        let max_phase_duration = ledger
+            .phases
+            .iter()
+            .map(|phase| phase.duration_ms)
+            .max()
+            .unwrap_or(0);
+        assert!(ledger.total_duration_ms >= max_phase_duration);
     }
 
     #[test]
