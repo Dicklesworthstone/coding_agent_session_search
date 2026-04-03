@@ -280,6 +280,12 @@ pub fn run_validation(conn: &Connection, config: &ValidateConfig) -> ValidationR
     }
 }
 
+fn query_executes(conn: &Connection, sql: &str) -> Result<(), String> {
+    conn.query_map_collect(sql, &[], |_row: &Row| Ok(()))
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Track A validation
 // ---------------------------------------------------------------------------
@@ -316,18 +322,6 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
         })
         .unwrap_or(0);
 
-    if total_buckets == 0 {
-        checks.push(Check {
-            id: "track_a.has_data".into(),
-            ok: false,
-            severity: Severity::Warning,
-            details: "usage_daily is empty".into(),
-            suggested_action: Some("Run 'cass analytics rebuild'".into()),
-        });
-        return (checks, 0, 0);
-    }
-
-    // Sample or full scan.
     let limit_clause = if config.sample_buckets > 0 {
         format!("LIMIT {}", config.sample_buckets)
     } else {
@@ -367,6 +361,30 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
          ORDER BY ud.day_id DESC
          {limit_clause}"
     );
+
+    if total_buckets == 0 {
+        if let Err(err) = query_executes(conn, &sql) {
+            checks.push(Check {
+                id: "track_a.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Track A invariant query failed: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track a' or verify the analytics schema".into(),
+                ),
+            });
+            return (checks, 0, 0);
+        }
+
+        checks.push(Check {
+            id: "track_a.has_data".into(),
+            ok: false,
+            severity: Severity::Warning,
+            details: "usage_daily is empty".into(),
+            suggested_action: Some("Run 'cass analytics rebuild'".into()),
+        });
+        return (checks, 0, 0);
+    }
 
     let mut mismatches_content = 0_usize;
     let mut mismatches_msg_count = 0_usize;
@@ -541,17 +559,6 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
         })
         .unwrap_or(0);
 
-    if total_buckets == 0 {
-        checks.push(Check {
-            id: "track_b.has_data".into(),
-            ok: false,
-            severity: Severity::Warning,
-            details: "token_daily_stats is empty".into(),
-            suggested_action: Some("Run 'cass analytics rebuild --track all'".into()),
-        });
-        return (checks, 0, 0);
-    }
-
     let limit_clause = if config.sample_buckets > 0 {
         format!("LIMIT {}", config.sample_buckets)
     } else {
@@ -601,6 +608,31 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
         });
         return (checks, 0, total_buckets);
     };
+
+    if total_buckets == 0 {
+        if let Err(err) = query_executes(conn, &sql) {
+            checks.push(Check {
+                id: "track_b.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Track B invariant query failed: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                        .into(),
+                ),
+            });
+            return (checks, 0, 0);
+        }
+
+        checks.push(Check {
+            id: "track_b.has_data".into(),
+            ok: false,
+            severity: Severity::Warning,
+            details: "token_daily_stats is empty".into(),
+            suggested_action: Some("Run 'cass analytics rebuild --track all'".into()),
+        });
+        return (checks, 0, 0);
+    }
 
     let mut mismatches_total = 0_usize;
     let mut mismatches_tools = 0_usize;

@@ -2605,24 +2605,7 @@ impl FrankenStorage {
     }
 
     /// Open in read-only mode using frankensqlite compat flags.
-    ///
-    /// Note: current frankensqlite compat `open_with_flags` is a façade and may
-    /// not enforce strict read-only behavior yet; this constructor still provides
-    /// the migration-compatible call site.
     pub fn open_readonly(path: &Path) -> Result<Self> {
-        let preflight = Self::open(path).with_context(|| {
-            format!(
-                "preflighting frankensqlite readonly open at {}",
-                path.display()
-            )
-        })?;
-        preflight.close().with_context(|| {
-            format!(
-                "closing frankensqlite preflight connection before readonly reopen at {}",
-                path.display()
-            )
-        })?;
-
         let path_str = path.to_string_lossy().to_string();
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening frankensqlite db readonly at {}", path.display()))?;
@@ -3976,7 +3959,7 @@ impl FrankenStorage {
 
         self.conn
             .query_row_map(
-                "SELECT id FROM agents WHERE slug = ?1",
+                "SELECT id FROM agents WHERE slug = ?1 ORDER BY id DESC LIMIT 1",
                 fparams![agent.slug.as_str()],
                 |row| row.get_typed(0),
             )
@@ -3994,7 +3977,7 @@ impl FrankenStorage {
 
         self.conn
             .query_row_map(
-                "SELECT id FROM workspaces WHERE path = ?1",
+                "SELECT id FROM workspaces WHERE path = ?1 ORDER BY id DESC LIMIT 1",
                 fparams![path_str.as_str()],
                 |row| row.get_typed(0),
             )
@@ -4189,32 +4172,62 @@ impl FrankenStorage {
 
     /// Fetch messages for a conversation.
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
+        let hinted_sql =
+            "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+             FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+             WHERE conversation_id = ?1 ORDER BY idx";
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+             FROM messages \
+             WHERE conversation_id = ?1 ORDER BY idx";
+
         self.conn
-            .query_map_collect(
-                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
-                 FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx",
-                fparams![conversation_id],
-                |row| {
-                    let role: String = row.get_typed(2)?;
-                    Ok(Message {
-                        id: Some(row.get_typed(0)?),
-                        idx: row.get_typed(1)?,
-                        role: match role.as_str() {
-                            "user" => MessageRole::User,
-                            "agent" | "assistant" => MessageRole::Agent,
-                            "tool" => MessageRole::Tool,
-                            "system" => MessageRole::System,
-                            other => MessageRole::Other(other.to_string()),
+            .query_map_collect(hinted_sql, fparams![conversation_id], |row| {
+                let role: String = row.get_typed(2)?;
+                Ok(Message {
+                    id: Some(row.get_typed(0)?),
+                    idx: row.get_typed(1)?,
+                    role: match role.as_str() {
+                        "user" => MessageRole::User,
+                        "agent" | "assistant" => MessageRole::Agent,
+                        "tool" => MessageRole::Tool,
+                        "system" => MessageRole::System,
+                        other => MessageRole::Other(other.to_string()),
+                    },
+                    author: row.get_typed(3)?,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                    extra_json: franken_read_metadata_compat(row, 6, 7),
+                    snippets: Vec::new(),
+                })
+            })
+            .or_else(|err| {
+                if err.to_string().contains("no such index: sqlite_autoindex_messages_1") {
+                    return self.conn.query_map_collect(
+                        fallback_sql,
+                        fparams![conversation_id],
+                        |row| {
+                            let role: String = row.get_typed(2)?;
+                            Ok(Message {
+                                id: Some(row.get_typed(0)?),
+                                idx: row.get_typed(1)?,
+                                role: match role.as_str() {
+                                    "user" => MessageRole::User,
+                                    "agent" | "assistant" => MessageRole::Agent,
+                                    "tool" => MessageRole::Tool,
+                                    "system" => MessageRole::System,
+                                    other => MessageRole::Other(other.to_string()),
+                                },
+                                author: row.get_typed(3)?,
+                                created_at: row.get_typed(4)?,
+                                content: row.get_typed(5)?,
+                                extra_json: franken_read_metadata_compat(row, 6, 7),
+                                snippets: Vec::new(),
+                            })
                         },
-                        author: row.get_typed(3)?,
-                        created_at: row.get_typed(4)?,
-                        content: row.get_typed(5)?,
-                        extra_json: franken_read_metadata_compat(row, 6, 7),
-                        snippets: Vec::new(),
-                    })
-                },
-            )
+                    );
+                }
+                Err(err)
+            })
             .with_context(|| format!("fetching messages for conversation {conversation_id}"))
     }
 
@@ -4224,32 +4237,61 @@ impl FrankenStorage {
     /// `extra_json` here prevents rebuilds from rehydrating enormous historical
     /// payloads that are irrelevant to lexical search.
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        self.conn
-            .query_map_collect(
-                "SELECT id, idx, role, author, created_at, content \
+        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+                 WHERE conversation_id = ?1 ORDER BY idx";
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
                  FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx",
-                fparams![conversation_id],
-                |row| {
-                    let role: String = row.get_typed(2)?;
-                    Ok(Message {
-                        id: Some(row.get_typed(0)?),
-                        idx: row.get_typed(1)?,
-                        role: match role.as_str() {
-                            "user" => MessageRole::User,
-                            "agent" | "assistant" => MessageRole::Agent,
-                            "tool" => MessageRole::Tool,
-                            "system" => MessageRole::System,
-                            other => MessageRole::Other(other.to_string()),
+                 WHERE conversation_id = ?1 ORDER BY idx";
+
+        self.conn
+            .query_map_collect(hinted_sql, fparams![conversation_id], |row| {
+                let role: String = row.get_typed(2)?;
+                Ok(Message {
+                    id: Some(row.get_typed(0)?),
+                    idx: row.get_typed(1)?,
+                    role: match role.as_str() {
+                        "user" => MessageRole::User,
+                        "agent" | "assistant" => MessageRole::Agent,
+                        "tool" => MessageRole::Tool,
+                        "system" => MessageRole::System,
+                        other => MessageRole::Other(other.to_string()),
+                    },
+                    author: row.get_typed(3)?,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+            })
+            .or_else(|err| {
+                if err.to_string().contains("no such index: sqlite_autoindex_messages_1") {
+                    return self.conn.query_map_collect(
+                        fallback_sql,
+                        fparams![conversation_id],
+                        |row| {
+                            let role: String = row.get_typed(2)?;
+                            Ok(Message {
+                                id: Some(row.get_typed(0)?),
+                                idx: row.get_typed(1)?,
+                                role: match role.as_str() {
+                                    "user" => MessageRole::User,
+                                    "agent" | "assistant" => MessageRole::Agent,
+                                    "tool" => MessageRole::Tool,
+                                    "system" => MessageRole::System,
+                                    other => MessageRole::Other(other.to_string()),
+                                },
+                                author: row.get_typed(3)?,
+                                created_at: row.get_typed(4)?,
+                                content: row.get_typed(5)?,
+                                extra_json: serde_json::Value::Null,
+                                snippets: Vec::new(),
+                            })
                         },
-                        author: row.get_typed(3)?,
-                        created_at: row.get_typed(4)?,
-                        content: row.get_typed(5)?,
-                        extra_json: serde_json::Value::Null,
-                        snippets: Vec::new(),
-                    })
-                },
-            )
+                    );
+                }
+                Err(err)
+            })
             .with_context(|| {
                 format!("fetching messages for lexical rebuild of conversation {conversation_id}")
             })

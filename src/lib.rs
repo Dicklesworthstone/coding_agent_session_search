@@ -4971,7 +4971,7 @@ fn state_meta_json(
                 age_seconds: last_indexed_at
                     .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64))),
                 stale_threshold_seconds: stale_threshold,
-                activity_at_ms: index_run.started_at_ms,
+                activity_at_ms: index_run.updated_at_ms.or(index_run.started_at_ms),
                 pending_sessions: 0,
                 processed_conversations: None,
                 total_conversations: None,
@@ -10035,6 +10035,54 @@ mod cli_read_db_tests {
             Some("lexical_refresh")
         );
         assert_eq!(state["rebuild"]["phase"].as_str(), Some("rebuilding"));
+    }
+
+    #[test]
+    fn state_meta_json_uses_latest_lock_heartbeat_when_asset_inspection_fails() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
+            .expect("create unreadable rebuild state path");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            concat!(
+                "pid={}\n",
+                "started_at_ms={}\n",
+                "updated_at_ms={}\n",
+                "db_path={}\n",
+                "mode=index\n"
+            ),
+            std::process::id(),
+            1_733_000_555_000_i64,
+            1_733_000_666_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["status"].as_str(), Some("error"));
+        assert_eq!(
+            state["index"]["activity_at"].as_str(),
+            Some("2024-11-30T21:04:26+00:00")
+        );
+        assert!(
+            state["index"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("asset inspection failed"))
+        );
     }
 
     #[test]
