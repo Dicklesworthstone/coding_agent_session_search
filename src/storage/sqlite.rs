@@ -8390,14 +8390,14 @@ impl AnalyticsRollupAggregator {
             }
             if is_api {
                 d.api_coverage_message_count += 1;
+                d.api_tokens_total += api_total;
+                d.api_input_tokens_total += entry.api_input_tokens.unwrap_or(0);
+                d.api_output_tokens_total += entry.api_output_tokens.unwrap_or(0);
+                d.api_cache_read_tokens_total += entry.api_cache_read_tokens.unwrap_or(0);
+                d.api_cache_creation_tokens_total += entry.api_cache_creation_tokens.unwrap_or(0);
+                d.api_thinking_tokens_total += entry.api_thinking_tokens.unwrap_or(0);
             }
             d.content_tokens_est_total += content_est;
-            d.api_tokens_total += api_total;
-            d.api_input_tokens_total += entry.api_input_tokens.unwrap_or(0);
-            d.api_output_tokens_total += entry.api_output_tokens.unwrap_or(0);
-            d.api_cache_read_tokens_total += entry.api_cache_read_tokens.unwrap_or(0);
-            d.api_cache_creation_tokens_total += entry.api_cache_creation_tokens.unwrap_or(0);
-            d.api_thinking_tokens_total += entry.api_thinking_tokens.unwrap_or(0);
         }
 
         let model_key = (
@@ -8428,14 +8428,14 @@ impl AnalyticsRollupAggregator {
         }
         if is_api {
             d.api_coverage_message_count += 1;
+            d.api_tokens_total += api_total;
+            d.api_input_tokens_total += entry.api_input_tokens.unwrap_or(0);
+            d.api_output_tokens_total += entry.api_output_tokens.unwrap_or(0);
+            d.api_cache_read_tokens_total += entry.api_cache_read_tokens.unwrap_or(0);
+            d.api_cache_creation_tokens_total += entry.api_cache_creation_tokens.unwrap_or(0);
+            d.api_thinking_tokens_total += entry.api_thinking_tokens.unwrap_or(0);
         }
         d.content_tokens_est_total += content_est;
-        d.api_tokens_total += api_total;
-        d.api_input_tokens_total += entry.api_input_tokens.unwrap_or(0);
-        d.api_output_tokens_total += entry.api_output_tokens.unwrap_or(0);
-        d.api_cache_read_tokens_total += entry.api_cache_read_tokens.unwrap_or(0);
-        d.api_cache_creation_tokens_total += entry.api_cache_creation_tokens.unwrap_or(0);
-        d.api_thinking_tokens_total += entry.api_thinking_tokens.unwrap_or(0);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -10186,7 +10186,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_api_rollup_requires_api_data_source() {
+    fn api_rollups_require_api_data_source() {
         let mut agg = AnalyticsRollupAggregator::new();
 
         let estimated_plan = MessageMetricsEntry {
@@ -10247,14 +10247,34 @@ mod tests {
 
         let key = (1_i64, "codex".to_string(), 0_i64, "local".to_string());
         let hourly = agg.hourly.get(&key).expect("hourly rollup key must exist");
+        let daily = agg.daily.get(&key).expect("daily rollup key must exist");
+        let model_key = (
+            1_i64,
+            "codex".to_string(),
+            0_i64,
+            "local".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+        );
+        let models_daily = agg
+            .models_daily
+            .get(&model_key)
+            .expect("model rollup key must exist");
 
         // Content rollup includes both plan messages.
         assert_eq!(hourly.plan_message_count, 2);
         assert_eq!(hourly.plan_content_tokens_est_total, 50);
         // API plan tokens must include only api_data_source='api' rows.
         assert_eq!(hourly.plan_api_tokens_total, 50);
-        // Overall API tokens still include all row-level API token fields.
-        assert_eq!(hourly.api_tokens_total, 200);
+        assert_eq!(daily.plan_api_tokens_total, 50);
+        assert_eq!(models_daily.plan_api_tokens_total, 50);
+        // Overall API totals must also exclude estimated rows.
+        assert_eq!(hourly.api_tokens_total, 50);
+        assert_eq!(hourly.api_input_tokens_total, 40);
+        assert_eq!(hourly.api_output_tokens_total, 10);
+        assert_eq!(hourly.api_coverage_message_count, 1);
+        assert_eq!(daily.api_tokens_total, 50);
+        assert_eq!(models_daily.api_tokens_total, 50);
     }
 
     #[test]
