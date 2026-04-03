@@ -416,6 +416,46 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
     workspace_a
 }
 
+fn seed_analytics_remote_source_tokens_fixture(temp_home: &TempDir) {
+    let (_workspace_a, workspace_b) = seed_analytics_workspace_fixture(temp_home);
+    let db_path = temp_home
+        .path()
+        .join(".local/share/coding-agent-search/agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().to_string()).unwrap();
+    conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+        .unwrap();
+
+    let workspace_rows = conn
+        .query_map_collect(
+            "SELECT path, id FROM workspaces",
+            &[],
+            |row: &frankensqlite::Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )
+        .unwrap();
+    let workspace_b_id = workspace_rows
+        .into_iter()
+        .find(|(path, _)| path == &workspace_b.to_string_lossy())
+        .map(|(_, id)| id)
+        .expect("workspace-b id");
+
+    conn.execute(&format!(
+        "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE workspace_id = {workspace_b_id}"
+    ))
+    .unwrap();
+    conn.execute(&format!(
+        "UPDATE message_metrics SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
+    ))
+    .unwrap();
+    conn.execute(&format!(
+        "UPDATE usage_hourly SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
+    ))
+    .unwrap();
+    conn.execute(&format!(
+        "UPDATE usage_daily SET source_id = '   ' WHERE workspace_id = {workspace_b_id}"
+    ))
+    .unwrap();
+}
+
 // =============================================================================
 // Completions command tests
 // =============================================================================
@@ -2524,6 +2564,33 @@ fn analytics_tokens_with_agent_filter() {
         has_agent_filter,
         "should include agent filter in _meta.filters_applied"
     );
+}
+
+#[test]
+fn analytics_tokens_source_filter_matches_blank_remote_usage_rollups_via_origin_host() {
+    let tmp = TempDir::new().unwrap();
+    seed_analytics_remote_source_tokens_fixture(&tmp);
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args(["analytics", "tokens", "--source", "remote-ci", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout={stdout}"));
+
+    assert_eq!(json["data"]["_meta"]["source_table"], "message_metrics");
+    assert_eq!(json["data"]["bucket_count"], 1);
+    assert_eq!(json["data"]["totals"]["counts"]["message_count"], 1);
+    assert_eq!(json["data"]["totals"]["counts"]["user_message_count"], 1);
+
+    let filters: Vec<String> = json["_meta"]["filters_applied"]
+        .as_array()
+        .expect("filters_applied array")
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(filters.iter().any(|value| value == "source=remote-ci"));
 }
 
 #[test]

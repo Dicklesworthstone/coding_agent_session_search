@@ -85,8 +85,10 @@ impl Default for EncryptionParams {
 /// matching the Web Crypto API implementation in scripts.rs.
 ///
 /// # Note
-/// This is a placeholder implementation. For production use,
-/// integrate with a proper crypto library like `ring` or `aes-gcm`.
+/// This is the production encryption path for feature-enabled HTML export.
+/// It intentionally uses the same algorithm and parameter contract as the
+/// browser-side Web Crypto decryptor so exported pages can be decrypted
+/// client-side without a server round-trip.
 #[cfg(feature = "encryption")]
 pub fn encrypt_content(
     plaintext: &str,

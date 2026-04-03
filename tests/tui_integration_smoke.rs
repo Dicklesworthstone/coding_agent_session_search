@@ -368,6 +368,14 @@ fn integration_asciicast_records_with_data() {
         cast.contains("\"version\":2"),
         "asciicast should be v2 format"
     );
+    assert!(
+        cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""),
+        "non-interactive headless --once should emit a labeled sentinel cast"
+    );
+    assert!(
+        cast.contains("sentinel artifact, not a real terminal session recording"),
+        "sentinel cast should explain why no live recording exists"
+    );
 }
 
 // =============================================================================

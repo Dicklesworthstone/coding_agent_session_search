@@ -596,6 +596,17 @@ fn track_a_source_breakdown_supports_raw_metric(conn: &Connection, metric: Metri
     }
 }
 
+fn track_a_timeseries_requires_source_fallback(filter: &AnalyticsFilter) -> bool {
+    match &filter.source {
+        SourceFilter::Remote => true,
+        SourceFilter::Specific(source_id) => {
+            normalized_analytics_source_id_value(source_id.as_str())
+                != crate::sources::provenance::LOCAL_SOURCE_ID
+        }
+        SourceFilter::All | SourceFilter::Local => false,
+    }
+}
+
 fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -> RollupStats {
     if !table_exists(conn, "token_daily_stats") {
         return RollupStats::default();
@@ -879,6 +890,13 @@ pub fn query_tokens_timeseries(
 ) -> AnalyticsResult<TimeseriesResult> {
     let query_start = std::time::Instant::now();
 
+    if track_a_timeseries_requires_source_fallback(filter)
+        && table_exists(conn, "messages")
+        && table_exists(conn, "conversations")
+    {
+        return query_track_a_timeseries_from_raw(conn, filter, group_by, query_start);
+    }
+
     // Choose source table and bucket column.
     let (table, bucket_col) = match group_by {
         GroupBy::Hour => ("usage_hourly", "hour_id"),
@@ -1048,6 +1066,286 @@ pub fn query_tokens_timeseries(
         group_by,
         elapsed_ms,
         path: "rollup".into(),
+    })
+}
+
+fn query_track_a_timeseries_from_raw(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+    group_by: GroupBy,
+    query_start: std::time::Instant,
+) -> AnalyticsResult<TimeseriesResult> {
+    let has_agents = table_exists(conn, "agents");
+    let has_origin_host = table_has_column(conn, "conversations", "origin_host");
+    let join_message_metrics = table_exists(conn, "message_metrics")
+        && table_has_column(conn, "message_metrics", "message_id");
+    let has_message_metrics_created_at =
+        join_message_metrics && table_has_column(conn, "message_metrics", "created_at_ms");
+    let has_content_tokens_est =
+        join_message_metrics && table_has_column(conn, "message_metrics", "content_tokens_est");
+    let has_api_input_tokens =
+        join_message_metrics && table_has_column(conn, "message_metrics", "api_input_tokens");
+    let has_api_output_tokens =
+        join_message_metrics && table_has_column(conn, "message_metrics", "api_output_tokens");
+    let has_api_cache_read_tokens =
+        join_message_metrics && table_has_column(conn, "message_metrics", "api_cache_read_tokens");
+    let has_api_cache_creation_tokens = join_message_metrics
+        && table_has_column(conn, "message_metrics", "api_cache_creation_tokens");
+    let has_api_thinking_tokens =
+        join_message_metrics && table_has_column(conn, "message_metrics", "api_thinking_tokens");
+    let has_api_data_source =
+        join_message_metrics && table_has_column(conn, "message_metrics", "api_data_source");
+    let has_tool_call_count =
+        join_message_metrics && table_has_column(conn, "message_metrics", "tool_call_count");
+    let has_has_plan =
+        join_message_metrics && table_has_column(conn, "message_metrics", "has_plan");
+
+    let conversation_sql = if has_origin_host {
+        "SELECT id, TRIM(COALESCE(source_id, '')), TRIM(COALESCE(origin_host, '')) FROM conversations"
+    } else {
+        "SELECT id, TRIM(COALESCE(source_id, '')), '' FROM conversations"
+    };
+    let conversation_sources: BTreeMap<i64, (String, String)> = conn
+        .query_map_collect(conversation_sql, &[], |row: &Row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                (row.get_typed::<String>(1)?, row.get_typed::<String>(2)?),
+            ))
+        })
+        .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?
+        .into_iter()
+        .collect();
+
+    let mut from_sql = String::from("messages m JOIN conversations c ON c.id = m.conversation_id");
+    if has_agents {
+        from_sql.push_str(" LEFT JOIN agents a ON a.id = c.agent_id");
+    }
+    if join_message_metrics {
+        from_sql.push_str(" LEFT JOIN message_metrics mm ON mm.message_id = m.id");
+    }
+
+    let filter_for_sql = AnalyticsFilter {
+        source: SourceFilter::All,
+        ..filter.clone()
+    };
+    let message_time_sql = if has_message_metrics_created_at {
+        "COALESCE(m.created_at, mm.created_at_ms, 0)"
+    } else {
+        "COALESCE(m.created_at, 0)"
+    };
+    let (where_sql, params) = build_filtered_where_sql(
+        &filter_for_sql,
+        Some("c.workspace_id"),
+        has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
+        sql_string_literal("all"),
+        Some(AnalyticsTimeColumn::TimestampMs(message_time_sql)),
+    );
+
+    let content_tokens_expr = if has_content_tokens_est {
+        "COALESCE(mm.content_tokens_est, 0)"
+    } else {
+        "0"
+    };
+    let api_input_expr = if has_api_input_tokens {
+        "COALESCE(mm.api_input_tokens, 0)"
+    } else {
+        "0"
+    };
+    let api_output_expr = if has_api_output_tokens {
+        "COALESCE(mm.api_output_tokens, 0)"
+    } else {
+        "0"
+    };
+    let api_cache_read_expr = if has_api_cache_read_tokens {
+        "COALESCE(mm.api_cache_read_tokens, 0)"
+    } else {
+        "0"
+    };
+    let api_cache_creation_expr = if has_api_cache_creation_tokens {
+        "COALESCE(mm.api_cache_creation_tokens, 0)"
+    } else {
+        "0"
+    };
+    let api_thinking_expr = if has_api_thinking_tokens {
+        "COALESCE(mm.api_thinking_tokens, 0)"
+    } else {
+        "0"
+    };
+    let api_covered_expr = if has_api_data_source {
+        "CASE WHEN mm.api_data_source = 'api' THEN 1 ELSE 0 END"
+    } else {
+        "0"
+    };
+    let tool_call_expr = if has_tool_call_count {
+        "COALESCE(mm.tool_call_count, 0)"
+    } else {
+        "0"
+    };
+    let has_plan_expr = if has_has_plan {
+        "CASE WHEN COALESCE(mm.has_plan, 0) != 0 THEN 1 ELSE 0 END"
+    } else {
+        "0"
+    };
+
+    let sql = format!(
+        "SELECT m.conversation_id,
+                m.role,
+                {message_time_sql},
+                {content_tokens_expr},
+                {api_input_expr},
+                {api_output_expr},
+                {api_cache_read_expr},
+                {api_cache_creation_expr},
+                {api_thinking_expr},
+                {api_covered_expr},
+                {tool_call_expr},
+                {has_plan_expr}
+         FROM {from_sql}{where_sql}"
+    );
+
+    let row_buckets: Vec<(i64, i64, UsageBucket)> = conn
+        .query_map_collect(&sql, &params, |row: &Row| {
+            let conversation_id: i64 = row.get_typed(0)?;
+            let role: String = row.get_typed(1)?;
+            let created_at_ms: i64 = row.get_typed(2)?;
+            let content_tokens_est: i64 = row.get_typed(3)?;
+            let api_input_tokens: i64 = row.get_typed(4)?;
+            let api_output_tokens: i64 = row.get_typed(5)?;
+            let api_cache_read_tokens: i64 = row.get_typed(6)?;
+            let api_cache_creation_tokens: i64 = row.get_typed(7)?;
+            let api_thinking_tokens: i64 = row.get_typed(8)?;
+            let api_covered: i64 = row.get_typed(9)?;
+            let tool_call_count: i64 = row.get_typed(10)?;
+            let has_plan: i64 = row.get_typed(11)?;
+            let normalized_created_at_ms = normalize_epoch_millis(created_at_ms);
+            let bucket_id = match group_by {
+                GroupBy::Hour => crate::storage::sqlite::FrankenStorage::hour_id_from_millis(
+                    normalized_created_at_ms,
+                ),
+                GroupBy::Day | GroupBy::Week | GroupBy::Month => {
+                    crate::storage::sqlite::FrankenStorage::day_id_from_millis(
+                        normalized_created_at_ms,
+                    )
+                }
+            };
+
+            let mut bucket = UsageBucket {
+                message_count: 1,
+                user_message_count: i64::from(role == "user"),
+                assistant_message_count: i64::from(role == "assistant"),
+                tool_call_count,
+                plan_message_count: has_plan,
+                api_coverage_message_count: api_covered,
+                content_tokens_est_total: content_tokens_est,
+                content_tokens_est_user: if role == "user" {
+                    content_tokens_est
+                } else {
+                    0
+                },
+                content_tokens_est_assistant: if role == "assistant" {
+                    content_tokens_est
+                } else {
+                    0
+                },
+                api_input_tokens_total: api_input_tokens,
+                api_output_tokens_total: api_output_tokens,
+                api_cache_read_tokens_total: api_cache_read_tokens,
+                api_cache_creation_tokens_total: api_cache_creation_tokens,
+                api_thinking_tokens_total: api_thinking_tokens,
+                plan_content_tokens_est_total: if has_plan != 0 { content_tokens_est } else { 0 },
+                ..Default::default()
+            };
+            bucket.api_tokens_total = api_input_tokens
+                + api_output_tokens
+                + api_cache_read_tokens
+                + api_cache_creation_tokens
+                + api_thinking_tokens;
+            if has_plan != 0 && api_covered != 0 {
+                bucket.plan_api_tokens_total = bucket.api_tokens_total;
+            }
+
+            Ok((conversation_id, bucket_id, bucket))
+        })
+        .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?;
+
+    let mut grouped_buckets: BTreeMap<i64, UsageBucket> = BTreeMap::new();
+    for (conversation_id, bucket_id, bucket) in row_buckets {
+        let (source_id, origin_host) = conversation_sources
+            .get(&conversation_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                (
+                    crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                    String::new(),
+                )
+            });
+        let normalized_key = {
+            let trimmed_source_id = source_id.trim();
+            if trimmed_source_id.is_empty() {
+                let trimmed_origin_host = origin_host.trim();
+                if trimmed_origin_host.is_empty() {
+                    crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
+                } else {
+                    trimmed_origin_host.to_string()
+                }
+            } else if trimmed_source_id
+                .eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID)
+            {
+                crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
+            } else {
+                trimmed_source_id.to_string()
+            }
+        };
+        if !analytics_source_filter_matches_key(&filter.source, &normalized_key) {
+            continue;
+        }
+        grouped_buckets.entry(bucket_id).or_default().merge(&bucket);
+    }
+
+    let raw_buckets: Vec<(i64, UsageBucket)> = grouped_buckets.into_iter().collect();
+    let final_buckets: Vec<(String, UsageBucket)> = match group_by {
+        GroupBy::Hour => raw_buckets
+            .into_iter()
+            .map(|(id, row)| (bucketing::hour_id_to_iso(id), row))
+            .collect(),
+        GroupBy::Day => raw_buckets
+            .into_iter()
+            .map(|(id, row)| (bucketing::day_id_to_iso(id), row))
+            .collect(),
+        GroupBy::Week => {
+            let mut merged: BTreeMap<String, UsageBucket> = BTreeMap::new();
+            for (day_id, row) in raw_buckets {
+                let key = bucketing::day_id_to_iso_week(day_id);
+                merged.entry(key).or_default().merge(&row);
+            }
+            merged.into_iter().collect()
+        }
+        GroupBy::Month => {
+            let mut merged: BTreeMap<String, UsageBucket> = BTreeMap::new();
+            for (day_id, row) in raw_buckets {
+                let key = bucketing::day_id_to_month(day_id);
+                merged.entry(key).or_default().merge(&row);
+            }
+            merged.into_iter().collect()
+        }
+    };
+
+    let mut totals = UsageBucket::default();
+    for (_, row) in &final_buckets {
+        totals.merge(row);
+    }
+
+    Ok(TimeseriesResult {
+        buckets: final_buckets,
+        totals,
+        source_table: if join_message_metrics {
+            "message_metrics".into()
+        } else {
+            "messages".into()
+        },
+        group_by,
+        elapsed_ms: query_start.elapsed().as_millis() as u64,
+        path: "raw".into(),
     })
 }
 
@@ -4311,6 +4609,40 @@ mod tests {
             .map(|(_, b)| b.estimated_cost_usd)
             .sum();
         assert!((result.totals.estimated_cost_usd - sum_cost).abs() < 0.001);
+    }
+
+    #[test]
+    fn query_tokens_timeseries_source_filter_matches_blank_remote_usage_daily_source_via_origin_host()
+     {
+        let conn = setup_status_filter_db();
+        conn.execute("ALTER TABLE conversations ADD COLUMN origin_host TEXT")
+            .unwrap();
+        conn.execute(
+            "UPDATE conversations SET source_id = '   ', origin_host = 'remote-ci' WHERE id = 2",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE message_metrics SET source_id = '   ' WHERE agent_slug = 'claude_code'",
+        )
+        .unwrap();
+        conn.execute("UPDATE usage_hourly SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+            .unwrap();
+        conn.execute("UPDATE usage_daily SET source_id = '   ' WHERE agent_slug = 'claude_code'")
+            .unwrap();
+
+        let filter = AnalyticsFilter {
+            source: SourceFilter::Specific("remote-ci".into()),
+            ..Default::default()
+        };
+        let result = query_tokens_timeseries(&conn, &filter, GroupBy::Day).unwrap();
+
+        assert_eq!(result.source_table, "message_metrics");
+        assert_eq!(result.buckets.len(), 1);
+        assert_eq!(result.buckets[0].1.message_count, 1);
+        assert_eq!(result.buckets[0].1.assistant_message_count, 1);
+        assert_eq!(result.buckets[0].1.content_tokens_est_total, 5);
+        assert_eq!(result.totals.message_count, 1);
+        assert_eq!(result.totals.content_tokens_est_total, 5);
     }
 
     #[test]

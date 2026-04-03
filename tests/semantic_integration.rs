@@ -997,14 +997,14 @@ fn test_models_install_from_file_directory_validates_checksums() {
 
     assert!(
         !output.status.success(),
-        "repo fixture directory should fail checksum validation instead of pretending --from-file is unimplemented. stderr: {}",
+        "repo fixture directory should fail checksum validation through the real local-directory install path. stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("SHA256 mismatch"),
-        "stderr should show real checksum validation, not an unimplemented-path error. Got: {}",
+        "stderr should show the real checksum-validation failure from the implemented --from-file path. Got: {}",
         stderr
     );
 }

@@ -147,7 +147,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         reset_state: bool,
 
-        /// Record terminal output to asciicast v2 file (for demos/bug repro)
+        /// Record terminal output to an asciicast v2 file; in non-interactive
+        /// headless --once mode cass writes a labeled sentinel cast because no
+        /// live TUI session is launched.
         #[arg(long, value_hint = ValueHint::FilePath)]
         asciicast: Option<PathBuf>,
 
@@ -3791,9 +3793,9 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
 /// { "command": "analytics/<sub>", "data": { ... }, "_meta": { "elapsed_ms": N } }
 /// ```
 ///
-/// Implementation of the actual data queries is deferred to child beads;
-/// these stubs return a well-formed "not yet implemented" response so
-/// downstream consumers can parse the envelope immediately.
+/// The data for each analytics subcommand is produced by dedicated helpers
+/// below; this dispatcher only normalizes envelopes, shared filters, and
+/// structured output across the analytics surface.
 fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> CliResult<()> {
     use std::time::Instant;
 
@@ -5175,13 +5177,13 @@ fn prepare_headless_once_tui_artifacts(
     })?;
 
     if let Some(path) = asciicast_path {
-        write_headless_asciicast_stub(path)?;
+        write_headless_asciicast_sentinel(path)?;
     }
 
     Ok(())
 }
 
-fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
+fn write_headless_asciicast_sentinel(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -5201,6 +5203,9 @@ fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
         "width": 120,
         "height": 40,
         "timestamp": Utc::now().timestamp(),
+        "cass_artifact_kind": "headless_once_asciicast_sentinel",
+        "recording_available": false,
+        "reason": "non_interactive_headless_once_bootstrap",
         "env": {
             "TERM": dotenvy::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
             "SHELL": dotenvy::var("SHELL").unwrap_or_else(|_| "cass".to_string())
@@ -5209,9 +5214,61 @@ fn write_headless_asciicast_stub(path: &Path) -> Result<()> {
 
     writeln!(file, "{header}")
         .map_err(|e| anyhow::anyhow!("write asciicast header to {}: {e}", path.display()))?;
-    writeln!(file, "[0.0,\"o\",\"\"]")
+    let sentinel_frame = serde_json::to_string(
+        "cass headless --once bootstrap completed without launching the interactive TUI.\r\n\
+This asciicast is a sentinel artifact, not a real terminal session recording.\r\n",
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "encode asciicast sentinel frame for {}: {e}",
+            path.display()
+        )
+    })?;
+    writeln!(file, "[0.0,\"o\",{sentinel_frame}]")
         .map_err(|e| anyhow::anyhow!("write asciicast frame to {}: {e}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod headless_asciicast_sentinel_tests {
+    use super::write_headless_asciicast_sentinel;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn headless_asciicast_sentinel_is_labeled_and_nonempty() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cast_path = tmp.path().join("captures").join("headless.cast");
+
+        write_headless_asciicast_sentinel(&cast_path).expect("write sentinel cast");
+
+        let cast = fs::read_to_string(&cast_path).expect("read sentinel cast");
+        assert!(cast.contains("\"version\":2"));
+        assert!(cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""));
+        assert!(cast.contains("\"recording_available\":false"));
+        assert!(cast.contains("sentinel artifact, not a real terminal session recording"));
+        assert!(
+            !cast.contains("[0.0,\"o\",\"\"]"),
+            "sentinel cast must not use an empty placeholder frame"
+        );
+    }
+
+    #[test]
+    fn headless_asciicast_sentinel_overwrites_existing_stub_content() {
+        let tmp = TempDir::new().expect("temp dir");
+        let cast_path = tmp.path().join("existing.cast");
+        fs::write(&cast_path, "{\"version\":2}\n[0.0,\"o\",\"\"]\n").expect("write old stub");
+
+        write_headless_asciicast_sentinel(&cast_path).expect("rewrite sentinel cast");
+
+        let cast = fs::read_to_string(&cast_path).expect("read overwritten cast");
+        assert!(cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""));
+        assert!(cast.contains("headless --once bootstrap completed"));
+        assert!(
+            !cast.contains("[0.0,\"o\",\"\"]"),
+            "overwritten cast should no longer contain the vacuous stub frame"
+        );
+    }
 }
 
 fn configure_color(choice: ColorPref, stdout_is_tty: bool, stderr_is_tty: bool) {
@@ -5886,7 +5943,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.buckets: [{ bucket: string, counts: {...}, content_tokens: {...},".into(),
         "                   api_tokens: {...}, plan: {...}, derived: {...} }]".into(),
         "  data.totals: <same shape as bucket>".into(),
-        "  data.source_table: string  ('usage_daily' | 'usage_hourly')".into(),
+        "  data.source_table: string  ('usage_daily' | 'usage_hourly' | 'messages' | 'message_metrics')".into(),
         "  data.granularity: string   ('hour' | 'day' | 'week' | 'month')".into(),
         "  Bucket keys: counts.{message_count, user_message_count, assistant_message_count,".into(),
         "    tool_call_count, plan_message_count}; api_tokens.{total, input, output,".into(),
@@ -5904,8 +5961,10 @@ fn render_analytics_docs() -> Vec<String> {
         "### analytics models".into(),
         "  data.by_api_tokens: { dim, metric, rows: [{ key, value, message_count, ... }] }".into(),
         "  data.timeseries: <same as analytics tokens>".into(),
-        "  Source: token_daily_stats (Track B) — models only available for connectors".into(),
-        "    that report model names (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
+        "  data.by_api_tokens._meta.source_table: string  ('token_daily_stats' | 'token_usage')".into(),
+        "    Usually token_daily_stats; token_usage when filters require raw provenance recovery.".into(),
+        "  Models only available for connectors that report model names".into(),
+        "    (claude_code, codex, pi_agent, factory, opencode, cursor).".into(),
         String::new(),
         "### analytics rebuild".into(),
         "  data.track: string ('a')".into(),

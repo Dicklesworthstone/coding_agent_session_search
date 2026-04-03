@@ -278,8 +278,9 @@ fn tui_data_dir_flag_recognized() {
 }
 
 #[test]
-fn tui_headless_asciicast_creates_recording_file() {
-    // Test: --asciicast writes a valid asciicast v2 file in headless once mode
+fn tui_headless_asciicast_writes_truthful_sentinel_cast() {
+    // Test: non-interactive headless --once writes a labeled sentinel cast,
+    // not a vacuous fake recording.
     let tmp = TempDir::new().unwrap();
     let data_dir = setup_indexed_data_dir(tmp.path());
     let cast_path = tmp.path().join("captures").join("smoke.cast");
@@ -300,6 +301,18 @@ fn tui_headless_asciicast_creates_recording_file() {
     assert!(
         cast.contains("\"version\":2"),
         "Asciicast header must declare v2 format"
+    );
+    assert!(
+        cast.contains("\"cass_artifact_kind\":\"headless_once_asciicast_sentinel\""),
+        "headless once cast should be labeled as a sentinel artifact"
+    );
+    assert!(
+        cast.contains("\"recording_available\":false"),
+        "headless once cast should truthfully report recording availability"
+    );
+    assert!(
+        cast.contains("sentinel artifact, not a real terminal session recording"),
+        "headless once cast should explain that it is not a live recording"
     );
 }
 
