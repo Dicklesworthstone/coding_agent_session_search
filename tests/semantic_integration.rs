@@ -975,22 +975,19 @@ fn test_search_mode_flag_consistency() {
 // Models Install From File Tests
 // =============================================================================
 
-/// Test: models install --from-file returns appropriate error (not yet implemented)
+/// Test: models install --from-file validates a local model directory instead of
+/// failing as \"not implemented\"
 #[test]
-fn test_models_install_from_file_error() {
+fn test_models_install_from_file_directory_validates_checksums() {
     let tmp = tempfile::TempDir::new().unwrap();
     let data_dir = tmp.path().join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    // Use fixture model file instead of fake content
-    // Note: Use CARGO_MANIFEST_DIR for robust path resolution regardless of cwd
     let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
-    let model_file = tmp.path().join("model.onnx");
-    fs::copy(fixture_dir.join("model.onnx"), &model_file).unwrap();
 
     let output = cargo_bin_cmd!("cass")
         .args(["models", "install", "--from-file"])
-        .arg(&model_file)
+        .arg(&fixture_dir)
         .arg("--data-dir")
         .arg(&data_dir)
         .arg("-y")
@@ -998,43 +995,109 @@ fn test_models_install_from_file_error() {
         .output()
         .expect("models install from-file command");
 
-    // Should fail with "not implemented" error
     assert!(
         !output.status.success(),
-        "install --from-file should fail (not implemented)"
+        "repo fixture directory should fail checksum validation instead of pretending --from-file is unimplemented. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("not yet implemented") || stderr.contains("from-file"),
-        "Error should mention --from-file not implemented. Got: {}",
+        stderr.contains("SHA256 mismatch"),
+        "stderr should show real checksum validation, not an unimplemented-path error. Got: {}",
         stderr
     );
 }
 
-/// Test: models install --from-file with non-existent file fails appropriately
+/// Test: models install rejects an invalid mirror URL before any network work
 #[test]
-fn test_models_install_from_file_missing_file() {
+fn test_models_install_rejects_invalid_mirror_url() {
     let tmp = tempfile::TempDir::new().unwrap();
     let data_dir = tmp.path().join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let missing_file = tmp.path().join("nonexistent.onnx");
-
     let output = cargo_bin_cmd!("cass")
-        .args(["models", "install", "--from-file"])
-        .arg(&missing_file)
+        .args(["models", "install", "--mirror", "not-a-valid-url"])
         .arg("--data-dir")
         .arg(&data_dir)
         .arg("-y")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .output()
-        .expect("models install with missing file");
+        .expect("models install with invalid mirror URL");
 
-    // Should fail (either file not found or not implemented)
     assert!(
         !output.status.success(),
-        "install --from-file with missing file should fail"
+        "install --mirror with an invalid URL should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid mirror URL"),
+        "stderr should explain that the mirror URL is invalid. Got: {}",
+        stderr
+    );
+}
+
+/// Test: models install rejects conflicting mirror and from-file sources
+#[test]
+fn test_models_install_rejects_conflicting_mirror_and_from_file() {
+    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
+
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "models",
+            "install",
+            "--mirror",
+            "https://mirror.example/cache",
+            "--from-file",
+        ])
+        .arg(&fixture_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .output()
+        .expect("models install with conflicting flags");
+
+    assert!(
+        !output.status.success(),
+        "conflicting --mirror and --from-file flags should fail to parse"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Could not parse arguments"),
+        "stderr should report a parse failure for conflicting flags. Got: {}",
+        stderr
+    );
+}
+
+/// Test: models install --from-file with non-existent directory fails appropriately
+#[test]
+fn test_models_install_from_file_missing_directory() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let data_dir = tmp.path().join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let missing_dir = tmp.path().join("nonexistent-model-dir");
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["models", "install", "--from-file"])
+        .arg(&missing_dir)
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .arg("-y")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .output()
+        .expect("models install with missing directory");
+
+    assert!(
+        !output.status.success(),
+        "install --from-file with a missing directory should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a directory"),
+        "stderr should explain that --from-file expects a directory. Got: {}",
+        stderr
     );
 }
 

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use asupersync::bytes::Buf;
 use asupersync::http::Body;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 /// Model state machine for download lifecycle.
 ///
@@ -165,6 +166,51 @@ pub struct ModelManifest {
 /// When a manifest file has this checksum, it means the model has not been
 /// downloaded and verified yet. The download system will reject such files.
 pub const PLACEHOLDER_CHECKSUM: &str = "PLACEHOLDER_VERIFY_AFTER_DOWNLOAD";
+
+/// Validate and normalize a mirror base URL for model downloads.
+///
+/// The returned string never ends with a trailing slash and must be an
+/// absolute HTTP(S) URL without query or fragment components.
+pub fn normalize_mirror_base_url(base_url: &str) -> Result<String, DownloadError> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err(DownloadError::InvalidMirrorUrl {
+            url: base_url.to_string(),
+            reason: "mirror URL cannot be empty".into(),
+        });
+    }
+
+    let parsed = Url::parse(trimmed).map_err(|err| DownloadError::InvalidMirrorUrl {
+        url: trimmed.to_string(),
+        reason: err.to_string(),
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(DownloadError::InvalidMirrorUrl {
+                url: trimmed.to_string(),
+                reason: format!("unsupported URL scheme '{scheme}' (expected http or https)"),
+            });
+        }
+    }
+
+    if parsed.host_str().is_none() {
+        return Err(DownloadError::InvalidMirrorUrl {
+            url: trimmed.to_string(),
+            reason: "mirror URL must include a host".into(),
+        });
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(DownloadError::InvalidMirrorUrl {
+            url: trimmed.to_string(),
+            reason: "mirror URL must not include query or fragment components".into(),
+        });
+    }
+
+    Ok(parsed.to_string().trim_end_matches('/').to_string())
+}
 
 impl ModelManifest {
     /// Check if this manifest has verified checksums for all files.
@@ -487,12 +533,21 @@ impl ModelManifest {
         self.files.iter().map(|f| f.size).sum()
     }
 
+    /// Download URL for a file, optionally via a validated mirror base URL.
+    pub fn download_url_with_base(&self, file: &ModelFile, base_url: Option<&str>) -> String {
+        let root = base_url.unwrap_or("https://huggingface.co");
+        format!(
+            "{}/{}/resolve/{}/{}",
+            root.trim_end_matches('/'),
+            self.repo.trim_start_matches('/'),
+            self.revision,
+            file.name.trim_start_matches('/')
+        )
+    }
+
     /// HuggingFace download URL for a file.
     pub fn download_url(&self, file: &ModelFile) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            self.repo, self.revision, file.name
-        )
+        self.download_url_with_base(file, None)
     }
 }
 
@@ -550,6 +605,8 @@ pub enum DownloadError {
         unverified_files: Vec<String>,
         revision_unpinned: bool,
     },
+    /// Mirror URL failed validation.
+    InvalidMirrorUrl { url: String, reason: String },
 }
 
 impl std::fmt::Display for DownloadError {
@@ -589,6 +646,9 @@ impl std::fmt::Display for DownloadError {
                     }
                 )
             }
+            DownloadError::InvalidMirrorUrl { url, reason } => {
+                write!(f, "invalid mirror URL '{url}': {reason}")
+            }
         }
     }
 }
@@ -613,7 +673,8 @@ impl DownloadError {
             }
             DownloadError::VerificationFailed { .. }
             | DownloadError::Cancelled
-            | DownloadError::ManifestNotVerified { .. } => false,
+            | DownloadError::ManifestNotVerified { .. }
+            | DownloadError::InvalidMirrorUrl { .. } => false,
         }
     }
 
@@ -744,6 +805,16 @@ impl ModelDownloader {
         manifest: &ModelManifest,
         on_progress: Option<ProgressCallback>,
     ) -> Result<(), DownloadError> {
+        self.download_with_mirror(manifest, None, on_progress)
+    }
+
+    /// Download and install a model, optionally via a validated mirror base URL.
+    pub fn download_with_mirror(
+        &self,
+        manifest: &ModelManifest,
+        mirror_base_url: Option<&str>,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<(), DownloadError> {
         // Validate manifest is production-ready before downloading
         // This prevents downloading models with placeholder checksums that can't be verified
         if !manifest.is_production_ready() {
@@ -776,7 +847,7 @@ impl ModelDownloader {
 
             // Use local_name() for local path (handles onnx/model.onnx -> model.onnx)
             let file_path = self.temp_dir.join(file.local_name());
-            let url = manifest.download_url(file);
+            let url = manifest.download_url_with_base(file, mirror_base_url);
 
             // Track bytes_downloaded at start of this file to reset on retry
             let bytes_before_file = bytes_downloaded.load(Ordering::SeqCst);
@@ -1359,6 +1430,13 @@ fn sync_parent_directory(_path: &Path) -> Result<(), DownloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     /// Copy model fixtures from tests/fixtures/models/ to the target directory.
     /// Copies model.onnx plus config files.
@@ -1383,6 +1461,199 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    struct MirrorRequest {
+        path: String,
+        range_start: Option<u64>,
+    }
+
+    #[derive(Clone)]
+    struct MirrorRoute {
+        body: Vec<u8>,
+        content_type: &'static str,
+        chunk_size: usize,
+        chunk_delay: Duration,
+    }
+
+    struct MirrorFixtureServer {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        wake_addr: String,
+        requests: Arc<Mutex<Vec<MirrorRequest>>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MirrorFixtureServer {
+        fn requests(&self) -> Vec<MirrorRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for MirrorFixtureServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(&self.wake_addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn start_mirror_fixture_server(routes: Vec<(String, MirrorRoute)>) -> MirrorFixtureServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test mirror server");
+        listener
+            .set_nonblocking(true)
+            .expect("set test mirror server nonblocking");
+        let addr = listener.local_addr().expect("read server address");
+        let wake_addr = addr.to_string();
+        let base_url = format!("http://{wake_addr}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let route_map: BTreeMap<String, MirrorRoute> = routes.into_iter().collect();
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        handle_mirror_request(stream, &route_map, &request_log);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        MirrorFixtureServer {
+            base_url,
+            stop,
+            wake_addr,
+            requests,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle_mirror_request(
+        mut stream: TcpStream,
+        routes: &BTreeMap<String, MirrorRoute>,
+        request_log: &Arc<Mutex<Vec<MirrorRequest>>>,
+    ) {
+        let mut buffer = [0_u8; 8192];
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) => return,
+        };
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let mut lines = request.lines();
+        let target = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        let path = target
+            .split_once('?')
+            .map(|(path, _)| path)
+            .unwrap_or(target)
+            .split_once('#')
+            .map(|(path, _)| path)
+            .unwrap_or(target)
+            .to_string();
+        let range_start = lines.find_map(parse_range_start_header);
+        request_log.lock().unwrap().push(MirrorRequest {
+            path: path.clone(),
+            range_start,
+        });
+
+        let Some(route) = routes.get(&path) else {
+            let response = concat!(
+                "HTTP/1.1 404 Not Found\r\n",
+                "Content-Length: 9\r\n",
+                "Content-Type: text/plain\r\n",
+                "Connection: close\r\n\r\n",
+                "not found"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            return;
+        };
+
+        let start = range_start.unwrap_or(0) as usize;
+        let mut status = "200 OK";
+        let mut content_range = None;
+        let body = if start >= route.body.len() {
+            status = "416 Range Not Satisfiable";
+            &[][..]
+        } else if start > 0 {
+            status = "206 Partial Content";
+            content_range = Some(format!(
+                "bytes {start}-{}/{}",
+                route.body.len().saturating_sub(1),
+                route.body.len()
+            ));
+            &route.body[start..]
+        } else {
+            route.body.as_slice()
+        };
+
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n",
+            body.len(),
+            route.content_type
+        );
+        if let Some(content_range) = content_range {
+            response.push_str(&format!("Content-Range: {content_range}\r\n"));
+        }
+        response.push_str("\r\n");
+        let _ = stream.write_all(response.as_bytes());
+        for chunk in body.chunks(route.chunk_size.max(1)) {
+            if stream.write_all(chunk).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            if !route.chunk_delay.is_zero() {
+                thread::sleep(route.chunk_delay);
+            }
+        }
+    }
+
+    fn parse_range_start_header(line: &str) -> Option<u64> {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("range") {
+            return None;
+        }
+        let value = value.trim();
+        let value = value.strip_prefix("bytes=")?;
+        let (start, _) = value.split_once('-')?;
+        start.parse().ok()
+    }
+
+    fn build_test_manifest(repo: &str, revision: &str, files: &[(&str, &[u8])]) -> ModelManifest {
+        ModelManifest {
+            id: "mirror-test-model".into(),
+            repo: repo.into(),
+            revision: revision.into(),
+            files: files
+                .iter()
+                .map(|(name, body)| ModelFile {
+                    name: (*name).into(),
+                    sha256: hex::encode(Sha256::digest(body)),
+                    size: body.len() as u64,
+                })
+                .collect(),
+            license: "Apache-2.0".into(),
+        }
+    }
+
+    fn mirror_route_path(prefix: &str, manifest: &ModelManifest, file: &ModelFile) -> String {
+        format!(
+            "{}/{}/resolve/{}/{}",
+            prefix.trim_end_matches('/'),
+            manifest.repo.trim_start_matches('/'),
+            manifest.revision,
+            file.name.trim_start_matches('/')
+        )
     }
 
     #[test]
@@ -1429,6 +1700,41 @@ mod tests {
         assert!(url.contains("huggingface.co"));
         assert!(url.contains("sentence-transformers/all-MiniLM-L6-v2"));
         assert!(url.contains("model.onnx"));
+    }
+
+    #[test]
+    fn test_model_manifest_download_url_with_mirror_base() {
+        let manifest = ModelManifest::minilm_v2();
+        let url = manifest
+            .download_url_with_base(&manifest.files[0], Some("https://mirror.example/cache/"));
+        assert_eq!(
+            url,
+            format!(
+                "https://mirror.example/cache/{}/resolve/{}/{}",
+                manifest.repo, manifest.revision, manifest.files[0].name
+            )
+        );
+    }
+
+    #[test]
+    fn test_normalize_mirror_base_url_trims_trailing_slash() {
+        let normalized = normalize_mirror_base_url("https://mirror.example/cache/").unwrap();
+        assert_eq!(normalized, "https://mirror.example/cache");
+    }
+
+    #[test]
+    fn test_normalize_mirror_base_url_rejects_invalid_values() {
+        let err = normalize_mirror_base_url("mirror.example").unwrap_err();
+        assert!(err.to_string().contains("invalid mirror URL"));
+
+        let err = normalize_mirror_base_url("file:///tmp/mirror").unwrap_err();
+        assert!(err.to_string().contains("unsupported URL scheme"));
+
+        let err = normalize_mirror_base_url("https://mirror.example/cache?token=abc").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must not include query or fragment")
+        );
     }
 
     #[test]
@@ -1788,6 +2094,209 @@ mod tests {
         assert!(
             !downloader.temp_dir.exists(),
             "verification failures should discard the temp directory to avoid reusing corrupt data"
+        );
+    }
+
+    #[test]
+    fn test_download_with_mirror_installs_verified_model_from_http_mirror() {
+        let files = [
+            ("onnx/model.onnx", b"mirror-model".as_slice()),
+            ("tokenizer.json", br#"{"tokenizer":"ok"}"#.as_slice()),
+        ];
+        let manifest = build_test_manifest("mirror/test-model", "rev123", &files);
+        let route_prefix = "/cache";
+        let routes: Vec<(String, MirrorRoute)> = manifest
+            .files
+            .iter()
+            .zip(files.iter())
+            .map(|(file, (_, body))| {
+                (
+                    mirror_route_path(route_prefix, &manifest, file),
+                    MirrorRoute {
+                        body: body.to_vec(),
+                        content_type: "application/octet-stream",
+                        chunk_size: 64,
+                        chunk_delay: Duration::ZERO,
+                    },
+                )
+            })
+            .collect();
+        let server = start_mirror_fixture_server(routes);
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        let mirror_base = format!("{}/cache/", server.base_url);
+
+        downloader
+            .download_with_mirror(&manifest, Some(&mirror_base), None)
+            .unwrap();
+
+        for (name, body) in files {
+            let installed = downloader.target_dir.join(
+                Path::new(name)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref(),
+            );
+            assert_eq!(
+                fs::read(installed).unwrap(),
+                body,
+                "mirror install should persist the downloaded payload"
+            );
+        }
+        let marker = fs::read_to_string(downloader.target_dir.join(".verified")).unwrap();
+        assert!(
+            marker.contains("revision=rev123"),
+            "verified marker should preserve manifest identity after mirror install"
+        );
+
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            manifest.files.len(),
+            "expected one request per manifest file"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path.starts_with("/cache/")),
+            "mirror requests should stay under the configured mirror prefix: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_with_mirror_reports_missing_artifact_from_http_mirror() {
+        let file_body = b"mirror-model".as_slice();
+        let manifest = build_test_manifest(
+            "mirror/test-model",
+            "rev404",
+            &[("onnx/model.onnx", file_body)],
+        );
+        let server = start_mirror_fixture_server(Vec::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        let mirror_base = format!("{}/cache", server.base_url);
+
+        let err = downloader
+            .download_with_mirror(&manifest, Some(&mirror_base), None)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::HttpError { status: 404, .. }),
+            "missing mirror artifacts should surface as HTTP 404, got: {err}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].path.contains("/resolve/"),
+            "mirror request should target the resolved artifact path: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn test_download_with_mirror_discards_corrupt_payload_from_http_mirror() {
+        let manifest = build_test_manifest(
+            "mirror/test-model",
+            "revbad",
+            &[("onnx/model.onnx", b"expected-bytes".as_slice())],
+        );
+        let route_prefix = "/cache";
+        let server = start_mirror_fixture_server(vec![(
+            mirror_route_path(route_prefix, &manifest, &manifest.files[0]),
+            MirrorRoute {
+                body: b"corrupt-bytes".to_vec(),
+                content_type: "application/octet-stream",
+                chunk_size: 64,
+                chunk_delay: Duration::ZERO,
+            },
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = ModelDownloader::new(tmp.path().join("model"));
+        let mirror_base = format!("{server_base}/cache", server_base = server.base_url);
+
+        let err = downloader
+            .download_with_mirror(&manifest, Some(&mirror_base), None)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::VerificationFailed { .. }),
+            "corrupt mirror payloads must fail checksum verification, got: {err}"
+        );
+        assert!(
+            !downloader.temp_dir.exists(),
+            "verification failures should discard the temp directory so corrupt payloads are not reused"
+        );
+        assert!(
+            !downloader.target_dir.exists(),
+            "corrupt mirror payloads must not be promoted into the installed model directory"
+        );
+    }
+
+    #[test]
+    fn test_download_with_mirror_resumes_after_cancelled_partial_download() {
+        let large_payload = vec![b'x'; 128 * 1024];
+        let manifest = build_test_manifest(
+            "mirror/test-model",
+            "revresume",
+            &[("onnx/model.onnx", &large_payload)],
+        );
+        let route_prefix = "/cache";
+        let server = start_mirror_fixture_server(vec![(
+            mirror_route_path(route_prefix, &manifest, &manifest.files[0]),
+            MirrorRoute {
+                body: large_payload.clone(),
+                content_type: "application/octet-stream",
+                chunk_size: 1024,
+                chunk_delay: Duration::from_millis(2),
+            },
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let downloader = Arc::new(ModelDownloader::new(tmp.path().join("model")));
+        let mirror_base = format!("{server_base}/cache", server_base = server.base_url);
+        let cancel_once = Arc::new(AtomicBool::new(false));
+        let canceller = Arc::clone(&downloader);
+        let cancel_flag = Arc::clone(&cancel_once);
+
+        let cancelled = downloader.download_with_mirror(
+            &manifest,
+            Some(&mirror_base),
+            Some(Arc::new(move |progress| {
+                if progress.total_bytes >= 16 * 1024
+                    && cancel_flag
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    canceller.cancel();
+                }
+            })),
+        );
+
+        assert!(
+            matches!(cancelled, Err(DownloadError::Cancelled)),
+            "first mirror attempt should stop with a cancellation so we can verify resumable recovery"
+        );
+        let partial_path = downloader.temp_dir.join("model.onnx");
+        let partial_size = fs::metadata(&partial_path).unwrap().len();
+        assert!(
+            partial_size > 0 && partial_size < large_payload.len() as u64,
+            "cancelled run should preserve a partial download for resume; got {partial_size} bytes"
+        );
+
+        downloader
+            .download_with_mirror(&manifest, Some(&mirror_base), None)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(downloader.target_dir.join("model.onnx")).unwrap(),
+            large_payload,
+            "rerun after cancellation should finish the mirrored download and install the exact payload"
+        );
+        let requests = server.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.range_start == Some(partial_size)),
+            "rerun should resume from the preserved partial via Range requests; saw requests: {requests:?}"
         );
     }
 }

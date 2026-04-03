@@ -277,6 +277,113 @@ fn seed_analytics_models_workspace_fixture(temp_home: &TempDir) -> PathBuf {
         .unwrap();
     }
 
+    let token_daily_rows = conn
+        .query_map_collect(
+            "SELECT tu.day_id,
+                    a.slug,
+                    tu.source_id,
+                    COALESCE(tu.model_family, 'unknown'),
+                    COUNT(*) AS api_call_count,
+                    SUM(CASE WHEN tu.role = 'user' THEN 1 ELSE 0 END) AS user_message_count,
+                    SUM(CASE WHEN tu.role IN ('assistant', 'agent') THEN 1 ELSE 0 END) AS assistant_message_count,
+                    SUM(CASE WHEN tu.role = 'tool' THEN 1 ELSE 0 END) AS tool_message_count,
+                    SUM(COALESCE(tu.input_tokens, 0)) AS total_input_tokens,
+                    SUM(COALESCE(tu.output_tokens, 0)) AS total_output_tokens,
+                    SUM(COALESCE(tu.cache_read_tokens, 0)) AS total_cache_read_tokens,
+                    SUM(COALESCE(tu.cache_creation_tokens, 0)) AS total_cache_creation_tokens,
+                    SUM(COALESCE(tu.thinking_tokens, 0)) AS total_thinking_tokens,
+                    SUM(COALESCE(tu.total_tokens, 0)) AS grand_total_tokens,
+                    SUM(COALESCE(tu.content_chars, 0)) AS total_content_chars,
+                    SUM(COALESCE(tu.tool_call_count, 0)) AS total_tool_calls,
+                    SUM(COALESCE(tu.estimated_cost_usd, 0.0)) AS estimated_cost_usd,
+                    COUNT(DISTINCT tu.conversation_id) AS session_count,
+                    MAX(tu.timestamp_ms) AS last_updated
+             FROM token_usage tu
+             JOIN agents a ON a.id = tu.agent_id
+             GROUP BY tu.day_id, a.slug, tu.source_id, COALESCE(tu.model_family, 'unknown')
+             ORDER BY tu.day_id, a.slug",
+            &[],
+            |row: &frankensqlite::Row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<String>(2)?,
+                    row.get_typed::<String>(3)?,
+                    row.get_typed::<i64>(4)?,
+                    row.get_typed::<i64>(5)?,
+                    row.get_typed::<i64>(6)?,
+                    row.get_typed::<i64>(7)?,
+                    row.get_typed::<i64>(8)?,
+                    row.get_typed::<i64>(9)?,
+                    row.get_typed::<i64>(10)?,
+                    row.get_typed::<i64>(11)?,
+                    row.get_typed::<i64>(12)?,
+                    row.get_typed::<i64>(13)?,
+                    row.get_typed::<i64>(14)?,
+                    row.get_typed::<i64>(15)?,
+                    row.get_typed::<f64>(16)?,
+                    row.get_typed::<i64>(17)?,
+                    row.get_typed::<i64>(18)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    for (
+        day_id,
+        agent_slug,
+        source_id,
+        model_family,
+        api_call_count,
+        user_message_count,
+        assistant_message_count,
+        tool_message_count,
+        total_input_tokens,
+        total_output_tokens,
+        total_cache_read_tokens,
+        total_cache_creation_tokens,
+        total_thinking_tokens,
+        grand_total_tokens,
+        total_content_chars,
+        total_tool_calls,
+        estimated_cost_usd,
+        session_count,
+        last_updated,
+    ) in token_daily_rows
+    {
+        conn.execute_compat(
+            "INSERT OR REPLACE INTO token_daily_stats (
+                day_id, agent_slug, source_id, model_family,
+                api_call_count, user_message_count, assistant_message_count, tool_message_count,
+                total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens,
+                total_thinking_tokens, grand_total_tokens, total_content_chars, total_tool_calls,
+                estimated_cost_usd, session_count, last_updated
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            frankensqlite::params![
+                day_id,
+                agent_slug,
+                source_id,
+                model_family,
+                api_call_count,
+                user_message_count,
+                assistant_message_count,
+                tool_message_count,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_tokens,
+                total_cache_creation_tokens,
+                total_thinking_tokens,
+                grand_total_tokens,
+                total_content_chars,
+                total_tool_calls,
+                estimated_cost_usd,
+                session_count,
+                last_updated,
+            ],
+        )
+        .unwrap();
+    }
+
     workspace_a
 }
 
@@ -2670,7 +2777,8 @@ fn analytics_validate_reports_query_failure_for_malformed_schema() {
     fs::create_dir_all(&data_dir).expect("create data dir");
     let db_path = data_dir.join("agent_search.db");
 
-    let conn = rusqlite::Connection::open(&db_path).expect("create sqlite db");
+    let conn =
+        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("create sqlite db");
     conn.execute_batch(
         "CREATE TABLE message_metrics (day_id INTEGER);
          CREATE TABLE usage_daily (day_id INTEGER);
@@ -2728,6 +2836,154 @@ fn analytics_validate_reports_query_failure_for_malformed_schema() {
     assert!(
         json["data"]["summary"]["errors"].as_u64().unwrap_or(0) >= 1,
         "malformed analytics schema should surface at least one error"
+    );
+}
+
+#[test]
+fn analytics_validate_fix_noops_when_reports_are_clean() {
+    let tmp_home = TempDir::new().expect("temp home");
+    let _workspace = seed_analytics_models_workspace_fixture(&tmp_home);
+    let data_dir = tmp_home.path().join(".local/share/coding-agent-search");
+
+    let mut cmd = base_cmd(tmp_home.path());
+    cmd.args([
+        "analytics",
+        "validate",
+        "--fix",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid analytics validate JSON");
+
+    assert_eq!(json["command"], "analytics/validate");
+    assert_eq!(
+        json["data"]["summary"]["errors"], 0,
+        "clean analytics validate --fix should finish without remaining errors: {json}"
+    );
+    assert_eq!(json["data"]["fix"]["requested"], true);
+    assert_eq!(json["data"]["fix"]["changed"], false);
+    assert_eq!(
+        json["data"]["fix"]["applied_repairs"]
+            .as_array()
+            .expect("applied repairs array")
+            .len(),
+        0
+    );
+    assert_eq!(
+        json["data"]["fix"]["skipped_repairs"]
+            .as_array()
+            .expect("skipped repairs array")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn analytics_validate_fix_rebuilds_track_a_when_safe() {
+    let tmp_home = TempDir::new().expect("temp home");
+    let _workspace = seed_analytics_models_workspace_fixture(&tmp_home);
+    let data_dir = tmp_home.path().join(".local/share/coding-agent-search");
+    let db_path = data_dir.join("agent_search.db");
+    let conn =
+        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("open analytics db");
+    conn.execute("UPDATE usage_daily SET message_count = message_count + 7")
+        .expect("corrupt track a rollup");
+    drop(conn);
+
+    let mut cmd = base_cmd(tmp_home.path());
+    cmd.args([
+        "analytics",
+        "validate",
+        "--fix",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid analytics validate JSON");
+
+    let applied = json["data"]["fix"]["applied_repairs"]
+        .as_array()
+        .expect("applied repairs array");
+    assert!(
+        applied
+            .iter()
+            .any(|repair| repair["kind"] == "rebuild_track_a"),
+        "track a corruption should trigger an automatic Track A rebuild: {json}"
+    );
+    assert_eq!(
+        json["data"]["summary"]["errors"], 0,
+        "safe Track A repair should clear remaining errors: {json}"
+    );
+
+    let checks = json["data"]["checks"].as_array().expect("checks array");
+    let message_count_check = checks
+        .iter()
+        .find(|check| check["id"] == "track_a.message_count_match")
+        .expect("track_a.message_count_match check");
+    assert_eq!(message_count_check["ok"], true);
+}
+
+#[test]
+fn analytics_validate_fix_refuses_when_source_schema_is_missing() {
+    let tmp_home = TempDir::new().expect("temp home");
+    let data_dir = tmp_home.path().join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let db_path = data_dir.join("agent_search.db");
+
+    let conn =
+        FrankenConnection::open(db_path.to_string_lossy().to_string()).expect("create sqlite db");
+    conn.execute_batch(
+        "CREATE TABLE message_metrics (day_id INTEGER);
+         CREATE TABLE usage_daily (day_id INTEGER);
+         INSERT INTO usage_daily (day_id) VALUES (20254);",
+    )
+    .expect("create malformed analytics tables");
+    drop(conn);
+
+    let mut cmd = base_cmd(tmp_home.path());
+    cmd.args([
+        "analytics",
+        "validate",
+        "--fix",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid analytics validate JSON");
+
+    let applied = json["data"]["fix"]["applied_repairs"]
+        .as_array()
+        .expect("applied repairs array");
+    let skipped = json["data"]["fix"]["skipped_repairs"]
+        .as_array()
+        .expect("skipped repairs array");
+
+    assert!(
+        applied.is_empty(),
+        "unsafe malformed schemas must not be mutated"
+    );
+    assert!(
+        skipped.iter().any(|repair| {
+            repair["kind"] == "rebuild_track_a"
+                && repair["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("raw cass source tables"))
+        }),
+        "missing raw schema should be reported as a skipped repair: {json}"
+    );
+    assert!(
+        json["data"]["summary"]["errors"].as_u64().unwrap_or(0) >= 1,
+        "malformed analytics schema should still report an error after refusing repair"
     );
 }
 

@@ -13,6 +13,7 @@ use frankensqlite::Connection;
 use frankensqlite::Row;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use super::query::table_exists;
 
@@ -94,6 +95,99 @@ impl ValidationReport {
     /// Produce the JSON value.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::json!({"error": "serialization failed"}))
+    }
+}
+
+/// Safe automatic repair class for a validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairKind {
+    RebuildTrackA,
+    TrackAllRebuildUnavailable,
+    ManualReview,
+}
+
+/// Grouped repair decision derived from a validation report.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairDecision {
+    pub kind: RepairKind,
+    pub fixable: bool,
+    pub check_ids: Vec<String>,
+    pub reason: String,
+}
+
+/// Summary of automatic repair opportunities in a validation report.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairPlan {
+    pub apply_track_a_rebuild: bool,
+    pub decisions: Vec<RepairDecision>,
+}
+
+/// Build a safe automatic repair plan from a validation report.
+pub fn build_repair_plan(report: &ValidationReport) -> RepairPlan {
+    let mut grouped: BTreeMap<RepairKind, Vec<String>> = BTreeMap::new();
+
+    for check in report.checks.iter().filter(|check| !check.ok) {
+        let kind = classify_repair_kind(check, report);
+        grouped.entry(kind).or_default().push(check.id.clone());
+    }
+
+    let decisions = grouped
+        .into_iter()
+        .map(|(kind, mut check_ids)| {
+            check_ids.sort();
+            RepairDecision {
+                fixable: matches!(kind, RepairKind::RebuildTrackA),
+                reason: repair_reason(kind).into(),
+                kind,
+                check_ids,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let apply_track_a_rebuild = decisions
+        .iter()
+        .any(|decision| decision.kind == RepairKind::RebuildTrackA);
+
+    RepairPlan {
+        apply_track_a_rebuild,
+        decisions,
+    }
+}
+
+fn classify_repair_kind(check: &Check, report: &ValidationReport) -> RepairKind {
+    if check.id.starts_with("track_a.") {
+        return RepairKind::RebuildTrackA;
+    }
+
+    if check.id == "cross_track.drift" {
+        if report.drift.iter().all(|entry| {
+            entry.likely_cause.starts_with("Track A missing rows")
+                || entry.likely_cause.starts_with("Track B higher")
+        }) {
+            return RepairKind::RebuildTrackA;
+        }
+        return RepairKind::TrackAllRebuildUnavailable;
+    }
+
+    if check.id.starts_with("track_b.") {
+        return RepairKind::TrackAllRebuildUnavailable;
+    }
+
+    RepairKind::ManualReview
+}
+
+fn repair_reason(kind: RepairKind) -> &'static str {
+    match kind {
+        RepairKind::RebuildTrackA => {
+            "Track A rollups are derivable from raw messages and can be rebuilt safely."
+        }
+        RepairKind::TrackAllRebuildUnavailable => {
+            "Track B or cross-track repair needs a track-all rebuild path that is not implemented yet."
+        }
+        RepairKind::ManualReview => {
+            "This validation failure does not have a proven automatic repair path."
+        }
     }
 }
 
@@ -615,101 +709,99 @@ fn validate_cross_track_drift(
         return (checks, entries);
     }
 
-    let limit_clause = if config.sample_buckets > 0 {
-        format!("LIMIT {}", config.sample_buckets)
-    } else {
-        String::new()
-    };
-
-    // Compare api_tokens_total (Track A) vs grand_total_tokens (Track B) by day+agent+source.
-    let sql = format!(
-        "SELECT COALESCE(a.day_id, b.day_id) AS did,
-                COALESCE(a.agent_slug, b.agent_slug) AS agent,
-                COALESCE(a.source_id, b.source_id) AS source,
-                COALESCE(a.api_total, 0),
-                COALESCE(b.grand_total, 0)
-         FROM (
-             SELECT day_id, agent_slug, source_id, SUM(api_tokens_total) AS api_total
-             FROM usage_daily
-             GROUP BY day_id, agent_slug, source_id
-         ) a
-         FULL OUTER JOIN (
-             SELECT day_id, agent_slug, source_id, SUM(grand_total_tokens) AS grand_total
-             FROM token_daily_stats
-             GROUP BY day_id, agent_slug, source_id
-         ) b ON a.day_id = b.day_id AND a.agent_slug = b.agent_slug AND a.source_id = b.source_id
-         ORDER BY did DESC
-         {limit_clause}"
-    );
-
-    // SQLite doesn't support FULL OUTER JOIN — fall back to UNION approach.
-    let sql_compat = format!(
-        "SELECT day_id, agent_slug, source_id,
-                SUM(a_total) AS a_total,
-                SUM(b_total) AS b_total
-         FROM (
-             SELECT day_id, agent_slug, source_id,
-                    SUM(api_tokens_total) AS a_total, 0 AS b_total
-             FROM usage_daily
-             GROUP BY day_id, agent_slug, source_id
-             UNION ALL
-             SELECT day_id, agent_slug, source_id,
-                    0 AS a_total, SUM(grand_total_tokens) AS b_total
-             FROM token_daily_stats
-             GROUP BY day_id, agent_slug, source_id
-         )
-         GROUP BY day_id, agent_slug, source_id
-         ORDER BY day_id DESC
-         {limit_clause}"
-    );
-
-    // Try the compatible query first.
     let mut drift_count = 0_usize;
     let mut drift_checked = 0_usize;
+    let mut merged = BTreeMap::<(i64, String, String), (i64, i64)>::new();
 
-    // Try compatible SQL (UNION-based) first, then fall back to the FULL OUTER JOIN
-    // variant for engines that support it. Either path must fail closed.
-    let rows = match conn.query_map_collect(&sql_compat, &[], |row: &Row| {
-        Ok((
-            row.get_typed::<i64>(0)?,    // day_id
-            row.get_typed::<String>(1)?, // agent_slug
-            row.get_typed::<String>(2)?, // source_id
-            row.get_typed::<i64>(3)?,    // a_total
-            row.get_typed::<i64>(4)?,    // b_total
-        ))
-    }) {
-        Ok(rows) => rows,
-        Err(compat_err) => match conn.query_map_collect(&sql, &[], |row: &Row| {
+    let track_a_rows = match conn.query_map_collect(
+        "SELECT day_id, agent_slug, source_id, SUM(api_tokens_total) AS api_total
+         FROM usage_daily
+         GROUP BY day_id, agent_slug, source_id",
+        &[],
+        |row: &Row| {
             Ok((
                 row.get_typed::<i64>(0)?,
                 row.get_typed::<String>(1)?,
                 row.get_typed::<String>(2)?,
                 row.get_typed::<i64>(3)?,
-                row.get_typed::<i64>(4)?,
             ))
-        }) {
-            Ok(rows) => rows,
-            Err(fallback_err) => {
-                checks.push(Check {
-                    id: "cross_track.query_exec".into(),
-                    ok: false,
-                    severity: Severity::Error,
-                    details: format!(
-                        "Cross-track drift query failed: compatible query error ({compat_err}); fallback query error ({fallback_err})"
-                    ),
-                    suggested_action: Some(
-                        "Run 'cass analytics rebuild --track all' or verify the analytics schema"
-                            .into(),
-                    ),
-                });
-                return (checks, entries);
-            }
         },
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            checks.push(Check {
+                id: "cross_track.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Cross-track drift query failed while reading Track A: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                        .into(),
+                ),
+            });
+            return (checks, entries);
+        }
     };
 
-    for row in rows {
+    for (day_id, agent_slug, source_id, total) in track_a_rows {
+        merged
+            .entry((day_id, agent_slug, source_id))
+            .or_insert((0, 0))
+            .0 = total;
+    }
+
+    let track_b_rows = match conn.query_map_collect(
+        "SELECT day_id, agent_slug, source_id, SUM(grand_total_tokens) AS grand_total
+         FROM token_daily_stats
+         GROUP BY day_id, agent_slug, source_id",
+        &[],
+        |row: &Row| {
+            Ok((
+                row.get_typed::<i64>(0)?,
+                row.get_typed::<String>(1)?,
+                row.get_typed::<String>(2)?,
+                row.get_typed::<i64>(3)?,
+            ))
+        },
+    ) {
+        Ok(rows) => rows,
+        Err(err) => {
+            checks.push(Check {
+                id: "cross_track.query_exec".into(),
+                ok: false,
+                severity: Severity::Error,
+                details: format!("Cross-track drift query failed while reading Track B: {err}"),
+                suggested_action: Some(
+                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
+                        .into(),
+                ),
+            });
+            return (checks, entries);
+        }
+    };
+
+    for (day_id, agent_slug, source_id, total) in track_b_rows {
+        merged
+            .entry((day_id, agent_slug, source_id))
+            .or_insert((0, 0))
+            .1 = total;
+    }
+
+    let mut rows: Vec<_> = merged.into_iter().collect();
+    rows.sort_by(|left, right| {
+        right
+            .0
+            .0
+            .cmp(&left.0.0)
+            .then_with(|| left.0.1.cmp(&right.0.1))
+            .then_with(|| left.0.2.cmp(&right.0.2))
+    });
+    if config.sample_buckets > 0 && rows.len() > config.sample_buckets {
+        rows.truncate(config.sample_buckets);
+    }
+
+    for ((day_id, agent_slug, source_id), (a_total, b_total)) in rows {
         drift_checked += 1;
-        let (day_id, agent_slug, source_id, a_total, b_total) = row;
         let delta = a_total.saturating_sub(b_total);
         let denom = a_total.max(b_total).max(1);
         let abs_delta = delta.unsigned_abs();
@@ -1477,5 +1569,89 @@ mod tests {
         assert!(!failure.ok);
         assert_eq!(failure.severity, Severity::Error);
         assert!(drift.is_empty());
+    }
+
+    #[test]
+    fn repair_plan_marks_track_a_failures_fixable() {
+        let conn = setup_track_a_fixture();
+        conn.execute("UPDATE usage_daily SET message_count = 999 WHERE day_id = 20254")
+            .unwrap();
+
+        let report = run_validation(&conn, &ValidateConfig::deep());
+        let plan = build_repair_plan(&report);
+
+        let track_a = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.kind == RepairKind::RebuildTrackA)
+            .expect("track a repair decision");
+        assert!(plan.apply_track_a_rebuild);
+        assert!(track_a.fixable);
+        assert!(
+            track_a
+                .check_ids
+                .contains(&"track_a.message_count_match".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_plan_marks_track_b_failures_as_unavailable() {
+        let conn = setup_both_tracks_fixture();
+        conn.execute("DELETE FROM token_daily_stats").unwrap();
+
+        let report = run_validation(&conn, &ValidateConfig::deep());
+        let plan = build_repair_plan(&report);
+
+        let unavailable = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.kind == RepairKind::TrackAllRebuildUnavailable)
+            .expect("track-all unavailable decision");
+        assert!(!plan.apply_track_a_rebuild);
+        assert!(!unavailable.fixable);
+        assert!(
+            unavailable
+                .check_ids
+                .contains(&"track_b.has_data".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_plan_marks_track_a_only_drift_as_fixable() {
+        let report = ValidationReport {
+            checks: vec![Check {
+                id: "cross_track.drift".into(),
+                ok: false,
+                severity: Severity::Warning,
+                details: "drift found".into(),
+                suggested_action: Some("Run 'cass analytics rebuild --track all'".into()),
+            }],
+            drift: vec![DriftEntry {
+                day_id: 20254,
+                agent_slug: "codex".into(),
+                source_id: "local".into(),
+                track_a_total: 0,
+                track_b_total: 123,
+                delta: -123,
+                delta_pct: 100.0,
+                likely_cause:
+                    "Track B higher — Track A may have been rebuilt recently without all data"
+                        .into(),
+            }],
+            _meta: ReportMeta {
+                elapsed_ms: 1,
+                sampling: SamplingMeta {
+                    buckets_checked: 1,
+                    buckets_total: 1,
+                    mode: "deep".into(),
+                },
+                path: "rollup".into(),
+            },
+        };
+
+        let plan = build_repair_plan(&report);
+        assert!(plan.apply_track_a_rebuild);
+        assert_eq!(plan.decisions.len(), 1);
+        assert_eq!(plan.decisions[0].kind, RepairKind::RebuildTrackA);
     }
 }

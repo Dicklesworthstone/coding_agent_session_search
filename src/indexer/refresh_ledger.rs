@@ -332,12 +332,16 @@ impl LedgerBuilder {
     }
 
     fn end_current_phase(&mut self) {
-        if let (Some((_, phase_start)), Some(mut record)) =
-            (self.current_phase.take(), self.current_record.take())
-        {
-            record.duration_ms = phase_start.elapsed().as_millis() as u64;
-            self.ledger.phases.push(record);
-        }
+        // Take each field separately so a .take() on one doesn't silently
+        // discard the other if they're ever out of sync.
+        let Some((_, phase_start)) = self.current_phase.take() else {
+            return;
+        };
+        let Some(mut record) = self.current_record.take() else {
+            return;
+        };
+        record.duration_ms = phase_start.elapsed().as_millis() as u64;
+        self.ledger.phases.push(record);
     }
 }
 

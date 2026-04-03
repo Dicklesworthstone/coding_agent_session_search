@@ -1046,6 +1046,7 @@ dependencies = [
  "tru",
  "unicode-normalization",
  "unicode-width",
+ "url",
  "urlencoding",
  "vergen",
  "walkdir",

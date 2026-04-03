@@ -502,6 +502,11 @@ pub struct EffectiveSetting {
 }
 
 /// Complete effective-settings report for `cass status --json`.
+///
+/// **Known limitation**: Provenance detection compares resolved values, not
+/// whether an env var was _set_.  If an env var is set to the same value as the
+/// compiled default, the reported source will be `CompiledDefault` rather than
+/// `Environment`.  The effective value is always correct regardless.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectiveSettings {
     pub settings: Vec<EffectiveSetting>,

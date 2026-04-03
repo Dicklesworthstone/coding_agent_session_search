@@ -80,6 +80,7 @@ ouroboros = "*"  # Safe self-referential wrapper for HNSW loader lifetime
 # Crypto for ChatGPT encrypted conversations and HTML export encryption
 aes-gcm = "*"
 ring = "*"
+url = "*"
 pbkdf2 = "*"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
 
 # SHA256 hashing for model verification

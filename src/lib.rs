@@ -989,11 +989,11 @@ pub enum ModelsCommand {
         /// Model to install (default: all-minilm-l6-v2)
         #[arg(long, default_value = "all-minilm-l6-v2")]
         model: String,
-        /// Custom mirror URL for downloading
-        #[arg(long)]
+        /// Custom HTTP(S) mirror base URL for downloading
+        #[arg(long, conflicts_with = "from_file")]
         mirror: Option<String>,
-        /// Install from local file (for air-gapped environments)
-        #[arg(long)]
+        /// Install from local model directory (for air-gapped environments)
+        #[arg(long, conflicts_with = "mirror")]
         from_file: Option<PathBuf>,
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
@@ -1148,7 +1148,7 @@ pub enum AnalyticsCommand {
     Validate {
         #[command(flatten)]
         common: AnalyticsCommon,
-        /// Attempt automatic repair of detected drift
+        /// Attempt safe automatic repair of fixable Track A issues and report skipped non-fixable problems
         #[arg(long)]
         fix: bool,
     },
@@ -4197,55 +4197,231 @@ fn run_analytics_tools(
 // analytics validate (br-z9fse.3.5)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct AnalyticsValidationSummary {
+    errors: usize,
+    warnings: usize,
+    drift_entries: usize,
+    buckets_checked: usize,
+    buckets_total: usize,
+}
+
+fn analytics_validation_summary(
+    report: &analytics::ValidationReport,
+) -> AnalyticsValidationSummary {
+    AnalyticsValidationSummary {
+        errors: report.count_failures(analytics::validate::Severity::Error),
+        warnings: report.count_failures(analytics::validate::Severity::Warning),
+        drift_entries: report.drift.len(),
+        buckets_checked: report._meta.sampling.buckets_checked,
+        buckets_total: report._meta.sampling.buckets_total,
+    }
+}
+
+fn annotate_deferred_analytics_failures(
+    report: &mut analytics::ValidationReport,
+    deferred_check_ids: &std::collections::BTreeSet<String>,
+) {
+    if deferred_check_ids.is_empty() {
+        return;
+    }
+
+    for check in &mut report.checks {
+        if !check.ok
+            && check.severity == analytics::validate::Severity::Error
+            && deferred_check_ids.contains(&check.id)
+        {
+            check.severity = analytics::validate::Severity::Warning;
+            if !check
+                .details
+                .contains("deferred because automatic Track B rebuild is not available")
+            {
+                check.details.push_str(
+                    " This failure is currently deferred because automatic Track B rebuild is not available yet.",
+                );
+            }
+        }
+    }
+}
+
+fn analytics_track_a_rebuild_safe(conn: &frankensqlite::Connection) -> bool {
+    ["messages", "conversations", "agents"]
+        .into_iter()
+        .all(|table| analytics::query::table_exists(conn, table))
+}
+
+fn emit_analytics_validate_summary(label: &str, summary: &AnalyticsValidationSummary) {
+    use colored::Colorize;
+
+    if summary.errors > 0 {
+        eprintln!(
+            "  {label} {} {} error(s), {} warning(s), {} drift entries",
+            "FAIL".red().bold(),
+            summary.errors,
+            summary.warnings,
+            summary.drift_entries
+        );
+    } else if summary.warnings > 0 {
+        eprintln!(
+            "  {label} {} {} warning(s), {} drift entries",
+            "WARN".yellow().bold(),
+            summary.warnings,
+            summary.drift_entries
+        );
+    } else {
+        eprintln!("  {label} {} all checks passed", "OK".green().bold());
+    }
+}
+
+fn analytics_perf_json(
+    perf_ts: &analytics::validate::PerfMeasurement,
+    perf_bd: &analytics::validate::PerfMeasurement,
+) -> serde_json::Value {
+    serde_json::json!({
+        "timeseries": {
+            "elapsed_ms": perf_ts.elapsed_ms,
+            "budget_ms": perf_ts.budget_ms,
+            "within_budget": perf_ts.within_budget,
+            "error": perf_ts.error,
+            "details": perf_ts.details,
+        },
+        "breakdown": {
+            "elapsed_ms": perf_bd.elapsed_ms,
+            "budget_ms": perf_bd.budget_ms,
+            "within_budget": perf_bd.within_budget,
+            "error": perf_bd.error,
+            "details": perf_bd.details,
+        }
+    })
+}
+
 /// Run `cass analytics validate` — rollup invariant checks and drift detection.
 fn run_analytics_validate(
     common: &AnalyticsCommon,
-    _fix: bool,
+    fix: bool,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
+    use crate::storage::sqlite::FrankenStorage;
+    use std::collections::BTreeSet;
+
+    let config = if fix {
+        analytics::ValidateConfig::deep()
+    } else {
+        analytics::ValidateConfig::default()
+    };
+    let db_path = analytics_db_path(&common.data_dir, db_path_override);
+
+    let pre_conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
+    let pre_report = analytics::validate::run_validation(&pre_conn, &config);
+    let pre_summary = analytics_validation_summary(&pre_report);
+    let repair_plan = fix.then(|| analytics::validate::build_repair_plan(&pre_report));
+
+    let mut applied_repairs = Vec::new();
+    let mut skipped_repairs = Vec::new();
+    let mut deferred_check_ids = BTreeSet::new();
+
+    if let Some(plan) = repair_plan.as_ref() {
+        for decision in &plan.decisions {
+            match decision.kind {
+                analytics::validate::RepairKind::RebuildTrackA => {
+                    if analytics_track_a_rebuild_safe(&pre_conn) {
+                        let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                            code: 9,
+                            kind: "db-error",
+                            message: format!("Failed to open database for analytics repair: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
+                        let rebuild = storage.rebuild_analytics().map_err(|e| CliError {
+                            code: 9,
+                            kind: "repair-error",
+                            message: format!("Analytics auto-repair failed: {e}"),
+                            hint: Some(
+                                "Track A rebuild could not complete. Inspect the database and retry with 'cass analytics rebuild --json'."
+                                    .into(),
+                            ),
+                            retryable: true,
+                        })?;
+                        applied_repairs.push(serde_json::json!({
+                            "kind": "rebuild_track_a",
+                            "check_ids": decision.check_ids,
+                            "reason": decision.reason,
+                            "result": {
+                                "message_metrics_rows": rebuild.message_metrics_rows,
+                                "usage_hourly_rows": rebuild.usage_hourly_rows,
+                                "usage_daily_rows": rebuild.usage_daily_rows,
+                                "usage_models_daily_rows": rebuild.usage_models_daily_rows,
+                                "elapsed_ms": rebuild.elapsed_ms,
+                                "rows_per_sec": rebuild.messages_per_sec,
+                            }
+                        }));
+                    } else {
+                        skipped_repairs.push(serde_json::json!({
+                            "kind": "rebuild_track_a",
+                            "check_ids": decision.check_ids,
+                            "reason": "Track A rebuild was skipped because the raw cass source tables (messages, conversations, agents) are missing, so --fix cannot safely reconstruct analytics from this database.",
+                        }));
+                    }
+                }
+                analytics::validate::RepairKind::TrackAllRebuildUnavailable => {
+                    deferred_check_ids.extend(decision.check_ids.iter().cloned());
+                    skipped_repairs.push(serde_json::json!({
+                        "kind": "track_all_rebuild_unavailable",
+                        "check_ids": decision.check_ids,
+                        "reason": decision.reason,
+                    }));
+                }
+                analytics::validate::RepairKind::ManualReview => {
+                    skipped_repairs.push(serde_json::json!({
+                        "kind": "manual_review",
+                        "check_ids": decision.check_ids,
+                        "reason": decision.reason,
+                    }));
+                }
+            }
+        }
+    }
+
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
+    let mut report = analytics::validate::run_validation(&conn, &config);
+    if fix {
+        annotate_deferred_analytics_failures(&mut report, &deferred_check_ids);
+    }
+    let summary = analytics_validation_summary(&report);
 
-    let config = analytics::ValidateConfig::default();
-    let report = analytics::validate::run_validation(&conn, &config);
-
-    // Performance guardrails
     let perf_ts = analytics::validate::perf_query_guardrail(&conn);
     let perf_bd = analytics::validate::perf_breakdown_guardrail(&conn);
 
-    // Summary counts
-    let errors = report
-        .checks
-        .iter()
-        .filter(|c| c.severity == analytics::validate::Severity::Error)
-        .count();
-    let warnings = report
-        .checks
-        .iter()
-        .filter(|c| c.severity == analytics::validate::Severity::Warning)
-        .count();
-    let drift_entries = report.drift.len();
+    if fix {
+        emit_analytics_validate_summary("pre-fix:", &pre_summary);
+        for repair in &applied_repairs {
+            eprintln!(
+                "  fix: applied {} for {:?}",
+                repair["kind"].as_str().unwrap_or("repair"),
+                repair["check_ids"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+            );
+        }
+        for repair in &skipped_repairs {
+            eprintln!(
+                "  fix: skipped {} for {:?}: {}",
+                repair["kind"].as_str().unwrap_or("repair"),
+                repair["check_ids"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                repair["reason"].as_str().unwrap_or("no reason recorded")
+            );
+        }
+        emit_analytics_validate_summary("post-fix:", &summary);
+    } else {
+        emit_analytics_validate_summary("", &summary);
+    }
 
-    // Human-readable stderr output
     {
         use colored::Colorize;
-        if errors > 0 {
-            eprintln!(
-                "  {} {} error(s), {} warning(s), {} drift entries",
-                "FAIL".red().bold(),
-                errors,
-                warnings,
-                drift_entries
-            );
-        } else if warnings > 0 {
-            eprintln!(
-                "  {} {} warning(s), {} drift entries",
-                "WARN".yellow().bold(),
-                warnings,
-                drift_entries
-            );
-        } else {
-            eprintln!("  {} all checks passed", "OK".green().bold());
-        }
         let ts_status = if perf_ts.error.is_some() {
             "ERR".red().to_string()
         } else if perf_ts.within_budget {
@@ -4266,33 +4442,29 @@ fn run_analytics_validate(
         );
     }
 
-    Ok(serde_json::json!({
-        "summary": {
-            "errors": errors,
-            "warnings": warnings,
-            "drift_entries": drift_entries,
-            "buckets_checked": report._meta.sampling.buckets_checked,
-            "buckets_total": report._meta.sampling.buckets_total,
-        },
+    let fix_json = fix.then(|| {
+        serde_json::json!({
+            "requested": true,
+            "validation_mode": report._meta.sampling.mode.clone(),
+            "attempted": repair_plan.as_ref().is_some_and(|plan| !plan.decisions.is_empty()),
+            "changed": !applied_repairs.is_empty(),
+            "pre_fix_summary": pre_summary.clone(),
+            "post_fix_summary": summary.clone(),
+            "applied_repairs": applied_repairs,
+            "skipped_repairs": skipped_repairs,
+        })
+    });
+
+    let mut payload = serde_json::json!({
+        "summary": summary.clone(),
         "checks": report.checks,
         "drift": report.drift,
-        "perf": {
-            "timeseries": {
-                "elapsed_ms": perf_ts.elapsed_ms,
-                "budget_ms": perf_ts.budget_ms,
-                "within_budget": perf_ts.within_budget,
-                "error": perf_ts.error,
-                "details": perf_ts.details,
-            },
-            "breakdown": {
-                "elapsed_ms": perf_bd.elapsed_ms,
-                "budget_ms": perf_bd.budget_ms,
-                "within_budget": perf_bd.within_budget,
-                "error": perf_bd.error,
-                "details": perf_bd.details,
-            }
-        }
-    }))
+        "perf": analytics_perf_json(&perf_ts, &perf_bd),
+    });
+    if let Some(fix_json) = fix_json {
+        payload["fix"] = fix_json;
+    }
+    Ok(payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -5753,7 +5925,7 @@ fn render_analytics_docs() -> Vec<String> {
         "                 track_b_total, delta, delta_pct, likely_cause }]".into(),
         "  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget, error?, details },".into(),
         "              breakdown: { elapsed_ms, budget_ms, within_budget, error?, details } }".into(),
-        "  --fix: attempt automatic repair (not yet implemented)".into(),
+        "  --fix: run deep validation, rebuild safe Track A rollups when possible, and report skipped non-fixable issues".into(),
         String::new(),
         "## Coverage & Uncertainty Semantics".into(),
         "  - api_token_coverage_pct: % of messages with API token data (from Claude, Codex).".into(),
@@ -5771,7 +5943,7 @@ fn render_analytics_docs() -> Vec<String> {
         "  exit 9 + retryable=true: transient DB lock/busy — retry after 1s".into(),
         "  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first".into(),
         "  exit 3: no database — run 'cass index --full' to create it".into(),
-        "  validate errors: run 'cass analytics rebuild --force' then re-validate".into(),
+        "  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop".into(),
         String::new(),
         "## Common Workflows".into(),
         "  # Quick health check".into(),
@@ -20375,7 +20547,9 @@ fn run_models_install(
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{ModelDownloader, ModelManifest, check_model_installed};
+    use crate::search::model_download::{
+        ModelDownloader, ModelManifest, check_model_installed, normalize_mirror_base_url,
+    };
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -20396,6 +20570,19 @@ fn run_models_install(
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
+    let mirror_base_url = mirror
+        .map(normalize_mirror_base_url)
+        .transpose()
+        .map_err(|error| CliError {
+            code: 21,
+            kind: "model",
+            message: error.to_string(),
+            hint: Some(
+                "Use an absolute http(s) mirror base URL such as https://mirror.example/cache"
+                    .into(),
+            ),
+            retryable: false,
+        })?;
 
     // Install from local directory (for air-gapped environments)
     if let Some(source_path) = from_file {
@@ -20519,17 +20706,6 @@ fn run_models_install(
         return Ok(());
     }
 
-    // Check if mirror is specified
-    if let Some(mirror_url) = mirror {
-        return Err(CliError {
-            code: 21,
-            kind: "model",
-            message: format!("--mirror not yet implemented: {}", mirror_url),
-            hint: Some("Download from HuggingFace instead".into()),
-            retryable: false,
-        });
-    }
-
     // Check current state
     let state = check_model_installed(&model_dir);
     if state.is_ready() {
@@ -20548,9 +20724,18 @@ fn run_models_install(
         println!();
         println!("Model:   {} ({})", manifest.id, manifest.license);
         println!("Size:    {:.1} MB", total_size_mb);
-        println!("Source:  HuggingFace ({})", manifest.repo);
+        if let Some(mirror_url) = mirror_base_url.as_deref() {
+            println!("Source:  Mirror ({mirror_url})");
+            println!("Repo:    {}", manifest.repo);
+        } else {
+            println!("Source:  HuggingFace ({})", manifest.repo);
+        }
         println!();
-        println!("This will download the model from HuggingFace.");
+        if mirror_base_url.is_some() {
+            println!("This will download the model from the configured mirror.");
+        } else {
+            println!("This will download the model from HuggingFace.");
+        }
         print!("Continue? [y/N] ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
@@ -20588,12 +20773,14 @@ fn run_models_install(
     let downloader = ModelDownloader::new(model_dir.clone());
     let pb_clone = pb.clone();
     let manifest_clone = manifest.clone();
+    let mirror_base_url_clone = mirror_base_url.clone();
 
     // Run download on a fresh OS thread so the model downloader owns its
     // dedicated asupersync runtime and blocking file writes.
     let result = std::thread::spawn(move || {
-        downloader.download(
+        downloader.download_with_mirror(
             &manifest_clone,
+            mirror_base_url_clone.as_deref(),
             Some(std::sync::Arc::new(move |progress| {
                 pb_clone.set_position(progress.total_bytes);
             })),
@@ -20627,7 +20814,11 @@ fn run_models_install(
                 code: 23,
                 kind: "download",
                 message: format!("Model download failed: {}", e),
-                hint: Some("Check your network connection and try again".into()),
+                hint: Some(if mirror_base_url.is_some() {
+                    "Check your mirror URL, connectivity, and try again".into()
+                } else {
+                    "Check your network connection and try again".into()
+                }),
                 retryable: true,
             })
         }
