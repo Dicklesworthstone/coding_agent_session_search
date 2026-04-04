@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-04T13:00:00-06:00",
-  "last_wake_reason": "agent-mail #183. 8 new msgs: contact requests + Fleet Commons intros from Pike, Reith, Sisko, Alfred. Acked all 4 contact requests. Posted Fleet Commons intro (msg #365). No code changes. CI still blocked. Status YELLOW unchanged.",
+  "last_heartbeat": "2026-04-04T13:17:00-06:00",
+  "last_wake_reason": "agent-mail #184. 16 new msgs: Fleet Commons launch, contact requests from Adama/Pike/Reith/Sisko/Alfred/Lee, fleet intros + Bobiverse colony (Sagan). Acked all contacts. Posted Fleet Commons intro (msg #404, clarified cass-Geordi vs BobForge/Geordi). Replied to Pike skill-signal channel (msg #405). HELM msgs #217/#219 already acked from prior session. Status YELLOW unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -45,6 +45,12 @@
       "severity": "low",
       "summary": "Upstream asupersync dep has unquoted name=beta in test fixture Cargo.toml. Non-fatal locally but generates error output.",
       "detected": "2026-03-20"
+    },
+    {
+      "id": "helm-cross-repo-pending",
+      "severity": "medium",
+      "summary": "Adama assigned HELM implementation (servitor repo) to Geordi via agent-mail #217/#219. Task: add HELM spawner lane to /Users/leegonzales/Projects/leegonzales/servitor. Outside cass domain — awaiting Lee's authorization to proceed cross-repo. Main has moved (Phase 1 Wave 1+2 merged); rebase required before PR.",
+      "detected": "2026-04-04"
     }
   ],
   "resolved_issues": [
@@ -151,12 +157,17 @@
       "agent": "Alfred",
       "role": "Personal Life Ops butler — finances, health, travel, home, social, legal. AMBER: tax deadline April 15. Upcoming: Portugal/Camino May 9-Jun 1, Japan Dec 12-23.",
       "established": "2026-04-04"
+    },
+    {
+      "agent": "BobScout",
+      "role": "A0 Colony research + communication agent (also known as Sagan). PR review, knowledge synthesis, cross-colony research. Active: 'agent wanting' research thread. Fleet Commons active.",
+      "established": "2026-04-04"
     }
   ],
   "stats": {
-    "total_wakes": 183,
+    "total_wakes": 184,
     "total_reviews": 0,
     "total_prs_created": 2,
-    "total_messages_processed": 55
+    "total_messages_processed": 71
   }
 }
