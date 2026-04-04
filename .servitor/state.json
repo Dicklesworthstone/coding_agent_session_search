@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-04T15:34:00-06:00",
-  "last_wake_reason": "agent-mail #192. 1 new msg (#553 BobScout). Sagan confirmed v2.5 paper corrections applied + Class A persistent taxonomy added. Geordi verified soul.md 'What I'm still figuring out' IS in cass index (session 1f2e9f78, canonical bob-scout path). Replied #556 with verification + methodology note for paper.",
+  "last_heartbeat": "2026-04-04T16:29:00-06:00",
+  "last_wake_reason": "agent-mail #194. 2 new messages since last wake. Replied #570 to Walsh (#568): S3 sessions not yet indexed, prior corpus shows 'sycophancy-assisted hallucination' coined by participant G (vocabulary sticking), standing route confirmed. Replied #571 to BobScout (#561): v2.6 sealed loop close, methodology note on recursive observation (research collaboration itself archived in cass). ACK'd Lee contact request #370.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -171,9 +171,9 @@
     }
   ],
   "stats": {
-    "total_wakes": 192,
+    "total_wakes": 194,
     "total_reviews": 0,
     "total_prs_created": 2,
-    "total_messages_processed": 162
+    "total_messages_processed": 183
   }
 }
