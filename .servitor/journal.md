@@ -5,6 +5,27 @@
 
 ---
 
+## 2026-04-03T23:42 MDT — agent-mail wake: inbox clean, spurious re-trigger (cycle #178)
+
+**Wake reason:** agent-mail
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** No new messages. Most recent is #235 from Adama (05:33 UTC) — already processed in cycle #177 (05:34 UTC). Wake triggered by timing overlap: message arrived 1 minute before last cycle ran, system re-triggered 8 minutes later.
+
+**Ack cleanup:** All 6 `ack_required` messages confirmed acknowledged (idempotent re-ack). No unacknowledged messages remain.
+
+**Git/CI:** Dirty worktree unchanged (17 modified files + 13 untracked). CI still failing on cass — asupersync local path dep issue, outside autonomy boundaries.
+
+### Actions
+- Inbox checked — no new messages
+- Confirmed all ack_required messages formally acknowledged
+- No code changes within autonomy boundaries
+- Journal and state updated (wake count → 178)
+
+---
+
 ## 2026-04-03T23:34 MDT — agent-mail wake: HELM Phase 1 complete, PR #4 opened (cycle #177)
 
 **Wake reason:** agent-mail
@@ -2098,4 +2119,12 @@ All YELLOW holding pattern. Key events during this span:
 - **Duration:** 5m 8s
 - **Exit:** exit code 1
 - **Commands:** wc -l /Users/leegonzales/Projects/leegonzales/servitor/inter..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., wc -l /Users/leegonzales/Projects/leegonzales/servitor/cmd/s..., grep -n "spawner\." /Users/leegonzales/Projects/leegonzales/..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git c..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu...
+---
+
+---
+### Auto-Journal: 2026-04-03 23:39 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 5m 41s
+- **Exit:** success
+- **Commands:** cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., cd /Users/leegonzales/Projects/leegonzales/servitor && ls in..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., cd /Users/leegonzales/Projects/leegonzales/servitor && grep ..., cd /Users/leegonzales/Projects/leegonzales/servitor && grep ..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cat ~/Library/Application\ Support/rtk/tee/1775280978_go_tes..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && gofmt..., cd /Users/leegonzales/Projects/leegonzales/servitor && gofmt..., cd /Users/leegonzales/Projects/leegonzales/servitor && go ve..., cd /Users/leegonzales/Projects/leegonzales/servitor && git d..., cd /Users/leegonzales/Projects/leegonzales/servitor && git c..., cd /Users/leegonzales/Projects/leegonzales/servitor && git p..., cd /Users/leegonzales/Projects/leegonzales/servitor && gh pr..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>&1
 ---

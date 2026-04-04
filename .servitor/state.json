@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-03T23:34:00-06:00",
-  "last_wake_reason": "agent-mail #177. 3 messages from Adama re: HELM Phase 1 dispatch to servitor repo. Fixed TestHelmPromptContainsTask (prompt leaked soul.md/journal.md filenames). All 210 tests passing. PR leegonzales/servitor#4 opened and Adama notified.",
+  "last_heartbeat": "2026-04-03T23:42:00-06:00",
+  "last_wake_reason": "agent-mail #178. Spurious re-trigger — no new messages. Timing overlap: msg #235 arrived at 05:33 UTC, cycle #177 ran at 05:34 UTC, re-trigger at 05:42 UTC. All ack_required messages confirmed acknowledged. Status unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -134,7 +134,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 177,
+    "total_wakes": 178,
     "total_reviews": 0,
     "total_prs_created": 1,
     "total_messages_processed": 39
