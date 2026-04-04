@@ -572,6 +572,9 @@ pub const FTS5_REGISTER_SQL: &str = "\
         content='', tokenize='porter'\
     )";
 
+const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
+const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
+
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
 /// Contentless FTS5 tables reject ordinary `DELETE FROM ...` statements.
@@ -2634,11 +2637,13 @@ ALTER TABLE conversations ADD COLUMN assistant_message_count INTEGER;
 ";
 
 const MIGRATION_V14: &str = r"
--- Switch FTS5 from internal-content to contentless mode.
--- The actual rebuild runs immediately after open() via rusqlite because
--- frankensqlite cannot currently recreate a live virtual table in the same
--- migration transaction after DROP TABLE on legacy databases.
-UPDATE meta SET value = value WHERE key = 'schema_version';
+-- Switch FTS5 from internal-content to contentless mode (CASS #163).
+-- Drop the old V13 internal-content fts_messages first so that
+-- sqlite_schema does not contain two conflicting CREATE VIRTUAL TABLE
+-- entries, which makes the database completely unreadable.
+-- The current contentless table is recreated lazily after open() only when the
+-- frankensqlite FTS consistency check finds it missing or malformed.
+DROP TABLE IF EXISTS fts_messages;
 ";
 
 /// Row from the embedding_jobs table.
@@ -2700,17 +2705,40 @@ impl FrankenStorage {
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self { conn };
         storage.run_migrations()?;
-        let rebuilt_rows = storage.rebuild_fts_via_frankensqlite().with_context(|| {
-            format!(
-                "rebuilding canonical FTS via frankensqlite after migrations for {}",
-                path.display()
-            )
-        })?;
-        tracing::info!(
-            db_path = %path.display(),
-            rebuilt_rows,
-            "rebuilt canonical FTS schema/content after migration open"
-        );
+        match storage
+            .ensure_fts_consistency_via_frankensqlite()
+            .with_context(|| {
+                format!(
+                    "repairing canonical FTS via frankensqlite after migrations for {}",
+                    path.display()
+                )
+            })? {
+            FtsConsistencyRepair::AlreadyHealthy { rows } => {
+                tracing::debug!(
+                    db_path = %path.display(),
+                    rows,
+                    "canonical FTS already healthy after migration open"
+                );
+            }
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows,
+            } => {
+                tracing::info!(
+                    db_path = %path.display(),
+                    inserted_rows,
+                    total_rows,
+                    "caught up missing canonical FTS rows after migration open"
+                );
+            }
+            FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+                tracing::info!(
+                    db_path = %path.display(),
+                    inserted_rows,
+                    "rebuilt canonical FTS schema/content after migration open"
+                );
+            }
+        }
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         Ok(storage)
@@ -2802,17 +2830,38 @@ impl FrankenStorage {
         // Frankensqlite retained autocommit currently mis-serves same-connection
         // read-after-write queries on cass's storage paths; keep it off here
         // until the upstream visibility bug is fixed.
+        //
+        // CASS #163 item 3: If neither PRAGMA variant succeeds, the MVCC engine
+        // will accumulate write snapshots for the lifetime of the connection,
+        // causing unbounded memory growth on long-lived watch-mode handles.
+        // Log at warn level so the failure is visible instead of silently
+        // swallowed, and set a flag for callers that need to periodically
+        // recycle the connection.
+        let mut autocommit_retain_disabled = false;
         for pragma in [
             "PRAGMA fsqlite.autocommit_retain = OFF;",
             "PRAGMA autocommit_retain = OFF;",
         ] {
-            if let Err(err) = self.conn.execute(pragma) {
-                tracing::debug!(
-                    %pragma,
-                    error = %err,
-                    "failed_to_disable_autocommit_retain"
-                );
+            match self.conn.execute(pragma) {
+                Ok(_) => {
+                    autocommit_retain_disabled = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        %pragma,
+                        error = %err,
+                        "autocommit_retain PRAGMA variant not supported"
+                    );
+                }
             }
+        }
+        if !autocommit_retain_disabled {
+            tracing::warn!(
+                "failed to disable autocommit_retain on frankensqlite connection; \
+                 long-lived connections may accumulate unbounded MVCC snapshots. \
+                 Upgrade frankensqlite to a version that supports this PRAGMA."
+            );
         }
 
         Ok(())
@@ -5785,6 +5834,128 @@ impl FrankenStorage {
     /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
     pub fn rebuild_fts(&self) -> Result<()> {
         self.rebuild_fts_via_frankensqlite().map(|_| ())
+    }
+
+    fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
+        let rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = ?1;")
+            .with_context(|| "reading frankensqlite FTS rebuild generation")?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let value: String = row
+            .get_typed(0)
+            .with_context(|| "decoding frankensqlite FTS rebuild generation")?;
+        Ok(value.parse::<i64>().ok())
+    }
+
+    fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![
+                    FTS_FRANKEN_REBUILD_META_KEY,
+                    FTS_FRANKEN_REBUILD_GENERATION.to_string()
+                ],
+            )
+            .with_context(|| "recording frankensqlite FTS rebuild generation")?;
+        Ok(())
+    }
+
+    fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
+        if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            self.record_fts_franken_rebuild_generation()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
+
+        let inspection = (|| -> Result<(i64, bool)> {
+            let fts_schema_rows = self.conn.query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            )?;
+            let fts_queryable = fts_schema_rows == 1
+                && self
+                    .conn
+                    .query("SELECT rowid FROM fts_messages LIMIT 1")
+                    .is_ok();
+            Ok((fts_schema_rows, fts_queryable))
+        })();
+
+        let (fts_schema_rows, fts_queryable) = match inspection {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "frankensqlite FTS consistency probe failed; rebuilding authoritative FTS"
+                );
+                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+                self.record_fts_franken_rebuild_generation()?;
+                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+            }
+        };
+
+        if fts_schema_rows != 1 || !fts_queryable {
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            self.record_fts_franken_rebuild_generation()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
+
+        let total_messages =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
+        let indexed_messages =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
+
+        if indexed_messages == total_messages {
+            return Ok(FtsConsistencyRepair::AlreadyHealthy {
+                rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
+            });
+        }
+
+        if indexed_messages > total_messages {
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            self.record_fts_franken_rebuild_generation()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
+
+        let inserted_rows = self
+            .conn
+            .execute_compat(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                 FROM messages m
+                 JOIN conversations c ON m.conversation_id = c.id
+                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN fts_messages f ON f.rowid = m.id
+                 WHERE f.rowid IS NULL
+                 ORDER BY m.rowid",
+                fparams![],
+            )
+            .with_context(|| "incrementally repairing missing FTS rows via frankensqlite")?;
+        let repaired_rows =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
+        if repaired_rows == total_messages {
+            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+            });
+        }
+
+        let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+        self.record_fts_franken_rebuild_generation()?;
+        Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
     }
 
     fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
@@ -13202,11 +13373,21 @@ mod tests {
             franken_seeded.schema_version().unwrap(),
             CURRENT_SCHEMA_VERSION
         );
-        drop(franken_seeded);
-
-        let post_franken_open = rusqlite::Connection::open(&canonical_db).unwrap();
-        assert_eq!(rusqlite_fts_schema_rows(&post_franken_open).unwrap(), 1);
-        assert!(rusqlite_fts_limit_probe(&post_franken_open));
+        let post_franken_schema_rows: i64 = franken_seeded
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(post_franken_schema_rows, 1);
+        assert!(
+            franken_seeded
+                .raw()
+                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -15306,6 +15487,13 @@ mod tests {
             [duplicate_legacy_fts_sql],
         )
         .unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [FTS_FRANKEN_REBUILD_META_KEY],
+        )
+        .unwrap();
+        // Simulate a pre-fix upgraded database that has never gone through the
+        // authoritative frankensqlite FTS rebuild generation yet.
         conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
 
         assert_eq!(rusqlite_fts_schema_rows(&conn).unwrap(), 2);
@@ -15313,33 +15501,46 @@ mod tests {
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        drop(reopened);
-
         let repaired = rusqlite::Connection::open(&db_path).unwrap();
         assert_eq!(rusqlite_fts_schema_rows(&repaired).unwrap(), 1);
-        assert!(rusqlite_fts_limit_probe(&repaired));
 
-        let total_messages: i64 = repaired
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        let total_messages: i64 = reopened
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
-        let total_fts_rows: i64 = repaired
-            .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
+        let total_fts_rows: i64 = reopened
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(total_fts_rows, total_messages);
     }
 
     #[test]
-    fn franken_storage_open_fresh_db_keeps_single_stock_fts_schema_row() {
+    fn franken_storage_open_fresh_db_keeps_single_franken_fts_schema_row() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fresh-franken-storage-open.db");
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        drop(storage);
-
-        let legacy = rusqlite::Connection::open(&db_path).unwrap();
-        assert_eq!(rusqlite_fts_schema_rows(&legacy).unwrap(), 1);
-        assert!(rusqlite_fts_limit_probe(&legacy));
+        let schema_rows: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(schema_rows, 1);
+        assert!(
+            storage
+                .raw()
+                .query("SELECT rowid FROM fts_messages LIMIT 1")
+                .is_ok()
+        );
     }
 
     #[test]

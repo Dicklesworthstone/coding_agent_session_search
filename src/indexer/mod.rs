@@ -2311,6 +2311,33 @@ pub fn run_index(
     let mut storage = storage;
     let mut storage_rebuilt = storage_rebuilt;
     let mut opened_fresh_for_full = opened_fresh_for_full;
+
+    // CASS #162 item 2: Verify the connection is writable early, before the
+    // code reaches deep batch-insert paths where a readonly failure is hard
+    // to diagnose.  A benign no-op UPDATE catches "attempt to write a readonly
+    // database" from frankensqlite.
+    if let Err(err) = storage
+        .raw()
+        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+    {
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            error = %err,
+            "primary storage connection failed writable preflight; \
+             attempting to close and reopen"
+        );
+        storage.close_best_effort_in_place();
+        storage = FrankenStorage::open(&opts.db_path).with_context(|| {
+            format!(
+                "reopening storage after writable preflight failure: {}. \
+                 If this persists, check that no other cass process holds \
+                 an exclusive lock on the database.",
+                opts.db_path.display()
+            )
+        })?;
+        storage_rebuilt = true;
+    }
+
     persist::apply_index_writer_busy_timeout(&storage);
     persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
     let index_path = index_dir(&opts.data_dir)?;
@@ -2405,8 +2432,40 @@ pub fn run_index(
     }
 
     if needs_rebuild && !resume_lexical_rebuild {
-        // Clean slate: avoid stale lock files and ensure a fresh Tantivy index.
-        let _ = std::fs::remove_dir_all(&index_path);
+        // Back up the old index directory before wiping it so that users don't
+        // silently lose potentially hundreds of MB of indexed data when the
+        // schema hash changes (CASS #162).
+        if index_path.exists() {
+            // Find a unique backup name: index/v7.bak, index/v7.bak.1, ...
+            let mut backup_path = index_path.with_extension("bak");
+            let mut attempt = 1u32;
+            while backup_path.exists() {
+                backup_path = index_path.with_extension(format!("bak.{attempt}"));
+                attempt += 1;
+            }
+            match std::fs::rename(&index_path, &backup_path) {
+                Ok(()) => {
+                    tracing::warn!(
+                        old_index = %index_path.display(),
+                        backup = %backup_path.display(),
+                        schema_matches,
+                        "backed up existing Tantivy index before rebuild \
+                         (schema or metadata changed); remove the backup \
+                         manually once you have confirmed the new index is healthy"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        old_index = %index_path.display(),
+                        backup = %backup_path.display(),
+                        error = %err,
+                        "failed to back up existing Tantivy index; \
+                         falling back to removal without backup"
+                    );
+                    let _ = std::fs::remove_dir_all(&index_path);
+                }
+            }
+        }
     }
     // Record scan start time before scanning
     let scan_start_ts = FrankenStorage::now_millis();
@@ -2893,6 +2952,15 @@ pub fn run_index(
         let storage_for_watch = Rc::clone(&storage);
         let t_index = Mutex::new(t_index);
 
+        // CASS #163 item 3: When autocommit_retain cannot be disabled, the
+        // long-lived read handle accumulates MVCC snapshots. Periodically
+        // close and reopen it to release that memory.
+        let watch_recycle_counter: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        let watch_recycle_interval: u32 = dotenvy::var("CASS_WATCH_RECYCLE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50); // recycle every 50 watch callbacks
+
         // Semantic embedding cooldown state for watch mode.
         // The initial pass already embedded everything, so we start the clock
         // from now — the cooldown must elapse before the first incremental pass.
@@ -3044,6 +3112,38 @@ pub fn run_index(
                                 // Reset cooldown on error to avoid rapid-fire retries
                                 if let Ok(mut t) = last_semantic_embed.lock() {
                                     *t = Instant::now();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // CASS #163 item 3: Periodically recycle the long-lived read
+                // handle to shed accumulated MVCC snapshots when
+                // autocommit_retain could not be disabled.
+                let count = watch_recycle_counter.get().wrapping_add(1);
+                watch_recycle_counter.set(count);
+                if count % watch_recycle_interval == 0 {
+                    if let Ok(mut guard) = storage_for_watch.lock() {
+                        let db_path = guard.database_path().ok();
+                        guard.close_best_effort_in_place();
+                        if let Some(path) = db_path {
+                            match FrankenStorage::open(&path) {
+                                Ok(new_storage) => {
+                                    *guard = new_storage;
+                                    tracing::debug!(
+                                        cycle = count,
+                                        "recycled long-lived storage handle to shed MVCC state"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        cycle = count,
+                                        "failed to reopen storage handle after recycle; \
+                                         next watch cycle will use the closed handle \
+                                         and likely fail"
+                                    );
                                 }
                             }
                         }
@@ -5097,6 +5197,7 @@ pub mod persist {
     use crate::connectors::NormalizedConversation;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
+    use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -5221,6 +5322,23 @@ pub mod persist {
                 db_path.display()
             )
         })?;
+
+        // CASS #162 item 2: Preflight write check to catch "attempt to write
+        // a readonly database" early with a clear diagnostic instead of letting
+        // it surface deep inside a batched insert.  The PRAGMA integrity_check
+        // is read-only, so we use a benign idempotent meta-table write instead.
+        if let Err(err) = writer
+            .raw()
+            .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+        {
+            anyhow::bail!(
+                "ephemeral writer preflight write failed for {context} at {}: {err}. \
+                 The database may be locked by another process or opened in \
+                 readonly mode. Try closing other cass instances and retrying.",
+                db_path.display()
+            );
+        }
+
         apply_index_writer_busy_timeout(&writer);
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
@@ -5326,6 +5444,8 @@ pub mod persist {
             let agent_slug = conv.agent_slug.clone();
             let workspace = conv.workspace.clone();
             let internal = map_to_internal(conv);
+
+            ensure_embedded_source_registered(franken, &conv.metadata, "begin-concurrent chunk")?;
 
             match with_concurrent_retry(max_retries, || {
                 let agent_id = if let Some(id) = agent_cache.get(&agent_slug) {
@@ -5610,6 +5730,35 @@ pub mod persist {
         (source_id, origin_host)
     }
 
+    fn ensure_embedded_source_registered(
+        writer: &FrankenStorage,
+        metadata: &serde_json::Value,
+        context: &str,
+    ) -> Result<()> {
+        let (source_id, origin_host) = extract_provenance(metadata);
+        if source_id == LOCAL_SOURCE_ID {
+            return Ok(());
+        }
+
+        let placeholder = Source {
+            id: source_id,
+            kind: SourceKind::Ssh,
+            host_label: origin_host,
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        };
+        writer.upsert_source(&placeholder).with_context(|| {
+            format!(
+                "auto-registering embedded provenance source {} for {context}",
+                placeholder.id
+            )
+        })?;
+        Ok(())
+    }
+
     /// Convert a NormalizedConversation to the internal Conversation type for SQLite storage.
     ///
     /// Extracts provenance from `metadata.cass.origin` if present, otherwise defaults to local.
@@ -5717,6 +5866,7 @@ pub mod persist {
                 None
             };
 
+            ensure_embedded_source_registered(writer, &conv.metadata, "persist_conversation")?;
             let internal_conv = map_to_internal(conv);
             writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
         })?;
@@ -5815,6 +5965,11 @@ pub mod persist {
                         None
                     };
 
+                    ensure_embedded_source_registered(
+                        writer,
+                        &conv.metadata,
+                        "serial batched indexing",
+                    )?;
                     let internal_conv = map_to_internal(conv);
                     prepared.push((agent_id, workspace_id, internal_conv));
                 }
@@ -6652,6 +6807,70 @@ pub mod persist {
         }
 
         #[test]
+        fn persist_conversation_registers_missing_remote_source() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("single-remote-source.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("remote-single-session".into()),
+                title: Some("Remote single session".into()),
+                workspace: Some(std::path::PathBuf::from("/ws/remote")),
+                source_path: std::path::PathBuf::from("/log/remote-single.jsonl"),
+                started_at: Some(3_000),
+                ended_at: Some(3_010),
+                metadata: serde_json::json!({
+                    "cass": {
+                        "origin": {
+                            "source_id": "remote-single-source",
+                            "host": "builder-3"
+                        }
+                    }
+                }),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "assistant".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(3_005),
+                    content: "single remote content".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                    invocations: Vec::new(),
+                }],
+            };
+
+            persist_conversation(&storage, &mut t_index, &conv)
+                .expect("single conversation path should auto-register embedded remote sources");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let source_ids = reader.get_source_ids().unwrap();
+            assert_eq!(source_ids, vec!["remote-single-source".to_string()]);
+
+            let provenance: Vec<(String, Option<String>)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT source_id, origin_host FROM conversations",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance,
+                vec![(
+                    "remote-single-source".to_string(),
+                    Some("builder-3".to_string())
+                )]
+            );
+        }
+
+        #[test]
         fn duplicate_conversation_keys_present_for_shared_source_path_without_external_id() {
             use crate::connectors::{NormalizedConversation, NormalizedMessage};
 
@@ -6799,31 +7018,21 @@ mod tests {
     }
 
     fn ensure_fts_schema(storage: &FrankenStorage) {
-        let db_path = storage
+        let count: i64 = storage
             .raw()
-            .query_map_collect("PRAGMA database_list", &[] as &[ParamValue], |row| {
-                Ok((row.get_typed::<String>(1)?, row.get_typed::<String>(2)?))
-            })
-            .unwrap()
-            .into_iter()
-            .find(|(name, path)| name == "main" && !path.is_empty())
-            .map(|(_, path)| std::path::PathBuf::from(path))
-            .expect("file-backed main database path");
-
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(count, 1, "fts_messages should exist after migrations");
         assert!(
-            conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
-                .and_then(|mut stmt| stmt.exists([]))
+            storage
+                .raw()
+                .query("SELECT rowid FROM fts_messages LIMIT 1")
                 .is_ok(),
-            "fts_messages should remain queryable via stock SQLite"
+            "fts_messages should remain queryable via frankensqlite"
         );
     }
 
