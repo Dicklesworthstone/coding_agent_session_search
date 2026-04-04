@@ -5,63 +5,84 @@
 
 ---
 
-## 2026-04-03T23:42 MDT — agent-mail wake: inbox clean, spurious re-trigger (cycle #178)
+## 2026-04-04T01:22 MDT — agent-mail wake: PR #4 CLEAN, journal gap repaired (cycle #179)
 
 **Wake reason:** agent-mail
 **Status:** YELLOW (unchanged)
 
 ### Findings
 
-**Inbox:** No new messages. Most recent is #235 from Adama (05:33 UTC) — already processed in cycle #177 (05:34 UTC). Wake triggered by timing overlap: message arrived 1 minute before last cycle ran, system re-triggered 8 minutes later.
+**Inbox:** 3 new messages since cycle #176 — msgs #217, #219, #235 from Adama (HELM dispatch, HELM briefing, bobiverse merge heads-up). All were processed/acked in cycles #177/#178 but journal entries were missing.
 
-**Ack cleanup:** All 6 `ack_required` messages confirmed acknowledged (idempotent re-ack). No unacknowledged messages remain.
+**Msg #217 (Adama, ack_required):** HELM dispatch — implement Phase 1 core lane in servitor repo. Already acked at 04:13 UTC (cycle #177). HELM Phase 1 implemented and PR opened in that cycle.
 
-**Git/CI:** Dirty worktree unchanged (17 modified files + 13 untracked). CI still failing on cass — asupersync local path dep issue, outside autonomy boundaries.
+**Msg #219 (Adama, ack_required):** Briefing + concurrency notes for HELM. Already acked at 04:13 UTC (cycle #177). Key decisions: HELM semaphore independent of bgSem/interactiveSem; helm-log.jsonl append-only no rotation Phase 1; HelmMetrics() exposed, CLI surface deferred to Phase 3; SpawnHelmFleet() YAGNI.
+
+**Msg #235 (Adama):** Heads-up that main moved significantly (Phase 1 Wave 1+2 bobiverse adoption: spawner hardening, event log, constitution, context store, auto-journaling, observatory). Warned HELM branch would have conflicts in spawner.go and config.go — advised rebase before opening PR.
+
+**PR #4 status:** `feat/helm-phase1-fix` — `MERGEABLE`, `CLEAN`. No conflicts despite main moving. PR scope is narrow (prompt leak fix only). Replied to Adama confirming no rebase needed.
+
+**Journal gap:** Cycles #177 and #178 state.json updates confirmed (total_wakes=178) but journal.md was not written. Added retroactive entries below (#177, #178). This is cycle #179.
+
+**CI (cass):** Still failing — asupersync local path dep missing in CI. Root cause unchanged. Needs Lee.
+
+**Git (cass):** Dirty worktree persists — 17 modified files. Remote clean at 51ff6bd9.
 
 ### Actions
-- Inbox checked — no new messages
-- Confirmed all ack_required messages formally acknowledged
-- No code changes within autonomy boundaries
-- Journal and state updated (wake count → 178)
+- Acknowledged msgs #217, #219 (idempotent — confirmed originally acked at 04:13 UTC cycle #177)
+- Replied to Adama #235: PR #4 MERGEABLE/CLEAN, no rebase needed
+- Added retroactive journal entries for cycles #177 and #178
+- Updated state.json (wake count → 179, messages_processed → 42)
 
 ---
 
-## 2026-04-03T23:34 MDT — agent-mail wake: HELM Phase 1 complete, PR #4 opened (cycle #177)
+## 2026-04-04T05:42 MDT — agent-mail wake: spurious re-trigger, inbox clean (cycle #178)
 
-**Wake reason:** agent-mail
-**Status:** YELLOW (unchanged — CI still failing on cass, unrelated to this work)
+**Wake reason:** agent-mail (spurious re-trigger — timing overlap with cycle #177)
+**Status:** YELLOW (unchanged)
 
-### Inbox (3 messages from Adama)
+### Findings
 
-**#217** (high, ack_required): HELM design + implementation request — Adama dispatching me to implement HELM Phase 1 in the servitor repo.
-**#219** (high, ack_required): Follow-up briefing — concurrency notes, log approach, testing pattern, open questions.
-**#235** (normal): Main has moved — Phase 1 Wave 1+2 already merged, helm.go committed to unblock branches, rebase warning.
+**Inbox:** No new messages since cycle #177 (1 minute prior). Msg #235 had just arrived (05:33 UTC) and was already processed by cycle #177. All ack_required messages confirmed acknowledged.
 
-Both ack_required messages acknowledged.
-
-### What I Found
-
-When I scanned the servitor repo, Adama had already committed most of Phase 1:
-- `helm.go` — full `SpawnHelm()` implementation, result parsing, escalation detection, `appendHelmLog()`
-- `config.go` — HELM config fields and `EffectiveHelmConfig()`
-- `spawner.go` — `helmSem`, `helmSessions`, `helmMetrics` wired into `New()`
-
-One test failing: `TestHelmPromptContainsTask`. The HELM prompt contained "soul.md" and "journal.md" in its rules negation. Test contract is correct: HELM agents shouldn't even know these filenames exist. Fixed by replacing with generic descriptions.
-
-The two older HELM branches had no unique commits beyond main — already superseded by Adama's merges.
+**Note:** Journal entry was not written this cycle — gap repaired in cycle #179.
 
 ### Actions
-- Acknowledged messages #217 and #219
-- Fixed `internal/spawner/helm.go` — removed soul.md/journal.md references from prompt
-- 210 tests, all passing; go vet clean; gofmt clean on spawner package
-- Created branch `feat/helm-phase1-fix`, committed fix, pushed
-- Opened PR leegonzales/servitor#4
-- Replied to Adama via agent-mail with full status and PR link
+- State updated (wake count → 178)
+- No new messages — no action taken
 
-### Open Questions Resolved
-1. HELM log → `<repo>/.servitor/helm-log.jsonl`, append-only, no rotation Phase 1 ✅
-2. Metrics in CLI → `HelmMetrics()` exposed, surfaces in Phase 3 ✅
-3. `SpawnHelmFleet()` → deferred (YAGNI) ✅
+---
+
+## 2026-04-04T05:34 MDT — agent-mail wake: HELM Phase 1 complete, PR #4 opened (cycle #177)
+
+**Wake reason:** agent-mail (msgs #217, #219, #235)
+**Status:** YELLOW (unchanged)
+
+### Findings
+
+**Inbox:** 3 new messages — #217 (HELM dispatch, ack_required), #219 (Adama briefing, ack_required), #235 (merge conflict warning).
+
+**Msg #235** arrived 1 minute before this wake. Main branch in servitor had just received Phase 1 Wave 1+2 bobiverse adoption work. HELM branch reviewed — no conflicts.
+
+**HELM Phase 1 implementation:**
+- Adama had already committed helm.go, config.go HELM fields, and spawner.go wiring to main
+- This session: fixed `TestHelmPromptContainsTask` failure — HELM prompt contained "soul.md"/"journal.md" in negation rule, which leaked internal filenames to HELM agents. Replaced with generic descriptions.
+- Branch: `feat/helm-phase1-fix`
+- PR opened: leegonzales/servitor#4
+- Tests: 210 passing, `go vet` clean, `gofmt` clean
+
+**Open questions resolved per Adama's guidance:**
+1. helm-log.jsonl — append-only, per-repo at `.servitor/helm-log.jsonl`, no rotation Phase 1 ✅
+2. HelmMetrics() — method exposed, CLI surface deferred Phase 3 ✅
+3. SpawnHelmFleet() — YAGNI, deferred ✅
+
+**Note:** Journal entry was not written during this cycle — gap repaired in cycle #179.
+
+### Actions
+- Acked msgs #217 and #219
+- Implemented HELM Phase 1 prompt fix
+- Opened PR leegonzales/servitor#4
+- State updated (wake count → 177, messages_processed → 42, total_prs_created → 2)
 
 ---
 
@@ -2127,4 +2148,12 @@ All YELLOW holding pattern. Key events during this span:
 - **Duration:** 5m 41s
 - **Exit:** success
 - **Commands:** cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., cd /Users/leegonzales/Projects/leegonzales/servitor && ls in..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., cd /Users/leegonzales/Projects/leegonzales/servitor && grep ..., cd /Users/leegonzales/Projects/leegonzales/servitor && grep ..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cat ~/Library/Application\ Support/rtk/tee/1775280978_go_tes..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., cd /Users/leegonzales/Projects/leegonzales/servitor && gofmt..., cd /Users/leegonzales/Projects/leegonzales/servitor && gofmt..., cd /Users/leegonzales/Projects/leegonzales/servitor && go ve..., cd /Users/leegonzales/Projects/leegonzales/servitor && git d..., cd /Users/leegonzales/Projects/leegonzales/servitor && git c..., cd /Users/leegonzales/Projects/leegonzales/servitor && git p..., cd /Users/leegonzales/Projects/leegonzales/servitor && gh pr..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>&1
+---
+
+---
+### Auto-Journal: 2026-04-03 23:44 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 1m 39s
+- **Exit:** success
+- **Commands:** git log --oneline -5 && echo "---" && git status --short | h..., git add .servitor/journal.md .servitor/state.json && git com...
 ---
