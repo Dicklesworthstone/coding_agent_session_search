@@ -597,10 +597,25 @@ pub(crate) fn search_hit_has_identity_hint(hit: &SearchHit) -> bool {
         || !title.is_empty()
 }
 
+pub(crate) fn search_hit_has_secondary_identity_hint(hit: &SearchHit) -> bool {
+    let snippet = hit.snippet.trim();
+    let snippet_prefix = snippet.strip_suffix("...").unwrap_or(snippet).trim();
+    let title = hit.title.trim();
+    hit.line_number.is_some_and(|line| line > 0)
+        || hit.created_at.is_some()
+        || !hit.content.is_empty()
+        || !snippet_prefix.is_empty()
+        || !title.is_empty()
+}
+
 pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &SearchHit) -> bool {
-    if let Some(expected_conversation_id) = hit.conversation_id {
-        return view.convo.id == Some(expected_conversation_id);
-    }
+    let conversation_id_mismatch = match hit.conversation_id {
+        Some(expected_conversation_id) if view.convo.id == Some(expected_conversation_id) => {
+            return true;
+        }
+        Some(_) => true,
+        None => false,
+    };
     let normalized_hit_source_id = normalize_ui_hit_source_id(hit);
     if view.convo.source_id != normalized_hit_source_id
         || view.convo.source_path != std::path::Path::new(&hit.source_path)
@@ -618,13 +633,17 @@ pub(crate) fn conversation_view_matches_hit(view: &ConversationView, hit: &Searc
         .map(str::trim)
         .filter(|title| !title.is_empty());
     let has_identity_hint = search_hit_has_identity_hint(hit);
+    let has_strong_message_identity_hint = hit.created_at.is_some() || !hit.content.is_empty();
+    if conversation_id_mismatch && !search_hit_has_secondary_identity_hint(hit) {
+        return false;
+    }
     if !has_identity_hint {
         return true;
     }
 
     if !hit_title.is_empty() {
         match convo_title {
-            Some(title) if title != hit_title => return false,
+            Some(title) if title != hit_title && !has_strong_message_identity_hint => return false,
             None if hit.line_number.is_none()
                 && hit.created_at.is_none()
                 && hit.content.is_empty()
@@ -1841,6 +1860,112 @@ mod tests {
     }
 
     #[test]
+    fn conversation_view_matches_hit_falls_back_when_stale_conversation_id_has_other_hints() {
+        let view = ConversationView {
+            convo: Conversation {
+                id: Some(1),
+                agent_slug: "claude_code".to_string(),
+                workspace: None,
+                external_id: Some("ext-1".to_string()),
+                title: Some("Session".to_string()),
+                source_path: std::path::PathBuf::from("/shared/session.jsonl"),
+                started_at: Some(100),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: "local".to_string(),
+                origin_host: None,
+            },
+            messages: vec![Message {
+                id: Some(1),
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(101),
+                content: "body".to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            workspace: None,
+        };
+
+        let hit = SearchHit {
+            title: "Session".to_string(),
+            snippet: String::new(),
+            content: "body".to_string(),
+            content_hash: 0,
+            score: 0.0,
+            conversation_id: Some(999),
+            source_path: "/shared/session.jsonl".to_string(),
+            agent: "claude_code".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(101),
+            line_number: Some(1),
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        assert!(conversation_view_matches_hit(&view, &hit));
+    }
+
+    #[test]
+    fn conversation_view_matches_hit_rejects_stale_conversation_id_without_other_hints() {
+        let view = ConversationView {
+            convo: Conversation {
+                id: Some(1),
+                agent_slug: "claude_code".to_string(),
+                workspace: None,
+                external_id: Some("ext-1".to_string()),
+                title: Some("Session".to_string()),
+                source_path: std::path::PathBuf::from("/shared/session.jsonl"),
+                started_at: Some(100),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![],
+                source_id: "local".to_string(),
+                origin_host: None,
+            },
+            messages: vec![Message {
+                id: Some(1),
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(101),
+                content: "body".to_string(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            workspace: None,
+        };
+
+        let hit = SearchHit {
+            title: String::new(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: 0,
+            score: 0.0,
+            conversation_id: Some(999),
+            source_path: "/shared/session.jsonl".to_string(),
+            agent: "claude_code".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: None,
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        assert!(!conversation_view_matches_hit(&view, &hit));
+    }
+
+    #[test]
     fn load_conversation_for_source_uses_cached_value_when_validation_query_fails() {
         use crate::storage::sqlite::FrankenStorage;
 
@@ -2259,6 +2384,63 @@ mod tests {
 
         assert_eq!(loaded.convo.id, Some(1));
         assert_eq!(loaded.convo.title.as_deref(), Some("Database Title"));
+    }
+
+    #[test]
+    fn load_conversation_for_hit_ignores_stale_title_when_exact_content_identifies_match() {
+        use crate::storage::sqlite::FrankenStorage;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let conn = storage.raw();
+        let shared_path = "/shared/cursor.sqlite";
+
+        conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'cursor', 'Cursor', 'local', 0, 0)")
+            .expect("insert agent");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'old-ext', 'Old Session', '/shared/cursor.sqlite', 'local', 100)",
+        )
+        .expect("insert old conversation");
+        conn.execute(
+            "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (2, 1, 'new-ext', 'New Session', '/shared/cursor.sqlite', 'local', 200)",
+        )
+        .expect("insert new conversation");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (1, 1, 0, 'user', 'old conversation body')",
+        )
+        .expect("insert old message");
+        conn.execute(
+            "INSERT INTO messages (id, conversation_id, idx, role, content) VALUES (2, 2, 0, 'user', 'new conversation body')",
+        )
+        .expect("insert new message");
+
+        let hit = SearchHit {
+            title: "Stale Indexed Title".to_string(),
+            snippet: "new conversation body".to_string(),
+            content: "new conversation body".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 0.0,
+            source_path: shared_path.to_string(),
+            agent: "cursor".to_string(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: None,
+            line_number: Some(1),
+            match_type: Default::default(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+        };
+
+        let loaded = load_conversation_for_hit(&storage, &hit)
+            .expect("load exact conversation")
+            .expect("matching conversation");
+
+        assert_eq!(loaded.convo.external_id.as_deref(), Some("new-ext"));
+        assert_eq!(loaded.convo.title.as_deref(), Some("New Session"));
+        assert_eq!(loaded.messages[0].content, "new conversation body");
     }
 
     #[test]

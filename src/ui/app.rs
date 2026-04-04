@@ -125,6 +125,7 @@ use crate::ui::data::{
     BudgetHealthContract, CockpitState, ConversationView, DiffStrategyContract, InputMode,
     ResizeRegimeContract, conversation_view_matches_hit, format_time_short,
     load_conversation_for_hit, search_hit_has_identity_hint,
+    search_hit_has_secondary_identity_hint,
 };
 use crate::ui::shortcuts;
 use crate::ui::time_parser::parse_time_input;
@@ -5272,7 +5273,12 @@ impl CassApp {
     }
 
     fn set_detail_scroll_clamped(&mut self, target: u32) {
-        self.detail_scroll = target.min(self.max_detail_scroll());
+        let max_scroll = self.max_detail_scroll();
+        self.detail_scroll = if self.detail_content_lines.get() == 0 {
+            target
+        } else {
+            target.min(max_scroll)
+        };
     }
 
     fn apply_persisted_state(&mut self, state: &PersistedState, mark_first_run_dirty: bool) {
@@ -5449,6 +5455,27 @@ impl CassApp {
             .and_then(|(_, cv)| conversation_view_matches_hit(cv, hit).then_some(cv))
     }
 
+    fn cached_detail_for_render(&self, hit: &SearchHit) -> Option<&ConversationView> {
+        if let Some(cv) = self.cached_detail_for_hit(hit) {
+            return Some(cv);
+        }
+
+        self.cached_detail.as_ref().and_then(|(cached_path, cv)| {
+            if cached_path != &hit.source_path {
+                return None;
+            }
+
+            let cached_source_id = trimmed_non_empty(cv.convo.source_id.as_str())
+                .or_else(|| trimmed_option_non_empty(cv.convo.origin_host.as_deref()))
+                .unwrap_or(crate::sources::provenance::LOCAL_SOURCE_ID);
+
+            // Rendering should trust the already-loaded session view for the same
+            // path/source, even when the search hit payload is truncated or normalized
+            // enough to fail the stricter reload-time identity matcher.
+            (cached_source_id == hit_source_id_display(hit)).then_some(cv)
+        })
+    }
+
     fn collect_session_hit_lines(&self, selected_hit: &SearchHit) -> Vec<usize> {
         let iter = if self.panes.is_empty() {
             self.results.iter().collect::<Vec<_>>()
@@ -5461,6 +5488,17 @@ impl CassApp {
         let cached_detail = self.cached_detail_for_hit(selected_hit);
         let selected_key = SelectedHitKey::from_hit(selected_hit);
         let selected_has_identity_hint = search_hit_has_identity_hint(selected_hit);
+        let selected_has_secondary_identity_hint =
+            search_hit_has_secondary_identity_hint(selected_hit);
+        let selected_has_message_identity_hint =
+            selected_hit.created_at.is_some() || !selected_hit.content.is_empty() || {
+                let snippet = selected_hit.snippet.trim();
+                !snippet
+                    .strip_suffix("...")
+                    .unwrap_or(snippet)
+                    .trim()
+                    .is_empty()
+            };
 
         let mut lines: Vec<usize> = iter
             .into_iter()
@@ -5469,6 +5507,12 @@ impl CassApp {
                     conversation_view_matches_hit(cv, hit)
                 } else if let Some(selected_conversation_id) = selected_hit.conversation_id {
                     hit.conversation_id == Some(selected_conversation_id)
+                } else if selected_has_identity_hint
+                    && (!selected_has_secondary_identity_hint
+                        || !selected_has_message_identity_hint)
+                {
+                    hit.source_path == selected_hit.source_path
+                        && hit_source_id_display(hit) == hit_source_id_display(selected_hit)
                 } else if selected_has_identity_hint {
                     SelectedHitKey::from_hit(hit) == selected_key
                 } else {
@@ -8620,7 +8664,7 @@ impl CassApp {
         let info_style = styles.style(style_system::STYLE_STATUS_INFO);
         let success_style = styles.style(style_system::STYLE_STATUS_SUCCESS);
         let warning_style = styles.style(style_system::STYLE_STATUS_WARNING);
-        let cached_detail = self.cached_detail_for_hit(hit);
+        let cached_detail = self.cached_detail_for_render(hit);
         let display_agent = cached_detail
             .map(|cv| cv.convo.agent_slug.as_str())
             .filter(|agent| !agent.trim().is_empty())
@@ -8719,7 +8763,7 @@ impl CassApp {
         };
 
         let mut sparkline_data: Option<(String, usize)> = None;
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = self.cached_detail_for_render(hit) {
             if let Some(started) = cv.convo.started_at {
                 if let Some(dt) = smart_timestamp(started) {
                     push_chip("at", dt.format("%Y-%m-%d %H:%M").to_string(), value_style);
@@ -8848,7 +8892,7 @@ impl CassApp {
         styles: &StyleContext,
     ) -> Vec<ftui::text::Line<'_>> {
         let mut lines: Vec<ftui::text::Line> = Vec::new();
-        let cached_detail = self.cached_detail_for_hit(hit);
+        let cached_detail = self.cached_detail_for_render(hit);
         let display_title = cached_detail
             .and_then(|cv| cv.convo.title.as_deref())
             .map(str::trim)
@@ -8976,7 +9020,7 @@ impl CassApp {
         }
 
         // If we have a cached conversation, render full messages
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = cached_detail {
             let md_width = inner_width.saturating_sub(4);
             let md_renderer = MarkdownRenderer::new(styles.markdown_theme())
                 .with_syntax_theme(styles.syntax_highlight_theme())
@@ -9178,7 +9222,7 @@ impl CassApp {
         lines.push(ftui::text::Line::from(""));
 
         // If we have a cached conversation, show per-message snippets
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = self.cached_detail_for_render(hit) {
             let mut any = false;
             for (i, msg) in cv.messages.iter().enumerate() {
                 if msg.snippets.is_empty() {
@@ -9213,7 +9257,17 @@ impl CassApp {
             }
         } else {
             // Fallback: show the same snippet/content/title excerpt used in the results list.
-            if let Some(snippet) = search_hit_snippet_fallback_text_opt(hit) {
+            let snippet = hit.snippet.trim();
+            let content = hit.content.trim();
+            let fallback = if !snippet.is_empty() {
+                Some(snippet)
+            } else if !content.is_empty() {
+                Some(content)
+            } else {
+                None
+            };
+
+            if let Some(snippet) = fallback {
                 for line in snippet.lines() {
                     lines.push(ftui::text::Line::from(line.to_string()));
                 }
@@ -9239,7 +9293,7 @@ impl CassApp {
         lines.push(ftui::text::Line::from(""));
 
         // If we have a cached conversation, serialize the full conversation
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = self.cached_detail_for_render(hit) {
             let display_agent = if cv.convo.agent_slug.trim().is_empty() {
                 hit_agent_display(hit)
             } else {
@@ -9397,7 +9451,7 @@ impl CassApp {
             }
         };
 
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = self.cached_detail_for_render(hit) {
             // Build the full conversation JSON including metadata and messages
             let display_agent = if cv.convo.agent_slug.trim().is_empty() {
                 hit_agent_display(hit)
@@ -9691,7 +9745,7 @@ impl CassApp {
         ]));
         lines.push(ftui::text::Line::from(""));
 
-        let Some(cv) = self.cached_detail_for_hit(hit) else {
+        let Some(cv) = self.cached_detail_for_render(hit) else {
             lines.push(ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled("No conversation data loaded for analytics.", muted_style),
             ]));
@@ -9981,7 +10035,7 @@ impl CassApp {
     /// Build export defaults for the current hit, reusing the same naming
     /// strategy as the HTML export modal.
     fn detail_export_state_for_hit(&self, hit: &SearchHit) -> ExportModalState {
-        if let Some(cv) = self.cached_detail_for_hit(hit) {
+        if let Some(cv) = self.cached_detail_for_render(hit) {
             return ExportModalState::from_hit(hit, cv);
         }
 
@@ -16975,7 +17029,7 @@ impl super::ftui_adapter::Model for CassApp {
                 // Collapse all tool/system messages from the active cached detail only.
                 let collapse_indices = self
                     .selected_hit()
-                    .and_then(|hit| self.cached_detail_for_hit(hit))
+                    .and_then(|hit| self.cached_detail_for_render(hit))
                     .map(|cv| {
                         cv.messages
                             .iter()
@@ -16997,7 +17051,11 @@ impl super::ftui_adapter::Model for CassApp {
                 ftui::Cmd::none()
             }
             CassMsg::DetailMessageJumped { forward, user_only } => {
-                let current = self.detail_scroll.min(self.max_detail_scroll());
+                let current = if self.detail_content_lines.get() == 0 {
+                    self.detail_scroll
+                } else {
+                    self.detail_scroll.min(self.max_detail_scroll())
+                };
                 let offsets = self.detail_message_offsets.borrow();
                 if offsets.is_empty() {
                     return ftui::Cmd::none();
@@ -20802,7 +20860,7 @@ impl super::ftui_adapter::Model for CassApp {
                 );
                 let detail_cache_warm = self
                     .selected_hit()
-                    .is_some_and(|hit| self.cached_detail_for_hit(hit).is_some());
+                    .is_some_and(|hit| self.cached_detail_for_render(hit).is_some());
                 let perf_lane = format!(
                     "lat:{} cache:{}",
                     self.last_search_ms
@@ -22892,6 +22950,11 @@ fn take_test_editor_invocations() -> Vec<Vec<String>> {
         .ok()
         .map(|mut guard| std::mem::take(&mut *guard))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn clear_test_editor_invocations() {
+    let _ = take_test_editor_invocations();
 }
 
 #[cfg(not(test))]
@@ -32078,6 +32141,7 @@ not jsonl",
         let temp = tempfile::tempdir().expect("tempdir");
         let _config_guard = EnvVarGuard::set_path("XDG_CONFIG_HOME", temp.path());
         let _editor_guard = EnvVarGuard::set_str("EDITOR", "code");
+        clear_test_editor_invocations();
 
         let mut config = SourcesConfig::default();
         let mut source = SourceDefinition::ssh("work-laptop", "user@work-laptop");
@@ -37450,9 +37514,8 @@ not jsonl",
     fn app_with_cached_conversation() -> CassApp {
         use crate::model::types::{Message, MessageRole};
         let mut app = app_with_hits(3);
-        // selected hit[0].source_path is "/path/0" from app_with_hits —
-        // cached_detail below uses the same key so DetailOpened takes the
-        // cache-hit branch.
+        app.panes[0].hits[0] = make_test_hit();
+        let selected_hit = app.panes[0].hits[0].clone();
 
         fn msg(idx: i64, role: MessageRole, content: &str, ts: Option<i64>) -> Message {
             Message {
@@ -37468,6 +37531,9 @@ not jsonl",
         }
 
         let mut cv = make_test_conversation_view();
+        cv.convo.id = selected_hit.conversation_id;
+        cv.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
+        cv.convo.source_id = hit_source_id_display(&selected_hit).to_string();
         cv.messages = vec![
             msg(
                 0,
@@ -37479,7 +37545,7 @@ not jsonl",
                 1,
                 MessageRole::Agent,
                 "# Analysis\n\nI'll look at the code:\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nLet me check.",
-                Some(2_000),
+                Some(1_700_000_000),
             ),
             msg(
                 2,
@@ -37499,7 +37565,7 @@ not jsonl",
         cv.convo.started_at = Some(1_000_000);
         cv.convo.ended_at = Some(1_060_000);
         cv.convo.approx_tokens = Some(15_000);
-        app.cached_detail = Some(("/path/0".to_string(), cv));
+        app.cached_detail = Some((selected_hit.source_path, cv));
         app
     }
 
@@ -37635,8 +37701,7 @@ not jsonl",
     #[test]
     fn regression_detail_open_cache_hit_uses_cached_conversation_without_reload() {
         let mut app = app_with_cached_conversation();
-        // app_with_cached_conversation already aligns hit[0].source_path ("/path/0")
-        // with cached_detail key ("/path/0"), so no override needed.
+        // app_with_cached_conversation already aligns hit[0] with the cached detail.
 
         let cmd = app.update(CassMsg::DetailOpened);
 
@@ -37654,7 +37719,7 @@ not jsonl",
             .cached_detail
             .as_ref()
             .expect("cached detail should remain loaded");
-        assert_eq!(cached_path, "/path/0");
+        assert_eq!(cached_path, "/test/session.jsonl");
         assert_eq!(cached_view.messages.len(), 6);
         assert!(
             cached_view.messages[0].content.contains("fix a bug"),
@@ -37793,7 +37858,7 @@ not jsonl",
     fn regression_detail_find_navigation_uses_rendered_match_cache() {
         let mut app = app_with_cached_conversation();
         // app_with_cached_conversation already aligns hit[0] and cached_detail
-        // to "/path/0" so DetailOpened takes the cache-hit branch.
+        // so DetailOpened takes the cache-hit branch.
 
         let _ = app.update(CassMsg::DetailOpened);
         let _ = app.update(CassMsg::DetailFindToggled);
@@ -44260,10 +44325,34 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             first_pane.selected = 0;
         }
         app.focus_manager.focus(focus_ids::DETAIL_PANE);
-        app.cached_detail = Some((
-            "/test/session.jsonl".to_string(),
-            make_test_conversation_view(),
-        ));
+        let mut cv = make_test_conversation_view();
+        if let Some(selected_hit) = app.selected_hit() {
+            cv.convo.id = selected_hit.conversation_id;
+            cv.convo.agent_slug = selected_hit.agent.clone();
+            cv.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
+            cv.convo.source_id = hit_source_id_display(selected_hit).to_string();
+            cv.convo.workspace =
+                trimmed_non_empty(&selected_hit.workspace).map(std::path::PathBuf::from);
+            cv.convo.title = trimmed_non_empty(&selected_hit.title).map(ToOwned::to_owned);
+            cv.convo.origin_host = selected_hit.origin_host.clone();
+            cv.convo.metadata_json = serde_json::json!({
+                "cass": {
+                    "workspace_original": selected_hit.workspace_original,
+                }
+            });
+            cv.workspace = trimmed_non_empty(&selected_hit.workspace).map(|workspace| {
+                crate::model::types::Workspace {
+                    id: None,
+                    path: std::path::PathBuf::from(workspace),
+                    display_name: None,
+                }
+            });
+        }
+        let selected_path = app
+            .selected_hit()
+            .map(|hit| hit.source_path.clone())
+            .unwrap_or_else(|| "/test/session.jsonl".to_string());
+        app.cached_detail = Some((selected_path, cv));
         app
     }
 
