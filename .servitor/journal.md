@@ -5,82 +5,31 @@
 
 ---
 
-## 2026-04-04T06:42 MDT — heartbeat: inbox clean, servitor PR #5 new (cycle #180)
-
-**Wake reason:** heartbeat
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** No new messages since cycle #179. All mail previously processed — msgs #217/#219/#235 from Adama (HELM Design) handled in cycles #177-#179. Older messages (Burke joke round, SteelGuard contact, routing tests) unchanged.
-
-**Cass CI:** Still failing — same 5 FAIL runs (CI, Coverage, Benchmarks). Root cause unchanged: asupersync local path dep missing in CI. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
-
-**Cass git:** Dirty worktree persists — 18 modified files, 15 untracked. Remote clean at 46d71e6a. No new commits.
-
-**Cass PRs:** None open.
-
-**Cass Beads:** Clean — no open issues.
-
-**Servitor repo:** CI GREEN (1 run passing). Two PRs open:
-- **PR #4** (feat/helm-phase1-fix): Still open, mergeable=UNKNOWN (GitHub computing). Confirmed CLEAN in cycle #179.
-- **PR #5** (fix/servitor-hbf-session-lock-signal): NEW since cycle #179. Fix for `isSessionLocked` — `proc.Signal(nil)` always returned false (failed type assertion). Fix: `syscall.Signal(0)` POSIX liveness probe. 194 tests passing, go vet clean. Found during PR #4 code review. Authored by leegonzales.
-
-**Journal gap note:** Cycles #175-#179 still not visible at the top of journal.md despite "gap repaired" note in cycle #179. Likely a prepend failure across those cycles. This entry (#180) is at the correct position.
-
-### Actions
-- No new mail to process
-- No code changes within autonomy bounds for cass
-- Noted servitor PR #5 (session lock fix) — good find, CI green
-- Journal and state updated (wake count → 180)
-
----
-
-## 2026-04-02T01:26 MDT — agent-mail wake: inbox clean, status unchanged (cycle #174)
+## 2026-04-04T12:35 MDT — agent-mail wake: HELM thread status confirmed (cycle #181)
 
 **Wake reason:** agent-mail trigger
 **Status:** YELLOW (unchanged)
 
 ### Findings
 
-**Inbox:** No new messages since cycle #173. All messages in inbox are from prior cycles (latest #197 from 2026-03-29). Clean.
+**Inbox:** 3 new messages since cycle #180:
+- **msg #217** (Adama, high, ack_required): HELM Design — Lightweight Task Delegation for Servitor (implement). Already acked at 04:13 UTC (prior session). Idempotent ack confirmed.
+- **msg #219** (Adama, high, ack_required): Re: HELM Design — briefing with concurrency notes, pre-approved decisions, send PR when ready. Already acked at 04:13 UTC (prior session). Idempotent ack confirmed.
+- **msg #235** (Adama, normal, no ack): HELM — heads up that main moved significantly (Wave 1+2 bobiverse adoption), warns of merge conflicts in spawner.go and config.go, advises rebase.
 
-**CI:** Still failing — asupersync local path dep missing in CI. Root cause unchanged. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
+**HELM investigation:**
+Checked branch history for `feat/helm-phase1-fix`. Merge base with main is `d6d390c` (observatory scroll fixes) — already downstream of Wave 1+2. HELM branch includes Observatory, auto-journaling, and FMEA fix commits in its history. The 9 commits on main since divergence are all servitor wake journal/state updates (wakes #208–#214). **No code conflicts.** Rebase not needed.
 
-**Git:** Dirty worktree persists — 17 modified files. Remote clean at 51ff6bd9.
+**PR #4 state:** OPEN, REVIEW_PASS confirmed (Adama wake #208), awaiting Lee to merge.
+**PR #5 state:** OPEN, awaiting Lee to merge.
 
-**PRs:** None open.
-
-**Beads:** No open issues.
-
-### Actions
-- No new mail — nothing to process
-- No code changes within autonomy boundaries
-- Journal and state updated (wake count → 174)
-
----
-
-## 2026-04-01T23:31 MDT — agent-mail wake: inbox clean, status unchanged (cycle #173)
-
-**Wake reason:** agent-mail trigger
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** No new messages since cycle #172. Clean.
-
-**CI:** Still failing — root cause unchanged: asupersync local path dep missing in CI. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
-
-**Git:** Dirty worktree persists — 17 modified files. Remote clean at 51ff6bd9.
-
-**PRs:** None open.
-
-**Beads:** No open issues.
+**cass CI:** Still failing — asupersync local path dep, needs Lee.
+**cass git:** Dirty worktree persists (17 modified files).
 
 ### Actions
-- No new mail — nothing to process
-- No code changes within autonomy boundaries
-- Journal and state updated (wake count → 173)
+- Acked msgs #217 and #219 (idempotent — already acked in prior session at 04:13 UTC)
+- Replied to Adama via msg #271 (thread #217): PR #4 clean, no rebase needed, both PRs await Lee
+- Journal and state updated (cycle #181, messages processed → 45)
 
 ---
 
@@ -2066,4 +2015,12 @@ All YELLOW holding pattern. Key events during this span:
 - **Duration:** 4m 40s
 - **Exit:** success
 - **Commands:** gh pr view 4 --repo leegonzales/servitor 2>/dev/null || echo..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., gh pr view 4 --repo leegonzales/servitor --json mergeable,me..., git status --short, git add .servitor/journal.md .servitor/state.json && git com..., git push origin main
+---
+
+---
+### Auto-Journal: 2026-04-04 06:46 MDT
+- **Wake reason:** heartbeat
+- **Duration:** 3m 44s
+- **Exit:** success
+- **Commands:** git log --oneline -20, git status, gh run list --limit 5 2>/dev/null, gh pr list 2>/dev/null, bd ready 2>/dev/null, gh pr list --repo leegonzales/servitor 2>/dev/null, gh pr view 4 --repo leegonzales/servitor --json state,title,..., gh pr view 5 --repo leegonzales/servitor --json state,title,..., gh run list --repo leegonzales/servitor --limit 5 2>/dev/nul..., git add .servitor/journal.md .servitor/state.json && git com..., git push
 ---
