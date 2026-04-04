@@ -13216,8 +13216,8 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| CliError {
             code: 9,
-            kind: "file-read",
-            message: format!("Failed to read file: {e}"),
+            kind: "file_read",
+            message: format!("Failed to read session file: {e}"),
             hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
             retryable: false,
         })
@@ -15779,6 +15779,7 @@ mod legacy_source_filter_tests {
     use super::*;
     use crate::sources::provenance::SourceFilter;
     use frankensqlite::compat::{ConnectionExt, RowExt};
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -15864,6 +15865,11 @@ mod legacy_source_filter_tests {
         (tmp, db_path, shared_path)
     }
 
+    fn open_legacy_local_db_for_update(db_path: &Path) -> frankensqlite::Connection {
+        frankensqlite::Connection::open(db_path.to_string_lossy().to_string())
+            .expect("open writable legacy source test db")
+    }
+
     #[test]
     fn source_filter_helpers_use_normalized_source_sql_for_local_semantics() {
         let normalized_source_sql =
@@ -15900,7 +15906,7 @@ mod legacy_source_filter_tests {
     #[test]
     fn source_filter_helpers_match_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
             .expect("blank remote source_id");
 
@@ -15921,13 +15927,13 @@ mod legacy_source_filter_tests {
             .expect("count remote source rows");
         assert_eq!(count, 1);
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 
     #[test]
     fn source_filter_helpers_match_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
             .expect("update legacy local source_id");
 
@@ -15948,7 +15954,7 @@ mod legacy_source_filter_tests {
             .expect("count local source rows");
         assert_eq!(count, 1);
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 
     #[test]
@@ -15985,7 +15991,7 @@ mod legacy_source_filter_tests {
     #[test]
     fn find_context_source_conversation_matches_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
             .expect("blank remote source_id");
 
@@ -15998,13 +16004,13 @@ mod legacy_source_filter_tests {
         assert_eq!(row.4, "Remote Session");
         assert_eq!(row.6, "user@laptop");
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 
     #[test]
     fn find_context_source_conversation_matches_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
             .expect("update legacy local source_id");
 
@@ -16020,7 +16026,7 @@ mod legacy_source_filter_tests {
         assert_eq!(preferred.4, "Local Session");
         assert_eq!(preferred.6, "local");
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 
     #[test]
@@ -16078,7 +16084,7 @@ mod legacy_source_filter_tests {
     #[test]
     fn stats_source_grouping_uses_origin_host_when_remote_source_id_blank() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2")
             .expect("blank remote source_id");
 
@@ -16103,13 +16109,13 @@ mod legacy_source_filter_tests {
             "expected blank remote source to group under origin host, got: {source_rows:?}"
         );
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 
     #[test]
     fn stats_source_grouping_normalizes_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        let conn = open_legacy_local_db_for_update(&db_path);
         conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1")
             .expect("update legacy local source_id");
 
@@ -16139,7 +16145,7 @@ mod legacy_source_filter_tests {
             "expected no raw trimmed/blank source ids, got: {source_rows:?}"
         );
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close writable legacy source test db");
     }
 }
 

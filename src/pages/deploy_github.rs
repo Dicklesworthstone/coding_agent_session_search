@@ -371,28 +371,7 @@ fn create_temp_dir() -> Result<PathBuf> {
 }
 
 fn resolve_deploy_site_dir(path: &Path) -> Result<PathBuf> {
-    if path.file_name().map(|name| name == "site").unwrap_or(false) {
-        return super::resolve_site_dir(path);
-    }
-
-    let site_subdir = path.join("site");
-    match std::fs::symlink_metadata(&site_subdir) {
-        Ok(_) => return super::resolve_site_dir(path),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to inspect deployment site directory {}",
-                    site_subdir.display()
-                )
-            });
-        }
-    }
-
-    bail!(
-        "expected a bundle root containing site/ or a site/ directory, got {}",
-        path.display()
-    );
+    super::resolve_site_dir(path)
 }
 
 /// Get gh CLI version
@@ -941,16 +920,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_deploy_site_dir_rejects_non_bundle_directory() {
+    fn test_resolve_deploy_site_dir_accepts_direct_site_directory() {
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join("index.html"), "<html></html>").unwrap();
 
-        let err = resolve_deploy_site_dir(temp.path())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("expected a bundle root containing site/ or a site/ directory"));
+        let resolved = resolve_deploy_site_dir(temp.path()).unwrap();
+        assert_eq!(resolved, temp.path());
     }
 
     #[test]

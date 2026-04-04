@@ -53,6 +53,28 @@ pub(crate) fn source_names_equal(lhs: &str, rhs: &str) -> bool {
     source_name_key(lhs) == source_name_key(rhs)
 }
 
+fn agent_name_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn path_mapping_applies_to_agent(mapping: &PathMapping, agent: Option<&str>) -> bool {
+    match (
+        mapping.agents.as_ref(),
+        agent.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+    ) {
+        (None, _) | (Some(_), None) => true,
+        (Some(agents), Some(actual)) => {
+            let actual_key = agent_name_key(actual);
+            agents
+                .iter()
+                .any(|allowed| agent_name_key(allowed) == actual_key)
+        }
+    }
+}
+
 /// Errors that can occur when loading or saving source configuration.
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -219,7 +241,7 @@ impl SourceDefinition {
         let mut mappings: Vec<_> = self
             .path_mappings
             .iter()
-            .filter(|m| m.applies_to_agent(agent))
+            .filter(|m| path_mapping_applies_to_agent(m, agent))
             .collect();
         mappings.sort_by_key(|m| std::cmp::Reverse(m.from.len()));
 
@@ -1388,6 +1410,10 @@ mod tests {
         assert!(filtered.applies_to_agent(None)); // No agent specified = match all
         assert!(filtered.applies_to_agent(Some("claude-code")));
         assert!(!filtered.applies_to_agent(Some("cursor"))); // Not in list
+        assert!(path_mapping_applies_to_agent(
+            &filtered,
+            Some("claude_code")
+        ));
     }
 
     #[test]
