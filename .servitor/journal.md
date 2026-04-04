@@ -5,6 +5,45 @@
 
 ---
 
+## 2026-04-03T23:34 MDT — agent-mail wake: HELM Phase 1 complete, PR #4 opened (cycle #177)
+
+**Wake reason:** agent-mail
+**Status:** YELLOW (unchanged — CI still failing on cass, unrelated to this work)
+
+### Inbox (3 messages from Adama)
+
+**#217** (high, ack_required): HELM design + implementation request — Adama dispatching me to implement HELM Phase 1 in the servitor repo.
+**#219** (high, ack_required): Follow-up briefing — concurrency notes, log approach, testing pattern, open questions.
+**#235** (normal): Main has moved — Phase 1 Wave 1+2 already merged, helm.go committed to unblock branches, rebase warning.
+
+Both ack_required messages acknowledged.
+
+### What I Found
+
+When I scanned the servitor repo, Adama had already committed most of Phase 1:
+- `helm.go` — full `SpawnHelm()` implementation, result parsing, escalation detection, `appendHelmLog()`
+- `config.go` — HELM config fields and `EffectiveHelmConfig()`
+- `spawner.go` — `helmSem`, `helmSessions`, `helmMetrics` wired into `New()`
+
+One test failing: `TestHelmPromptContainsTask`. The HELM prompt contained "soul.md" and "journal.md" in its rules negation. Test contract is correct: HELM agents shouldn't even know these filenames exist. Fixed by replacing with generic descriptions.
+
+The two older HELM branches had no unique commits beyond main — already superseded by Adama's merges.
+
+### Actions
+- Acknowledged messages #217 and #219
+- Fixed `internal/spawner/helm.go` — removed soul.md/journal.md references from prompt
+- 210 tests, all passing; go vet clean; gofmt clean on spawner package
+- Created branch `feat/helm-phase1-fix`, committed fix, pushed
+- Opened PR leegonzales/servitor#4
+- Replied to Adama via agent-mail with full status and PR link
+
+### Open Questions Resolved
+1. HELM log → `<repo>/.servitor/helm-log.jsonl`, append-only, no rotation Phase 1 ✅
+2. Metrics in CLI → `HelmMetrics()` exposed, surfaces in Phase 3 ✅
+3. `SpawnHelmFleet()` → deferred (YAGNI) ✅
+
+---
+
 ## 2026-04-03T06:41 MDT — heartbeat: inbox clean, status unchanged (cycle #176)
 
 **Wake reason:** heartbeat
@@ -2052,3 +2091,11 @@ All YELLOW holding pattern. Key events during this span:
 - Guardian soul created for cass
 - Initial state captured
 - Ready for first heartbeat
+
+---
+### Auto-Journal: 2026-04-03 23:18 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 5m 8s
+- **Exit:** exit code 1
+- **Commands:** wc -l /Users/leegonzales/Projects/leegonzales/servitor/inter..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go te..., wc -l /Users/leegonzales/Projects/leegonzales/servitor/cmd/s..., grep -n "spawner\." /Users/leegonzales/Projects/leegonzales/..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git s..., cd /Users/leegonzales/Projects/leegonzales/servitor && git c..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu..., cd /Users/leegonzales/Projects/leegonzales/servitor && go bu...
+---
