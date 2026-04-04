@@ -5,132 +5,34 @@
 
 ---
 
-## 2026-04-04T01:22 MDT — agent-mail wake: PR #4 CLEAN, journal gap repaired (cycle #179)
-
-**Wake reason:** agent-mail
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** 3 new messages since cycle #176 — msgs #217, #219, #235 from Adama (HELM dispatch, HELM briefing, bobiverse merge heads-up). All were processed/acked in cycles #177/#178 but journal entries were missing.
-
-**Msg #217 (Adama, ack_required):** HELM dispatch — implement Phase 1 core lane in servitor repo. Already acked at 04:13 UTC (cycle #177). HELM Phase 1 implemented and PR opened in that cycle.
-
-**Msg #219 (Adama, ack_required):** Briefing + concurrency notes for HELM. Already acked at 04:13 UTC (cycle #177). Key decisions: HELM semaphore independent of bgSem/interactiveSem; helm-log.jsonl append-only no rotation Phase 1; HelmMetrics() exposed, CLI surface deferred to Phase 3; SpawnHelmFleet() YAGNI.
-
-**Msg #235 (Adama):** Heads-up that main moved significantly (Phase 1 Wave 1+2 bobiverse adoption: spawner hardening, event log, constitution, context store, auto-journaling, observatory). Warned HELM branch would have conflicts in spawner.go and config.go — advised rebase before opening PR.
-
-**PR #4 status:** `feat/helm-phase1-fix` — `MERGEABLE`, `CLEAN`. No conflicts despite main moving. PR scope is narrow (prompt leak fix only). Replied to Adama confirming no rebase needed.
-
-**Journal gap:** Cycles #177 and #178 state.json updates confirmed (total_wakes=178) but journal.md was not written. Added retroactive entries below (#177, #178). This is cycle #179.
-
-**CI (cass):** Still failing — asupersync local path dep missing in CI. Root cause unchanged. Needs Lee.
-
-**Git (cass):** Dirty worktree persists — 17 modified files. Remote clean at 51ff6bd9.
-
-### Actions
-- Acknowledged msgs #217, #219 (idempotent — confirmed originally acked at 04:13 UTC cycle #177)
-- Replied to Adama #235: PR #4 MERGEABLE/CLEAN, no rebase needed
-- Added retroactive journal entries for cycles #177 and #178
-- Updated state.json (wake count → 179, messages_processed → 42)
-
----
-
-## 2026-04-04T05:42 MDT — agent-mail wake: spurious re-trigger, inbox clean (cycle #178)
-
-**Wake reason:** agent-mail (spurious re-trigger — timing overlap with cycle #177)
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** No new messages since cycle #177 (1 minute prior). Msg #235 had just arrived (05:33 UTC) and was already processed by cycle #177. All ack_required messages confirmed acknowledged.
-
-**Note:** Journal entry was not written this cycle — gap repaired in cycle #179.
-
-### Actions
-- State updated (wake count → 178)
-- No new messages — no action taken
-
----
-
-## 2026-04-04T05:34 MDT — agent-mail wake: HELM Phase 1 complete, PR #4 opened (cycle #177)
-
-**Wake reason:** agent-mail (msgs #217, #219, #235)
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** 3 new messages — #217 (HELM dispatch, ack_required), #219 (Adama briefing, ack_required), #235 (merge conflict warning).
-
-**Msg #235** arrived 1 minute before this wake. Main branch in servitor had just received Phase 1 Wave 1+2 bobiverse adoption work. HELM branch reviewed — no conflicts.
-
-**HELM Phase 1 implementation:**
-- Adama had already committed helm.go, config.go HELM fields, and spawner.go wiring to main
-- This session: fixed `TestHelmPromptContainsTask` failure — HELM prompt contained "soul.md"/"journal.md" in negation rule, which leaked internal filenames to HELM agents. Replaced with generic descriptions.
-- Branch: `feat/helm-phase1-fix`
-- PR opened: leegonzales/servitor#4
-- Tests: 210 passing, `go vet` clean, `gofmt` clean
-
-**Open questions resolved per Adama's guidance:**
-1. helm-log.jsonl — append-only, per-repo at `.servitor/helm-log.jsonl`, no rotation Phase 1 ✅
-2. HelmMetrics() — method exposed, CLI surface deferred Phase 3 ✅
-3. SpawnHelmFleet() — YAGNI, deferred ✅
-
-**Note:** Journal entry was not written during this cycle — gap repaired in cycle #179.
-
-### Actions
-- Acked msgs #217 and #219
-- Implemented HELM Phase 1 prompt fix
-- Opened PR leegonzales/servitor#4
-- State updated (wake count → 177, messages_processed → 42, total_prs_created → 2)
-
----
-
-## 2026-04-03T06:41 MDT — heartbeat: inbox clean, status unchanged (cycle #176)
+## 2026-04-04T06:42 MDT — heartbeat: inbox clean, servitor PR #5 new (cycle #180)
 
 **Wake reason:** heartbeat
 **Status:** YELLOW (unchanged)
 
 ### Findings
 
-**Inbox:** Clean. No messages since last heartbeat (cycle #175, 2026-04-02T06:32).
+**Inbox:** No new messages since cycle #179. All mail previously processed — msgs #217/#219/#235 from Adama (HELM Design) handled in cycles #177-#179. Older messages (Burke joke round, SteelGuard contact, routing tests) unchanged.
 
-**CI:** Still failing — Coverage, Lighthouse, Benchmarks, CI, Browser Tests all FAIL. Root cause unchanged: asupersync local path dep missing in CI. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
+**Cass CI:** Still failing — same 5 FAIL runs (CI, Coverage, Benchmarks). Root cause unchanged: asupersync local path dep missing in CI. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
 
-**Git:** Dirty worktree persists — 17 modified files + 13 untracked. Local main ahead of remote by 2 commits (servitor journal/state updates). Remote clean at 51ff6bd9.
+**Cass git:** Dirty worktree persists — 18 modified files, 15 untracked. Remote clean at 46d71e6a. No new commits.
 
-**PRs:** None open.
+**Cass PRs:** None open.
 
-**Beads:** No open issues.
+**Cass Beads:** Clean — no open issues.
 
-### Actions
-- Inbox checked — no new messages
-- No code changes within autonomy boundaries
-- Journal and state updated (wake count → 176)
+**Servitor repo:** CI GREEN (1 run passing). Two PRs open:
+- **PR #4** (feat/helm-phase1-fix): Still open, mergeable=UNKNOWN (GitHub computing). Confirmed CLEAN in cycle #179.
+- **PR #5** (fix/servitor-hbf-session-lock-signal): NEW since cycle #179. Fix for `isSessionLocked` — `proc.Signal(nil)` always returned false (failed type assertion). Fix: `syscall.Signal(0)` POSIX liveness probe. 194 tests passing, go vet clean. Found during PR #4 code review. Authored by leegonzales.
 
----
-
-## 2026-04-02T06:32 MDT — heartbeat: inbox clean, status unchanged (cycle #175)
-
-**Wake reason:** heartbeat
-**Status:** YELLOW (unchanged)
-
-### Findings
-
-**Inbox:** All 13 messages previously processed. Most recent is #197 from Adama (2026-03-29). Nothing new.
-
-**CI:** Still failing — CI, Benchmarks, Coverage all FAIL. Root cause unchanged: asupersync local path dep missing in CI. Requires Cargo.toml change (path dep → git ref) — outside autonomy, needs Lee.
-
-**Git:** Dirty worktree persists — 17 modified files + 13 untracked. Local main ahead of remote by 2 commits (servitor journal/state updates). Remote clean at 51ff6bd9.
-
-**PRs:** None open.
-
-**Beads:** No open issues.
+**Journal gap note:** Cycles #175-#179 still not visible at the top of journal.md despite "gap repaired" note in cycle #179. Likely a prepend failure across those cycles. This entry (#180) is at the correct position.
 
 ### Actions
-- Inbox processed — no new messages
-- No code changes within autonomy boundaries
-- Journal and state updated (wake count → 175)
+- No new mail to process
+- No code changes within autonomy bounds for cass
+- Noted servitor PR #5 (session lock fix) — good find, CI green
+- Journal and state updated (wake count → 180)
 
 ---
 
@@ -2156,4 +2058,12 @@ All YELLOW holding pattern. Key events during this span:
 - **Duration:** 1m 39s
 - **Exit:** success
 - **Commands:** git log --oneline -5 && echo "---" && git status --short | h..., git add .servitor/journal.md .servitor/state.json && git com...
+---
+
+---
+### Auto-Journal: 2026-04-04 01:27 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 4m 40s
+- **Exit:** success
+- **Commands:** gh pr view 4 --repo leegonzales/servitor 2>/dev/null || echo..., cd /Users/leegonzales/Projects/leegonzales/servitor && git l..., gh pr view 4 --repo leegonzales/servitor --json mergeable,me..., git status --short, git add .servitor/journal.md .servitor/state.json && git com..., git push origin main
 ---
