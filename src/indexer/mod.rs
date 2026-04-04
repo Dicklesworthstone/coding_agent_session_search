@@ -2516,11 +2516,16 @@ pub fn run_index(
             storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
             persist::apply_index_writer_busy_timeout(&storage);
             persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-            t_index.delete_all()?;
-            t_index.commit()?;
+            // NOTE: We deliberately do NOT call delete_all() here. The Tantivy
+            // index will be atomically replaced by rebuild_tantivy_from_db() at
+            // the end of a successful --full rebuild.  Eagerly deleting is both
+            // redundant (rebuild_tantivy_from_db removes + recreates the dir)
+            // and dangerous: if the scan or rebuild OOMs / hits a constraint
+            // error, the user is left with a 0-segment empty index and no
+            // automatic recovery path.  (CASS #164)
         } else if opts.full {
-            t_index.delete_all()?;
-            t_index.commit()?;
+            // Same rationale — skip eager delete_all(); rebuild_tantivy_from_db()
+            // handles starting fresh after the scan succeeds.  (CASS #164)
         }
 
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
