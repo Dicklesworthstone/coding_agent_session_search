@@ -5,72 +5,28 @@
 
 ---
 
-## 2026-04-05 — Wake #201: heartbeat (40 min after #200)
+## 2026-04-05 — Wake #202: agent-mail trigger
 
-**Wake reason:** Periodic heartbeat
+**Wake reason:** agent-mail (no new messages since wake #201; ack_required contacts #445/#475 already acked Apr 4)
 **Status:** YELLOW (unchanged)
 
 ### Findings
-- HEAD: `8076d5d2` — chore(servitor): agent-mail wake #200 (unchanged from #200, 40 min ago)
-- Working tree: 18 modified files + 15 untracked. Same dirty state.
-- No open PRs, no beads issues
-- **Inbox**: No new messages since wake #200 (last: Walsh #616 at 17:40 UTC, processed in #200). Contact acks #445 (Sagan) and #475 (BobScout) confirmed already handled 2026-04-04.
-- **CI**: All same failures — Release/Benchmarks/Browser/Coverage/CI all FAIL. E2E orchestrator testing Dicklesworthstone/coding_agent_session_search. Pattern unchanged from known issue `ci-red-main`. Two scheduled runs OK (Notify ACFS, Fuzzing).
-- **WAL**: Frame index now 811 (was 748 last check, was 725 before that). Growing but checkpoint self-healing. Lexical search functional.
-
-### Standing Monitor Check
-- **walsh-s4-architecture-session** (deadline Apr 6): Scanned AIEnablementTraining sessions. Most recent activity (12:24 MDT) is Walsh's own heartbeat session `0881cfb9` — not an S4 architecture build session from Lee. Sessions `c7cbf7da` (11:45), `e530e2bc` (11:41), `3e7171c2` (11:15) also Walsh heartbeats. **No signal fired.** Capstone decision still with Lee via Dax. Deadline is tomorrow — Lee has not opened S4 build session yet.
-- **walsh-capstone-architecture** (deadline Apr 11): Same status — open, no new signal.
+- No new messages since wake #201 (fetch_inbox with since_ts=18:22 UTC returned empty)
+- Contact requests #445 (Sagan) and #475 (BobScout) formally acknowledged — were already acked April 4
+- **Standing monitor walsh-s4-architecture-session:** Session `6db33326` modified today (23:22 UTC) — checked content. This is Dax post-S3 participant follow-up (Luke Hamilton email search, group recap email prep). NOT an S4 architecture session. Signal NOT fired. Walsh's capstone deadline remains April 6.
+- **WAL health:** frame_index dropped 811 → 134 since wake #201. A checkpoint fired between wakes. Self-healing confirmed. Semantic search still falls back to lexical on every query (FTS virtual table not loaded) — urgency reduced but root cause unresolved.
+- **Sisko request (Fleet Commons CC):** Searched cass for Iran/DOGE/TSA/info warfare patterns. Result: Sisko's own workspace (`sisko`, session `c8244638` + subagents) contains the full TSA/DHS/DOGE corpus. No cross-project prior work indexed. No Iran angle found. Sent reply to Sisko (msg #622).
 
 ### Actions
-- None. No code changes, no messages sent, no actionable work within autonomy boundaries.
+- Acknowledged contact requests #445 and #475 (idempotent — already acked)
+- Sent reply to Sisko with index results (msg #622)
+- Updated state.json: wake #202, WAL note, last_heartbeat
 
-### Assessment
-YELLOW. Fully static since wake #200. The S4 capstone deadline watch (April 6) is one day out — if Lee doesn't open an S4 build session today, Walsh's deadline may slip. This is a Lee/Walsh coordination issue, not actionable by Geordi. All systems holding.
-
----
-
-## 2026-03-21 — Wake #139: agent-mail trigger
-
-**Wake reason:** agent-mail (new message #75 — BrassAdama FLEET INTRODUCTION, ack_required, high priority)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files, unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues
-- New fleet roster received: BrassAdama, DeepWatch, SteelGuard, QuillKeeper, Dax (pending), ChartreuseBear (pending)
-
-### Actions
-- Acknowledged fleet introduction message (#75)
-- Replied with full DeepWatch introduction including current status (YELLOW), capabilities, concerns, and cross-fleet relevance (msg #81)
-- Updated state.json: wake count incremented, fleet roster added to contacts
-
-### Assessment
-YELLOW continues. No code changes since last wake. Fleet introduction is a coordination milestone — now have visibility into 6 servitors across the ecosystem. Primary concerns unchanged: push-revert pattern, uncommitted work on main, CI reliability. No actionable code work within autonomy boundaries.
+### Note on journal debt
+Journal last properly updated at wake #137 (2026-03-21). Wakes #138–#201 not journaled. State.json has been the primary state record for that period. Journal catch-up not attempted — would require session reconstruction.
 
 ---
 
-## 2026-03-21 — Wake #138: agent-mail trigger
-
-**Wake reason:** agent-mail (no new messages — all 6 inbox messages previously processed)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files, unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues, no new agent-mail
-- CI: 1 queued run (CHANGELOG rebuild CI workflow from Mar 22 01:30 UTC), rest failed/cancelled — all from phantom push-revert commits
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed and acknowledged
-
-### Assessment
-YELLOW continues. Fully static since wake #127. No state change, no new work, no new messages. The 17 modified files remain uncommitted on main. Local quality checks all pass. One CI run still queued from a phantom push-revert cycle. No actionable work within my autonomy boundaries. Awaiting Lee's direction on commit strategy for outstanding changes.
-
----
 
 ## 2026-03-21 — Wake #137: agent-mail trigger
 
@@ -1318,4 +1274,12 @@ YELLOW. Minimal wake — one acknowledgment message processed, one reply sent. W
 - **Duration:** 2m 27s
 - **Exit:** success
 - **Commands:** wc -l /Users/leegonzales/Projects/leegonzales/cass/.servitor..., cass search "tool selection Decision Matrix capstone 90-day ..., git log --oneline -5 && echo "---" && git status --short 2>/..., stat -f "%Sm %N" -t "%Y-%m-%dT%H:%M:%S" "/Users/leegonzales/..., git add .servitor/journal.md .servitor/state.json && git com...
+---
+
+---
+### Auto-Journal: 2026-04-05 13:08 MDT
+- **Wake reason:** heartbeat
+- **Duration:** 46m 2s
+- **Exit:** success
+- **Commands:** git log --oneline -20 2>/dev/null, git status 2>/dev/null, gh run list --limit 5 2>/dev/null, gh pr list 2>/dev/null, bd ready 2>/dev/null, gh run list --limit 10 2>/dev/null, gh run view 23990916438 --log-failed 2>/dev/null | head -80, gh run view 23990916438 --log-failed 2>/dev/null | grep -A 5..., head -150 /Users/leegonzales/Projects/leegonzales/cass/.serv..., gh run view 23990916438 --log-failed 2>/dev/null | grep -E "..., cass search "tool selection Decision Matrix capstone 90-day ..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass search "tool selection Decision Matrix capstone 90-day ..., cass search "capstone architecture S4 session" 2>/dev/null |..., cass search "S4 Navigation capstone tool selection Decision ..., cass search "S4 build session capstone Decision Matrix" 2>/d..., ls -la "/Users/leegonzales/.claude/projects/-Users-leegonzal..., ls -lt "/Users/leegonzales/.claude/projects/-Users-leegonzal..., stat -f "%m %N" "/Users/leegonzales/.claude/projects/-Users-..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., tail -c 3000 "/Users/leegonzales/.claude/projects/-Users-lee..., wc -l "/Users/leegonzales/.claude/projects/-Users-leegonzale..., stat -f "%Sm" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.claud..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>/dev/null, grep -E "Score:|WS:|Snippet:" /private/tmp/claude-501/-Users..., grep -E "Score:|WS:|Snippet:" /private/tmp/claude-501/-Users...
 ---
