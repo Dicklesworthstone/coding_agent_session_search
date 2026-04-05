@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -10,12 +12,49 @@ fn cass_bin() -> String {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
 
+fn run_index_full(
+    data_dir: &Path,
+    home_dir: &Path,
+    xdg_data: &Path,
+    xdg_config: &Path,
+) -> (std::process::Output, String, String) {
+    let mut cmd = std::process::Command::new(cass_bin());
+    cmd.arg("index")
+        .arg("--full")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .current_dir(home_dir)
+        .env("HOME", home_dir)
+        .env("XDG_DATA_HOME", xdg_data)
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("CODEX_HOME", data_dir.join(".codex"));
+    let output = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("run full index");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    (output, stdout, stderr)
+}
+
 fn run_watch_once(
     paths: &[&Path],
     data_dir: &Path,
     home_dir: &Path,
     xdg_data: &Path,
     xdg_config: &Path,
+) -> (std::process::Output, String, String) {
+    run_watch_once_with_env(paths, data_dir, home_dir, xdg_data, xdg_config, &[])
+}
+
+fn run_watch_once_with_env(
+    paths: &[&Path],
+    data_dir: &Path,
+    home_dir: &Path,
+    xdg_data: &Path,
+    xdg_config: &Path,
+    extra_env: &[(&str, &str)],
 ) -> (std::process::Output, String, String) {
     let mut cmd = std::process::Command::new(cass_bin());
     cmd.arg("index")
@@ -34,6 +73,9 @@ fn run_watch_once(
         .env("XDG_DATA_HOME", xdg_data)
         .env("XDG_CONFIG_HOME", xdg_config)
         .env("CODEX_HOME", data_dir.join(".codex"));
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
     let output = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -326,5 +368,110 @@ fn watch_once_survives_corrupt_file_without_persisting_watch_state() {
     assert!(
         !data_dir.join("watch_state.json").exists(),
         "explicit watch-once indexing should not persist watch_state"
+    );
+}
+
+/// Repeated idle incremental watch passes should stay healthy and still ingest later updates.
+#[test]
+fn watch_once_repeated_idle_cycles_stay_healthy_and_accept_new_content() {
+    let sandbox = TempDir::new().expect("temp dir");
+    let data_dir = sandbox.path().join("data");
+    let home_dir = sandbox.path().join("home");
+    let xdg_data = sandbox.path().join("xdg-data");
+    let xdg_config = sandbox.path().join("xdg-config");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_data).unwrap();
+    std::fs::create_dir_all(&xdg_config).unwrap();
+
+    let codex_root = data_dir.join(".codex/sessions/2025/12/03");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let rollout = codex_root.join("rollout-idle.jsonl");
+    write_codex_session(&rollout, "watch_idle_baseline", "watch-idle-baseline");
+
+    let (full_output, full_stdout, full_stderr) =
+        run_index_full(&data_dir, &home_dir, &xdg_data, &xdg_config);
+    assert!(
+        full_output.status.success(),
+        "full index should succeed before repeated incremental watch passes\nstdout:\n{full_stdout}\nstderr:\n{full_stderr}"
+    );
+
+    let db_path = data_dir.join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).expect("open indexed db");
+    let namespaced: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA fsqlite.autocommit_retain;", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("query fsqlite autocommit_retain");
+    let alias: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA autocommit_retain;", &[], |row| row.get_typed(0))
+        .expect("query autocommit_retain alias");
+    assert_eq!(
+        namespaced, 0,
+        "writer connections should disable retained autocommit"
+    );
+    assert_eq!(alias, 0, "autocommit_retain alias should also be disabled");
+
+    for cycle in 1..=8 {
+        let (output, stdout, stderr) = run_watch_once_with_env(
+            &[rollout.as_path()],
+            &data_dir,
+            &home_dir,
+            &xdg_data,
+            &xdg_config,
+            &[("CASS_WATCH_RECYCLE_INTERVAL", "1")],
+        );
+        assert!(
+            output.status.success(),
+            "idle watch cycle {cycle} should not fail or crash-loop\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    assert!(
+        !data_dir.join("watch_state.json").exists(),
+        "explicit watch-once indexing should not persist watch_state during repeated idle passes"
+    );
+
+    let baseline_hits = run_robot_search(
+        "watch_idle_baseline",
+        &data_dir,
+        &home_dir,
+        &xdg_data,
+        &xdg_config,
+    );
+    assert!(
+        content_hit_count(&baseline_hits, "watch_idle_baseline") >= 1,
+        "baseline content should remain searchable after repeated idle watch passes: {baseline_hits}"
+    );
+
+    let followup = codex_root.join("rollout-idle-followup.jsonl");
+    write_codex_session(&followup, "watch_idle_followup", "watch-idle-followup");
+    std::thread::sleep(Duration::from_millis(20));
+
+    let (output, stdout, stderr) = run_watch_once_with_env(
+        &[followup.as_path()],
+        &data_dir,
+        &home_dir,
+        &xdg_data,
+        &xdg_config,
+        &[("CASS_WATCH_RECYCLE_INTERVAL", "1")],
+    );
+    assert!(
+        output.status.success(),
+        "watch should still ingest a new session after repeated idle passes\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let followup_hits = run_robot_search(
+        "watch_idle_followup",
+        &data_dir,
+        &home_dir,
+        &xdg_data,
+        &xdg_config,
+    );
+    assert!(
+        content_hit_count(&followup_hits, "watch_idle_followup") >= 1,
+        "new content should still be indexed after repeated idle watch cycles: {followup_hits}"
     );
 }

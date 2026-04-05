@@ -77,6 +77,240 @@ fn count_messages(db_path: &Path) -> i64 {
         .expect("count messages")
 }
 
+fn run_sqlite3(db_path: &Path, sql: &str) -> std::process::Output {
+    match std::process::Command::new("sqlite3")
+        .arg(db_path)
+        .arg(sql)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    r#"
+import sqlite3
+import sys
+
+db_path, sql = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db_path)
+try:
+    cur = conn.cursor()
+    statement = sql.strip()
+    if ";" in statement.rstrip(";"):
+        cur.executescript(statement)
+        conn.commit()
+    else:
+        cur.execute(statement)
+        rows = cur.fetchall()
+        for row in rows:
+            print("\t".join("" if value is None else str(value) for value in row))
+        conn.commit()
+finally:
+    conn.close()
+"#,
+                    db_path
+                        .to_str()
+                        .expect("db path should be valid utf-8 for python fallback"),
+                    sql,
+                ])
+                .output()
+                .expect("sqlite3 CLI or python3 is required for schema-corruption fixture setup")
+        }
+        Err(err) => panic!("failed to execute sqlite3 fixture helper: {err}"),
+    }
+}
+
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[test]
+fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
+    let tracker =
+        tracker_for("duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    let ts = 1_732_118_400_000u64;
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-fts-repair.jsonl",
+        "fts_repair_initial_token",
+        ts,
+    );
+    let session_file = codex_home.join("sessions/2024/11/20/rollout-fts-repair.jsonl");
+
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    let db_path = data_dir.join("agent_search.db");
+    let baseline_messages = count_messages(&db_path);
+    assert_eq!(
+        baseline_messages, 2,
+        "initial full index should ingest both messages"
+    );
+
+    let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
+    let injection_sql = format!(
+        "PRAGMA writable_schema = ON;
+         INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+         VALUES('table', 'fts_messages', 'fts_messages', 0, {});
+         DELETE FROM meta WHERE key = 'fts_frankensqlite_rebuild_generation';
+         PRAGMA writable_schema = OFF;",
+        sql_literal(duplicate_legacy_fts_sql)
+    );
+    let injection = run_sqlite3(&db_path, &injection_sql);
+    assert!(
+        injection.status.success(),
+        "schema corruption fixture injection should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&injection.stdout),
+        String::from_utf8_lossy(&injection.stderr)
+    );
+
+    let broken_read = run_sqlite3(&db_path, "SELECT COUNT(*) FROM fts_messages;");
+    assert!(
+        !broken_read.status.success(),
+        "the injected duplicate schema row should reproduce the unreadable pre-fix SQLite state\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&broken_read.stdout),
+        String::from_utf8_lossy(&broken_read.stderr)
+    );
+
+    let repair_index = cargo_bin_cmd!("cass")
+        .args(["index", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("run index after duplicate schema injection");
+    assert!(
+        repair_index.status.success(),
+        "incremental index should repair the duplicate schema and succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repair_index.stdout),
+        String::from_utf8_lossy(&repair_index.stderr)
+    );
+
+    let health = cargo_bin_cmd!("cass")
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("run health after duplicate schema repair");
+    assert!(
+        health.status.success(),
+        "health should report the repaired database as healthy\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&health.stdout),
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let health_json: serde_json::Value =
+        serde_json::from_slice(&health.stdout).expect("parse health json");
+    assert_eq!(
+        health_json["healthy"],
+        serde_json::Value::Bool(true),
+        "health should report the repaired database as healthy"
+    );
+
+    let repaired = SqliteStorage::open(&db_path).expect("reopen repaired cass db");
+    let schema_rows: i64 = repaired
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .expect("count repaired schema rows");
+    assert_eq!(
+        schema_rows, 1,
+        "repair should leave exactly one authoritative fts_messages schema row"
+    );
+    let repaired_fts_rows: i64 = repaired
+        .raw()
+        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("query repaired fts table");
+    assert_eq!(
+        repaired_fts_rows, baseline_messages,
+        "repair should preserve the indexed FTS rows instead of dropping content"
+    );
+    let sqlite_client_read = run_sqlite3(&db_path, "SELECT COUNT(*) FROM fts_messages;");
+    assert!(
+        sqlite_client_read.status.success(),
+        "stock SQLite reads should work again after repair\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sqlite_client_read.stdout),
+        String::from_utf8_lossy(&sqlite_client_read.stderr)
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    append_codex_session(&session_file, "fts_repair_appended_token", ts + 10_000);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    cargo_bin_cmd!("cass")
+        .args(["index", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .assert()
+        .success();
+
+    let after_messages = count_messages(&db_path);
+    assert_eq!(
+        after_messages,
+        baseline_messages + 2,
+        "incremental writes should resume after repair and append the new turn"
+    );
+
+    let appended = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "fts_repair_appended_token",
+            "--robot",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("search for appended content after repair");
+    assert!(
+        appended.status.success(),
+        "search should succeed after repair and incremental write\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&appended.stdout),
+        String::from_utf8_lossy(&appended.stderr)
+    );
+    let appended_hits = serde_json::from_slice::<serde_json::Value>(&appended.stdout)
+        .expect("parse appended search json")
+        .get("hits")
+        .and_then(|hits| hits.as_array())
+        .map(|hits| hits.len())
+        .unwrap_or(0);
+    assert!(
+        appended_hits >= 1,
+        "the post-repair incremental content should be searchable"
+    );
+
+    tracker.flush();
+}
+
 /// Test: Full index pipeline - index --full creates DB and index
 #[test]
 fn index_full_creates_artifacts() {

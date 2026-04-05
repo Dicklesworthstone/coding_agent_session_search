@@ -7,7 +7,26 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5), and [v0.2.6](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.6) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5), [v0.2.6](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.6), and [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+
+---
+
+## [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7) -- 2026-04-05
+
+**GitHub Release** with downloadable binaries.
+
+Validation release focused on proving the 0.2.6 database/indexing repairs hold under end-to-end conditions and shipping the new regression coverage as part of a fully green release gate.
+
+### Test coverage
+
+- **Duplicate `fts_messages` migration repair, end to end**: add a full CLI regression that injects the legacy duplicate-schema corruption, proves stock SQLite clients fail, runs `cass index` to repair the database, and then verifies health, FTS readability, and post-repair incremental indexing/search behavior
+- **Remote `source_id` FK safety across both persistence paths**: add detailed serial and `BEGIN CONCURRENT` regressions that prove unknown non-`local` sources are auto-registered exactly once, preserve provenance, and keep `foreign_key_check` clean
+- **Incremental watch/index stability after `autocommit_retain` shutdown**: add a repeated idle `watch --watch-once` regression that verifies `autocommit_retain` is actually disabled, idle cycles stay healthy, and newly appended content is still ingested correctly
+
+### Release engineering
+
+- Re-run the full release gate through `rch`, including `cargo fmt --check`, full `cargo test`, `cargo check --all-targets`, and `cargo clippy --all-targets -- -D warnings`
+- Harden the remote test gate by moving `TMPDIR` and `CARGO_TARGET_DIR` off `tmpfs` for the full-suite run so release validation is not derailed by worker RAM-disk exhaustion during link steps
 
 ---
 

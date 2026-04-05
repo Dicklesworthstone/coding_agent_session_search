@@ -6872,6 +6872,262 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
+        fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("serial-source-reuse.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let metadata = serde_json::json!({
+                "cass": {
+                    "origin": {
+                        "source_id": "remote-source-reused",
+                        "host": "builder-reuse-1"
+                    }
+                }
+            });
+
+            for (external_id, started_at, content, source_path) in [
+                (
+                    "remote-serial-session-1",
+                    10_000_i64,
+                    "serial remote content one",
+                    "/log/remote-serial-1.jsonl",
+                ),
+                (
+                    "remote-serial-session-2",
+                    20_000_i64,
+                    "serial remote content two",
+                    "/log/remote-serial-2.jsonl",
+                ),
+            ] {
+                let convs = vec![NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(external_id.into()),
+                    title: Some(format!("Remote serial session {external_id}")),
+                    workspace: Some(std::path::PathBuf::from("/ws/remote")),
+                    source_path: std::path::PathBuf::from(source_path),
+                    started_at: Some(started_at),
+                    ended_at: Some(started_at + 10),
+                    metadata: metadata.clone(),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "assistant".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(started_at + 5),
+                        content: content.into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    }],
+                }];
+
+                persist_conversations_batched(
+                    &storage,
+                    &mut t_index,
+                    &convs,
+                    LexicalPopulationStrategy::IncrementalInline,
+                    false,
+                )
+                .expect("serial batched path should keep reusing the auto-registered source");
+            }
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let source_rows: Vec<(String, Option<String>)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT id, host_label FROM sources WHERE id <> 'local' ORDER BY id",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                source_rows,
+                vec![(
+                    "remote-source-reused".to_string(),
+                    Some("builder-reuse-1".to_string())
+                )],
+                "serial path should upsert the missing remote source once and then reuse it"
+            );
+
+            let provenance: Vec<(String, Option<String>, String)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT source_id, origin_host, external_id FROM conversations ORDER BY external_id",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance,
+                vec![
+                    (
+                        "remote-source-reused".to_string(),
+                        Some("builder-reuse-1".to_string()),
+                        "remote-serial-session-1".to_string()
+                    ),
+                    (
+                        "remote-source-reused".to_string(),
+                        Some("builder-reuse-1".to_string()),
+                        "remote-serial-session-2".to_string()
+                    )
+                ],
+                "every persisted conversation should retain the recovered source provenance"
+            );
+
+            let conversation_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(conversation_count, 2);
+
+            let fk_violations = reader.raw().query("PRAGMA foreign_key_check").unwrap();
+            assert!(
+                fk_violations.is_empty(),
+                "serial path should not leave any foreign-key violations after source auto-registration"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_reuses_auto_registered_remote_source_across_begin_concurrent_runs()
+         {
+            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("begin-source-reuse.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let metadata = serde_json::json!({
+                "cass": {
+                    "origin": {
+                        "source_id": "remote-begin-reused",
+                        "host": "builder-reuse-2"
+                    }
+                }
+            });
+
+            for (external_id, started_at, content, source_path) in [
+                (
+                    "remote-begin-session-1",
+                    30_000_i64,
+                    "begin-concurrent content one",
+                    "/log/remote-begin-1.jsonl",
+                ),
+                (
+                    "remote-begin-session-2",
+                    40_000_i64,
+                    "begin-concurrent content two",
+                    "/log/remote-begin-2.jsonl",
+                ),
+            ] {
+                let convs = vec![NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(external_id.into()),
+                    title: Some(format!("Remote begin session {external_id}")),
+                    workspace: Some(std::path::PathBuf::from("/ws/remote")),
+                    source_path: std::path::PathBuf::from(source_path),
+                    started_at: Some(started_at),
+                    ended_at: Some(started_at + 10),
+                    metadata: metadata.clone(),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "assistant".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(started_at + 5),
+                        content: content.into(),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    }],
+                }];
+
+                persist_conversations_batched(
+                    &storage,
+                    &mut t_index,
+                    &convs,
+                    LexicalPopulationStrategy::IncrementalInline,
+                    false,
+                )
+                .expect("begin-concurrent path should keep reusing the auto-registered source");
+            }
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let source_rows: Vec<(String, Option<String>)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT id, host_label FROM sources WHERE id <> 'local' ORDER BY id",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                source_rows,
+                vec![(
+                    "remote-begin-reused".to_string(),
+                    Some("builder-reuse-2".to_string())
+                )],
+                "begin-concurrent path should upsert the missing remote source once and then reuse it"
+            );
+
+            let provenance: Vec<(String, Option<String>, String)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT source_id, origin_host, external_id FROM conversations ORDER BY external_id",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance,
+                vec![
+                    (
+                        "remote-begin-reused".to_string(),
+                        Some("builder-reuse-2".to_string()),
+                        "remote-begin-session-1".to_string()
+                    ),
+                    (
+                        "remote-begin-reused".to_string(),
+                        Some("builder-reuse-2".to_string()),
+                        "remote-begin-session-2".to_string()
+                    )
+                ],
+                "every begin-concurrent persist should retain the recovered source provenance"
+            );
+
+            let conversation_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(conversation_count, 2);
+
+            let fk_violations = reader.raw().query("PRAGMA foreign_key_check").unwrap();
+            assert!(
+                fk_violations.is_empty(),
+                "begin-concurrent path should not leave any foreign-key violations after source auto-registration"
+            );
+        }
+
+        #[test]
         fn persist_conversation_registers_missing_remote_source() {
             use crate::connectors::{NormalizedConversation, NormalizedMessage};
             use crate::search::tantivy::TantivyIndex;
