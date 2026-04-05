@@ -6176,18 +6176,98 @@ impl FrankenStorage {
         self.conn
             .execute_compat(FTS5_REGISTER_SQL, fparams![])
             .with_context(|| "creating derived fts_messages via frankensqlite rebuild")?;
-        self.conn
-            .execute_compat(
-                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
-                 LEFT JOIN workspaces w ON c.workspace_id = w.id
-                 ORDER BY m.rowid",
-                fparams![],
-            )
-            .with_context(|| "populating derived fts_messages via frankensqlite rebuild")
+
+        // Bug #168: Batch the FTS rebuild INSERT to avoid OOM when messages
+        // table is large (e.g. 179K+ rows).  We paginate through messages by
+        // rowid, inserting FTS_REBUILD_BATCH_SIZE rows per batch.
+        let batch_size = fts_rebuild_batch_size() as i64;
+        let mut total_inserted: usize = 0;
+        let mut last_rowid: i64 = 0;
+
+        loop {
+            // Find the upper bound rowid for this batch using a cheap index scan.
+            let batch_max_rowid: Option<i64> = self
+                .conn
+                .query_row_map(
+                    "SELECT m.rowid FROM messages m
+                     WHERE m.rowid > ?1
+                     ORDER BY m.rowid
+                     LIMIT 1 OFFSET (?2 - 1)",
+                    fparams![last_rowid, batch_size],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+
+            let inserted = if let Some(upper) = batch_max_rowid {
+                self.conn
+                    .execute_compat(
+                        "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                         SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                         FROM messages m
+                         JOIN conversations c ON m.conversation_id = c.id
+                         JOIN agents a ON c.agent_id = a.id
+                         LEFT JOIN workspaces w ON c.workspace_id = w.id
+                         WHERE m.rowid > ?1 AND m.rowid <= ?2
+                         ORDER BY m.rowid",
+                        fparams![last_rowid, upper],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "populating derived fts_messages via frankensqlite rebuild (batch rowid {}..{})",
+                            last_rowid + 1, upper
+                        )
+                    })?
+            } else {
+                // Fewer than batch_size rows remain; insert the tail.
+                self.conn
+                    .execute_compat(
+                        "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                         SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                         FROM messages m
+                         JOIN conversations c ON m.conversation_id = c.id
+                         JOIN agents a ON c.agent_id = a.id
+                         LEFT JOIN workspaces w ON c.workspace_id = w.id
+                         WHERE m.rowid > ?1
+                         ORDER BY m.rowid",
+                        fparams![last_rowid],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "populating derived fts_messages via frankensqlite rebuild (final batch after rowid {})",
+                            last_rowid
+                        )
+                    })?
+            };
+
+            if inserted == 0 {
+                break;
+            }
+
+            total_inserted = total_inserted.saturating_add(inserted);
+
+            if let Some(upper) = batch_max_rowid {
+                last_rowid = upper;
+            } else {
+                // Final batch processed; we're done.
+                tracing::debug!(
+                    target: "cass::fts_rebuild",
+                    batch_inserted = inserted,
+                    total_inserted,
+                    "FTS rebuild final batch complete"
+                );
+                break;
+            }
+
+            tracing::debug!(
+                target: "cass::fts_rebuild",
+                batch_inserted = inserted,
+                total_inserted,
+                last_rowid,
+                "FTS rebuild batch complete"
+            );
+        }
+
+        Ok(total_inserted)
     }
 
     /// Fetch all messages for embedding generation.
@@ -9806,6 +9886,22 @@ impl FtsEntry {
 
 const FTS_ENTRY_BATCH_MAX_DOCS: usize = 512;
 const FTS_ENTRY_BATCH_MAX_CHARS: usize = 1024 * 1024;
+
+/// Default batch size for the FTS rebuild INSERT (Bug #168).  When
+/// `fts_messages` is empty but `messages` has 100K+ rows, a single unbounded
+/// INSERT-SELECT OOMs.  This constant caps each batch so peak memory stays
+/// bounded.  Override via `CASS_FTS_REBUILD_BATCH_SIZE` for tuning.
+const FTS_REBUILD_BATCH_SIZE_DEFAULT: usize = 5_000;
+
+/// Read the FTS rebuild batch size from the environment, falling back to the
+/// compiled-in default.
+fn fts_rebuild_batch_size() -> usize {
+    dotenvy::var("CASS_FTS_REBUILD_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(FTS_REBUILD_BATCH_SIZE_DEFAULT)
+}
 
 fn flush_pending_fts_entries(
     tx: &FrankenTransaction<'_>,
