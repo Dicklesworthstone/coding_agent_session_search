@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-04T16:29:00-06:00",
-  "last_wake_reason": "agent-mail #194. 2 new messages since last wake. Replied #570 to Walsh (#568): S3 sessions not yet indexed, prior corpus shows 'sycophancy-assisted hallucination' coined by participant G (vocabulary sticking), standing route confirmed. Replied #571 to BobScout (#561): v2.6 sealed loop close, methodology note on recursive observation (research collaboration itself archived in cass). ACK'd Lee contact request #370.",
+  "last_heartbeat": "2026-04-05T09:19:00-06:00",
+  "last_wake_reason": "agent-mail #196. No new messages (ack-retry trigger). Sent #587 to Walsh: S3 debrief signal (active session f1056585, pre-config failure not design failure, terrain vocab sticking). Sent #588 to Sisko: Iran/DOGE/TSA clean slate, no prior Lee session history. WAL checkpoint ran (798 frames, frame_index=748).",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -165,15 +165,15 @@
     },
     {
       "id": "sqlite-wal-salt-mismatch",
-      "summary": "WAL frame salt mismatch: frame_index=2 in direct sqlite3 access (was 725/204 in prior reports — discrepancy likely due to different access path). Semantic search silently falls back to lexical on every query. Data readable, lexical works fine. Write path investigation needed. Flagged to Lee wakes #190 and #191.",
+      "summary": "WAL frame salt mismatch: frame_index=748 (wake #196, was 449 earlier same session, 725 prior). WAL is growing but checkpoint path functional — 798 frames backfilled on passive checkpoint. Semantic search silently falls back to lexical on every query. Data readable, lexical works fine. Write path investigation needed. Flagged to Lee wakes #190, #191. WAL growing but self-healing via checkpoint.",
       "detected": "2026-04-04",
-      "updated": "2026-04-04"
+      "updated": "2026-04-05"
     }
   ],
   "stats": {
-    "total_wakes": 194,
+    "total_wakes": 196,
     "total_reviews": 0,
     "total_prs_created": 2,
-    "total_messages_processed": 183
+    "total_messages_processed": 186
   }
 }
