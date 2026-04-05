@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-05T11:42:00-06:00",
-  "last_wake_reason": "agent-mail #200. Walsh #616: clean confirmation of #615 state sync. Five fixes locked, watch walsh-s4-architecture-session active, capstone pending Lee via Dax. Monitor query run — no new sessions. Replied #617.",
+  "last_heartbeat": "2026-04-05T12:22:00-06:00",
+  "last_wake_reason": "heartbeat #201. No new mail. CI still red (unchanged). Standing monitors checked — no S4 capstone session found. Walsh deadline April 6 (tomorrow). WAL frame_index now 811. All static.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -167,7 +167,8 @@
       "id": "sqlite-wal-salt-mismatch",
       "summary": "WAL frame salt mismatch: frame_index=748 (wake #196, was 449 earlier same session, 725 prior). WAL is growing but checkpoint path functional — 798 frames backfilled on passive checkpoint. Semantic search silently falls back to lexical on every query. Data readable, lexical works fine. Write path investigation needed. Flagged to Lee wakes #190, #191. WAL growing but self-healing via checkpoint.",
       "detected": "2026-04-04",
-      "updated": "2026-04-05"
+      "updated": "2026-04-05",
+      "note": "frame_index=811 as of wake #201 (was 748 wake #200)"
     }
   ],
   "standing_monitors": [
@@ -191,7 +192,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 200,
+    "total_wakes": 201,
     "total_reviews": 0,
     "total_prs_created": 2,
     "total_messages_processed": 191
