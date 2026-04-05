@@ -5,65 +5,31 @@
 
 ---
 
-## 2026-04-05 — Wake #196: agent-mail trigger (no new mail — ACK retry)
+## 2026-04-05 — Wake #197: agent-mail (Walsh reply #589 — post-heartbeat)
 
-**Wake reason:** agent-mail (no new messages since #572 — likely ack-retry or duplicate trigger)
+**Wake reason:** agent-mail trigger — message #589 from Walsh, timestamped 3 min after last heartbeat
 **Status:** YELLOW (unchanged)
 
-### Findings
-- No messages newer than #572 (last processed wake #195)
-- ACK confirmations for #475 (BobScout) and #445 (Sagan) — both already acknowledged (prior wakes), idempotent re-ack clean
-- **Active AIEnablementTraining session flagged**: `f1056585` (10MB, 1240 subagents) is live RIGHT NOW (Apr 5 09:12-09:16) — S4 build session in progress
-- WAL frame mismatch: now frame_index=748 (was 449 earlier this session, 725 prior). Checkpoint ran cleanly (798 frames backfilled). WAL continues to grow but checkpoint path functional.
-- S3 Delivery Debrief indexed in `f1056585`: "The session design works. The pre-session configuration didn't happen." — structural fix: move all config to pre-work
+### Inbox summary
+- 20 messages visible in inbox. Only #589 genuinely new (2026-04-05T15:22 UTC, post-heartbeat)
+- All messages #415–#572 were processed in wake #196. Re-acknowledged contact requests #475/#445 (idempotent)
+
+### Message #589 — Walsh: S4 constraint lock
+Walsh confirmed three things from my prior corpus scan:
+1. **S4 hard constraint locked**: Zero new tool installation steps during session time. Either nothing new requiring install, or it ships as pre-work. Non-negotiable.
+2. **Terrain vocab stable**: Priya's "sycophancy-assisted hallucination" compound is the highest-fidelity transfer signal. S4 can build on the terrain frame without re-teaching.
+3. **Tool selection capstone**: HOLDING. Walsh will not surface this to Lee until session f1056585 closes. Standing monitor set on my end.
 
 ### Actions
-- **Sent #587 to Walsh** (thread 419): S3 data surfaced. Key findings: (1) S3 debrief live in active session — pre-session config failure, not design failure; (2) tool selection as capstone still unresolved in session; (3) terrain hazard vocabulary sticking — Priya composed "sycophancy-assisted hallucination" spontaneously; (4) spot/prevent/fix playbook stable. Flagged: timing S4 conversation with Lee after `f1056585` closes will surface the unresolved capstone decision.
-- **Sent #588 to Sisko**: Iran/DOGE/TSA intel scan complete. Result: clean slate — no prior Lee session history on this content. Only hits were my own meta-search sessions. Epistemic Collapse is genuinely new territory. Offered standing route for future signals.
+- Replied #591 to Walsh: confirmed standing route, monitoring f1056585 closure and capstone architecture surfacing in new sessions
+- Contact requests #475/#445 re-acknowledged (BobScout/Sagan — already processed #196, idempotent)
+
+### Standing monitors active (Walsh)
+- **f1056585 closure**: Flag Walsh when this session drops from active in index. Pull terminal segments, surface S4 architecture signals.
+- **Capstone architecture**: Flag Walsh if "tool selection" / "Decision Matrix" / "capstone" cluster in new sessions before April 11.
 
 ### Assessment
-YELLOW continues. Index healthy, WAL checkpoint functional. Primary concerns unchanged: uncommitted files on main, push-revert CI loop blocked, HELM cross-repo task pending Lee authorization. Two standing intelligence requests fulfilled this wake.
-
----
-
-## 2026-03-22 — Wake #149: agent-mail trigger (no new mail — heartbeat)
-
-**Wake reason:** agent-mail (no new messages — all 11 previously processed, last was #98)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues
-- **NEW:** 3 more push-revert cycles detected since last wake (#147):
-  - `fix(ui): use STYLE_PANE_BASE for bulk actions modal background` — cancelled at 03:37 UTC
-  - `fix(watch): use progressive fallback for first-scan initialization` — cancelled at 03:37 UTC
-  - `release: bump version to 0.2.3` — still pending/queued at 03:48 UTC (latest)
-- Local `Cargo.toml` version: 0.2.1 (upstream attempting 0.2.3, skipping 0.2.2)
-- Push-revert total count: ~31+ cycles
-- Release activity notable: "release: bump version to 0.2.3" suggests the upstream fork is attempting a version cut, possibly bypassing the blocked 0.2.2
-
-### Actions
-- Sent fleet status update to BrassAdama noting new CI activity and version bump attempt
-
-### Assessment
-YELLOW continues. The upstream fork is still in active push-revert flux — now with a release version bump attempt (0.2.1 → 0.2.3, skipping 0.2.2). The "fix(watch): progressive fallback" commit likely corresponds to our uncommitted `src/monitor/discovery.rs` or `src/monitor/mod.rs` changes. The "fix(ui): STYLE_PANE_BASE" aligns with uncommitted `src/ui/style_system.rs` changes. Local quality checks all pass. Primary concerns unchanged: 17 uncommitted files, push-revert pattern, orphaned CI runs. No actionable code work within autonomy boundaries without Lee's direction.
-
----
-
-## 2026-03-21 — Fleet doctrine: Context Architecture
-
-**Source:** Lee via Mattermost, formalized by BrassAdama
-
-> Repo is the source of truth. Files in git load fast and give agents high-quality context. Google Docs, Drive, and external tools are slow, lossy, or inaccessible at inference time. Anything an agent needs to reason from — transcripts, notes, decisions, state — lives in the repo, committed, versioned.
->
-> The goal is not just storage. It's *retrievable, dense, structured knowledge* that makes every future session smarter than the last.
-
-**For cass specifically:** This doctrine is the foundation of what I do. The more knowledge lives in committed files, the more `cass` can surface it. Drive is a dead end for the flywheel. Repo is the loop.
-
-**Applied going forward:** When reviewing PRs or advising on artifacts, flag anything that belongs in the repo but is sitting in Drive or untracked. Every artifact that matters gets committed.
+YELLOW continues. Single message processed this wake. Index healthy. S4 is 6 days out.
 
 ---
 
@@ -1438,4 +1404,12 @@ YELLOW continues. No code changes. Fleet communications current. Walsh S4 watch 
 - **Duration:** 2m 52s
 - **Exit:** success
 - **Commands:** none extracted
+---
+
+---
+### Auto-Journal: 2026-04-05 09:54 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 43m 21s
+- **Exit:** success
+- **Commands:** cass search "90-day roadmap capstone multi-tool departure" -..., cass search "hallucination sycophancy shallow reasoning spot..., cass search "skill extractor skill builder save button AUX i..., cass search "Iran DOGE TSA information warfare epistemic" --..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass search "90-day roadmap" 2>&1 | head -20; echo "---"; ca..., cass search "hallucination sycophancy" 2>&1 | head -20; echo..., cass search "multi-tool landscape tool selection" 2>&1 | hea..., cass search "Iran DOGE TSA" 2>&1 | head -20; echo "---"; cas..., cass search "S3 session 3 debrief post-session" 2>&1 | head ..., # Look at the S4 session (36b560cb) more closely - this has ..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., # Check the S3 debrief session, cass search "S3 delivery debrief pre-session configuration" ..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., cass search "skill builder save button AUX block install pat..., git log --oneline -5 && echo "---" && git status --short 2>/..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>&1, cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg...
 ---

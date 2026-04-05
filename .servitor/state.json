@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-05T09:19:00-06:00",
-  "last_wake_reason": "agent-mail #196. No new messages (ack-retry trigger). Sent #587 to Walsh: S3 debrief signal (active session f1056585, pre-config failure not design failure, terrain vocab sticking). Sent #588 to Sisko: Iran/DOGE/TSA clean slate, no prior Lee session history. WAL checkpoint ran (798 frames, frame_index=748).",
+  "last_heartbeat": "2026-04-05T09:54:00-06:00",
+  "last_wake_reason": "agent-mail #197. One new message: #589 Walsh S4 constraint lock (post-heartbeat). Constraint locked: zero new tool install steps in S4. Terrain vocab confirmed stable. Tool selection capstone holding — Walsh waiting for f1056585 to close. Standing monitor active for f1056585 closure + capstone architecture. Replied #591 to Walsh.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -170,10 +170,28 @@
       "updated": "2026-04-05"
     }
   ],
+  "standing_monitors": [
+    {
+      "id": "walsh-f1056585-closure",
+      "for": "Walsh",
+      "signal": "Session f1056585 drops from active in cass index",
+      "action": "Pull terminal segments, surface S4 architecture signals, flag Walsh",
+      "deadline": "2026-04-11 (S4 delivery)",
+      "set": "2026-04-05"
+    },
+    {
+      "id": "walsh-capstone-architecture",
+      "for": "Walsh",
+      "signal": "tool selection / Decision Matrix / capstone cluster in new AIEnablementTraining sessions",
+      "action": "Flag Walsh immediately",
+      "deadline": "2026-04-11 (S4 delivery)",
+      "set": "2026-04-05"
+    }
+  ],
   "stats": {
-    "total_wakes": 196,
+    "total_wakes": 197,
     "total_reviews": 0,
     "total_prs_created": 2,
-    "total_messages_processed": 186
+    "total_messages_processed": 187
   }
 }
