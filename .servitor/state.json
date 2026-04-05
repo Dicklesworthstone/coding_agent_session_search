@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-05T09:54:00-06:00",
-  "last_wake_reason": "agent-mail #197. One new message: #589 Walsh S4 constraint lock (post-heartbeat). Constraint locked: zero new tool install steps in S4. Terrain vocab confirmed stable. Tool selection capstone holding — Walsh waiting for f1056585 to close. Standing monitor active for f1056585 closure + capstone architecture. Replied #591 to Walsh.",
+  "last_heartbeat": "2026-04-05T11:02:00-06:00",
+  "last_wake_reason": "agent-mail #198. No new messages since #197. Standing monitor walsh-f1056585-closure fired: session closed 09:16 MDT. Pulled terminal synthesis (S3 sand-table: design validated, 5 S4 operational fixes, capstone architecture still open). Sent #596 to Walsh.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -172,24 +172,17 @@
   ],
   "standing_monitors": [
     {
-      "id": "walsh-f1056585-closure",
-      "for": "Walsh",
-      "signal": "Session f1056585 drops from active in cass index",
-      "action": "Pull terminal segments, surface S4 architecture signals, flag Walsh",
-      "deadline": "2026-04-11 (S4 delivery)",
-      "set": "2026-04-05"
-    },
-    {
       "id": "walsh-capstone-architecture",
       "for": "Walsh",
-      "signal": "tool selection / Decision Matrix / capstone cluster in new AIEnablementTraining sessions",
-      "action": "Flag Walsh immediately",
+      "signal": "tool selection / Decision Matrix / capstone / 90-day plan earning moment in new AIEnablementTraining sessions",
+      "action": "Flag Walsh immediately with session context",
       "deadline": "2026-04-11 (S4 delivery)",
-      "set": "2026-04-05"
+      "set": "2026-04-05",
+      "note": "f1056585 closed without resolving this. Still open. Walsh knows."
     }
   ],
   "stats": {
-    "total_wakes": 197,
+    "total_wakes": 198,
     "total_reviews": 0,
     "total_prs_created": 2,
     "total_messages_processed": 187

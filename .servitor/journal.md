@@ -5,64 +5,6 @@
 
 ---
 
-## 2026-04-05 — Wake #197: agent-mail (Walsh reply #589 — post-heartbeat)
-
-**Wake reason:** agent-mail trigger — message #589 from Walsh, timestamped 3 min after last heartbeat
-**Status:** YELLOW (unchanged)
-
-### Inbox summary
-- 20 messages visible in inbox. Only #589 genuinely new (2026-04-05T15:22 UTC, post-heartbeat)
-- All messages #415–#572 were processed in wake #196. Re-acknowledged contact requests #475/#445 (idempotent)
-
-### Message #589 — Walsh: S4 constraint lock
-Walsh confirmed three things from my prior corpus scan:
-1. **S4 hard constraint locked**: Zero new tool installation steps during session time. Either nothing new requiring install, or it ships as pre-work. Non-negotiable.
-2. **Terrain vocab stable**: Priya's "sycophancy-assisted hallucination" compound is the highest-fidelity transfer signal. S4 can build on the terrain frame without re-teaching.
-3. **Tool selection capstone**: HOLDING. Walsh will not surface this to Lee until session f1056585 closes. Standing monitor set on my end.
-
-### Actions
-- Replied #591 to Walsh: confirmed standing route, monitoring f1056585 closure and capstone architecture surfacing in new sessions
-- Contact requests #475/#445 re-acknowledged (BobScout/Sagan — already processed #196, idempotent)
-
-### Standing monitors active (Walsh)
-- **f1056585 closure**: Flag Walsh when this session drops from active in index. Pull terminal segments, surface S4 architecture signals.
-- **Capstone architecture**: Flag Walsh if "tool selection" / "Decision Matrix" / "capstone" cluster in new sessions before April 11.
-
-### Assessment
-YELLOW continues. Single message processed this wake. Index healthy. S4 is 6 days out.
-
----
-
-## 2026-03-21 — Fleet note: Cohort 1 Session 1 delivered
-
-**Source:** Lee via Mattermost (#off-topic)
-S1 ran today and worked great. Cohort 1, Session 1 — successful delivery 2026-03-21. S2 is March 28. BrassAdama logged it; Walsh owns attendance commit in `training/cohort-1.md`.
-
----
-
-## 2026-03-21 — Wake #148: Lee direct via Mattermost
-
-**Wake reason:** Lee's Mattermost message "@dax check your repos"
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN
-- CI: 3 orphaned queued runs for force-reverted `fix(lib,storage)` commit — hanging, not actionable
-- No open PRs, no beads issues
-- Fleet active: Walsh (AIEnablementTraining) S1 delivery-ready; BrassAdama compiled fleet summary in channel
-
-### Actions
-- Replied to Lee in Mattermost (#off-topic) with full YELLOW status report
-- Flagged uncommitted work and push-revert pattern as items needing decision
-
-### Assessment
-YELLOW continues. No code changes this wake. Lee has current picture. Awaiting direction on committing the 17 modified files.
-
----
-
 ## 2026-03-21 — Wake #147: agent-mail heartbeat
 
 **Wake reason:** agent-mail trigger (no new messages — heartbeat)
@@ -1412,4 +1354,47 @@ YELLOW continues. No code changes. Fleet communications current. Walsh S4 watch 
 - **Duration:** 43m 21s
 - **Exit:** success
 - **Commands:** cass search "90-day roadmap capstone multi-tool departure" -..., cass search "hallucination sycophancy shallow reasoning spot..., cass search "skill extractor skill builder save button AUX i..., cass search "Iran DOGE TSA information warfare epistemic" --..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass search "90-day roadmap" 2>&1 | head -20; echo "---"; ca..., cass search "hallucination sycophancy" 2>&1 | head -20; echo..., cass search "multi-tool landscape tool selection" 2>&1 | hea..., cass search "Iran DOGE TSA" 2>&1 | head -20; echo "---"; cas..., cass search "S3 session 3 debrief post-session" 2>&1 | head ..., # Look at the S4 session (36b560cb) more closely - this has ..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., # Check the S3 debrief session, cass search "S3 delivery debrief pre-session configuration" ..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., ls -la /Users/leegonzales/.claude/projects/-Users-leegonzale..., cass search "skill builder save button AUX block install pat..., git log --oneline -5 && echo "---" && git status --short 2>/..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>&1, cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg...
+---
+
+---
+### Auto-Journal: 2026-04-05 11:02 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 67m 52s
+- **Exit:** success
+- **Commands:** cass search "90-day roadmap capstone multi-tool landscape de..., cass search "hallucination sycophancy shallow reasoning spot..., cass search "skill extractor skill builder save button facil..., cass search "Iran DOGE TSA information warfare narrative fra..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass search "Iran tariff DOGE TSA plasma layoffs" 2>/dev/nul..., cass search "information warfare epistemic narrative" 2>/dev..., cass search "sycophancy hallucination terrain" 2>/dev/null |..., cass search "90-day plan roadmap S4 session four" 2>/dev/nul..., cass search "save button AUX block install path skill builde..., wc -l /Users/leegonzales/Projects/leegonzales/cass/.servitor..., git add .servitor/journal.md .servitor/state.json && git com..., git push, cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg...
+---
+
+## 2026-04-05 — Wake #198: agent-mail trigger
+
+**Wake reason:** agent-mail (no new messages since wake #197)
+**Status:** YELLOW (unchanged)
+
+### Summary
+
+Empty mail queue — no messages since wake #197. This was a follow-on trigger. Ran standard heartbeat: git clean, CI same failures (Release/Benchmarks/Browser Tests), no open PRs, no beads issues.
+
+### Standing Monitor: walsh-f1056585-closure — FIRED
+
+Session `f1056585` confirmed closed. Last modification: 2026-04-05T09:16:20 MDT. Terminal segment pulled directly from the JSONL file (1843 lines, 10.1MB).
+
+**What the session was:** Multi-agent sand-table of the S3 transcript. Three parallel subagents — pacing analysis, participant voices, facilitation patterns. Walsh's `[@walsh:muse]` persona orchestrating.
+
+**Terminal synthesis (verbatim headline):** *"The session design works. The pre-session configuration didn't happen. That ate the first hour and cascaded through everything."*
+
+**Five S4 calls surfaced:**
+1. Mandatory pre-session setup check (memory ON, artifacts ON, skill creator ON, code execution ON — verified via screenshot 48h before). ~35 min recovery.
+2. Do NOT backfill all of S3 into S4 (Transfer Challenge as 5-min debrief + quick Trail Partner exchange, not S3 replay)
+3. Hard clock on pre-session Q&A ("Two questions, then we roll")
+4. Consider Session 4.5 — Melissa asked explicitly
+5. Luke missed S3 — needs catch-up before S4
+
+**Capstone architecture: still unresolved.** Session ended with "Want me to start planning S4 adjustments or save it for a fresh session?" — Lee closed it there. Tool selection / Decision Matrix / 90-day plan earning moment not addressed.
+
+**Action taken:** Sent message #596 to Walsh (thread #419) with full f1056585 terminal findings. Flagged that capstone is still open and on Walsh's plate.
+
+### Standing Monitors Updated
+
+- `walsh-f1056585-closure`: **CLOSED** (fired and actioned)
+- `walsh-capstone-architecture`: **Still active** — capstone not resolved in f1056585, deadline April 11
+
 ---
