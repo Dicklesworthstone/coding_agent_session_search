@@ -6671,6 +6671,17 @@ impl FrankenStorage {
         let mut pricing_diag = PricingDiagnostics::default();
 
         let mut tx = self.conn.transaction()?;
+
+        // Bug #167: Ensure all referenced agents, workspaces, and sources
+        // exist inside the transaction so FK checks pass.  The caller resolves
+        // IDs via ensure_agent / ensure_workspace / ensure_sources_for_batch
+        // outside the transaction, but those autocommit writes may not be
+        // visible inside the transaction snapshot in frankensqlite.  Re-verify
+        // (and insert if missing) within the tx.
+        ensure_agents_in_tx(&tx, conversations)?;
+        ensure_workspaces_in_tx(&tx, conversations)?;
+        ensure_sources_in_tx(&tx, conversations)?;
+
         let mut outcomes = Vec::with_capacity(conversations.len());
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
@@ -7306,6 +7317,93 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
         .ok()
         .filter(|&id| id > 0)
         .with_context(|| "last_insert_rowid() returned NULL or 0 after INSERT")
+}
+
+/// Bug #167: Ensure all agents referenced by a batch exist within the
+/// transaction.  The caller already resolved `agent_id` values via
+/// `ensure_agent` outside the transaction, but those autocommit writes may
+/// not be visible inside a frankensqlite transaction snapshot.  This function
+/// checks each unique agent_id and creates a stub row if it's missing.
+fn ensure_agents_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversations: &[(i64, Option<i64>, &Conversation)],
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let now = FrankenStorage::now_millis();
+    for &(agent_id, _, conv) in conversations {
+        if !seen.insert(agent_id) {
+            continue;
+        }
+        let exists: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM agents WHERE id = ?1",
+            fparams![agent_id],
+            |row| row.get_typed(0),
+        )?;
+        if exists == 0 {
+            tracing::debug!(
+                target: "cass::fk_guard",
+                agent_id,
+                slug = %conv.agent_slug,
+                "inserting agent row inside transaction to satisfy FK constraint"
+            );
+            // INSERT OR IGNORE: the slug might already exist with a different
+            // id from a concurrent writer.  If the slug row exists, the FK
+            // constraint is already satisfied (the caller just got a stale id).
+            tx.execute_compat(
+                "INSERT OR IGNORE INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, 'cli', ?4, ?5)",
+                fparams![
+                    agent_id,
+                    conv.agent_slug.as_str(),
+                    conv.agent_slug.as_str(),
+                    now,
+                    now
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Bug #167: Ensure all workspaces referenced by a batch exist within the
+/// transaction.  Same rationale as `ensure_agents_in_tx`.
+fn ensure_workspaces_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversations: &[(i64, Option<i64>, &Conversation)],
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for &(_, workspace_id, conv) in conversations {
+        let ws_id = match workspace_id {
+            Some(id) => id,
+            None => continue,
+        };
+        if !seen.insert(ws_id) {
+            continue;
+        }
+        let exists: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+            fparams![ws_id],
+            |row| row.get_typed(0),
+        )?;
+        if exists == 0 {
+            let path_str = conv
+                .workspace
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            tracing::debug!(
+                target: "cass::fk_guard",
+                workspace_id = ws_id,
+                path = %path_str,
+                "inserting workspace row inside transaction to satisfy FK constraint"
+            );
+            tx.execute_compat(
+                "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
+                fparams![ws_id, path_str.as_str()],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn env_flag_enabled(name: &str) -> bool {
