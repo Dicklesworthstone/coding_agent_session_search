@@ -6181,19 +6181,21 @@ impl FrankenStorage {
         // table is large (e.g. 179K+ rows).  We paginate through messages by
         // rowid, inserting FTS_REBUILD_BATCH_SIZE rows per batch.
         let batch_size = fts_rebuild_batch_size() as i64;
+        let batch_offset = (batch_size - 1).max(0);
         let mut total_inserted: usize = 0;
         let mut last_rowid: i64 = 0;
 
         loop {
             // Find the upper bound rowid for this batch using a cheap index scan.
+            // OFFSET (batch_size - 1) with LIMIT 1 gives us the batch_size-th row.
             let batch_max_rowid: Option<i64> = self
                 .conn
                 .query_row_map(
                     "SELECT m.rowid FROM messages m
                      WHERE m.rowid > ?1
                      ORDER BY m.rowid
-                     LIMIT 1 OFFSET (?2 - 1)",
-                    fparams![last_rowid, batch_size],
+                     LIMIT 1 OFFSET ?2",
+                    fparams![last_rowid, batch_offset],
                     |row| row.get_typed(0),
                 )
                 .optional()?;
@@ -7400,6 +7402,46 @@ fn ensure_workspaces_in_tx(
             tx.execute_compat(
                 "INSERT OR IGNORE INTO workspaces(id, path) VALUES(?1, ?2)",
                 fparams![ws_id, path_str.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Bug #167: Ensure all sources referenced by a batch exist within the
+/// transaction.  Same rationale as `ensure_agents_in_tx` — source_id is a
+/// TEXT FK on the conversations table.
+fn ensure_sources_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversations: &[(i64, Option<i64>, &Conversation)],
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for &(_, _, conv) in conversations {
+        if !seen.insert(conv.source_id.clone()) {
+            continue;
+        }
+        let exists: i64 = tx.query_row_map(
+            "SELECT COUNT(*) FROM sources WHERE id = ?1",
+            fparams![conv.source_id.as_str()],
+            |row| row.get_typed(0),
+        )?;
+        if exists == 0 {
+            let kind_str = if conv.source_id == LOCAL_SOURCE_ID {
+                "local"
+            } else {
+                "ssh"
+            };
+            let now = FrankenStorage::now_millis();
+            tracing::debug!(
+                target: "cass::fk_guard",
+                source_id = %conv.source_id,
+                kind = kind_str,
+                "inserting source row inside transaction to satisfy FK constraint"
+            );
+            tx.execute_compat(
+                "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4)",
+                fparams![conv.source_id.as_str(), kind_str, now, now],
             )?;
         }
     }
