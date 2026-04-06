@@ -5782,7 +5782,9 @@ impl FrankenStorage {
                         );
                         continue;
                     }
-                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
+                        continue;
+                    };
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -5877,7 +5879,9 @@ impl FrankenStorage {
                 );
                 continue;
             }
-            let msg_id = franken_insert_message(&tx, conv_id, msg)?;
+            let Some(msg_id) = franken_insert_message(&tx, conv_id, msg)? else {
+                continue;
+            };
             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -5975,7 +5979,9 @@ impl FrankenStorage {
                 );
                 continue;
             }
-            let msg_id = franken_insert_message(tx, conversation_id, msg)?;
+            let Some(msg_id) = franken_insert_message(tx, conversation_id, msg)? else {
+                continue;
+            };
             franken_insert_snippets(tx, msg_id, &msg.snippets)?;
             if !defer_lexical_updates {
                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6773,7 +6779,9 @@ impl FrankenStorage {
                         );
                         continue;
                     }
-                    let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                    let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
+                        continue;
+                    };
                     franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                     if !defer_lexical_updates {
                         fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6840,7 +6848,9 @@ impl FrankenStorage {
                             {
                                 continue;
                             }
-                            let msg_id = franken_insert_message(&tx, new_conv_id, msg)?;
+                            let Some(msg_id) = franken_insert_message(&tx, new_conv_id, msg)? else {
+                                continue;
+                            };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -6918,7 +6928,9 @@ impl FrankenStorage {
                                 );
                                 continue;
                             }
-                            let msg_id = franken_insert_message(&tx, existing_id, msg)?;
+                            let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
+                                continue;
+                            };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
                             if !defer_lexical_updates {
                                 fts_entries.push(FtsEntry::from_message(msg_id, msg, conv));
@@ -7708,11 +7720,16 @@ fn franken_insert_conversation(
 }
 
 /// Insert a message within a frankensqlite transaction.
+///
+/// Returns `Ok(Some(msg_id))` when the message was newly inserted, or
+/// `Ok(None)` when a row with the same `(conversation_id, idx)` already
+/// exists (the INSERT is silently ignored).  Callers should skip snippet
+/// and FTS insertion for `None` results to avoid duplicate data.
 fn franken_insert_message(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     msg: &Message,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
     let (extra_json_str, extra_bin): (Cow<'_, str>, Option<Vec<u8>>) =
         if let Some(raw) = historical_raw_json(&msg.extra_json) {
             (Cow::Borrowed(raw), None)
@@ -7724,8 +7741,8 @@ fn franken_insert_message(
         };
     let extra_bin_bytes = extra_bin.as_deref();
 
-    tx.execute_compat(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+    let rows_changed = tx.execute_compat(
+        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         fparams![
             conversation_id,
@@ -7738,7 +7755,14 @@ fn franken_insert_message(
             extra_bin_bytes
         ],
     )?;
-    franken_last_rowid(tx)
+
+    if rows_changed == 0 {
+        // Message already exists (UNIQUE constraint on conversation_id, idx).
+        // The caller should skip snippets/FTS for this message.
+        Ok(None)
+    } else {
+        Ok(Some(franken_last_rowid(tx)?))
+    }
 }
 
 /// Insert snippets within a frankensqlite transaction.
