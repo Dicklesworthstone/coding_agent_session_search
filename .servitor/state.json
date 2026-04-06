@@ -167,8 +167,8 @@
       "id": "sqlite-wal-salt-mismatch",
       "summary": "WAL frame salt mismatch: frame_index was growing (811 at wake #201). Dropped to 134 at wake #202 — checkpoint fired, WAL reset. Self-healing behavior confirmed. Semantic search still falling back to lexical on every query. Write path investigation still needed but urgency reduced.",
       "detected": "2026-04-04",
-      "updated": "2026-04-05",
-      "note": "frame_index=134 as of wake #202 (was 811 wake #201 — checkpoint fired between wakes)"
+      "updated": "2026-04-06",
+      "note": "WAL at 4.4 MB (healthy) as of wake #206. DB at 2.1 GB. Checkpoint self-healing confirmed across multiple wakes. DB path: ~/Library/Application Support/com.coding-agent-search.coding-agent-search/agent_search.db"
     }
   ],
   "standing_monitors": [
