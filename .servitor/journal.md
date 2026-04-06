@@ -5,62 +5,6 @@
 
 ---
 
-## 2026-03-21 — Wake #135: agent-mail trigger
-
-**Wake reason:** agent-mail (no new messages — all 6 inbox messages previously processed)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues, no new agent-mail
-- CI: last 5 runs all failed (same phantom push-revert commit from Mar 21 22:40 UTC)
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed
-
-### Assessment
-YELLOW continues. Fully static since wake #127. No state change, no new work, no new messages. The 17 modified files remain uncommitted on main. Local quality checks all pass. No actionable work within my autonomy boundaries. Awaiting Lee's direction on commit strategy for outstanding changes.
-
----
-
-## 2026-03-21 — Wake #134: agent-mail trigger
-
-**Wake reason:** agent-mail (no new messages — all 6 inbox messages previously processed)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues, no new agent-mail
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed
-
-### Assessment
-YELLOW continues. Fully static since wake #127. No state change, no new work, no new messages. The 17 modified files remain uncommitted on main. Local quality checks all pass. No actionable work within my autonomy boundaries. Awaiting Lee's direction on commit strategy for outstanding changes.
-
----
-
-## 2026-03-21 — Wake #133: Heartbeat
-
-**Wake reason:** Periodic heartbeat check
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files, unchanged since wake #127
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues
-- CI: last 5 runs all failed (same phantom push-revert commit from Mar 21 22:40 UTC)
-- Agent-mail: message #53 (BrassAdama CHECK_IN) already processed in wake #129; no new messages
-
-### Assessment
-YELLOW continues. Fully static since wake #127 — identical HEAD, identical working tree, identical CI state. The 17 modified files remain uncommitted on main. Local quality checks all pass. No actionable work within my autonomy boundaries. Awaiting Lee's direction on commit strategy for the outstanding changes.
-
----
-
 ## 2026-03-21 — Wake #132: agent-mail trigger — Heartbeat
 
 **Wake reason:** agent-mail (no new messages — all 6 inbox messages previously processed)
@@ -1242,3 +1186,38 @@ YELLOW. Minimal wake — one acknowledgment message processed, one reply sent. W
 ### Assessment
 YELLOW. Minimal wake — one informational message from Sisko confirming index corpus quality. Loop closed cleanly: Geordi surfaced the relevant index data in wake #202, Sisko received and validated it. No action needed. Standing monitor for S4 capstone architecture still active — Walsh's decision window closes April 6.
 ---
+
+---
+### Auto-Journal: 2026-04-05 17:47 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 3m 7s
+- **Exit:** success
+- **Commands:** grep -n "Wake #20[0-9]" /Users/leegonzales/Projects/leegonza..., cass search "tool selection Decision Matrix capstone 90-day ..., git -C /Users/leegonzales/Projects/leegonzales/cass log --on..., cass search "S4 capstone architecture" 2>/dev/null | head -2..., ls -lt "/Users/leegonzales/.claude/projects/" 2>/dev/null | ..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., git add .servitor/journal.md .servitor/state.json && git com...
+---
+
+## 2026-04-05 — Wake #204: agent-mail trigger
+
+**Wake reason:** agent-mail (no new messages since wake #203)
+**Status:** YELLOW (unchanged)
+
+### Messages Processed
+No new messages. Inbox shows same messages as wake #203 (most recent: #623 Sisko, 23:29 UTC). All previously processed.
+
+### Contact Request Acknowledgments
+- **#445 (Sagan contact request)**: Re-acknowledged — confirmed idempotent (originally acked 2026-04-04T19:50 UTC)
+- **#475 (BobScout contact request)**: Re-acknowledged — confirmed idempotent (originally acked 2026-04-04T21:04 UTC)
+
+### Standing Monitor: walsh-s4-architecture-session — NOT FIRED
+
+Ran full check on AIEnablementTraining and catalyst session timestamps:
+
+**AIEnablementTraining**: Most recent session still `0881cfb9` at 12:24 MDT Apr 5 — unchanged since wake #203.
+
+**Two new catalyst sessions found since last check:**
+1. `9c12113c` (18:26 MDT) — Dax session, night-before-training participant emails for S3. Completely unrelated to S4 capstone.
+2. `6db33326` (20:28 MDT) — **catalyst/website** dev server debugging. Lee working on 54MB presentation HTML file choking Next.js watcher during startup. Slug: `iterative-singing-hollerith`. No S4 content whatsoever.
+
+Monitor: **still on watch**. April 6 deadline is tomorrow (current: Apr 5 20:24 MDT). No capstone architecture decision visible yet.
+
+### Assessment
+YELLOW. Empty wake — no new mail, no actionable work. Standing watch holds for one more day. If Lee resolves the S4 capstone question today or tomorrow, it will likely surface in an AIEnablementTraining session. The catalyst/website session activity suggests Lee is doing website prep for S3 presentation delivery — could indicate he's close to S4 planning mode.
