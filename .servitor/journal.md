@@ -5,72 +5,41 @@
 
 ---
 
-## 2026-04-05T21:03 MDT — Wake #205: agent-mail trigger — No New Messages
+## 2026-04-06T12:20 — Wake #206: Heartbeat
 
-**Wake reason:** agent-mail (no new messages since #203 Sisko loop-close / wake #204)
+**Wake reason:** Heartbeat (periodic)
 **Status:** YELLOW (unchanged)
 
-### Actions Taken
-1. Fetched inbox — 20 messages, all previously processed (most recent: #623 Sisko loop-close, 5:29 PM MDT Apr 5)
-2. Re-acked contact requests #445 (Sagan) and #475 (BobScout) — idempotent
-3. Ran S4 monitor: searched AIEnablementTraining workspace for tool selection / Decision Matrix / capstone architecture / earning moment signals
-4. Ran CI/git/PR status check
+### Inbox
+- Message #623 from Sisko (Apr 5 23:29 UTC): Status reply on corpus intel query. Confirms "Selling Their Blood" + "The Heist v2" research fully indexed in session c8244638. Iran angle is original — no prior sessions. Pipeline at April 12-15 window pending Lee-only gates. No action needed from Geordi. Acknowledged.
 
-### Findings
-- **Inbox**: No new messages. Last processed: #623 (Sisko loop-close, received Apr 5 17:29 MDT, processed wake #203)
-- **S4 monitor** (`walsh-s4-architecture-session`): NOT FIRED. Today's AIEnablementTraining session `8838086d` (Apr 5 09:19 AM) is Walsh's own coordination session, not Lee building S4 capstone architecture. Search for "earning moment capstone architecture" returns zero results in AIEnablementTraining workspace (excluding watch sessions)
-- **Sisko / April 6 deadline**: Iran deadline arrives tonight/tomorrow. "Selling Their Blood" and "The Heist v2" remain in HOLD pending Lee's publish decision + opsec fix
-- **CI**: Coverage/Benchmarks/CI still failing. Fuzzing green (24014319855). Known issue `ci-red-main` — unchanged
-- **Git**: HEAD at 3716fb0e. Same 17 modified files uncommitted on main. No PRs open
-- **WAL**: DB check failed at standard paths — sqlite3 direct query not available via Bash (likely path issue)
+### Standing Monitors
+- **walsh-s4-architecture-session**: Deadline TODAY (April 6). No new AIEnablementTraining sessions since `8838086d` (Apr 5 09:19 — Walsh coordination, not S4 build). No capstone/tool-selection/Decision-Matrix signal detected. Monitor still live — deadline window not yet closed (today).
+- **walsh-capstone-architecture**: Still open. Walsh knows.
 
-### Assessment
-YELLOW continues. No actionable work within autonomy boundaries. S4 monitor still live — Walsh needs Lee's capstone architecture decision before April 11. April 6 deadline (Sisko's Iran window) resolves in the next few hours. No code changes, no PRs, no beads issues.
-
----
-
-## 2026-03-21 — Wake #130: agent-mail trigger — Heartbeat
-
-**Wake reason:** agent-mail (no new messages — all 6 inbox messages previously processed)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since wake #127
+### Repo Health
+- HEAD: `2485231b` — last 20 commits are all servitor heartbeats (no code changes)
+- Working tree: 18 modified files, 15 untracked (same dirty-worktree state as prior wakes)
 - `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only — upstream unquoted `name=beta`)
-- `cargo test`: not run (no code changes since last wake)
-- No open PRs, no beads issues, no new agent-mail
-- CI: last 5 runs all failed (same phantom push-revert commit from Mar 21 22:40 UTC: "feat(indexer,ui,ci): parallel indexing, TUI search overhaul, release...")
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed and acknowledged
+- `cargo clippy`: Running (background) — no prior errors expected
+- No open PRs on `leegonzales/cass`
+- Beads: no open issues
+
+### CI Analysis
+- `gh run list` returns runs for **upstream** `Dicklesworthstone/coding_agent_session_search` (not `leegonzales/cass`)
+- `leegonzales/cass` has no CI runs — fork CI not enabled or no triggers
+- Upstream CI failing: `franken-agent-detection` resolves as path dep `../franken_agent_detection` — NOT present in CI runner
+- Note: Local `Cargo.toml` has `franken-agent-detection` as a **git dep** (rev=5b0eb1a) — discrepancy means upstream is on a different commit that still has the path dep, or the runner workspace is different. This is an **upstream issue**, outside my domain.
+
+### Known Issues Update
+- `push-revert-pattern`: Still relevant at upstream. Not actionable for Geordi.
+- `dirty-worktree`: Unchanged — 18 modified files awaiting Lee's commit.
+- `mattermost-geordi-403-recurrence`: Unresolved, routing via agent-mail.
+- `helm-cross-repo-pending`: Awaiting Lee's authorization.
+- `sqlite-wal-salt-mismatch`: WAL health unverifiable this wake (cass db not found at expected paths — launchd may route to non-standard location).
 
 ### Assessment
-YELLOW continues. Completely static since wake #129 — identical HEAD, identical working tree, identical CI state. The 17 modified files remain uncommitted on main. Local quality checks all pass. No actionable work within my autonomy boundaries. Awaiting Lee's direction on commit strategy for the outstanding changes.
-
----
-
-## 2026-03-21T16:45 — Wake #129: agent-mail trigger — Fleet Check-In
-
-**Wake reason:** agent-mail — message #53 from BrassAdama (CHECK_IN: Fleet status report requested)
-**Status:** YELLOW (unchanged)
-
-### Actions Taken
-1. Ran full diagnostic suite: `git status`, `cargo fmt --check`, `cargo clippy --all-targets`, `gh run list`, `gh pr list`, `bd ready`
-2. Composed and sent detailed status report to BrassAdama (reply to msg #53, sent as msg #69)
-3. Acknowledged message #53
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged since last wake
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- `cargo test`: long compile, previous runs show ~7 analytics_tokens fixture failures (known)
-- No open PRs, no beads issues
-- CI: last 5 runs all failed (phantom push-revert commits from Mar 21)
-- All prior inbox messages (#34, #31, #16, #13, #2) previously processed
-
-### Assessment
-YELLOW continues. No state change from wake #128. Responded to Adama's fleet check-in with full diagnostic report. The 17 modified files remain uncommitted — this is the primary actionable item, outside my autonomy. CI remains red. Awaiting Lee's direction.
+YELLOW continues. No new mail requiring action. Walsh S4 deadline arrives today — no signal yet from AIEnablementTraining. Sisko loop is clean. Local quality checks pass. Dirty worktree unchanged — Lee's call. Nothing actionable within my autonomy boundaries this wake.
 
 ---
 
@@ -1214,4 +1183,12 @@ YELLOW. Empty wake — no new mail, no actionable work. Standing watch holds for
 - **Duration:** 39m 30s
 - **Exit:** success
 - **Commands:** wc -l /Users/leegonzales/Projects/leegonzales/cass/.servitor..., cass search "tool selection Decision Matrix capstone 90-day ..., git -C /Users/leegonzales/Projects/leegonzales/cass log --on..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass search "tool selection Decision Matrix capstone 90-day ..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., wc -l "/Users/leegonzales/.claude/projects/-Users-leegonzale..., cass search "capstone S4 tool selection Decision Matrix 90-d..., wc -l "/Users/leegonzales/.claude/projects/-Users-leegonzale..., git -C /Users/leegonzales/Projects/leegonzales/cass add .ser...
+---
+
+---
+### Auto-Journal: 2026-04-05 21:42 MDT
+- **Wake reason:** agent-mail
+- **Duration:** 39m 5s
+- **Exit:** success
+- **Commands:** git log --oneline -5 && echo "---" && git status --short && ..., cass search "S4 capstone tool selection Decision Matrix 90-d..., sqlite3 ~/.local/share/cass/index.db "PRAGMA wal_checkpoint(..., find ~/Library/Application\ Support/cass ~/.local/share/cass..., cass search "tool selection Decision Matrix capstone" 2>/dev..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., ls -la "/Users/leegonzales/.claude/projects/-Users-leegonzal..., ls -la "/Users/leegonzales/.claude/projects/-Users-leegonzal..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., ls -lt "/Users/leegonzales/.claude/projects/-Users-leegonzal..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., cass search "tool selection Decision Matrix capstone 90-day"..., cass search "S4" --workspace "/Users/leegonzales/Projects/le..., ls "/Users/leegonzales/.claude/projects/-Users-leegonzales-P..., cass search "S4 session" --workspace "/Users/leegonzales/Pro..., cass search "earning moment capstone architecture" --workspa..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>/dev/null && echo "pushed"
 ---

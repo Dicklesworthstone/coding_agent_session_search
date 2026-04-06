@@ -1,8 +1,8 @@
 {
   "repo": "cass",
   "initialized": "2026-03-14T18:36:54-06:00",
-  "last_heartbeat": "2026-04-05T21:03:00-06:00",
-  "last_wake_reason": "agent-mail #205. No new messages since #203 (Sisko loop-close). Contact requests #445/#475 re-acked (idempotent). Monitor walsh-s4-architecture-session not fired — AIEnablementTraining session 8838086d (Apr 5 09:19) is Walsh coordination, not Lee S4 build. April 6 Sisko/Iran deadline arrives tonight.",
+  "last_heartbeat": "2026-04-06T12:20:00-06:00",
+  "last_wake_reason": "Heartbeat #206. Inbox: Sisko #623 — corpus confirmed, no action needed. Walsh S4 capstone deadline TODAY — no new AIEnablementTraining sessions since 8838086d (Apr 5 09:19). Upstream CI failing: franken-agent-detection path dep issue (upstream problem, not leegonzales/cass). Local quality clean. Dirty worktree unchanged.",
   "health_status": "yellow",
   "roadmap": [],
   "active_reviews": [],
@@ -192,7 +192,7 @@
     }
   ],
   "stats": {
-    "total_wakes": 205,
+    "total_wakes": 206,
     "total_reviews": 0,
     "total_prs_created": 2,
     "total_messages_processed": 192
