@@ -5378,6 +5378,21 @@ pub mod persist {
         apply_index_writer_busy_timeout(&writer);
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
+        // CASS #169: Disable database-level FK enforcement on ephemeral writers.
+        // All insert paths already guarantee FK parent records exist at the
+        // application level (ensure_agent, ensure_workspace,
+        // ensure_embedded_source_registered), so SQLite FK checks are redundant.
+        // After sustained write activity (~39 min), frankensqlite's cursor cache
+        // can report false-positive FK constraint violations that PRAGMA
+        // foreign_key_check confirms do not actually exist.
+        if let Err(err) = writer.raw().execute("PRAGMA foreign_keys = OFF") {
+            tracing::debug!(
+                error = %err,
+                context,
+                "failed to disable FK enforcement on ephemeral writer"
+            );
+        }
+
         let result = f(&writer);
         let close_result = writer.close().with_context(|| {
             format!(
@@ -5540,6 +5555,13 @@ pub mod persist {
             )
         })?;
         apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
+        // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
+        if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF") {
+            tracing::debug!(
+                error = %err,
+                "failed to disable FK enforcement on serial fallback writer"
+            );
+        }
         let fallback_retries = max_retries.max(12);
         let result = persist_chunk_with_writer(&franken, base_idx, chunk, fallback_retries);
         let close_result = franken.close().with_context(|| {
@@ -5643,6 +5665,14 @@ pub mod persist {
                     )
                 })?;
                 apply_begin_concurrent_writer_tuning(&franken, defer_checkpoints);
+                // CASS #169: Disable FK enforcement — see with_ephemeral_writer for rationale.
+                if let Err(err) = franken.raw().execute("PRAGMA foreign_keys = OFF") {
+                    tracing::debug!(
+                        error = %err,
+                        chunk_idx,
+                        "failed to disable FK enforcement on begin-concurrent writer"
+                    );
+                }
                 let result = persist_chunk_with_writer(&franken, base_idx, chunk, max_retries);
                 let close_result = franken.close().with_context(|| {
                     format!(
