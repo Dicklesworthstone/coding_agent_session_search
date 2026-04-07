@@ -56,6 +56,138 @@ pub fn content_hash_hex(text: &str) -> String {
     hex::encode(hash)
 }
 
+fn role_is(role: Option<&str>, expected: &str) -> bool {
+    role.is_some_and(|role| role.trim().eq_ignore_ascii_case(expected))
+}
+
+fn is_short_acknowledgement(lower: &str) -> bool {
+    matches!(
+        lower,
+        "ok" | "ok."
+            | "okay"
+            | "okay."
+            | "done"
+            | "done."
+            | "done!"
+            | "got it"
+            | "got it."
+            | "got it!"
+            | "ack"
+            | "ack."
+            | "acknowledged"
+            | "acknowledged."
+            | "confirmed"
+            | "confirmed."
+            | "completed"
+            | "completed."
+            | "complete"
+            | "complete."
+    )
+}
+
+/// Return true when text is a low-value acknowledgement/tool confirmation.
+///
+/// These messages add little search value and tend to dominate result sets with
+/// repeated "done/acknowledged/wrote file" noise.
+pub fn is_tool_acknowledgement(role: Option<&str>, text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if is_short_acknowledgement(&lower) {
+        return true;
+    }
+
+    if trimmed.len() > 200 {
+        return false;
+    }
+
+    let toolish = role_is(role, "tool");
+    let short_tool_ack = lower == "no matches found"
+        || lower == "no changes made"
+        || lower == "no changes"
+        || lower == "already up to date"
+        || lower == "up to date"
+        || lower == "file written";
+    if short_tool_ack && (toolish || lower.contains("file") || lower.contains("match")) {
+        return true;
+    }
+
+    let prefixed_tool_ack = lower.starts_with("successfully wrote to ")
+        || lower.starts_with("successfully updated ")
+        || lower.starts_with("successfully created ")
+        || lower.starts_with("successfully deleted ")
+        || lower.starts_with("successfully saved ")
+        || lower.starts_with("successfully applied ")
+        || lower.starts_with("applied patch")
+        || lower.starts_with("patch applied");
+    prefixed_tool_ack && (toolish || lower.contains('/') || lower.contains("file"))
+}
+
+/// Return true when content looks like an injected prompt/instructions block.
+///
+/// We keep these messages in storage, but suppress them from normal search
+/// results unless the query is clearly asking for prompt/instruction content.
+pub fn is_system_prompt_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("# agents.md instructions for ")
+        || lower.starts_with("agents.md instructions for ")
+        || lower.starts_with("system prompt:")
+        || lower.starts_with("developer prompt:")
+        || lower.starts_with("developer message:")
+        || lower.starts_with("system message:")
+        || lower.contains("follow the agents.md instructions")
+        || ((lower.starts_with("you are a ") || lower.starts_with("you are an "))
+            && (lower.contains("assistant") || lower.contains("coding agent"))
+            && (lower.contains("instructions")
+                || lower.contains("follow")
+                || lower.contains("must")
+                || lower.contains("rules")))
+}
+
+/// Return true when a query explicitly asks for prompt/instructions content.
+pub fn query_requests_system_prompt(query: &str) -> bool {
+    let lower = query.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    lower.contains("system prompt")
+        || lower.contains("developer prompt")
+        || lower.contains("system message")
+        || lower.contains("developer message")
+        || lower.contains("system instructions")
+        || lower.contains("developer instructions")
+        || lower.contains("agents.md")
+        || lower.contains("agents md")
+        || lower.contains("claude.md")
+        || lower.contains("claude md")
+        || lower.contains("prompt text")
+        || ((lower.starts_with("you are ") || lower.contains(" you are "))
+            && (lower.contains("assistant") || lower.contains("coding agent")))
+        || lower.contains("\"you are")
+}
+
+/// Noise we can safely skip during indexing.
+pub fn is_hard_message_noise(role: Option<&str>, text: &str) -> bool {
+    text.trim().is_empty() || is_tool_acknowledgement(role, text)
+}
+
+/// Noise we should suppress from search results.
+pub fn is_search_noise_text(text: &str, query: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || is_tool_acknowledgement(None, trimmed)
+        || (is_system_prompt_text(trimmed) && !query_requests_system_prompt(query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +320,49 @@ mod tests {
         let hex = content_hash_hex("test");
         assert_eq!(hex.len(), 64);
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_is_tool_acknowledgement_detects_short_replies() {
+        assert!(is_tool_acknowledgement(None, "OK"));
+        assert!(is_tool_acknowledgement(None, "Acknowledged."));
+        assert!(is_tool_acknowledgement(None, "Done!"));
+        assert!(!is_tool_acknowledgement(None, "Thanks!"));
+    }
+
+    #[test]
+    fn test_is_tool_acknowledgement_detects_tool_write_confirmations() {
+        assert!(is_tool_acknowledgement(
+            Some("tool"),
+            "Successfully wrote to /tmp/output.rs"
+        ));
+        assert!(is_tool_acknowledgement(Some("tool"), "No matches found"));
+        assert!(!is_tool_acknowledgement(
+            Some("tool"),
+            "Compilation failed with an auth refresh error"
+        ));
+    }
+
+    #[test]
+    fn test_is_system_prompt_text_detects_instruction_blocks() {
+        assert!(is_system_prompt_text(
+            "# AGENTS.md instructions for /repo\n\nFollow these rules carefully."
+        ));
+        assert!(is_system_prompt_text(
+            "You are a coding assistant. You must follow the instructions exactly."
+        ));
+        assert!(!is_system_prompt_text(
+            "You are looking at the auth module."
+        ));
+    }
+
+    #[test]
+    fn test_query_requests_system_prompt_matches_prompt_terms() {
+        assert!(query_requests_system_prompt("AGENTS.md instructions"));
+        assert!(query_requests_system_prompt("show me the system prompt"));
+        assert!(query_requests_system_prompt("you are a coding assistant"));
+        assert!(!query_requests_system_prompt("build instructions"));
+        assert!(!query_requests_system_prompt("authentication failure"));
     }
 
     #[test]

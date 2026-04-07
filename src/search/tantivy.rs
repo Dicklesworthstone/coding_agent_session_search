@@ -11,6 +11,7 @@ use frankensearch::lexical::{
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
+use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 
 fn normalized_index_source_id(
@@ -185,6 +186,9 @@ impl TantivyIndex {
         let mut docs: Vec<FsCassDocument> = Vec::new();
         let mut pending_chars = 0usize;
         for msg in messages {
+            if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+                continue;
+            }
             docs.push(FsCassDocument {
                 agent: conv.agent_slug.clone(),
                 workspace: workspace.clone(),

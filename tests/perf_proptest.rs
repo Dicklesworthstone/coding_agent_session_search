@@ -174,8 +174,8 @@ proptest! {
             .map(|(i, score)| make_hit(&format!("S{i}"), *score * 0.5))
             .collect();
 
-        let a = rrf_fuse_hits(&lexical, &semantic, TOP_K, 0);
-        let b = rrf_fuse_hits(&lexical, &semantic, TOP_K, 0);
+        let a = rrf_fuse_hits(&lexical, &semantic, "", TOP_K, 0);
+        let b = rrf_fuse_hits(&lexical, &semantic, "", TOP_K, 0);
 
         let keys_a: Vec<(String, Option<usize>)> = a
             .iter()

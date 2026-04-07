@@ -33,6 +33,7 @@ use crate::connectors::{
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
+use crate::search::canonicalize::is_hard_message_noise;
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
@@ -2824,6 +2825,10 @@ pub fn run_index(
             let embedding_inputs: Vec<EmbeddingInput> = raw_messages
                 .into_iter()
                 .filter_map(|msg| {
+                    if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+                        return None;
+                    }
+
                     let role_u8 = match msg.role.as_str() {
                         "user" => ROLE_USER,
                         "agent" | "assistant" => ROLE_ASSISTANT,
@@ -3287,6 +3292,10 @@ fn incremental_semantic_embed(
     let embedding_inputs: Vec<EmbeddingInput> = raw_messages
         .into_iter()
         .filter_map(|msg| {
+            if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+                return None;
+            }
+
             let role_u8 = match msg.role.as_str() {
                 "user" => ROLE_USER,
                 "agent" | "assistant" => ROLE_ASSISTANT,

@@ -120,7 +120,7 @@ fn franken_query_rows_retry(
     }
 }
 
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
     ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
@@ -1387,6 +1387,7 @@ fn top_k_fused(mut hits: Vec<FusedHit>, k: usize) -> Vec<FusedHit> {
 pub fn rrf_fuse_hits(
     lexical: &[SearchHit],
     semantic: &[SearchHit],
+    query: &str,
     limit: usize,
     offset: usize,
 ) -> Vec<SearchHit> {
@@ -1491,12 +1492,7 @@ pub fn rrf_fuse_hits(
             Some(hit) => hit,
             None => continue,
         };
-        let content_to_check = if hit.content.is_empty() {
-            &hit.snippet
-        } else {
-            &hit.content
-        };
-        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
+        if hit_is_noise(&hit, query) {
             continue;
         }
 
@@ -1918,6 +1914,16 @@ struct ProgressiveLexicalCache {
     hits_by_message: HashMap<u64, ProgressiveLexicalHit>,
     wildcard_fallback: bool,
     suggestions: Vec<QuerySuggestion>,
+}
+
+#[derive(Clone, Copy)]
+struct ProgressivePhaseContext<'a> {
+    query: &'a str,
+    filters: &'a SearchFilters,
+    field_mask: FieldMask,
+    lexical_cache: Option<&'a ProgressiveLexicalCache>,
+    limit: usize,
+    fetch_limit: usize,
 }
 
 type ProgressiveLexicalSnapshot = Arc<ProgressiveLexicalCache>;
@@ -2460,6 +2466,20 @@ pub(crate) fn is_tool_invocation_noise(content: &str) -> bool {
     false
 }
 
+fn hit_content_for_noise_check(hit: &SearchHit) -> &str {
+    if hit.content.is_empty() {
+        &hit.snippet
+    } else {
+        &hit.content
+    }
+}
+
+fn hit_is_noise(hit: &SearchHit, query: &str) -> bool {
+    let content_to_check = hit_content_for_noise_check(hit);
+    is_search_noise_text(content_to_check, query)
+        || (!content_to_check.is_empty() && is_tool_invocation_noise(content_to_check))
+}
+
 fn snippet_from_content(content: &str) -> String {
     let trimmed = content.trim();
     let mut chars = trimmed.chars();
@@ -2478,7 +2498,12 @@ fn snippet_from_content(content: &str) -> String {
 /// appears as separate results, since they represent distinct conversations.
 ///
 /// Also filters out tool invocation noise that isn't useful for search results.
+#[cfg(test)]
 pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    deduplicate_hits_with_query(hits, "")
+}
+
+pub(crate) fn deduplicate_hits_with_query(hits: Vec<SearchHit>, query: &str) -> Vec<SearchHit> {
     // Key: (source_numeric_id, source_path_numeric_id, conversation_id-or-title,
     //       line_number, created_at, content_hash) -> index in deduped.
     // Include message-level identity so repeated identical content in the same
@@ -2505,13 +2530,7 @@ pub(crate) fn deduplicate_hits(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut deduped: Vec<SearchHit> = Vec::new();
 
     for hit in hits {
-        // Skip tool invocation noise
-        let content_to_check = if hit.content.is_empty() {
-            &hit.snippet
-        } else {
-            &hit.content
-        };
-        if !content_to_check.is_empty() && is_tool_invocation_noise(content_to_check) {
+        if hit_is_noise(&hit, query) {
             continue;
         }
 
@@ -2783,15 +2802,7 @@ impl SearchClient {
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
                 let page_hits = |raw_hits: Vec<SearchHit>| {
-                    let mut deduped = deduplicate_hits(raw_hits);
-                    // Apply session_paths filter (post-search since source_path is not indexed)
-                    if !filters.session_paths.is_empty() {
-                        deduped.retain(|h| filters.session_paths.contains(&h.source_path));
-                    }
-                    let deduped_len = deduped.len();
-                    let paged_hits: Vec<SearchHit> =
-                        deduped.into_iter().skip(offset).take(limit).collect();
-                    (deduped_len, paged_hits)
+                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
                 };
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
@@ -2882,13 +2893,8 @@ impl SearchClient {
                 0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
-            let mut deduped = deduplicate_hits(hits);
-            // Apply session_paths filter (post-search since source_path is not indexed)
-            if !filters.session_paths.is_empty() {
-                deduped.retain(|h| filters.session_paths.contains(&h.source_path));
-            }
-
-            let paged_hits: Vec<SearchHit> = deduped.into_iter().skip(offset).take(limit).collect();
+            let (_, paged_hits) =
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
 
             if can_use_cache && offset == 0 {
                 self.put_cache(&sanitized, &filters, &paged_hits);
@@ -3533,17 +3539,13 @@ impl SearchClient {
     fn progressive_phase_to_result(
         &self,
         results: &[FsScoredResult],
-        filters: &SearchFilters,
-        field_mask: FieldMask,
-        lexical_cache: Option<&ProgressiveLexicalCache>,
-        limit: usize,
-        fetch_limit: usize,
+        ctx: ProgressivePhaseContext<'_>,
     ) -> Result<SearchResult> {
-        let collapsed = self.collapse_progressive_scored_results(results, fetch_limit);
+        let collapsed = self.collapse_progressive_scored_results(results, ctx.fetch_limit);
         let missing: Vec<VectorSearchResult> = collapsed
             .iter()
             .filter(|result| {
-                lexical_cache
+                ctx.lexical_cache
                     .and_then(|cache| cache.hits_by_message.get(&result.message_id))
                     .is_none()
             })
@@ -3554,32 +3556,33 @@ impl SearchClient {
             })
             .collect();
         let mut hydrated_by_id: HashMap<u64, SearchHit> = self
-            .hydrate_semantic_hits_with_ids(&missing, field_mask)?
+            .hydrate_semantic_hits_with_ids(&missing, ctx.field_mask)?
             .into_iter()
             .collect();
 
         let mut hydrated: Vec<(u64, SearchHit)> = Vec::with_capacity(collapsed.len());
         for result in &collapsed {
-            if let Some(cache) = lexical_cache
+            if let Some(cache) = ctx.lexical_cache
                 && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
             {
                 hydrated.push((result.message_id, lexical.to_search_hit(result.score)));
                 continue;
             }
             if let Some(mut hit) = hydrated_by_id.remove(&result.message_id) {
-                if let Some(cache) = lexical_cache
+                if let Some(cache) = ctx.lexical_cache
                     && let Some(lexical) = cache.hits_by_message.get(&result.message_id)
                 {
-                    self.overlay_progressive_lexical_hit(&mut hit, lexical, field_mask);
+                    self.overlay_progressive_lexical_hit(&mut hit, lexical, ctx.field_mask);
                 }
                 hydrated.push((result.message_id, hit));
             }
         }
 
         let mut hits: Vec<SearchHit> = hydrated.into_iter().map(|(_, hit)| hit).collect();
-        (_, hits) = self.postprocess_hits_page(hits, filters, limit, 0);
+        (_, hits) = self.postprocess_hits_page(hits, ctx.query, ctx.filters, ctx.limit, 0);
 
-        let (wildcard_fallback, suggestions) = lexical_cache
+        let (wildcard_fallback, suggestions) = ctx
+            .lexical_cache
             .map(|cache| {
                 let suggestions = if hits.is_empty() {
                     cache.suggestions.clone()
@@ -3711,11 +3714,14 @@ impl SearchClient {
                     } => phase_client
                         .progressive_phase_to_result(
                             &results,
-                            &phase_filters,
-                            field_mask,
-                            lexical_snapshot.as_deref(),
-                            limit,
-                            fetch_limit,
+                            ProgressivePhaseContext {
+                                query,
+                                filters: &phase_filters,
+                                field_mask,
+                                lexical_cache: lexical_snapshot.as_deref(),
+                                limit,
+                                fetch_limit,
+                            },
                         )
                         .map(|result| ProgressiveSearchEvent::Phase {
                             kind: ProgressivePhaseKind::Initial,
@@ -3727,11 +3733,14 @@ impl SearchClient {
                     } => phase_client
                         .progressive_phase_to_result(
                             &results,
-                            &phase_filters,
-                            field_mask,
-                            lexical_snapshot.as_deref(),
-                            limit,
-                            fetch_limit,
+                            ProgressivePhaseContext {
+                                query,
+                                filters: &phase_filters,
+                                field_mask,
+                                lexical_cache: lexical_snapshot.as_deref(),
+                                limit,
+                                fetch_limit,
+                            },
                         )
                         .map(|result| ProgressiveSearchEvent::Phase {
                             kind: ProgressivePhaseKind::Refined,
@@ -4050,7 +4059,7 @@ impl SearchClient {
 
         let finalize_hits = |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
             let hits = self.hydrate_semantic_hits(results, field_mask)?;
-            Ok(self.postprocess_hits_page(hits, &filters, limit, offset))
+            Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
         };
 
         let (results, search_was_truncated, mut ann_stats) =
@@ -4098,11 +4107,12 @@ impl SearchClient {
     fn postprocess_hits_page(
         &self,
         hits: Vec<SearchHit>,
+        query: &str,
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
     ) -> (usize, Vec<SearchHit>) {
-        let mut hits = deduplicate_hits(hits);
+        let mut hits = deduplicate_hits_with_query(hits, query);
         if !filters.session_paths.is_empty() {
             hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
         }
@@ -4310,7 +4320,7 @@ impl SearchClient {
             approximate,
             semantic_tier_mode,
         )?;
-        let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, limit, offset);
+        let fused = rrf_fuse_hits(&lexical.hits, &semantic_hits, semantic_query, limit, offset);
         let suggestions = if fused.is_empty() {
             lexical.suggestions.clone()
         } else {
@@ -5747,7 +5757,8 @@ mod tests {
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::FrankenStorage;
-    use rusqlite::Connection as LegacyConnection;
+    use frankensqlite::Connection as FrankenConnection;
+    use frankensqlite::compat::{OpenFlags, open_with_flags};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -6169,6 +6180,19 @@ mod tests {
 
     fn parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
         fs_cass_parse_boolean_query(query)
+    }
+
+    fn open_test_db_with_flags(db_path: &Path, flags: OpenFlags) -> Result<FrankenConnection> {
+        Ok(open_with_flags(db_path.to_string_lossy().as_ref(), flags)?)
+    }
+
+    fn sqlite_master_name_count(db_path: &Path, name: &str) -> Result<i64> {
+        let conn = FrankenConnection::open(db_path.to_string_lossy().as_ref())?;
+        Ok(conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            &[ParamValue::from(name)],
+            |row| row.get_typed(0),
+        )?)
     }
 
     type QueryToken = FsCassQueryToken;
@@ -7025,11 +7049,14 @@ mod tests {
 
         let result = client.progressive_phase_to_result(
             &results,
-            &SearchFilters::default(),
-            field_mask,
-            Some(&lexical_cache),
-            1,
-            1,
+            ProgressivePhaseContext {
+                query: "merged title",
+                filters: &SearchFilters::default(),
+                field_mask,
+                lexical_cache: Some(&lexical_cache),
+                limit: 1,
+                fetch_limit: 1,
+            },
         )?;
 
         assert_eq!(result.hits.len(), 1);
@@ -7708,29 +7735,33 @@ mod tests {
             storage.insert_conversation_tree(agent_id, None, &conversation)?;
         }
 
-        let legacy_count_before: i64 = LegacyConnection::open(&db_path)?.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
-        )?;
+        let legacy_count_before = sqlite_master_name_count(&db_path, "fts_messages")
+            .context("count legacy schema rows before duplicate injection")?;
         assert_eq!(
             legacy_count_before, 1,
             "legacy fixture should start with one sqlite_master entry"
         );
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = LegacyConnection::open(&db_path)?;
+        let conn = open_test_db_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         conn.execute_batch("PRAGMA writable_schema = ON;")?;
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
              VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            [duplicate_legacy_fts_sql],
+            &[ParamValue::from(duplicate_legacy_fts_sql)],
         )?;
-        conn.execute(
+        conn.execute_compat(
             "DELETE FROM meta WHERE key = ?1",
-            ["fts_frankensqlite_rebuild_generation"],
+            &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
         )?;
         conn.execute_batch("PRAGMA writable_schema = OFF;")?;
         drop(conn);
+
+        let duplicated_legacy_count = sqlite_master_name_count(&db_path, "fts_messages")
+            .context("count legacy schema rows after duplicate injection")?;
+        assert_eq!(
+            duplicated_legacy_count, 2,
+            "test fixture should reproduce the duplicate legacy fts_messages rows"
+        );
 
         let client = SearchClient {
             reader: None,
@@ -7749,15 +7780,14 @@ mod tests {
             last_tantivy_total_count: Mutex::new(None),
         };
 
-        let guard = client.sqlite_guard()?;
+        let guard = client
+            .sqlite_guard()
+            .context("open sqlite guard for duplicate legacy fts schema fixture")?;
         assert!(guard.is_some(), "sqlite guard should open the legacy db");
         drop(guard);
 
-        let legacy_count_after: i64 = LegacyConnection::open(&db_path)?.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
-        )?;
+        let legacy_count_after = sqlite_master_name_count(&db_path, "fts_messages")
+            .context("count legacy schema rows after sqlite guard reopen")?;
         assert_eq!(
             legacy_count_after, 1,
             "opening the legacy db must not persist duplicate fts_messages schema rows"
@@ -10234,6 +10264,86 @@ mod tests {
         let deduped = deduplicate_hits(hits);
         assert_eq!(deduped.len(), 1);
         assert!(deduped[0].content.contains("real content"));
+    }
+
+    #[test]
+    fn deduplicate_hits_filters_acknowledgement_noise() {
+        let hits = vec![
+            SearchHit {
+                title: "ack".into(),
+                snippet: "ack".into(),
+                content: "Acknowledged.".into(),
+                content_hash: stable_content_hash("Acknowledged."),
+                score: 1.0,
+                source_path: "ack.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                workspace_original: None,
+                created_at: Some(100),
+                line_number: None,
+                match_type: MatchType::Exact,
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: None,
+            },
+            SearchHit {
+                title: "real".into(),
+                snippet: "real".into(),
+                content: "Authentication refresh logic changed".into(),
+                content_hash: stable_content_hash("Authentication refresh logic changed"),
+                score: 0.5,
+                source_path: "real.jsonl".into(),
+                agent: "agent".into(),
+                workspace: "ws".into(),
+                workspace_original: None,
+                created_at: Some(200),
+                line_number: None,
+                match_type: MatchType::Exact,
+                source_id: "local".into(),
+                origin_kind: "local".into(),
+                origin_host: None,
+                conversation_id: None,
+            },
+        ];
+
+        let deduped = deduplicate_hits_with_query(hits, "authentication");
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].title, "real");
+    }
+
+    #[test]
+    fn deduplicate_hits_hides_system_prompts_unless_query_requests_them() {
+        let prompt_hit = SearchHit {
+            title: "prompt".into(),
+            snippet: "prompt".into(),
+            content:
+                "# AGENTS.md instructions for /repo\n\nYou are a coding assistant. Follow the instructions exactly."
+                    .into(),
+            content_hash: stable_content_hash(
+                "# AGENTS.md instructions for /repo\n\nYou are a coding assistant. Follow the instructions exactly.",
+            ),
+            score: 1.0,
+            source_path: "prompt.jsonl".into(),
+            agent: "agent".into(),
+            workspace: "ws".into(),
+            workspace_original: None,
+            created_at: Some(100),
+            line_number: None,
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        };
+
+        assert!(
+            deduplicate_hits_with_query(vec![prompt_hit.clone()], "coding assistant").is_empty()
+        );
+
+        let kept = deduplicate_hits_with_query(vec![prompt_hit], "AGENTS.md instructions");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].title, "prompt");
     }
 
     #[test]
@@ -12951,11 +13061,14 @@ mod tests {
 
         let result = fixture.client.progressive_phase_to_result(
             &results,
-            &filters,
-            FieldMask::FULL,
-            None,
-            1,
-            3,
+            ProgressivePhaseContext {
+                query: "session path filter",
+                filters: &filters,
+                field_mask: FieldMask::FULL,
+                lexical_cache: None,
+                limit: 1,
+                fetch_limit: 3,
+            },
         )?;
 
         assert_eq!(
@@ -13088,7 +13201,7 @@ mod tests {
             make_test_hit("D", 0.5),
         ];
 
-        let fused = rrf_fuse_hits(&lexical, &semantic, 10, 0);
+        let fused = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
 
         // A and B should be top (in both lists), A first (rank 0 in both)
         assert_eq!(fused.len(), 4);
@@ -13103,7 +13216,7 @@ mod tests {
         let lexical = vec![make_test_hit("A", 10.0), make_test_hit("B", 8.0)];
         let semantic = vec![make_test_hit("C", 0.9), make_test_hit("D", 0.7)];
 
-        let fused = rrf_fuse_hits(&lexical, &semantic, 10, 0);
+        let fused = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
 
         // All 4 items should be present
         assert_eq!(fused.len(), 4);
@@ -13125,9 +13238,9 @@ mod tests {
         let semantic = vec![]; // Empty semantic list
 
         // Run multiple times and verify same order
-        let fused1 = rrf_fuse_hits(&lexical, &semantic, 10, 0);
-        let fused2 = rrf_fuse_hits(&lexical, &semantic, 10, 0);
-        let fused3 = rrf_fuse_hits(&lexical, &semantic, 10, 0);
+        let fused1 = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
+        let fused2 = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
+        let fused3 = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
 
         // Order should be deterministic based on key comparison
         assert_eq!(fused1.len(), fused2.len());
@@ -13152,7 +13265,7 @@ mod tests {
             make_test_hit("both", 0.5),     // Rank 1 semantic
         ];
 
-        let fused = rrf_fuse_hits(&lexical, &semantic, 10, 0);
+        let fused = rrf_fuse_hits(&lexical, &semantic, "", 10, 0);
 
         // "both" should be first due to appearing in both lists
         // It gets RRF score from rank 1 in both lists = 1/(60+2) * 2 = 0.0322
@@ -13173,15 +13286,15 @@ mod tests {
         let semantic = vec![];
 
         // Test limit
-        let fused = rrf_fuse_hits(&lexical, &semantic, 2, 0);
+        let fused = rrf_fuse_hits(&lexical, &semantic, "", 2, 0);
         assert_eq!(fused.len(), 2);
 
         // Test offset
-        let fused_offset = rrf_fuse_hits(&lexical, &semantic, 10, 1);
+        let fused_offset = rrf_fuse_hits(&lexical, &semantic, "", 10, 1);
         assert_eq!(fused_offset.len(), 2); // Skipped first one
 
         // Test limit 0
-        let fused_empty = rrf_fuse_hits(&lexical, &semantic, 0, 0);
+        let fused_empty = rrf_fuse_hits(&lexical, &semantic, "", 0, 0);
         assert!(fused_empty.is_empty());
     }
 
@@ -13191,15 +13304,15 @@ mod tests {
         let non_empty = vec![make_test_hit("A", 10.0)];
 
         // Both empty
-        assert!(rrf_fuse_hits(&empty, &empty, 10, 0).is_empty());
+        assert!(rrf_fuse_hits(&empty, &empty, "", 10, 0).is_empty());
 
         // Lexical empty
-        let fused = rrf_fuse_hits(&empty, &non_empty, 10, 0);
+        let fused = rrf_fuse_hits(&empty, &non_empty, "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].title, "A");
 
         // Semantic empty
-        let fused = rrf_fuse_hits(&non_empty, &empty, 10, 0);
+        let fused = rrf_fuse_hits(&non_empty, &empty, "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].title, "A");
     }
@@ -13215,7 +13328,7 @@ mod tests {
         let mut semantic = lexical.clone();
         semantic.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[lexical], &[semantic], 10, 0);
+        let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].title, "");
     }
@@ -13234,7 +13347,7 @@ mod tests {
         semantic.origin_kind = "local".into();
         semantic.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[lexical], &[semantic], 10, 0);
+        let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].source_id, "local");
     }
@@ -13254,7 +13367,7 @@ mod tests {
         second.created_at = Some(200);
         second.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[first], &[second], 10, 0);
+        let fused = rrf_fuse_hits(&[first], &[second], "", 10, 0);
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].line_number, Some(1));
         assert_eq!(fused[1].line_number, Some(2));
@@ -13275,7 +13388,7 @@ mod tests {
         semantic.conversation_id = Some(42);
         semantic.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[lexical], &[semantic], 10, 0);
+        let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].conversation_id, Some(42));
     }
@@ -13299,7 +13412,7 @@ mod tests {
         semantic.origin_kind = "local".into();
         semantic.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[lexical], &[semantic], 10, 0);
+        let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].conversation_id, Some(42));
     }
@@ -13317,7 +13430,7 @@ mod tests {
         second.conversation_id = Some(2);
         second.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[first], &[second], 10, 0);
+        let fused = rrf_fuse_hits(&[first], &[second], "", 10, 0);
         assert_eq!(fused.len(), 2);
         assert!(fused.iter().any(|hit| hit.conversation_id == Some(1)));
         assert!(fused.iter().any(|hit| hit.conversation_id == Some(2)));
@@ -13336,7 +13449,7 @@ mod tests {
         semantic.title = "Evening Session".into();
         semantic.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[lexical], &[semantic], 10, 0);
+        let fused = rrf_fuse_hits(&[lexical], &[semantic], "", 10, 0);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].conversation_id, Some(9));
     }
@@ -13354,7 +13467,7 @@ mod tests {
         evening.title = "Evening Session".into();
         evening.score = 0.9;
 
-        let fused = rrf_fuse_hits(&[morning], &[evening], 10, 0);
+        let fused = rrf_fuse_hits(&[morning], &[evening], "", 10, 0);
         assert_eq!(fused.len(), 2);
         assert!(fused.iter().any(|hit| hit.title == "Morning Session"));
         assert!(fused.iter().any(|hit| hit.title == "Evening Session"));
@@ -13370,7 +13483,7 @@ mod tests {
             .map(|i| make_test_hit(&format!("S{}", i), 1.0 - 0.01 * i as f32))
             .collect();
 
-        let fused = rrf_fuse_hits(&lexical, &semantic, 20, 0);
+        let fused = rrf_fuse_hits(&lexical, &semantic, "", 20, 0);
 
         // Should return 20 items
         assert_eq!(fused.len(), 20);
