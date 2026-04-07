@@ -6848,7 +6848,8 @@ impl FrankenStorage {
                             {
                                 continue;
                             }
-                            let Some(msg_id) = franken_insert_message(&tx, new_conv_id, msg)? else {
+                            let Some(msg_id) = franken_insert_message(&tx, new_conv_id, msg)?
+                            else {
                                 continue;
                             };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
@@ -6928,7 +6929,8 @@ impl FrankenStorage {
                                 );
                                 continue;
                             }
-                            let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)? else {
+                            let Some(msg_id) = franken_insert_message(&tx, existing_id, msg)?
+                            else {
                                 continue;
                             };
                             franken_insert_snippets(&tx, msg_id, &msg.snippets)?;
@@ -7619,21 +7621,6 @@ fn franken_find_existing_conversation_by_key(
     }
 }
 
-fn is_conversation_identity_conflict(error: &anyhow::Error) -> bool {
-    if let Some(franken_error) = error.downcast_ref::<frankensqlite::FrankenError>()
-        && let frankensqlite::FrankenError::UniqueViolation { columns } = franken_error
-    {
-        return columns.contains("conversations.source_id")
-            && columns.contains("agent_id")
-            && columns.contains("external_id");
-    }
-    let rendered = error.to_string();
-    rendered.contains("UNIQUE constraint failed")
-        && rendered.contains("conversations.source_id")
-        && rendered.contains("agent_id")
-        && rendered.contains("external_id")
-}
-
 fn franken_insert_conversation_or_get_existing(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -7648,13 +7635,15 @@ fn franken_insert_conversation_or_get_existing(
     }
 
     match franken_insert_conversation(tx, agent_id, workspace_id, conv) {
-        Ok(conv_id) => Ok(ConversationInsertStatus::Inserted(conv_id)),
-        Err(error) if is_conversation_identity_conflict(&error) => {
+        Ok(Some(conv_id)) => Ok(ConversationInsertStatus::Inserted(conv_id)),
+        Ok(None) => {
+            // INSERT OR IGNORE silently skipped a duplicate.  Look up the
+            // existing row so callers can merge messages into it (#141).
             let existing_id =
                 franken_find_existing_conversation_by_key(tx, &conversation_key, Some(conv))?
                     .with_context(|| {
                         format!(
-                            "conversation insert conflicted but existing row was not found for source_id={} agent_id={} external_id={:?} source_path={}",
+                            "conversation INSERT OR IGNORE produced 0 rows but existing row was not found for source_id={} agent_id={} external_id={:?} source_path={}",
                             conv.source_id,
                             agent_id,
                             conv.external_id,
@@ -7667,7 +7656,7 @@ fn franken_insert_conversation_or_get_existing(
                 external_id = ?conv.external_id,
                 existing_id,
                 source_path = %conv.source_path.display(),
-                "conversation insert hit unique constraint; reusing existing row"
+                "conversation INSERT OR IGNORE: duplicate gracefully skipped, reusing existing row"
             );
             Ok(ConversationInsertStatus::Existing(existing_id))
         }
@@ -7677,6 +7666,7 @@ fn franken_insert_conversation_or_get_existing(
                 agent_id,
                 external_id = ?conv.external_id,
                 error = %error,
+                source_path = %conv.source_path.display(),
                 "franken_insert_conversation failed"
             );
             Err(error)
@@ -7685,19 +7675,24 @@ fn franken_insert_conversation_or_get_existing(
 }
 
 /// Insert a conversation into the DB within a frankensqlite transaction.
+///
+/// Uses `INSERT OR IGNORE` so that duplicate `(source_id, agent_id,
+/// external_id)` rows are silently skipped instead of aborting the
+/// transaction (#141).  Returns `Ok(Some(id))` on successful insert or
+/// `Ok(None)` when the row already existed and was ignored.
 fn franken_insert_conversation(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
     workspace_id: Option<i64>,
     conv: &Conversation,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
     let metadata_bin = serialize_json_to_msgpack(&conv.metadata_json);
 
     let metadata_json_str = serde_json::to_string(&conv.metadata_json)?;
     let metadata_bin_bytes = metadata_bin.as_deref();
 
-    tx.execute_compat(
-        "INSERT INTO conversations(
+    let rows_changed = tx.execute_compat(
+        "INSERT OR IGNORE INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin
         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -7716,7 +7711,20 @@ fn franken_insert_conversation(
             metadata_bin_bytes
         ],
     )?;
-    franken_last_rowid(tx)
+
+    if rows_changed == 0 {
+        // Duplicate row was silently ignored by INSERT OR IGNORE.
+        tracing::debug!(
+            source_id = %conv.source_id,
+            agent_id,
+            external_id = ?conv.external_id,
+            source_path = %conv.source_path.display(),
+            "conversation INSERT OR IGNORE: duplicate row skipped"
+        );
+        Ok(None)
+    } else {
+        Ok(Some(franken_last_rowid(tx)?))
+    }
 }
 
 /// Insert a message within a frankensqlite transaction.
@@ -12380,7 +12388,9 @@ mod tests {
         };
 
         let tx = storage.conn.transaction().unwrap();
-        let inserted_id = franken_insert_conversation(&tx, agent_id, None, &conv).unwrap();
+        let inserted_id = franken_insert_conversation(&tx, agent_id, None, &conv)
+            .unwrap()
+            .expect("first insert should succeed");
 
         let resolved =
             franken_insert_conversation_or_get_existing(&tx, agent_id, None, &conv).unwrap();

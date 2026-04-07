@@ -13531,6 +13531,13 @@ fn prefers_direct_jsonl_file(path: &Path, source_id: Option<&str>) -> bool {
     )
 }
 
+fn should_defer_indexed_lookup_for_direct_export(path: &Path, source_id: Option<&str>) -> bool {
+    let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    prefers_direct_jsonl_file(path, source_id)
+        || (allow_direct_file
+            && (detect_opencode_sqlite_session(path) || detect_opencode_session(path)))
+}
+
 fn try_load_indexed_conversation_from_db_with_source(
     source_path: &Path,
     db_path: &Path,
@@ -14437,6 +14444,92 @@ fn detect_opencode_session(path: &Path) -> bool {
     false
 }
 
+/// Detect if a path points to an OpenCode SQLite-backed session.
+///
+/// These paths look like `<prefix>/opencode.db/<url-encoded-session-id>` and are
+/// produced by the OpenCode connector when indexing from the SQLite database.
+/// The actual file at that path does not exist -- the session lives inside
+/// the `.db` file.
+fn detect_opencode_sqlite_session(path: &Path) -> bool {
+    // Walk ancestors looking for a component that ends in ".db"
+    if let Some(parent) = path.parent() {
+        let parent_name = parent
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if parent_name.ends_with(".db") && parent.is_file() {
+            // The parent is a real .db file and the child is the session id
+            return true;
+        }
+    }
+    false
+}
+
+fn path_exists_or_virtual_opencode_sqlite_session(path: &Path, allow_direct_file: bool) -> bool {
+    path.exists() || (allow_direct_file && detect_opencode_sqlite_session(path))
+}
+
+/// Load an OpenCode session from the SQLite database for export.
+///
+/// `path` is expected to be `<dir>/opencode.db/<url-encoded-session-id>`.
+/// Returns (title, start_ts, end_ts, messages as JSON values).
+#[allow(clippy::type_complexity)]
+fn load_opencode_sqlite_session_for_export(
+    path: &Path,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Vec<serde_json::Value>,
+)> {
+    use anyhow::Context;
+
+    let session_id_encoded = path
+        .file_name()
+        .context("missing session id in path")?
+        .to_string_lossy();
+    let session_id =
+        urlencoding::decode(&session_id_encoded).unwrap_or_else(|_| session_id_encoded.clone());
+    let db_path = path.parent().context("missing parent db path")?;
+
+    use franken_agent_detection::connectors::Connector;
+    let connector = franken_agent_detection::OpenCodeConnector::new();
+    let scan_ctx = franken_agent_detection::connectors::ScanContext::local_default(
+        db_path.to_path_buf(),
+        None,
+    );
+    let convs = connector.scan(&scan_ctx)?;
+
+    // Find the conversation matching the session id
+    let conv = convs
+        .into_iter()
+        .find(|c| c.external_id.as_deref() == Some(session_id.as_ref()))
+        .with_context(|| {
+            format!(
+                "session '{}' not found in OpenCode database at {}",
+                session_id,
+                db_path.display()
+            )
+        })?;
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for msg in &conv.messages {
+        let mut msg_json = serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        });
+        if let Some(ts) = msg.created_at {
+            msg_json["timestamp"] = serde_json::Value::from(ts);
+        }
+        if let Some(author) = &msg.author {
+            msg_json["model"] = serde_json::Value::from(author.clone());
+        }
+        messages.push(msg_json);
+    }
+
+    Ok((conv.title, conv.started_at, conv.ended_at, messages))
+}
+
 /// Load an OpenCode session for export.
 /// Returns (title, start_ts, end_ts, messages as JSON values).
 #[allow(clippy::type_complexity)]
@@ -14651,10 +14744,17 @@ fn run_export(
     let source_id = normalized_source_id.as_deref();
 
     let db_path = db_override.unwrap_or_else(default_db_path);
-    let indexed_view = try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id);
     let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(path, source_id) {
+        None
+    } else {
+        try_load_indexed_conversation_from_db_with_source(path, &db_path, source_id)
+    };
 
-    if source_id.is_none() && !path.exists() && indexed_view.is_none() {
+    if source_id.is_none()
+        && !path_exists_or_virtual_opencode_sqlite_session(path, allow_direct_file)
+        && indexed_view.is_none()
+    {
         return Err(CliError {
             code: 3,
             kind: "file-not-found",
@@ -14681,6 +14781,11 @@ fn run_export(
                 _session_end = parsed_end;
             }
             Err(err) => {
+                if indexed_view.is_none() {
+                    indexed_view = try_load_indexed_conversation_from_db_with_source(
+                        path, &db_path, source_id,
+                    );
+                }
                 if let Some(view) = indexed_view.as_ref() {
                     session_title = view.convo.title.clone();
                     session_start = view.convo.started_at;
@@ -14696,6 +14801,27 @@ fn run_export(
         session_start = view.convo.started_at;
         _session_end = view.convo.ended_at;
         messages = conversation_view_to_raw_messages(view);
+    } else if allow_direct_file && detect_opencode_sqlite_session(path) {
+        // OpenCode SQLite-backed session: path is db_path/session_id (#149)
+        match load_opencode_sqlite_session_for_export(path) {
+            Ok((title, start, end, msgs)) => {
+                session_title = title;
+                session_start = start;
+                _session_end = end;
+                messages = msgs;
+            }
+            Err(e) => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "opencode-sqlite-parse",
+                    message: format!("Failed to load OpenCode SQLite session: {e}"),
+                    hint: Some(
+                        "Ensure the OpenCode database exists and the session ID is valid".into(),
+                    ),
+                    retryable: false,
+                });
+            }
+        }
     } else if allow_direct_file && detect_opencode_session(path) {
         match load_opencode_session_for_export(path) {
             Ok((title, start, end, msgs)) => {
@@ -14788,7 +14914,9 @@ fn run_export(
             code: 9,
             kind: "empty-session",
             message: format!("No messages found in: {}", path.display()),
-            hint: if allow_direct_file && detect_opencode_session(path) {
+            hint: if allow_direct_file && detect_opencode_sqlite_session(path) {
+                Some("This path references an OpenCode SQLite session. Use `cass sessions --json` to list available sessions and their exportable paths.".into())
+            } else if allow_direct_file && detect_opencode_session(path) {
                 Some("Check that storage/message/{sessionID}/ contains message files".into())
             } else {
                 None
@@ -14901,12 +15029,18 @@ fn run_export_html(
     };
 
     let db_path = db_override.unwrap_or_else(default_db_path);
-    let indexed_view =
-        try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id);
     let allow_direct_file = followup_source_is_local(source_id) || source_id.is_none();
+    let mut indexed_view = if should_defer_indexed_lookup_for_direct_export(session_path, source_id)
+    {
+        None
+    } else {
+        try_load_indexed_conversation_from_db_with_source(session_path, &db_path, source_id)
+    };
 
     // --- Validate session exists ---
-    if indexed_view.is_none() && !(allow_direct_file && session_path.exists()) {
+    if indexed_view.is_none()
+        && !path_exists_or_virtual_opencode_sqlite_session(session_path, allow_direct_file)
+    {
         let err = CliError {
             code: 3,
             kind: "session_not_found",
@@ -15032,6 +15166,13 @@ fn run_export_html(
                 session_end = parsed_end;
             }
             Err(err) => {
+                if indexed_view.is_none() {
+                    indexed_view = try_load_indexed_conversation_from_db_with_source(
+                        session_path,
+                        &db_path,
+                        source_id,
+                    );
+                }
                 if let Some(view) = indexed_view.as_ref() {
                     session_title = view.convo.title.clone();
                     session_start = view.convo.started_at;
@@ -15081,7 +15222,32 @@ fn run_export_html(
             workspace = Some(parent.display().to_string());
         }
 
-        if allow_direct_file && detect_opencode_session(session_path) {
+        if allow_direct_file && detect_opencode_sqlite_session(session_path) {
+            // OpenCode SQLite-backed session: path is db_path/session_id (#149)
+            match load_opencode_sqlite_session_for_export(session_path) {
+                Ok((title, start, end, msgs)) => {
+                    session_title = title;
+                    session_start = start;
+                    session_end = end;
+                    raw_messages = msgs;
+                    agent_name = Some("opencode".to_string());
+                }
+                Err(e) => {
+                    let err = CliError {
+                        code: 9,
+                        kind: "opencode_sqlite_parse",
+                        message: format!("Failed to load OpenCode SQLite session: {e}"),
+                        hint: Some(
+                            "Ensure the OpenCode database exists and the session ID is valid"
+                                .into(),
+                        ),
+                        retryable: false,
+                    };
+                    emit_structured_error(&err);
+                    return Err(err);
+                }
+            }
+        } else if allow_direct_file && detect_opencode_session(session_path) {
             match load_opencode_session_for_export(session_path) {
                 Ok((title, start, end, msgs)) => {
                     session_title = title;
@@ -16192,6 +16358,37 @@ mod export_timestamp_tests {
             err.message
         );
     }
+
+    #[test]
+    fn export_html_accepts_virtual_opencode_sqlite_session_paths() {
+        let temp = TempDir::new().expect("temp dir");
+        let db_path = temp.path().join("opencode.db");
+        fs::write(&db_path, b"not a sqlite db").expect("write placeholder db file");
+        let session_path = db_path.join("session-1");
+
+        let err = run_export_html(
+            &session_path,
+            None,
+            None,
+            Some(temp.path()),
+            Some("out.html"),
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+            false,
+            "system",
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect_err("invalid virtual sqlite session should fail after path acceptance");
+
+        assert_eq!(err.kind, "opencode_sqlite_parse");
+    }
 }
 
 #[cfg(test)]
@@ -16616,6 +16813,27 @@ mod indexed_conversation_fallback_tests {
             canonical_followup_source_id(Some("\tLOCAL\n")).as_deref(),
             Some(crate::sources::provenance::LOCAL_SOURCE_ID)
         );
+    }
+
+    #[test]
+    fn defer_index_lookup_for_direct_opencode_and_jsonl_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let jsonl = tmp.path().join("session.jsonl");
+        std::fs::write(&jsonl, "{\"role\":\"user\",\"content\":\"hello\"}\n").expect("write jsonl");
+
+        let opencode_db = tmp.path().join("opencode.db");
+        std::fs::write(&opencode_db, b"placeholder").expect("write db");
+        let virtual_session = opencode_db.join("session-1");
+
+        assert!(should_defer_indexed_lookup_for_direct_export(&jsonl, None));
+        assert!(should_defer_indexed_lookup_for_direct_export(
+            &virtual_session,
+            None
+        ));
+        assert!(!should_defer_indexed_lookup_for_direct_export(
+            Path::new("/missing/indexed/session.jsonl"),
+            Some("work-laptop")
+        ));
     }
 
     #[test]
