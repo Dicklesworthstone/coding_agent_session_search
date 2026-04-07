@@ -117,9 +117,13 @@ default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
+# Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
+# validate the optional /data/projects path checkouts before enabling local overrides.
+strict-path-dep-validation = []
 
 [build-dependencies]
 vergen = { version = "*", default-features = false, features = ["build", "cargo"] }
+toml = "*"
 
 [dev-dependencies]
 assert_cmd = "*"
@@ -166,12 +170,16 @@ strip = false
 # franken-decision = { path = "../asupersync/franken_decision" }
 # franken-evidence = { path = "../asupersync/franken_evidence" }
 # franken-kernel = { path = "../asupersync/franken_kernel" }
+# build.rs validates the committed path overrides below and can validate the
+# optional sibling repos above when `strict-path-dep-validation` is enabled.
 [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
 franken-agent-detection = { path = "../franken_agent_detection" }
 
+# Enable strict validation before uncommenting any additional sibling path overrides:
+# cargo check --features strict-path-dep-validation
 # [patch."https://github.com/Dicklesworthstone/frankensearch"]
 # frankensearch = { path = "../frankensearch/frankensearch" }
 
@@ -190,6 +198,10 @@ harness = false
 
 [[bench]]
 name = "search_perf"
+harness = false
+
+[[bench]]
+name = "search_latency_e2e"
 harness = false
 
 [[bench]]

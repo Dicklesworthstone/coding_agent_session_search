@@ -497,3 +497,55 @@ fn test_search_without_fts() {
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].title.as_deref(), Some("Test Conv"));
 }
+
+// =============================================================================
+// Path Dependency Compile Contracts
+// =============================================================================
+
+/// Lock the minimal public API surface cass expects from its sibling crates.
+///
+/// `build.rs` validates manifest/package/feature contracts; this test makes the
+/// expected symbols compile against the currently resolved dependency graph.
+#[test]
+fn test_path_dependency_compile_contracts() {
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+
+    let conn = frankensqlite::Connection::open(":memory:").expect("open frankensqlite memory db");
+    conn.execute("CREATE TABLE contract_check (value INTEGER)")
+        .expect("create contract table");
+    let _params_contract = frankensqlite::params![7_i64];
+    conn.execute("INSERT INTO contract_check(value) VALUES (7)")
+        .expect("insert contract row");
+    let value: i64 = conn
+        .query_row_map(
+            "SELECT value FROM contract_check",
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
+        )
+        .expect("query contract row");
+    assert_eq!(value, 7);
+
+    let _runtime_builder = asupersync::runtime::RuntimeBuilder::current_thread();
+    let _http_builder = asupersync::http::h1::HttpClient::builder();
+
+    let _detect_agents = franken_agent_detection::detect_installed_agents;
+    let _detect_opts = franken_agent_detection::AgentDetectOptions {
+        include_undetected: true,
+        ..Default::default()
+    };
+
+    let _open_search_reader = frankensearch::lexical::cass_open_search_reader;
+    let _reload_policy = frankensearch::lexical::ReloadPolicy::Manual;
+    assert_eq!(
+        frankensearch::ModelCategory::HashEmbedder.default_tier(),
+        frankensearch::ModelTier::Fast
+    );
+
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(8, 4, &mut pool);
+    frame.set_degradation(ftui::render::budget::DegradationLevel::Full);
+    let _style = ftui::Style::default();
+
+    let encoded = toon::encode(json!({ "contract": true }), None);
+    assert!(!encoded.is_empty(), "toon::encode should produce output");
+}
