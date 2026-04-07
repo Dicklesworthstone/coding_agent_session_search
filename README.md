@@ -2567,6 +2567,27 @@ Update check state is stored in the data directory:
 
 ---
 
+## Sibling Dependency Contract
+
+`cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite` and `franken-agent-detection`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
+
+**Build-time validation**
+- `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
+- If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
+- Enable strict enforcement with `cargo check --features strict-path-dep-validation` or `CASS_STRICT_PATH_DEP_VALIDATION=1 cargo check`. Strict mode upgrades drift warnings to hard errors and also validates the optional sibling repos before you switch them to local path overrides.
+
+**Expected interface contract**
+- `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
+- `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
+- `frankensearch`: `lexical::cass_open_search_reader`, `lexical::ReloadPolicy`, `ModelCategory`, and `ModelTier`.
+- `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
+- `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
+- `toon` (`tru`): `toon::encode(...)`.
+
+When intentionally updating one of these sibling crates, update the manifest pin, the `build.rs` contract, and the compile-contract test together.
+
+---
+
 ## 🩺 Troubleshooting
 
 - **TUI looks monochrome / “1981 mode”**: Check `TERM` and `NO_COLOR`.

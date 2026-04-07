@@ -239,6 +239,13 @@ use fsqlite::params;
 conn.execute_with_params("INSERT INTO t (a) VALUES (?1)", params![42])?;
 ```
 
+### Verified Standard SQLite File Reads
+
+`frankensqlite::Connection::open()` can open and read standard SQLite database files created by SQLite/rusqlite. That includes external app databases such as Cursor `state.vscdb`, OpenCode `opencode.db`, and historical cass databases.
+
+- Do not add `rusqlite` just to read an existing SQLite file.
+- If a specific query shape fails against one of these files, treat it as a targeted engine/query bug and file a reproducer instead of assuming the file format is unsupported.
+
 ### FrankenConnectionManager (production pattern)
 
 Use `FrankenConnectionManager` for concurrent access:
