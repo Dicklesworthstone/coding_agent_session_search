@@ -2388,11 +2388,11 @@ pub fn run_index(
         persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
         initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     }
-    // canonical_only_full_rebuild is disabled: --full must always rescan the
-    // filesystem for new session files, not just rebuild Tantivy from existing
-    // DB rows.  The previous shortcut caused `cass index --full` to silently
-    // skip any session files added after the initial DB population (CASS #153).
-    let canonical_only_full_rebuild = false;
+    // canonical_only_full_rebuild: when --force-rebuild is set and we already
+    // have canonical sessions in the DB, skip the expensive filesystem rescan
+    // and go straight to rebuild_tantivy_from_db().  Plain --full continues to
+    // rescan as expected (preserving the #153 fix).
+    let canonical_only_full_rebuild = opts.force_rebuild && initial_canonical_sessions_before_salvage > 0;
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
         false
@@ -2557,8 +2557,9 @@ pub fn run_index(
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
         let mut has_pending_historical_bundles =
             storage.has_pending_historical_bundles(&opts.db_path)?;
-        // See CASS #153: --full must always rescan the filesystem.
-        let canonical_only_full_rebuild = false;
+        // See CASS #153: plain --full must always rescan the filesystem.
+        // --force-rebuild with existing sessions skips rescan (fast path).
+        let canonical_only_full_rebuild = opts.force_rebuild && canonical_sessions_before_salvage > 0;
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             opts.watch_once_paths
                 .as_ref()
