@@ -4620,15 +4620,14 @@ impl FrankenStorage {
                 LIMIT ?1 OFFSET ?2",
                 fparams![limit, offset],
                 |row| {
-                    let agent_id: i64 = row.get_typed(1)?;
+                    let agent_id: Option<i64> = row.get_typed(1)?;
                     let workspace_id: Option<i64> = row.get_typed(2)?;
                     let source_path: String = row.get_typed(5)?;
                     let source_id: Option<String> = row.get_typed(8)?;
                     Ok(LexicalRebuildConversationRow {
                         id: Some(row.get_typed(0)?),
-                        agent_slug: agent_slugs
-                            .get(&agent_id)
-                            .cloned()
+                        agent_slug: agent_id
+                            .and_then(|aid| agent_slugs.get(&aid).cloned())
                             .unwrap_or_else(|| "unknown".to_string()),
                         workspace: workspace_id
                             .and_then(|wid| workspace_paths.get(&wid).cloned()),
