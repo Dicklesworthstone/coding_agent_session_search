@@ -4565,11 +4565,6 @@ impl FrankenStorage {
             .with_context(|| "listing conversations")
     }
 
-    /// List conversations in primary-key order for full lexical rebuilds.
-    ///
-    /// This avoids the user-facing recency sort, which forces SQLite to build a
-    /// temp B-tree on every page. Rebuilds only need a stable traversal order,
-    /// not reverse-chronological presentation.
     /// Build lookup maps for agents and workspaces to avoid JOINs in
     /// paged conversation queries.  Both tables are tiny (tens of rows)
     /// so this is effectively free.
@@ -4602,6 +4597,11 @@ impl FrankenStorage {
         Ok((agents, workspaces))
     }
 
+    /// List conversations in primary-key order for full lexical rebuilds.
+    ///
+    /// This avoids the user-facing recency sort, which forces SQLite to build a
+    /// temp B-tree on every page. Rebuilds only need a stable traversal order,
+    /// not reverse-chronological presentation.
     pub fn list_conversations_for_lexical_rebuild(
         &self,
         limit: i64,
