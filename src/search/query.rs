@@ -68,6 +68,15 @@ impl std::ops::Deref for SendConnection {
     }
 }
 
+/// NFC-normalize a query string before sanitization so that decomposed
+/// Unicode (NFD — common on macOS keyboard input) matches NFC-indexed content
+/// produced by `DefaultCanonicalizer`.
+fn nfc_sanitize_query(raw: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let nfc: String = raw.nfc().collect();
+    fs_cass_sanitize_query(&nfc)
+}
+
 fn franken_query_map_collect_retry<T, F>(
     conn: &Connection,
     sql: &str,
@@ -510,7 +519,7 @@ pub struct FiltersSummary {
 impl QueryExplanation {
     /// Build explanation from query string and filters
     pub fn analyze(query: &str, filters: &SearchFilters) -> Self {
-        let sanitized = fs_cass_sanitize_query(query);
+        let sanitized = nfc_sanitize_query(query);
         // Parse original query to preserve quotes for phrases
         let tokens = fs_cass_parse_boolean_query(query);
 
@@ -522,7 +531,7 @@ impl QueryExplanation {
         for token in &tokens {
             match token {
                 FsCassQueryToken::Term(t) => {
-                    let parts: Vec<String> = fs_cass_sanitize_query(t)
+                    let parts: Vec<String> = nfc_sanitize_query(t)
                         .split_whitespace()
                         .map(|s| s.to_string())
                         .collect();
@@ -553,7 +562,7 @@ impl QueryExplanation {
                     next_negated = false;
                 }
                 FsCassQueryToken::Phrase(p) => {
-                    let parts: Vec<String> = fs_cass_sanitize_query(p)
+                    let parts: Vec<String> = nfc_sanitize_query(p)
                         .split_whitespace()
                         .map(|s| s.trim_matches('*').to_lowercase())
                         .filter(|s| !s.is_empty())
@@ -2363,7 +2372,7 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 /// text in `fts_messages`.
 fn normalize_term_parts(raw: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    for token in fs_cass_sanitize_query(raw).split_whitespace() {
+    for token in nfc_sanitize_query(raw).split_whitespace() {
         let mut current = String::new();
         let mut chars = token.chars().peekable();
         while let Some(ch) = chars.next() {
@@ -2706,7 +2715,13 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
-        let sanitized = fs_cass_sanitize_query(query);
+        // NFC-normalize early so every downstream consumer (Tantivy query
+        // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
+        // matching the NFC-indexed content.
+        use unicode_normalization::UnicodeNormalization;
+        let query: String = query.nfc().collect();
+        let query: &str = &query;
+        let sanitized = nfc_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
         let limit = if limit == 0 {
             self.total_docs().max(1)
@@ -4918,7 +4933,7 @@ impl SearchClient {
         }
 
         sql.push_str(&format!(
-            " ORDER BY m.created_at IS NULL, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
+            " ORDER BY CASE WHEN m.created_at IS NULL THEN 1 ELSE 0 END, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
         ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
@@ -6175,7 +6190,7 @@ mod tests {
     }
 
     fn sanitize_query(raw: &str) -> String {
-        fs_cass_sanitize_query(raw)
+        nfc_sanitize_query(raw)
     }
 
     fn parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
@@ -13785,7 +13800,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_nfc_vs_nfd_differ_in_sanitization() {
+    fn unicode_nfc_and_nfd_produce_same_sanitized_query() {
         // NFC (precomposed): é = U+00E9 (single char, alphanumeric)
         let nfc = "caf\u{00E9}";
         // NFD (decomposed): e + ◌́ = U+0065 U+0301 (two chars, accent not alphanumeric)
@@ -13794,12 +13809,12 @@ mod tests {
         let san_nfc = sanitize_query(nfc);
         let san_nfd = sanitize_query(nfd);
 
-        // NFC preserves the é
+        // Both produce "café" because nfc_sanitize_query normalizes to NFC
+        // before sanitization, matching the NFC-indexed content from
+        // DefaultCanonicalizer.
         assert_eq!(san_nfc, "café");
-        // NFD strips the combining accent
-        assert_eq!(san_nfd, "cafe ");
-        // They differ — this is expected behavior (no normalization applied)
-        assert_ne!(san_nfc, san_nfd);
+        assert_eq!(san_nfd, "café");
+        assert_eq!(san_nfc, san_nfd);
     }
 
     #[test]

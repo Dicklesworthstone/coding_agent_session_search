@@ -164,8 +164,18 @@ inherits = "release"
 debug = true
 strip = false
 
-# For local development with sibling checkouts, add to a non-committed Cargo.toml section:
+# TODO: Unify the asupersync version bifurcation.  The lockfile currently has
+# two copies of asupersync 0.2.9 (crates.io for frankensqlite, git for cass).
+# Uncommenting the patches below requires that the local asupersync AND
+# frankensqlite checkouts are mutually compatible.  As of 2026-04-08 the local
+# asupersync HEAD (55501ebb) has VtabModuleFactory API changes that the local
+# frankensqlite (74200d98) has not yet adopted.  Once frankensqlite is updated:
 # [patch."https://github.com/Dicklesworthstone/asupersync"]
+# asupersync = { path = "../asupersync" }
+# franken-decision = { path = "../asupersync/franken_decision" }
+# franken-evidence = { path = "../asupersync/franken_evidence" }
+# franken-kernel = { path = "../asupersync/franken_kernel" }
+# [patch.crates-io]
 # asupersync = { path = "../asupersync" }
 # franken-decision = { path = "../asupersync/franken_decision" }
 # franken-evidence = { path = "../asupersync/franken_evidence" }
@@ -180,8 +190,14 @@ franken-agent-detection = { path = "../franken_agent_detection" }
 
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
-# frankensearch = { path = "../frankensearch/frankensearch" }
+[patch."https://github.com/Dicklesworthstone/frankensearch"]
+frankensearch = { path = "../frankensearch/frankensearch" }
+frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
+frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
+frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
+frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]

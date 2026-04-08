@@ -11529,7 +11529,7 @@ fn run_sessions(
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN messages m ON m.conversation_id = c.id
              GROUP BY c.id, a.slug, w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
-             ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC",
+             ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
             params,
             |row: &frankensqlite::Row| {
                 Ok((

@@ -241,6 +241,15 @@ impl ModelDaemon {
         }
 
         let listener = UnixListener::bind(&self.config.socket_path)?;
+        // Restrict socket to owner-only access (prevent other local users from
+        // connecting and issuing Shutdown / SubmitEmbeddingJob with arbitrary paths).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &self.config.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
         listener.set_nonblocking(true)?;
 
         info!(

@@ -4538,7 +4538,7 @@ impl FrankenStorage {
                 FROM conversations c
                 JOIN agents a ON c.agent_id = a.id
                 LEFT JOIN workspaces w ON c.workspace_id = w.id
-                ORDER BY c.started_at IS NULL, c.started_at DESC, c.id DESC
+                ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC
                 LIMIT ?1 OFFSET ?2",
                 fparams![limit, offset],
                 |row| {
@@ -12663,7 +12663,6 @@ mod tests {
                             | frankensqlite::FrankenError::BusySnapshot { .. }
                             | frankensqlite::FrankenError::WriteConflict { .. }
                             | frankensqlite::FrankenError::SerializationFailure { .. }
-                            | frankensqlite::FrankenError::DatabaseCorrupt { .. }
                     )
                 })
         }

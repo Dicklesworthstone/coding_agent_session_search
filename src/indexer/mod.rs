@@ -5447,6 +5447,10 @@ pub mod persist {
 
     fn is_retryable_franken_error(err: &anyhow::Error) -> bool {
         transient_franken_error(err).is_some_and(|inner| {
+            // DatabaseCorrupt is intentionally NOT retried here — retrying on
+            // corruption can amplify damage by hammering corrupt pages and
+            // spreading partial writes through the WAL.  Let it fail fast so
+            // the caller can trigger the backup/quarantine path instead.
             matches!(
                 inner,
                 FrankenError::Busy
@@ -5454,7 +5458,6 @@ pub mod persist {
                     | FrankenError::BusySnapshot { .. }
                     | FrankenError::WriteConflict { .. }
                     | FrankenError::SerializationFailure { .. }
-                    | FrankenError::DatabaseCorrupt { .. }
             )
         })
     }

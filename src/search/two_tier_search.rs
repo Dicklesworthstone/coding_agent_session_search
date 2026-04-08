@@ -437,16 +437,18 @@ impl TwoTierIndex {
 
         match fs_index.quality_scores_for_hits(query_vec, &all_hits) {
             Ok(scores) => {
-                // Build scored results and sort by score descending
+                // Build scored results and sort by score descending.
+                // Documents without quality-tier vectors (None) are skipped.
                 let mut results: Vec<ScoredResult> = scores
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, &score)| {
+                    .filter_map(|(idx, score)| {
+                        let s = (*score)?;
                         let message_id = *self.message_ids.get(idx)?;
                         Some(ScoredResult {
                             idx,
                             message_id,
-                            score,
+                            score: s,
                         })
                     })
                     .collect();
@@ -483,7 +485,7 @@ impl TwoTierIndex {
             .collect();
 
         match fs_index.quality_scores_for_hits(query_vec, &hits) {
-            Ok(scores) => scores,
+            Ok(scores) => scores.into_iter().map(|s| s.unwrap_or(0.0)).collect(),
             Err(e) => {
                 warn!(error = %e, "frankensearch quality scoring failed; using zero scores");
                 vec![0.0; indices.len()]
