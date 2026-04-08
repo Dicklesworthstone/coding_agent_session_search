@@ -4570,29 +4570,68 @@ impl FrankenStorage {
     /// This avoids the user-facing recency sort, which forces SQLite to build a
     /// temp B-tree on every page. Rebuilds only need a stable traversal order,
     /// not reverse-chronological presentation.
+    /// Build lookup maps for agents and workspaces to avoid JOINs in
+    /// paged conversation queries.  Both tables are tiny (tens of rows)
+    /// so this is effectively free.
+    pub fn build_lexical_rebuild_lookups(
+        &self,
+    ) -> Result<(HashMap<i64, String>, HashMap<i64, PathBuf>)> {
+        let agents: HashMap<i64, String> = self
+            .conn
+            .query_map_collect(
+                "SELECT id, slug FROM agents",
+                fparams![],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
+            )
+            .with_context(|| "loading agent lookup for lexical rebuild")?
+            .into_iter()
+            .collect();
+        let workspaces: HashMap<i64, PathBuf> = self
+            .conn
+            .query_map_collect(
+                "SELECT id, path FROM workspaces",
+                fparams![],
+                |row| {
+                    let path_str: String = row.get_typed(1)?;
+                    Ok((row.get_typed::<i64>(0)?, PathBuf::from(path_str)))
+                },
+            )
+            .with_context(|| "loading workspace lookup for lexical rebuild")?
+            .into_iter()
+            .collect();
+        Ok((agents, workspaces))
+    }
+
     pub fn list_conversations_for_lexical_rebuild(
         &self,
         limit: i64,
         offset: i64,
+        agent_slugs: &HashMap<i64, String>,
+        workspace_paths: &HashMap<i64, PathBuf>,
     ) -> Result<Vec<LexicalRebuildConversationRow>> {
+        // Single-table query avoids the 3-table JOIN that triggers
+        // frankensqlite's full-materialization fallback path.
         self.conn
             .query_map_collect(
-                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
-                       c.started_at, c.ended_at, c.source_id, c.origin_host
-                FROM conversations c
-                JOIN agents a ON c.agent_id = a.id
-                LEFT JOIN workspaces w ON c.workspace_id = w.id
-                ORDER BY c.id ASC
+                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                       started_at, ended_at, source_id, origin_host
+                FROM conversations
+                ORDER BY id ASC
                 LIMIT ?1 OFFSET ?2",
                 fparams![limit, offset],
                 |row| {
-                    let workspace_path: Option<String> = row.get_typed(2)?;
+                    let agent_id: i64 = row.get_typed(1)?;
+                    let workspace_id: Option<i64> = row.get_typed(2)?;
                     let source_path: String = row.get_typed(5)?;
                     let source_id: Option<String> = row.get_typed(8)?;
                     Ok(LexicalRebuildConversationRow {
                         id: Some(row.get_typed(0)?),
-                        agent_slug: row.get_typed(1)?,
-                        workspace: workspace_path.map(|p| Path::new(&p).to_path_buf()),
+                        agent_slug: agent_slugs
+                            .get(&agent_id)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        workspace: workspace_id
+                            .and_then(|wid| workspace_paths.get(&wid).cloned()),
                         external_id: row.get_typed(3)?,
                         title: row.get_typed(4)?,
                         source_path: Path::new(&source_path).to_path_buf(),
@@ -13881,8 +13920,10 @@ mod tests {
             ]
         );
 
+        let (agent_slugs, workspace_paths) =
+            storage.build_lexical_rebuild_lookups().unwrap();
         let rebuild_order: Vec<PathBuf> = storage
-            .list_conversations_for_lexical_rebuild(10, 0)
+            .list_conversations_for_lexical_rebuild(10, 0, &agent_slugs, &workspace_paths)
             .unwrap()
             .into_iter()
             .map(|conv| conv.source_path)

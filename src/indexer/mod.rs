@@ -3652,6 +3652,11 @@ pub(crate) fn rebuild_tantivy_from_db(
         source_map.insert(source.id, (source.kind, source.host_label));
     }
 
+    // Pre-fetch agent/workspace lookup maps to avoid 3-table JOINs in the
+    // paged conversation query — frankensqlite materialises the full
+    // Cartesian product for multi-table JOINs, causing 200x+ regressions.
+    let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
+
     let index_path = index_dir(data_dir)?;
     let db_state = lexical_rebuild_db_state(&storage, db_path)?;
     let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
@@ -3813,7 +3818,12 @@ pub(crate) fn rebuild_tantivy_from_db(
     };
 
     loop {
-        let batch = storage.list_conversations_for_lexical_rebuild(page_size, offset)?;
+        let batch = storage.list_conversations_for_lexical_rebuild(
+            page_size,
+            offset,
+            &agent_slugs,
+            &workspace_paths,
+        )?;
         if batch.is_empty() {
             break;
         }
