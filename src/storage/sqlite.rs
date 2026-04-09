@@ -6185,13 +6185,13 @@ impl FrankenStorage {
             .conn
             .execute_compat(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                 SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                 SELECT m.id, m.content, c.title,
+                        (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                        (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                        c.source_path, m.created_at
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
-                 LEFT JOIN workspaces w ON c.workspace_id = w.id
-                 LEFT JOIN fts_messages f ON f.rowid = m.id
-                 WHERE f.rowid IS NULL
+                 WHERE NOT EXISTS (SELECT 1 FROM fts_messages f WHERE f.rowid = m.id)
                  ORDER BY m.rowid",
                 fparams![],
             )
@@ -6248,11 +6248,12 @@ impl FrankenStorage {
                 self.conn
                     .execute_compat(
                         "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                         SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                         SELECT m.id, m.content, c.title,
+                                (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                                (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                                c.source_path, m.created_at
                          FROM messages m
                          JOIN conversations c ON m.conversation_id = c.id
-                         JOIN agents a ON c.agent_id = a.id
-                         LEFT JOIN workspaces w ON c.workspace_id = w.id
                          WHERE m.rowid > ?1 AND m.rowid <= ?2
                          ORDER BY m.rowid",
                         fparams![last_rowid, upper],
@@ -6268,11 +6269,12 @@ impl FrankenStorage {
                 self.conn
                     .execute_compat(
                         "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-                         SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+                         SELECT m.id, m.content, c.title,
+                                (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                                (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                                c.source_path, m.created_at
                          FROM messages m
                          JOIN conversations c ON m.conversation_id = c.id
-                         JOIN agents a ON c.agent_id = a.id
-                         LEFT JOIN workspaces w ON c.workspace_id = w.id
                          WHERE m.rowid > ?1
                          ORDER BY m.rowid",
                         fparams![last_rowid],
