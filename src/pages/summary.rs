@@ -831,43 +831,27 @@ impl<'a> SummaryGenerator<'a> {
         params: &[ParamValue],
         total_conversations: usize,
     ) -> Result<Vec<AgentSummaryItem>> {
+        // LEFT JOIN + COALESCE on agents so the summary correctly bucketizes
+        // legacy V1 conversations with NULL agent_id under 'unknown' (and
+        // avoids a runtime row-decode crash when c.agent_id is NULL).
+        // Fetching the slug directly in the join also removes the need for
+        // the separate agent_id -> slug resolution query.
         let query = format!(
-            "SELECT c.id, c.agent_id
+            "SELECT c.id, COALESCE(a.slug, 'unknown')
              FROM conversations c
+             LEFT JOIN agents a ON c.agent_id = a.id
              WHERE 1=1{}",
             where_clause
         );
 
         let conv_rows = self.db.query_map_collect(&query, params, |row: &Row| {
-            Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?))
+            Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
         })?;
 
-        let mut agent_ids: Vec<i64> = conv_rows.iter().map(|(_, agent_id)| *agent_id).collect();
-        agent_ids.sort_unstable();
-        agent_ids.dedup();
-
-        let agent_map = if agent_ids.is_empty() {
-            HashMap::new()
-        } else {
-            let agent_params: Vec<ParamValue> =
-                agent_ids.iter().copied().map(ParamValue::from).collect();
-            let placeholders = vec!["?"; agent_params.len()].join(", ");
-            let agent_query = format!("SELECT id, slug FROM agents WHERE id IN ({placeholders})");
-            self.db
-                .query_map_collect(&agent_query, &agent_params, |row: &Row| {
-                    Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
-                })?
-                .into_iter()
-                .collect::<HashMap<_, _>>()
-        };
-
         let mut aggregates: HashMap<String, Vec<i64>> = HashMap::new();
-        for (conversation_id, agent_id) in conv_rows {
-            let Some(agent) = agent_map.get(&agent_id) else {
-                continue;
-            };
+        for (conversation_id, agent_slug) in conv_rows {
             aggregates
-                .entry(agent.clone())
+                .entry(agent_slug)
                 .or_default()
                 .push(conversation_id);
         }

@@ -3202,7 +3202,9 @@ impl SearchClient {
                     let source_path: String = row.get_typed(2)?;
                     let idx: i64 = row.get_typed(3)?;
                     let message_id_raw: i64 = row.get_typed(4)?;
-                    let agent_id_raw: i64 = row.get_typed(5)?;
+                    // agent_id is nullable for legacy V1 conversations; treat
+                    // NULL the same as the negative-sentinel branch below (0).
+                    let agent_id_raw: Option<i64> = row.get_typed(5)?;
                     let workspace_id_raw: Option<i64> = row.get_typed(6)?;
                     let role_raw: String = row.get_typed(7)?;
                     let created_at_ms: Option<i64> = row.get_typed(8)?;
@@ -3217,10 +3219,10 @@ impl SearchClient {
                     let message_id = u64::try_from(message_id_raw).map_err(|_| {
                         std::io::Error::other("message id out of range for progressive doc_id")
                     })?;
-                    let agent_id = if agent_id_raw < 0 {
-                        0
-                    } else {
-                        u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
+                    let agent_id = match agent_id_raw {
+                        None => 0,
+                        Some(raw) if raw < 0 => 0,
+                        Some(raw) => u32::try_from(raw).unwrap_or(u32::MAX),
                     };
                     let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
                         0
@@ -3291,7 +3293,9 @@ impl SearchClient {
                     let source_path: String = row.get_typed(1)?;
                     let idx: i64 = row.get_typed(2)?;
                     let message_id_raw: i64 = row.get_typed(3)?;
-                    let agent_id_raw: i64 = row.get_typed(4)?;
+                    // agent_id is nullable for legacy V1 conversations; treat
+                    // NULL the same as the negative-sentinel branch below (0).
+                    let agent_id_raw: Option<i64> = row.get_typed(4)?;
                     let workspace_id_raw: Option<i64> = row.get_typed(5)?;
                     let role_raw: String = row.get_typed(6)?;
                     let created_at_ms: Option<i64> = row.get_typed(7)?;
@@ -3306,10 +3310,10 @@ impl SearchClient {
                     let message_id = u64::try_from(message_id_raw).map_err(|_| {
                         std::io::Error::other("message id out of range for progressive doc_id")
                     })?;
-                    let agent_id = if agent_id_raw < 0 {
-                        0
-                    } else {
-                        u32::try_from(agent_id_raw).unwrap_or(u32::MAX)
+                    let agent_id = match agent_id_raw {
+                        None => 0,
+                        Some(raw) if raw < 0 => 0,
+                        Some(raw) => u32::try_from(raw).unwrap_or(u32::MAX),
                     };
                     let workspace_id = if workspace_id_raw.unwrap_or(0) < 0 {
                         0

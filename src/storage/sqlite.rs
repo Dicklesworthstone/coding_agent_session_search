@@ -6375,9 +6375,13 @@ impl FrankenStorage {
 
     /// Fetch all messages for embedding generation.
     pub fn fetch_messages_for_embedding(&self) -> Result<Vec<MessageForEmbedding>> {
+        // COALESCE(c.agent_id, 0) so legacy V1 conversations with NULL
+        // agent_id don't cause a runtime row-decode failure (agent_id in
+        // MessageForEmbedding is i64).  saturating_u32_from_i64 downstream
+        // turns 0 into the "unknown agent" sentinel for doc-id hashing.
         self.conn
             .query_map_collect(
-                "SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
+                "SELECT m.id, m.created_at, COALESCE(c.agent_id, 0), c.workspace_id, c.source_id, m.role, m.content
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
                  ORDER BY m.id",
@@ -6406,9 +6410,10 @@ impl FrankenStorage {
         &self,
         since_id: i64,
     ) -> Result<Vec<MessageForEmbedding>> {
+        // Same COALESCE(c.agent_id, 0) guard as fetch_messages_for_embedding.
         self.conn
             .query_map_collect(
-                "SELECT m.id, m.created_at, c.agent_id, c.workspace_id, c.source_id, m.role, m.content
+                "SELECT m.id, m.created_at, COALESCE(c.agent_id, 0), c.workspace_id, c.source_id, m.role, m.content
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
                  WHERE m.id > ?1
