@@ -272,9 +272,12 @@ pub fn scan_database<P: AsRef<Path>>(
     let mut seen: HashSet<String> = HashSet::new();
     let mut truncated = false;
 
+    // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
+    // conversations with NULL agent_id — dropping them would hide credential
+    // leaks rather than exposing them.
     let (conv_where, conv_params) = build_where_clause(filters)?;
     let conv_sql = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, a.slug, w.path\n         FROM conversations c\n         JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
         conv_where
     );
     let conv_param_values = params_from_iter(conv_params);
@@ -338,7 +341,7 @@ pub fn scan_database<P: AsRef<Path>>(
     if !truncated {
         let (msg_where, msg_params) = build_where_clause(filters)?;
         let msg_sql = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, a.slug, w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             msg_where
         );
         let msg_param_values = params_from_iter(msg_params);
@@ -403,7 +406,7 @@ pub fn scan_database<P: AsRef<Path>>(
     if !truncated && table_exists(&conn, "snippets") {
         let (snip_where, snip_params) = build_where_clause(filters)?;
         let snip_sql = format!(
-            "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, a.slug, w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
             snip_where
         );
         let snip_param_values = params_from_iter(snip_params);

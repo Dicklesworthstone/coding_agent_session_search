@@ -171,13 +171,17 @@ impl ExportEngine {
                 )
                 .context("Failed to create messages_code_fts table")?;
 
-                // 4. Query Source
+                // 4. Query Source.  LEFT JOIN + COALESCE on agents so the
+                // export path includes legacy NULL-agent conversations
+                // (otherwise the exported archive silently omits them).
+                // Agent filter becomes an EXISTS guard against the agents
+                // table so it works correctly without the joined column.
                 let mut query = String::from(
-                "SELECT c.id, a.slug as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
+                "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
              c.metadata_json
              FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE 1=1"
             );
@@ -187,7 +191,7 @@ impl ExportEngine {
                     if agents.is_empty() {
                         query.push_str(" AND 1=0");
                     } else {
-                        query.push_str(" AND a.slug IN (");
+                        query.push_str(" AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (");
                         for (i, agent) in agents.iter().enumerate() {
                             if i > 0 {
                                 query.push_str(", ");
@@ -195,7 +199,7 @@ impl ExportEngine {
                             query.push('?');
                             params.push(ParamValue::from(agent.clone()));
                         }
-                        query.push(')');
+                        query.push_str("))");
                     }
                 }
 
