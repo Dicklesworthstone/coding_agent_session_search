@@ -2326,6 +2326,7 @@ version = "0.1.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
+ "dashmap",
  "foldhash 0.1.5",
  "fsqlite-error",
  "fsqlite-observability",

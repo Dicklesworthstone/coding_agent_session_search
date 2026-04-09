@@ -11701,12 +11701,16 @@ fn run_sessions(
 
 /// Find related sessions for a given source path.
 /// Returns sessions that share the same workspace, same day, or same agent.
+///
+/// The second tuple element (agent_id) is Option<i64> because legacy V1
+/// conversations may have NULL agent_id.  Callers that want to filter by
+/// "same agent" should skip that filter when agent_id is None.
 #[allow(clippy::type_complexity)]
 fn find_context_source_conversation(
     conn: &frankensqlite::Connection,
     path_str: &str,
     source_id: Option<&str>,
-) -> Option<(i64, i64, Option<i64>, Option<i64>, String, String, String)> {
+) -> Option<(i64, Option<i64>, Option<i64>, Option<i64>, String, String, String)> {
     use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
@@ -11888,8 +11892,10 @@ fn run_context(
         Vec::new()
     };
 
-    // Find related sessions: same agent (excluding self)
-    let same_agent: Vec<(String, String, Option<i64>, String)> = {
+    // Find related sessions: same agent (excluding self).  Skip this lookup
+    // entirely when the source conversation has a NULL agent_id (legacy V1
+    // row) — there's no meaningful "same agent" grouping in that case.
+    let same_agent: Vec<(String, String, Option<i64>, String)> = if let Some(agent_id) = agent_id {
         let query = format!(
             "SELECT c.source_path, c.title, c.started_at, {normalized_source_sql}
                  FROM conversations c
@@ -11914,6 +11920,8 @@ fn run_context(
             },
         )
         .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    } else {
+        Vec::new()
     };
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
