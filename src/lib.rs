@@ -11513,7 +11513,11 @@ fn run_sessions(
         i64,
     )> = conn
         .query_map_collect(
-            "SELECT a.slug,
+            // LEFT JOIN + COALESCE on agents so list_sessions still reports
+            // legacy conversations with NULL agent_id.  GROUP BY must use the
+            // same COALESCE expression so those rows group into a single
+            // 'unknown' bucket.
+            "SELECT COALESCE(a.slug, 'unknown') AS agent_slug,
                     w.path,
                     c.title,
                     c.source_path,
@@ -11524,11 +11528,11 @@ fn run_sessions(
                     COUNT(m.id) AS message_count,
                     COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS human_turns
              FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN messages m ON m.conversation_id = c.id
-             GROUP BY c.id, a.slug, w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
+             GROUP BY c.id, COALESCE(a.slug, 'unknown'), w.path, c.title, c.source_path, COALESCE(c.source_id, 'local'), c.origin_host, s.kind, c.started_at
              ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC",
             params,
             |row: &frankensqlite::Row| {
@@ -11706,10 +11710,13 @@ fn find_context_source_conversation(
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
     let source_id = canonical_followup_source_id(source_id);
     if let Some(source_id) = source_id.as_deref() {
+        // LEFT JOIN + COALESCE on agents: find_context_source_conversation
+        // must return the most-recent matching conversation even if it has a
+        // legacy NULL agent_id (V1 schema).
         let query = format!(
-            "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, a.slug, {normalized_source_sql}
+            "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, COALESCE(a.slug, 'unknown'), {normalized_source_sql}
              FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              WHERE c.source_path = ? AND {normalized_source_sql} = ?
              ORDER BY c.started_at DESC
              LIMIT 1"
@@ -11734,9 +11741,9 @@ fn find_context_source_conversation(
     }
 
     let query = format!(
-        "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, a.slug, {normalized_source_sql}
+        "SELECT c.id, c.agent_id, c.workspace_id, c.started_at, c.title, COALESCE(a.slug, 'unknown'), {normalized_source_sql}
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN agents a ON c.agent_id = a.id
          WHERE c.source_path = ?
          ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, c.started_at DESC
          LIMIT 1",
@@ -11814,9 +11821,9 @@ fn run_context(
     let same_workspace: Vec<(String, String, String, Option<i64>, String)> =
         if let Some(ws_id) = workspace_id {
             let query = format!(
-                "SELECT c.source_path, c.title, a.slug, c.started_at, {normalized_source_sql}
+                "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  WHERE c.workspace_id = ? AND c.id != ?
                  ORDER BY c.started_at DESC
                  LIMIT ?"
@@ -11849,9 +11856,9 @@ fn run_context(
         let day_start = ts - (ts % 86_400_000); // Start of day in milliseconds
         let day_end = day_start + 86_400_000;
         let query = format!(
-            "SELECT c.source_path, c.title, a.slug, c.started_at, {normalized_source_sql}
+            "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  WHERE c.started_at >= ? AND c.started_at < ? AND c.id != ?
                  ORDER BY c.started_at DESC
                  LIMIT ?"
@@ -19442,11 +19449,15 @@ fn run_timeline(
         (start, end)
     };
 
+    // LEFT JOIN + COALESCE on agents so timeline reporting doesn't silently
+    // drop legacy conversations with NULL agent_id.  Agent filter becomes
+    // an EXISTS guard against the agents table so it works with the
+    // correlated lookup rather than a joined column.
     let mut sql = String::from(
-        "SELECT c.id, a.slug as agent, c.title, c.started_at, c.ended_at, c.source_path,
+        "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, c.title, c.started_at, c.ended_at, c.source_path,
                 COUNT(m.id) as message_count, COALESCE(c.source_id, 'local') as source_id, c.origin_host, s.kind as origin_kind
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN sources s ON c.source_id = s.id
          LEFT JOIN messages m ON m.conversation_id = c.id
          WHERE c.started_at >= ?1 AND c.started_at <= ?2",
@@ -19455,7 +19466,7 @@ fn run_timeline(
     let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
-        sql.push_str(" AND a.slug IN (");
+        sql.push_str(" AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (");
         for (i, agent) in agents.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
@@ -19463,7 +19474,7 @@ fn run_timeline(
             sql.push_str(&format!("?{}", params.len() + 1));
             params.push(agent.clone().into());
         }
-        sql.push(')');
+        sql.push_str("))");
     }
 
     // Source filter (P3.2)
