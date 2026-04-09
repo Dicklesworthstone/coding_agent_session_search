@@ -301,11 +301,14 @@ fn load_conversation_by_id_uncached(
     storage: &FrankenStorage,
     conversation_id: i64,
 ) -> Result<Option<ConversationView>> {
+    // LEFT JOIN + COALESCE on agents so conversations with NULL agent_id
+    // (legacy V1 schema) still load instead of returning "conversation not
+    // found" in the UI.  Consistent with 8a0c547c / e1c08e7c.
     let rows = storage.raw().query_map_collect(
-        "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+        "SELECT c.id, COALESCE(a.slug, 'unknown'), w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
                 c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.id = ?1
          LIMIT 1",
@@ -375,13 +378,15 @@ pub(crate) fn load_conversation_uncached(
 ) -> Result<Option<ConversationView>> {
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    // LEFT JOIN + COALESCE on agents for the same NULL-agent_id safety as
+    // load_conversation_by_id_uncached.
     let (sql, params) = if let Some(source_id) = source_id {
         (
             format!(
-                "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                "SELECT c.id, COALESCE(a.slug, 'unknown'), w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
                  WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
                  ORDER BY c.started_at DESC LIMIT 1"
@@ -391,10 +396,10 @@ pub(crate) fn load_conversation_uncached(
     } else {
         (
             format!(
-                "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+                "SELECT c.id, COALESCE(a.slug, 'unknown'), w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
+                 LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
                  WHERE c.source_path = ?1
                  ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END,
@@ -732,11 +737,13 @@ pub fn load_conversation_for_hit(
 
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    // LEFT JOIN + COALESCE on agents for consistency with the other UI
+    // conversation loaders (NULL agent_id rows must still load).
     let sql = format!(
-        "SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
+        "SELECT c.id, COALESCE(a.slug, 'unknown'), w.id, w.path, w.display_name, c.external_id, c.title, c.source_path,
                 c.started_at, c.ended_at, c.approx_tokens, c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
          FROM conversations c
-         JOIN agents a ON c.agent_id = a.id
+         LEFT JOIN agents a ON c.agent_id = a.id
          LEFT JOIN workspaces w ON c.workspace_id = w.id
          WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
          ORDER BY c.started_at DESC"
