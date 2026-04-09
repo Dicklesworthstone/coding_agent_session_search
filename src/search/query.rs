@@ -3436,11 +3436,15 @@ impl SearchClient {
             "''"
         };
         let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        // LEFT JOIN + COALESCE on agents so search hits for conversations
+        // with NULL agent_id (legacy V1 schema) still surface instead of
+        // being silently dropped from results.  Consistent with the fts/
+        // lexical rebuild paths (8a0c547c, e1c08e7c).
         let sql = format!(
-            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, a.slug, w.path, s.kind, c.started_at
+            "SELECT m.id, c.id, m.content, m.created_at, m.idx, m.role, {title_expr}, c.source_path, {normalized_source_sql}, c.origin_host, COALESCE(a.slug, 'unknown'), w.path, s.kind, c.started_at
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
              WHERE m.id IN ({placeholders})"
@@ -4877,13 +4881,21 @@ impl SearchClient {
         } else {
             "''"
         };
+        // Replace INNER JOIN agents with a correlated subquery: (a) avoids
+        // frankensqlite's multi-table-JOIN-with-LIMIT/OFFSET materialization
+        // fallback on every paginated search, and (b) stops silently dropping
+        // search hits whose conversation has a NULL agent_id (legacy V1 rows)
+        // by degrading to 'unknown' consistently with e1c08e7c / 8a0c547c.
+        // The agent filter below becomes an EXISTS guard instead of a slug
+        // equality on the joined column.
         let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
         let mut sql = format!(
-            "SELECT c.id, {title_expr}, m.content, a.slug, w.path, c.source_path, m.created_at, m.idx, \
+            "SELECT c.id, {title_expr}, m.content, \
+                 COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'), \
+                 w.path, c.source_path, m.created_at, m.idx, \
                  {normalized_source_sql}, c.origin_host, s.kind
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
              WHERE 1=1"
@@ -4892,7 +4904,9 @@ impl SearchClient {
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(" AND a.slug IN ({placeholders})"));
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug IN ({placeholders}))"
+            ));
             for a in &filters.agents {
                 params.push(ParamValue::from(a.as_str()));
             }
