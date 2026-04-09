@@ -4548,14 +4548,21 @@ impl FrankenStorage {
 
     /// List conversations with pagination.
     pub fn list_conversations(&self, limit: i64, offset: i64) -> Result<Vec<Conversation>> {
+        // Avoid the multi-table JOIN with LIMIT/OFFSET that triggers
+        // frankensqlite's materialization fallback (see c38edcd9, 860acb12).
+        // Use correlated subqueries for the tiny agents (~20 rows) and
+        // workspaces (~30 rows) lookup tables and degrade NULL agent_id to
+        // the same 'unknown' sentinel that 8a0c547c established for the
+        // lexical rebuild path.
         self.conn
             .query_map_collect(
-                r"SELECT c.id, a.slug, w.path, c.external_id, c.title, c.source_path,
-                       c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
-                       c.source_id, c.origin_host, c.metadata_bin
+                r"SELECT c.id,
+                         COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
+                         (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                         c.external_id, c.title, c.source_path,
+                         c.started_at, c.ended_at, c.approx_tokens, c.metadata_json,
+                         c.source_id, c.origin_host, c.metadata_bin
                 FROM conversations c
-                JOIN agents a ON c.agent_id = a.id
-                LEFT JOIN workspaces w ON c.workspace_id = w.id
                 ORDER BY CASE WHEN c.started_at IS NULL THEN 1 ELSE 0 END, c.started_at DESC, c.id DESC
                 LIMIT ?1 OFFSET ?2",
                 fparams![limit, offset],
@@ -8632,14 +8639,18 @@ impl FrankenStorage {
                 Option<i64>,
                 String,
             )> = tx.query_map_collect(
+                // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
+                // frankensqlite's materialization fallback (see 860acb12).
+                // Inline the agent slug lookup as a correlated subquery and
+                // fall back to 'unknown' for NULL agent_id, matching the
+                // FTS / lexical rebuild paths.
                 "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
                         m.created_at,
                         c.id AS conv_id, c.started_at AS conv_started_at,
                         c.source_id, c.workspace_id,
-                        a.slug AS agent_slug
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
-                 JOIN agents a ON c.agent_id = a.id
                  ORDER BY m.id
                  LIMIT ?1 OFFSET ?2",
                 fparams![CHUNK_SIZE, offset],
@@ -8871,10 +8882,16 @@ impl FrankenStorage {
         };
 
         loop {
+            // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
+            // materialization fallback (which is what the OOM retry below is
+            // defending against — see 860acb12).  Inline agent slug via
+            // correlated subquery and degrade NULL agent_id to 'unknown' for
+            // consistency with the lexical/FTS rebuild paths.
             let conversation_rows = match self.conn.query_with_params(
-                "SELECT c.id, c.started_at, a.slug, c.source_id
+                "SELECT c.id, c.started_at,
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
+                        c.source_id
                  FROM conversations c
-                 JOIN agents a ON c.agent_id = a.id
                  WHERE c.id > ?1
                  ORDER BY c.id
                  LIMIT ?2",
