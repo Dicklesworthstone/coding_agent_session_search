@@ -853,10 +853,10 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
     let inserted = tx
         .execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             SELECT m.id, m.content, c.title, COALESCE(a.slug, 'unknown'), w.path, c.source_path, m.created_at
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              ORDER BY m.rowid",
             [],
@@ -952,13 +952,12 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
     let inserted_rows = tx
         .execute(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             SELECT m.id, m.content, c.title, a.slug, w.path, c.source_path, m.created_at
+             SELECT m.id, m.content, c.title, COALESCE(a.slug, 'unknown'), w.path, c.source_path, m.created_at
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             LEFT JOIN fts_messages f ON f.rowid = m.id
-             WHERE f.rowid IS NULL
+             WHERE NOT EXISTS (SELECT 1 FROM fts_messages f WHERE f.rowid = m.id)
              ORDER BY m.rowid",
             [],
         )
@@ -976,6 +975,25 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
     if repaired_rows == total_messages {
         return Ok(FtsConsistencyRepair::IncrementalCatchUp {
             inserted_rows,
+            total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+        });
+    }
+
+    // Same un-indexable-gap short-circuit as the frankensqlite path: if the
+    // incremental catch-up inserted zero rows yet the gap between
+    // total_messages and indexed_messages persists, the remaining messages
+    // are orphans (dangling conversation_id) and a full rebuild would just
+    // re-exclude them.  Accept the current state instead of looping.
+    if inserted_rows == 0 {
+        tracing::debug!(
+            db_path = %db_path.display(),
+            indexed_messages = repaired_rows,
+            total_messages,
+            un_indexable_gap = total_messages.saturating_sub(repaired_rows),
+            "FTS catch-up (rusqlite) inserted 0 rows; remaining gap is un-indexable (likely orphaned messages)"
+        );
+        return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+            inserted_rows: 0,
             total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
         });
     }
