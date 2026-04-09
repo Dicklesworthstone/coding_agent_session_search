@@ -6186,7 +6186,7 @@ impl FrankenStorage {
             .execute_compat(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                  SELECT m.id, m.content, c.title,
-                        (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                         (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                         c.source_path, m.created_at
                  FROM messages m
@@ -6249,7 +6249,7 @@ impl FrankenStorage {
                     .execute_compat(
                         "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                          SELECT m.id, m.content, c.title,
-                                (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                                 (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                                 c.source_path, m.created_at
                          FROM messages m
@@ -6270,7 +6270,7 @@ impl FrankenStorage {
                     .execute_compat(
                         "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
                          SELECT m.id, m.content, c.title,
-                                (SELECT a.slug FROM agents a WHERE a.id = c.agent_id),
+                                COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
                                 (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
                                 c.source_path, m.created_at
                          FROM messages m
