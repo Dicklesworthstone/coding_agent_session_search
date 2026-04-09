@@ -6287,13 +6287,15 @@ impl FrankenStorage {
                     })?
             };
 
-            if inserted == 0 {
-                break;
-            }
-
             total_inserted = total_inserted.saturating_add(inserted);
 
             if let Some(upper) = batch_max_rowid {
+                // Advance past this batch and loop regardless of inserted count.
+                // A zero-insert batch is possible when every row in the range is
+                // orphaned (e.g. dangling conversation_id), and breaking early
+                // would skip any valid messages that live beyond the orphaned
+                // range.  Termination is driven by batch_max_rowid returning
+                // None once we scan past the last message.
                 last_rowid = upper;
             } else {
                 // Final batch processed; we're done.
