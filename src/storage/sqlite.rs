@@ -6208,6 +6208,29 @@ impl FrankenStorage {
             });
         }
 
+        // The incremental catch-up found nothing to insert, yet the gap
+        // between total_messages (all rows, including orphans) and
+        // indexed_messages (only rows with valid conversation_id, since the
+        // FTS INSERT inner-joins on conversations) remains.  A full rebuild
+        // cannot close this gap either — the orphaned messages will be
+        // excluded again — so falling through to one would just re-do ~5 min
+        // of work on every startup.  Accept the current state.
+        if inserted_rows == 0 {
+            tracing::debug!(
+                target: "cass::fts_rebuild",
+                indexed_messages = repaired_rows,
+                total_messages,
+                un_indexable_gap = total_messages.saturating_sub(repaired_rows),
+                "FTS catch-up inserted 0 rows; remaining gap is un-indexable (likely orphaned messages with dangling conversation_id)"
+            );
+            return Ok(FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows: 0,
+                total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
+            });
+        }
+
+        // Incremental made progress but didn't fully close the gap — something
+        // is genuinely inconsistent, so do a full rebuild.
         let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
         self.record_fts_franken_rebuild_generation()?;
         Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
