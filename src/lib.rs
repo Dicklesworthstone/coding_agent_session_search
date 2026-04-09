@@ -8892,9 +8892,11 @@ fn run_stats(
         .unwrap_or(0);
     }
 
-    // Get per-agent breakdown with source filter
+    // Get per-agent breakdown with source filter.  LEFT JOIN + COALESCE so
+    // legacy NULL-agent conversations aren't silently excluded from the
+    // breakdown (they collapse into a single 'unknown' bucket instead).
     let agent_sql = format!(
-        "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY a.slug ORDER BY COUNT(*) DESC"
+        "SELECT COALESCE(a.slug, 'unknown'), COUNT(*) FROM conversations c LEFT JOIN agents a ON c.agent_id = a.id{source_where} GROUP BY COALESCE(a.slug, 'unknown') ORDER BY COUNT(*) DESC"
     );
     let agent_rows: Vec<(String, i64)> =
         franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
