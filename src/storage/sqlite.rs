@@ -5381,10 +5381,15 @@ impl FrankenStorage {
             );
         }
 
+        // LEFT JOIN + COALESCE on agents so legacy source databases with NULL
+        // agent_id (the V1 schema did not require NOT NULL) still have their
+        // conversations imported, degrading to 'unknown' slug like the other
+        // rebuild paths.  Using INNER JOIN here would silently drop those
+        // conversations during historical salvage, which is data loss.
         let conv_sql = if resume_after_row_id.is_some() {
             "SELECT
                 c.id,
-                a.slug,
+                COALESCE(a.slug, 'unknown'),
                 w.path,
                 c.external_id,
                 c.title,
@@ -5396,14 +5401,14 @@ impl FrankenStorage {
                 c.source_id,
                 c.origin_host
              FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              WHERE c.id > ?1
              ORDER BY c.id"
         } else {
             "SELECT
                 c.id,
-                a.slug,
+                COALESCE(a.slug, 'unknown'),
                 w.path,
                 c.external_id,
                 c.title,
@@ -5415,7 +5420,7 @@ impl FrankenStorage {
                 c.source_id,
                 c.origin_host
              FROM conversations c
-             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              ORDER BY c.id"
         };
@@ -6639,10 +6644,13 @@ impl FrankenStorage {
         agent_slug: Option<&str>,
         source_id: Option<&str>,
     ) -> Result<(i64, bool)> {
-        // Build dynamic SQL with positional params
-        let mut sql = "SELECT COUNT(*) FROM conversations c
-                       JOIN agents a ON c.agent_id = a.id WHERE 1=1"
-            .to_string();
+        // Build dynamic SQL with positional params.  Single-table scan of
+        // conversations; filter on agent slug via an EXISTS subquery only
+        // when that filter is actually requested.  This avoids the unneeded
+        // 2-table JOIN (which also silently dropped legacy conversations
+        // with NULL agent_id) and sidesteps frankensqlite's materialization
+        // fallback entirely.
+        let mut sql = "SELECT COUNT(*) FROM conversations c WHERE 1=1".to_string();
         let mut param_values: Vec<ParamValue> = Vec::new();
         let mut idx = 1;
 
@@ -6659,7 +6667,9 @@ impl FrankenStorage {
         if let Some(agent) = agent_slug
             && agent != "all"
         {
-            sql.push_str(&format!(" AND a.slug = ?{idx}"));
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM agents a WHERE a.id = c.agent_id AND a.slug = ?{idx})"
+            ));
             param_values.push(ParamValue::from(agent));
             idx += 1;
         }
