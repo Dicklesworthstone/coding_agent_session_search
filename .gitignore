@@ -134,6 +134,7 @@ scan.txt
 core.*
 core
 *.mcp.json.*.bak
+.mcp.json
 cline.mcp.json
 opencode.json
 windsurf.mcp.json
@@ -151,3 +152,14 @@ storage.sqlite3.bak
 storage.sqlite3.corrupt-*
 storage.sqlite3-shm.corrupt-*
 storage.sqlite3-wal.corrupt-*
+
+# Servitor runtime state and logs (ephemeral per-machine)
+.servitor/logs/
+.servitor/heartbeat.json
+.servitor/session-state.json
+
+# Worktree work area
+.worktrees/
+
+# CLI scan/report output
+output/
