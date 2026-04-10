@@ -1025,10 +1025,24 @@ fn analytics_group_by_invalid_value_returns_actionable_error() {
 // Analytics tokens data tests (br-z9fse.3.3)
 // =============================================================================
 
+/// Create an isolated analytics test environment with an empty-but-valid SQLite
+/// database. Returns (TempDir, data_dir_string) — keep TempDir alive for the
+/// test duration so the temp path isn't reclaimed.
+fn analytics_tokens_env() -> (TempDir, String) {
+    let tmp = TempDir::new().expect("temp dir");
+    let data_dir = tmp.path().join("cass_data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let db_path = data_dir.join("agent_search.db");
+    rusqlite::Connection::open(&db_path).expect("create sqlite db");
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    (tmp, data_dir_str)
+}
+
 #[test]
 fn analytics_tokens_json_returns_buckets_and_totals() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args(["analytics", "tokens", "--data-dir", &data_dir_str, "--json"]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1063,8 +1077,17 @@ fn analytics_tokens_json_returns_buckets_and_totals() {
 
 #[test]
 fn analytics_tokens_group_by_hour() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--group-by", "hour", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--group-by",
+        "hour",
+        "--data-dir",
+        &data_dir_str,
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1078,8 +1101,17 @@ fn analytics_tokens_group_by_hour() {
 
 #[test]
 fn analytics_tokens_group_by_week() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--group-by", "week", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--group-by",
+        "week",
+        "--data-dir",
+        &data_dir_str,
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1093,8 +1125,17 @@ fn analytics_tokens_group_by_week() {
 
 #[test]
 fn analytics_tokens_group_by_month() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--group-by", "month", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--group-by",
+        "month",
+        "--data-dir",
+        &data_dir_str,
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1108,8 +1149,17 @@ fn analytics_tokens_group_by_month() {
 
 #[test]
 fn analytics_tokens_with_time_filter() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--days", "7", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--days",
+        "7",
+        "--data-dir",
+        &data_dir_str,
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1135,8 +1185,17 @@ fn analytics_tokens_with_time_filter() {
 
 #[test]
 fn analytics_tokens_with_agent_filter() {
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--agent", "claude_code", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "analytics",
+        "tokens",
+        "--agent",
+        "claude_code",
+        "--data-dir",
+        &data_dir_str,
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1162,8 +1221,9 @@ fn analytics_tokens_with_agent_filter() {
 fn analytics_tokens_totals_structure_complete() {
     // Verify that the totals JSON includes all required sections
     // even when the database has no data.
-    let mut cmd = simple_cmd();
-    cmd.args(["analytics", "tokens", "--json"]);
+    let (tmp, data_dir_str) = analytics_tokens_env();
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args(["analytics", "tokens", "--data-dir", &data_dir_str, "--json"]);
     let output = cmd.assert().success().get_output().clone();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
