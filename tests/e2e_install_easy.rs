@@ -654,7 +654,6 @@ fn install_help_flag() {
 /// Run with: `cargo test --test e2e_install_easy install_lock_prevents_concurrent -- --ignored`
 #[test]
 #[ignore] // Uses global lock that interferes with parallel tests
-#[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_lock_prevents_concurrent() {
     skip_unless_install_tests!();
 
