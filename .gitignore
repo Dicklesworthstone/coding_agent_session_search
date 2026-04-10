@@ -175,3 +175,6 @@ storage.sqlite3-wal.corrupt-*
 
 # Recovery build artifacts
 .target_cass_recovery/
+
+# NTM per-repo state (rate-limit tracking, session metadata) — regenerated on demand
+.ntm/
