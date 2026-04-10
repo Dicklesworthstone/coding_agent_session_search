@@ -5150,6 +5150,12 @@ fn state_meta_json(
 
     let index_path = crate::search::tantivy::index_dir(data_dir)
         .unwrap_or_else(|_| data_dir.join("index").join("v4"));
+    let index_doc_count = if db_opened && !counts_skipped && message_count > 0 {
+        probe_state_index_doc_count(&index_path)
+    } else {
+        None
+    };
+    let index_empty_with_messages = index_doc_count == Some(0) && message_count > 0;
     if last_indexed_at.is_none() && index_path.exists() {
         let meta_path = index_path.join("meta.json");
         let probe_path = if meta_path.exists() {
@@ -5245,6 +5251,8 @@ fn state_meta_json(
             "status": lexical.status,
             "reason": lexical.status_reason,
             "fresh": lexical.fresh,
+            "documents": index_doc_count,
+            "empty_with_messages": index_empty_with_messages,
             "last_indexed_at": last_indexed_at.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
@@ -5354,6 +5362,42 @@ fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
     } else {
         serde_json::Value::from(count)
     }
+}
+
+fn probe_state_index_doc_count(index_path: &Path) -> Option<u64> {
+    let meta_path = index_path.join("meta.json");
+    if !meta_path.exists() {
+        return None;
+    }
+
+    frankensearch::lexical::cass_open_search_reader(
+        index_path,
+        frankensearch::lexical::ReloadPolicy::Manual,
+    )
+    .ok()
+    .map(|(reader, _fields)| reader.searcher().num_docs())
+}
+
+fn state_index_empty_with_messages(state: &serde_json::Value) -> bool {
+    if let Some(flag) = state
+        .get("index")
+        .and_then(|i| i.get("empty_with_messages"))
+        .and_then(|v| v.as_bool())
+    {
+        return flag;
+    }
+
+    let index_documents = state
+        .get("index")
+        .and_then(|i| i.get("documents"))
+        .and_then(|v| v.as_u64());
+    let message_count = state
+        .get("database")
+        .and_then(|d| d.get("messages"))
+        .and_then(|v| v.as_i64())
+        .and_then(|v| u64::try_from(v).ok());
+
+    matches!((index_documents, message_count), (Some(0), Some(messages)) if messages > 0)
 }
 
 fn refresh_state_database_counts_if_needed(
@@ -9475,9 +9519,15 @@ fn run_status(
         .get("semantic")
         .and_then(|s| s.get("hint"))
         .and_then(|v| v.as_str());
+    let index_empty_with_messages = state_index_empty_with_messages(&state);
 
     let db_available = db_opened || (db_exists && db_open_retryable);
-    let healthy = db_exists && db_available && index_exists && index_fresh && !rebuild_active;
+    let healthy = db_exists
+        && db_available
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
     let status = if rebuild_active {
         "rebuilding"
     } else if healthy {
@@ -9496,6 +9546,11 @@ fn run_status(
         Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_empty_with_messages {
+        Some(
+            "Run 'cass doctor --fix' or 'cass index --full' to rebuild the search index"
+                .to_string(),
+        )
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -9583,6 +9638,8 @@ fn run_status(
                 }
                 _ => println!("  Rebuild progress: in progress"),
             }
+        } else if index_empty_with_messages {
+            println!("  Warning: lexical index is empty while the database still has messages");
         }
     } else {
         println!("  Not found - run 'cass index --full'");
@@ -9701,9 +9758,15 @@ fn run_health(
         .and_then(|p| p.get("sessions"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let index_empty_with_messages = state_index_empty_with_messages(&state);
 
     let db_degraded = db_exists && !db_opened;
-    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
+    let healthy = db_exists
+        && db_opened
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
@@ -9718,6 +9781,9 @@ fn run_health(
     }
     if !index_fresh {
         errors.push("index stale".to_string());
+    }
+    if index_empty_with_messages {
+        errors.push("index empty while database has messages".to_string());
     }
     if rebuild_active {
         errors.push("index rebuild in progress".to_string());
@@ -9788,6 +9854,9 @@ fn run_health(
         }
         if !index_exists {
             println!("  - index not found");
+        }
+        if index_empty_with_messages {
+            println!("  - index empty while database has messages");
         }
         println!("Run 'cass index --full' or 'cass index --watch' to create index.");
     }
@@ -10523,6 +10592,55 @@ mod cli_read_db_tests {
         );
         assert_eq!(state["rebuild"]["indexed_docs"], serde_json::Value::Null);
         assert_eq!(state["semantic"]["fallback_mode"].as_str(), Some("lexical"));
+    }
+
+    #[test]
+    fn state_meta_json_reports_empty_index_with_database_messages() {
+        let (temp, db_path) = seed_cli_db();
+        let storage = FrankenStorage::open(&db_path).expect("open cass db");
+        storage
+            .raw()
+            .execute_batch(
+                r#"
+                INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                VALUES (1, 'codex', 'Codex', 'test', 'cli', 0, 0);
+                INSERT INTO workspaces (id, path, display_name)
+                VALUES (1, '/tmp/workspace', 'workspace');
+                INSERT INTO conversations (id, agent_id, workspace_id, source_id, source_path, title)
+                VALUES (1, 1, 1, 'local', '/tmp/session.jsonl', 'session');
+                INSERT INTO messages (id, conversation_id, idx, role, content)
+                VALUES (1, 1, 0, 'user', 'hello from a real message');
+                "#,
+            )
+            .expect("seed conversation and message");
+        drop(storage);
+
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        let mut index = crate::search::tantivy::TantivyIndex::open_or_create(&index_path)
+            .expect("create index");
+        index.commit().expect("commit empty index");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["documents"].as_u64(), Some(0));
+        assert_eq!(state["index"]["empty_with_messages"].as_bool(), Some(true));
+        assert_eq!(state["database"]["messages"].as_i64(), Some(1));
+        assert!(state_index_empty_with_messages(&state));
+    }
+
+    #[test]
+    fn state_index_empty_with_messages_detects_empty_doc_state() {
+        let state = serde_json::json!({
+            "index": {
+                "documents": 0,
+                "empty_with_messages": true
+            },
+            "database": {
+                "messages": 42
+            }
+        });
+
+        assert!(state_index_empty_with_messages(&state));
     }
 
     #[test]
