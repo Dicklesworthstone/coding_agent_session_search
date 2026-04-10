@@ -145,40 +145,45 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
 
     let active = match file.try_lock_exclusive() {
         Ok(()) => {
-            // We acquired the exclusive lock with no waiting, which means
-            // no process holds it. POSIX flock (via fs2) is released
-            // automatically when the owning file description is closed
-            // (either explicitly or when the process exits). Therefore, if
-            // the file contains metadata but no holder is present, the
-            // previous owner is dead.
+            // We acquired the exclusive lock with no waiting, which is
+            // proof that no process holds it. POSIX flock (via fs2) is
+            // released automatically when the owning file description
+            // is closed — either explicitly on graceful drop, or by the
+            // kernel on process exit / crash. Therefore, if the file
+            // contains metadata but no holder is present, the previous
+            // owner is gone.
             //
-            // Historically this produced a permanent `orphaned: true` state
-            // that callers (notably the TUI) interpreted as "rebuild in
-            // progress, keep polling" — yielding a tight CPU-bound loop
-            // that only cleared when the user manually deleted the lock
-            // file (see issue #176).
+            // Historically this produced a permanent `orphaned: true`
+            // state that callers (notably the TUI) interpreted as
+            // "rebuild in progress, keep polling" — yielding a tight
+            // CPU-bound loop that only cleared when the user manually
+            // deleted the lock file (see issue #176).
             //
-            // Reap the stale metadata in place while we hold the lock, so
-            // that this and every subsequent reader observes a clean state.
+            // Reap the stale metadata in place while we hold the lock,
+            // so that this and every subsequent reader observes a
+            // clean state.
+            //
+            // We deliberately do NOT gate this on a `kill(pid, 0)`
+            // liveness probe. Under PID reuse (the recorded pid is
+            // reassigned to an unrelated live process), such a probe
+            // would refuse to reap and the spin would reappear. Flock
+            // acquisition is the stronger and more precise signal.
             if metadata_present {
-                let owner_dead = pid.map(|p| !process_is_alive(p)).unwrap_or(true);
-                if owner_dead {
-                    if let Err(err) = file.set_len(0) {
-                        tracing::warn!(
-                            path = %lock_path.display(),
-                            error = %err,
-                            "failed to truncate stale index-run lock metadata"
-                        );
-                    } else {
-                        let _ = file.sync_all();
-                        tracing::info!(
-                            path = %lock_path.display(),
-                            dead_pid = ?pid,
-                            "cleared stale index-run lock metadata (owner dead)"
-                        );
-                        let _ = file.unlock();
-                        return SearchMaintenanceSnapshot::default();
-                    }
+                if let Err(err) = file.set_len(0) {
+                    tracing::warn!(
+                        path = %lock_path.display(),
+                        error = %err,
+                        "failed to truncate stale index-run lock metadata"
+                    );
+                } else {
+                    let _ = file.sync_all();
+                    tracing::info!(
+                        path = %lock_path.display(),
+                        stale_pid = ?pid,
+                        "cleared stale index-run lock metadata (previous owner gone)"
+                    );
+                    let _ = file.unlock();
+                    return SearchMaintenanceSnapshot::default();
                 }
             }
             let _ = file.unlock();
@@ -199,26 +204,6 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         phase,
         updated_at_ms,
         orphaned: metadata_present && !active,
-    }
-}
-
-/// Returns whether `pid` refers to a live process. Uses `/proc/<pid>` on
-/// Linux (no syscall, no external dependency). On non-Linux platforms we
-/// trust POSIX flock release semantics and return `false` — if we reached
-/// this function we already acquired the lock, which is evidence enough
-/// that the previous owner is dead.
-fn process_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
     }
 }
 

@@ -10803,14 +10803,37 @@ mod cli_read_db_tests {
         assert_eq!(target.agent, "codex");
         assert_eq!(target.session_id.as_deref(), Some("abc-123"));
 
-        // `oh-my-pi` alias must normalize to pi_agent. Use a tmp path
-        // that pre-populates a session file so id extraction can run.
+        // `oh-my-pi` alias must normalize to pi_agent AND force the `omp`
+        // binary even when the path doesn't contain `.omp/agent`.
         let temp = tempfile::tempdir().expect("tempdir");
         let sess = temp.path().join("2026-04-09T00-00-00_xyz.jsonl");
         std::fs::write(&sess, r#"{"type":"session","id":"ov-42"}"#).expect("write");
         let target = resolve_resume_target(&sess, Some("oh-my-pi")).expect("resolve");
         assert_eq!(target.agent, "pi_agent");
+        assert_eq!(
+            target.argv[0], "omp",
+            "--agent oh-my-pi must force the `omp` binary"
+        );
         assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+
+        // `pi` alias must force the `pi` binary even when path contains .omp/agent.
+        let omp_dir = temp.path().join(".omp/agent/sessions");
+        std::fs::create_dir_all(&omp_dir).expect("create dir");
+        let omp_sess = omp_dir.join("2026-04-09T00-00-00_pp.jsonl");
+        std::fs::write(&omp_sess, r#"{"type":"session","id":"pp-77"}"#).expect("write");
+        let target = resolve_resume_target(&omp_sess, Some("pi")).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(
+            target.argv[0], "pi",
+            "--agent pi must force the `pi` binary even on .omp/agent paths"
+        );
+
+        // Generic `pi_agent` alias with path hint should still use the hint.
+        let target = resolve_resume_target(&omp_sess, Some("pi_agent")).expect("resolve");
+        assert_eq!(
+            target.argv[0], "omp",
+            "--agent pi_agent falls back to path inference (.omp/agent → omp)"
+        );
     }
 
     #[test]
@@ -14994,61 +15017,109 @@ fn shell_quote(arg: &str) -> String {
     out
 }
 
+/// Result of agent detection: the normalized slug, an optional
+/// harness-binary hint (currently only meaningful for pi_agent, where
+/// the same slug can correspond to either `pi` or `omp`), and a short
+/// human-readable reason for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedAgent {
+    slug: &'static str,
+    /// Only set when the caller passed an unambiguous alias — e.g.
+    /// `--agent omp` pins the binary to `omp`, while `--agent pi_agent`
+    /// leaves it to the path-based inference inside [`resolve_resume_target`].
+    binary_hint: Option<&'static str>,
+    reason: String,
+}
+
 /// Detect which coding-agent harness owns a given session path.
 ///
 /// Detection is path-based and mirrors the layouts that the bundled
 /// connectors understand. If `agent_override` is set, its value is
-/// validated and returned verbatim. Returns a normalized slug and a
-/// short human-readable reason.
+/// validated and returned verbatim. Returns a normalized slug plus an
+/// optional binary hint (see [`DetectedAgent::binary_hint`]).
 fn detect_resume_agent(
     path: &Path,
     agent_override: Option<&str>,
-) -> CliResult<(&'static str, String)> {
+) -> CliResult<DetectedAgent> {
     if let Some(raw) = agent_override {
-        let slug = match raw.trim().to_ascii_lowercase().as_str() {
-            "claude" | "claude_code" | "claude-code" => "claude",
-            "codex" => "codex",
-            "opencode" => "opencode",
-            "pi_agent" | "pi-agent" | "pi" | "omp" | "oh-my-pi" | "ohmypi" => "pi_agent",
-            "gemini" => "gemini",
+        let normalized = raw.trim().to_ascii_lowercase();
+        let (slug, binary_hint): (&'static str, Option<&'static str>) = match normalized.as_str() {
+            "claude" | "claude_code" | "claude-code" => ("claude", None),
+            "codex" => ("codex", None),
+            "opencode" => ("opencode", None),
+            // Generic "pi_agent" / "pi-agent": let path inference pick the binary.
+            "pi_agent" | "pi-agent" => ("pi_agent", None),
+            // pi-mono: user explicitly selected the `pi` binary.
+            "pi" => ("pi_agent", Some("pi")),
+            // Oh My Pi: user explicitly selected the `omp` binary.
+            "omp" | "oh-my-pi" | "ohmypi" | "oh_my_pi" => ("pi_agent", Some("omp")),
+            "gemini" => ("gemini", None),
             other => {
                 return Err(CliError {
                     code: 2,
                     kind: "invalid_agent",
                     message: format!(
-                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, gemini"
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
                     ),
                     hint: None,
                     retryable: false,
                 });
             }
         };
-        return Ok((slug, format!("--agent override: {raw}")));
+        return Ok(DetectedAgent {
+            slug,
+            binary_hint,
+            reason: format!("--agent override: {raw}"),
+        });
     }
 
     let path_str = path.to_string_lossy();
     // Path-substring detection. These match the real on-disk layouts
     // and are ordered longest-match-first where it matters.
     if path_str.contains(".claude/projects") || path_str.contains("claude_code") {
-        return Ok(("claude", "path contains .claude/projects".to_string()));
+        return Ok(DetectedAgent {
+            slug: "claude",
+            binary_hint: None,
+            reason: "path contains .claude/projects".to_string(),
+        });
     }
     if path_str.contains(".codex/sessions") || path_str.contains("/codex/sessions") {
-        return Ok(("codex", "path contains .codex/sessions".to_string()));
+        return Ok(DetectedAgent {
+            slug: "codex",
+            binary_hint: None,
+            reason: "path contains .codex/sessions".to_string(),
+        });
     }
     if path_str.contains("opencode.db")
         || path_str.contains(".local/share/opencode")
         || path_str.contains(".config/opencode")
     {
-        return Ok(("opencode", "path references opencode storage".to_string()));
+        return Ok(DetectedAgent {
+            slug: "opencode",
+            binary_hint: None,
+            reason: "path references opencode storage".to_string(),
+        });
     }
-    if path_str.contains(".pi/agent") || path_str.contains(".omp/agent") {
-        return Ok((
-            "pi_agent",
-            "path contains .pi/agent or .omp/agent".to_string(),
-        ));
+    if path_str.contains(".omp/agent") {
+        return Ok(DetectedAgent {
+            slug: "pi_agent",
+            binary_hint: Some("omp"),
+            reason: "path contains .omp/agent".to_string(),
+        });
+    }
+    if path_str.contains(".pi/agent") {
+        return Ok(DetectedAgent {
+            slug: "pi_agent",
+            binary_hint: Some("pi"),
+            reason: "path contains .pi/agent".to_string(),
+        });
     }
     if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
-        return Ok(("gemini", "path contains gemini storage".to_string()));
+        return Ok(DetectedAgent {
+            slug: "gemini",
+            binary_hint: None,
+            reason: "path contains gemini storage".to_string(),
+        });
     }
 
     Err(CliError {
@@ -15059,7 +15130,7 @@ fn detect_resume_agent(
             path.display()
         ),
         hint: Some(
-            "Pass --agent <name> to override (claude, codex, opencode, pi_agent, gemini).".into(),
+            "Pass --agent <name> to override (claude, codex, opencode, pi, omp, gemini).".into(),
         ),
         retryable: false,
     })
@@ -15082,22 +15153,44 @@ fn extract_filename_session_id(path: &Path) -> Option<String> {
 /// Pi-agent session files begin with a `{"type":"session", ...}` header
 /// that contains `id` (and often `sessionId`). We scan up to the first
 /// 16 non-empty lines to find it, tolerating blank lines and leading
-/// metadata.
+/// metadata. Streams line-by-line so large session logs do not get
+/// read into memory in full.
 fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
-    let content = std::fs::read_to_string(path).map_err(|err| CliError {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).map_err(|err| CliError {
         code: 4,
         kind: "session_file_unreadable",
-        message: format!("cannot read pi-agent session file {}: {err}", path.display()),
+        message: format!(
+            "cannot open pi-agent session file {}: {err}",
+            path.display()
+        ),
         hint: None,
         retryable: false,
     })?;
-    for (idx, line) in content.lines().enumerate() {
-        if idx >= 16 {
-            break;
-        }
+    let reader = std::io::BufReader::new(file);
+    let mut scanned = 0usize;
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(err) => {
+                // Stop at the first I/O error — file may have been truncated
+                // mid-scan. Any partial info above is still usable via the
+                // filename fallback below.
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %err,
+                    "pi-agent: stopped reading after line I/O error"
+                );
+                break;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        scanned += 1;
+        if scanned > 16 {
+            break;
         }
         let value: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
@@ -15108,10 +15201,10 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
             return Ok(id.to_string());
         }
         let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if entry_type == "session" {
-            if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                return Ok(id.to_string());
-            }
+        if entry_type == "session"
+            && let Some(id) = value.get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
         }
     }
     // Fallback: derive from filename, matching how cass stores pi-agent
@@ -15180,9 +15273,10 @@ fn resolve_resume_target(
     path: &Path,
     agent_override: Option<&str>,
 ) -> CliResult<ResumeTarget> {
-    let (agent, detection_reason) = detect_resume_agent(path, agent_override)?;
+    let detected = detect_resume_agent(path, agent_override)?;
+    let detection_reason = detected.reason;
 
-    match agent {
+    match detected.slug {
         "claude" => {
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
@@ -15195,7 +15289,7 @@ fn resolve_resume_target(
                 retryable: false,
             })?;
             Ok(ResumeTarget {
-                agent,
+                agent: "claude",
                 argv: vec!["claude".into(), "--resume".into(), uuid.clone()],
                 session_id: Some(uuid),
                 detection_reason,
@@ -15213,7 +15307,7 @@ fn resolve_resume_target(
                 retryable: false,
             })?;
             Ok(ResumeTarget {
-                agent,
+                agent: "codex",
                 argv: vec!["codex".into(), "resume".into(), uuid.clone()],
                 session_id: Some(uuid),
                 detection_reason,
@@ -15222,7 +15316,7 @@ fn resolve_resume_target(
         "opencode" => {
             let id = extract_opencode_session_id(path)?;
             Ok(ResumeTarget {
-                agent,
+                agent: "opencode",
                 argv: vec!["opencode".into(), "resume".into(), id.clone()],
                 session_id: Some(id),
                 detection_reason,
@@ -15230,16 +15324,19 @@ fn resolve_resume_target(
         }
         "pi_agent" => {
             let id = extract_pi_agent_session_id(path)?;
-            // Oh My Pi ships as `omp`; pi-mono ships as `pi`. Both
-            // accept `--resume <id>`. We default to `omp` when the path
-            // clearly originates there, else `pi`.
-            let binary = if path.to_string_lossy().contains(".omp/agent") {
-                "omp"
-            } else {
-                "pi"
-            };
+            // Binary selection precedence:
+            //   1. Explicit override (from `--agent omp` / `--agent pi`).
+            //   2. Path inference (path contains `.omp/agent` → omp).
+            //   3. Fallback to `pi` (pi-mono is the original).
+            let binary = detected.binary_hint.unwrap_or_else(|| {
+                if path.to_string_lossy().contains(".omp/agent") {
+                    "omp"
+                } else {
+                    "pi"
+                }
+            });
             Ok(ResumeTarget {
-                agent,
+                agent: "pi_agent",
                 argv: vec![binary.into(), "--resume".into(), id.clone()],
                 session_id: Some(id),
                 detection_reason,
@@ -15252,7 +15349,7 @@ fn resolve_resume_target(
             let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let path_str = canonical.display().to_string();
             Ok(ResumeTarget {
-                agent,
+                agent: "gemini",
                 argv: vec![
                     "gemini".into(),
                     "session".into(),

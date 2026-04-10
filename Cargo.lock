@@ -2174,6 +2174,7 @@ version = "0.1.2"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
+ "fsqlite-func",
  "fsqlite-pager",
  "fsqlite-types",
  "hashbrown 0.14.5",
