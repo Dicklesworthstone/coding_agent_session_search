@@ -253,6 +253,7 @@ impl Reranker for StaticReranker {
                 doc_id: doc.doc_id.clone(),
                 score: self.value,
                 original_rank: i,
+                raw_logit: None,
             })
             .collect())
     }

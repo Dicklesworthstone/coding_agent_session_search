@@ -572,9 +572,18 @@ pub enum Commands {
         /// Session file path (as printed by `cass search` or `cass sessions`)
         #[arg(value_hint = ValueHint::FilePath)]
         path: PathBuf,
-        /// Override the detected harness.
-        /// Accepted values: claude, codex, opencode, pi_agent, gemini.
-        #[arg(long)]
+        /// Override the detected harness (see `--help` for accepted values).
+        #[arg(
+            long,
+            long_help = "Override the detected harness. Accepted values:\n\
+                \x20 claude | claude-code | claude_code\n\
+                \x20 codex\n\
+                \x20 opencode\n\
+                \x20 pi_agent | pi-agent     (let path inference pick `pi` vs `omp`)\n\
+                \x20 pi                      (force the pi-mono binary)\n\
+                \x20 omp | oh-my-pi | ohmypi (force the Oh My Pi binary)\n\
+                \x20 gemini"
+        )]
         agent: Option<String>,
         /// Replace the current process with the resolved resume command.
         /// Mutually exclusive with `--shell` and `--json`.
@@ -10740,6 +10749,43 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn resume_rejects_opencode_path_outside_opencode_db_parent() {
+        // `~/.config/opencode/config.json` matches the opencode detection
+        // heuristic but is NOT a session path. We must refuse to produce
+        // a resume command rather than synthesize a plausible-but-wrong
+        // `opencode resume config.json` invocation.
+        let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
+        let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("opencode.db"),
+            "error should explain the expected shape: {}",
+            err.message
+        );
+        // The hint should point at the override escape hatch.
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--agent opencode")),
+            "hint should advertise the override: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn resume_allows_opencode_path_outside_parent_with_explicit_override() {
+        // With `--agent opencode` the user takes responsibility for the
+        // path shape. Cass uses the final path component as the id.
+        let path = PathBuf::from("/Users/ellis/custom/opencode-export/sess-xyz");
+        let target = resolve_resume_target(&path, Some("opencode"))
+            .expect("explicit override must bypass parent-directory check");
+        assert_eq!(target.agent, "opencode");
+        assert_eq!(target.session_id.as_deref(), Some("sess-xyz"));
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-xyz"]);
+    }
+
+    #[test]
     fn resume_detects_oh_my_pi_from_omp_path_and_reads_session_id() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_dir = temp.path().join(".omp/agent/sessions");
@@ -10853,6 +10899,133 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn resume_does_not_false_positive_on_claude_code_substring() {
+        // Paths like `~/projects/my_claude_code_extension/notes.jsonl`
+        // must NOT be misdetected as Claude Code session files. The
+        // canonical path pattern is `.claude/projects/...`.
+        let path = PathBuf::from("/home/user/projects/my_claude_code_extension/notes.jsonl");
+        let err = resolve_resume_target(&path, None).expect_err("must not false-match claude");
+        assert_eq!(err.code, 3);
+        assert_eq!(err.kind, "unknown_agent");
+    }
+
+    #[test]
+    fn looks_like_session_uuid_accepts_canonical_form() {
+        // Canonical 8-4-4-4-12 hex UUIDs (mixed case allowed).
+        assert!(looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789ab"));
+        assert!(looks_like_session_uuid("ABC12345-DEAD-BEEF-CAFE-0123456789AB"));
+        assert!(looks_like_session_uuid(
+            "fedc1234-babe-cafe-beef-abcdef012345"
+        ));
+        assert!(looks_like_session_uuid(
+            "00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(looks_like_session_uuid(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn looks_like_session_uuid_rejects_bad_forms() {
+        // Wrong length.
+        assert!(!looks_like_session_uuid(""));
+        assert!(!looks_like_session_uuid("abc"));
+        assert!(!looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789a")); // 35
+        assert!(!looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789abc")); // 37
+        // Right length, wrong separator positions.
+        assert!(!looks_like_session_uuid("abc1234-5dead-beef-cafe-0123456789ab"));
+        // Non-hex characters.
+        assert!(!looks_like_session_uuid("xyz12345-dead-beef-cafe-0123456789ab"));
+        // Common wrong-path mistakes.
+        assert!(!looks_like_session_uuid("2026-04-09T10-00-00_notes"));
+        assert!(!looks_like_session_uuid("my_project_name"));
+        assert!(!looks_like_session_uuid("notes"));
+    }
+
+    #[test]
+    fn resume_rejects_non_uuid_claude_path_without_override() {
+        // `.claude/projects/foo/notes.jsonl` is under a claude projects
+        // directory but the filename stem is not a UUID. Without an
+        // explicit `--agent`, we block and suggest the user verify the
+        // path.
+        let path = PathBuf::from("/home/u/.claude/projects/-home-proj/notes.jsonl");
+        let err = resolve_resume_target(&path, None)
+            .expect_err("auto-detected non-UUID claude path must be rejected");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("notes"),
+            "error should include the bad stem: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("--agent claude")),
+            "hint should point at the override escape hatch: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn resume_allows_non_uuid_claude_path_with_explicit_override() {
+        // With `--agent claude` the user is saying "trust me" — we
+        // accept non-UUID stems as-is and let the downstream harness
+        // decide.
+        let path = PathBuf::from("/home/u/.claude/projects/-home-proj/legacy-name.jsonl");
+        let target = resolve_resume_target(&path, Some("claude"))
+            .expect("explicit override must bypass UUID validation");
+        assert_eq!(target.agent, "claude");
+        assert_eq!(target.session_id.as_deref(), Some("legacy-name"));
+        assert_eq!(target.argv, vec!["claude", "--resume", "legacy-name"]);
+    }
+
+    #[test]
+    fn resume_rejects_non_uuid_codex_path_without_override() {
+        let path = PathBuf::from("/home/u/.codex/sessions/2026/04/09/notes.jsonl");
+        let err = resolve_resume_target(&path, None)
+            .expect_err("auto-detected non-UUID codex path must be rejected");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.message.contains("Codex"),
+            "error should name the harness: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn run_resume_rejects_exec_with_structured_output() {
+        // `--exec` + `--robot-format json` is a conflict clap cannot
+        // see from the subcommand (robot_format is global). Runtime
+        // rejects it with a clear usage error.
+        let path = PathBuf::from("/home/user/.claude/projects/p/uuid.jsonl");
+        let err = run_resume(&path, None, true, false, Some(RobotFormat::Json))
+            .expect_err("must reject exec + structured output");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`--exec`"),
+            "error should mention --exec: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn run_resume_rejects_shell_with_structured_output() {
+        let path = PathBuf::from("/home/user/.claude/projects/p/uuid.jsonl");
+        let err = run_resume(&path, None, false, true, Some(RobotFormat::Json))
+            .expect_err("must reject shell + structured output");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "usage");
+        assert!(
+            err.message.contains("`--shell`"),
+            "error should mention --shell: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn shell_quote_escapes_special_characters() {
         assert_eq!(shell_quote("safe_value-1.0"), "safe_value-1.0");
         assert_eq!(shell_quote("has space"), "'has space'");
@@ -10862,13 +11035,78 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn extract_pi_agent_session_id_falls_back_to_filename_when_no_header() {
+    fn extract_pi_agent_session_id_errors_when_no_header() {
+        // No filename fallback: headerless files must produce an error
+        // rather than a synthesized id that `omp --resume` would reject
+        // with a confusing runtime message.
         let temp = tempfile::tempdir().expect("tempdir");
         let f = temp.path().join("2026-04-09T00-00-00_stem-id.jsonl");
-        std::fs::write(&f, r#"{"type":"message","message":{"role":"user","content":"hi"}}"#)
-            .expect("write");
+        std::fs::write(
+            &f,
+            r#"{"type":"message","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write");
+        let err = extract_pi_agent_session_id(&f).expect_err("must fail without header");
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "session_id_not_found");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("omp --resume")),
+            "hint should point at the manual invocation: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_prefers_sessionid_field_over_id() {
+        // When a single session-header line contains BOTH `sessionId`
+        // and `id`, `sessionId` wins. The `sessionId` field is the
+        // explicit Oh My Pi resume identifier (per issue #175) while
+        // `id` can be any legacy identifier that happened to be called
+        // `id` in earlier formats.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_sid.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"type":"session","id":"legacy-id","sessionId":"sid-wins"}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
         let id = extract_pi_agent_session_id(&f).expect("extract");
-        assert_eq!(id, "2026-04-09T00-00-00_stem-id");
+        assert_eq!(id, "sid-wins");
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_uses_id_when_sessionid_absent() {
+        // A session-header line with only `id` (no `sessionId`) falls
+        // back to `id`. This is the pi-mono format.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_id.jsonl");
+        std::fs::write(
+            &f,
+            r#"{"type":"session","id":"plain-id","timestamp":"2026-04-09T00:00:00Z"}
+{"type":"message","timestamp":"2026-04-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "plain-id");
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_skips_leading_blank_lines() {
+        // Blank lines should not consume the 16-line budget.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_blank.jsonl");
+        let header = r#"{"type":"session","id":"after-blanks"}"#;
+        let content = format!("\n\n\n{header}\n");
+        std::fs::write(&f, content).expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "after-blanks");
     }
 }
 
@@ -15028,6 +15266,11 @@ struct DetectedAgent {
     /// `--agent omp` pins the binary to `omp`, while `--agent pi_agent`
     /// leaves it to the path-based inference inside [`resolve_resume_target`].
     binary_hint: Option<&'static str>,
+    /// True when the agent was selected via an explicit `--agent`
+    /// override. Used by downstream validators (e.g. the UUID-shape
+    /// check for Claude Code / Codex) to decide whether to enforce
+    /// strict format rules (auto-detection) or trust the user (override).
+    is_override: bool,
     reason: String,
 }
 
@@ -15069,6 +15312,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug,
             binary_hint,
+            is_override: true,
             reason: format!("--agent override: {raw}"),
         });
     }
@@ -15076,10 +15320,18 @@ fn detect_resume_agent(
     let path_str = path.to_string_lossy();
     // Path-substring detection. These match the real on-disk layouts
     // and are ordered longest-match-first where it matters.
-    if path_str.contains(".claude/projects") || path_str.contains("claude_code") {
+    //
+    // We deliberately only match Claude Code via `.claude/projects`
+    // (the canonical path segment). An earlier draft also matched
+    // `claude_code` anywhere in the path, but that produced false
+    // positives on user directories named things like
+    // `~/projects/my_claude_code_extension/`. Users on unusual installs
+    // can always force detection with `--agent claude`.
+    if path_str.contains(".claude/projects") {
         return Ok(DetectedAgent {
             slug: "claude",
             binary_hint: None,
+            is_override: false,
             reason: "path contains .claude/projects".to_string(),
         });
     }
@@ -15087,6 +15339,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug: "codex",
             binary_hint: None,
+            is_override: false,
             reason: "path contains .codex/sessions".to_string(),
         });
     }
@@ -15097,6 +15350,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug: "opencode",
             binary_hint: None,
+            is_override: false,
             reason: "path references opencode storage".to_string(),
         });
     }
@@ -15104,6 +15358,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug: "pi_agent",
             binary_hint: Some("omp"),
+            is_override: false,
             reason: "path contains .omp/agent".to_string(),
         });
     }
@@ -15111,6 +15366,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug: "pi_agent",
             binary_hint: Some("pi"),
+            is_override: false,
             reason: "path contains .pi/agent".to_string(),
         });
     }
@@ -15118,6 +15374,7 @@ fn detect_resume_agent(
         return Ok(DetectedAgent {
             slug: "gemini",
             binary_hint: None,
+            is_override: false,
             reason: "path contains gemini storage".to_string(),
         });
     }
@@ -15148,6 +15405,33 @@ fn extract_filename_session_id(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Best-effort check that `candidate` looks like a UUID in the canonical
+/// 8-4-4-4-12 hex form (case-insensitive). Both Claude Code and Codex
+/// store sessions at `<dir>/<uuid>.jsonl`, so if we extracted something
+/// that clearly isn't a UUID we can surface a clearer error than the
+/// "session not found" the downstream harness would emit.
+fn looks_like_session_uuid(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if *b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
 ///
 /// Pi-agent session files begin with a `{"type":"session", ...}` header
@@ -15155,8 +15439,14 @@ fn extract_filename_session_id(path: &Path) -> Option<String> {
 /// 16 non-empty lines to find it, tolerating blank lines and leading
 /// metadata. Streams line-by-line so large session logs do not get
 /// read into memory in full.
+///
+/// A 1 MiB byte budget caps the total read so a pathologically long
+/// first line (e.g. a JSONL file with no newlines, or a single megabyte
+/// of garbage before the real content) cannot OOM the process. The
+/// session header is always well under this budget in practice.
 fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
-    use std::io::BufRead as _;
+    use std::io::{BufRead as _, Read as _};
+    const MAX_SCAN_BYTES: u64 = 1024 * 1024; // 1 MiB
     let file = std::fs::File::open(path).map_err(|err| CliError {
         code: 4,
         kind: "session_file_unreadable",
@@ -15167,15 +15457,17 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
         hint: None,
         retryable: false,
     })?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::new(file).take(MAX_SCAN_BYTES);
     let mut scanned = 0usize;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(err) => {
-                // Stop at the first I/O error — file may have been truncated
-                // mid-scan. Any partial info above is still usable via the
-                // filename fallback below.
+                // Stop at the first I/O error — the file may have been
+                // truncated mid-scan, or we hit the MAX_SCAN_BYTES cap
+                // in the middle of a multi-byte UTF-8 sequence. Fall
+                // through to the session-id-not-found error path so
+                // the user gets a clear diagnostic.
                 tracing::debug!(
                     path = %path.display(),
                     error = %err,
@@ -15207,19 +15499,22 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
             return Ok(id.to_string());
         }
     }
-    // Fallback: derive from filename, matching how cass stores pi-agent
-    // external_ids (relative path under sessions/).
-    if let Some(stem) = extract_filename_session_id(path) {
-        return Ok(stem);
-    }
+    // Deliberately no filename fallback: pi-agent session ids come from
+    // the in-file `{"type":"session","id":"..."}` header, not from the
+    // filename. Synthesizing an id from the filename would produce a
+    // command that looks plausible but `omp --resume` would reject with
+    // a confusing error. Fail explicitly so the user knows what's wrong.
     Err(CliError {
         code: 5,
         kind: "session_id_not_found",
         message: format!(
-            "no session id found in pi-agent file {} (scanned first 16 lines)",
+            "no session header found in pi-agent file {} (scanned first 16 non-empty lines)",
             path.display()
         ),
-        hint: None,
+        hint: Some(
+            "Pi-agent session ids live in the `{\"type\":\"session\",\"id\":\"...\"}` header of the JSONL file. If the file is missing its header, invoke `omp --resume <id>` directly with the id you want."
+                .to_string(),
+        ),
         retryable: false,
     })
 }
@@ -15228,21 +15523,51 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
 ///
 /// Cass records OpenCode conversations with
 /// `source_path = <opencode.db>/<url-encoded-session-id>`, so the
-/// session id is the URL-decoded final path component.
-fn extract_opencode_session_id(path: &Path) -> CliResult<String> {
+/// session id is the URL-decoded final path component and the parent
+/// directory's name is `opencode.db`. When `strict` is true (the
+/// auto-detection path) we reject anything not matching that shape —
+/// otherwise a random file under `~/.config/opencode` (such as
+/// `config.json`) would produce a plausible-looking but bogus resume
+/// command. When `strict` is false (the `--agent opencode` override)
+/// we trust the caller and only enforce the presence of a non-empty
+/// final component.
+fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     let raw = path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| CliError {
             code: 5,
             kind: "session_id_not_found",
-            message: format!(
-                "opencode path has no final component: {}",
-                path.display()
-            ),
+            message: format!("opencode path has no final component: {}", path.display()),
             hint: None,
             retryable: false,
         })?;
+    if strict {
+        // The parent directory must be the opencode.db virtual folder.
+        // `parent_name` is the last segment of the parent path (already
+        // split by the OS), so a simple equality check is both
+        // sufficient and correct — no need to worry about slashes.
+        let parent_name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str());
+        let looks_like_session_path = parent_name == Some("opencode.db");
+        if !looks_like_session_path {
+            return Err(CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!(
+                    "opencode session path must live under an 'opencode.db' directory, got: {}",
+                    path.display()
+                ),
+                hint: Some(
+                    "Expected path shape: '<.../opencode.db>/<session-id>' (as emitted by `cass search` and `cass sessions`). Pass `--agent opencode` to bypass this check if the id is correct."
+                        .into(),
+                ),
+                retryable: false,
+            });
+        }
+    }
     // Percent-decode the component. urlencoding::decode returns the
     // original string on pass-through, so this is always non-lossy.
     let decoded = urlencoding::decode(raw)
@@ -15275,6 +15600,12 @@ fn resolve_resume_target(
 ) -> CliResult<ResumeTarget> {
     let detected = detect_resume_agent(path, agent_override)?;
     let detection_reason = detected.reason;
+    // Skip strict validations (like UUID-shape checks) when the user
+    // passed `--agent ...` — explicit is explicit. We only enforce
+    // strict format rules when detection came from path inference,
+    // because that's the case where cass can meaningfully help the
+    // user catch a "wrong path" mistake.
+    let is_override = detected.is_override;
 
     match detected.slug {
         "claude" => {
@@ -15288,6 +15619,20 @@ fn resolve_resume_target(
                 hint: None,
                 retryable: false,
             })?;
+            if !is_override && !looks_like_session_uuid(&uuid) {
+                return Err(CliError {
+                    code: 5,
+                    kind: "session_id_not_found",
+                    message: format!(
+                        "filename stem '{uuid}' does not look like a Claude Code session UUID (expected 8-4-4-4-12 hex)"
+                    ),
+                    hint: Some(
+                        "Did you pass a project directory or notes file instead of a <uuid>.jsonl session file? Pass `--agent claude` to bypass this check if the id is correct."
+                            .into(),
+                    ),
+                    retryable: false,
+                });
+            }
             Ok(ResumeTarget {
                 agent: "claude",
                 argv: vec!["claude".into(), "--resume".into(), uuid.clone()],
@@ -15306,6 +15651,20 @@ fn resolve_resume_target(
                 hint: None,
                 retryable: false,
             })?;
+            if !is_override && !looks_like_session_uuid(&uuid) {
+                return Err(CliError {
+                    code: 5,
+                    kind: "session_id_not_found",
+                    message: format!(
+                        "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
+                    ),
+                    hint: Some(
+                        "Did you pass a date directory or log file instead of a <uuid>.jsonl session file? Pass `--agent codex` to bypass this check if the id is correct."
+                            .into(),
+                    ),
+                    retryable: false,
+                });
+            }
             Ok(ResumeTarget {
                 agent: "codex",
                 argv: vec!["codex".into(), "resume".into(), uuid.clone()],
@@ -15314,7 +15673,9 @@ fn resolve_resume_target(
             })
         }
         "opencode" => {
-            let id = extract_opencode_session_id(path)?;
+            // Strict mode only when we auto-detected. An explicit
+            // `--agent opencode` bypasses the parent-directory check.
+            let id = extract_opencode_session_id(path, !is_override)?;
             Ok(ResumeTarget {
                 agent: "opencode",
                 argv: vec!["opencode".into(), "resume".into(), id.clone()],
@@ -15380,8 +15741,47 @@ fn run_resume(
     shell: bool,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
+    // Clap enforces mutual exclusion between the local flags `--exec`,
+    // `--shell`, and `--json`, but it cannot see the GLOBAL
+    // `--robot-format` flag from the subcommand's perspective. A user
+    // doing `cass --robot-format json resume --exec /path` would
+    // otherwise silently get structured output with no exec — an
+    // inconsistent experience. Reject the combination explicitly so
+    // the error message matches clap's own conflict errors in spirit.
+    if exec && output_format.is_some() {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message:
+                "`--exec` cannot be combined with structured output (`--robot-format`/`--json`)"
+                    .into(),
+            hint: Some(
+                "Pick one: `--exec` replaces the process with the resume command, structured output prints the plan.".into(),
+            ),
+            retryable: false,
+        });
+    }
+    if shell && output_format.is_some() {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message:
+                "`--shell` cannot be combined with structured output (`--robot-format`/`--json`)"
+                    .into(),
+            hint: Some(
+                "Pick one: `--shell` emits a shell-escaped command line, structured output emits a JSON object.".into(),
+            ),
+            retryable: false,
+        });
+    }
+
     let target = resolve_resume_target(path, agent_override)?;
 
+    // Output mode precedence (mutually exclusive by construction above):
+    //   1. structured output (`--robot-format json|yaml|msgpack`, `--json`)
+    //   2. `--exec` — replaces the process, side-effectful
+    //   3. `--shell` — single quoted command line
+    //   4. Default — one argv token per line
     if let Some(fmt) = output_format {
         let payload = serde_json::json!({
             "success": true,

@@ -100,14 +100,20 @@ pub(crate) struct SearchMaintenanceSnapshot {
 }
 
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
+    // Real index-run.lock files written by `acquire_index_run_lock`
+    // have a fixed key=value shape under ~1 KiB. Cap the read at 64 KiB
+    // so a corrupted or maliciously-large lock file cannot force us to
+    // allocate arbitrary memory just to inspect its metadata.
+    const MAX_LOCK_FILE_READ: u64 = 64 * 1024;
+
     let lock_path = data_dir.join("index-run.lock");
-    let mut file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
         Ok(file) => file,
         Err(_) => return SearchMaintenanceSnapshot::default(),
     };
 
     let mut raw = String::new();
-    let _ = file.read_to_string(&mut raw);
+    let _ = (&file).take(MAX_LOCK_FILE_READ).read_to_string(&mut raw);
 
     let mut pid = None;
     let mut started_at_ms = None;
@@ -710,24 +716,21 @@ mod tests {
         // while holding the exclusive flock.
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
-        // Use u32::MAX as a synthetic dead PID: the kernel will never
-        // assign it (PID ceiling is well below 2^32) so `/proc/<pid>`
-        // is guaranteed not to exist on Linux, and on non-Linux we fall
-        // through to flock-based reaping unconditionally.
+        // The reap path does not probe the recorded pid — POSIX flock
+        // acquisition is the signal — so the concrete pid value in the
+        // fixture is irrelevant. We still record one so the parser
+        // runs through its full happy path.
         std::fs::write(
             &lock_path,
-            format!(
-                concat!(
-                    "pid={}\n",
-                    "started_at_ms=1733000111000\n",
-                    "updated_at_ms=1733000112000\n",
-                    "db_path=/tmp/cass/agent_search.db\n",
-                    "mode=index\n",
-                    "job_id=lexical-refresh-1733000111000-max\n",
-                    "job_kind=lexical_refresh\n",
-                    "phase=rebuilding\n"
-                ),
-                u32::MAX
+            concat!(
+                "pid=4242\n",
+                "started_at_ms=1733000111000\n",
+                "updated_at_ms=1733000112000\n",
+                "db_path=/tmp/cass/agent_search.db\n",
+                "mode=index\n",
+                "job_id=lexical-refresh-1733000111000-4242\n",
+                "job_kind=lexical_refresh\n",
+                "phase=rebuilding\n"
             ),
         )
         .expect("write lock metadata");
