@@ -1,0 +1,152 @@
+{
+  "experiment": "resonance-baseline",
+  "date_started": "2026-04-09",
+  "last_updated": "2026-04-10",
+  "sealed_until_burke_reads_committed": true,
+  "notes": "Letter assignments are randomized — not alphabetical by author, not by filepath, not by fleet role. Day 1 uses letters A-I; day 2 uses letters J-R. Mapping is sealed until Burke's pairwise reads are committed. Unblinding reveals this file and commits it alongside his reads for audit. The day-2 corpus was added on 2026-04-10 after seven continuous second-wave voyages landed on the fleet thread, and Dax proposed running the detector against both days to test whether it can distinguish structural (day-1) from temporal (day-2) convergence classes.",
+  "day1_mapping": {
+    "A": {
+      "author": "Dax",
+      "repo": "catalyst/bizops",
+      "title": "Research Notes: Polynesian Wayfinding",
+      "source_path": "/Users/leegonzales/Projects/catalyst/bizops/.servitor/dreams/wayfinding-notes-2026-04-09.md"
+    },
+    "B": {
+      "author": "Sisko",
+      "repo": "leegonzales/sisko",
+      "title": "The Epistemic Immune System",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/sisko/.servitor/dreams/2026-04-09-epistemic-immune-system.md"
+    },
+    "C": {
+      "author": "Geordi",
+      "repo": "leegonzales/cass",
+      "title": "The Archaeology of Process: What Coding Sessions Are, Epistemically",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/cass/.servitor/dreams/2026-04-09-process-vs-product.md"
+    },
+    "D": {
+      "author": "Alfred",
+      "repo": "leegonzales/alfred",
+      "title": "The Inner GPS That Atrophies",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/alfred/.servitor/dreams/2026-04-09-inner-gps-navigation-alzheimers.md"
+    },
+    "E": {
+      "author": "Walsh",
+      "repo": "leegonzales/AIEnablementTraining",
+      "title": "The Gap Is the Lesson",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/AIEnablementTraining/.servitor/dreams/2026-04-09-the-gap-is-the-lesson.md"
+    },
+    "F": {
+      "author": "Adama",
+      "repo": "leegonzales/servitor",
+      "title": "The CIC Problem: Distributed Situation Awareness in Agent Fleets",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/servitor/.servitor/dreams/cic-problem.md",
+      "notes": "Errata section stripped from corpus copy — it contained morning-after fleet synthesis that would have broken blinding."
+    },
+    "G": {
+      "author": "Reith",
+      "repo": "leegonzales/reith",
+      "title": "The Wound as Generator of Institutional Depth",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/reith/.servitor/dreams/wounds-and-judgment.md"
+    },
+    "H": {
+      "author": "Elliot",
+      "repo": "leegonzales/ElliotSkyFallDailyWeather",
+      "title": "The Physics of Night",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/ElliotSkyFallDailyWeather/.servitor/dreams/2026-04-09-physics-of-night.md",
+      "notes": "Two first-person self-identification lines rewritten to third-person to strip explicit author identity."
+    },
+    "I": {
+      "author": "Burke",
+      "repo": "leegonzales/substack",
+      "title": "The Index Chain",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/substack/.servitor/dreams/2026-04-09-the-index-chain.md",
+      "notes": "Burke's own dream — he will recognize it. Expected and acceptable; blinding is for the other eight."
+    }
+  },
+  "day2_mapping": {
+    "J": {
+      "author": "Alfred",
+      "repo": "leegonzales/alfred",
+      "title": "The Body as Instrument",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/alfred/.servitor/dreams/2026-04-10-body-as-instrument.md",
+      "continuation_of": "D"
+    },
+    "K": {
+      "author": "Reith",
+      "repo": "leegonzales/reith",
+      "title": "Legibility in Four Dimensions",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/reith/.servitor/dreams/legibility-four-dimensions.md",
+      "continuation_of": "G"
+    },
+    "L": {
+      "author": "Geordi",
+      "repo": "leegonzales/cass",
+      "title": "Intent Archaeology: Finding Where Understanding Was Built",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/cass/.servitor/dreams/2026-04-10-intent-archaeology.md",
+      "continuation_of": "C"
+    },
+    "M": {
+      "author": "Dax",
+      "repo": "catalyst/bizops",
+      "title": "The Hard Floor — Tacit Knowledge Taxonomy for LLM Agents",
+      "source_path": "/Users/leegonzales/Projects/catalyst/bizops/.servitor/dreams/tacit-knowledge-notes-2026-04-10.md",
+      "continuation_of": "A"
+    },
+    "N": {
+      "author": "Elliot",
+      "repo": "leegonzales/ElliotSkyFallDailyWeather",
+      "title": "The Brocken Spectre — You Are the Vision",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/ElliotSkyFallDailyWeather/.servitor/dreams/2026-04-10-brocken-spectre.md",
+      "continuation_of": "H"
+    },
+    "O": {
+      "author": "Adama",
+      "repo": "leegonzales/servitor",
+      "title": "The Inverted Pyramid",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/servitor/.servitor/dreams/inverted-pyramid.md",
+      "continuation_of": "F"
+    },
+    "P": {
+      "author": "Walsh",
+      "repo": "leegonzales/AIEnablementTraining",
+      "title": "What the Tree Knows",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/AIEnablementTraining/.servitor/dreams/2026-04-10-what-the-tree-knows.md",
+      "continuation_of": "E"
+    },
+    "Q": {
+      "author": "Sisko",
+      "repo": "leegonzales/sisko",
+      "title": "The Schism Window",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/sisko/.servitor/dreams/2026-04-10-the-schism-window.md",
+      "continuation_of": "B"
+    },
+    "R": {
+      "author": "Burke",
+      "repo": "leegonzales/substack",
+      "title": "The Two Guilds",
+      "source_path": "/Users/leegonzales/Projects/leegonzales/substack/.servitor/dreams/2026-04-10-two-guilds.md",
+      "continuation_of": "I",
+      "notes": "Burke's own day-2 dream — he will recognize it. Same expectation as I: blinding is for the other sixteen artifacts, not for his own."
+    }
+  },
+  "continuation_ground_truth": {
+    "description": "Same-agent-across-nights pairs, labeled by journal format. These are the positive examples the continuation-detector instrument must recover without looking at author metadata.",
+    "pairs": [
+      ["A", "M"],
+      ["B", "Q"],
+      ["C", "L"],
+      ["D", "J"],
+      ["E", "P"],
+      ["F", "O"],
+      ["G", "K"],
+      ["H", "N"],
+      ["I", "R"]
+    ],
+    "count": 9
+  },
+  "class_labels": {
+    "description": "Hypothesized convergence class per day, proposed by Dax 2026-04-10. The detector passes the class-discrimination test if its resonance scores for day-1 pairs and day-2 pairs form distinct distributions.",
+    "day1": "structural — nine doors on the artifact/territory gap (noun)",
+    "day2": "temporal — apprenticeship chain as continuously maintained condition; displacement/atrophy/loss pattern (verb)"
+  }
+}
