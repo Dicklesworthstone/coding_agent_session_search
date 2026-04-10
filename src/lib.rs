@@ -557,6 +557,38 @@ pub enum Commands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Resolve a session path into a ready-to-run resume command for
+    /// its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini).
+    ///
+    /// By default, the resolved command is printed to stdout, one
+    /// argv token per line, so the caller can wrap it however they like:
+    ///
+    ///   eval "$(cass resume /path/to/session.jsonl --shell)"
+    ///   $(cass resume /path/to/session.jsonl --shell) # direct exec
+    ///
+    /// Use `--exec` to have cass `exec` the command directly, replacing
+    /// the current process.
+    Resume {
+        /// Session file path (as printed by `cass search` or `cass sessions`)
+        #[arg(value_hint = ValueHint::FilePath)]
+        path: PathBuf,
+        /// Override the detected harness.
+        /// Accepted values: claude, codex, opencode, pi_agent, gemini.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Replace the current process with the resolved resume command.
+        /// Mutually exclusive with `--shell` and `--json`.
+        #[arg(long, default_value_t = false, conflicts_with_all = ["shell", "json"])]
+        exec: bool,
+        /// Emit a single shell-escaped command line on stdout (suitable
+        /// for `eval "$(cass resume ...)"`). Mutually exclusive with
+        /// `--json`.
+        #[arg(long, default_value_t = false, conflicts_with = "json")]
+        shell: bool,
+        /// Output as JSON (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Export a conversation to markdown or other formats
     Export {
         /// Path to session file
@@ -3729,6 +3761,22 @@ async fn execute_cli(
                         structured_format,
                     )?;
                 }
+                Commands::Resume {
+                    path,
+                    agent,
+                    exec,
+                    shell,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_resume(
+                        &path,
+                        agent.as_deref(),
+                        exec,
+                        shell,
+                        structured_format,
+                    )?;
+                }
                 Commands::Export {
                     path,
                     source,
@@ -5642,6 +5690,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Sessions { .. }) => "sessions".to_string(),
+        Some(Commands::Resume { .. }) => "resume".to_string(),
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
@@ -5690,6 +5739,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sessions { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Resume { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::ExportHtml { json, .. } => {
@@ -10635,6 +10687,166 @@ mod cli_read_db_tests {
         assert_eq!(payload["kind"].as_str(), Some("index_busy"));
         assert_eq!(payload["retryable"].as_bool(), Some(true));
     }
+
+    // =====================================================
+    // `cass resume` — issue #175
+    // =====================================================
+
+    #[test]
+    fn resume_detects_claude_code_from_path() {
+        let path = PathBuf::from(
+            "/Users/ellis/.claude/projects/-home-ellis-proj/abc12345-dead-beef-cafe-0123456789ab.jsonl",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "claude");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("abc12345-dead-beef-cafe-0123456789ab")
+        );
+        assert_eq!(
+            target.argv,
+            vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "abc12345-dead-beef-cafe-0123456789ab".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_detects_codex_from_path() {
+        let path = PathBuf::from(
+            "/Users/ellis/.codex/sessions/fedc1234-babe-cafe-beef-abcdef012345.jsonl",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(
+            target.session_id.as_deref(),
+            Some("fedc1234-babe-cafe-beef-abcdef012345")
+        );
+        assert_eq!(target.argv[0], "codex");
+        assert_eq!(target.argv[1], "resume");
+    }
+
+    #[test]
+    fn resume_detects_opencode_session_from_source_path() {
+        let path = PathBuf::from(
+            "/Users/ellis/.local/share/opencode/opencode.db/sess%2D42",
+        );
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "opencode");
+        assert_eq!(target.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(target.argv, vec!["opencode", "resume", "sess-42"]);
+    }
+
+    #[test]
+    fn resume_detects_oh_my_pi_from_omp_path_and_reads_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = temp.path().join(".omp/agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-04-09T00-00-00_abc.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"my-omp-id","timestamp":"2026-04-09T00:00:00Z"}
+{"type":"message","timestamp":"2026-04-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write session file");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(target.session_id.as_deref(), Some("my-omp-id"));
+        // Must choose `omp` because path contains .omp/agent.
+        assert_eq!(target.argv[0], "omp");
+        assert_eq!(target.argv[1], "--resume");
+        assert_eq!(target.argv[2], "my-omp-id");
+    }
+
+    #[test]
+    fn resume_detects_pi_mono_from_pi_path_and_reads_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = temp.path().join(".pi/agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_file = sessions_dir.join("2026-04-09T00-00-00_def.jsonl");
+        std::fs::write(
+            &session_file,
+            r#"{"type":"session","id":"my-pi-id","timestamp":"2026-04-09T00:00:00Z"}"#,
+        )
+        .expect("write session file");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(target.session_id.as_deref(), Some("my-pi-id"));
+        assert_eq!(target.argv[0], "pi");
+    }
+
+    #[test]
+    fn resume_detects_gemini_from_path_and_uses_path_argv() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gemini_sessions = temp.path().join(".gemini/sessions");
+        std::fs::create_dir_all(&gemini_sessions).expect("create dir");
+        let session_file = gemini_sessions.join("2026-04-09T00-00-00.jsonl");
+        std::fs::write(&session_file, b"{}").expect("write session");
+
+        let target = resolve_resume_target(&session_file, None).expect("resolve");
+        assert_eq!(target.agent, "gemini");
+        assert!(target.session_id.is_none());
+        assert_eq!(target.argv[0], "gemini");
+        assert_eq!(target.argv[1], "session");
+        assert_eq!(target.argv[2], "restore");
+    }
+
+    #[test]
+    fn resume_honors_explicit_agent_override() {
+        // Claude path, but we force codex detection — legal alias handling.
+        let path = PathBuf::from("/tmp/unknown/abc-123.jsonl");
+        let target = resolve_resume_target(&path, Some("codex")).expect("resolve");
+        assert_eq!(target.agent, "codex");
+        assert_eq!(target.session_id.as_deref(), Some("abc-123"));
+
+        // `oh-my-pi` alias must normalize to pi_agent. Use a tmp path
+        // that pre-populates a session file so id extraction can run.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sess = temp.path().join("2026-04-09T00-00-00_xyz.jsonl");
+        std::fs::write(&sess, r#"{"type":"session","id":"ov-42"}"#).expect("write");
+        let target = resolve_resume_target(&sess, Some("oh-my-pi")).expect("resolve");
+        assert_eq!(target.agent, "pi_agent");
+        assert_eq!(target.session_id.as_deref(), Some("ov-42"));
+    }
+
+    #[test]
+    fn resume_rejects_unknown_agent_override() {
+        let path = PathBuf::from("/tmp/whatever/xyz.jsonl");
+        let err = resolve_resume_target(&path, Some("bogus")).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid_agent");
+    }
+
+    #[test]
+    fn resume_errors_when_no_agent_detectable() {
+        let path = PathBuf::from("/tmp/somewhere/random/file.txt");
+        let err = resolve_resume_target(&path, None).expect_err("must error");
+        assert_eq!(err.code, 3);
+        assert_eq!(err.kind, "unknown_agent");
+    }
+
+    #[test]
+    fn shell_quote_escapes_special_characters() {
+        assert_eq!(shell_quote("safe_value-1.0"), "safe_value-1.0");
+        assert_eq!(shell_quote("has space"), "'has space'");
+        assert_eq!(shell_quote("has'quote"), "'has'\\''quote'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("/abs/path/with-dashes"), "/abs/path/with-dashes");
+    }
+
+    #[test]
+    fn extract_pi_agent_session_id_falls_back_to_filename_when_no_header() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_stem-id.jsonl");
+        std::fs::write(&f, r#"{"type":"message","message":{"role":"user","content":"hi"}}"#)
+            .expect("write");
+        let id = extract_pi_agent_session_id(&f).expect("extract");
+        assert_eq!(id, "2026-04-09T00-00-00_stem-id");
+    }
 }
 
 /// Comprehensive diagnostic and repair tool for cass installation.
@@ -14739,6 +14951,418 @@ fn load_opencode_session_for_export(
     let end = session_end.or(message_ts_max);
 
     Ok((session_title, start, end, sorted_messages))
+}
+
+/// Return value of [`resolve_resume_target`] — the full recipe needed
+/// to resume a session in its native harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeTarget {
+    /// Normalized agent slug (claude, codex, opencode, pi_agent, gemini).
+    agent: &'static str,
+    /// Session identifier extracted from the path or file contents, or
+    /// `None` when the harness resumes by path rather than by id.
+    session_id: Option<String>,
+    /// Fully-resolved argv for the resume command, ready to exec.
+    argv: Vec<String>,
+    /// Why the agent was detected — useful for diagnostics and JSON output.
+    detection_reason: String,
+}
+
+/// POSIX shell escaping for a single argument: wraps in single quotes
+/// and escapes any embedded single quotes. Keeps the output suitable
+/// for `eval "$(cass resume ...)"` without introducing shell injection.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | ','))
+    {
+        // Safe characters — no quoting needed.
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            // Close quote, emit escaped quote, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Detect which coding-agent harness owns a given session path.
+///
+/// Detection is path-based and mirrors the layouts that the bundled
+/// connectors understand. If `agent_override` is set, its value is
+/// validated and returned verbatim. Returns a normalized slug and a
+/// short human-readable reason.
+fn detect_resume_agent(
+    path: &Path,
+    agent_override: Option<&str>,
+) -> CliResult<(&'static str, String)> {
+    if let Some(raw) = agent_override {
+        let slug = match raw.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude_code" | "claude-code" => "claude",
+            "codex" => "codex",
+            "opencode" => "opencode",
+            "pi_agent" | "pi-agent" | "pi" | "omp" | "oh-my-pi" | "ohmypi" => "pi_agent",
+            "gemini" => "gemini",
+            other => {
+                return Err(CliError {
+                    code: 2,
+                    kind: "invalid_agent",
+                    message: format!(
+                        "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, gemini"
+                    ),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+        };
+        return Ok((slug, format!("--agent override: {raw}")));
+    }
+
+    let path_str = path.to_string_lossy();
+    // Path-substring detection. These match the real on-disk layouts
+    // and are ordered longest-match-first where it matters.
+    if path_str.contains(".claude/projects") || path_str.contains("claude_code") {
+        return Ok(("claude", "path contains .claude/projects".to_string()));
+    }
+    if path_str.contains(".codex/sessions") || path_str.contains("/codex/sessions") {
+        return Ok(("codex", "path contains .codex/sessions".to_string()));
+    }
+    if path_str.contains("opencode.db")
+        || path_str.contains(".local/share/opencode")
+        || path_str.contains(".config/opencode")
+    {
+        return Ok(("opencode", "path references opencode storage".to_string()));
+    }
+    if path_str.contains(".pi/agent") || path_str.contains(".omp/agent") {
+        return Ok((
+            "pi_agent",
+            "path contains .pi/agent or .omp/agent".to_string(),
+        ));
+    }
+    if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
+        return Ok(("gemini", "path contains gemini storage".to_string()));
+    }
+
+    Err(CliError {
+        code: 3,
+        kind: "unknown_agent",
+        message: format!(
+            "could not detect the source harness from path '{}'",
+            path.display()
+        ),
+        hint: Some(
+            "Pass --agent <name> to override (claude, codex, opencode, pi_agent, gemini).".into(),
+        ),
+        retryable: false,
+    })
+}
+
+/// Extract a UUID-ish identifier from a session filename.
+///
+/// Strips a single trailing extension (`.jsonl`, `.json`, `.log`, …)
+/// and returns the remaining file stem. For Claude Code and Codex this
+/// IS the session UUID. Returns `None` if the path has no file stem.
+fn extract_filename_session_id(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
+///
+/// Pi-agent session files begin with a `{"type":"session", ...}` header
+/// that contains `id` (and often `sessionId`). We scan up to the first
+/// 16 non-empty lines to find it, tolerating blank lines and leading
+/// metadata.
+fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
+    let content = std::fs::read_to_string(path).map_err(|err| CliError {
+        code: 4,
+        kind: "session_file_unreadable",
+        message: format!("cannot read pi-agent session file {}: {err}", path.display()),
+        hint: None,
+        retryable: false,
+    })?;
+    for (idx, line) in content.lines().enumerate() {
+        if idx >= 16 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Prefer explicit `sessionId` but fall back to `id` on session-header lines.
+        if let Some(id) = value.get("sessionId").and_then(|v| v.as_str()) {
+            return Ok(id.to_string());
+        }
+        let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type == "session" {
+            if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    // Fallback: derive from filename, matching how cass stores pi-agent
+    // external_ids (relative path under sessions/).
+    if let Some(stem) = extract_filename_session_id(path) {
+        return Ok(stem);
+    }
+    Err(CliError {
+        code: 5,
+        kind: "session_id_not_found",
+        message: format!(
+            "no session id found in pi-agent file {} (scanned first 16 lines)",
+            path.display()
+        ),
+        hint: None,
+        retryable: false,
+    })
+}
+
+/// Extract an OpenCode session id from a cass-stored source_path.
+///
+/// Cass records OpenCode conversations with
+/// `source_path = <opencode.db>/<url-encoded-session-id>`, so the
+/// session id is the URL-decoded final path component.
+fn extract_opencode_session_id(path: &Path) -> CliResult<String> {
+    let raw = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| CliError {
+            code: 5,
+            kind: "session_id_not_found",
+            message: format!(
+                "opencode path has no final component: {}",
+                path.display()
+            ),
+            hint: None,
+            retryable: false,
+        })?;
+    // Percent-decode the component. urlencoding::decode returns the
+    // original string on pass-through, so this is always non-lossy.
+    let decoded = urlencoding::decode(raw)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|_| raw.to_string());
+    if decoded.is_empty() || decoded == "opencode.db" {
+        return Err(CliError {
+            code: 5,
+            kind: "session_id_not_found",
+            message: format!(
+                "could not extract opencode session id from '{}'",
+                path.display()
+            ),
+            hint: Some(
+                "Expected path shape: '<opencode.db>/<session-id>' (as emitted by cass search)."
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
+    Ok(decoded)
+}
+
+/// Build the ready-to-run resume target for a session path. Does not
+/// touch the filesystem unless the agent requires file-based id
+/// extraction (pi-agent).
+fn resolve_resume_target(
+    path: &Path,
+    agent_override: Option<&str>,
+) -> CliResult<ResumeTarget> {
+    let (agent, detection_reason) = detect_resume_agent(path, agent_override)?;
+
+    match agent {
+        "claude" => {
+            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!(
+                    "cannot derive Claude Code session UUID from '{}'",
+                    path.display()
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+            Ok(ResumeTarget {
+                agent,
+                argv: vec!["claude".into(), "--resume".into(), uuid.clone()],
+                session_id: Some(uuid),
+                detection_reason,
+            })
+        }
+        "codex" => {
+            let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
+                code: 5,
+                kind: "session_id_not_found",
+                message: format!(
+                    "cannot derive Codex session UUID from '{}'",
+                    path.display()
+                ),
+                hint: None,
+                retryable: false,
+            })?;
+            Ok(ResumeTarget {
+                agent,
+                argv: vec!["codex".into(), "resume".into(), uuid.clone()],
+                session_id: Some(uuid),
+                detection_reason,
+            })
+        }
+        "opencode" => {
+            let id = extract_opencode_session_id(path)?;
+            Ok(ResumeTarget {
+                agent,
+                argv: vec!["opencode".into(), "resume".into(), id.clone()],
+                session_id: Some(id),
+                detection_reason,
+            })
+        }
+        "pi_agent" => {
+            let id = extract_pi_agent_session_id(path)?;
+            // Oh My Pi ships as `omp`; pi-mono ships as `pi`. Both
+            // accept `--resume <id>`. We default to `omp` when the path
+            // clearly originates there, else `pi`.
+            let binary = if path.to_string_lossy().contains(".omp/agent") {
+                "omp"
+            } else {
+                "pi"
+            };
+            Ok(ResumeTarget {
+                agent,
+                argv: vec![binary.into(), "--resume".into(), id.clone()],
+                session_id: Some(id),
+                detection_reason,
+            })
+        }
+        "gemini" => {
+            // Gemini resumes by path rather than by id. Use the
+            // absolute path to avoid cwd ambiguity when `cass resume`
+            // is piped through another process.
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let path_str = canonical.display().to_string();
+            Ok(ResumeTarget {
+                agent,
+                argv: vec![
+                    "gemini".into(),
+                    "session".into(),
+                    "restore".into(),
+                    path_str,
+                ],
+                session_id: None,
+                detection_reason,
+            })
+        }
+        // Unreachable: detect_resume_agent validates the slug.
+        other => Err(CliError {
+            code: 3,
+            kind: "unknown_agent",
+            message: format!("internal: unhandled agent slug '{other}'"),
+            hint: None,
+            retryable: false,
+        }),
+    }
+}
+
+/// `cass resume <path>` — resolve and optionally execute the native
+/// harness resume command for a session.
+fn run_resume(
+    path: &Path,
+    agent_override: Option<&str>,
+    exec: bool,
+    shell: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let target = resolve_resume_target(path, agent_override)?;
+
+    if let Some(fmt) = output_format {
+        let payload = serde_json::json!({
+            "success": true,
+            "agent": target.agent,
+            "session_id": target.session_id,
+            "command": target.argv,
+            "shell_command": target
+                .argv
+                .iter()
+                .map(|a| shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+            "detection": target.detection_reason,
+            "path": path.display().to_string(),
+        });
+        output_structured_value(payload, fmt)?;
+        return Ok(());
+    }
+
+    if exec {
+        // Replace the current process with the resume command so the
+        // caller's TTY is handed over to the resumed harness cleanly.
+        let (program, args) = target.argv.split_first().ok_or_else(|| CliError {
+            code: 6,
+            kind: "resume_empty_command",
+            message: "internal: resolved resume command had no program".into(),
+            hint: None,
+            retryable: false,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let err = std::process::Command::new(program).args(args).exec();
+            // `exec` only returns on failure.
+            return Err(CliError {
+                code: 7,
+                kind: "resume_exec_failed",
+                message: format!("failed to exec '{program}': {err}"),
+                hint: Some(format!(
+                    "Verify that '{program}' is installed and on your PATH."
+                )),
+                retryable: false,
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            let status = std::process::Command::new(program)
+                .args(args)
+                .status()
+                .map_err(|err| CliError {
+                    code: 7,
+                    kind: "resume_exec_failed",
+                    message: format!("failed to spawn '{program}': {err}"),
+                    hint: None,
+                    retryable: false,
+                })?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    if shell {
+        // Single-line shell-quoted command for `eval "$(cass resume ...)"`.
+        let line = target
+            .argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{line}");
+        return Ok(());
+    }
+
+    // Default: one argv token per line. Lets callers either `xargs`
+    // the output or read it into a shell array without extra parsing.
+    for token in &target.argv {
+        println!("{token}");
+    }
+    Ok(())
 }
 
 /// Export a conversation to markdown or other formats
