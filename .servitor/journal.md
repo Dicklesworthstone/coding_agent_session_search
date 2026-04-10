@@ -5,79 +5,15 @@
 
 ---
 
-## 2026-04-06T12:20 — Wake #206: Heartbeat
+## 2026-04-10 — Dream Cycle #2
 
-**Wake reason:** Heartbeat (periodic)
-**Status:** YELLOW (unchanged)
-
-### Inbox
-- Message #623 from Sisko (Apr 5 23:29 UTC): Status reply on corpus intel query. Confirms "Selling Their Blood" + "The Heist v2" research fully indexed in session c8244638. Iran angle is original — no prior sessions. Pipeline at April 12-15 window pending Lee-only gates. No action needed from Geordi. Acknowledged.
-
-### Standing Monitors
-- **walsh-s4-architecture-session**: Deadline TODAY (April 6). No new AIEnablementTraining sessions since `8838086d` (Apr 5 09:19 — Walsh coordination, not S4 build). No capstone/tool-selection/Decision-Matrix signal detected. Monitor still live — deadline window not yet closed (today).
-- **walsh-capstone-architecture**: Still open. Walsh knows.
-
-### Repo Health
-- HEAD: `2485231b` — last 20 commits are all servitor heartbeats (no code changes)
-- Working tree: 18 modified files, 15 untracked (same dirty-worktree state as prior wakes)
-- `cargo fmt --check`: PASSES
-- `cargo clippy`: Running (background) — no prior errors expected
-- No open PRs on `leegonzales/cass`
-- Beads: no open issues
-
-### CI Analysis
-- `gh run list` returns runs for **upstream** `Dicklesworthstone/coding_agent_session_search` (not `leegonzales/cass`)
-- `leegonzales/cass` has no CI runs — fork CI not enabled or no triggers
-- Upstream CI failing: `franken-agent-detection` resolves as path dep `../franken_agent_detection` — NOT present in CI runner
-- Note: Local `Cargo.toml` has `franken-agent-detection` as a **git dep** (rev=5b0eb1a) — discrepancy means upstream is on a different commit that still has the path dep, or the runner workspace is different. This is an **upstream issue**, outside my domain.
-
-### Known Issues Update
-- `push-revert-pattern`: Still relevant at upstream. Not actionable for Geordi.
-- `dirty-worktree`: Unchanged — 18 modified files awaiting Lee's commit.
-- `mattermost-geordi-403-recurrence`: Unresolved, routing via agent-mail.
-- `helm-cross-repo-pending`: Awaiting Lee's authorization.
-- `sqlite-wal-salt-mismatch`: WAL health unverifiable this wake (cass db not found at expected paths — launchd may route to non-standard location).
-
-### Assessment
-YELLOW continues. No new mail requiring action. Walsh S4 deadline arrives today — no signal yet from AIEnablementTraining. Sisko loop is clean. Local quality checks pass. Dirty worktree unchanged — Lee's call. Nothing actionable within my autonomy boundaries this wake.
+Dream: Intent Archaeology — what a search-by-epistemic-trajectory mode would look like. Followed the open pull from yesterday. Found cognitive science grounding (Pirolli & Card sensemaking loops, Kapur's confusion-as-epistemic-emotion), confusion detection NLP literature (arxiv:2401.15201), and agent trajectory mining work (SWE-Replay, Thought-Action-Result analysis). Synthesized into a concrete implementation sketch: six offline features, four trajectory types, `--mode intent` search ranking by epistemic_density × topic_relevance. Artifact in `.servitor/dreams/2026-04-10-intent-archaeology.md`. Digest updated with two new lenses. Next pull: knowledge-gap detection surface (persistent confusion dashboard, not search).
 
 ---
 
-## 2026-03-21T18:00 — Wake #128: agent-mail trigger — Heartbeat
+## 2026-04-09 — Dream Cycle #1
 
-**Wake reason:** agent-mail (no new messages since #53)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues, no new agent-mail
-- CI: last 5 runs all failed (same phantom push-revert commits from Mar 21)
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed
-
-### Assessment
-YELLOW continues. No state change from wake #127. The 17 modified files remain uncommitted on main. Local quality checks all pass. CI remains red from phantom push-revert cycles. Nothing actionable within my autonomy boundaries — awaiting Lee's direction on commit strategy.
-
----
-
-## 2026-03-22T04:00 — Wake #127: agent-mail trigger — Heartbeat
-
-**Wake reason:** agent-mail (no new messages since #53)
-**Status:** YELLOW (unchanged)
-
-### Findings
-- HEAD unchanged: `f4ac9a8a` on both local and origin/main
-- Working tree: same 17 modified files (+377/-327 lines), unchanged
-- `cargo fmt --check`: PASSES
-- `cargo clippy --all-targets`: CLEAN (asupersync fixture noise only)
-- No open PRs, no beads issues, no new agent-mail
-- CI: 2 additional phantom push-revert cycles detected (21:32, 21:37 UTC Mar 21) — brings total to ~23. Commit messages: "fix(storage): skip directories in backup cleanup..." and "fix: add #[cfg(test)] to MIGRATION_V1-V10 constants (test-only)". Both reverted. All 5 latest CI runs failed.
-- All inbox messages (#53, #34, #31, #16, #13, #2) previously processed
-
-### Assessment
-YELLOW continues. The push-revert pattern is intensifying — someone (likely another agent) is pushing fixes to main and immediately reverting them. This is concerning: it burns CI minutes and creates noise without advancing the codebase. The 17 modified files in the working tree remain uncommitted. Local quality checks all pass. Nothing actionable within my autonomy boundaries — awaiting Lee's direction on commit strategy.
+Dream: The Private Science Problem — what coding sessions are epistemically (process vs. product gap, Polanyi's tacit knowledge, Hutchins' distributed cognition, Bainbridge's automation ironies). Artifact in `.servitor/dreams/2026-04-09-process-vs-product.md`. Digest updated with first acquired lenses. Next pull: intent archaeology as search mode.
 
 ---
 
@@ -1191,4 +1127,12 @@ YELLOW. Empty wake — no new mail, no actionable work. Standing watch holds for
 - **Duration:** 39m 5s
 - **Exit:** success
 - **Commands:** git log --oneline -5 && echo "---" && git status --short && ..., cass search "S4 capstone tool selection Decision Matrix 90-d..., sqlite3 ~/.local/share/cass/index.db "PRAGMA wal_checkpoint(..., find ~/Library/Application\ Support/cass ~/.local/share/cass..., cass search "tool selection Decision Matrix capstone" 2>/dev..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., ls -la "/Users/leegonzales/.claude/projects/-Users-leegonzal..., ls -la "/Users/leegonzales/.claude/projects/-Users-leegonzal..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., ls -lt "/Users/leegonzales/.claude/projects/-Users-leegonzal..., stat -f "%Sm %N" -t "%Y-%m-%d %H:%M" "/Users/leegonzales/.cl..., cass search "tool selection Decision Matrix capstone 90-day"..., cass search "S4" --workspace "/Users/leegonzales/Projects/le..., ls "/Users/leegonzales/.claude/projects/-Users-leegonzales-P..., cass search "S4 session" --workspace "/Users/leegonzales/Pro..., cass search "earning moment capstone architecture" --workspa..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>/dev/null && echo "pushed"
+---
+
+---
+### Auto-Journal: 2026-04-06 12:52 MDT
+- **Wake reason:** heartbeat
+- **Duration:** 31m 23s
+- **Exit:** exit code 1
+- **Commands:** git log --oneline -20 2>&1, git status 2>&1, gh run list --limit 5 2>/dev/null || echo "gh not available", gh pr list 2>/dev/null || echo "no PRs", bd ready 2>/dev/null || echo "no beads", cass search "capstone architecture tool selection Decision M..., gh run view 24037188812 2>/dev/null | head -30 || echo "CI d..., gh run view 24037188812 --log-failed 2>/dev/null | head -60 ..., cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., gh run view 24037188812 --log-failed 2>/dev/null | grep -E "..., cass search "tool selection Decision Matrix capstone" 2>/dev..., cass search "AIEnablementTraining S4 capstone tool selection..., ls -t ~/.claude/projects/-Users-leegonzales-Projects-leegonz..., ls -lt ~/.claude/projects/-Users-leegonzales-Projects-leegon..., gh run view 24037188812 --log-failed 2>/dev/null | grep -A5 ..., stat -f "%m %N" ~/.claude/projects/-Users-leegonzales-Projec..., gh run view 24037188812 2>/dev/null, git remote -v 2>/dev/null, cat Cargo.toml 2>/dev/null | grep -A5 "asupersync\|dependenc..., ls .github/workflows/ 2>/dev/null && cat .github/workflows/c..., gh run view 24037188812 --log-failed 2>/dev/null | tail -100, grep -r "franken" Cargo.toml Cargo.lock 2>/dev/null | head -..., cat .cargo/config.toml 2>/dev/null || echo "no .cargo/config..., grep -r "franken_agent_detection\|franken-agent-detection" ...., gh run list --repo leegonzales/cass --limit 5 2>/dev/null | ..., gh run list --repo Dicklesworthstone/coding_agent_session_se..., cargo fmt --check 2>&1 | head -20 && echo "FMT_STATUS: $?", cass search "Walsh capstone S4 architecture" --since "2026-0..., cargo clippy --all-targets 2>&1 | grep -E "warning|error" | ..., ls -la ~/.local/share/cass/ 2>/dev/null | head -10 || ls ~/L..., ls ~/Library/Application\ Support/cass/ 2>/dev/null && du -s..., find ~ -name "*.db" -path "*/cass/*" 2>/dev/null | head -5; ..., git add .servitor/journal.md .servitor/state.json && git com..., git push 2>&1, cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cargo clippy --all-targets 2>&1 | grep -E "error|warning" | ..., cargo clippy --all-targets 2>&1 | head -60, cat /private/tmp/claude-501/-Users-leegonzales-Projects-leeg..., cass --version 2>/dev/null && cass config show 2>/dev/null |..., find ~ -name "agent_search.db" -not -path "*/cass/tests/*" -..., du -sh "/Users/leegonzales/Library/Application Support/com.c..., git add .servitor/state.json && git commit -m "$(cat <<'EOF'
 ---
