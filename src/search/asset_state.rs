@@ -134,14 +134,6 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         }
     }
 
-    let active = match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-        Err(_) => false,
-    };
     let metadata_present = pid.is_some()
         || started_at_ms.is_some()
         || lock_db_path.is_some()
@@ -150,6 +142,51 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         || job_kind.is_some()
         || phase.is_some()
         || updated_at_ms.is_some();
+
+    let active = match file.try_lock_exclusive() {
+        Ok(()) => {
+            // We acquired the exclusive lock with no waiting, which means
+            // no process holds it. POSIX flock (via fs2) is released
+            // automatically when the owning file description is closed
+            // (either explicitly or when the process exits). Therefore, if
+            // the file contains metadata but no holder is present, the
+            // previous owner is dead.
+            //
+            // Historically this produced a permanent `orphaned: true` state
+            // that callers (notably the TUI) interpreted as "rebuild in
+            // progress, keep polling" — yielding a tight CPU-bound loop
+            // that only cleared when the user manually deleted the lock
+            // file (see issue #176).
+            //
+            // Reap the stale metadata in place while we hold the lock, so
+            // that this and every subsequent reader observes a clean state.
+            if metadata_present {
+                let owner_dead = pid.map(|p| !process_is_alive(p)).unwrap_or(true);
+                if owner_dead {
+                    if let Err(err) = file.set_len(0) {
+                        tracing::warn!(
+                            path = %lock_path.display(),
+                            error = %err,
+                            "failed to truncate stale index-run lock metadata"
+                        );
+                    } else {
+                        let _ = file.sync_all();
+                        tracing::info!(
+                            path = %lock_path.display(),
+                            dead_pid = ?pid,
+                            "cleared stale index-run lock metadata (owner dead)"
+                        );
+                        let _ = file.unlock();
+                        return SearchMaintenanceSnapshot::default();
+                    }
+                }
+            }
+            let _ = file.unlock();
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    };
 
     SearchMaintenanceSnapshot {
         active,
@@ -162,6 +199,26 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         phase,
         updated_at_ms,
         orphaned: metadata_present && !active,
+    }
+}
+
+/// Returns whether `pid` refers to a live process. Uses `/proc/<pid>` on
+/// Linux (no syscall, no external dependency). On non-Linux platforms we
+/// trust POSIX flock release semantics and return `false` — if we reached
+/// this function we already acquired the lock, which is evidence enough
+/// that the previous owner is dead.
+fn process_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -659,9 +716,76 @@ mod tests {
     }
 
     #[test]
-    fn inactive_lock_metadata_is_reported_as_orphaned() {
+    fn stale_lock_metadata_from_dead_owner_is_reaped_on_read() {
+        // Regression for issue #176: the TUI used to see a permanent
+        // `orphaned: true` state when the index-run.lock file contained
+        // metadata from a crashed process, because nothing in the read
+        // path cleaned it up. That produced a tight CPU-bound poll loop
+        // on startup. The read path now reaps stale metadata atomically
+        // while holding the exclusive flock.
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
+        // Use u32::MAX as a synthetic dead PID: the kernel will never
+        // assign it (PID ceiling is well below 2^32) so `/proc/<pid>`
+        // is guaranteed not to exist on Linux, and on non-Linux we fall
+        // through to flock-based reaping unconditionally.
+        std::fs::write(
+            &lock_path,
+            format!(
+                concat!(
+                    "pid={}\n",
+                    "started_at_ms=1733000111000\n",
+                    "updated_at_ms=1733000112000\n",
+                    "db_path=/tmp/cass/agent_search.db\n",
+                    "mode=index\n",
+                    "job_id=lexical-refresh-1733000111000-max\n",
+                    "job_kind=lexical_refresh\n",
+                    "phase=rebuilding\n"
+                ),
+                u32::MAX
+            ),
+        )
+        .expect("write lock metadata");
+
+        let snapshot = read_search_maintenance_snapshot(temp.path());
+        assert!(!snapshot.active, "no owner, must not be reported active");
+        assert!(
+            !snapshot.orphaned,
+            "stale metadata must be reaped, not reported as orphaned"
+        );
+        assert!(snapshot.pid.is_none(), "pid must be cleared after reap");
+        assert!(snapshot.job_id.is_none(), "job_id must be cleared after reap");
+        assert!(snapshot.phase.is_none(), "phase must be cleared after reap");
+
+        // File must still exist (to preserve permissions and avoid
+        // creating/recreating races) but be empty.
+        let post = std::fs::metadata(&lock_path).expect("lock file still present");
+        assert_eq!(post.len(), 0, "stale metadata must be truncated in place");
+
+        // Second read also returns a clean default snapshot.
+        let snapshot2 = read_search_maintenance_snapshot(temp.path());
+        assert!(!snapshot2.active);
+        assert!(!snapshot2.orphaned);
+    }
+
+    #[test]
+    fn live_owner_metadata_is_preserved_when_flock_is_held() {
+        // When the lock is actually held by a live owner, the snapshot
+        // must report the owner faithfully and must NOT reap the file.
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner
+            .try_lock_exclusive()
+            .expect("owner acquires exclusive lock");
+        // Write metadata while holding the lock, matching acquire_index_run_lock's order.
         std::fs::write(
             &lock_path,
             concat!(
@@ -678,8 +802,9 @@ mod tests {
         .expect("write lock metadata");
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
-        assert!(!snapshot.active);
-        assert!(snapshot.orphaned);
+        assert!(snapshot.active, "live owner must be reported active");
+        assert!(!snapshot.orphaned);
+        assert_eq!(snapshot.pid, Some(4242));
         assert_eq!(
             snapshot.job_id.as_deref(),
             Some("lexical-refresh-1733000111000-4242")
@@ -690,6 +815,12 @@ mod tests {
         );
         assert_eq!(snapshot.phase.as_deref(), Some("rebuilding"));
         assert_eq!(snapshot.updated_at_ms, Some(1_733_000_112_000));
+
+        // Metadata must still be present — reaping must NOT have happened.
+        let post = std::fs::metadata(&lock_path).expect("lock file still present");
+        assert!(post.len() > 0, "live-owner metadata must not be truncated");
+
+        let _ = FileExt::unlock(&owner);
     }
 
     #[test]
