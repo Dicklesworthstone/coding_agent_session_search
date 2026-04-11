@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task-by-task.
 >
-> **Status:** DRAFT — awaiting Lee's approval. Do NOT execute any destructive or state-changing step until Lee signs off.
+> **Status:** APPROVED 2026-04-10 by Lee. Revised after Gemini adversarial peer review (see "Revisions from peer review" section below).
 
 **Goal:** Sync `cass` with 355 new commits from `upstream/main` (Dicklesworthstone/coding_agent_session_search), rebuild the binary, restart the index-watch daemon, and verify that agent-visible `cass search` noise is gone — without losing the local `feat/cass-monitor` feature or the monitor-patch working-tree edits.
 
@@ -77,6 +77,30 @@ fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 But `~/Projects/leegonzales/frankensqlite/` **does not exist**. Neighbouring siblings `frankensearch`, `frankentui`, `franken_agent_detection` exist; `frankensqlite` does not. We must clone it before the first `cargo check`.
 
 Upstream also likely expects a sibling `../asupersync` (new dep `asupersync = git "...Dicklesworthstone/asupersync"`), and may have a patch override for it. Needs verification in Task 3.
+
+---
+
+## Revisions from Gemini peer review (2026-04-10)
+
+Gemini's adversarial review surfaced one real bug in the plan and several legitimate concerns. Captured here so the executing agent applies them at the right step.
+
+| # | Gemini concern | Plan revision |
+|---|---|---|
+| G1 | Cherry-pick-one-at-a-time on the 11 monitor commits is wishful thinking — the storage/FTS APIs the monitor module hooks into were rewritten upstream. You're not resolving conflicts, you're porting a feature. | **Revise Task 6**: squash the 11 `feat/cass-monitor` commits into a single `feat(monitor): port live agent monitor TUI to upstream API` patch, read the diff, and re-implement against the new upstream API. Cherry-pick attempts only as a fallback if the squash diff applies cleanly with trivial fixups. |
+| G2 | Hardlink "fast rollback" of `agent_search.db*` is broken — hardlinks share the same inode, so any in-place write by the new binary corrupts the "backup" too. | **Revise Task 2**: use `cp -c` (APFS clonefile, copy-on-write) instead of `ln`. True backup with no upfront disk cost on APFS. |
+| G3 | Don't assume the old DB is forward-compatible with the new FrankenSQLite version across 355 commits of mid-migration. The 3.6 GB hang+OOM may indicate the existing DB is already in an edge-case poison state. | **Revise Task 11**: keep "try old DB first" per Lee's call, but **lower the failure bar drastically** — any FrankenSQLite ERROR or WARN beyond a small allowlist on the new binary's first read triggers immediate move-aside-and-rebuild. The clonefile copy stays for forensics. |
+| G4 | Toolchain drift across 355 commits of Rust ecosystem evolution is real. | **Revise Task 3**: explicitly diff `rust-toolchain.toml` (or `rust-toolchain` file) between current HEAD and `upstream/main`. Install the upstream version via `rustup` if different. |
+| G5 | The daemon may be hung when we try to stop it. SIGKILL during Tantivy segment merge + FrankenSQLite WAL write would guarantee inconsistency between metadata and FTS indices. | **Revise Task 2**: pre-stop health check on PID 8568 — verify CPU is in normal range (not stuck at 0% AND not stuck at 100% with no log progress for 60s). If hung, escalate carefully (read log tail, decide whether to wait for a quiescent moment vs. accept SIGKILL risk and force rebuild as the recovery strategy). |
+| G6 | Telemetry suppression (upstream `b4bde82c`) does NOT necessarily fix the `cass stats` 3.6 GB hang+OOM. The hang may be FrankenSQLite materialization (not telemetry collection). Several upstream perf commits (`166122e6`, `860acb12`, `c38edcd9`) DO target materialization, but we shouldn't assume they fix this specific symptom. | **Reinforce Task 9 success criterion**: `cass stats` returning in <15s is a hard pass/fail gate. If sync ships and stats still hangs, that's a separate root-cause investigation (not a regression — just an unfixed bug). Do not declare success without it. |
+| G7 | Rsyncing `.servitor/**` into the new worktree could trip the new indexer if upstream made it scan dot-folders for session content. | **Revise Task 7**: before rsync, `git show upstream/main:src/indexer/discovery.rs` (or wherever session source paths are configured) and confirm `.servitor/` is NOT a scanned path. Low risk but cheap verification. |
+
+Gemini's strategic recommendation ("abort the sync, backport just `b4bde82c` as a tactical hotfix") was **considered and rejected** by Lee. Reasons documented:
+1. Lee's stated goal from the start was a clean rebuild with upstream improvements compounded in, not a band-aid.
+2. The 355-commit drift is itself a growing risk; deferring it makes each future sync harder.
+3. "Compound, don't consume" — work that only solves today's problem is half-finished.
+4. The clonefile + rebuild fallback already gives us a fast revert path if cutover regresses.
+
+The keeper-of-the-memory is doing this properly, not papering over it.
 
 ---
 
