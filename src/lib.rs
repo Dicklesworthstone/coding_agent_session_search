@@ -5292,6 +5292,22 @@ fn state_meta_json(
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
 
+    // Probe Tantivy index document count when the DB has messages.
+    // This is cheap (one reader open) and only runs when it matters.
+    let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
+        frankensearch::lexical::cass_open_search_reader(
+            &index_path,
+            frankensearch::lexical::ReloadPolicy::Manual,
+        )
+        .ok()
+        .map(|(reader, _fields)| reader.searcher().num_docs())
+    } else {
+        None
+    };
+    let index_empty_with_messages = index_doc_count
+        .map(|docs| docs == 0 && message_count > 0)
+        .unwrap_or(false);
+
     let ts_str = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
@@ -5316,6 +5332,8 @@ fn state_meta_json(
                     .unwrap_or_else(chrono::Utc::now)
                     .to_rfc3339()
             }),
+            "documents": index_doc_count,
+            "empty_with_messages": index_empty_with_messages,
             "fingerprint": {
                 "current_db_fingerprint": lexical.fingerprint.current_db_fingerprint,
                 "checkpoint_fingerprint": lexical.fingerprint.checkpoint_fingerprint,
@@ -9536,9 +9554,14 @@ fn run_status(
         .get("semantic")
         .and_then(|s| s.get("hint"))
         .and_then(|v| v.as_str());
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|i| i.get("empty_with_messages"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let db_available = db_opened || (db_exists && db_open_retryable);
-    let healthy = db_exists && db_available && index_exists && index_fresh && !rebuild_active;
+    let healthy = db_exists && db_available && index_exists && index_fresh && !rebuild_active && !index_empty_with_messages;
     let status = if rebuild_active {
         "rebuilding"
     } else if healthy {
@@ -9557,6 +9580,8 @@ fn run_status(
         Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_empty_with_messages {
+        Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -9644,6 +9669,10 @@ fn run_status(
                 }
                 _ => println!("  Rebuild progress: in progress"),
             }
+        }
+        if index_empty_with_messages {
+            println!("  Warning: index has 0 documents but database has messages");
+            println!("  Run 'cass index --full' to populate the search index");
         }
     } else {
         println!("  Not found - run 'cass index --full'");
@@ -9762,9 +9791,14 @@ fn run_health(
         .and_then(|p| p.get("sessions"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+    let index_empty_with_messages = state
+        .get("index")
+        .and_then(|i| i.get("empty_with_messages"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let db_degraded = db_exists && !db_opened;
-    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active;
+    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active && !index_empty_with_messages;
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
@@ -9782,6 +9816,9 @@ fn run_health(
     }
     if rebuild_active {
         errors.push("index rebuild in progress".to_string());
+    }
+    if index_empty_with_messages {
+        errors.push("index empty but database has messages — run 'cass index --full'".to_string());
     }
 
     // Determine status string for structured output.
@@ -9849,6 +9886,9 @@ fn run_health(
         }
         if !index_exists {
             println!("  - index not found");
+        }
+        if index_empty_with_messages {
+            println!("  - index has 0 documents but database has messages");
         }
         println!("Run 'cass index --full' or 'cass index --watch' to create index.");
     }
