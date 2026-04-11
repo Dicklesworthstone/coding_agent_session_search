@@ -176,7 +176,6 @@ fn stress_parallel_connector_writes() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite MVCC bug: duplicates rows and corrupts counts under heavy contention (lost/duplicate cells)"]
 fn stress_write_heavy_contention() {
     let dir = TempDir::new().unwrap();
     let db_path = setup_db(&dir);

@@ -3778,13 +3778,7 @@ async fn execute_cli(
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_resume(
-                        &path,
-                        agent.as_deref(),
-                        exec,
-                        shell,
-                        structured_format,
-                    )?;
+                    run_resume(&path, agent.as_deref(), exec, shell, structured_format)?;
                 }
                 Commands::Export {
                     path,
@@ -4221,8 +4215,11 @@ where
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -4249,8 +4246,11 @@ where
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -4278,8 +4278,11 @@ fn fresh_franken_count_retry(
                     return None;
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
                 continue;
             }
         };
@@ -4294,8 +4297,11 @@ fn fresh_franken_count_retry(
                     return None;
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
             }
             Err(_) => return None,
         }
@@ -5768,9 +5774,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Sessions { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Resume { json, .. } => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
+        Commands::Resume { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::ExportHtml { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -9561,7 +9565,12 @@ fn run_status(
         .unwrap_or(false);
 
     let db_available = db_opened || (db_exists && db_open_retryable);
-    let healthy = db_exists && db_available && index_exists && index_fresh && !rebuild_active && !index_empty_with_messages;
+    let healthy = db_exists
+        && db_available
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
     let status = if rebuild_active {
         "rebuilding"
     } else if healthy {
@@ -9798,7 +9807,12 @@ fn run_health(
         .unwrap_or(false);
 
     let db_degraded = db_exists && !db_opened;
-    let healthy = db_exists && db_opened && index_exists && index_fresh && !rebuild_active && !index_empty_with_messages;
+    let healthy = db_exists
+        && db_opened
+        && index_exists
+        && index_fresh
+        && !rebuild_active
+        && !index_empty_with_messages;
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
@@ -10779,9 +10793,7 @@ mod cli_read_db_tests {
 
     #[test]
     fn resume_detects_opencode_session_from_source_path() {
-        let path = PathBuf::from(
-            "/Users/ellis/.local/share/opencode/opencode.db/sess%2D42",
-        );
+        let path = PathBuf::from("/Users/ellis/.local/share/opencode/opencode.db/sess%2D42");
         let target = resolve_resume_target(&path, None).expect("resolve");
         assert_eq!(target.agent, "opencode");
         assert_eq!(target.session_id.as_deref(), Some("sess-42"));
@@ -10952,8 +10964,12 @@ mod cli_read_db_tests {
     #[test]
     fn looks_like_session_uuid_accepts_canonical_form() {
         // Canonical 8-4-4-4-12 hex UUIDs (mixed case allowed).
-        assert!(looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789ab"));
-        assert!(looks_like_session_uuid("ABC12345-DEAD-BEEF-CAFE-0123456789AB"));
+        assert!(looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789ab"
+        ));
+        assert!(looks_like_session_uuid(
+            "ABC12345-DEAD-BEEF-CAFE-0123456789AB"
+        ));
         assert!(looks_like_session_uuid(
             "fedc1234-babe-cafe-beef-abcdef012345"
         ));
@@ -10970,12 +10986,20 @@ mod cli_read_db_tests {
         // Wrong length.
         assert!(!looks_like_session_uuid(""));
         assert!(!looks_like_session_uuid("abc"));
-        assert!(!looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789a")); // 35
-        assert!(!looks_like_session_uuid("abc12345-dead-beef-cafe-0123456789abc")); // 37
+        assert!(!looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789a"
+        )); // 35
+        assert!(!looks_like_session_uuid(
+            "abc12345-dead-beef-cafe-0123456789abc"
+        )); // 37
         // Right length, wrong separator positions.
-        assert!(!looks_like_session_uuid("abc1234-5dead-beef-cafe-0123456789ab"));
+        assert!(!looks_like_session_uuid(
+            "abc1234-5dead-beef-cafe-0123456789ab"
+        ));
         // Non-hex characters.
-        assert!(!looks_like_session_uuid("xyz12345-dead-beef-cafe-0123456789ab"));
+        assert!(!looks_like_session_uuid(
+            "xyz12345-dead-beef-cafe-0123456789ab"
+        ));
         // Common wrong-path mistakes.
         assert!(!looks_like_session_uuid("2026-04-09T10-00-00_notes"));
         assert!(!looks_like_session_uuid("my_project_name"));
@@ -11071,7 +11095,10 @@ mod cli_read_db_tests {
         assert_eq!(shell_quote("has space"), "'has space'");
         assert_eq!(shell_quote("has'quote"), "'has'\\''quote'");
         assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("/abs/path/with-dashes"), "/abs/path/with-dashes");
+        assert_eq!(
+            shell_quote("/abs/path/with-dashes"),
+            "/abs/path/with-dashes"
+        );
     }
 
     #[test]
@@ -12223,7 +12250,15 @@ fn find_context_source_conversation(
     conn: &frankensqlite::Connection,
     path_str: &str,
     source_id: Option<&str>,
-) -> Option<(i64, Option<i64>, Option<i64>, Option<i64>, String, String, String)> {
+) -> Option<(
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    String,
+    String,
+    String,
+)> {
     use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
@@ -12337,9 +12372,10 @@ fn run_context(
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
 
     // Find related sessions: same workspace (excluding self)
-    let same_workspace: Vec<(String, String, String, Option<i64>, String)> =
-        if let Some(ws_id) = workspace_id {
-            let query = format!(
+    let same_workspace: Vec<(String, String, String, Option<i64>, String)> = if let Some(ws_id) =
+        workspace_id
+    {
+        let query = format!(
                 "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
                  FROM conversations c
                  LEFT JOIN agents a ON c.agent_id = a.id
@@ -12347,27 +12383,27 @@ fn run_context(
                  ORDER BY c.started_at DESC
                  LIMIT ?"
             );
-            conn.query_map_collect(
-                &query,
-                &[
-                    ParamValue::from(ws_id),
-                    ParamValue::from(conv_id),
-                    ParamValue::from(limit as i64),
-                ],
-                |r: &frankensqlite::Row| {
-                    Ok((
-                        r.get_typed(0)?,
-                        r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                        r.get_typed(2)?,
-                        r.get_typed(3)?,
-                        r.get_typed(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| CliError::unknown(format!("query: {e}")))?
-        } else {
-            Vec::new()
-        };
+        conn.query_map_collect(
+            &query,
+            &[
+                ParamValue::from(ws_id),
+                ParamValue::from(conv_id),
+                ParamValue::from(limit as i64),
+            ],
+            |r: &frankensqlite::Row| {
+                Ok((
+                    r.get_typed(0)?,
+                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                    r.get_typed(2)?,
+                    r.get_typed(3)?,
+                    r.get_typed(4)?,
+                ))
+            },
+        )
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    } else {
+        Vec::new()
+    };
 
     // Find related sessions: same day (within 24 hours of started_at)
     let same_day: Vec<(String, String, String, Option<i64>, String)> = if let Some(ts) = started_at
@@ -15274,9 +15310,9 @@ struct ResumeTarget {
 /// for `eval "$(cass resume ...)"` without introducing shell injection.
 fn shell_quote(arg: &str) -> String {
     if !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | ','))
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '+' | ',')
+        })
     {
         // Safe characters — no quoting needed.
         return arg.to_string();
@@ -15320,10 +15356,7 @@ struct DetectedAgent {
 /// connectors understand. If `agent_override` is set, its value is
 /// validated and returned verbatim. Returns a normalized slug plus an
 /// optional binary hint (see [`DetectedAgent::binary_hint`]).
-fn detect_resume_agent(
-    path: &Path,
-    agent_override: Option<&str>,
-) -> CliResult<DetectedAgent> {
+fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<DetectedAgent> {
     if let Some(raw) = agent_override {
         let normalized = raw.trim().to_ascii_lowercase();
         let (slug, binary_hint): (&'static str, Option<&'static str>) = match normalized.as_str() {
@@ -15634,10 +15667,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
 /// Build the ready-to-run resume target for a session path. Does not
 /// touch the filesystem unless the agent requires file-based id
 /// extraction (pi-agent).
-fn resolve_resume_target(
-    path: &Path,
-    agent_override: Option<&str>,
-) -> CliResult<ResumeTarget> {
+fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult<ResumeTarget> {
     let detected = detect_resume_agent(path, agent_override)?;
     let detection_reason = detected.reason;
     // Skip strict validations (like UUID-shape checks) when the user
@@ -15684,10 +15714,7 @@ fn resolve_resume_target(
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
                 kind: "session_id_not_found",
-                message: format!(
-                    "cannot derive Codex session UUID from '{}'",
-                    path.display()
-                ),
+                message: format!("cannot derive Codex session UUID from '{}'", path.display()),
                 hint: None,
                 retryable: false,
             })?;
@@ -20637,7 +20664,9 @@ fn run_timeline(
     let mut params: Vec<ParamValue> = vec![start_ts.into(), end_ts.into()];
 
     if !agents.is_empty() {
-        sql.push_str(" AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (");
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM agents a2 WHERE a2.id = c.agent_id AND a2.slug IN (",
+        );
         for (i, agent) in agents.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");

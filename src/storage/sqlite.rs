@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Frankensqlite parameter list builder.
 macro_rules! fparams {
@@ -219,6 +220,41 @@ impl LazyFrankenDb {
     }
 }
 
+static FRANKEN_RETRY_JITTER_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+fn next_franken_retry_jitter_ms(max_inclusive: u64) -> u64 {
+    let mut value = FRANKEN_RETRY_JITTER_STATE.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value % max_inclusive.saturating_add(1)
+}
+
+/// Sleep with jittered exponential backoff to avoid lock-step retry storms
+/// when many threads hit the same transient SQLite/frankensqlite contention.
+pub(crate) fn sleep_with_franken_retry_backoff(
+    backoff: &mut Duration,
+    remaining: Duration,
+    max_backoff: Duration,
+) {
+    let capped = (*backoff).min(remaining);
+    let extra_budget = remaining.saturating_sub(capped).min(capped);
+    let extra_ms = extra_budget.as_millis().min(u128::from(u64::MAX)) as u64;
+    let sleep_for = if extra_ms == 0 {
+        capped
+    } else {
+        capped
+            .saturating_add(Duration::from_millis(next_franken_retry_jitter_ms(
+                extra_ms,
+            )))
+            .min(remaining)
+    };
+    std::thread::sleep(sleep_for);
+    *backoff = backoff.saturating_mul(2).min(max_backoff);
+}
+
 pub(crate) fn open_franken_storage_with_timeout(
     path: &Path,
     timeout: Duration,
@@ -238,8 +274,11 @@ pub(crate) fn open_franken_storage_with_timeout(
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(128));
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -265,8 +304,11 @@ pub(crate) fn open_franken_readonly_storage_with_timeout(
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(128));
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -295,8 +337,11 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(128));
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -329,8 +374,11 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(128));
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -4598,24 +4646,18 @@ impl FrankenStorage {
     ) -> Result<(HashMap<i64, String>, HashMap<i64, PathBuf>)> {
         let agents: HashMap<i64, String> = self
             .conn
-            .query_map_collect(
-                "SELECT id, slug FROM agents",
-                fparams![],
-                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
-            )
+            .query_map_collect("SELECT id, slug FROM agents", fparams![], |row| {
+                Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
+            })
             .with_context(|| "loading agent lookup for lexical rebuild")?
             .into_iter()
             .collect();
         let workspaces: HashMap<i64, PathBuf> = self
             .conn
-            .query_map_collect(
-                "SELECT id, path FROM workspaces",
-                fparams![],
-                |row| {
-                    let path_str: String = row.get_typed(1)?;
-                    Ok((row.get_typed::<i64>(0)?, PathBuf::from(path_str)))
-                },
-            )
+            .query_map_collect("SELECT id, path FROM workspaces", fparams![], |row| {
+                let path_str: String = row.get_typed(1)?;
+                Ok((row.get_typed::<i64>(0)?, PathBuf::from(path_str)))
+            })
             .with_context(|| "loading workspace lookup for lexical rebuild")?
             .into_iter()
             .collect();
@@ -4654,8 +4696,7 @@ impl FrankenStorage {
                         agent_slug: agent_id
                             .and_then(|aid| agent_slugs.get(&aid).cloned())
                             .unwrap_or_else(|| "unknown".to_string()),
-                        workspace: workspace_id
-                            .and_then(|wid| workspace_paths.get(&wid).cloned()),
+                        workspace: workspace_id.and_then(|wid| workspace_paths.get(&wid).cloned()),
                         external_id: row.get_typed(3)?,
                         title: row.get_typed(4)?,
                         source_path: Path::new(&source_path).to_path_buf(),
@@ -13995,8 +14036,7 @@ mod tests {
             ]
         );
 
-        let (agent_slugs, workspace_paths) =
-            storage.build_lexical_rebuild_lookups().unwrap();
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
         let rebuild_order: Vec<PathBuf> = storage
             .list_conversations_for_lexical_rebuild(10, 0, &agent_slugs, &workspace_paths)
             .unwrap()
@@ -16471,22 +16511,24 @@ mod tests {
         }
 
         {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS usage_models_daily;
-                 DROP TABLE IF EXISTS usage_daily;
-                 DROP TABLE IF EXISTS usage_hourly;
-                 DROP TABLE IF EXISTS message_metrics;
-                 DROP TABLE IF EXISTS token_daily_stats;
-                 DROP TABLE IF EXISTS token_usage;
-                 DROP TABLE IF EXISTS model_pricing;
-                 DROP TABLE IF EXISTS embedding_jobs;
-                 DROP TABLE IF EXISTS daily_stats;",
-            )
-            .unwrap();
-            conn.execute(
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            for table in &[
+                "usage_models_daily",
+                "usage_daily",
+                "usage_hourly",
+                "message_metrics",
+                "token_daily_stats",
+                "token_usage",
+                "model_pricing",
+                "embedding_jobs",
+                "daily_stats",
+            ] {
+                conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
+                    .unwrap();
+            }
+            conn.execute_compat(
                 "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-                rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+                &[ParamValue::from(CURRENT_SCHEMA_VERSION.to_string())],
             )
             .unwrap();
         }

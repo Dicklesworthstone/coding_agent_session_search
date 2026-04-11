@@ -742,7 +742,10 @@ mod tests {
             "stale metadata must be reaped, not reported as orphaned"
         );
         assert!(snapshot.pid.is_none(), "pid must be cleared after reap");
-        assert!(snapshot.job_id.is_none(), "job_id must be cleared after reap");
+        assert!(
+            snapshot.job_id.is_none(),
+            "job_id must be cleared after reap"
+        );
         assert!(snapshot.phase.is_none(), "phase must be cleared after reap");
 
         // File must still exist (to preserve permissions and avoid

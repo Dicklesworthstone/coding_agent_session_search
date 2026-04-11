@@ -261,12 +261,13 @@ Use `FrankenConnectionManager` for concurrent access:
 4. **Limit concurrent writers** to 4 threads (matches production rayon parallelism)
 5. **Retryable errors:** `Busy`, `BusyRecovery`, `BusySnapshot`, `WriteConflict`, `SerializationFailure`, `DatabaseCorrupt`
 
-### Known frankensqlite Limitations (during migration)
+### Known frankensqlite Differences
 
-- `ORDER BY` with `IS NULL` expressions not supported in SELECT list
-- Mixed aggregate and non-aggregate columns without GROUP BY not supported
-- `INSERT ON CONFLICT` (UPSERT) can fail after repeated calls in release mode
-- Some complex `SELECT` queries fail with "OpenRead" errors (result-loading path)
+- **File format incompatibility:** frankensqlite databases cannot be read by C
+  SQLite (rusqlite) and vice versa. Historical bundle salvage still uses rusqlite
+  for reading pre-migration databases.
+- **`PRAGMA writable_schema`:** Not supported for write operations (INSERT/UPDATE
+  on sqlite_master). SELECT from sqlite_master works.
 
 ### General Rules
 

@@ -32,7 +32,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "ff6a114b", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -104,8 +104,8 @@ rand = "0.10"
 qrcode = { version = "*", optional = true }
 image = { version = "*", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
-# rusqlite used for FTS5 search fallback path: frankensqlite's in-memory FTS5
-# cannot read on-disk shadow tables, so we need stock SQLite for MATCH queries.
+# rusqlite retained for historical bundle salvage: reading pre-migration databases
+# created by C SQLite (frankensqlite uses a different on-disk format).
 rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 
 # macOS keychain access (optional, for ChatGPT decryption)
@@ -138,7 +138,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "ff6a114b", package = "fsqlite-types" }
+fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"

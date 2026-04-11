@@ -97,8 +97,11 @@ where
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -121,8 +124,11 @@ fn franken_query_rows_retry(
                     return Err(err);
                 }
                 let remaining = deadline.saturating_duration_since(now);
-                std::thread::sleep(backoff.min(remaining));
-                backoff = backoff.saturating_mul(2).min(Duration::from_millis(64));
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -1624,22 +1630,21 @@ impl QueryCache {
         }
     }
 
-    fn get_or_embed(&mut self, embedder: &dyn Embedder, canonical: &str) -> Result<Vec<f32>> {
+    fn align_embedder(&mut self, embedder: &dyn Embedder) {
         if self.embedder_id != embedder.id() {
             self.embedder_id = embedder.id().to_string();
             self.embeddings.clear();
         }
+    }
 
-        if let Some(hit) = self.embeddings.get(canonical) {
-            return Ok(hit.clone());
-        }
+    fn get_cached(&mut self, embedder: &dyn Embedder, canonical: &str) -> Option<Vec<f32>> {
+        self.align_embedder(embedder);
+        self.embeddings.get(canonical).cloned()
+    }
 
-        let embedding = embedder
-            .embed_sync(canonical)
-            .map_err(|e| anyhow!("embedding failed: {e}"))?;
-        self.embeddings
-            .put(canonical.to_string(), embedding.clone());
-        Ok(embedding)
+    fn store(&mut self, embedder: &dyn Embedder, canonical: &str, embedding: Vec<f32>) {
+        self.align_embedder(embedder);
+        self.embeddings.put(canonical.to_string(), embedding);
     }
 }
 
@@ -1680,8 +1685,8 @@ fn open_fs_semantic_ann_index(fs_index: &FsVectorIndex, ann_path: &Path) -> Resu
 
 struct SemanticSearchState {
     embedder: Arc<dyn Embedder>,
-    fs_semantic_index: FsVectorIndex,
-    fs_ann_index: Option<FsHnswIndex>,
+    fs_semantic_index: Arc<FsVectorIndex>,
+    fs_ann_index: Option<Arc<FsHnswIndex>>,
     ann_path: Option<PathBuf>,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
     in_memory_two_tier_init_attempted: bool,
@@ -1696,6 +1701,13 @@ struct ProgressiveTwoTierContext {
     index: Arc<FsTwoTierIndex>,
     fast_embedder: Arc<dyn frankensearch::Embedder>,
     quality_embedder: Option<Arc<dyn frankensearch::Embedder>>,
+}
+
+#[derive(Clone)]
+struct SemanticCandidateContext {
+    fs_semantic_index: Arc<FsVectorIndex>,
+    filter_maps: SemanticFilterMaps,
+    roles: Option<HashSet<u8>>,
 }
 
 struct SharedCassSyncEmbedder {
@@ -1769,66 +1781,48 @@ impl Embedder for SharedCassSyncEmbedder {
     }
 }
 
-impl SemanticSearchState {
-    fn load_in_memory_two_tier_index(
-        &mut self,
-        tier_mode: SemanticTierMode,
-    ) -> Option<Arc<FsInMemoryTwoTierIndex>> {
-        if let Some(index) = self.fs_in_memory_two_tier_index.as_ref() {
-            return Some(Arc::clone(index));
-        }
-        if self.in_memory_two_tier_init_attempted {
-            return None;
-        }
-        self.in_memory_two_tier_init_attempted = true;
+fn build_in_memory_two_tier_index(
+    ann_path: Option<PathBuf>,
+    embedder_id: &str,
+    tier_mode: SemanticTierMode,
+) -> Option<Arc<FsInMemoryTwoTierIndex>> {
+    let index_dir = ann_path
+        .as_ref()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let Some(index_dir) = index_dir else {
+        tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
+        return None;
+    };
 
-        let index_dir = self
-            .ann_path
-            .as_ref()
-            .and_then(|path| path.parent().map(Path::to_path_buf));
-        let Some(index_dir) = index_dir else {
-            tracing::debug!("two-tier semantic unavailable: ann/index directory path missing");
-            return None;
-        };
-
-        match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
-            Ok(index) => {
-                let index = Arc::new(index);
-                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
-                return Some(index);
-            }
-            Err(err) => {
-                tracing::debug!(
-                    dir = %index_dir.display(),
-                    error = %err,
-                    "two-tier semantic index load failed; considering fallback"
-                );
-            }
+    match FsInMemoryTwoTierIndex::from_dir(&index_dir) {
+        Ok(index) => return Some(Arc::new(index)),
+        Err(err) => {
+            tracing::debug!(
+                dir = %index_dir.display(),
+                error = %err,
+                "two-tier semantic index load failed; considering fallback"
+            );
         }
+    }
 
-        if !matches!(tier_mode, SemanticTierMode::FastOnly) {
-            return None;
-        }
+    if !matches!(tier_mode, SemanticTierMode::FastOnly) {
+        return None;
+    }
 
-        let fallback_fast = index_dir.join(format!("index-{}.fsvi", self.embedder.id()));
-        if !fallback_fast.is_file() {
-            return None;
-        }
+    let fallback_fast = index_dir.join(format!("index-{embedder_id}.fsvi"));
+    if !fallback_fast.is_file() {
+        return None;
+    }
 
-        match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
-            Ok(fast) => {
-                let index = Arc::new(FsInMemoryTwoTierIndex::new(fast, None));
-                self.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
-                Some(index)
-            }
-            Err(err) => {
-                tracing::debug!(
-                    path = %fallback_fast.display(),
-                    error = %err,
-                    "fast-only semantic fallback index load failed"
-                );
-                None
-            }
+    match FsInMemoryVectorIndex::from_fsvi(&fallback_fast) {
+        Ok(fast) => Some(Arc::new(FsInMemoryTwoTierIndex::new(fast, None))),
+        Err(err) => {
+            tracing::debug!(
+                path = %fallback_fast.display(),
+                error = %err,
+                "fast-only semantic fallback index load failed"
+            );
+            None
         }
     }
 }
@@ -2953,7 +2947,7 @@ impl SearchClient {
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *state_guard = Some(SemanticSearchState {
             embedder,
-            fs_semantic_index,
+            fs_semantic_index: Arc::new(fs_semantic_index),
             fs_ann_index: None,
             ann_path,
             fs_in_memory_two_tier_index: None,
@@ -2976,15 +2970,362 @@ impl SearchClient {
         Ok(())
     }
 
+    fn semantic_query_embedding(&self, canonical: &str) -> Result<Vec<f32>> {
+        loop {
+            let embedder = {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if let Some(hit) = state
+                    .query_cache
+                    .get_cached(state.embedder.as_ref(), canonical)
+                {
+                    return Ok(hit);
+                }
+                Arc::clone(&state.embedder)
+            };
+
+            let embedding = embedder
+                .embed_sync(canonical)
+                .map_err(|e| anyhow!("embedding failed: {e}"))?;
+
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_mut().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            if state.embedder.id() != embedder.id() {
+                continue;
+            }
+            if let Some(hit) = state
+                .query_cache
+                .get_cached(state.embedder.as_ref(), canonical)
+            {
+                return Ok(hit);
+            }
+            state
+                .query_cache
+                .store(state.embedder.as_ref(), canonical, embedding.clone());
+            return Ok(embedding);
+        }
+    }
+
+    fn in_memory_two_tier_index(
+        &self,
+        tier_mode: SemanticTierMode,
+    ) -> Result<Option<Arc<FsInMemoryTwoTierIndex>>> {
+        loop {
+            let (ann_path, embedder_id) = {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if let Some(index) = state.fs_in_memory_two_tier_index.as_ref() {
+                    return Ok(Some(Arc::clone(index)));
+                }
+                if state.in_memory_two_tier_init_attempted {
+                    return Ok(None);
+                }
+                state.in_memory_two_tier_init_attempted = true;
+                (state.ann_path.clone(), state.embedder.id().to_string())
+            };
+
+            let index = build_in_memory_two_tier_index(ann_path.clone(), &embedder_id, tier_mode);
+
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_mut().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            if let Some(existing) = state.fs_in_memory_two_tier_index.as_ref() {
+                return Ok(Some(Arc::clone(existing)));
+            }
+            if state.ann_path != ann_path || state.embedder.id() != embedder_id {
+                continue;
+            }
+            if let Some(index) = index {
+                state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+                return Ok(Some(index));
+            }
+            return Ok(None);
+        }
+    }
+
+    fn ann_index(&self) -> Result<Arc<FsHnswIndex>> {
+        loop {
+            let (ann_path, fs_semantic_index) = {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if let Some(index) = state.fs_ann_index.as_ref() {
+                    return Ok(Arc::clone(index));
+                }
+                let ann_path = state.ann_path.clone().ok_or_else(|| {
+                    anyhow!(
+                        "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
+                    )
+                })?;
+                (ann_path, Arc::clone(&state.fs_semantic_index))
+            };
+
+            let ann = Arc::new(open_fs_semantic_ann_index(
+                fs_semantic_index.as_ref(),
+                &ann_path,
+            )?);
+
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_mut().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            if let Some(existing) = state.fs_ann_index.as_ref() {
+                return Ok(Arc::clone(existing));
+            }
+            if state.ann_path.as_ref() != Some(&ann_path)
+                || !Arc::ptr_eq(&state.fs_semantic_index, &fs_semantic_index)
+            {
+                continue;
+            }
+            state.fs_ann_index = Some(Arc::clone(&ann));
+            return Ok(ann);
+        }
+    }
+
+    fn collapse_semantic_results(
+        best_by_message: HashMap<u64, VectorSearchResult>,
+        fetch_limit: usize,
+    ) -> Vec<VectorSearchResult> {
+        let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
+        collapsed.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        if collapsed.len() > fetch_limit {
+            collapsed.truncate(fetch_limit);
+        }
+        collapsed
+    }
+
+    fn search_semantic_candidates(
+        &self,
+        context: &SemanticCandidateContext,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        fetch_limit: usize,
+        approximate: bool,
+        tier_mode: SemanticTierMode,
+        in_memory_two_tier_index: Option<&Arc<FsInMemoryTwoTierIndex>>,
+        ann_index: Option<&Arc<FsHnswIndex>>,
+    ) -> Result<(
+        Vec<VectorSearchResult>,
+        bool,
+        Option<crate::search::ann_index::AnnSearchStats>,
+    )> {
+        let mut semantic_filter =
+            SemanticFilter::from_search_filters(filters, &context.filter_maps)?;
+        if let Some(roles) = context.roles.clone() {
+            semantic_filter = semantic_filter.with_roles(Some(roles));
+        }
+
+        if tier_mode.wants_two_tier() && !approximate {
+            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+            if let Some(two_tier_index) = in_memory_two_tier_index {
+                let config = tier_mode.to_frankensearch_config();
+                let searcher = FsSyncTwoTierSearcher::new(Arc::clone(two_tier_index), config);
+                let (tier_hits, metrics) = searcher
+                    .search_collect_with_filter(embedding, fetch_limit, fs_filter)
+                    .map_err(|err| {
+                        anyhow!("frankensearch two-tier semantic search failed: {err}")
+                    })?;
+
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    phase1_ms = metrics.phase1_total_ms,
+                    phase2_ms = metrics.phase2_total_ms,
+                    skip_reason = ?metrics.skip_reason,
+                    returned = tier_hits.len(),
+                    "semantic two-tier search executed"
+                );
+
+                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                for hit in tier_hits.iter() {
+                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                        continue;
+                    };
+                    best_by_message
+                        .entry(parsed.message_id)
+                        .and_modify(|entry| {
+                            if hit.score > entry.score {
+                                entry.score = hit.score;
+                                entry.chunk_idx = parsed.chunk_idx;
+                            }
+                        })
+                        .or_insert(VectorSearchResult {
+                            message_id: parsed.message_id,
+                            chunk_idx: parsed.chunk_idx,
+                            score: hit.score,
+                        });
+                }
+
+                return Ok((
+                    Self::collapse_semantic_results(best_by_message, fetch_limit),
+                    tier_hits.len() >= fetch_limit,
+                    None,
+                ));
+            }
+
+            tracing::debug!(
+                tier_mode = ?tier_mode,
+                "two-tier semantic unavailable; falling back to exact single-tier search"
+            );
+
+            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+            let fs_hits = context
+                .fs_semantic_index
+                .search_top_k(embedding, fetch_limit, fs_filter)
+                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+
+            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+            for hit in fs_hits.iter() {
+                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                    continue;
+                };
+                best_by_message
+                    .entry(parsed.message_id)
+                    .and_modify(|entry| {
+                        if hit.score > entry.score {
+                            entry.score = hit.score;
+                            entry.chunk_idx = parsed.chunk_idx;
+                        }
+                    })
+                    .or_insert(VectorSearchResult {
+                        message_id: parsed.message_id,
+                        chunk_idx: parsed.chunk_idx,
+                        score: hit.score,
+                    });
+            }
+
+            return Ok((
+                Self::collapse_semantic_results(best_by_message, fetch_limit),
+                fs_hits.len() >= fetch_limit,
+                None,
+            ));
+        }
+
+        if approximate {
+            if tier_mode.wants_two_tier() {
+                tracing::debug!(
+                    tier_mode = ?tier_mode,
+                    "approximate search requested; bypassing two-tier mode"
+                );
+            }
+
+            let ann = ann_index.ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
+            let candidate = fetch_limit
+                .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
+                .max(fetch_limit);
+            let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
+            let (ann_results, search_stats) =
+                ann.knn_search_with_stats(embedding, candidate, ef)
+                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
+            let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
+                index_size: search_stats.index_size,
+                dimension: search_stats.dimension,
+                ef_search: search_stats.ef_search,
+                k_requested: search_stats.k_requested,
+                k_returned: search_stats.k_returned,
+                search_time_us: search_stats.search_time_us,
+                estimated_recall: search_stats.estimated_recall as f32,
+                is_approximate: search_stats.is_approximate,
+            });
+
+            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+
+            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+            for hit in ann_results.iter() {
+                if let Some(filter) = fs_filter
+                    && !filter.matches(&hit.doc_id, None)
+                {
+                    continue;
+                }
+                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                    continue;
+                };
+                best_by_message
+                    .entry(parsed.message_id)
+                    .and_modify(|entry| {
+                        if hit.score > entry.score {
+                            entry.score = hit.score;
+                            entry.chunk_idx = parsed.chunk_idx;
+                        }
+                    })
+                    .or_insert(VectorSearchResult {
+                        message_id: parsed.message_id,
+                        chunk_idx: parsed.chunk_idx,
+                        score: hit.score,
+                    });
+            }
+
+            return Ok((
+                Self::collapse_semantic_results(best_by_message, fetch_limit),
+                ann_results.len() >= candidate,
+                ann_stats,
+            ));
+        }
+
+        let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
+        let fs_hits = context
+            .fs_semantic_index
+            .search_top_k(embedding, fetch_limit, fs_filter)
+            .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
+
+        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        for hit in fs_hits.iter() {
+            let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
+                continue;
+            };
+            best_by_message
+                .entry(parsed.message_id)
+                .and_modify(|entry| {
+                    if hit.score > entry.score {
+                        entry.score = hit.score;
+                        entry.chunk_idx = parsed.chunk_idx;
+                    }
+                })
+                .or_insert(VectorSearchResult {
+                    message_id: parsed.message_id,
+                    chunk_idx: parsed.chunk_idx,
+                    score: hit.score,
+                });
+        }
+
+        Ok((
+            Self::collapse_semantic_results(best_by_message, fetch_limit),
+            fs_hits.len() >= fetch_limit,
+            None,
+        ))
+    }
+
     pub fn can_progressively_refine(&self) -> bool {
-        let mut guard = match self.semantic.lock() {
-            Ok(guard) => guard,
-            Err(_) => return false,
-        };
-        let Some(state) = guard.as_mut() else {
-            return false;
-        };
-        self.load_progressive_context(state)
+        self.progressive_context()
             .map(|context| {
                 context.as_ref().is_some_and(|ctx| {
                     ctx.quality_embedder.is_some() && ctx.index.has_quality_index()
@@ -2993,20 +3334,71 @@ impl SearchClient {
             .unwrap_or(false)
     }
 
-    fn load_progressive_context(
-        &self,
-        state: &mut SemanticSearchState,
-    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
-        if let Some(context) = state.progressive_context.as_ref() {
-            return Ok(Some(Arc::clone(context)));
-        }
-        if state.progressive_context_init_attempted {
-            return Ok(None);
-        }
-        state.progressive_context_init_attempted = true;
+    fn progressive_context(&self) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+        loop {
+            let (ann_path, embedder, embedder_id) = {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if let Some(context) = state.progressive_context.as_ref() {
+                    return Ok(Some(Arc::clone(context)));
+                }
+                if state.progressive_context_init_attempted {
+                    return Ok(None);
+                }
+                state.progressive_context_init_attempted = true;
+                (
+                    state.ann_path.clone(),
+                    Arc::clone(&state.embedder),
+                    state.embedder.id().to_string(),
+                )
+            };
 
-        let Some(index_dir) = state
-            .ann_path
+            let Some(context) = self.build_progressive_context(ann_path.clone(), embedder)? else {
+                let mut guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_mut().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                if let Some(existing) = state.progressive_context.as_ref() {
+                    return Ok(Some(Arc::clone(existing)));
+                }
+                if state.embedder.id() != embedder_id || state.ann_path != ann_path {
+                    continue;
+                }
+                return Ok(None);
+            };
+
+            let mut guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_mut().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            if let Some(existing) = state.progressive_context.as_ref() {
+                return Ok(Some(Arc::clone(existing)));
+            }
+            if state.embedder.id() != embedder_id || state.ann_path != ann_path {
+                continue;
+            }
+            state.progressive_context = Some(Arc::clone(&context));
+            return Ok(Some(context));
+        }
+    }
+
+    fn build_progressive_context(
+        &self,
+        ann_path: Option<PathBuf>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<Option<Arc<ProgressiveTwoTierContext>>> {
+        let Some(index_dir) = ann_path
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf))
         else {
@@ -3041,7 +3433,7 @@ impl SearchClient {
         );
 
         let fast_embedder = self.load_embedder_for_progressive_id(
-            state,
+            &embedder,
             fast_index.embedder_id(),
             fast_index.dimension(),
         )?;
@@ -3049,7 +3441,7 @@ impl SearchClient {
             SharedCassSyncEmbedder::new(fast_embedder),
         ));
         let quality_embedder = Some(self.load_embedder_for_progressive_id(
-            state,
+            &embedder,
             quality_index.embedder_id(),
             quality_index.dimension(),
         )?);
@@ -3058,23 +3450,21 @@ impl SearchClient {
                 as Arc<dyn frankensearch::Embedder>
         });
 
-        let context = Arc::new(ProgressiveTwoTierContext {
+        Ok(Some(Arc::new(ProgressiveTwoTierContext {
             index,
             fast_embedder,
             quality_embedder,
-        });
-        state.progressive_context = Some(Arc::clone(&context));
-        Ok(Some(context))
+        })))
     }
 
     fn load_embedder_for_progressive_id(
         &self,
-        state: &SemanticSearchState,
+        current_embedder: &Arc<dyn Embedder>,
         embedder_id: &str,
         dimension: usize,
     ) -> Result<Arc<dyn Embedder>> {
-        if state.embedder.id() == embedder_id {
-            return Ok(Arc::clone(&state.embedder));
+        if current_embedder.id() == embedder_id {
+            return Ok(Arc::clone(current_embedder));
         }
 
         if let Some(dim) = embedder_id.strip_prefix("fnv1a-")
@@ -3666,14 +4056,7 @@ impl SearchClient {
         }
 
         let progressive_context = {
-            let mut guard = self
-                .semantic
-                .lock()
-                .map_err(|_| anyhow!("semantic lock poisoned"))?;
-            let state = guard.as_mut().ok_or_else(|| {
-                anyhow!("semantic search unavailable (no embedder or vector index)")
-            })?;
-            self.load_progressive_context(state)?
+            self.progressive_context()?
                 .ok_or_else(|| anyhow!("progressive two-tier context unavailable"))?
         };
 
@@ -3841,22 +4224,7 @@ impl SearchClient {
         if canonical.trim().is_empty() {
             return Ok((Vec::new(), None));
         }
-        let mut guard = self
-            .semantic
-            .lock()
-            .map_err(|_| anyhow!("semantic lock poisoned"))?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| anyhow!("semantic search unavailable (no embedder or vector index)"))?;
-
-        let embedding = state
-            .query_cache
-            .get_or_embed(state.embedder.as_ref(), &canonical)?;
-        let mut semantic_filter =
-            SemanticFilter::from_search_filters(&filters, &state.filter_maps)?;
-        if let Some(roles) = state.roles.clone() {
-            semantic_filter = semantic_filter.with_roles(Some(roles));
-        }
+        let embedding = self.semantic_query_embedding(&canonical)?;
 
         let limit = if limit == 0 {
             self.total_docs().max(1)
@@ -3869,215 +4237,29 @@ impl SearchClient {
         }
         let initial_fetch_limit = target_hits;
         let fallback_fetch_limit = target_hits.saturating_mul(3);
-
-        let collapse = |best_by_message: HashMap<u64, VectorSearchResult>, fetch_limit: usize| {
-            let mut collapsed: Vec<VectorSearchResult> = best_by_message.into_values().collect();
-            collapsed.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.message_id.cmp(&b.message_id))
-            });
-            if collapsed.len() > fetch_limit {
-                collapsed.truncate(fetch_limit);
+        let candidate_context = {
+            let guard = self
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard.as_ref().ok_or_else(|| {
+                anyhow!("semantic search unavailable (no embedder or vector index)")
+            })?;
+            SemanticCandidateContext {
+                fs_semantic_index: Arc::clone(&state.fs_semantic_index),
+                filter_maps: state.filter_maps.clone(),
+                roles: state.roles.clone(),
             }
-            collapsed
         };
-
-        let mut search_candidates = |fetch_limit: usize| -> Result<(
-            Vec<VectorSearchResult>,
-            bool,
-            Option<crate::search::ann_index::AnnSearchStats>,
-        )> {
-            if tier_mode.wants_two_tier() && !approximate {
-                let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-                if let Some(two_tier_index) = state.load_in_memory_two_tier_index(tier_mode) {
-                    let config = tier_mode.to_frankensearch_config();
-                    let searcher = FsSyncTwoTierSearcher::new(two_tier_index, config);
-                    let (tier_hits, metrics) = searcher
-                        .search_collect_with_filter(&embedding, fetch_limit, fs_filter)
-                        .map_err(|err| {
-                            anyhow!("frankensearch two-tier semantic search failed: {err}")
-                        })?;
-
-                    tracing::debug!(
-                        tier_mode = ?tier_mode,
-                        phase1_ms = metrics.phase1_total_ms,
-                        phase2_ms = metrics.phase2_total_ms,
-                        skip_reason = ?metrics.skip_reason,
-                        returned = tier_hits.len(),
-                        "semantic two-tier search executed"
-                    );
-
-                    let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
-                    for hit in tier_hits.iter() {
-                        let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                            continue;
-                        };
-                        best_by_message
-                            .entry(parsed.message_id)
-                            .and_modify(|entry| {
-                                if hit.score > entry.score {
-                                    entry.score = hit.score;
-                                    entry.chunk_idx = parsed.chunk_idx;
-                                }
-                            })
-                            .or_insert(VectorSearchResult {
-                                message_id: parsed.message_id,
-                                chunk_idx: parsed.chunk_idx,
-                                score: hit.score,
-                            });
-                    }
-
-                    return Ok((
-                        collapse(best_by_message, fetch_limit),
-                        tier_hits.len() >= fetch_limit,
-                        None,
-                    ));
-                }
-
-                tracing::debug!(
-                    tier_mode = ?tier_mode,
-                    "two-tier semantic unavailable; falling back to exact single-tier search"
-                );
-
-                let fs_index = &state.fs_semantic_index;
-                let fs_hits = fs_index
-                    .search_top_k(&embedding, fetch_limit, fs_filter)
-                    .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-
-                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
-                for hit in fs_hits.iter() {
-                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                        continue;
-                    };
-                    best_by_message
-                        .entry(parsed.message_id)
-                        .and_modify(|entry| {
-                            if hit.score > entry.score {
-                                entry.score = hit.score;
-                                entry.chunk_idx = parsed.chunk_idx;
-                            }
-                        })
-                        .or_insert(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
-                        });
-                }
-
-                return Ok((
-                    collapse(best_by_message, fetch_limit),
-                    fs_hits.len() >= fetch_limit,
-                    None,
-                ));
-            }
-
-            if approximate {
-                if tier_mode.wants_two_tier() {
-                    tracing::debug!(
-                        tier_mode = ?tier_mode,
-                        "approximate search requested; bypassing two-tier mode"
-                    );
-                }
-                let fs_index = &state.fs_semantic_index;
-
-                if state.fs_ann_index.is_none() {
-                    let ann_path = state.ann_path.as_ref().ok_or_else(|| {
-                        anyhow!(
-                            "approximate search unavailable: HNSW index missing (run 'cass index --semantic --build-hnsw')"
-                        )
-                    })?;
-                    let ann = open_fs_semantic_ann_index(fs_index, ann_path)?;
-                    state.fs_ann_index = Some(ann);
-                }
-
-                let ann = state
-                    .fs_ann_index
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-                let candidate = fetch_limit
-                    .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                    .max(fetch_limit);
-                let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-                let (ann_results, search_stats) = ann
-                    .knn_search_with_stats(&embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
-                let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
-                    index_size: search_stats.index_size,
-                    dimension: search_stats.dimension,
-                    ef_search: search_stats.ef_search,
-                    k_requested: search_stats.k_requested,
-                    k_returned: search_stats.k_returned,
-                    search_time_us: search_stats.search_time_us,
-                    estimated_recall: search_stats.estimated_recall as f32,
-                    is_approximate: search_stats.is_approximate,
-                });
-
-                let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-
-                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
-                for hit in ann_results.iter() {
-                    if let Some(filter) = fs_filter
-                        && !filter.matches(&hit.doc_id, None)
-                    {
-                        continue;
-                    }
-                    let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                        continue;
-                    };
-                    best_by_message
-                        .entry(parsed.message_id)
-                        .and_modify(|entry| {
-                            if hit.score > entry.score {
-                                entry.score = hit.score;
-                                entry.chunk_idx = parsed.chunk_idx;
-                            }
-                        })
-                        .or_insert(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
-                        });
-                }
-
-                return Ok((
-                    collapse(best_by_message, fetch_limit),
-                    ann_results.len() >= candidate,
-                    ann_stats,
-                ));
-            }
-
-            let fs_index = &state.fs_semantic_index;
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            let fs_hits = fs_index
-                .search_top_k(&embedding, fetch_limit, fs_filter)
-                .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
-            for hit in fs_hits.iter() {
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            Ok((
-                collapse(best_by_message, fetch_limit),
-                fs_hits.len() >= fetch_limit,
-                None,
-            ))
+        let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
+            self.in_memory_two_tier_index(tier_mode)?
+        } else {
+            None
+        };
+        let ann_index = if approximate {
+            Some(self.ann_index()?)
+        } else {
+            None
         };
 
         let finalize_hits = |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
@@ -4085,8 +4267,16 @@ impl SearchClient {
             Ok(self.postprocess_hits_page(hits, query, &filters, limit, offset))
         };
 
-        let (results, search_was_truncated, mut ann_stats) =
-            search_candidates(initial_fetch_limit)?;
+        let (results, search_was_truncated, mut ann_stats) = self.search_semantic_candidates(
+            &candidate_context,
+            &embedding,
+            &filters,
+            initial_fetch_limit,
+            approximate,
+            tier_mode,
+            in_memory_two_tier_index.as_ref(),
+            ann_index.as_ref(),
+        )?;
         let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
         let needs_retry = available_hits < target_hits
@@ -4102,7 +4292,16 @@ impl SearchClient {
                 fallback_fetch_limit,
                 "retrying semantic fetch due to post-filter shortfall"
             );
-            let (retry_results, _, retry_ann_stats) = search_candidates(fallback_fetch_limit)?;
+            let (retry_results, _, retry_ann_stats) = self.search_semantic_candidates(
+                &candidate_context,
+                &embedding,
+                &filters,
+                fallback_fetch_limit,
+                approximate,
+                tier_mode,
+                in_memory_two_tier_index.as_ref(),
+                ann_index.as_ref(),
+            )?;
             (available_hits, paged_hits) = finalize_hits(&retry_results)?;
             ann_stats = retry_ann_stats;
         }
@@ -5791,7 +5990,7 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::{OpenFlags, open_with_flags};
+    use frankensqlite::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -5807,6 +6006,62 @@ mod tests {
                 id: id.to_string(),
                 vector: vector.to_vec(),
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingTestEmbedder {
+        id: String,
+        vector: Vec<f32>,
+        started_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        unblock_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BlockingTestEmbedder {
+        fn new(
+            id: &str,
+            vector: &[f32],
+            started_tx: std::sync::mpsc::Sender<()>,
+            unblock_rx: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                id: id.to_string(),
+                vector: vector.to_vec(),
+                started_tx: Mutex::new(Some(started_tx)),
+                unblock_rx: Mutex::new(unblock_rx),
+            }
+        }
+    }
+
+    impl crate::search::embedder::Embedder for BlockingTestEmbedder {
+        fn embed_sync(&self, _text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
+            if let Ok(mut guard) = self.started_tx.lock()
+                && let Some(tx) = guard.take()
+            {
+                let _ = tx.send(());
+            }
+            self.unblock_rx
+                .lock()
+                .expect("blocking embedder receiver")
+                .recv()
+                .expect("blocking embedder unblock signal");
+            Ok(self.vector.clone())
+        }
+
+        fn dimension(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> frankensearch::ModelCategory {
+            frankensearch::ModelCategory::HashEmbedder
         }
     }
 
@@ -5849,6 +6104,70 @@ mod tests {
     fn search_client_is_send_sync_without_phantom_filters() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SearchClient>();
+    }
+
+    #[test]
+    fn semantic_embedding_releases_semantic_lock_while_embedding() -> Result<()> {
+        let fixture = build_semantic_test_fixture()?;
+        let client = Arc::new(fixture.client);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
+
+        {
+            let mut guard = client
+                .semantic
+                .lock()
+                .map_err(|_| anyhow!("semantic lock poisoned"))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("semantic state missing in fixture"))?;
+            state.embedder = Arc::new(BlockingTestEmbedder::new(
+                "test-fixed-2d",
+                &[1.0, 0.0],
+                started_tx,
+                unblock_rx,
+            ));
+            state.query_cache = QueryCache::new(
+                "test-fixed-2d",
+                NonZeroUsize::new(100).expect("cache capacity"),
+            );
+        }
+
+        let search_client = Arc::clone(&client);
+        let search_handle = std::thread::spawn(move || {
+            search_client.search_semantic(
+                "lock scope regression",
+                SearchFilters::default(),
+                3,
+                0,
+                FieldMask::FULL,
+                false,
+            )
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("embedder should start");
+
+        let clear_client = Arc::clone(&client);
+        let (clear_tx, clear_rx) = std::sync::mpsc::channel();
+        let clear_handle = std::thread::spawn(move || {
+            let _ = clear_tx.send(clear_client.clear_semantic_context());
+        });
+
+        clear_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("semantic lock should not stay held during embed")?;
+
+        unblock_tx.send(()).expect("unblock embedder");
+        clear_handle.join().expect("clear thread join");
+        let search_result = search_handle.join().expect("search thread join");
+        assert!(
+            search_result.is_err(),
+            "search should observe semantic context cleared after embedding"
+        );
+
+        Ok(())
     }
 
     fn build_semantic_test_fixture() -> Result<SemanticTestFixture> {
@@ -6213,10 +6532,6 @@ mod tests {
 
     fn parse_boolean_query(query: &str) -> Vec<FsCassQueryToken> {
         fs_cass_parse_boolean_query(query)
-    }
-
-    fn open_test_db_with_flags(db_path: &Path, flags: OpenFlags) -> Result<FrankenConnection> {
-        Ok(open_with_flags(db_path.to_string_lossy().as_ref(), flags)?)
     }
 
     fn sqlite_master_name_count(db_path: &Path, name: &str) -> Result<i64> {
@@ -7727,10 +8042,11 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_guard_does_not_persist_duplicate_fts_rows_on_legacy_schema() -> Result<()> {
+    fn sqlite_guard_rebuilds_fts_when_generation_key_stale() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let db_path = temp_dir.path().join("legacy-fts.db");
+        let db_path = temp_dir.path().join("stale-gen-fts.db");
 
+        // Seed a DB with a conversation and indexed FTS content.
         {
             let storage = FrankenStorage::open(&db_path)?;
             let agent = Agent {
@@ -7745,9 +8061,9 @@ mod tests {
                 id: None,
                 agent_slug: "codex".into(),
                 workspace: Some(PathBuf::from("/tmp/workspace")),
-                external_id: Some("dup-fts-schema".into()),
-                title: Some("Duplicate FTS schema".into()),
-                source_path: PathBuf::from("/tmp/dup-fts-schema.jsonl"),
+                external_id: Some("stale-gen-fts".into()),
+                title: Some("Stale FTS generation".into()),
+                source_path: PathBuf::from("/tmp/stale-gen-fts.jsonl"),
                 started_at: Some(1_700_000_000_000),
                 ended_at: Some(1_700_000_000_100),
                 approx_tokens: Some(42),
@@ -7768,34 +8084,28 @@ mod tests {
             storage.insert_conversation_tree(agent_id, None, &conversation)?;
         }
 
-        let legacy_count_before = sqlite_master_name_count(&db_path, "fts_messages")
-            .context("count legacy schema rows before duplicate injection")?;
+        // Verify initial state: exactly 1 fts_messages entry in sqlite_master.
+        let count_before = sqlite_master_name_count(&db_path, "fts_messages")
+            .context("count schema rows before generation key deletion")?;
         assert_eq!(
-            legacy_count_before, 1,
-            "legacy fixture should start with one sqlite_master entry"
-        );
-        let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = open_test_db_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        conn.execute_batch("PRAGMA writable_schema = ON;")?;
-        conn.execute_compat(
-            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
-            &[ParamValue::from(duplicate_legacy_fts_sql)],
-        )?;
-        conn.execute_compat(
-            "DELETE FROM meta WHERE key = ?1",
-            &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
-        )?;
-        conn.execute_batch("PRAGMA writable_schema = OFF;")?;
-        drop(conn);
-
-        let duplicated_legacy_count = sqlite_master_name_count(&db_path, "fts_messages")
-            .context("count legacy schema rows after duplicate injection")?;
-        assert_eq!(
-            duplicated_legacy_count, 2,
-            "test fixture should reproduce the duplicate legacy fts_messages rows"
+            count_before, 1,
+            "fresh DB should have exactly one fts_messages schema entry"
         );
 
+        // Simulate a stale generation by deleting the rebuild marker.
+        // This is the condition ensure_fts_consistency_via_frankensqlite
+        // detects to trigger a full FTS rebuild.
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
+            conn.execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
+            )?;
+        }
+
+        // Opening via sqlite_guard() triggers FrankenStorage::open() →
+        // ensure_fts_consistency_via_frankensqlite() which detects the
+        // missing generation key and rebuilds FTS.
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(None),
@@ -7815,15 +8125,16 @@ mod tests {
 
         let guard = client
             .sqlite_guard()
-            .context("open sqlite guard for duplicate legacy fts schema fixture")?;
-        assert!(guard.is_some(), "sqlite guard should open the legacy db");
+            .context("open sqlite guard for stale generation fixture")?;
+        assert!(guard.is_some(), "sqlite guard should open the db");
         drop(guard);
 
-        let legacy_count_after = sqlite_master_name_count(&db_path, "fts_messages")
-            .context("count legacy schema rows after sqlite guard reopen")?;
+        // After rebuild: exactly 1 schema entry and FTS is queryable.
+        let count_after = sqlite_master_name_count(&db_path, "fts_messages")
+            .context("count schema rows after sqlite guard reopen")?;
         assert_eq!(
-            legacy_count_after, 1,
-            "opening the legacy db must not persist duplicate fts_messages schema rows"
+            count_after, 1,
+            "reopen must leave exactly one fts_messages schema entry"
         );
 
         Ok(())
@@ -13809,12 +14120,11 @@ mod tests {
     #[test]
     fn unicode_combining_accent_becomes_separator() {
         // Decomposed: 'e' + combining acute accent (U+0301)
-        // The combining mark itself is NOT alphanumeric → becomes space
-        // This means "cafe\u{0301}" becomes "cafe " (accent stripped)
+        // nfc_sanitize_query first normalizes to NFC, composing e + U+0301
+        // into precomposed é (U+00E9), which is alphanumeric and preserved.
         let input = "cafe\u{0301}";
         let sanitized = sanitize_query(input);
-        // 'c','a','f','e' are alphanumeric; U+0301 is Mark category → space
-        assert_eq!(sanitized, "cafe ");
+        assert_eq!(sanitized, "caf\u{00e9}");
     }
 
     #[test]

@@ -1278,14 +1278,12 @@ pub fn query_tokens_timeseries(
     let plan_content_expr = if has_plan_token_rollups {
         "SUM(plan_content_tokens_est_total)"
     } else {
-        // Use SUM(0) instead of bare 0 — frankensqlite requires all non-GROUP-BY
-        // columns in a grouped query to be aggregate expressions.
-        "SUM(0)"
+        "0"
     };
     let plan_api_expr = if has_plan_token_rollups {
         "SUM(plan_api_tokens_total)"
     } else {
-        "SUM(0)"
+        "0"
     };
 
     let sql = format!(
@@ -2080,6 +2078,8 @@ fn query_track_b_breakdown_from_token_usage(
         if present {
             format!("SUM(COALESCE({expr}, 0))")
         } else {
+            // Must be SUM(0), not bare 0: these expressions feed into ORDER BY
+            // where a bare integer literal is treated as a column position.
             "SUM(0)".to_string()
         }
     };
@@ -2673,14 +2673,12 @@ fn build_breakdown_sql_track_a(
     let plan_content_expr = if has_plan_token_rollups {
         "SUM(plan_content_tokens_est_total)"
     } else {
-        // Use SUM(0) instead of bare 0 — frankensqlite requires all non-GROUP-BY
-        // columns in a grouped query to be aggregate expressions.
-        "SUM(0)"
+        "0"
     };
     let plan_api_expr = if has_plan_token_rollups {
         "SUM(plan_api_tokens_total)"
     } else {
-        "SUM(0)"
+        "0"
     };
     let limit_clause = limit
         .map(|limit| {

@@ -6,21 +6,9 @@
 //! Covers: CRUD operations, queries (JOIN, GROUP BY, ORDER BY, LIMIT, LIKE, FTS),
 //! transaction behavior, edge cases (Unicode, NULL, empty DB, large content).
 //!
-//! ## Known frankensqlite limitations (documented via #[ignore] tests):
-//!
-//! - **ON CONFLICT / UPSERT**: INSERT ... ON CONFLICT DO UPDATE fails with UNIQUE
-//!   constraint error. Affects: ensure_agent idempotent, source upsert update.
-//! - **ORDER BY expression not in SELECT**: `ORDER BY started_at DESC` fails when
-//!   the column isn't in the SELECT list. Affects: list_conversations.
-//! - **Placeholder in JOIN/subquery**: Parameterized queries in certain contexts
-//!   produce "unsupported expression type: Placeholder" errors. Affects: dedup
-//!   check in insert_conversation_tree, embedding job queries.
-//! - **daily_stats UNIQUE constraint**: Batch conversation inserts with same day_id
-//!   hit constraint failures. Affects: multi-conversation inserts.
-//! - **Mixed aggregate/non-aggregate without GROUP BY**: Frankensqlite rejects
-//!   queries that C SQLite handles. Affects: count_sessions_in_range.
-//! - **File format interop**: Frankensqlite-written DBs are not guaranteed readable
-//!   by C SQLite (different WAL/page format).
+//! As of frankensqlite rev 9cedb30b (306 commits of fixes), all previously-ignored
+//! parity tests now pass: UPSERT, ORDER BY, placeholder in subquery, mixed
+//! aggregates, daily_stats constraints, and cross-format file reads.
 
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
@@ -174,7 +162,6 @@ fn parity_ensure_agent_returns_id() {
 }
 
 #[test]
-#[ignore = "frankensqlite: ON CONFLICT DO UPDATE not yet supported (UNIQUE constraint error on second insert)"]
 fn parity_ensure_agent_idempotent() {
     let (_dir, sql, frank) = open_both();
     let agent = make_agent("codex", "OpenAI Codex");
@@ -339,7 +326,6 @@ fn parity_delete_local_source_fails() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn parity_insert_and_list_conversations() {
     let (_dir, sql, frank) = open_both();
 
@@ -497,7 +483,6 @@ fn parity_insert_with_snippets() {
 }
 
 #[test]
-#[ignore = "frankensqlite: Placeholder in subquery (dedup SELECT with ?1 in WHERE clause)"]
 fn parity_conversation_dedup_by_external_id() {
     let (_dir, sql, frank) = open_both();
 
@@ -545,7 +530,6 @@ fn parity_conversation_dedup_by_external_id() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn parity_list_conversations_pagination() {
     let (_dir, sql, frank) = open_both();
 
@@ -653,7 +637,6 @@ fn parity_empty_database_agents_and_sources() {
 }
 
 #[test]
-#[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn parity_empty_database_conversations() {
     let (_dir, sql, frank) = open_both();
 
@@ -777,7 +760,6 @@ fn parity_large_content() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: daily_stats UNIQUE constraint + ORDER BY expression not in SELECT list"]
 fn parity_multiple_agents_multiple_conversations() {
     let (_dir, sql, frank) = open_both();
 
@@ -864,7 +846,6 @@ fn parity_multiple_agents_only() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: ON CONFLICT DO UPDATE not yet supported (UNIQUE constraint on second upsert)"]
 fn parity_source_upsert_updates_existing() {
     let (_dir, sql, frank) = open_both();
 
@@ -910,7 +891,6 @@ fn parity_delete_nonexistent_source_returns_false() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: Placeholder in subquery (embedding_jobs WHERE clause)"]
 fn parity_embedding_job_lifecycle() {
     let (_dir, sql, frank) = open_both();
 
@@ -941,7 +921,6 @@ fn parity_embedding_job_lifecycle() {
 }
 
 #[test]
-#[ignore = "frankensqlite: Placeholder in subquery (embedding_jobs WHERE clause)"]
 fn parity_embedding_job_failure() {
     let (_dir, sql, frank) = open_both();
 
@@ -965,7 +944,6 @@ fn parity_embedding_job_failure() {
 }
 
 #[test]
-#[ignore = "frankensqlite: Placeholder in subquery (cancel_embedding_jobs WHERE clause)"]
 fn parity_cancel_embedding_jobs() {
     let (_dir, sql, frank) = open_both();
 
@@ -992,7 +970,6 @@ fn parity_cancel_embedding_jobs() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: 'no such column: kind in table sources' when reading rusqlite-created schema"]
 fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("transition.db");
@@ -1031,7 +1008,6 @@ fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
 }
 
 #[test]
-#[ignore = "frankensqlite: ORDER BY expression not in SELECT list (list_conversations)"]
 fn transition_rusqlite_db_conversations_readable() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("transition_conv.db");
@@ -1057,7 +1033,6 @@ fn transition_rusqlite_db_conversations_readable() {
 }
 
 #[test]
-#[ignore = "frankensqlite: DB file format not compatible with C SQLite reader"]
 fn transition_frankenstorage_data_readable_by_rusqlite() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("frank_first.db");
@@ -1101,7 +1076,6 @@ fn transition_frankenstorage_data_readable_by_rusqlite() {
 // ============================================================================
 
 #[test]
-#[ignore = "frankensqlite: mixed aggregate and non-aggregate columns without GROUP BY"]
 fn parity_count_sessions_in_range() {
     let (_dir, sql, frank) = open_both();
 
