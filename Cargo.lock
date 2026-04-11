@@ -2233,6 +2233,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",
+ "smallvec",
  "tracing",
 ]
 
