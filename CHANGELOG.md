@@ -11,6 +11,33 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [v0.3.0] -- Unreleased
+
+Pending GitHub release preparation for the next minor version after v0.2.7.
+
+This release line focuses on semantic-search concurrency safety, legacy-data correctness, new resume ergonomics, and making the release pipeline fail early instead of cutting broken or partially-updated releases.
+
+### Search and concurrency
+
+- **Semantic search deadlock / TOCTOU hardening**: reduce semantic-search lock scope, add context-token validation across lazy loaders, make two-tier cache availability mode-aware, and add regression coverage for stale-context and cache-poisoning races
+- **Retry storm mitigation**: replace deterministic SQLite retry sleeps with shared jittered exponential backoff for `Busy`, `BusySnapshot`, and related write-conflict paths
+- **Stale lock recovery**: reap dead-owner `index-run.lock` metadata on read so stale lock files stop wedging search and health flows
+- **Query correctness**: NFC-normalize queries and harden empty-index health/status detection
+
+### CLI, data quality, and indexing
+
+- **`cass resume`**: add a CLI subcommand that resolves a session path into a ready-to-run harness resume command, then harden it with UUID validation, false-positive guards, and structured diagnostics
+- **Legacy NULL-agent correctness**: fix search, UI, export, stats, context loading, salvage, and related-session paths that previously dropped or crashed on rows with `NULL agent_id`
+- **Indexer / FTS rebuild reliability**: fix large-batch OOMs, zero-row batch aborts, repeated full-rebuild loops, and several frankensqlite materialization-heavy query paths
+
+### Release engineering
+
+- **Release workflow hardening**: require `HOMEBREW_TAP_TOKEN` before cutting a release, clone all sibling path dependencies in every release job, and avoid failing post-release on a missing Homebrew dispatch token
+- **Installer fallback**: stop probing for a non-existent Intel macOS prebuilt and fall back cleanly to source builds instead
+- **Crates publish readiness gate**: validate `cargo package` before attempting `cargo publish` so the workflow warns and skips instead of failing when the current dependency graph is not registry-ready
+
+---
+
 ## [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7) -- 2026-04-05
 
 **GitHub Release** with downloadable binaries.
