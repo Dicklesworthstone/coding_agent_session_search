@@ -105,7 +105,7 @@ qrcode = { version = "*", optional = true }
 image = { version = "*", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
 # rusqlite retained for historical bundle salvage: reading pre-migration databases
-# created by C SQLite (frankensqlite uses a different on-disk format).
+# via the proven C-SQLite read path (HistoricalReadConnection, FTS schema scrub).
 rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 
 # macOS keychain access (optional, for ChatGPT decryption)

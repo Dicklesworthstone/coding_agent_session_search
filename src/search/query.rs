@@ -1710,6 +1710,14 @@ struct SemanticCandidateContext {
     roles: Option<HashSet<u8>>,
 }
 
+struct SemanticCandidateSearchRequest<'a> {
+    fetch_limit: usize,
+    approximate: bool,
+    tier_mode: SemanticTierMode,
+    in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
+    ann_index: Option<&'a Arc<FsHnswIndex>>,
+}
+
 struct SharedCassSyncEmbedder {
     inner: Arc<dyn Embedder>,
     cache: Mutex<LruCache<String, Vec<f32>>>,
@@ -1825,6 +1833,16 @@ fn build_in_memory_two_tier_index(
             None
         }
     }
+}
+
+fn two_tier_index_supports_mode(
+    index: &FsInMemoryTwoTierIndex,
+    tier_mode: SemanticTierMode,
+) -> bool {
+    !matches!(
+        tier_mode,
+        SemanticTierMode::Progressive | SemanticTierMode::QualityOnly
+    ) || index.has_quality_index()
 }
 
 #[derive(Debug, Clone)]
@@ -3029,10 +3047,16 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(index) = state.fs_in_memory_two_tier_index.as_ref() {
+                if let Some(index) = state.fs_in_memory_two_tier_index.as_ref()
+                    && two_tier_index_supports_mode(index.as_ref(), tier_mode)
+                {
                     return Ok(Some(Arc::clone(index)));
                 }
                 if state.in_memory_two_tier_init_attempted {
+                    // Already attempted: either no index was built (is_none), or
+                    // the cached index doesn't support the requested mode (e.g.
+                    // fast-only cached but QualityOnly requested). Either way,
+                    // avoid repeated expensive disk rebuilds.
                     return Ok(None);
                 }
                 state.in_memory_two_tier_init_attempted = true;
@@ -3048,17 +3072,22 @@ impl SearchClient {
             let state = guard.as_mut().ok_or_else(|| {
                 anyhow!("semantic search unavailable (no embedder or vector index)")
             })?;
-            if let Some(existing) = state.fs_in_memory_two_tier_index.as_ref() {
+            if let Some(existing) = state.fs_in_memory_two_tier_index.as_ref()
+                && two_tier_index_supports_mode(existing.as_ref(), tier_mode)
+            {
                 return Ok(Some(Arc::clone(existing)));
             }
             if state.ann_path != ann_path || state.embedder.id() != embedder_id {
                 continue;
             }
-            if let Some(index) = index {
-                state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
-                return Ok(Some(index));
+            let Some(index) = index else {
+                return Ok(None);
+            };
+            if !two_tier_index_supports_mode(index.as_ref(), tier_mode) {
+                return Ok(None);
             }
-            return Ok(None);
+            state.fs_in_memory_two_tier_index = Some(Arc::clone(&index));
+            return Ok(Some(index));
         }
     }
 
@@ -3129,11 +3158,7 @@ impl SearchClient {
         context: &SemanticCandidateContext,
         embedding: &[f32],
         filters: &SearchFilters,
-        fetch_limit: usize,
-        approximate: bool,
-        tier_mode: SemanticTierMode,
-        in_memory_two_tier_index: Option<&Arc<FsInMemoryTwoTierIndex>>,
-        ann_index: Option<&Arc<FsHnswIndex>>,
+        request: SemanticCandidateSearchRequest<'_>,
     ) -> Result<(
         Vec<VectorSearchResult>,
         bool,
@@ -3145,19 +3170,19 @@ impl SearchClient {
             semantic_filter = semantic_filter.with_roles(Some(roles));
         }
 
-        if tier_mode.wants_two_tier() && !approximate {
+        if request.tier_mode.wants_two_tier() && !request.approximate {
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-            if let Some(two_tier_index) = in_memory_two_tier_index {
-                let config = tier_mode.to_frankensearch_config();
+            if let Some(two_tier_index) = request.in_memory_two_tier_index {
+                let config = request.tier_mode.to_frankensearch_config();
                 let searcher = FsSyncTwoTierSearcher::new(Arc::clone(two_tier_index), config);
                 let (tier_hits, metrics) = searcher
-                    .search_collect_with_filter(embedding, fetch_limit, fs_filter)
+                    .search_collect_with_filter(embedding, request.fetch_limit, fs_filter)
                     .map_err(|err| {
                         anyhow!("frankensearch two-tier semantic search failed: {err}")
                     })?;
 
                 tracing::debug!(
-                    tier_mode = ?tier_mode,
+                    tier_mode = ?request.tier_mode,
                     phase1_ms = metrics.phase1_total_ms,
                     phase2_ms = metrics.phase2_total_ms,
                     skip_reason = ?metrics.skip_reason,
@@ -3186,21 +3211,21 @@ impl SearchClient {
                 }
 
                 return Ok((
-                    Self::collapse_semantic_results(best_by_message, fetch_limit),
-                    tier_hits.len() >= fetch_limit,
+                    Self::collapse_semantic_results(best_by_message, request.fetch_limit),
+                    tier_hits.len() >= request.fetch_limit,
                     None,
                 ));
             }
 
             tracing::debug!(
-                tier_mode = ?tier_mode,
+                tier_mode = ?request.tier_mode,
                 "two-tier semantic unavailable; falling back to exact single-tier search"
             );
 
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
             let fs_hits = context
                 .fs_semantic_index
-                .search_top_k(embedding, fetch_limit, fs_filter)
+                .search_top_k(embedding, request.fetch_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
 
             let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
@@ -3224,24 +3249,27 @@ impl SearchClient {
             }
 
             return Ok((
-                Self::collapse_semantic_results(best_by_message, fetch_limit),
-                fs_hits.len() >= fetch_limit,
+                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
+                fs_hits.len() >= request.fetch_limit,
                 None,
             ));
         }
 
-        if approximate {
-            if tier_mode.wants_two_tier() {
+        if request.approximate {
+            if request.tier_mode.wants_two_tier() {
                 tracing::debug!(
-                    tier_mode = ?tier_mode,
+                    tier_mode = ?request.tier_mode,
                     "approximate search requested; bypassing two-tier mode"
                 );
             }
 
-            let ann = ann_index.ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-            let candidate = fetch_limit
+            let ann = request
+                .ann_index
+                .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
+            let candidate = request
+                .fetch_limit
                 .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                .max(fetch_limit);
+                .max(request.fetch_limit);
             let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
             let (ann_results, search_stats) =
                 ann.knn_search_with_stats(embedding, candidate, ef)
@@ -3285,7 +3313,7 @@ impl SearchClient {
             }
 
             return Ok((
-                Self::collapse_semantic_results(best_by_message, fetch_limit),
+                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
                 ann_results.len() >= candidate,
                 ann_stats,
             ));
@@ -3294,7 +3322,7 @@ impl SearchClient {
         let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
         let fs_hits = context
             .fs_semantic_index
-            .search_top_k(embedding, fetch_limit, fs_filter)
+            .search_top_k(embedding, request.fetch_limit, fs_filter)
             .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
 
         let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
@@ -3318,8 +3346,8 @@ impl SearchClient {
         }
 
         Ok((
-            Self::collapse_semantic_results(best_by_message, fetch_limit),
-            fs_hits.len() >= fetch_limit,
+            Self::collapse_semantic_results(best_by_message, request.fetch_limit),
+            fs_hits.len() >= request.fetch_limit,
             None,
         ))
     }
@@ -4237,7 +4265,32 @@ impl SearchClient {
         }
         let initial_fetch_limit = target_hits;
         let fallback_fetch_limit = target_hits.saturating_mul(3);
-        let candidate_context = {
+        let (candidate_context, in_memory_two_tier_index, ann_index) = loop {
+            let candidate_context = {
+                let guard = self
+                    .semantic
+                    .lock()
+                    .map_err(|_| anyhow!("semantic lock poisoned"))?;
+                let state = guard.as_ref().ok_or_else(|| {
+                    anyhow!("semantic search unavailable (no embedder or vector index)")
+                })?;
+                SemanticCandidateContext {
+                    fs_semantic_index: Arc::clone(&state.fs_semantic_index),
+                    filter_maps: state.filter_maps.clone(),
+                    roles: state.roles.clone(),
+                }
+            };
+            let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
+                self.in_memory_two_tier_index(tier_mode)?
+            } else {
+                None
+            };
+            let ann_index = if approximate {
+                Some(self.ann_index()?)
+            } else {
+                None
+            };
+
             let guard = self
                 .semantic
                 .lock()
@@ -4245,21 +4298,13 @@ impl SearchClient {
             let state = guard.as_ref().ok_or_else(|| {
                 anyhow!("semantic search unavailable (no embedder or vector index)")
             })?;
-            SemanticCandidateContext {
-                fs_semantic_index: Arc::clone(&state.fs_semantic_index),
-                filter_maps: state.filter_maps.clone(),
-                roles: state.roles.clone(),
+            if !Arc::ptr_eq(
+                &state.fs_semantic_index,
+                &candidate_context.fs_semantic_index,
+            ) {
+                continue;
             }
-        };
-        let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
-            self.in_memory_two_tier_index(tier_mode)?
-        } else {
-            None
-        };
-        let ann_index = if approximate {
-            Some(self.ann_index()?)
-        } else {
-            None
+            break (candidate_context, in_memory_two_tier_index, ann_index);
         };
 
         let finalize_hits = |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
@@ -4271,11 +4316,13 @@ impl SearchClient {
             &candidate_context,
             &embedding,
             &filters,
-            initial_fetch_limit,
-            approximate,
-            tier_mode,
-            in_memory_two_tier_index.as_ref(),
-            ann_index.as_ref(),
+            SemanticCandidateSearchRequest {
+                fetch_limit: initial_fetch_limit,
+                approximate,
+                tier_mode,
+                in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
+                ann_index: ann_index.as_ref(),
+            },
         )?;
         let (mut available_hits, mut paged_hits) = finalize_hits(&results)?;
 
@@ -4296,11 +4343,13 @@ impl SearchClient {
                 &candidate_context,
                 &embedding,
                 &filters,
-                fallback_fetch_limit,
-                approximate,
-                tier_mode,
-                in_memory_two_tier_index.as_ref(),
-                ann_index.as_ref(),
+                SemanticCandidateSearchRequest {
+                    fetch_limit: fallback_fetch_limit,
+                    approximate,
+                    tier_mode,
+                    in_memory_two_tier_index: in_memory_two_tier_index.as_ref(),
+                    ann_index: ann_index.as_ref(),
+                },
             )?;
             (available_hits, paged_hits) = finalize_hits(&retry_results)?;
             ann_stats = retry_ann_stats;
@@ -6165,6 +6214,54 @@ mod tests {
         assert!(
             search_result.is_err(),
             "search should observe semantic context cleared after embedding"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn quality_mode_does_not_reuse_fast_only_two_tier_cache() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let embedder = Arc::new(crate::search::hash_embedder::HashEmbedder::new(256));
+        let fast_path = dir.path().join(format!("index-{}.fsvi", embedder.id()));
+        let writer = VectorIndex::create_with_revision(
+            &fast_path,
+            embedder.id(),
+            "rev-fast-only",
+            embedder.dimension(),
+            frankensearch::index::Quantization::F16,
+        )?;
+        writer.finish()?;
+
+        client.set_semantic_context(
+            embedder,
+            VectorIndex::open(&fast_path)?,
+            SemanticFilterMaps::for_tests(
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
+            ),
+            None,
+            Some(fast_path),
+        )?;
+
+        let fast_only_index = client
+            .in_memory_two_tier_index(SemanticTierMode::FastOnly)?
+            .expect("fast-only index should load");
+        assert!(
+            !fast_only_index.has_quality_index(),
+            "fixture should only provide the fast tier"
+        );
+
+        let quality_index = client.in_memory_two_tier_index(SemanticTierMode::QualityOnly)?;
+        assert!(
+            quality_index.is_none(),
+            "quality mode must not reuse a cached fast-only two-tier index"
         );
 
         Ok(())

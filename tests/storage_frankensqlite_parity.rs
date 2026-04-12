@@ -1,14 +1,12 @@
-//! FrankenStorage / SqliteStorage parity tests.
+//! FrankenStorage parity tests.
 //!
-//! These tests exercise identical operations against both SqliteStorage (rusqlite)
-//! and FrankenStorage (frankensqlite) and verify the results match.
+//! These tests exercise FrankenStorage (the primary frankensqlite-backed storage
+//! engine) against the full range of SQL patterns cass uses. `SqliteStorage` is a
+//! type alias for `FrankenStorage`.
 //!
 //! Covers: CRUD operations, queries (JOIN, GROUP BY, ORDER BY, LIMIT, LIKE, FTS),
-//! transaction behavior, edge cases (Unicode, NULL, empty DB, large content).
-//!
-//! As of frankensqlite rev 9cedb30b (306 commits of fixes), all previously-ignored
-//! parity tests now pass: UPSERT, ORDER BY, placeholder in subquery, mixed
-//! aggregates, daily_stats constraints, and cross-format file reads.
+//! transaction behavior, edge cases (Unicode, NULL, empty DB, large content),
+//! and cross-format file reads (rusqlite ↔ frankensqlite interop).
 
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,

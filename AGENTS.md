@@ -263,9 +263,9 @@ Use `FrankenConnectionManager` for concurrent access:
 
 ### Known frankensqlite Differences
 
-- **File format incompatibility:** frankensqlite databases cannot be read by C
-  SQLite (rusqlite) and vice versa. Historical bundle salvage still uses rusqlite
-  for reading pre-migration databases.
+- **File format interop:** As of rev `9cedb30b`, frankensqlite databases are
+  readable by C SQLite (rusqlite) and vice versa. Historical bundle salvage
+  still uses rusqlite as a proven read bridge for pre-migration databases.
 - **`PRAGMA writable_schema`:** Not supported for write operations (INSERT/UPDATE
   on sqlite_master). SELECT from sqlite_master works.
 
