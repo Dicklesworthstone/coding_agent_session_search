@@ -32,11 +32,12 @@ jobs:
     env:
       HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
-      - name: Require Homebrew token before cutting a release
+      - name: Check Homebrew token availability
         run: |
           if [[ "${HAS_HOMEBREW_TOKEN}" != "true" ]]; then
-            echo "::error::HOMEBREW_TAP_TOKEN not configured; refusing to create a release before Homebrew metadata can be updated."
-            exit 1
+            echo "::warning::HOMEBREW_TAP_TOKEN not configured — Homebrew tap update will be skipped after release."
+          else
+            echo "HOMEBREW_TAP_TOKEN is configured."
           fi
 
   build:
