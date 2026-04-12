@@ -55,7 +55,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_rel: "crates/fsqlite/Cargo.toml",
         patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
         patch_key: Some("fsqlite"),
-        mode: ValidationMode::ActivePathOverride,
+        mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
         label: "frankensqlite shared types",
@@ -72,7 +72,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_rel: "crates/fsqlite-types/Cargo.toml",
         patch_url: Some("https://github.com/Dicklesworthstone/frankensqlite"),
         patch_key: Some("fsqlite-types"),
-        mode: ValidationMode::ActivePathOverride,
+        mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
         label: "franken_agent_detection",
@@ -89,7 +89,7 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_rel: "Cargo.toml",
         patch_url: Some("https://github.com/Dicklesworthstone/franken_agent_detection"),
         patch_key: Some("franken-agent-detection"),
-        mode: ValidationMode::ActivePathOverride,
+        mode: ValidationMode::StrictOptIn,
     },
     DependencyContract {
         label: "asupersync",
@@ -115,7 +115,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        expected_rev: "9961c0e7",
+        expected_rev: "fa186910",
         expected_version: "0.1.0",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
         expected_default_features: Some(false),

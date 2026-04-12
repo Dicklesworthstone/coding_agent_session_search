@@ -69,7 +69,7 @@ half = { version = "*", features = ["bytemuck"] }
 memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
-frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "9961c0e7", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
+frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fa186910", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
 franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "ba9c598", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
@@ -182,22 +182,28 @@ strip = false
 # franken-kernel = { path = "../asupersync/franken_kernel" }
 # build.rs validates the committed path overrides below and can validate the
 # optional sibling repos above when `strict-path-dep-validation` is enabled.
-[patch."https://github.com/Dicklesworthstone/frankensqlite"]
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-[patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
-franken-agent-detection = { path = "../franken_agent_detection" }
-
+#
+# LOCAL DEVELOPMENT: Uncomment the [patch] sections below to build against
+# local sibling repo checkouts instead of pinned git revisions. These are
+# commented out by default so that a clean clone builds without requiring
+# specific directory layout. See build.rs for validation details.
+#
+# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
+# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
+# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+# [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
+# franken-agent-detection = { path = "../franken_agent_detection" }
+#
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
-[patch."https://github.com/Dicklesworthstone/frankensearch"]
-frankensearch = { path = "../frankensearch/frankensearch" }
-frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
+# [patch."https://github.com/Dicklesworthstone/frankensearch"]
+# frankensearch = { path = "../frankensearch/frankensearch" }
+# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
+# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
+# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
+# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
+# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
+# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
