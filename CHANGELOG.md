@@ -7,13 +7,13 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5), [v0.2.6](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.6), and [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5), [v0.2.6](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.6), [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7), and [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
 
 ---
 
-## [v0.3.0] -- Unreleased
+## [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0) -- 2026-04-12
 
-Pending GitHub release preparation for the next minor version after v0.2.7.
+**GitHub Release** with downloadable binaries.
 
 This release line focuses on semantic-search concurrency safety, legacy-data correctness, new resume ergonomics, and making the release pipeline fail early instead of cutting broken or partially-updated releases.
 

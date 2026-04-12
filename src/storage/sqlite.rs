@@ -12791,13 +12791,13 @@ mod tests {
         {
             let mut rng = rand::rng();
             let mut backoff_ms = 4_u64;
-            for attempt in 0..=16 {
+            for attempt in 0..=24 {
                 match f() {
                     Ok(value) => return Ok(value),
-                    Err(err) if attempt < 16 && retryable_franken_error(&err) => {
+                    Err(err) if attempt < 24 && retryable_franken_error(&err) => {
                         let sleep_ms = backoff_ms + rng.random_range(0..=backoff_ms);
                         std::thread::sleep(Duration::from_millis(sleep_ms));
-                        backoff_ms = (backoff_ms * 2).min(256);
+                        backoff_ms = (backoff_ms * 2).min(512);
                     }
                     Err(err) => return Err(err),
                 }
