@@ -190,10 +190,11 @@ esac
 
 TARGET=""
 EXT="tar.gz"
+NO_PREBUILT_REASON=""
 case "${OS}-${ARCH}" in
   linux-amd64) TARGET="linux-amd64" ;;
   linux-arm64) TARGET="linux-arm64" ;;
-  darwin-amd64) TARGET="darwin-amd64" ;;
+  darwin-amd64) NO_PREBUILT_REASON="Intel macOS release binaries are not published" ;;
   darwin-arm64) TARGET="darwin-arm64" ;;
   mingw*-amd64|msys*-amd64|cygwin*-amd64) TARGET="windows-amd64"; EXT="zip" ;;
   *) :;;
@@ -210,7 +211,11 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     TAR="cass-${TARGET}.${EXT}"
     URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
   else
-    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
+    if [ -n "$NO_PREBUILT_REASON" ]; then
+      warn "$NO_PREBUILT_REASON; falling back to build-from-source"
+    else
+      warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
+    fi
     FROM_SOURCE=1
   fi
 fi

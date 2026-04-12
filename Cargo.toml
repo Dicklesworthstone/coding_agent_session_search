@@ -14,7 +14,7 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "08dd31df", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "08dd31df", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
@@ -23,7 +23,7 @@ console = "*"
 colored = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
-toon = { git = "https://github.com/Dicklesworthstone/toon_rust", rev = "bc3f9da", package = "tru" }
+toon = { version = "*", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "bc3f9da", package = "tru" }
 tempfile = "*"
 rmp-serde = "*"  # MessagePack for binary metadata serialization (Opt 3.1)
 toml = "*"
@@ -32,7 +32,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -44,10 +44,10 @@ regex = "*"
 portable-pty = "*"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
-ftui = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
-ftui-runtime = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
-ftui-extras = { git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+ftui = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
+ftui-runtime = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
+ftui-extras = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "*"
 walkdir = "*"
 glob = "*"
@@ -69,8 +69,8 @@ half = { version = "*", features = ["bytemuck"] }
 memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "9961c0e7", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "ba9c598", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "9961c0e7", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
+franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "ba9c598", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -138,7 +138,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite-types" }
+fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "9cedb30b", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"

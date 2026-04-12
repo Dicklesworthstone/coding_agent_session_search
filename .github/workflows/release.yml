@@ -71,6 +71,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -203,6 +204,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -369,17 +371,40 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Check crates.io publish readiness
+        id: publish_readiness
+        shell: bash
+        run: |
+          set +e
+          cargo package --locked --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -eq 0 ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Cargo package validation passed."
+            exit 0
+          fi
+
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::Skipping crates.io publish because the manifest is not registry-ready with the currently published dependency set."
+          cat "$RUNNER_TEMP/cargo-package.log"
+
       - name: Publish to crates.io
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
         run: cargo publish --all-features --locked
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
         run: echo "::warning::CARGO_REGISTRY_TOKEN is not configured; skipping publish."
+
+      - name: Warn when manifest is not registry-ready
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready != 'true' }}
+        run: echo "::warning::Crates.io publish skipped because cargo package validation failed."
 
   # ==========================================================================
   # Notify Package Managers to Update
