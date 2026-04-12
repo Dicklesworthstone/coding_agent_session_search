@@ -25,8 +25,23 @@ permissions:
   contents: read
 
 jobs:
+  validate-release-config:
+    name: Validate Release Config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - name: Require Homebrew token before cutting a release
+        run: |
+          if [[ "${HAS_HOMEBREW_TOKEN}" != "true" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN not configured; refusing to create a release before Homebrew metadata can be updated."
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate-release-config
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:

@@ -6548,7 +6548,8 @@ mod tests {
 
         let first_err = client
             .progressive_context()
-            .expect_err("invalid progressive index files should fail to load");
+            .err()
+            .expect("invalid progressive index files should fail to load");
         assert!(
             first_err
                 .to_string()
@@ -6558,7 +6559,8 @@ mod tests {
 
         let second_err = client
             .progressive_context()
-            .expect_err("a failed progressive load must not be memoized as None");
+            .err()
+            .expect("a failed progressive load must not be memoized as None");
         assert!(
             second_err
                 .to_string()
