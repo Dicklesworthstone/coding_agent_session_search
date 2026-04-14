@@ -6163,17 +6163,15 @@ impl FrankenStorage {
     }
 
     fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
-        let rows = self
+        let value: Option<String> = self
             .conn
-            .query("SELECT value FROM meta WHERE key = ?1;")
-            .with_context(|| "reading frankensqlite FTS rebuild generation")?;
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-        let value: String = row
-            .get_typed(0)
-            .with_context(|| "decoding frankensqlite FTS rebuild generation")?;
-        Ok(value.parse::<i64>().ok())
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_FRANKEN_REBUILD_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse::<i64>().ok()))
     }
 
     fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
@@ -6191,9 +6189,48 @@ impl FrankenStorage {
 
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
         if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
-            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
-            self.record_fts_franken_rebuild_generation()?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+            // Before triggering an expensive full rebuild, probe whether
+            // fts_messages is already populated and consistent.  On large
+            // databases the rebuild can take hours and OOM — skip it when
+            // the only thing missing is the generation marker (#184).
+            let fts_already_healthy = (|| -> Result<bool> {
+                let fts_exists: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                if fts_exists != 1 {
+                    return Ok(false);
+                }
+                let total: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                if total == 0 {
+                    return Ok(false);
+                }
+                let indexed: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )?;
+                // Consider healthy if >=90% of messages are indexed
+                Ok(indexed > 0 && indexed * 100 >= total * 90)
+            })()
+            .unwrap_or(false);
+
+            if fts_already_healthy {
+                tracing::info!(
+                    target: "cass::fts_rebuild",
+                    "FTS already populated and consistent; setting generation marker without rebuild"
+                );
+                self.record_fts_franken_rebuild_generation()?;
+            } else {
+                let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+                self.record_fts_franken_rebuild_generation()?;
+                return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+            }
         }
 
         let inspection = (|| -> Result<(i64, bool)> {
