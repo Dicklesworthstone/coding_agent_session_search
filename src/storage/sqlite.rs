@@ -6191,6 +6191,67 @@ impl FrankenStorage {
 
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
         if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
+            // Before triggering an expensive full rebuild, check if FTS is already
+            // populated and consistent.  The generation marker may be missing simply
+            // because the DB was created by a version that did not write it, or
+            // because a previous rebuild was interrupted before
+            // record_fts_franken_rebuild_generation() ran.  Rebuilding a large
+            // (400K+ row) FTS table takes hours and multiple GB of RAM, so we avoid
+            // it when the data is already present.
+            // Returns Some(fts_row_count) if FTS is already populated, None otherwise.
+            let fts_already_populated = (|| -> Result<Option<usize>> {
+                let schema_rows: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )?;
+                if schema_rows != 1 {
+                    return Ok(None);
+                }
+                let msg_count: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM messages",
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )?;
+                if msg_count == 0 {
+                    return Ok(None);
+                }
+                let fts_count: i64 = self.conn.query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages",
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )?;
+                // Tolerate a small delta (new messages indexed since FTS was built)
+                // but flag if FTS is empty or wildly divergent.
+                let ratio = fts_count as f64 / msg_count as f64;
+                if ratio > 0.9 {
+                    Ok(Some(fts_count as usize))
+                } else {
+                    Ok(None)
+                }
+            })();
+
+            match fts_already_populated {
+                Ok(Some(rows)) => {
+                    tracing::info!(
+                        rows,
+                        "FTS generation marker missing but fts_messages is already populated; \
+                         setting marker without rebuild"
+                    );
+                    self.record_fts_franken_rebuild_generation()?;
+                    return Ok(FtsConsistencyRepair::AlreadyHealthy { rows });
+                }
+                Ok(None) => {
+                    // FTS genuinely needs rebuilding
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "could not probe FTS population; falling through to rebuild"
+                    );
+                }
+            }
+
             let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
             self.record_fts_franken_rebuild_generation()?;
             return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
