@@ -770,7 +770,9 @@ pub const FTS5_REGISTER_SQL: &str = "\
         content='', tokenize='porter'\
     )";
 
+#[cfg(test)]
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
+#[cfg(test)]
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
 
 /// SQL to clear all rows from the contentless `fts_messages` table.
@@ -6143,10 +6145,12 @@ impl FrankenStorage {
     ///
     /// The canonical archive and Tantivy index remain authoritative, so callers
     /// should invoke this from maintenance paths rather than ordinary opens.
+    #[cfg(test)]
     pub(crate) fn ensure_search_fallback_fts_consistency(&self) -> Result<FtsConsistencyRepair> {
         self.ensure_fts_consistency_via_frankensqlite()
     }
 
+    #[cfg(test)]
     fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
         let value: Option<String> = self
             .conn
@@ -6159,6 +6163,7 @@ impl FrankenStorage {
         Ok(value.and_then(|v| v.parse::<i64>().ok()))
     }
 
+    #[cfg(test)]
     fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
         self.conn
             .execute_compat(
@@ -6172,6 +6177,7 @@ impl FrankenStorage {
         Ok(())
     }
 
+    #[cfg(test)]
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
         if self.read_fts_franken_rebuild_generation()? != Some(FTS_FRANKEN_REBUILD_GENERATION) {
             // Before triggering an expensive full rebuild, probe whether
@@ -16456,6 +16462,7 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap();
         drop(storage);
+        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let conn = rusqlite::Connection::open(&db_path).unwrap();

@@ -11,6 +11,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
+use rusqlite::Connection as RusqliteConnection;
 use std::fs;
 use std::path::Path;
 
@@ -77,58 +78,9 @@ fn count_messages(db_path: &Path) -> i64 {
         .expect("count messages")
 }
 
-fn run_sqlite3(db_path: &Path, sql: &str) -> std::process::Output {
-    match std::process::Command::new("sqlite3")
-        .arg(db_path)
-        .arg(sql)
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::process::Command::new("python3")
-                .args([
-                    "-c",
-                    r#"
-import sqlite3
-import sys
-
-db_path, sql = sys.argv[1], sys.argv[2]
-conn = sqlite3.connect(db_path)
-try:
-    cur = conn.cursor()
-    statement = sql.strip()
-    if ";" in statement.rstrip(";"):
-        cur.executescript(statement)
-        conn.commit()
-    else:
-        cur.execute(statement)
-        rows = cur.fetchall()
-        for row in rows:
-            print("\t".join("" if value is None else str(value) for value in row))
-        conn.commit()
-finally:
-    conn.close()
-"#,
-                    db_path
-                        .to_str()
-                        .expect("db path should be valid utf-8 for python fallback"),
-                    sql,
-                ])
-                .output()
-                .expect("sqlite3 CLI or python3 is required for schema-corruption fixture setup")
-        }
-        Err(err) => panic!("failed to execute sqlite3 fixture helper: {err}"),
-    }
-}
-
-fn sql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[test]
-fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
-    let tracker =
-        tracker_for("duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume");
+fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
+    let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
@@ -166,31 +118,84 @@ fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
     );
 
     let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-    let injection_sql = format!(
-        "PRAGMA writable_schema = ON;
-         INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
-         VALUES('table', 'fts_messages', 'fts_messages', 0, {});
-         DELETE FROM meta WHERE key = 'fts_frankensqlite_rebuild_generation';
-         PRAGMA writable_schema = OFF;",
-        sql_literal(duplicate_legacy_fts_sql)
-    );
-    let injection = run_sqlite3(&db_path, &injection_sql);
+    let injection =
+        RusqliteConnection::open(&db_path).expect("open db for writable_schema fixture");
+    injection
+        .execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );",
+        )
+        .expect("materialize canonical fts schema before duplicate injection");
+    injection
+        .execute_batch("PRAGMA writable_schema = ON;")
+        .expect("enable writable_schema");
+    injection
+        .execute(
+            "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+             VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+            [duplicate_legacy_fts_sql],
+        )
+        .expect("inject duplicate fts schema row");
+    injection
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            ["fts_frankensqlite_rebuild_generation"],
+        )
+        .expect("delete stale fts generation marker");
+    injection
+        .execute_batch("PRAGMA writable_schema = OFF;")
+        .expect("disable writable_schema");
+    drop(injection);
+
+    let broken_read = RusqliteConnection::open(&db_path)
+        .expect("reopen db for broken-read assertion")
+        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| {
+            row.get::<_, i64>(0)
+        });
     assert!(
-        injection.status.success(),
-        "schema corruption fixture injection should succeed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&injection.stdout),
-        String::from_utf8_lossy(&injection.stderr)
+        broken_read.is_err(),
+        "the injected duplicate schema row should reproduce the unreadable pre-fix SQLite state"
     );
 
-    let broken_read = run_sqlite3(&db_path, "SELECT COUNT(*) FROM fts_messages;");
+    let existing_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "fts_repair_initial_token",
+            "--robot",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .output()
+        .expect("search for existing content after duplicate schema injection");
     assert!(
-        !broken_read.status.success(),
-        "the injected duplicate schema row should reproduce the unreadable pre-fix SQLite state\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&broken_read.stdout),
-        String::from_utf8_lossy(&broken_read.stderr)
+        existing_search.status.success(),
+        "search should continue to succeed even when the fallback SQLite FTS table is malformed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&existing_search.stdout),
+        String::from_utf8_lossy(&existing_search.stderr)
+    );
+    let existing_hits = serde_json::from_slice::<serde_json::Value>(&existing_search.stdout)
+        .expect("parse existing search json")
+        .get("hits")
+        .and_then(|hits| hits.as_array())
+        .map(|hits| hits.len())
+        .unwrap_or(0);
+    assert!(
+        existing_hits >= 1,
+        "the Tantivy index should remain authoritative for search results"
     );
 
-    let repair_index = cargo_bin_cmd!("cass")
+    let incremental_index = cargo_bin_cmd!("cass")
         .args(["index", "--data-dir"])
         .arg(&data_dir)
         .current_dir(home)
@@ -199,10 +204,10 @@ fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
         .output()
         .expect("run index after duplicate schema injection");
     assert!(
-        repair_index.status.success(),
-        "incremental index should repair the duplicate schema and succeed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&repair_index.stdout),
-        String::from_utf8_lossy(&repair_index.stderr)
+        incremental_index.status.success(),
+        "incremental index should succeed even when the fallback SQLite FTS table is malformed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&incremental_index.stdout),
+        String::from_utf8_lossy(&incremental_index.stderr)
     );
 
     let health = cargo_bin_cmd!("cass")
@@ -224,38 +229,7 @@ fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
     assert_eq!(
         health_json["healthy"],
         serde_json::Value::Bool(true),
-        "health should report the repaired database as healthy"
-    );
-
-    let repaired = SqliteStorage::open(&db_path).expect("reopen repaired cass db");
-    let schema_rows: i64 = repaired
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            &[],
-            |row| row.get_typed(0),
-        )
-        .expect("count repaired schema rows");
-    assert_eq!(
-        schema_rows, 1,
-        "repair should leave exactly one authoritative fts_messages schema row"
-    );
-    let repaired_fts_rows: i64 = repaired
-        .raw()
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |row| {
-            row.get_typed(0)
-        })
-        .expect("query repaired fts table");
-    assert_eq!(
-        repaired_fts_rows, baseline_messages,
-        "repair should preserve the indexed FTS rows instead of dropping content"
-    );
-    let sqlite_client_read = run_sqlite3(&db_path, "SELECT COUNT(*) FROM fts_messages;");
-    assert!(
-        sqlite_client_read.status.success(),
-        "stock SQLite reads should work again after repair\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&sqlite_client_read.stdout),
-        String::from_utf8_lossy(&sqlite_client_read.stderr)
+        "health should treat the canonical archive plus Tantivy index as healthy"
     );
 
     std::thread::sleep(std::time::Duration::from_millis(1200));
@@ -293,7 +267,7 @@ fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
         .expect("search for appended content after repair");
     assert!(
         appended.status.success(),
-        "search should succeed after repair and incremental write\nstdout:\n{}\nstderr:\n{}",
+        "search should succeed after incremental write even with malformed fallback FTS\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&appended.stdout),
         String::from_utf8_lossy(&appended.stderr)
     );
@@ -305,7 +279,7 @@ fn duplicate_fts_schema_rows_are_repaired_before_cli_reads_and_writes_resume() {
         .unwrap_or(0);
     assert!(
         appended_hits >= 1,
-        "the post-repair incremental content should be searchable"
+        "the post-index incremental content should be searchable"
     );
 
     tracker.flush();

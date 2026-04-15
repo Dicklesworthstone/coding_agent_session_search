@@ -2353,11 +2353,15 @@ pub fn run_index(
              attempting to close and reopen"
         );
         storage.close_best_effort_in_place();
-        storage = FrankenStorage::open(&opts.db_path).with_context(|| {
+        storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+            &opts.db_path,
+            Duration::from_secs(10),
+        )
+        .with_context(|| {
             format!(
                 "reopening storage after writable preflight failure: {}. \
-                 If this persists, check that no other cass process holds \
-                 an exclusive lock on the database.",
+                     If this persists, check that no other cass process holds \
+                     an exclusive lock on the database.",
                 opts.db_path.display()
             )
         })?;
@@ -3372,7 +3376,10 @@ fn open_storage_for_index(
 ) -> Result<(FrankenStorage, bool, bool)> {
     if db_path.exists() {
         match current_schema_fast_probe(db_path) {
-            Ok(true) => match FrankenStorage::open(db_path) {
+            Ok(true) => match crate::storage::sqlite::open_franken_storage_with_timeout(
+                db_path,
+                Duration::from_secs(10),
+            ) {
                 Ok(storage) => return Ok((storage, false, false)),
                 Err(err) => tracing::warn!(
                     db_path = %db_path.display(),
@@ -3401,7 +3408,10 @@ fn open_storage_for_index(
                 backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
                 "storage schema incompatible; rebuilt database before indexing"
             );
-            let storage = FrankenStorage::open(db_path)?;
+            let storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                db_path,
+                Duration::from_secs(10),
+            )?;
             Ok((storage, true, true))
         }
         Err(err) if allow_full_recovery => {
@@ -3431,7 +3441,10 @@ fn open_storage_for_index(
                     "backed up canonical db after full-rebuild open failure"
                 );
             }
-            let storage = FrankenStorage::open(db_path)?;
+            let storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                db_path,
+                Duration::from_secs(10),
+            )?;
             Ok((storage, true, true))
         }
         Err(err) => Err(anyhow::anyhow!(

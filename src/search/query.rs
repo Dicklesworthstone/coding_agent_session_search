@@ -44,6 +44,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use frankensqlite::Connection;
+#[cfg(test)]
+use frankensqlite::compat::OptionalExtension;
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 #[cfg(test)]
 use frankensqlite::params;
@@ -141,8 +143,6 @@ use crate::search::vector_index::{
     ROLE_USER, SemanticDocId, SemanticFilter, SemanticFilterMaps, VectorIndex, VectorSearchResult,
     parse_semantic_doc_id, role_code_from_str,
 };
-use crate::storage::sqlite::FrankenStorage;
-
 use crate::sources::provenance::SourceFilter;
 
 // ============================================================================
@@ -8444,7 +8444,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_guard_rebuilds_fts_when_generation_key_stale() -> Result<()> {
+    fn sqlite_guard_does_not_repair_fts_when_generation_key_stale() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("stale-gen-fts.db");
 
@@ -8486,13 +8486,8 @@ mod tests {
             storage.insert_conversation_tree(agent_id, None, &conversation)?;
         }
 
-        // Verify initial state: exactly 1 fts_messages entry in sqlite_master.
         let count_before = sqlite_master_name_count(&db_path, "fts_messages")
             .context("count schema rows before generation key deletion")?;
-        assert_eq!(
-            count_before, 1,
-            "fresh DB should have exactly one fts_messages schema entry"
-        );
 
         // Simulate a stale generation by deleting the rebuild marker.
         // This is the condition ensure_fts_consistency_via_frankensqlite
@@ -8548,8 +8543,8 @@ mod tests {
         let count_after = sqlite_master_name_count(&db_path, "fts_messages")
             .context("count schema rows after sqlite guard reopen")?;
         assert_eq!(
-            count_after, 1,
-            "read-only reopen must leave exactly one fts_messages schema entry"
+            count_after, count_before,
+            "read-only reopen must leave FTS schema state unchanged"
         );
 
         Ok(())
