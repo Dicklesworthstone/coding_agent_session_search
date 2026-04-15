@@ -2926,10 +2926,20 @@ pub struct FrankenStorage {
 }
 
 impl FrankenStorage {
+    fn apply_open_stage_busy_timeout(&self) {
+        if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
+            tracing::debug!(
+                error = %err,
+                "failed to apply open-stage busy_timeout before migrations"
+            );
+        }
+    }
+
     /// Open a frankensqlite connection, run migrations, and apply config.
     ///
-    /// Migrations run before PRAGMAs to avoid page lock contention in
-    /// frankensqlite's WAL mode on file-based databases.
+    /// This initializes canonical schema state only. Derived fallback search
+    /// structures like the in-database `fts_messages` table are repaired
+    /// separately so ordinary opens never block on heavyweight maintenance.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -2940,41 +2950,8 @@ impl FrankenStorage {
         let conn = FrankenConnection::open(&path_str)
             .with_context(|| format!("opening frankensqlite db at {}", path.display()))?;
         let storage = Self { conn };
+        storage.apply_open_stage_busy_timeout();
         storage.run_migrations()?;
-        match storage
-            .ensure_fts_consistency_via_frankensqlite()
-            .with_context(|| {
-                format!(
-                    "repairing canonical FTS via frankensqlite after migrations for {}",
-                    path.display()
-                )
-            })? {
-            FtsConsistencyRepair::AlreadyHealthy { rows } => {
-                tracing::debug!(
-                    db_path = %path.display(),
-                    rows,
-                    "canonical FTS already healthy after migration open"
-                );
-            }
-            FtsConsistencyRepair::IncrementalCatchUp {
-                inserted_rows,
-                total_rows,
-            } => {
-                tracing::info!(
-                    db_path = %path.display(),
-                    inserted_rows,
-                    total_rows,
-                    "caught up missing canonical FTS rows after migration open"
-                );
-            }
-            FtsConsistencyRepair::Rebuilt { inserted_rows } => {
-                tracing::info!(
-                    db_path = %path.display(),
-                    inserted_rows,
-                    "rebuilt canonical FTS schema/content after migration open"
-                );
-            }
-        }
         storage.repair_missing_current_schema_objects()?;
         storage.apply_config()?;
         Ok(storage)
@@ -6160,6 +6137,14 @@ impl FrankenStorage {
     /// Rebuild the FTS5 index from scratch (chunked to avoid OOM on large databases, #110).
     pub fn rebuild_fts(&self) -> Result<()> {
         self.rebuild_fts_via_frankensqlite().map(|_| ())
+    }
+
+    /// Best-effort repair for the derived SQLite FTS fallback index.
+    ///
+    /// The canonical archive and Tantivy index remain authoritative, so callers
+    /// should invoke this from maintenance paths rather than ordinary opens.
+    pub(crate) fn ensure_search_fallback_fts_consistency(&self) -> Result<FtsConsistencyRepair> {
+        self.ensure_fts_consistency_via_frankensqlite()
     }
 
     fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
@@ -16495,6 +16480,19 @@ mod tests {
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            reopened
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .unwrap(),
+            2,
+            "canonical open should not eagerly repair derived FTS artifacts"
+        );
+        reopened.ensure_search_fallback_fts_consistency().unwrap();
         let repaired = rusqlite::Connection::open(&db_path).unwrap();
         assert_eq!(rusqlite_fts_schema_rows(&repaired).unwrap(), 1);
 

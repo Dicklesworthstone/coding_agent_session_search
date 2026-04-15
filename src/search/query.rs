@@ -2718,35 +2718,19 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match FrankenStorage::open(path) {
+            match crate::storage::sqlite::open_franken_readonly_storage_with_timeout(
+                path,
+                std::time::Duration::from_secs(1),
+            ) {
                 Ok(storage) => {
                     *guard = Some(SendConnection(storage.into_raw()));
                 }
-                Err(e) => {
-                    let retryable = crate::storage::sqlite::retryable_franken_anyhow(&e);
-                    if retryable {
-                        match crate::storage::sqlite::open_franken_storage_with_timeout(
-                            path,
-                            std::time::Duration::from_secs(1),
-                        ) {
-                            Ok(storage) => {
-                                *guard = Some(SendConnection(storage.into_raw()));
-                            }
-                            Err(fallback_err) => {
-                                tracing::debug!(
-                                    error = %fallback_err,
-                                    path = %path.display(),
-                                    "sqlite open failed after retry fallback"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            error = %e,
-                            path = %path.display(),
-                            "sqlite open failed"
-                        );
-                    }
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        path = %path.display(),
+                        "readonly sqlite open failed for search client"
+                    );
                 }
             }
         }
@@ -5072,11 +5056,19 @@ impl SearchClient {
         }
 
         let query_match_type = dominant_match_type(raw_query);
-        let message_join = if Self::sqlite_fts_uses_message_id_column(conn)? {
-            "CAST(fts_messages.message_id AS INTEGER) = m.id"
-        } else {
-            "fts_messages.rowid = m.id"
-        };
+        let message_join =
+            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
+                if uses_message_id {
+                    "CAST(fts_messages.message_id AS INTEGER) = m.id"
+                } else {
+                    "fts_messages.rowid = m.id"
+                }
+            } else {
+                tracing::warn!(
+                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
+                );
+                return Ok(Vec::new());
+            };
 
         let title_expr = if field_mask.wants_title() {
             "fts_messages.title"
@@ -5160,7 +5152,16 @@ impl SearchClient {
         params.push(ParamValue::from(offset as i64));
 
         let params = params_from_iter(params);
-        let rows = franken_query_rows_retry(conn, &sql, &params)?;
+        let rows = match franken_query_rows_retry(conn, &sql, &params) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "sqlite FTS fallback query failed; returning no fallback hits"
+                );
+                return Ok(Vec::new());
+            }
+        };
         let mut hits = Vec::with_capacity(rows.len());
         for row in rows {
             let title: String = row.get_typed(0)?;
@@ -8504,9 +8505,8 @@ mod tests {
             )?;
         }
 
-        // Opening via sqlite_guard() triggers FrankenStorage::open() →
-        // ensure_fts_consistency_via_frankensqlite() which detects the
-        // missing generation key and rebuilds FTS.
+        // Opening via sqlite_guard() must remain read-only. A search path
+        // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(None),
@@ -8530,12 +8530,26 @@ mod tests {
         assert!(guard.is_some(), "sqlite guard should open the db");
         drop(guard);
 
-        // After rebuild: exactly 1 schema entry and FTS is queryable.
+        // The read-only open must not rewrite the rebuild-generation marker.
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
+        let generation_after: Option<String> = conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                &[ParamValue::from("fts_frankensqlite_rebuild_generation")],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        assert!(
+            generation_after.is_none(),
+            "search sqlite guard must not mutate FTS rebuild metadata"
+        );
+
+        // Schema rows remain unchanged by the read-only open.
         let count_after = sqlite_master_name_count(&db_path, "fts_messages")
             .context("count schema rows after sqlite guard reopen")?;
         assert_eq!(
             count_after, 1,
-            "reopen must leave exactly one fts_messages schema entry"
+            "read-only reopen must leave exactly one fts_messages schema entry"
         );
 
         Ok(())
