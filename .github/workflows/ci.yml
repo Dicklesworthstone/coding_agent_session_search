@@ -158,6 +158,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
         with:
@@ -183,6 +191,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
@@ -239,6 +255,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
 
@@ -290,6 +314,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
@@ -349,6 +381,14 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
 
@@ -367,6 +407,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
@@ -400,6 +448,14 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
