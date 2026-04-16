@@ -17,7 +17,8 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/coding-agent-search-install.lock"
+TMP_ROOT=""
+LOCK_FILE=""
 
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() { log "\033[0;34m→\033[0m $*"; }
@@ -46,6 +47,28 @@ sibling_url() {
 
 is_valid_sha256() {
   printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{64}$'
+}
+
+resolve_tmp_root() {
+  local candidate
+  if [ -n "${TMPDIR:-}" ] && [ "${TMPDIR}" != "/tmp" ]; then
+    if [ -d "${TMPDIR}" ] && [ -w "${TMPDIR}" ] && [ -x "${TMPDIR}" ]; then
+      printf '%s' "${TMPDIR}"
+      return 0
+    fi
+    warn "Ignoring TMPDIR=${TMPDIR} because it is not an accessible directory"
+  fi
+
+  for candidate in "/data/tmp" "/var/tmp" "/tmp"; do
+    [ -n "$candidate" ] || continue
+    if [ -d "$candidate" ] && [ -w "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  err "Could not find a writable temporary directory. Set TMPDIR to a writable path and retry."
+  exit 1
 }
 
 checksum_matches() {
@@ -180,6 +203,14 @@ done
 resolve_version
 
 mkdir -p "$DEST"
+TMP_ROOT="$(resolve_tmp_root)"
+LOCK_FILE="${TMP_ROOT%/}/coding-agent-search-install.lock"
+if [ "${TMPDIR:-}" != "$TMP_ROOT" ]; then
+  export TMPDIR="$TMP_ROOT"
+fi
+if [ "$TMP_ROOT" != "/tmp" ]; then
+  info "Using temporary workspace under $TMP_ROOT"
+fi
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -252,7 +283,7 @@ cleanup() {
   if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
 }
 
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMP_ROOT%/}/cass-install.XXXXXX")
 trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
