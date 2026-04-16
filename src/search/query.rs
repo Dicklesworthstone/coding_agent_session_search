@@ -8694,6 +8694,9 @@ mod tests {
 
         {
             let storage = FrankenStorage::open(&db_path)?;
+            // V14 drops fts_messages during migration — run the lazy repair
+            // so the direct INSERT INTO fts_messages below can land.
+            storage.ensure_search_fallback_fts_consistency()?;
             let conn = storage.raw();
             conn.execute(
                 "INSERT INTO agents(id, slug, name, kind, created_at, updated_at)

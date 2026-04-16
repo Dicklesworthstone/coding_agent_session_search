@@ -1399,21 +1399,35 @@ mod tests {
 
     #[test]
     fn test_path_mapping_applies_to_agent() {
-        // Mapping with no agent filter
-        let global = PathMapping::new("/home", "/Users");
-        assert!(global.applies_to_agent(None));
-        assert!(global.applies_to_agent(Some("claude-code")));
-        assert!(global.applies_to_agent(Some("any-agent")));
+        // This test pins the semantics of the *cass wrapper*
+        // (`path_mapping_applies_to_agent`) rather than the upstream
+        // `PathMapping::applies_to_agent` method. Cass intentionally uses a
+        // permissive wrapper: when the caller doesn't specify an agent, even
+        // mappings that are scoped to a specific agent still apply. Upstream
+        // (`franken_agent_detection`) uses a stricter default (`(Some, None)
+        // => false`) because its scan-time usage wants to skip
+        // agent-specific mappings when the agent is unknown. Both semantics
+        // are correct in their own context; cass's tests must exercise the
+        // cass wrapper to avoid coupling to whichever default franken picks.
 
-        // Mapping with agent filter
+        // Mapping with no agent filter — applies in every case.
+        let global = PathMapping::new("/home", "/Users");
+        assert!(path_mapping_applies_to_agent(&global, None));
+        assert!(path_mapping_applies_to_agent(&global, Some("claude-code")));
+        assert!(path_mapping_applies_to_agent(&global, Some("any-agent")));
+
+        // Mapping with agent filter.
         let filtered = PathMapping::with_agents("/home", "/Users", vec!["claude-code".into()]);
-        assert!(filtered.applies_to_agent(None)); // No agent specified = match all
-        assert!(filtered.applies_to_agent(Some("claude-code")));
-        assert!(!filtered.applies_to_agent(Some("cursor"))); // Not in list
-        assert!(path_mapping_applies_to_agent(
-            &filtered,
-            Some("claude_code")
-        ));
+        // No agent specified → cass wrapper matches (permissive default).
+        assert!(path_mapping_applies_to_agent(&filtered, None));
+        // Agent matches the allow-list.
+        assert!(path_mapping_applies_to_agent(&filtered, Some("claude-code")));
+        // Agent not in the allow-list.
+        assert!(!path_mapping_applies_to_agent(&filtered, Some("cursor")));
+        // Hyphen/underscore normalization: `claude_code` must match the
+        // allow-list entry `claude-code` because cass normalizes agent slugs
+        // before comparison.
+        assert!(path_mapping_applies_to_agent(&filtered, Some("claude_code")));
     }
 
     #[test]

@@ -880,6 +880,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
+        // Simulate an existing tantivy index (meta.json present) so the
+        // "missing" branch in lexical_state_from_observations doesn't short
+        // circuit before the fingerprint check we want to exercise.
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -929,6 +933,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -1032,6 +1037,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");
@@ -1095,6 +1101,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");

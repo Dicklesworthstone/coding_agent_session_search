@@ -1632,15 +1632,30 @@ pub(crate) fn discover_historical_database_bundles(
     }
 
     fn bundle_health_rank(bundle: &HistoricalDatabaseBundle) -> i32 {
-        let clean_schema14_fts = bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION)
-            && bundle.probe.fts_schema_rows == Some(1)
-            && bundle.probe.fts_queryable;
+        // An fts_messages sqlite_master row count of 0 or 1 is "clean":
+        //   0 = modern cass (V14+) drops fts_messages during migration and
+        //       recreates it lazily on first open; the virtual table is
+        //       unavailable until `ensure_search_fallback_fts_consistency` runs
+        //       but the bundle is otherwise healthy.
+        //   1 = pre-V14 cass left fts_messages in place after migration.
+        // Two or more rows means a duplicate/malformed CREATE VIRTUAL TABLE
+        // landed in sqlite_master (usually from a failed legacy rebuild), and
+        // the bundle shouldn't be preferred.
+        let fts_schema_rows_ok = matches!(bundle.probe.fts_schema_rows, Some(0 | 1));
+        // For ranking purposes "queryable OR lazy-creatable" both count as
+        // clean. The probe sets `fts_queryable = fts_schema_rows == 1 && <probe>`,
+        // so it will be false for the lazy-V14 case; treat that as clean too
+        // since the consistency pass will recreate the table on first use.
+        let fts_clean =
+            fts_schema_rows_ok && (bundle.probe.fts_queryable || bundle.probe.fts_schema_rows == Some(0));
+
+        let clean_schema14_fts =
+            bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION) && fts_clean;
         if clean_schema14_fts {
             return 5;
         }
 
-        let clean_fts = bundle.probe.fts_schema_rows == Some(1) && bundle.probe.fts_queryable;
-        if clean_fts {
+        if fts_clean {
             return 4;
         }
 
@@ -11900,6 +11915,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
+        // V14 drops fts_messages during migration; cass normally recreates it
+        // during startup via `ensure_search_fallback_fts_consistency`. Tests
+        // that inspect fts_messages directly need to run the same repair pass
+        // to exercise the "insert flushes FTS" contract.
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("ensure FTS consistency before insert");
 
         let agent = Agent {
             id: None,
@@ -14142,6 +14164,17 @@ mod tests {
             .unwrap();
         drop(source);
 
+        // Legacy "duplicate FTS" fixture reconstruction.
+        //
+        // Post-V14 migration cass drops the V13-era fts_messages virtual table
+        // and recreates it lazily, so a freshly-opened canonical DB has zero
+        // fts_messages entries in sqlite_master. To reproduce the historical
+        // failure mode this test exercises — a legacy v13 bundle with a
+        // duplicated CREATE VIRTUAL TABLE row — we have to inject *both*
+        // entries: the original V13-era contentless row and the buggy duplicate
+        // row. Before V14 existed the original was already present after
+        // migration and only the duplicate needed manual injection.
+        let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
         let legacy = rusqlite::Connection::open(&source_db).unwrap();
         legacy
@@ -14157,6 +14190,15 @@ mod tests {
                 [FTS_FRANKEN_REBUILD_META_KEY],
             )
             .unwrap();
+        // Inject the V13 original first.
+        legacy
+            .execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                 VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                [legacy_v13_fts_sql],
+            )
+            .unwrap();
+        // Then the duplicate that's the real subject of the fixup logic.
         legacy
             .execute(
                 "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
@@ -14272,6 +14314,15 @@ mod tests {
             franken_seeded.schema_version().unwrap(),
             CURRENT_SCHEMA_VERSION
         );
+        // Post-V14 fts_messages is recreated lazily. `FrankenStorage::open`
+        // alone doesn't re-register the virtual table for the frankensqlite
+        // query engine — the consistency pass does, and this is exactly what
+        // normal cass startup runs before the first search. Invoke it
+        // explicitly so the query below exercises the expected post-repair
+        // state rather than the between-steps state.
+        franken_seeded
+            .ensure_search_fallback_fts_consistency()
+            .expect("ensure FTS consistency after seed");
         let post_franken_schema_rows: i64 = franken_seeded
             .raw()
             .query_row_map(
@@ -14964,10 +15015,21 @@ mod tests {
             bundles[0].probe.schema_version,
             Some(CURRENT_SCHEMA_VERSION)
         );
-        assert_eq!(bundles[0].probe.fts_schema_rows, Some(1));
-        assert!(bundles[0].probe.fts_queryable);
+        // Post-V14 cass drops the fts_messages virtual table during migration
+        // and recreates it lazily on first open, so a freshly-migrated "clean"
+        // backup has zero fts_messages rows in sqlite_master. The bundle is
+        // still ranked as healthy by `bundle_health_rank` because 0 rows is a
+        // legitimate lazy-FTS state (see comment there).
+        assert_eq!(bundles[0].probe.fts_schema_rows, Some(0));
+        // `fts_queryable` mirrors a direct rusqlite probe; with 0 sqlite_master
+        // rows the table isn't queryable until lazy repair runs.
+        assert!(!bundles[0].probe.fts_queryable);
         assert_eq!(bundles[1].probe.schema_version, Some(13));
-        assert_eq!(bundles[1].probe.fts_schema_rows, Some(2));
+        // The replay bundle had V14 run (dropping fts_messages → 0 rows), then
+        // the test rolls meta.schema_version back to 13, deletes the V14
+        // marker, and manually injects a duplicate sqlite_master row. Net
+        // result: one synthetic (malformed) fts_messages entry.
+        assert_eq!(bundles[1].probe.fts_schema_rows, Some(1));
     }
 
     #[test]
@@ -16526,20 +16588,37 @@ mod tests {
 
         let storage = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-        let schema_rows: i64 = storage
-            .raw()
-            .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                fparams![],
-                |row| row.get_typed(0),
-            )
-            .unwrap();
-        assert_eq!(schema_rows, 1);
+
+        // The FTS5 virtual table is no longer created eagerly by the
+        // migration runner (V14 drops the old internal-content table and the
+        // current contentless table is recreated lazily — see MIGRATION_V14).
+        // Invoke the repair path to match normal cass startup, then assert
+        // there is exactly one fts_messages entry in sqlite_schema (no
+        // duplicates). rusqlite is used for the schema count because
+        // frankensqlite's sqlite_master projection is authoritative only for
+        // the engine that wrote the page, and we want the canonical C-SQLite
+        // view for this invariant.
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("ensure FTS consistency after fresh open");
+        drop(storage);
+
+        let c_reader = rusqlite::Connection::open(&db_path)
+            .expect("open DB via rusqlite for sqlite_master inspection");
+        assert_eq!(
+            rusqlite_fts_schema_rows(&c_reader).unwrap(),
+            1,
+            "exactly one fts_messages schema row should exist after ensure_search_fallback_fts_consistency"
+        );
+        drop(c_reader);
+
+        let storage = FrankenStorage::open(&db_path).unwrap();
         assert!(
             storage
                 .raw()
                 .query("SELECT rowid FROM fts_messages LIMIT 1")
-                .is_ok()
+                .is_ok(),
+            "fts_messages must be queryable through frankensqlite after open"
         );
     }
 

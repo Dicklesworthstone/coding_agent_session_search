@@ -10568,7 +10568,7 @@ mod cli_read_db_tests {
                     "total_conversations": 10,
                     "storage_fingerprint": "10:42:0:0"
                 },
-                "page_size": 200,
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 4,
                 "processed_conversations": 4,
                 "indexed_docs": 20,
@@ -10627,7 +10627,7 @@ mod cli_read_db_tests {
                     "total_conversations": 10,
                     "storage_fingerprint": "10:42:0:0"
                 },
-                "page_size": 200,
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 4,
                 "processed_conversations": 4,
                 "indexed_docs": 20,
@@ -10873,7 +10873,7 @@ mod cli_read_db_tests {
                     "total_conversations": 10,
                     "storage_fingerprint": "stale-fingerprint"
                 },
-                "page_size": 200,
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 10,
                 "processed_conversations": 10,
                 "indexed_docs": 20,
