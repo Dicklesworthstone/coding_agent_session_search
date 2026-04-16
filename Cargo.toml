@@ -1,6 +1,6 @@
 [package]
 name = "coding-agent-search"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["Jeffrey Emanuel"]
 description = "Unified TUI search over local coding agent histories"
