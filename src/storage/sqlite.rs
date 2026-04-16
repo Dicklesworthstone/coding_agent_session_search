@@ -1641,22 +1641,25 @@ pub(crate) fn discover_historical_database_bundles(
         //     bundle where the FTS virtual table was eagerly created by
         //     migration and is queryable right now.
         //
-        //   * `fts_schema_rows == Some(0)` on a DB whose schema_version is
-        //     actually known — a modern (V14+) bundle where the migration
-        //     drops fts_messages on purpose and cass recreates it lazily via
+        //   * `fts_schema_rows == Some(0) && schema_version == Some(V14+)` —
+        //     a modern bundle where `MIGRATION_V14` dropped fts_messages on
+        //     purpose and cass recreates it lazily via
         //     `ensure_search_fallback_fts_consistency` on the first open.
-        //     We require a known `schema_version` here so a genuinely
-        //     corrupt / mid-migration DB (where `read_meta_schema_version`
-        //     failed and returned `None`) does not get falsely promoted
-        //     alongside legitimate lazy-FTS bundles.
+        //     Gating on `schema_version == CURRENT_SCHEMA_VERSION` is critical:
+        //     `MIGRATION_FRESH_SCHEMA` (V13) creates fts_messages eagerly,
+        //     so a schema-13 bundle with 0 fts rows is a symptom of a
+        //     crashed / tampered migration — not a legitimate lazy-FTS
+        //     state — and must not be promoted alongside real lazy-V14
+        //     bundles. A `None` schema_version (schema marker unreadable)
+        //     is excluded for the same reason.
         //
         // Everything else — `Some(1)` without queryability, `Some(n)` for
         // n >= 2 (duplicated CREATE VIRTUAL TABLE rows from a broken legacy
-        // rebuild), `None` entirely, or `Some(0)` on a DB whose schema
-        // marker cannot be read — is not "fts clean".
+        // rebuild), `None` entirely, or `Some(0)` on a non-current schema —
+        // is not "fts clean".
         let fts_clean = match bundle.probe.fts_schema_rows {
             Some(1) => bundle.probe.fts_queryable,
-            Some(0) => bundle.probe.schema_version.is_some(),
+            Some(0) => bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION),
             _ => false,
         };
 
