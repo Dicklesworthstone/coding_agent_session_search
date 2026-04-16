@@ -2571,6 +2571,15 @@ Update check state is stored in the data directory:
 
 `cass` pins git revisions in [`Cargo.toml`](Cargo.toml) for `asupersync`, `frankensqlite`/`fsqlite-types`, `franken-agent-detection`, `frankensearch`, `frankentui`, and `toon` (`tru`). The repo also commits local `[patch]` overrides for `frankensqlite`, `franken-agent-detection`, and `frankensearch`; the remaining sibling repos can be switched to `/data/projects/*` checkouts during local development.
 
+| Dependency | Pinned revision |
+|------------|-----------------|
+| `frankensqlite` / `fsqlite-types` | `6d046a5f` |
+| `franken-agent-detection` | `546724a4` |
+| `asupersync` | `08dd31df` |
+| `frankensearch` | `fa186910` |
+| `frankentui` | `7a91089` |
+| `toon` (`tru`) | `bc3f9da` |
+
 **Build-time validation**
 - `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.
 - If an active sibling checkout has drifted away from the pinned git revision or has a dirty worktree, the build emits a warning instead of silently trusting it.
