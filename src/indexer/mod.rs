@@ -565,6 +565,47 @@ impl IndexRunLockGuard {
     }
 }
 
+struct IndexRunLockHeartbeat {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl IndexRunLockHeartbeat {
+    fn start(data_dir: PathBuf, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                thread::sleep(interval);
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(err) = heartbeat_index_run_lock(&data_dir) {
+                    tracing::debug!(
+                        error = %err,
+                        path = %data_dir.display(),
+                        "failed to refresh index-run heartbeat from background worker"
+                    );
+                }
+            }
+        });
+
+        Self {
+            stop,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for IndexRunLockHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
     let lock_path = data_dir.join("index-run.lock");
     let existing = match fs::read_to_string(&lock_path) {
@@ -601,24 +642,18 @@ fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
         .with_context(|| format!("writing index-run lock heartbeat {}", lock_path.display()))
 }
 
-fn maybe_heartbeat_index_run_lock(
-    data_dir: &Path,
-    last_progress_heartbeat: &mut Instant,
-    progress_heartbeat_interval: Duration,
-) -> Result<()> {
-    if last_progress_heartbeat.elapsed() < progress_heartbeat_interval {
-        return Ok(());
-    }
-    heartbeat_index_run_lock(data_dir)?;
-    *last_progress_heartbeat = Instant::now();
-    Ok(())
+fn index_run_lock_heartbeat_interval() -> Duration {
+    Duration::from_millis(
+        dotenvy::var("CASS_INDEX_RUN_LOCK_HEARTBEAT_EVERY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_000),
+    )
 }
 
 fn normalize_lexical_messages_for_rebuild(
     messages: Vec<crate::model::types::Message>,
-    data_dir: &Path,
-    last_progress_heartbeat: &mut Instant,
-    progress_heartbeat_interval: Duration,
 ) -> (Vec<NormalizedMessage>, usize, usize) {
     use crate::model::types::MessageRole;
 
@@ -627,16 +662,6 @@ fn normalize_lexical_messages_for_rebuild(
     let normalized_messages: Vec<NormalizedMessage> = messages
         .into_iter()
         .map(|msg| {
-            if let Err(err) = maybe_heartbeat_index_run_lock(
-                data_dir,
-                last_progress_heartbeat,
-                progress_heartbeat_interval,
-            ) {
-                tracing::debug!(
-                    error = %err,
-                    "failed to refresh index-run heartbeat during lexical message normalization"
-                );
-            }
             conversation_message_count = conversation_message_count.saturating_add(1);
             conversation_message_bytes =
                 conversation_message_bytes.saturating_add(msg.content.len());
@@ -2637,6 +2662,8 @@ pub fn run_index(
     };
     let mut index_run_lock =
         acquire_index_run_lock(&opts.data_dir, &opts.db_path, initial_lock_mode)?;
+    let _index_run_lock_heartbeat =
+        IndexRunLockHeartbeat::start(opts.data_dir.clone(), index_run_lock_heartbeat_interval());
 
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
@@ -4164,7 +4191,6 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut message_bytes_since_commit = 0usize;
     let mut conversations_since_progress_persist = 0usize;
     let mut last_progress_persist = Instant::now();
-    let mut last_lock_heartbeat = Instant::now();
     let commit_rebuild_progress = |offset: i64,
                                    processed_conversations: usize,
                                    indexed_docs: usize,
@@ -4268,12 +4294,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                 ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
 
                 let (normalized_messages, conversation_message_count, conversation_message_bytes) =
-                    normalize_lexical_messages_for_rebuild(
-                        messages,
-                        data_dir,
-                        &mut last_lock_heartbeat,
-                        progress_heartbeat_interval,
-                    );
+                    normalize_lexical_messages_for_rebuild(messages);
 
                 let normalized = NormalizedConversation {
                     agent_slug: conv.agent_slug,
@@ -4288,17 +4309,10 @@ pub(crate) fn rebuild_tantivy_from_db(
                 };
 
                 indexed_docs += normalized.messages.len();
-                t_index.add_messages_with_conversation_id_and_batch_hook(
+                t_index.add_messages_with_conversation_id(
                     &normalized,
                     &normalized.messages,
                     Some(conv_id),
-                    |_| {
-                        maybe_heartbeat_index_run_lock(
-                            data_dir,
-                            &mut last_lock_heartbeat,
-                            progress_heartbeat_interval,
-                        )
-                    },
                 )?;
                 messages_since_commit =
                     messages_since_commit.saturating_add(conversation_message_count);
@@ -4334,7 +4348,6 @@ pub(crate) fn rebuild_tantivy_from_db(
                     message_bytes_since_commit = 0;
                     conversations_since_progress_persist = 0;
                     last_progress_persist = Instant::now();
-                    last_lock_heartbeat = Instant::now();
                 } else {
                     conversations_since_progress_persist =
                         conversations_since_progress_persist.saturating_add(1);
@@ -4412,7 +4425,6 @@ pub(crate) fn rebuild_tantivy_from_db(
             message_bytes_since_commit = 0;
             conversations_since_progress_persist = 0;
             last_progress_persist = Instant::now();
-            last_lock_heartbeat = Instant::now();
         }
     }
 

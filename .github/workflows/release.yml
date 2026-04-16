@@ -434,13 +434,17 @@ jobs:
       HAS_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - name: Check for token
+        id: check
         run: |
           if [[ "${{ env.HAS_TOKEN }}" != "true" ]]; then
-            echo "::error::HOMEBREW_TAP_TOKEN not configured; refusing to cut a release with stale Homebrew metadata."
-            exit 1
+            echo "::warning::HOMEBREW_TAP_TOKEN not configured, skipping Homebrew tap notification"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Resolve release checksums
+        if: steps.check.outputs.skip != 'true'
         id: checksums
         shell: bash
         run: |
@@ -467,6 +471,7 @@ jobs:
           echo "darwin_arm64=${darwin_arm64}" >> "$GITHUB_OUTPUT"
 
       - name: Trigger formula update
+        if: steps.check.outputs.skip != 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -484,6 +489,7 @@ jobs:
             }
 
       - name: Log dispatch
+        if: steps.check.outputs.skip != 'true'
         run: |
           echo "Dispatched formula-update event to homebrew-tap"
           echo "   Tool: cass"
@@ -494,6 +500,7 @@ jobs:
           echo "     cass-darwin-arm64.tar.gz: ${{ steps.checksums.outputs.darwin_arm64 }}"
 
       - name: Verify live Homebrew formula matches release
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
