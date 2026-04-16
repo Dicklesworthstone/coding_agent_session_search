@@ -842,6 +842,56 @@ fn search_missing_index_returns_json_error_contract() {
 }
 
 #[test]
+fn search_missing_index_returns_json_error_contract_with_robot_format_compact() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "foo",
+        "--robot-format",
+        "compact",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .expect("stderr should contain a JSON error line");
+    let val: Value =
+        serde_json::from_str(last_line.trim()).expect("stderr should contain JSON error payload");
+    assert_eq!(
+        val["error"]["kind"],
+        Value::String("missing-index".to_string())
+    );
+}
+
+#[test]
+fn search_missing_index_returns_json_error_contract_with_env_output_format() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.env("CASS_OUTPUT_FORMAT", "compact");
+    cmd.args(["search", "foo", "--data-dir", tmp.path().to_str().unwrap()]);
+
+    let output = cmd.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .expect("stderr should contain a JSON error line");
+    let val: Value =
+        serde_json::from_str(last_line.trim()).expect("stderr should contain JSON error payload");
+    assert_eq!(
+        val["error"]["kind"],
+        Value::String("missing-index".to_string())
+    );
+}
+
+#[test]
 fn stats_missing_index_returns_json_error_contract() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();
@@ -1921,6 +1971,17 @@ fn status_missing_db_reports_not_initialized() {
             .contains("cass index --full"),
         "Should recommend the first index run"
     );
+    assert_eq!(
+        json["semantic"]["status"],
+        Value::String("not_initialized".to_string())
+    );
+    assert!(
+        json["semantic"]["summary"]
+            .as_str()
+            .unwrap_or("")
+            .contains("optional"),
+        "fresh installs should not surface semantic model absence as a failure: {json}"
+    );
 }
 
 #[test]
@@ -1971,6 +2032,10 @@ fn health_missing_db_reports_not_initialized() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
+    assert!(
+        output.stderr.is_empty(),
+        "health --json should not emit a second structured error once stdout already contains the full payload"
+    );
     assert_eq!(json["status"], Value::String("not_initialized".to_string()));
     assert_eq!(json["initialized"], Value::Bool(false));
     assert_eq!(json["healthy"], Value::Bool(false));
@@ -2001,6 +2066,10 @@ fn health_missing_db_reports_not_initialized() {
                 .any(|entry| entry.as_str() == Some("database not initialized yet")))
             .unwrap_or(false),
         "health should distinguish not-initialized from broken: {json}"
+    );
+    assert_eq!(
+        json["state"]["semantic"]["status"],
+        Value::String("not_initialized".to_string())
     );
 }
 

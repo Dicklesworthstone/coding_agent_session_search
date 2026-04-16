@@ -1,6 +1,30 @@
+fn env_requests_robot_output() -> bool {
+    let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                "json" | "jsonl" | "compact" | "sessions" | "toon"
+            )
+        });
+    let toon_default_format = dotenvy::var("TOON_DEFAULT_FORMAT")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "json" | "toon"));
+    cass_output_format || toon_default_format
+}
+
 fn is_robot_mode_args() -> bool {
-    std::env::args()
-        .any(|arg| arg == "--json" || arg == "--robot" || arg == "-json" || arg == "-robot")
+    for arg in std::env::args() {
+        if matches!(arg.as_str(), "--json" | "--robot" | "-json" | "-robot") {
+            return true;
+        }
+        if arg == "--robot-format" || arg.starts_with("--robot-format=") {
+            return true;
+        }
+    }
+    env_requests_robot_output()
 }
 
 fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {

@@ -5370,6 +5370,12 @@ fn state_meta_json(
         assets.semantic.available = false;
         assets.semantic.can_search = false;
         assets.semantic.fallback_mode = Some("lexical");
+        assets.semantic.embedder_id = None;
+        assets.semantic.vector_index_path = None;
+        assets.semantic.model_dir = None;
+        assets.semantic.hnsw_path = None;
+        assets.semantic.hnsw_ready = false;
+        assets.semantic.progressive_ready = false;
         assets.semantic.hint = Some(
             "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical."
                 .to_string(),
@@ -10082,16 +10088,19 @@ fn run_health(
         if !index_exists {
             println!("  - index not found");
         }
+        if index_exists && !index_fresh {
+            println!("  - index stale");
+        }
         if index_empty_with_messages {
             println!("  - index has 0 documents but database has messages");
         }
         println!("Run 'cass index --full' or 'cass index --watch' to create index.");
     }
 
-    if healthy {
-        Ok(())
+    let final_error = if healthy {
+        None
     } else if rebuild_active {
-        Err(CliError {
+        Some(CliError {
             code: 1,
             kind: "health",
             message: "Index rebuild is still in progress".to_string(),
@@ -10099,7 +10108,7 @@ fn run_health(
             retryable: true,
         })
     } else if not_initialized {
-        Err(CliError {
+        Some(CliError {
             code: 1,
             kind: "health",
             message: "cass has not been initialized in this data dir yet".to_string(),
@@ -10107,7 +10116,7 @@ fn run_health(
             retryable: true,
         })
     } else if db_degraded {
-        Err(CliError {
+        Some(CliError {
             code: 1,
             kind: "health",
             message: format!(
@@ -10122,13 +10131,19 @@ fn run_health(
             retryable: false,
         })
     } else {
-        Err(CliError {
+        Some(CliError {
             code: 1,
             kind: "health",
             message: "Health check failed".to_string(),
             hint: Some("Run 'cass index --full' to rebuild the index/database.".to_string()),
             retryable: true,
         })
+    };
+
+    match final_error {
+        None => Ok(()),
+        Some(err) if structured_format.is_some() => Err(CliError::already_reported_from(&err)),
+        Some(err) => Err(err),
     }
 }
 
@@ -12187,7 +12202,7 @@ fn run_doctor(
     if fail_count == 0 {
         Ok(())
     } else {
-        Err(CliError {
+        let err = CliError {
             code: 5, // Data corruption code
             kind: "doctor",
             message: format!("{} failure(s) remain", fail_count),
@@ -12196,7 +12211,12 @@ fn run_doctor(
                     .to_string(),
             ),
             retryable: true,
-        })
+        };
+        if structured_format.is_some() {
+            Err(CliError::already_reported_from(&err))
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -14792,12 +14812,68 @@ fn run_index_with_data(
         .filter(|paths| !paths.is_empty())
         .or_else(read_watch_once_paths_env);
 
+    // Decide whether to emit NDJSON progress events on stderr (structured output only).
+    // Respect both the CLI flag and the CASS_INDEX_NO_PROGRESS_EVENTS env var.
+    // Computed up here so the active-index pre-flight error path can also
+    // participate in the event stream — callers polling stderr see a coherent
+    // `started → error` sequence even for fail-fast outcomes.
+    let env_disabled = dotenvy::var("CASS_INDEX_NO_PROGRESS_EVENTS")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let emit_progress_events = structured_output && !no_progress_events && !env_disabled;
+    // Clamp the user-supplied interval so callers can't DoS stderr or wait forever.
+    let progress_interval = Duration::from_millis(progress_interval_ms.clamp(250, 60_000));
+
+    // NDJSON event emitter. The event name is always embedded in payload["event"];
+    // stdout is left untouched so pretty `--json` consumers keep working.
+    let emit_event = |payload: serde_json::Value| {
+        if let Ok(s) = serde_json::to_string(&payload) {
+            eprintln!("{}", s);
+        }
+    };
+
+    if emit_progress_events {
+        let pid = std::process::id();
+        let started = serde_json::json!({
+            "event": "started",
+            "ts_ms": chrono::Utc::now().timestamp_millis(),
+            "pid": pid,
+            "mode": if full { "full" } else { "incremental" },
+            "full": full,
+            "force_rebuild": force_rebuild,
+            "watch": watch,
+            "semantic": semantic,
+            "build_hnsw": build_hnsw,
+            "embedder": embedder,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+            "progress_interval_ms": progress_interval.as_millis() as u64,
+            "hint": "Run `cass status --json` in another shell to inspect progress",
+        });
+        emit_event(started);
+    }
+
     if let Some(active_index) = active_index_run_details(&data_dir, &db_path) {
         let err = active_index.to_cli_error();
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(&err, 0);
             payload["active_index"] = active_index.to_json();
+            if emit_progress_events {
+                let mut event = payload.clone();
+                if let serde_json::Value::Object(ref mut m) = event {
+                    m.insert("event".into(), serde_json::json!("error"));
+                    m.insert(
+                        "ts_ms".into(),
+                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
+                emit_event(event);
+            }
             output_structured_value(payload, fmt)?;
+            return Err(CliError::already_reported_from(&err));
         }
         return Err(err);
     }
@@ -14837,48 +14913,6 @@ fn run_index_with_data(
 
     let start = Instant::now();
     let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
-
-    // Decide whether to emit NDJSON progress events on stderr (structured output only).
-    // Respect both the CLI flag and the CASS_INDEX_NO_PROGRESS_EVENTS env var.
-    let env_disabled = dotenvy::var("CASS_INDEX_NO_PROGRESS_EVENTS")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false);
-    let emit_progress_events = structured_output && !no_progress_events && !env_disabled;
-    // Clamp the user-supplied interval so callers can't DoS stderr or wait forever.
-    let progress_interval = Duration::from_millis(progress_interval_ms.clamp(250, 60_000));
-
-    let emit_event = |event: &str, payload: serde_json::Value| {
-        // NDJSON on stderr: one compact JSON object per line, stdout is untouched
-        // so pretty `--json` final payload consumers keep working.
-        if let Ok(s) = serde_json::to_string(&payload) {
-            eprintln!("{}", s);
-            let _ = event; // event name is already embedded in payload
-        }
-    };
-
-    if emit_progress_events {
-        let pid = std::process::id();
-        let started = serde_json::json!({
-            "event": "started",
-            "ts_ms": chrono::Utc::now().timestamp_millis(),
-            "pid": pid,
-            "mode": if full { "full" } else { "incremental" },
-            "full": full,
-            "force_rebuild": force_rebuild,
-            "watch": watch,
-            "semantic": semantic,
-            "build_hnsw": build_hnsw,
-            "embedder": embedder,
-            "data_dir": data_dir.display().to_string(),
-            "db_path": db_path.display().to_string(),
-            "progress_interval_ms": progress_interval.as_millis() as u64,
-            "hint": "Run `cass status --json` in another shell to inspect progress",
-        });
-        emit_event("started", started);
-    }
 
     // Run indexer in background thread so we can poll progress
     let opts_clone = opts.clone();
@@ -15090,7 +15124,7 @@ fn run_index_with_data(
                         serde_json::json!(chrono::Utc::now().timestamp_millis()),
                     );
                 }
-                emit_event("phase", payload);
+                emit_event(payload);
                 last_phase = phase_code;
                 last_emit = std::time::Instant::now();
             } else if last_emit.elapsed() >= progress_interval {
@@ -15102,7 +15136,7 @@ fn run_index_with_data(
                         serde_json::json!(chrono::Utc::now().timestamp_millis()),
                     );
                 }
-                emit_event("progress", payload);
+                emit_event(payload);
                 last_emit = std::time::Instant::now();
             }
 
@@ -15176,7 +15210,7 @@ fn run_index_with_data(
                         serde_json::json!(chrono::Utc::now().timestamp_millis()),
                     );
                 }
-                emit_event("error", event);
+                emit_event(event);
             }
             output_structured_value(payload, fmt)?;
         } else {
@@ -15253,7 +15287,7 @@ fn run_index_with_data(
                     serde_json::json!(chrono::Utc::now().timestamp_millis()),
                 );
             }
-            emit_event("completed", event);
+            emit_event(event);
         }
 
         output_structured_value(payload, fmt)?;
@@ -15263,7 +15297,10 @@ fn run_index_with_data(
         eprintln!("index completed");
     }
 
-    res
+    match res {
+        Err(err) if structured_format.is_some() => Err(CliError::already_reported_from(&err)),
+        other => other,
+    }
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -24095,6 +24132,24 @@ mod daemon_cli_config_tests {
     }
 }
 
+/// Run `f` on a dedicated thread with a 16 MiB stack. Used for clap-parse
+/// tests whose monomorphized parser depth can exceed the 2 MiB default test
+/// stack in debug builds. Lifting this out of any one test module so both
+/// `subcommand_robot_output_tests` and `pages_cli_flag_tests` can share it.
+#[cfg(test)]
+fn run_on_large_stack<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("cass-clap-parse-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack test thread")
+        .join()
+        .expect("large-stack test thread panicked");
+}
+
 #[cfg(test)]
 mod subcommand_robot_output_tests {
     use super::*;
@@ -24102,81 +24157,85 @@ mod subcommand_robot_output_tests {
 
     #[test]
     fn subcommand_json_flags_enable_robot_mode_and_structured_output() {
-        let cases = [
-            vec!["cass", "search", "needle", "--json"],
-            vec!["cass", "index", "--json"],
-            vec!["cass", "health", "--json"],
-            vec!["cass", "sessions", "--json"],
-            vec!["cass", "timeline", "--json"],
-            vec!["cass", "analytics", "status", "--json"],
-            vec![
-                "cass",
-                "pages",
-                "--export-only",
-                "/tmp/export",
-                "--dry-run",
-                "--json",
-            ],
-            vec!["cass", "export-html", "session.jsonl", "--json"],
-            vec!["cass", "sources", "setup", "--json"],
-        ];
+        run_on_large_stack(|| {
+            let cases = [
+                vec!["cass", "search", "needle", "--json"],
+                vec!["cass", "index", "--json"],
+                vec!["cass", "health", "--json"],
+                vec!["cass", "sessions", "--json"],
+                vec!["cass", "timeline", "--json"],
+                vec!["cass", "analytics", "status", "--json"],
+                vec![
+                    "cass",
+                    "pages",
+                    "--export-only",
+                    "/tmp/export",
+                    "--dry-run",
+                    "--json",
+                ],
+                vec!["cass", "export-html", "session.jsonl", "--json"],
+                vec!["cass", "sources", "setup", "--json"],
+            ];
 
-        for args in cases {
-            let cli = Cli::try_parse_from(args.clone()).expect("parse command with --json");
-            let command = cli.command.as_ref().expect("command");
-            assert!(
-                is_robot_mode(command, &cli),
-                "expected robot mode for args: {args:?}"
-            );
+            for args in cases {
+                let cli = Cli::try_parse_from(args.clone()).expect("parse command with --json");
+                let command = cli.command.as_ref().expect("command");
+                assert!(
+                    is_robot_mode(command, &cli),
+                    "expected robot mode for args: {args:?}"
+                );
 
-            let format = match command {
-                Commands::Search { json, .. }
-                | Commands::Index { json, .. }
-                | Commands::Health { json, .. }
-                | Commands::Sessions { json, .. }
-                | Commands::Timeline { json, .. }
-                | Commands::Pages { json, .. }
-                | Commands::ExportHtml { json, .. } => {
-                    resolve_subcommand_structured_format(&cli, *json)
-                }
-                Commands::Analytics(
-                    AnalyticsCommand::Status { common }
-                    | AnalyticsCommand::Tokens { common, .. }
-                    | AnalyticsCommand::Tools { common, .. }
-                    | AnalyticsCommand::AnalyticsModels { common, .. }
-                    | AnalyticsCommand::Rebuild { common, .. }
-                    | AnalyticsCommand::Validate { common, .. },
-                ) => resolve_subcommand_structured_format(&cli, common.json),
-                Commands::Sources(SourcesCommand::Setup { json, .. }) => {
-                    resolve_subcommand_structured_format(&cli, *json)
-                }
-                other => panic!("unexpected command variant for args {args:?}: {other:?}"),
-            };
+                let format = match command {
+                    Commands::Search { json, .. }
+                    | Commands::Index { json, .. }
+                    | Commands::Health { json, .. }
+                    | Commands::Sessions { json, .. }
+                    | Commands::Timeline { json, .. }
+                    | Commands::Pages { json, .. }
+                    | Commands::ExportHtml { json, .. } => {
+                        resolve_subcommand_structured_format(&cli, *json)
+                    }
+                    Commands::Analytics(
+                        AnalyticsCommand::Status { common }
+                        | AnalyticsCommand::Tokens { common, .. }
+                        | AnalyticsCommand::Tools { common, .. }
+                        | AnalyticsCommand::AnalyticsModels { common, .. }
+                        | AnalyticsCommand::Rebuild { common, .. }
+                        | AnalyticsCommand::Validate { common, .. },
+                    ) => resolve_subcommand_structured_format(&cli, common.json),
+                    Commands::Sources(SourcesCommand::Setup { json, .. }) => {
+                        resolve_subcommand_structured_format(&cli, *json)
+                    }
+                    other => panic!("unexpected command variant for args {args:?}: {other:?}"),
+                };
 
-            assert_eq!(
-                format,
-                Some(RobotFormat::Json),
-                "expected structured JSON output for args: {args:?}"
-            );
-        }
+                assert_eq!(
+                    format,
+                    Some(RobotFormat::Json),
+                    "expected structured JSON output for args: {args:?}"
+                );
+            }
+        });
     }
 
     #[test]
     fn global_robot_format_overrides_subcommand_json_format() {
-        let cli = Cli::try_parse_from(["cass", "--robot-format", "jsonl", "index", "--json"])
-            .expect("parse index command");
-        let command = cli.command.as_ref().expect("command");
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from(["cass", "--robot-format", "jsonl", "index", "--json"])
+                .expect("parse index command");
+            let command = cli.command.as_ref().expect("command");
 
-        let json = match command {
-            Commands::Index { json, .. } => *json,
-            other => panic!("expected index command, got {other:?}"),
-        };
+            let json = match command {
+                Commands::Index { json, .. } => *json,
+                other => panic!("expected index command, got {other:?}"),
+            };
 
-        assert!(is_robot_mode(command, &cli));
-        assert_eq!(
-            resolve_subcommand_structured_format(&cli, json),
-            Some(RobotFormat::Jsonl)
-        );
+            assert!(is_robot_mode(command, &cli));
+            assert_eq!(
+                resolve_subcommand_structured_format(&cli, json),
+                Some(RobotFormat::Jsonl)
+            );
+        });
     }
 }
 
@@ -24208,29 +24267,38 @@ mod pages_cli_flag_tests {
     fn include_attachments_still_accepted_when_explicitly_passed() {
         // Even though hidden, the CLI must still accept the flag without a parse error.
         // Config validation (not CLI parsing) is responsible for rejecting it.
-        let cli = Cli::try_parse_from([
-            "cass",
-            "pages",
-            "--include-attachments",
-            "--export-only",
-            "/tmp/test",
-            "--dry-run",
-        ]);
-        assert!(
-            cli.is_ok(),
-            "--include-attachments must parse even when hidden: {:?}",
-            cli.err()
-        );
-        if let Ok(ref parsed) = cli {
-            if let Some(Commands::Pages {
-                include_attachments,
-                ..
-            }) = &parsed.command
-            {
-                assert!(include_attachments, "flag should be true when passed");
-            } else {
-                panic!("expected Pages command");
+        //
+        // The `Cli`/`Commands` enum is large enough that clap's derive-generated
+        // parser blows past the 2 MB default thread stack in debug builds
+        // (monomorphized dispatch with no inlining, plus per-argument parser
+        // frames). Running the test body on a dedicated thread with a larger
+        // stack makes the test self-sufficient, so it passes whether or not the
+        // outer test runner was launched with `RUST_MIN_STACK` set.
+        run_on_large_stack(|| {
+            let cli = Cli::try_parse_from([
+                "cass",
+                "pages",
+                "--include-attachments",
+                "--export-only",
+                "/tmp/test",
+                "--dry-run",
+            ]);
+            assert!(
+                cli.is_ok(),
+                "--include-attachments must parse even when hidden: {:?}",
+                cli.err()
+            );
+            if let Ok(ref parsed) = cli {
+                if let Some(Commands::Pages {
+                    include_attachments,
+                    ..
+                }) = &parsed.command
+                {
+                    assert!(include_attachments, "flag should be true when passed");
+                } else {
+                    panic!("expected Pages command");
+                }
             }
-        }
+        });
     }
 }
