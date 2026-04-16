@@ -922,12 +922,21 @@ fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
     index_path.join(".lexical-rebuild-state.json")
 }
 
+// Lexical-rebuild batching defaults are tuned for cold rebuilds over tens of
+// thousands of conversations on a developer workstation (~512MB tantivy heap,
+// 4 writer threads). Raise via env vars on constrained hosts or when a corpus
+// exceeds these budgets. The previous (much smaller) defaults served
+// correctness during the frankensqlite migration but capped throughput at
+// ~20 docs/sec on a 4.7M-message corpus; the values below keep Tantivy's
+// writer threads fed and cut SQL round-trips by ~5x without blowing the
+// configured heap.
+
 fn lexical_rebuild_commit_interval_conversations() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2_000)
+        .unwrap_or(10_000)
 }
 
 fn lexical_rebuild_commit_interval_messages() -> usize {
@@ -935,7 +944,7 @@ fn lexical_rebuild_commit_interval_messages() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(25_000)
+        .unwrap_or(200_000)
 }
 
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
@@ -943,7 +952,7 @@ fn lexical_rebuild_commit_interval_message_bytes() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(64 * 1024 * 1024)
+        .unwrap_or(512 * 1024 * 1024)
 }
 
 fn lexical_rebuild_progress_heartbeat_interval_conversations() -> usize {
@@ -951,7 +960,7 @@ fn lexical_rebuild_progress_heartbeat_interval_conversations() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(250)
+        .unwrap_or(2_000)
 }
 
 fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
@@ -960,7 +969,7 @@ fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(2_000),
+            .unwrap_or(10_000),
     )
 }
 
@@ -969,7 +978,7 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(16)
+        .unwrap_or(128)
         .min(usize::try_from(page_size.max(1)).unwrap_or(usize::MAX))
 }
 
@@ -978,7 +987,7 @@ fn lexical_rebuild_initial_batch_fetch_conversation_limit(default_limit: usize) 
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(2)
+        .unwrap_or(32)
         .min(default_limit.max(1))
 }
 
@@ -987,7 +996,7 @@ fn lexical_rebuild_batch_fetch_message_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(50_000)
+        .unwrap_or(250_000)
 }
 
 fn lexical_rebuild_batch_fetch_message_bytes_limit() -> usize {
@@ -995,7 +1004,7 @@ fn lexical_rebuild_batch_fetch_message_bytes_limit() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(16 * 1024 * 1024)
+        .unwrap_or(128 * 1024 * 1024)
 }
 
 fn should_commit_lexical_rebuild(
