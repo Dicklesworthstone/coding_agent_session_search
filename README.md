@@ -2575,8 +2575,8 @@ Update check state is stored in the data directory:
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `aed640a2` |
 | `franken-agent-detection` | `88756ba9` |
-| `asupersync` | `2028c111` |
-| `frankensearch` | `50e46f85` |
+| `asupersync` | `310ff61f` |
+| `frankensearch` | `486eb2bb` |
 | `frankentui` | `2d25a03d` |
 | `toon` (`tru`) | `5669b72a` |
 
