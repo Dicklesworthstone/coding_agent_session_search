@@ -2,11 +2,12 @@ use std::path::Path;
 
 use anyhow::{Error, Result};
 use frankensearch::lexical::{
-    CASS_SCHEMA_HASH, CassDocument as FsCassDocument, CassFields as FsCassFields,
-    CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
-    IndexReader, Schema, cass_build_schema as fs_build_schema,
-    cass_ensure_tokenizer as fs_ensure_tokenizer, cass_fields_from_schema as fs_fields_from_schema,
-    cass_index_dir as fs_index_dir, cass_schema_hash_matches,
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
+    CassFields as FsCassFields, CassMergeStatus as FsCassMergeStatus,
+    CassTantivyIndex as FsCassTantivyIndex, Index, IndexReader, Schema,
+    cass_build_schema as fs_build_schema, cass_ensure_tokenizer as fs_ensure_tokenizer,
+    cass_fields_from_schema as fs_fields_from_schema, cass_index_dir as fs_index_dir,
+    cass_schema_hash_matches,
 };
 
 use crate::connectors::NormalizedConversation;
@@ -254,6 +255,10 @@ pub fn build_schema() -> Schema {
 
 pub fn fields_from_schema(schema: &Schema) -> Result<Fields> {
     fs_fields_from_schema(schema).map_err(map_fs_err)
+}
+
+pub fn expected_index_dir(base: &Path) -> std::path::PathBuf {
+    base.join("index").join(CASS_SCHEMA_VERSION)
 }
 
 pub fn index_dir(base: &Path) -> Result<std::path::PathBuf> {

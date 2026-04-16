@@ -1902,6 +1902,11 @@ fn status_missing_db_reports_not_initialized() {
         Value::Bool(false),
         "Should not be healthy without db"
     );
+    assert_eq!(json["index"]["exists"], Value::Bool(false));
+    assert!(
+        !tmp.path().join("index").exists(),
+        "status should not create an empty index dir while inspecting a fresh install"
+    );
     assert!(
         json["explanation"]
             .as_str()
@@ -1940,6 +1945,11 @@ fn health_missing_db_reports_not_initialized() {
     assert_eq!(json["status"], Value::String("not_initialized".to_string()));
     assert_eq!(json["initialized"], Value::Bool(false));
     assert_eq!(json["healthy"], Value::Bool(false));
+    assert_eq!(json["state"]["index"]["exists"], Value::Bool(false));
+    assert!(
+        !tmp.path().join("index").exists(),
+        "health should not create an empty index dir while probing a fresh install"
+    );
     assert!(
         json["explanation"]
             .as_str()
@@ -1985,6 +1995,10 @@ fn search_missing_index_explains_initialization_required() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let json: Value = serde_json::from_str(stderr.trim()).expect("valid JSON");
 
+    assert!(
+        !tmp.path().join("index").exists(),
+        "search should not create an empty index dir when the archive is not initialized"
+    );
     assert_eq!(
         json["error"]["kind"],
         Value::String("missing-index".to_string())

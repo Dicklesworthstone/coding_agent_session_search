@@ -22,7 +22,7 @@ use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, load_hash_semantic_context, load_semantic_context,
 };
-use crate::search::tantivy::{SCHEMA_HASH, index_dir};
+use crate::search::tantivy::SCHEMA_HASH;
 use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -425,7 +425,7 @@ fn inspect_lexical_assets(
     maintenance: SearchMaintenanceSnapshot,
     db_available: bool,
 ) -> Result<LexicalAssetState> {
-    let index_path = index_dir(data_dir).unwrap_or_else(|_| data_dir.join("index").join("v4"));
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
     let current_db_fingerprint = if db_available {
@@ -475,7 +475,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         checkpoint,
         current_db_fingerprint,
     } = input;
-    let exists = index_path.exists();
+    let exists = index_path.join("meta.json").exists();
     let checkpoint_db_matches = checkpoint.map(|state| state.db_path == db_path.to_string_lossy());
     let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
     let page_size_matches =
@@ -527,7 +527,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let status_reason = if rebuilding {
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
-        Some("lexical index directory missing".to_string())
+        Some("lexical Tantivy metadata missing".to_string())
     } else if contract_mismatch {
         Some("lexical rebuild checkpoint no longer matches the active lexical contract".to_string())
     } else if fingerprint_mismatch {

@@ -5193,9 +5193,9 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
 }
 
 fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
-    crate::search::tantivy::index_dir(data_dir)
-        .map(|path| path.join("meta.json").exists())
-        .unwrap_or(false)
+    crate::search::tantivy::expected_index_dir(data_dir)
+        .join("meta.json")
+        .exists()
 }
 
 fn cass_not_initialized(
@@ -5252,16 +5252,11 @@ fn state_meta_json(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
 
-    let index_path = crate::search::tantivy::index_dir(data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
-    if last_indexed_at.is_none() && index_path.exists() {
-        let meta_path = index_path.join("meta.json");
-        let probe_path = if meta_path.exists() {
-            meta_path
-        } else {
-            index_path.clone()
-        };
-        last_indexed_at = fs::metadata(&probe_path)
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    let index_meta_path = index_path.join("meta.json");
+    let lexical_index_initialized = index_meta_path.exists();
+    if last_indexed_at.is_none() && lexical_index_initialized {
+        last_indexed_at = fs::metadata(&index_meta_path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
@@ -5284,7 +5279,7 @@ fn state_meta_json(
         crate::search::asset_state::SearchAssetSnapshot {
             lexical: crate::search::asset_state::LexicalAssetState {
                 status: "error",
-                exists: index_path.exists(),
+                exists: lexical_index_initialized,
                 fresh: false,
                 stale: true,
                 rebuilding: index_run
@@ -6782,7 +6777,7 @@ fn run_cli_search(
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
-    use crate::search::tantivy::index_dir;
+
     use crate::sources::provenance::SourceFilter;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -6791,13 +6786,7 @@ fn run_cli_search(
     let start_time = Instant::now();
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let index_path = index_dir(&data_dir).map_err(|e| CliError {
-        code: 9,
-        kind: "path",
-        message: format!("failed to open index dir: {e}"),
-        hint: None,
-        retryable: false,
-    })?;
+    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
     let tantivy_index_initialized = index_path.join("meta.json").exists();
@@ -9233,9 +9222,8 @@ fn run_diag(
     let version = env!("CARGO_PKG_VERSION");
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // Use the actual versioned index path (index/v4, not tantivy_index)
-    let index_path = crate::search::tantivy::index_dir(&data_dir)
-        .unwrap_or_else(|_| data_dir.join("index").join("v4"));
+    // Use the actual versioned lexical index path without creating it during diagnostics.
+    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
 
     // Check database existence and get stats
     let (db_exists, db_size, conversation_count, message_count) = if db_path.exists() {
@@ -9293,7 +9281,8 @@ fn run_diag(
     };
 
     // Check index existence
-    let (index_exists, index_size) = if index_path.exists() {
+    let index_meta_path = index_path.join("meta.json");
+    let (index_exists, index_size) = if index_meta_path.exists() {
         let size = fs_dir_size(&index_path);
         (true, size)
     } else {
@@ -11419,13 +11408,7 @@ fn run_doctor(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let index_path = crate::search::tantivy::index_dir(&data_dir).map_err(|e| CliError {
-        code: 5,
-        kind: "doctor",
-        message: format!("failed to resolve index directory: {e}"),
-        hint: None,
-        retryable: true,
-    })?;
+    let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let lock_path = data_dir.join(".index.lock");
 
     // Track all checks and their results
@@ -13840,7 +13823,10 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
         json!({
             "type": "object",
             "properties": {
+                "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "initialized": { "type": "boolean" },
+                "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
                 "index": {
                     "type": "object",
