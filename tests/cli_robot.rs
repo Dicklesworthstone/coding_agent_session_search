@@ -1924,6 +1924,35 @@ fn status_missing_db_reports_not_initialized() {
 }
 
 #[test]
+fn status_empty_index_dir_without_meta_still_reports_not_initialized() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir_all(tmp.path().join("index").join("v7")).unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "status",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
+    assert_eq!(json["initialized"], Value::Bool(false));
+    assert_eq!(json["index"]["exists"], Value::Bool(false));
+    assert!(
+        json["recommended_action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cass index --full"),
+        "empty leftover index dirs should not masquerade as a usable index: {json}"
+    );
+}
+
+#[test]
 fn health_missing_db_reports_not_initialized() {
     let tmp = TempDir::new().unwrap();
 

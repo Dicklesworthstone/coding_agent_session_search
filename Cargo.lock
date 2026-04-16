@@ -2203,6 +2203,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "frankensearch-core",
+ "rayon",
  "serde",
  "serde_json",
  "tantivy",
