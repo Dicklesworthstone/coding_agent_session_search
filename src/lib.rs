@@ -9949,7 +9949,7 @@ fn run_health(
             "index not found".to_string()
         });
     }
-    if !index_fresh {
+    if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
     if rebuild_active {
