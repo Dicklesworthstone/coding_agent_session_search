@@ -1873,8 +1873,8 @@ fn status_json_reports_stale_threshold() {
 }
 
 #[test]
-fn status_missing_db_reports_not_found() {
-    // rob.state.status: status on missing db should report not found
+fn status_missing_db_reports_not_initialized() {
+    // rob.state.status: brand-new data dir should surface initialization guidance
     let tmp = TempDir::new().unwrap();
 
     let mut cmd = base_cmd();
@@ -1890,25 +1890,118 @@ fn status_missing_db_reports_not_found() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
-    // Database should not exist
+    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
+    assert_eq!(json["initialized"], Value::Bool(false));
     assert_eq!(
         json["database"]["exists"],
         Value::Bool(false),
         "Database should not exist"
     );
-    // healthy should be false
     assert_eq!(
         json["healthy"],
         Value::Bool(false),
         "Should not be healthy without db"
     );
-    // recommended_action should suggest creating index
+    assert!(
+        json["explanation"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fresh install"),
+        "status should explain that this is an expected cold-start state: {json}"
+    );
     assert!(
         json["recommended_action"]
             .as_str()
             .unwrap_or("")
-            .contains("index"),
-        "Should recommend running index"
+            .contains("cass index --full"),
+        "Should recommend the first index run"
+    );
+}
+
+#[test]
+fn health_missing_db_reports_not_initialized() {
+    let tmp = TempDir::new().unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "health",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    let assert = cmd.assert().failure();
+    let output = assert.get_output();
+    assert_eq!(output.status.code(), Some(1));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
+    assert_eq!(json["initialized"], Value::Bool(false));
+    assert_eq!(json["healthy"], Value::Bool(false));
+    assert!(
+        json["explanation"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fresh install"),
+        "health should explain the cold-start state: {json}"
+    );
+    assert!(
+        json["recommended_action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cass index --full"),
+        "health should recommend the initial index run: {json}"
+    );
+    assert!(
+        json["errors"]
+            .as_array()
+            .map(|errors| errors
+                .iter()
+                .any(|entry| entry.as_str() == Some("database not initialized yet")))
+            .unwrap_or(false),
+        "health should distinguish not-initialized from broken: {json}"
+    );
+}
+
+#[test]
+fn search_missing_index_explains_initialization_required() {
+    let tmp = TempDir::new().unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "auth",
+        "--json",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    let assert = cmd.assert().failure();
+    let output = assert.get_output();
+    assert_eq!(output.status.code(), Some(3));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: Value = serde_json::from_str(stderr.trim()).expect("valid JSON");
+
+    assert_eq!(
+        json["error"]["kind"],
+        Value::String("missing-index".to_string())
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not been initialized"),
+        "search should explain that the data dir needs first-run indexing: {json}"
+    );
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cass index --full"),
+        "search should tell the user exactly how to initialize the archive: {json}"
     );
 }
 

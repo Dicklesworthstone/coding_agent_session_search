@@ -375,6 +375,65 @@ pub struct IndexingProgress {
     pub stats: Mutex<IndexingStats>,
 }
 
+impl IndexingProgress {
+    /// Human-readable label for the current phase.
+    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing.
+    pub fn phase_label(&self) -> &'static str {
+        match self.phase.load(Ordering::Relaxed) {
+            1 => "scanning",
+            2 => "indexing",
+            _ => "preparing",
+        }
+    }
+
+    /// Capture a JSON snapshot of the current progress state, suitable for
+    /// NDJSON event streaming. `elapsed_ms` is the wall-clock elapsed since
+    /// the index command started (caller's responsibility to track).
+    pub fn snapshot_json(&self, elapsed_ms: u128) -> serde_json::Value {
+        let phase = self.phase.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let current = self.current.load(Ordering::Relaxed);
+        let agents = self.discovered_agents.load(Ordering::Relaxed);
+        let is_rebuilding = self.is_rebuilding.load(Ordering::Relaxed);
+        let agent_names: Vec<String> = self
+            .discovered_agent_names
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let last_error: Option<String> = self.last_error.lock().ok().and_then(|g| g.clone());
+
+        // Derived rate + ETA for the indexing phase. Guard against divide-by-zero
+        // and bogus values when `total` isn't set yet.
+        let (rate_per_sec, eta_seconds) = if phase == 2 && elapsed_ms > 0 && current > 0 {
+            let secs = (elapsed_ms as f64) / 1000.0;
+            let rate = (current as f64) / secs.max(0.001);
+            let remaining = total.saturating_sub(current) as f64;
+            let eta = if rate > 0.0 && total > 0 {
+                Some(remaining / rate)
+            } else {
+                None
+            };
+            (Some(rate), eta)
+        } else {
+            (None, None)
+        };
+
+        serde_json::json!({
+            "phase": match phase { 1 => "scanning", 2 => "indexing", _ => "preparing" },
+            "phase_code": phase,
+            "total": total,
+            "current": current,
+            "discovered_agents": agents,
+            "agent_names": agent_names,
+            "is_rebuilding": is_rebuilding,
+            "elapsed_ms": elapsed_ms,
+            "rate_per_sec": rate_per_sec,
+            "eta_seconds": eta_seconds,
+            "last_error": last_error,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexOptions {
     pub full: bool,

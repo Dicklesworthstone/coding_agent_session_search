@@ -1,2647 +1,3145 @@
 {
-    "api_version": 1,
-    "contract_version": "1",
-    "global_flags": [
+  "api_version": 1,
+  "contract_version": "1",
+  "global_flags": [
+    {
+      "name": "db",
+      "description": "Path to the SQLite database (defaults to platform data dir)",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
+    },
+    {
+      "name": "robot-help",
+      "description": "Deterministic machine-first help (no TUI)",
+      "arg_type": "flag",
+      "required": false
+    },
+    {
+      "name": "trace-file",
+      "description": "Trace command execution spans to JSONL file",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
+    },
+    {
+      "name": "quiet",
+      "short": "q",
+      "description": "Reduce log noise (warnings and errors only)",
+      "arg_type": "flag",
+      "required": false
+    },
+    {
+      "name": "verbose",
+      "short": "v",
+      "description": "Increase verbosity (debug information)",
+      "arg_type": "flag",
+      "required": false
+    },
+    {
+      "name": "color",
+      "description": "Color behavior for CLI output",
+      "arg_type": "option",
+      "value_type": "enum",
+      "required": false,
+      "default": "auto",
+      "enum_values": [
+        "auto",
+        "never",
+        "always"
+      ]
+    },
+    {
+      "name": "progress",
+      "description": "Progress output style",
+      "arg_type": "option",
+      "value_type": "enum",
+      "required": false,
+      "default": "auto",
+      "enum_values": [
+        "auto",
+        "bars",
+        "plain",
+        "none"
+      ]
+    },
+    {
+      "name": "wrap",
+      "description": "Wrap informational output to N columns",
+      "arg_type": "option",
+      "value_type": "integer",
+      "required": false
+    },
+    {
+      "name": "nowrap",
+      "description": "Disable wrapping entirely",
+      "arg_type": "flag",
+      "required": false
+    }
+  ],
+  "commands": [
+    {
+      "name": "tui",
+      "description": "Launch interactive TUI",
+      "arguments": [
         {
-            "name": "db",
-            "description": "Path to the SQLite database (defaults to platform data dir)",
-            "arg_type": "option",
-            "value_type": "path",
-            "required": false
+          "name": "once",
+          "description": "Render once and exit (headless-friendly)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "robot-help",
-            "description": "Deterministic machine-first help (no TUI)",
-            "arg_type": "flag",
-            "required": false
+          "name": "reset-state",
+          "description": "Delete persisted UI state (`tui_state.json`) before launch",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "trace-file",
-            "description": "Trace command execution spans to JSONL file",
-            "arg_type": "option",
-            "value_type": "path",
-            "required": false
+          "name": "asciicast",
+          "description": "Record terminal output to an asciicast v2 file; in non-interactive headless --once mode cass writes a labeled sentinel cast because no live TUI session is launched",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
         },
         {
-            "name": "quiet",
-            "short": "q",
-            "description": "Reduce log noise (warnings and errors only)",
-            "arg_type": "flag",
-            "required": false
+          "name": "data-dir",
+          "description": "Override data dir (matches index --data-dir)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
         },
         {
-            "name": "verbose",
-            "short": "v",
-            "description": "Increase verbosity (debug information)",
-            "arg_type": "flag",
-            "required": false
+          "name": "inline",
+          "description": "Run in inline mode (UI anchored within terminal, scrollback preserved)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "color",
-            "description": "Color behavior for CLI output",
-            "arg_type": "option",
-            "value_type": "enum",
-            "required": false,
-            "default": "auto",
-            "enum_values": [
-                "auto",
-                "never",
-                "always"
-            ]
+          "name": "ui-height",
+          "description": "Height of the inline UI in rows (default: 12, ignored without --inline)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "12"
         },
         {
-            "name": "progress",
-            "description": "Progress output style",
-            "arg_type": "option",
-            "value_type": "enum",
-            "required": false,
-            "default": "auto",
-            "enum_values": [
-                "auto",
-                "bars",
-                "plain",
-                "none"
-            ]
+          "name": "anchor",
+          "description": "Anchor the inline UI to top or bottom of the terminal (default: bottom)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "bottom",
+          "enum_values": [
+            "top",
+            "bottom"
+          ]
         },
         {
-            "name": "wrap",
-            "description": "Wrap informational output to N columns",
-            "arg_type": "option",
-            "value_type": "integer",
-            "required": false
+          "name": "record-macro",
+          "description": "Record input events to a macro file for replay/debugging",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
         },
         {
-            "name": "nowrap",
-            "description": "Disable wrapping entirely",
-            "arg_type": "flag",
-            "required": false
+          "name": "play-macro",
+          "description": "Play back a previously recorded macro file",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
         }
-    ],
-    "commands": [
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "index",
+      "description": "Run indexer",
+      "arguments": [
         {
-            "name": "tui",
-            "description": "Launch interactive TUI",
-            "arguments": [
-                {
-                    "name": "once",
-                    "description": "Render once and exit (headless-friendly)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "reset-state",
-                    "description": "Delete persisted UI state (`tui_state.json`) before launch",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "asciicast",
-                    "description": "Record terminal output to asciicast v2 file (for demos/bug repro)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir (matches index --data-dir)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "inline",
-                    "description": "Run in inline mode (UI anchored within terminal, scrollback preserved)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "ui-height",
-                    "description": "Height of the inline UI in rows (default: 12, ignored without --inline)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "default": "12"
-                },
-                {
-                    "name": "anchor",
-                    "description": "Anchor the inline UI to top or bottom of the terminal (default: bottom)",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "default": "bottom",
-                    "enum_values": [
-                        "top",
-                        "bottom"
-                    ]
-                },
-                {
-                    "name": "record-macro",
-                    "description": "Record input events to a macro file for replay/debugging",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "play-macro",
-                    "description": "Play back a previously recorded macro file",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                }
-            ],
-            "has_json_output": false
+          "name": "full",
+          "description": "Perform full rebuild",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "index",
-            "description": "Run indexer",
-            "arguments": [
-                {
-                    "name": "full",
-                    "description": "Perform full rebuild",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "force-rebuild",
-                    "description": "Force Tantivy index rebuild even if schema matches",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "watch",
-                    "description": "Watch for changes and reindex automatically",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "watch-once",
-                    "description": "Trigger a single watch cycle for specific paths (comma-separated or repeated)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "semantic",
-                    "description": "Build semantic vector index after text indexing",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "build-hnsw",
-                    "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` flag at query time",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "embedder",
-                    "description": "Embedder to use for semantic indexing (hash, fastembed)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "default": "fastembed"
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir (index + db). Defaults to platform data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON (for automation)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "idempotency-key",
-                    "description": "Idempotency key for safe retries. If the same key is used with identical parameters, the cached result is returned. Keys expire after 24 hours",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                }
-            ],
-            "has_json_output": true
+          "name": "force-rebuild",
+          "description": "Force Tantivy index rebuild even if schema matches",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "completions",
-            "description": "Generate shell completions to stdout",
-            "arguments": [
-                {
-                    "name": "shell",
-                    "description": "",
-                    "arg_type": "positional",
-                    "value_type": "enum",
-                    "required": true,
-                    "enum_values": [
-                        "bash",
-                        "elvish",
-                        "fish",
-                        "powershell",
-                        "zsh"
-                    ]
-                }
-            ],
-            "has_json_output": false
+          "name": "watch",
+          "description": "Watch for changes and reindex automatically",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "man",
-            "description": "Generate man page to stdout",
-            "arguments": [],
-            "has_json_output": false
+          "name": "watch-once",
+          "description": "Trigger a single watch cycle for specific paths (comma-separated or repeated)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false,
+          "repeatable": true
         },
         {
-            "name": "robot-docs",
-            "description": "Machine-focused docs for automation agents",
-            "arguments": [
-                {
-                    "name": "topic",
-                    "description": "Topic to print",
-                    "arg_type": "positional",
-                    "value_type": "enum",
-                    "required": true,
-                    "enum_values": [
-                        "commands",
-                        "env",
-                        "paths",
-                        "schemas",
-                        "guide",
-                        "exit-codes",
-                        "examples",
-                        "contracts",
-                        "wrap",
-                        "sources",
-                        "analytics"
-                    ]
-                }
-            ],
-            "has_json_output": false
+          "name": "watch-interval",
+          "description": "Minimum seconds between watch scan cycles (default: 30). Prevents high CPU usage from tight-loop scanning when filesystem events arrive continuously",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "30"
         },
         {
-            "name": "search",
-            "description": "Run a one-off search and print results to stdout",
-            "arguments": [
-                {
-                    "name": "query",
-                    "description": "The query string",
-                    "arg_type": "positional",
-                    "value_type": "string",
-                    "required": true
-                },
-                {
-                    "name": "agent",
-                    "description": "Filter by agent slug (can be specified multiple times)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "workspace",
-                    "description": "Filter by workspace path (can be specified multiple times)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "limit",
-                    "description": "Max results",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "10"
-                },
-                {
-                    "name": "offset",
-                    "description": "Offset for pagination (start at Nth result)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "0"
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON (--robot also works). Equivalent to --robot-format json",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "robot-format",
-                    "description": "Robot output format: json (pretty), jsonl (streaming), compact (single-line), sessions (paths), toon (token-optimized). Env: CASS_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "enum_values": [
-                        "json",
-                        "jsonl",
-                        "compact",
-                        "sessions",
-                        "toon"
-                    ]
-                },
-                {
-                    "name": "robot-meta",
-                    "description": "Include extended metadata in robot output (`elapsed_ms`, `wildcard_fallback`, `cache_stats`)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "fields",
-                    "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "max-content-length",
-                    "description": "Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false
-                },
-                {
-                    "name": "max-tokens",
-                    "description": "Soft token budget for robot output (approx; 4 chars \u2248 1 token). Adjusts truncation",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false
-                },
-                {
-                    "name": "request-id",
-                    "description": "Request ID to echo in robot _meta for correlation",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "cursor",
-                    "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "display",
-                    "description": "Human-readable display format: table (aligned columns), lines (one-liner), markdown",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "enum_values": [
-                        "table",
-                        "lines",
-                        "markdown"
-                    ]
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "days",
-                    "description": "Filter to last N days",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false
-                },
-                {
-                    "name": "today",
-                    "description": "Filter to today only",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "yesterday",
-                    "description": "Filter to yesterday only",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "week",
-                    "description": "Filter to last 7 days",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "since",
-                    "description": "Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "until",
-                    "description": "Filter to entries until ISO date",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "aggregate",
-                    "description": "Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type` Returns buckets with counts instead of full results. Use with --limit to get both",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "explain",
-                    "description": "Include query explanation in output (shows parsed query, index strategy, cost estimate)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "dry-run",
-                    "description": "Validate and analyze query without executing (returns explanation, estimated cost, warnings)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "timeout",
-                    "description": "Timeout in milliseconds. Returns partial results and error if exceeded",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "highlight",
-                    "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "source",
-                    "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "sessions-from",
-                    "description": "Filter to sessions from file (one path per line). Use '-' for stdin. Enables chained searches: `cass search \"query1\" --robot-format sessions | cass search \"query2\" --sessions-from -`",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "mode",
-                    "description": "Search mode: lexical (default), semantic, or hybrid",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "enum_values": [
-                        "lexical",
-                        "semantic",
-                        "hybrid"
-                    ]
-                },
-                {
-                    "name": "approximate",
-                    "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "model",
-                    "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "rerank",
-                    "description": "Enable reranking of search results for improved relevance. Requires a reranker model to be available",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "reranker",
-                    "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "daemon",
-                    "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "no-daemon",
-                    "description": "Disable daemon usage even if available (force direct inference)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "two-tier",
-                    "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "fast-only",
-                    "description": "Fast-only search: use lightweight embedder for instant results, no refinement. Ideal for real-time search-as-you-type scenarios where latency is critical",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "quality-only",
-                    "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
+          "name": "semantic",
+          "description": "Build semantic vector index after text indexing",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "stats",
-            "description": "Show statistics about indexed data",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "source",
-                    "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "by-source",
-                    "description": "Show breakdown by source",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
+          "name": "build-hnsw",
+          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` flag at query time",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "diag",
-            "description": "Output diagnostic information for troubleshooting",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "verbose",
-                    "short": "v",
-                    "description": "Include verbose information (file sizes, timestamps)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
+          "name": "embedder",
+          "description": "Embedder to use for semantic indexing (hash, fastembed)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "fastembed"
         },
         {
-            "name": "status",
-            "description": "Quick health check for agents: index freshness, db stats, recommended action",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON (default for robot consumption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "robot-meta",
-                    "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "stale-threshold",
-                    "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "1800"
-                }
-            ],
-            "has_json_output": true
+          "name": "data-dir",
+          "description": "Override data dir (index + db). Defaults to platform data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
         },
         {
-            "name": "capabilities",
-            "description": "Discover available features, versions, and limits for agent introspection",
-            "arguments": [
-                {
-                    "name": "json",
-                    "description": "Output as JSON (default for robot consumption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
-            "name": "state",
-            "description": "Quick state/health check (alias of status)",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON (default for robot consumption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "robot-meta",
-                    "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "stale-threshold",
-                    "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "1800"
-                }
-            ],
-            "has_json_output": true
+          "name": "idempotency-key",
+          "description": "Idempotency key for safe retries. If the same key is used with identical parameters, the cached result is returned. Keys expire after 24 hours",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
-            "name": "api-version",
-            "description": "Show API + contract version info",
-            "arguments": [
-                {
-                    "name": "json",
-                    "description": "Output as JSON (default for robot consumption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "introspect",
-            "description": "Full API schema introspection - commands, arguments, and response schemas",
-            "arguments": [
-                {
-                    "name": "json",
-                    "description": "Output as JSON (default for robot consumption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "view",
-            "description": "View a source file at a specific line (follow up on search results)",
-            "arguments": [
-                {
-                    "name": "path",
-                    "description": "Path to the source file",
-                    "arg_type": "positional",
-                    "value_type": "path",
-                    "required": true
-                },
-                {
-                    "name": "line",
-                    "short": "n",
-                    "description": "Line number to show (1-indexed)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false
-                },
-                {
-                    "name": "context",
-                    "short": "C",
-                    "description": "Number of context lines before/after",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "5"
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "health",
-            "description": "Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy. For agent pre-flight checks",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON (`{\"healthy\": bool, \"latency_ms\": N}`)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "robot-meta",
-                    "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "stale-threshold",
-                    "description": "Staleness threshold in seconds (default: 300)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "300"
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "doctor",
-            "description": "Diagnose and repair cass installation issues. Safe by default - never deletes user data. Use --fix to apply automatic repairs (rebuilds derived data only, preserves source sessions)",
-            "arguments": [
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "fix",
-                    "description": "Apply safe fixes automatically (rebuilds index/db from source data)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "verbose",
-                    "short": "v",
-                    "description": "Run all checks verbosely (show passed checks too)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "force-rebuild",
-                    "description": "Force index rebuild even if index appears healthy",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "context",
-            "description": "Find related sessions for a given source path",
-            "arguments": [
-                {
-                    "name": "path",
-                    "description": "Path to the source session file",
-                    "arg_type": "positional",
-                    "value_type": "path",
-                    "required": true
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "limit",
-                    "description": "Maximum results per relation type (default: 5)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "5"
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "sessions",
-            "description": "List recent sessions, with optional workspace/current-session filtering",
-            "arguments": [
-                {
-                    "name": "workspace",
-                    "description": "Filter to sessions for this workspace/project directory",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "current",
-                    "description": "Resolve the current workspace automatically and return the most recent match",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "false",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "limit",
-                    "description": "Maximum sessions to return (defaults: 10, or 1 with --current)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "export",
-            "description": "Export a conversation to markdown or other formats",
-            "arguments": [
-                {
-                    "name": "path",
-                    "description": "Path to session file",
-                    "arg_type": "positional",
-                    "value_type": "path",
-                    "required": true
-                },
-                {
-                    "name": "format",
-                    "description": "Output format",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "default": "markdown",
-                    "enum_values": [
-                        "markdown",
-                        "text",
-                        "json",
-                        "html"
-                    ]
-                },
-                {
-                    "name": "output",
-                    "short": "o",
-                    "description": "Output file (stdout if not specified)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "include-tools",
-                    "description": "Include tool use details in export",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": false
-        },
-        {
-            "name": "export-html",
-            "description": "Export session as beautiful, self-contained HTML (with optional encryption)",
-            "arguments": [
-                {
-                    "name": "session",
-                    "description": "Path to session file",
-                    "arg_type": "positional",
-                    "value_type": "path",
-                    "required": true
-                },
-                {
-                    "name": "output-dir",
-                    "description": "Output directory (default: current directory)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "filename",
-                    "description": "Custom filename (default: auto-generated from session metadata)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "encrypt",
-                    "description": "Enable password encryption (Web Crypto compatible)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "password",
-                    "description": "Password for encryption (required if --encrypt)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "password-stdin",
-                    "description": "Read password from stdin (secure, no echo)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "include-tools",
-                    "description": "Include tool calls in export (default: true)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "true",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "show-timestamps",
-                    "description": "Show message timestamps",
-                    "arg_type": "flag",
-                    "required": false,
-                    "default": "true",
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "no-cdns",
-                    "description": "Disable CDN references (fully offline, larger file)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "theme",
-                    "description": "Default theme (dark or light)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "default": "dark"
-                },
-                {
-                    "name": "dry-run",
-                    "description": "Validate without writing file",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "explain",
-                    "description": "Show export plan without executing",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "open",
-                    "description": "Open file in browser after export",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "json",
-                    "description": "JSON output (for automation)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "expand",
-            "description": "Show messages around a specific line in a session file",
-            "arguments": [
-                {
-                    "name": "path",
-                    "description": "Path to session file",
-                    "arg_type": "positional",
-                    "value_type": "path",
-                    "required": true
-                },
-                {
-                    "name": "line",
-                    "short": "n",
-                    "description": "Line number to show context around",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": true
-                },
-                {
-                    "name": "context",
-                    "short": "C",
-                    "description": "Number of messages before/after (default: 3)",
-                    "arg_type": "option",
-                    "value_type": "integer",
-                    "required": false,
-                    "default": "3"
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "timeline",
-            "description": "Show activity timeline for a time range",
-            "arguments": [
-                {
-                    "name": "since",
-                    "description": "Start time (ISO date, 'today', 'yesterday', 'Nd' for N days ago)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "until",
-                    "description": "End time (ISO date or relative)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "today",
-                    "description": "Show today only",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "agent",
-                    "description": "Filter by agent (can be repeated)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "data-dir",
-                    "description": "Override data dir",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "json",
-                    "description": "Output as JSON",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "group-by",
-                    "description": "Group by: hour, day, or none",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "default": "hour",
-                    "enum_values": [
-                        "hour",
-                        "day",
-                        "none"
-                    ]
-                },
-                {
-                    "name": "source",
-                    "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "pages",
-            "description": "Export encrypted searchable archive for static hosting (P4.x)",
-            "arguments": [
-                {
-                    "name": "export-only",
-                    "description": "Export only (skip wizard and encryption) to specified directory",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "verify",
-                    "description": "Verify an existing export bundle (for CI/CD)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "agents",
-                    "description": "Filter by agent (comma-separated)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "workspaces",
-                    "description": "Filter by workspace (comma-separated)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "since",
-                    "description": "Filter entries since ISO date or relative time",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "until",
-                    "description": "Filter entries until ISO date or relative time",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "path-mode",
-                    "description": "Path mode: relative (default), basename, full, hash",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "default": "relative",
-                    "enum_values": [
-                        "relative",
-                        "basename",
-                        "full",
-                        "hash"
-                    ]
-                },
-                {
-                    "name": "target",
-                    "description": "Deployment target: local, github, cloudflare",
-                    "arg_type": "option",
-                    "value_type": "enum",
-                    "required": false,
-                    "enum_values": [
-                        "local",
-                        "github",
-                        "cloudflare"
-                    ]
-                },
-                {
-                    "name": "project",
-                    "description": "Cloudflare project name (also used for GitHub repo name)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "branch",
-                    "description": "Cloudflare production branch (default: main)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "account-id",
-                    "description": "Cloudflare account ID (or CLOUDFLARE_ACCOUNT_ID env)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "api-token",
-                    "description": "Cloudflare API token (or CLOUDFLARE_API_TOKEN env)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "dry-run",
-                    "description": "Dry run (don't write files)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "scan-secrets",
-                    "description": "Scan for secrets and exit (no export)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "fail-on-secrets",
-                    "description": "Fail with non-zero exit if secrets are detected (for CI)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "secrets-allow",
-                    "description": "Allowlist regex patterns to suppress findings (repeatable or comma-separated)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "secrets-deny",
-                    "description": "Denylist regex patterns to force findings (repeatable or comma-separated)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "repeatable": true
-                },
-                {
-                    "name": "json",
-                    "description": "Output results as JSON (for verify and secret scan)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "verbose",
-                    "short": "v",
-                    "description": "Verbose output (show detailed check results)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "no-encryption",
-                    "description": "Export without encryption (DANGEROUS - all content publicly readable)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "i-understand-unencrypted-risks",
-                    "description": "Acknowledge unencrypted export risks (required in robot/JSON mode with --no-encryption)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "include-attachments",
-                    "description": "Include message attachments (images, PDFs, code snapshots)",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "preview",
-                    "description": "Preview an existing export locally (starts HTTP server)",
-                    "arg_type": "option",
-                    "value_type": "path",
-                    "required": false
-                },
-                {
-                    "name": "port",
-                    "description": "Port for preview server (default: 8080)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false,
-                    "default": "8080"
-                },
-                {
-                    "name": "no-open",
-                    "description": "Don't auto-open browser when starting preview server",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "config",
-                    "description": "JSON config file for non-interactive export (use \"-\" for stdin)",
-                    "arg_type": "option",
-                    "value_type": "string",
-                    "required": false
-                },
-                {
-                    "name": "validate-config",
-                    "description": "Validate config file without running export",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                },
-                {
-                    "name": "example-config",
-                    "description": "Show example config file",
-                    "arg_type": "flag",
-                    "required": false,
-                    "enum_values": [
-                        "true",
-                        "false"
-                    ]
-                }
-            ],
-            "has_json_output": true
-        },
-        {
-            "name": "sources",
-            "description": "Manage remote sources (P5.x)",
-            "arguments": [],
-            "has_json_output": false
-        },
-        {
-            "name": "models",
-            "description": "Manage semantic search models",
-            "arguments": [],
-            "has_json_output": false
-        },
-        {
-            "name": "import",
-            "description": "Import data from external sources",
-            "arguments": [],
-            "has_json_output": false
-        },
-        {
-            "name": "analytics",
-            "description": "Token usage, cost, tool, and model analytics",
-            "arguments": [],
-            "has_json_output": false
-        },
-        {
-            "name": "daemon",
-            "description": "Run the semantic model daemon (Unix only)",
-            "arguments": [],
-            "has_json_output": false
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
         }
-    ],
-    "response_schemas": {
-        "view": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string"
-                },
-                "start_line": {
-                    "type": "integer"
-                },
-                "end_line": {
-                    "type": "integer"
-                },
-                "highlight_line": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-                "lines": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "number": {
-                                "type": "integer"
-                            },
-                            "content": {
-                                "type": "string"
-                            },
-                            "highlighted": {
-                                "type": "boolean"
-                            }
-                        }
-                    }
-                }
-            }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "completions",
+      "description": "Generate shell completions to stdout",
+      "arguments": [
+        {
+          "name": "shell",
+          "description": "",
+          "arg_type": "positional",
+          "value_type": "enum",
+          "required": true,
+          "enum_values": [
+            "bash",
+            "elvish",
+            "fish",
+            "powershell",
+            "zsh"
+          ]
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "man",
+      "description": "Generate man page to stdout",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "robot-docs",
+      "description": "Machine-focused docs for automation agents",
+      "arguments": [
+        {
+          "name": "topic",
+          "description": "Topic to print",
+          "arg_type": "positional",
+          "value_type": "enum",
+          "required": true,
+          "enum_values": [
+            "commands",
+            "env",
+            "paths",
+            "schemas",
+            "guide",
+            "exit-codes",
+            "examples",
+            "contracts",
+            "wrap",
+            "sources",
+            "analytics"
+          ]
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "search",
+      "description": "Run a one-off search and print results to stdout",
+      "arguments": [
+        {
+          "name": "query",
+          "description": "The query string",
+          "arg_type": "positional",
+          "value_type": "string",
+          "required": true
         },
-        "introspect": {
-            "type": "object",
-            "properties": {
-                "api_version": {
-                    "type": "integer"
-                },
-                "contract_version": {
-                    "type": "string"
-                },
-                "global_flags": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string"
-                            },
-                            "short": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "description": {
-                                "type": "string"
-                            },
-                            "arg_type": {
-                                "type": "string"
-                            },
-                            "value_type": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "required": {
-                                "type": "boolean"
-                            },
-                            "default": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "enum_values": {
-                                "type": [
-                                    "array",
-                                    "null"
-                                ]
-                            },
-                            "repeatable": {
-                                "type": [
-                                    "boolean",
-                                    "null"
-                                ]
-                            }
-                        }
-                    }
-                },
-                "commands": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string"
-                            },
-                            "description": {
-                                "type": "string"
-                            },
-                            "has_json_output": {
-                                "type": "boolean"
-                            },
-                            "arguments": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": {
-                                            "type": "string"
-                                        },
-                                        "short": {
-                                            "type": [
-                                                "string",
-                                                "null"
-                                            ]
-                                        },
-                                        "description": {
-                                            "type": "string"
-                                        },
-                                        "arg_type": {
-                                            "type": "string"
-                                        },
-                                        "value_type": {
-                                            "type": [
-                                                "string",
-                                                "null"
-                                            ]
-                                        },
-                                        "required": {
-                                            "type": "boolean"
-                                        },
-                                        "default": {
-                                            "type": [
-                                                "string",
-                                                "null"
-                                            ]
-                                        },
-                                        "enum_values": {
-                                            "type": [
-                                                "array",
-                                                "null"
-                                            ]
-                                        },
-                                        "repeatable": {
-                                            "type": [
-                                                "boolean",
-                                                "null"
-                                            ]
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                "response_schemas": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "object"
-                    }
-                }
-            }
+        {
+          "name": "agent",
+          "description": "Filter by agent slug (can be specified multiple times)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
         },
+        {
+          "name": "workspace",
+          "description": "Filter by workspace path (can be specified multiple times)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "limit",
+          "description": "Max results (0 = no limit)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "offset",
+          "description": "Offset for pagination (start at Nth result)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "0"
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (--robot also works). Equivalent to --robot-format json",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-meta",
+          "description": "Include extended metadata in robot output (`elapsed_ms`, `wildcard_fallback`, `cache_stats`)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "fields",
+          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "max-content-length",
+          "description": "Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "max-tokens",
+          "description": "Soft token budget for robot output (approx; 4 chars ≈ 1 token). Adjusts truncation",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "request-id",
+          "description": "Request ID to echo in robot _meta for correlation",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "cursor",
+          "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "display",
+          "description": "Human-readable display format: table (aligned columns), lines (one-liner), markdown",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "table",
+            "lines",
+            "markdown"
+          ]
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "days",
+          "description": "Filter to last N days",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "today",
+          "description": "Filter to today only",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "yesterday",
+          "description": "Filter to yesterday only",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "week",
+          "description": "Filter to last 7 days",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "since",
+          "description": "Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "until",
+          "description": "Filter to entries until ISO date",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "aggregate",
+          "description": "Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type` Returns buckets with counts instead of full results. Use with --limit to get both",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "explain",
+          "description": "Include query explanation in output (shows parsed query, index strategy, cost estimate)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "dry-run",
+          "description": "Validate and analyze query without executing (returns explanation, estimated cost, warnings)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "timeout",
+          "description": "Timeout in milliseconds. Returns partial results and error if exceeded",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "highlight",
+          "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "sessions-from",
+          "description": "Filter to sessions from file (one path per line). Use '-' for stdin. Enables chained searches: `cass search \"query1\" --robot-format sessions | cass search \"query2\" --sessions-from -`",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "mode",
+          "description": "Search mode: lexical (default), semantic, or hybrid",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "lexical",
+            "semantic",
+            "hybrid"
+          ]
+        },
+        {
+          "name": "approximate",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "model",
+          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "rerank",
+          "description": "Enable reranking of search results for improved relevance. Requires a reranker model to be available",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "reranker",
+          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "daemon",
+          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-daemon",
+          "description": "Disable daemon usage even if available (force direct inference)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "two-tier",
+          "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "fast-only",
+          "description": "Fast-only search: use lightweight embedder for instant results, no refinement. Ideal for real-time search-as-you-type scenarios where latency is critical",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "quality-only",
+          "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "stats",
+      "description": "Show statistics about indexed data",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "by-source",
+          "description": "Show breakdown by source",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "diag",
+      "description": "Output diagnostic information for troubleshooting",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "verbose",
+          "short": "v",
+          "description": "Include verbose information (file sizes, timestamps)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "status",
+      "description": "Quick health check for agents: index freshness, db stats, recommended action",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-meta",
+          "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "1800"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "capabilities",
+      "description": "Discover available features, versions, and limits for agent introspection",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "state",
+      "description": "Quick state/health check (alias of status)",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-meta",
+          "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 1800 = 30 minutes)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "1800"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "api-version",
+      "description": "Show API + contract version info",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "introspect",
+      "description": "Full API schema introspection - commands, arguments, and response schemas",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "view",
+      "description": "View a source file at a specific line (follow up on search results)",
+      "arguments": [
+        {
+          "name": "path",
+          "description": "Path to the source file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "line",
+          "short": "n",
+          "description": "Line number to show (1-indexed)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "context",
+          "short": "C",
+          "description": "Number of context lines before/after",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "5"
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "health",
+      "description": "Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy. For agent pre-flight checks",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`{\"healthy\": bool, \"latency_ms\": N}`)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-meta",
+          "description": "Include _meta block (elapsed, freshness, data_dir/db_path)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 300)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "300"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "doctor",
+      "description": "Diagnose and repair cass installation issues. Safe by default - never deletes user data. Use --fix to apply automatic repairs (rebuilds derived data only, preserves source sessions)",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "fix",
+          "description": "Apply safe fixes automatically (rebuilds index/db from source data)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "verbose",
+          "short": "v",
+          "description": "Run all checks verbosely (show passed checks too)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "force-rebuild",
+          "description": "Force index rebuild even if index appears healthy",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "context",
+      "description": "Find related sessions for a given source path",
+      "arguments": [
+        {
+          "name": "path",
+          "description": "Path to the source session file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "limit",
+          "description": "Maximum results per relation type (default: 5)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "5"
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "sessions",
+      "description": "List recent sessions, with optional workspace/current-session filtering",
+      "arguments": [
+        {
+          "name": "workspace",
+          "description": "Filter to sessions for this workspace/project directory",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "current",
+          "description": "Resolve the current workspace automatically and return the most recent match",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "limit",
+          "description": "Maximum sessions to return (defaults: 10, or 1 with --current)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "resume",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini)",
+      "arguments": [
+        {
+          "name": "path",
+          "description": "Session file path (as printed by `cass search` or `cass sessions`)",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "agent",
+          "description": "Override the detected harness (see `--help` for accepted values)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "exec",
+          "description": "Replace the current process with the resolved resume command. Mutually exclusive with `--shell` and `--json`",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "shell",
+          "description": "Emit a single shell-escaped command line on stdout (suitable for `eval \"$(cass resume ...)\"`). Mutually exclusive with `--json`",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "export",
+      "description": "Export a conversation to markdown or other formats",
+      "arguments": [
+        {
+          "name": "path",
+          "description": "Path to session file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "format",
+          "description": "Output format",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "markdown",
+          "enum_values": [
+            "markdown",
+            "text",
+            "json",
+            "html"
+          ]
+        },
+        {
+          "name": "output",
+          "short": "o",
+          "description": "Output file (stdout if not specified)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "include-tools",
+          "description": "Include tool use details in export",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-skills",
+          "description": "Include skill content in export (default: stripped for privacy)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "has_json_output": false
+    },
+    {
+      "name": "export-html",
+      "description": "Export session as beautiful, self-contained HTML (with optional encryption)",
+      "arguments": [
+        {
+          "name": "session",
+          "description": "Path to session file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "output-dir",
+          "description": "Output directory (default: current directory)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "filename",
+          "description": "Custom filename (default: auto-generated from session metadata)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "encrypt",
+          "description": "Enable password encryption (Web Crypto compatible)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "password",
+          "description": "Password for encryption (required if --encrypt)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "password-stdin",
+          "description": "Read password from stdin (secure, no echo)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-tools",
+          "description": "Include tool calls in export (default: true)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "true",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "show-timestamps",
+          "description": "Show message timestamps",
+          "arg_type": "flag",
+          "required": false,
+          "default": "true",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-cdns",
+          "description": "Disable CDN references (fully offline, larger file)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-skills",
+          "description": "Include skill content in export (default: stripped for privacy). Skills injected by Claude Code/Codex contain proprietary SKILL.md content that should not appear in shared/published exports",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "theme",
+          "description": "Default theme (dark or light)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "dark"
+        },
+        {
+          "name": "dry-run",
+          "description": "Validate without writing file",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "explain",
+          "description": "Show export plan without executing",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "open",
+          "description": "Open file in browser after export",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "JSON output (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "expand",
+      "description": "Show messages around a specific line in a session file",
+      "arguments": [
+        {
+          "name": "path",
+          "description": "Path to session file",
+          "arg_type": "positional",
+          "value_type": "path",
+          "required": true
+        },
+        {
+          "name": "source",
+          "description": "Exact source_id from search output (e.g. 'local', 'work-laptop')",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "line",
+          "short": "n",
+          "description": "Line number to show context around",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": true
+        },
+        {
+          "name": "context",
+          "short": "C",
+          "description": "Number of messages before/after (default: 3)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "3"
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "timeline",
+      "description": "Show activity timeline for a time range",
+      "arguments": [
+        {
+          "name": "since",
+          "description": "Start time (ISO date, 'today', 'yesterday', 'Nd' for N days ago)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "until",
+          "description": "End time (ISO date or relative)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "today",
+          "description": "Show today only",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "agent",
+          "description": "Filter by agent (can be repeated)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (--robot also works). Equivalent to --robot-format json",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "group-by",
+          "description": "Group by: hour, day, or none",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "hour",
+          "enum_values": [
+            "hour",
+            "day",
+            "none"
+          ]
+        },
+        {
+          "name": "source",
+          "description": "Filter by source: 'local', 'remote', 'all', or a specific source hostname",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "pages",
+      "description": "Export encrypted searchable archive for static hosting (P4.x)",
+      "arguments": [
+        {
+          "name": "export-only",
+          "description": "Export only (skip wizard and encryption) to specified directory",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "verify",
+          "description": "Verify an existing export bundle (for CI/CD)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "agents",
+          "description": "Filter by agent (comma-separated)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "workspaces",
+          "description": "Filter by workspace (comma-separated)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "since",
+          "description": "Filter entries since ISO date or relative time",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "until",
+          "description": "Filter entries until ISO date or relative time",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "path-mode",
+          "description": "Path mode: relative (default), basename, full, hash",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "default": "relative",
+          "enum_values": [
+            "relative",
+            "basename",
+            "full",
+            "hash"
+          ]
+        },
+        {
+          "name": "target",
+          "description": "Deployment target: local, github, cloudflare",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "local",
+            "github",
+            "cloudflare"
+          ]
+        },
+        {
+          "name": "project",
+          "description": "Cloudflare project name (also used for GitHub repo name)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "branch",
+          "description": "Cloudflare production branch (default: main)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "account-id",
+          "description": "Cloudflare account ID (or CLOUDFLARE_ACCOUNT_ID env)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "api-token",
+          "description": "Cloudflare API token (or CLOUDFLARE_API_TOKEN env)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "dry-run",
+          "description": "Dry run (don't write files)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "scan-secrets",
+          "description": "Scan for secrets and exit (no export)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "fail-on-secrets",
+          "description": "Fail with non-zero exit if secrets are detected (for CI)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "secrets-allow",
+          "description": "Allowlist regex patterns to suppress findings (repeatable or comma-separated)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "secrets-deny",
+          "description": "Denylist regex patterns to force findings (repeatable or comma-separated)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "repeatable": true
+        },
+        {
+          "name": "json",
+          "description": "Output results as JSON (for verify and secret scan)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "verbose",
+          "short": "v",
+          "description": "Verbose output (show detailed check results)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-encryption",
+          "description": "Export without encryption (DANGEROUS - all content publicly readable)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "i-understand-unencrypted-risks",
+          "description": "Acknowledge unencrypted export risks (required in robot/JSON mode with --no-encryption)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "preview",
+          "description": "Preview an existing export locally (starts HTTP server)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "port",
+          "description": "Port for preview server (default: 8080)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false,
+          "default": "8080"
+        },
+        {
+          "name": "no-open",
+          "description": "Don't auto-open browser when starting preview server",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "config",
+          "description": "JSON config file for non-interactive export (use \"-\" for stdin)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "validate-config",
+          "description": "Validate config file without running export",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "example-config",
+          "description": "Show example config file",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "sources",
+      "description": "Manage remote sources (P5.x)",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "models",
+      "description": "Manage semantic search models",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "import",
+      "description": "Import data from external sources",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "analytics",
+      "description": "Token usage, tool, and model analytics",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "daemon",
+      "description": "Run the semantic model daemon (Unix only)",
+      "arguments": [
+        {
+          "name": "socket",
+          "description": "Socket path to listen on (default comes from env or built-in config)",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "idle-timeout",
+          "description": "Idle timeout in seconds before auto-shutdown (0 = never; default comes from env or built-in config)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "max-connections",
+          "description": "Maximum concurrent connections (default comes from env or built-in config)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir for model storage",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        }
+      ],
+      "has_json_output": false
+    }
+  ],
+  "response_schemas": {
+    "status": {
+      "type": "object",
+      "properties": {
         "status": {
-            "type": "object",
-            "properties": {
-                "healthy": {
-                    "type": "boolean"
-                },
-                "recommended_action": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "index": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "fresh": {
-                            "type": "boolean"
-                        },
-                        "last_indexed_at": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        },
-                        "age_seconds": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ]
-                        },
-                        "stale": {
-                            "type": "boolean"
-                        },
-                        "stale_threshold_seconds": {
-                            "type": "integer"
-                        }
-                    }
-                },
-                "database": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "conversations": {
-                            "type": "integer"
-                        },
-                        "messages": {
-                            "type": "integer"
-                        },
-                        "path": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "pending": {
-                    "type": "object",
-                    "properties": {
-                        "sessions": {
-                            "type": "integer"
-                        },
-                        "watch_active": {
-                            "type": [
-                                "boolean",
-                                "null"
-                            ]
-                        }
-                    }
-                },
-                "_meta": {
-                    "type": "object",
-                    "properties": {
-                        "timestamp": {
-                            "type": "string"
-                        },
-                        "data_dir": {
-                            "type": "string"
-                        },
-                        "db_path": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
+          "type": "string"
         },
-        "diag": {
-            "type": "object",
-            "properties": {
-                "version": {
-                    "type": "string"
-                },
-                "platform": {
-                    "type": "object",
-                    "properties": {
-                        "os": {
-                            "type": "string"
-                        },
-                        "arch": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "paths": {
-                    "type": "object",
-                    "properties": {
-                        "data_dir": {
-                            "type": "string"
-                        },
-                        "db_path": {
-                            "type": "string"
-                        },
-                        "index_path": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "database": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "size_bytes": {
-                            "type": "integer"
-                        },
-                        "conversations": {
-                            "type": "integer"
-                        },
-                        "messages": {
-                            "type": "integer"
-                        }
-                    }
-                },
-                "index": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "size_bytes": {
-                            "type": "integer"
-                        }
-                    }
-                },
-                "connectors": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string"
-                            },
-                            "path": {
-                                "type": "string"
-                            },
-                            "found": {
-                                "type": "boolean"
-                            }
-                        }
-                    }
-                }
-            }
+        "healthy": {
+          "type": "boolean"
         },
-        "health": {
-            "type": "object",
-            "properties": {
-                "healthy": {
-                    "type": "boolean"
-                },
-                "latency_ms": {
-                    "type": "integer"
-                },
-                "state": {
-                    "type": "object",
-                    "properties": {
-                        "_meta": {
-                            "type": "object",
-                            "properties": {
-                                "data_dir": {
-                                    "type": "string"
-                                },
-                                "db_path": {
-                                    "type": "string"
-                                },
-                                "timestamp": {
-                                    "type": "string"
-                                }
-                            }
-                        },
-                        "database": {
-                            "type": "object",
-                            "properties": {
-                                "exists": {
-                                    "type": "boolean"
-                                },
-                                "conversations": {
-                                    "type": "integer"
-                                },
-                                "messages": {
-                                    "type": "integer"
-                                }
-                            }
-                        },
-                        "index": {
-                            "type": "object",
-                            "properties": {
-                                "exists": {
-                                    "type": "boolean"
-                                },
-                                "fresh": {
-                                    "type": "boolean"
-                                },
-                                "last_indexed_at": {
-                                    "type": [
-                                        "string",
-                                        "null"
-                                    ]
-                                },
-                                "age_seconds": {
-                                    "type": [
-                                        "integer",
-                                        "null"
-                                    ]
-                                },
-                                "stale": {
-                                    "type": "boolean"
-                                },
-                                "stale_threshold_seconds": {
-                                    "type": "integer"
-                                }
-                            }
-                        },
-                        "pending": {
-                            "type": "object",
-                            "properties": {
-                                "sessions": {
-                                    "type": "integer"
-                                },
-                                "watch_active": {
-                                    "type": [
-                                        "boolean",
-                                        "null"
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        "initialized": {
+          "type": "boolean"
         },
-        "capabilities": {
-            "type": "object",
-            "properties": {
-                "crate_version": {
-                    "type": "string"
-                },
-                "api_version": {
-                    "type": "integer"
-                },
-                "contract_version": {
-                    "type": "string"
-                },
-                "features": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "connectors": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
-                    }
-                },
-                "limits": {
-                    "type": "object",
-                    "properties": {
-                        "max_limit": {
-                            "type": "integer"
-                        },
-                        "max_content_length": {
-                            "type": "integer"
-                        },
-                        "max_fields": {
-                            "type": "integer"
-                        },
-                        "max_agg_buckets": {
-                            "type": "integer"
-                        }
-                    }
-                }
-            }
+        "explanation": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "search": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string"
-                },
-                "limit": {
-                    "type": "integer"
-                },
-                "offset": {
-                    "type": "integer"
-                },
-                "count": {
-                    "type": "integer"
-                },
-                "total_matches": {
-                    "type": "integer"
-                },
-                "max_tokens": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-                "request_id": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "cursor": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "hits_clamped": {
-                    "type": "boolean"
-                },
-                "hits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source_path": {
-                                "type": "string"
-                            },
-                            "line_number": {
-                                "type": [
-                                    "integer",
-                                    "null"
-                                ]
-                            },
-                            "agent": {
-                                "type": "string"
-                            },
-                            "workspace": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "title": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "content": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "snippet": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "score": {
-                                "type": [
-                                    "number",
-                                    "null"
-                                ]
-                            },
-                            "created_at": {
-                                "type": [
-                                    "integer",
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "match_type": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ]
-                            },
-                            "source_id": {
-                                "type": "string",
-                                "description": "Source identifier (e.g., 'local', 'work-laptop')"
-                            },
-                            "origin_kind": {
-                                "type": "string",
-                                "description": "Origin kind ('local' or 'ssh')"
-                            },
-                            "origin_host": {
-                                "type": [
-                                    "string",
-                                    "null"
-                                ],
-                                "description": "Host label for remote sources"
-                            }
-                        }
-                    }
-                },
-                "aggregations": {
-                    "type": [
-                        "object",
-                        "null"
-                    ],
-                    "additionalProperties": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "key": {
-                                    "type": "string"
-                                },
-                                "count": {
-                                    "type": "integer"
-                                }
-                            }
-                        }
-                    }
-                },
-                "_warning": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "_meta": {
-                    "type": "object",
-                    "properties": {
-                        "elapsed_ms": {
-                            "type": "integer"
-                        },
-                        "wildcard_fallback": {
-                            "type": "boolean"
-                        },
-                        "cache_stats": {
-                            "type": "object",
-                            "properties": {
-                                "hits": {
-                                    "type": "integer"
-                                },
-                                "misses": {
-                                    "type": "integer"
-                                },
-                                "shortfall": {
-                                    "type": "integer"
-                                }
-                            }
-                        },
-                        "tokens_estimated": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ]
-                        },
-                        "max_tokens": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ]
-                        },
-                        "request_id": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        },
-                        "next_cursor": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        },
-                        "hits_clamped": {
-                            "type": "boolean"
-                        },
-                        "state": {
-                            "type": "object",
-                            "properties": {
-                                "index": {
-                                    "type": "object",
-                                    "properties": {
-                                        "exists": {
-                                            "type": "boolean"
-                                        },
-                                        "fresh": {
-                                            "type": "boolean"
-                                        },
-                                        "last_indexed_at": {
-                                            "type": [
-                                                "string",
-                                                "null"
-                                            ]
-                                        },
-                                        "age_seconds": {
-                                            "type": [
-                                                "integer",
-                                                "null"
-                                            ]
-                                        },
-                                        "stale": {
-                                            "type": "boolean"
-                                        },
-                                        "stale_threshold_seconds": {
-                                            "type": "integer"
-                                        }
-                                    }
-                                },
-                                "database": {
-                                    "type": "object",
-                                    "properties": {
-                                        "exists": {
-                                            "type": "boolean"
-                                        },
-                                        "conversations": {
-                                            "type": "integer"
-                                        },
-                                        "messages": {
-                                            "type": "integer"
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        "index_freshness": {
-                            "type": "object",
-                            "properties": {
-                                "last_indexed_at": {
-                                    "type": [
-                                        "string",
-                                        "null"
-                                    ]
-                                },
-                                "age_seconds": {
-                                    "type": [
-                                        "integer",
-                                        "null"
-                                    ]
-                                },
-                                "stale": {
-                                    "type": "boolean"
-                                },
-                                "pending_sessions": {
-                                    "type": "integer"
-                                },
-                                "fresh": {
-                                    "type": "boolean"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "state": {
-            "type": "object",
-            "properties": {
-                "healthy": {
-                    "type": "boolean"
-                },
-                "recommended_action": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "index": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "fresh": {
-                            "type": "boolean"
-                        },
-                        "last_indexed_at": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        },
-                        "age_seconds": {
-                            "type": [
-                                "integer",
-                                "null"
-                            ]
-                        },
-                        "stale": {
-                            "type": "boolean"
-                        },
-                        "stale_threshold_seconds": {
-                            "type": "integer"
-                        }
-                    }
-                },
-                "database": {
-                    "type": "object",
-                    "properties": {
-                        "exists": {
-                            "type": "boolean"
-                        },
-                        "conversations": {
-                            "type": "integer"
-                        },
-                        "messages": {
-                            "type": "integer"
-                        },
-                        "path": {
-                            "type": "string"
-                        }
-                    }
-                },
-                "pending": {
-                    "type": "object",
-                    "properties": {
-                        "sessions": {
-                            "type": "integer"
-                        },
-                        "watch_active": {
-                            "type": [
-                                "boolean",
-                                "null"
-                            ]
-                        }
-                    }
-                },
-                "_meta": {
-                    "type": "object",
-                    "properties": {
-                        "timestamp": {
-                            "type": "string"
-                        },
-                        "data_dir": {
-                            "type": "string"
-                        },
-                        "db_path": {
-                            "type": "string"
-                        }
-                    }
-                }
-            }
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "index": {
-            "type": "object",
-            "properties": {
-                "success": {
-                    "type": "boolean"
-                },
-                "elapsed_ms": {
-                    "type": "integer"
-                },
-                "full": {
-                    "type": [
-                        "boolean",
-                        "null"
-                    ]
-                },
-                "force_rebuild": {
-                    "type": [
-                        "boolean",
-                        "null"
-                    ]
-                },
-                "data_dir": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "db_path": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                },
-                "conversations": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-                "messages": {
-                    "type": [
-                        "integer",
-                        "null"
-                    ]
-                },
-                "error": {
-                    "type": [
-                        "string",
-                        "null"
-                    ]
-                }
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
             }
+          }
         },
-        "api-version": {
-            "type": "object",
-            "properties": {
-                "crate_version": {
-                    "type": "string"
-                },
-                "api_version": {
-                    "type": "integer"
-                },
-                "contract_version": {
-                    "type": "string"
-                }
+        "database": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "conversations": {
+              "type": "integer"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
             }
+          }
         },
-        "stats": {
-            "type": "object",
-            "properties": {
-                "conversations": {
-                    "type": "integer"
-                },
-                "messages": {
-                    "type": "integer"
-                },
-                "by_agent": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "agent": {
-                                "type": "string"
-                            },
-                            "count": {
-                                "type": "integer"
-                            }
-                        }
-                    }
-                },
-                "top_workspaces": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "workspace": {
-                                "type": "string"
-                            },
-                            "count": {
-                                "type": "integer"
-                            }
-                        }
-                    }
-                },
-                "date_range": {
-                    "type": "object",
-                    "properties": {
-                        "oldest": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        },
-                        "newest": {
-                            "type": [
-                                "string",
-                                "null"
-                            ]
-                        }
-                    }
-                },
-                "db_path": {
-                    "type": "string"
-                }
+        "pending": {
+          "type": "object",
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
             }
+          }
+        },
+        "_meta": {
+          "type": "object",
+          "properties": {
+            "timestamp": {
+              "type": "string"
+            },
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            }
+          }
         }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "agent": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_id": {
+                "type": "string"
+              },
+              "origin_host": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "modified": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "size_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "message_count": {
+                "type": "integer"
+              },
+              "human_turns": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "path",
+              "agent",
+              "source_id",
+              "message_count",
+              "human_turns"
+            ]
+          }
+        }
+      },
+      "required": [
+        "sessions"
+      ]
+    },
+    "health": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "healthy": {
+          "type": "boolean"
+        },
+        "initialized": {
+          "type": "boolean"
+        },
+        "explanation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "latency_ms": {
+          "type": "integer"
+        },
+        "state": {
+          "type": "object",
+          "properties": {
+            "_meta": {
+              "type": "object",
+              "properties": {
+                "data_dir": {
+                  "type": "string"
+                },
+                "db_path": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "type": "string"
+                }
+              }
+            },
+            "database": {
+              "type": "object",
+              "properties": {
+                "exists": {
+                  "type": "boolean"
+                },
+                "conversations": {
+                  "type": "integer"
+                },
+                "messages": {
+                  "type": "integer"
+                }
+              }
+            },
+            "index": {
+              "type": "object",
+              "properties": {
+                "exists": {
+                  "type": "boolean"
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "stale": {
+                  "type": "boolean"
+                },
+                "stale_threshold_seconds": {
+                  "type": "integer"
+                }
+              }
+            },
+            "pending": {
+              "type": "object",
+              "properties": {
+                "sessions": {
+                  "type": "integer"
+                },
+                "watch_active": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "introspect": {
+      "type": "object",
+      "properties": {
+        "api_version": {
+          "type": "integer"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "global_flags": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "short": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "description": {
+                "type": "string"
+              },
+              "arg_type": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "default": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enum_values": {
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "repeatable": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "has_json_output": {
+                "type": "boolean"
+              },
+              "arguments": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "short": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "arg_type": {
+                      "type": "string"
+                    },
+                    "value_type": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "required": {
+                      "type": "boolean"
+                    },
+                    "default": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "enum_values": {
+                      "type": [
+                        "array",
+                        "null"
+                      ]
+                    },
+                    "repeatable": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "response_schemas": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "crate_version": {
+          "type": "string"
+        },
+        "api_version": {
+          "type": "integer"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "connectors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "max_limit": {
+              "type": "integer"
+            },
+            "max_content_length": {
+              "type": "integer"
+            },
+            "max_fields": {
+              "type": "integer"
+            },
+            "max_agg_buckets": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "properties": {
+        "healthy": {
+          "type": "boolean"
+        },
+        "recommended_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "age_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            }
+          }
+        },
+        "database": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "conversations": {
+              "type": "integer"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          }
+        },
+        "pending": {
+          "type": "object",
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "_meta": {
+          "type": "object",
+          "properties": {
+            "timestamp": {
+              "type": "string"
+            },
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "api-version": {
+      "type": "object",
+      "properties": {
+        "crate_version": {
+          "type": "string"
+        },
+        "api_version": {
+          "type": "integer"
+        },
+        "contract_version": {
+          "type": "string"
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "full": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "force_rebuild": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "data_dir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "db_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversations": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "diag": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "object",
+          "properties": {
+            "os": {
+              "type": "string"
+            },
+            "arch": {
+              "type": "string"
+            }
+          }
+        },
+        "paths": {
+          "type": "object",
+          "properties": {
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            },
+            "index_path": {
+              "type": "string"
+            }
+          }
+        },
+        "database": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "size_bytes": {
+              "type": "integer"
+            },
+            "conversations": {
+              "type": "integer"
+            },
+            "messages": {
+              "type": "integer"
+            }
+          }
+        },
+        "index": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "size_bytes": {
+              "type": "integer"
+            }
+          }
+        },
+        "connectors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "found": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "properties": {
+        "conversations": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "by_agent": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "top_workspaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "workspace": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "date_range": {
+          "type": "object",
+          "properties": {
+            "oldest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "newest": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "db_path": {
+          "type": "string"
+        }
+      }
+    },
+    "search": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        },
+        "count": {
+          "type": "integer"
+        },
+        "total_matches": {
+          "type": "integer"
+        },
+        "max_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hits_clamped": {
+          "type": "boolean"
+        },
+        "hits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "source_path": {
+                "type": "string"
+              },
+              "line_number": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "agent": {
+                "type": "string"
+              },
+              "workspace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "workspace_original": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Original workspace path before remote path mapping"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "content": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "snippet": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "score": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "created_at": {
+                "type": [
+                  "integer",
+                  "string",
+                  "null"
+                ]
+              },
+              "match_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_id": {
+                "type": "string",
+                "description": "Source identifier (e.g., 'local', 'work-laptop')"
+              },
+              "origin_kind": {
+                "type": "string",
+                "description": "Origin kind ('local' or 'ssh')"
+              },
+              "origin_host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Host label for remote sources"
+              }
+            }
+          }
+        },
+        "aggregations": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_meta": {
+          "type": "object",
+          "properties": {
+            "elapsed_ms": {
+              "type": "integer"
+            },
+            "wildcard_fallback": {
+              "type": "boolean"
+            },
+            "cache_stats": {
+              "type": "object",
+              "properties": {
+                "hits": {
+                  "type": "integer"
+                },
+                "misses": {
+                  "type": "integer"
+                },
+                "shortfall": {
+                  "type": "integer"
+                }
+              }
+            },
+            "tokens_estimated": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "next_cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hits_clamped": {
+              "type": "boolean"
+            },
+            "state": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "object",
+                  "properties": {
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "fresh": {
+                      "type": "boolean"
+                    },
+                    "last_indexed_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "age_seconds": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "stale": {
+                      "type": "boolean"
+                    },
+                    "stale_threshold_seconds": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "database": {
+                  "type": "object",
+                  "properties": {
+                    "exists": {
+                      "type": "boolean"
+                    },
+                    "conversations": {
+                      "type": "integer"
+                    },
+                    "messages": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            },
+            "index_freshness": {
+              "type": "object",
+              "properties": {
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "stale": {
+                  "type": "boolean"
+                },
+                "pending_sessions": {
+                  "type": "integer"
+                },
+                "fresh": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
+          "type": "integer"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "highlight_line": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "number": {
+                "type": "integer"
+              },
+              "content": {
+                "type": "string"
+              },
+              "highlighted": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
     }
+  }
 }

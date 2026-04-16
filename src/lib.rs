@@ -227,6 +227,16 @@ pub enum Commands {
         /// the cached result is returned. Keys expire after 24 hours.
         #[arg(long)]
         idempotency_key: Option<String>,
+
+        /// Interval (ms) between NDJSON progress events emitted on stderr in --json/--robot
+        /// mode. Clamped to [250, 60000]. Default 2000. Set --no-progress-events to disable.
+        #[arg(long, default_value_t = 2000)]
+        progress_interval_ms: u64,
+
+        /// Suppress NDJSON progress events on stderr in --json/--robot mode.
+        /// Also honored via CASS_INDEX_NO_PROGRESS_EVENTS=1 env var.
+        #[arg(long, default_value_t = false)]
+        no_progress_events: bool,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -2916,6 +2926,8 @@ async fn execute_cli(
                     embedder,
                     idempotency_key,
                     json,
+                    progress_interval_ms,
+                    no_progress_events,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
@@ -2932,6 +2944,8 @@ async fn execute_cli(
                         progress,
                         structured_format,
                         idempotency_key,
+                        progress_interval_ms,
+                        no_progress_events,
                     )?;
                 }
                 Commands::Search {
@@ -5173,8 +5187,35 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
     });
     if let Some(hint) = &err.hint {
         payload["hint"] = serde_json::json!(hint);
+        payload["recommended_action"] = serde_json::json!(hint);
     }
     payload
+}
+
+fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
+    crate::search::tantivy::index_dir(data_dir)
+        .map(|path| path.join("meta.json").exists())
+        .unwrap_or(false)
+}
+
+fn cass_not_initialized(
+    db_exists: bool,
+    lexical_index_initialized: bool,
+    rebuild_active: bool,
+) -> bool {
+    !db_exists && !lexical_index_initialized && !rebuild_active
+}
+
+fn cass_not_initialized_explanation(data_dir: &Path) -> String {
+    format!(
+        "No cass database or search index exists in {} yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+        data_dir.display()
+    )
+}
+
+fn cass_not_initialized_recommended_action() -> String {
+    "Run 'cass index --full' once to discover local sessions and build the initial archive."
+        .to_string()
 }
 
 fn state_meta_json(
@@ -6104,6 +6145,11 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass sessions [--workspace DIR] [--current] [--limit N] [--json]".to_string(),
             "  cass view <path> [-n LINE] [-C CONTEXT] [--json]".to_string(),
             "  cass index [--full] [--watch] [--json] [--data-dir DIR]".to_string(),
+            "                    In --json mode, NDJSON events stream on stderr:".to_string(),
+            "                      {event:started|phase|progress|completed|error, ...}".to_string(),
+            "                    Tune with --progress-interval-ms N (250..60000, default 2000),".to_string(),
+            "                    disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.".to_string(),
+            "                    From another shell: `cass status --json` shows live progress.".to_string(),
             "  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]"
                 .to_string(),
             "  cass capabilities [--json]".to_string(),
@@ -6123,6 +6169,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_NO_COLOR                            force monochrome".to_string(),
             "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
             "  CASS_TRACE_FILE                          default trace path".to_string(),
+            "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
         ],
         RobotTopic::Paths => {
             let mut lines: Vec<String> = vec!["paths:".to_string()];
@@ -6752,6 +6799,8 @@ fn run_cli_search(
         retryable: false,
     })?;
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let db_exists = db_path.exists();
+    let tantivy_index_initialized = index_path.join("meta.json").exists();
 
     let client = SearchClient::open_with_options(
         &index_path,
@@ -6768,15 +6817,48 @@ fn run_cli_search(
         hint: Some("try cass index --full".to_string()),
         retryable: true,
     })?
-    .ok_or_else(|| CliError {
-        code: 3,
-        kind: "missing-index",
-        message: format!(
-            "Index not found at {}. Run 'cass index --full' first.",
-            index_path.display()
-        ),
-        hint: None,
-        retryable: true,
+    .ok_or_else(|| {
+        let (message, hint) = if cass_not_initialized(db_exists, tantivy_index_initialized, false) {
+            (
+                format!(
+                    "cass has not been initialized in {} yet, so search cannot run until the first index completes.",
+                    data_dir.display()
+                ),
+                Some(cass_not_initialized_recommended_action()),
+            )
+        } else if db_exists && !tantivy_index_initialized {
+            (
+                format!(
+                    "Search index not found at {}. The archive database exists, but the Tantivy index has not been built yet.",
+                    index_path.display()
+                ),
+                Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
+            )
+        } else if !db_exists && tantivy_index_initialized {
+            (
+                format!(
+                    "Search index exists at {}, but the archive database {} is missing.",
+                    index_path.display(),
+                    db_path.display()
+                ),
+                Some("Run 'cass index --full' to recreate the local archive database.".to_string()),
+            )
+        } else {
+            (
+                format!(
+                    "Index not found at {}. Run 'cass index --full' first.",
+                    index_path.display()
+                ),
+                Some("Run 'cass index --full' to create the local archive and search index.".to_string()),
+            )
+        };
+        CliError {
+            code: 3,
+            kind: "missing-index",
+            message,
+            hint,
+            retryable: true,
+        }
     })?;
 
     if !client.has_tantivy() {
@@ -9566,6 +9648,9 @@ fn run_status(
         .unwrap_or(false);
 
     let db_available = db_opened || (db_exists && db_open_retryable);
+    let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
+    let not_initialized =
+        cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
     let healthy = db_exists
         && db_available
         && index_exists
@@ -9576,14 +9661,23 @@ fn run_status(
         "rebuilding"
     } else if healthy {
         "healthy"
+    } else if not_initialized {
+        "not_initialized"
     } else if db_exists && !db_available {
         "degraded"
     } else {
         "unhealthy"
     };
+    let explanation = if not_initialized {
+        Some(cass_not_initialized_explanation(&data_dir))
+    } else {
+        None
+    };
 
     let recommended_action = if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
+    } else if not_initialized {
+        Some(cass_not_initialized_recommended_action())
     } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
@@ -9617,6 +9711,8 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
+            "initialized": !not_initialized,
+            "explanation": explanation,
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "database": serde_json::json!({
                 "exists": db_exists,
@@ -9641,6 +9737,8 @@ fn run_status(
         "✓"
     } else if rebuild_active {
         "~"
+    } else if not_initialized {
+        "○"
     } else {
         "!"
     };
@@ -9648,6 +9746,8 @@ fn run_status(
         "Rebuilding"
     } else if healthy {
         "Healthy"
+    } else if not_initialized {
+        "Not initialized yet"
     } else {
         "Attention needed"
     };
@@ -9684,6 +9784,8 @@ fn run_status(
             println!("  Warning: index has 0 documents but database has messages");
             println!("  Run 'cass index --full' to populate the search index");
         }
+    } else if not_initialized {
+        println!("  Not created yet - run 'cass index --full' once");
     } else {
         println!("  Not found - run 'cass index --full'");
     }
@@ -9721,6 +9823,8 @@ fn run_status(
                 println!("  Error: {err}");
             }
         }
+    } else if not_initialized {
+        println!("  Not created yet");
     } else {
         println!("  Not found");
     }
@@ -9736,6 +9840,11 @@ fn run_status(
     if pending_sessions > 0 {
         println!();
         println!("Pending: {pending_sessions} sessions awaiting indexing");
+    }
+
+    if let Some(explanation) = &explanation {
+        println!();
+        println!("Why: {explanation}");
     }
 
     if let Some(action) = &recommended_action {
@@ -9808,12 +9917,29 @@ fn run_health(
         .unwrap_or(false);
 
     let db_degraded = db_exists && !db_opened;
+    let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
+    let not_initialized =
+        cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
     let healthy = db_exists
         && db_opened
         && index_exists
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages;
+    let explanation = if not_initialized {
+        Some(cass_not_initialized_explanation(&data_dir))
+    } else {
+        None
+    };
+    let recommended_action = if not_initialized {
+        Some(cass_not_initialized_recommended_action())
+    } else if db_degraded {
+        Some("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string())
+    } else if !healthy {
+        Some("Run 'cass index --full' to rebuild the index/database.".to_string())
+    } else {
+        None
+    };
 
     // Collect structured errors for the JSON response.
     let mut errors: Vec<String> = Vec::new();
@@ -9821,10 +9947,18 @@ fn run_health(
         errors.push(err.clone());
     }
     if !db_exists {
-        errors.push("database not found".to_string());
+        errors.push(if not_initialized {
+            "database not initialized yet".to_string()
+        } else {
+            "database not found".to_string()
+        });
     }
     if !index_exists {
-        errors.push("index not found".to_string());
+        errors.push(if not_initialized {
+            "index not initialized yet".to_string()
+        } else {
+            "index not found".to_string()
+        });
     }
     if !index_fresh {
         errors.push("index stale".to_string());
@@ -9841,6 +9975,8 @@ fn run_health(
         "rebuilding"
     } else if healthy {
         "healthy"
+    } else if not_initialized {
+        "not_initialized"
     } else if db_degraded {
         "degraded"
     } else {
@@ -9863,6 +9999,9 @@ fn run_health(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
+            "initialized": !not_initialized,
+            "explanation": explanation,
+            "recommended_action": recommended_action,
             "errors": errors,
             "latency_ms": latency_ms,
             "db": {
@@ -9888,6 +10027,14 @@ fn run_health(
     } else if rebuild_active {
         println!("~ Rebuilding ({latency_ms}ms)");
         println!("  - index rebuild is in progress");
+    } else if not_initialized {
+        println!("○ Not initialized yet ({latency_ms}ms)");
+        if let Some(explanation) = &explanation {
+            println!("  - {explanation}");
+        }
+        if let Some(action) = &recommended_action {
+            println!("  {action}");
+        }
     } else if db_degraded {
         println!("⚠ Degraded ({latency_ms}ms) - database exists but could not be opened");
         for err in &errors {
@@ -9916,6 +10063,14 @@ fn run_health(
             kind: "health",
             message: "Index rebuild is still in progress".to_string(),
             hint: Some("Wait for the active 'cass index' run to finish.".to_string()),
+            retryable: true,
+        })
+    } else if not_initialized {
+        Err(CliError {
+            code: 1,
+            kind: "health",
+            message: "cass has not been initialized in this data dir yet".to_string(),
+            hint: Some(cass_not_initialized_recommended_action()),
             retryable: true,
         })
     } else if db_degraded {
@@ -13609,7 +13764,10 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
         json!({
             "type": "object",
             "properties": {
+                "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "initialized": { "type": "boolean" },
+                "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
                 "index": {
                     "type": "object",
@@ -13956,7 +14114,15 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
         json!({
             "type": "object",
             "properties": {
+                "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "initialized": { "type": "boolean" },
+                "explanation": { "type": ["string", "null"] },
+                "recommended_action": { "type": ["string", "null"] },
+                "errors": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
                 "latency_ms": { "type": "integer" },
                 "state": {
                     "type": "object",
@@ -14489,6 +14655,8 @@ fn run_index_with_data(
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
+    progress_interval_ms: u64,
+    no_progress_events: bool,
 ) -> CliResult<()> {
     use frankensqlite::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
@@ -14639,6 +14807,48 @@ fn run_index_with_data(
 
     let start = Instant::now();
     let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
+
+    // Decide whether to emit NDJSON progress events on stderr (structured output only).
+    // Respect both the CLI flag and the CASS_INDEX_NO_PROGRESS_EVENTS env var.
+    let env_disabled = dotenvy::var("CASS_INDEX_NO_PROGRESS_EVENTS")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    let emit_progress_events = structured_output && !no_progress_events && !env_disabled;
+    // Clamp the user-supplied interval so callers can't DoS stderr or wait forever.
+    let progress_interval = Duration::from_millis(progress_interval_ms.clamp(250, 60_000));
+
+    let emit_event = |event: &str, payload: serde_json::Value| {
+        // NDJSON on stderr: one compact JSON object per line, stdout is untouched
+        // so pretty `--json` final payload consumers keep working.
+        if let Ok(s) = serde_json::to_string(&payload) {
+            eprintln!("{}", s);
+            let _ = event; // event name is already embedded in payload
+        }
+    };
+
+    if emit_progress_events {
+        let pid = std::process::id();
+        let started = serde_json::json!({
+            "event": "started",
+            "ts_ms": chrono::Utc::now().timestamp_millis(),
+            "pid": pid,
+            "mode": if full { "full" } else { "incremental" },
+            "full": full,
+            "force_rebuild": force_rebuild,
+            "watch": watch,
+            "semantic": semantic,
+            "build_hnsw": build_hnsw,
+            "embedder": embedder,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+            "progress_interval_ms": progress_interval.as_millis() as u64,
+            "hint": "Run `cass status --json` in another shell to inspect progress",
+        });
+        emit_event("started", started);
+    }
 
     // Run indexer in background thread so we can poll progress
     let opts_clone = opts.clone();
@@ -14818,8 +15028,59 @@ fn run_index_with_data(
 
             std::thread::sleep(Duration::from_millis(200));
         }
+    } else if emit_progress_events {
+        // Structured (--json / --robot / --robot-format ...) mode: emit NDJSON
+        // progress events on stderr so callers see forward progress without
+        // disturbing the single-payload JSON response on stdout.
+        use std::sync::atomic::Ordering;
+
+        let mut last_phase = usize::MAX;
+        let mut last_emit = std::time::Instant::now()
+            .checked_sub(progress_interval)
+            .unwrap_or_else(std::time::Instant::now);
+
+        // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
+        // `progress` event at `progress_interval`.
+        loop {
+            if index_handle.is_finished() {
+                break;
+            }
+
+            let phase_code = index_progress.phase.load(Ordering::Relaxed);
+            let elapsed_ms = start.elapsed().as_millis();
+
+            // Always emit on phase transitions, independent of the interval, so
+            // callers see "scanning -> indexing" immediately.
+            if phase_code != last_phase {
+                let mut payload = index_progress.snapshot_json(elapsed_ms);
+                if let serde_json::Value::Object(ref mut m) = payload {
+                    m.insert("event".into(), serde_json::json!("phase"));
+                    m.insert(
+                        "ts_ms".into(),
+                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
+                emit_event("phase", payload);
+                last_phase = phase_code;
+                last_emit = std::time::Instant::now();
+            } else if last_emit.elapsed() >= progress_interval {
+                let mut payload = index_progress.snapshot_json(elapsed_ms);
+                if let serde_json::Value::Object(ref mut m) = payload {
+                    m.insert("event".into(), serde_json::json!("progress"));
+                    m.insert(
+                        "ts_ms".into(),
+                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
+                emit_event("progress", payload);
+                last_emit = std::time::Instant::now();
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        }
     } else {
-        // No progress display (json mode or none): just wait for completion
+        // No progress display (json mode with events disabled, or plain=none):
+        // just wait for completion.
         while !index_handle.is_finished() {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -14875,6 +15136,17 @@ fn run_index_with_data(
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
+            }
+            if emit_progress_events {
+                let mut event = payload.clone();
+                if let serde_json::Value::Object(ref mut m) = event {
+                    m.insert("event".into(), serde_json::json!("error"));
+                    m.insert(
+                        "ts_ms".into(),
+                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
+                emit_event("error", event);
             }
             output_structured_value(payload, fmt)?;
         } else {
@@ -14940,6 +15212,18 @@ fn run_index_with_data(
             ) {
                 tracing::warn!("Failed to store idempotency key: {e}");
             }
+        }
+
+        if emit_progress_events {
+            let mut event = payload.clone();
+            if let serde_json::Value::Object(ref mut m) = event {
+                m.insert("event".into(), serde_json::json!("completed"));
+                m.insert(
+                    "ts_ms".into(),
+                    serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                );
+            }
+            emit_event("completed", event);
         }
 
         output_structured_value(payload, fmt)?;
@@ -22215,7 +22499,9 @@ fn run_sources_sync(
             "fastembed".to_string(),
             progress,
             output_format,
-            None, // idempotency_key
+            None,  // idempotency_key
+            2000,  // progress_interval_ms (default)
+            false, // no_progress_events
         )?;
     }
 
