@@ -1953,6 +1953,7 @@ fn status_missing_db_reports_not_initialized() {
         "Should not be healthy without db"
     );
     assert_eq!(json["index"]["exists"], Value::Bool(false));
+    assert_eq!(json["index"]["stale"], Value::Bool(false));
     assert!(
         !tmp.path().join("index").exists(),
         "status should not create an empty index dir while inspecting a fresh install"
@@ -2008,6 +2009,7 @@ fn status_empty_index_dir_without_meta_still_reports_not_initialized() {
     assert_eq!(json["status"], Value::String("not_initialized".to_string()));
     assert_eq!(json["initialized"], Value::Bool(false));
     assert_eq!(json["index"]["exists"], Value::Bool(false));
+    assert_eq!(json["index"]["stale"], Value::Bool(false));
     assert!(
         json["recommended_action"]
             .as_str()
@@ -2044,6 +2046,7 @@ fn health_missing_db_reports_not_initialized() {
     assert_eq!(json["initialized"], Value::Bool(false));
     assert_eq!(json["healthy"], Value::Bool(false));
     assert_eq!(json["state"]["index"]["exists"], Value::Bool(false));
+    assert_eq!(json["state"]["index"]["stale"], Value::Bool(false));
     assert!(
         !tmp.path().join("index").exists(),
         "health should not create an empty index dir while probing a fresh install"

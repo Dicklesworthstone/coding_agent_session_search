@@ -1421,13 +1421,19 @@ mod tests {
         // No agent specified → cass wrapper matches (permissive default).
         assert!(path_mapping_applies_to_agent(&filtered, None));
         // Agent matches the allow-list.
-        assert!(path_mapping_applies_to_agent(&filtered, Some("claude-code")));
+        assert!(path_mapping_applies_to_agent(
+            &filtered,
+            Some("claude-code")
+        ));
         // Agent not in the allow-list.
         assert!(!path_mapping_applies_to_agent(&filtered, Some("cursor")));
         // Hyphen/underscore normalization: `claude_code` must match the
         // allow-list entry `claude-code` because cass normalizes agent slugs
         // before comparison.
-        assert!(path_mapping_applies_to_agent(&filtered, Some("claude_code")));
+        assert!(path_mapping_applies_to_agent(
+            &filtered,
+            Some("claude_code")
+        ));
     }
 
     #[test]

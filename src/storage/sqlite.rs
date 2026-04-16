@@ -1632,22 +1632,33 @@ pub(crate) fn discover_historical_database_bundles(
     }
 
     fn bundle_health_rank(bundle: &HistoricalDatabaseBundle) -> i32 {
-        // An fts_messages sqlite_master row count of 0 or 1 is "clean":
-        //   0 = modern cass (V14+) drops fts_messages during migration and
-        //       recreates it lazily on first open; the virtual table is
-        //       unavailable until `ensure_search_fallback_fts_consistency` runs
-        //       but the bundle is otherwise healthy.
-        //   1 = pre-V14 cass left fts_messages in place after migration.
-        // Two or more rows means a duplicate/malformed CREATE VIRTUAL TABLE
-        // landed in sqlite_master (usually from a failed legacy rebuild), and
-        // the bundle shouldn't be preferred.
-        let fts_schema_rows_ok = matches!(bundle.probe.fts_schema_rows, Some(0 | 1));
-        // For ranking purposes "queryable OR lazy-creatable" both count as
-        // clean. The probe sets `fts_queryable = fts_schema_rows == 1 && <probe>`,
-        // so it will be false for the lazy-V14 case; treat that as clean too
-        // since the consistency pass will recreate the table on first use.
-        let fts_clean =
-            fts_schema_rows_ok && (bundle.probe.fts_queryable || bundle.probe.fts_schema_rows == Some(0));
+        // Classify FTS health. The probe only sets `fts_queryable = true`
+        // when `fts_schema_rows == Some(1)` (see
+        // `historical_bundle_fts_queryable_via_frankensqlite`), so we have
+        // two legitimate "clean" shapes for a bundle:
+        //
+        //   * `fts_schema_rows == Some(1) && fts_queryable` — a pre-V14
+        //     bundle where the FTS virtual table was eagerly created by
+        //     migration and is queryable right now.
+        //
+        //   * `fts_schema_rows == Some(0)` on a DB whose schema_version is
+        //     actually known — a modern (V14+) bundle where the migration
+        //     drops fts_messages on purpose and cass recreates it lazily via
+        //     `ensure_search_fallback_fts_consistency` on the first open.
+        //     We require a known `schema_version` here so a genuinely
+        //     corrupt / mid-migration DB (where `read_meta_schema_version`
+        //     failed and returned `None`) does not get falsely promoted
+        //     alongside legitimate lazy-FTS bundles.
+        //
+        // Everything else — `Some(1)` without queryability, `Some(n)` for
+        // n >= 2 (duplicated CREATE VIRTUAL TABLE rows from a broken legacy
+        // rebuild), `None` entirely, or `Some(0)` on a DB whose schema
+        // marker cannot be read — is not "fts clean".
+        let fts_clean = match bundle.probe.fts_schema_rows {
+            Some(1) => bundle.probe.fts_queryable,
+            Some(0) => bundle.probe.schema_version.is_some(),
+            _ => false,
+        };
 
         let clean_schema14_fts =
             bundle.probe.schema_version == Some(CURRENT_SCHEMA_VERSION) && fts_clean;

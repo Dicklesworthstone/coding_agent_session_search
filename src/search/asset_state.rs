@@ -512,7 +512,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let stale = if rebuilding {
         !exists || contract_mismatch
     } else {
-        !exists || age_stale || checkpoint_incomplete || contract_mismatch || fingerprint_mismatch
+        exists && (age_stale || checkpoint_incomplete || contract_mismatch || fingerprint_mismatch)
     };
     let fresh = exists && !stale && !rebuilding;
     let status = if rebuilding {
@@ -926,6 +926,35 @@ mod tests {
         assert_eq!(state.processed_conversations, None);
         assert_eq!(state.total_conversations, None);
         assert_eq!(state.indexed_docs, None);
+    }
+
+    #[test]
+    fn lexical_state_missing_index_is_not_marked_stale_until_initialized() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: None,
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+
+        assert_eq!(state.status, "missing");
+        assert!(!state.exists);
+        assert!(!state.stale);
+        assert!(!state.fresh);
+        assert_eq!(
+            state.status_reason.as_deref(),
+            Some("lexical Tantivy metadata missing")
+        );
     }
 
     #[test]

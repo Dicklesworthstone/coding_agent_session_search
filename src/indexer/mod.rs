@@ -566,15 +566,23 @@ impl Drop for RunIndexProgressReset {
 
 const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
 // Size of each SQL page fetched from the conversations table during a lexical
-// rebuild. Larger = fewer SQL round-trips and fewer OFFSET scans; the upper
-// bound is governed by:
-//   - Memory: a 1024-conv page × ~50 msg avg × ~6 KB/msg prepared = ~300 MB peak
-//     in the in-flight Vec before it's flushed to the Tantivy writer.
-//   - Checkpoint granularity: the `.lexical-rebuild-state.json` page_size must
-//     match the const on resume; changing this invalidates existing
-//     checkpoints and restarts the rebuild from 0. That's acceptable given the
-//     5–10× speedup this batch-size change unlocks.
+// rebuild. The page is a LIMIT+OFFSET window over the conversations table
+// materialized as lightweight `LexicalRebuildConversationRow` records
+// (~1 KB each — no message bodies at this stage). Inside the page we process
+// sub-chunks of `batch_fetch_conversation_limit` conversations at a time,
+// each of which triggers one batched message fetch (capped by
+// `CASS_TANTIVY_REBUILD_BATCH_FETCH_MESSAGE_BYTES`) and feeds the Tantivy
+// writer. Larger page sizes mean:
+//   - Fewer SQL round-trips and fewer OFFSET scans (OFFSET cost grows linearly
+//     with offset on SQLite's b-tree indexes).
+//   - Peak memory for the page itself is modest: 1024 × ~1 KB ≈ 1 MB. The
+//     real memory ceiling is the per-chunk batched-message-fetch budget
+//     (`BATCH_FETCH_MESSAGE_BYTES`, default 128 MB), not the page window.
 //   - SQL parameter limit: well below SQLite's 32k-param IN clause cap.
+// Changing this constant invalidates existing `.lexical-rebuild-state.json`
+// checkpoints (via `LexicalRebuildState::matches_run`) and restarts any
+// in-flight rebuild from offset 0. That's acceptable given the 5–10×
+// throughput gain this batch-size change unlocks.
 const LEXICAL_REBUILD_PAGE_SIZE: i64 = 1024;
 pub(crate) const LEXICAL_REBUILD_PAGE_SIZE_PUBLIC: i64 = LEXICAL_REBUILD_PAGE_SIZE;
 
@@ -1028,11 +1036,12 @@ fn lexical_rebuild_initial_batch_fetch_conversation_limit(default_limit: usize) 
     // Historically this returned a tiny "warmup" chunk (2 conversations) before
     // ramping to the steady-state `batch_fetch_conversation_limit`. On large
     // cold rebuilds (tens of thousands of conversations) that warmup is pure
-    // overhead: the 4-thread Tantivy writer starves for seconds on a
-    // 2-conversation first batch, and first-iteration latency isn't
-    // user-observable anyway (the real wall-clock signal is the total rebuild
-    // time). The default now matches the steady-state chunk size so the
-    // indexing threads ramp up immediately; operators can still override via
+    // overhead: the Tantivy writer pool (up to `CASS_MAX_WRITER_THREADS`
+    // threads) starves for seconds on a 2-conversation first batch, and
+    // first-iteration latency isn't user-observable anyway (the real
+    // wall-clock signal is the total rebuild time). The default now matches
+    // the steady-state chunk size so the indexing threads ramp up
+    // immediately; operators can still override via
     // `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS=N` on
     // memory-constrained hosts that want a gentler ramp.
     dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS")

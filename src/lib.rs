@@ -24136,18 +24136,24 @@ mod daemon_cli_config_tests {
 /// tests whose monomorphized parser depth can exceed the 2 MiB default test
 /// stack in debug builds. Lifting this out of any one test module so both
 /// `subcommand_robot_output_tests` and `pages_cli_flag_tests` can share it.
+///
+/// If `f` panics, the panic payload is resumed on the calling thread so the
+/// real assertion message and backtrace surface to the test runner instead of
+/// being replaced by a generic "child thread panicked" wrapper.
 #[cfg(test)]
 fn run_on_large_stack<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("cass-clap-parse-test".to_string())
         .stack_size(16 * 1024 * 1024)
         .spawn(f)
-        .expect("spawn large-stack test thread")
-        .join()
-        .expect("large-stack test thread panicked");
+        .expect("spawn large-stack test thread");
+    match handle.join() {
+        Ok(()) => {}
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[cfg(test)]
