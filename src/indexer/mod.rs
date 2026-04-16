@@ -889,6 +889,15 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
         .min(usize::try_from(page_size.max(1)).unwrap_or(usize::MAX))
 }
 
+fn lexical_rebuild_initial_batch_fetch_conversation_limit(default_limit: usize) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2)
+        .min(default_limit.max(1))
+}
+
 fn lexical_rebuild_batch_fetch_message_limit() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_MESSAGES")
         .ok()
@@ -4138,6 +4147,8 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut offset = rebuild_state.committed_offset;
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let batch_fetch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
+    let initial_batch_fetch_conversation_limit =
+        lexical_rebuild_initial_batch_fetch_conversation_limit(batch_fetch_conversation_limit);
     let batch_fetch_message_limit = lexical_rebuild_batch_fetch_message_limit();
     let batch_fetch_message_bytes_limit = lexical_rebuild_batch_fetch_message_bytes_limit();
     let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
@@ -4183,7 +4194,20 @@ pub(crate) fn rebuild_tantivy_from_db(
             break;
         }
 
-        for conv_chunk in batch.chunks(batch_fetch_conversation_limit) {
+        let mut batch_chunk_start = 0usize;
+        let mut current_batch_fetch_conversation_limit = if offset == rebuild_state.committed_offset
+            && processed_conversations == rebuild_state.processed_conversations
+        {
+            initial_batch_fetch_conversation_limit
+        } else {
+            batch_fetch_conversation_limit
+        };
+
+        while batch_chunk_start < batch.len() {
+            let batch_chunk_end = batch_chunk_start
+                .saturating_add(current_batch_fetch_conversation_limit)
+                .min(batch.len());
+            let conv_chunk = &batch[batch_chunk_start..batch_chunk_end];
             let mut conv_ids = Vec::with_capacity(conv_chunk.len());
             for conv in conv_chunk {
                 offset = offset.saturating_add(1);
@@ -4364,6 +4388,9 @@ pub(crate) fn rebuild_tantivy_from_db(
                 conversations_since_progress_persist = 0;
                 last_progress_persist = Instant::now();
             }
+
+            batch_chunk_start = batch_chunk_end;
+            current_batch_fetch_conversation_limit = batch_fetch_conversation_limit;
         }
         if should_commit_lexical_rebuild(
             conversations_since_commit,
@@ -11251,6 +11278,15 @@ mod tests {
             Duration::from_millis(1999),
             Duration::from_secs(2)
         ));
+    }
+
+    #[test]
+    fn initial_batch_fetch_limit_defaults_to_small_warmup_chunk() {
+        assert_eq!(
+            lexical_rebuild_initial_batch_fetch_conversation_limit(16),
+            2
+        );
+        assert_eq!(lexical_rebuild_initial_batch_fetch_conversation_limit(1), 1);
     }
 
     #[test]
