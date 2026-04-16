@@ -78,6 +78,11 @@ jobs:
           # Deterministic test execution
           RUST_TEST_THREADS: 1
           PROPTEST_CASES: 32  # Fixed seed count for property tests
+          # llvm-cov instrumentation balloons stack frames enough to overflow
+          # the default 2 MiB thread stack inside clap derive parsers
+          # (pages_cli_flag_tests). Bump to 16 MiB to match what cargo test
+          # uses natively for deeply nested generated code.
+          RUST_MIN_STACK: "16777216"
         run: |
           # Run with deterministic options and skip known flaky tests
           cargo llvm-cov --workspace --lib -j 1 \
