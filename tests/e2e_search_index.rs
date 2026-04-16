@@ -9,11 +9,16 @@
 //! Part of bead: coding_agent_session_search-0jt (TST.11)
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use chrono::{SecondsFormat, Utc};
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection as RusqliteConnection;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 #[macro_use]
 mod util;
@@ -28,17 +33,27 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_search_index", test_name)
 }
 
+fn codex_iso_timestamp(ts_millis: u64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp_millis(ts_millis as i64)
+        .expect("valid millis timestamp for codex fixture")
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &str, ts: u64) {
     let sessions = root.join(format!("sessions/{date_path}"));
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join(filename);
+    let workspace = root.to_string_lossy();
+    let meta_ts = codex_iso_timestamp(ts);
+    let user_ts = codex_iso_timestamp(ts + 1000);
+    let assistant_ts = codex_iso_timestamp(ts + 2000);
     // Trailing newline is critical for append_codex_session to work correctly
     let sample = format!(
-        r#"{{"type": "event_msg", "timestamp": {ts}, "payload": {{"type": "user_message", "message": "{content}"}}}}
-{{"type": "response_item", "timestamp": {}, "payload": {{"role": "assistant", "content": "{content}_response"}}}}
+        r#"{{"timestamp": "{meta_ts}", "type": "session_meta", "payload": {{"id": "{filename}", "cwd": "{workspace}", "cli_version": "0.42.0"}}}}
+{{"timestamp": "{user_ts}", "type": "response_item", "payload": {{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "{content}"}}]}}}}
+{{"timestamp": "{assistant_ts}", "type": "response_item", "payload": {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "{content}_response"}}]}}}}
 "#,
-        ts + 1000
     );
     fs::write(file, sample).unwrap();
 }
@@ -63,11 +78,68 @@ fn append_codex_session(file: &Path, content: &str, ts: u64) {
         .append(true)
         .open(file)
         .expect("open rollout for append");
+    let user_ts = codex_iso_timestamp(ts);
+    let assistant_ts = codex_iso_timestamp(ts + 1000);
     let sample = format!(
-        "{{\"type\": \"event_msg\", \"timestamp\": {ts}, \"payload\": {{\"type\": \"user_message\", \"message\": \"{content}\"}}}}\n{{\"type\": \"response_item\", \"timestamp\": {}, \"payload\": {{\"role\": \"assistant\", \"content\": \"{content}_response\"}}}}\n",
-        ts + 1000
+        "{{\"timestamp\": \"{user_ts}\", \"type\": \"response_item\", \"payload\": {{\"type\": \"message\", \"role\": \"user\", \"content\": [{{\"type\": \"input_text\", \"text\": \"{content}\"}}]}}}}\n{{\"timestamp\": \"{assistant_ts}\", \"type\": \"response_item\", \"payload\": {{\"type\": \"message\", \"role\": \"assistant\", \"content\": [{{\"type\": \"text\", \"text\": \"{content}_response\"}}]}}}}\n",
     );
     f.write_all(sample.as_bytes()).unwrap();
+}
+
+fn make_codex_session_with_turns(
+    root: &Path,
+    date_path: &str,
+    filename: &str,
+    common_token: &str,
+    unique_suffix: &str,
+    ts: u64,
+    turns: usize,
+) {
+    let sessions = root.join(format!("sessions/{date_path}"));
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join(filename);
+    let workspace = root.to_string_lossy();
+    let mut sample = String::new();
+    let meta_ts = codex_iso_timestamp(ts);
+    sample.push_str(&format!(
+        r#"{{"timestamp": "{meta_ts}", "type": "session_meta", "payload": {{"id": "{filename}", "cwd": "{workspace}", "cli_version": "0.42.0"}}}}
+"#
+    ));
+
+    for turn in 0..turns {
+        let turn_ts = ts + ((turn as u64) + 1) * 3_000;
+        let user_ts = codex_iso_timestamp(turn_ts);
+        let assistant_ts = codex_iso_timestamp(turn_ts + 1_000);
+        sample.push_str(&format!(
+            r#"{{"timestamp": "{user_ts}", "type": "response_item", "payload": {{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "{common_token} {unique_suffix} user_turn_{turn}"}}]}}}}
+{{"timestamp": "{assistant_ts}", "type": "response_item", "payload": {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "{common_token} {unique_suffix} assistant_turn_{turn}"}}]}}}}
+"#,
+        ));
+    }
+
+    fs::write(file, sample).unwrap();
+}
+
+fn make_bulk_codex_sessions(
+    root: &Path,
+    date_path: &str,
+    batch_prefix: &str,
+    common_token: &str,
+    start_ts: u64,
+    session_count: usize,
+    turns_per_session: usize,
+) {
+    for idx in 0..session_count {
+        make_codex_session_with_turns(
+            root,
+            date_path,
+            &format!("{batch_prefix}-{idx:03}.jsonl"),
+            common_token,
+            &format!("session_{idx:03}"),
+            start_ts + (idx as u64) * 50_000,
+            turns_per_session,
+        );
+    }
 }
 
 fn count_messages(db_path: &Path) -> i64 {
@@ -78,13 +150,33 @@ fn count_messages(db_path: &Path) -> i64 {
         .expect("count messages")
 }
 
+fn total_matches_from_search_output(output: &[u8]) -> u64 {
+    let json: serde_json::Value = serde_json::from_slice(output).expect("parse search json");
+    json.get("total_matches")
+        .and_then(|matches| matches.as_u64())
+        .unwrap_or_else(|| {
+            json.get("hits")
+                .and_then(|hits| hits.as_array())
+                .map(|hits| hits.len() as u64)
+                .unwrap_or(0)
+        })
+}
+
+#[derive(Debug, Default)]
+struct SearchLoopStats {
+    attempts: usize,
+    successes: usize,
+    max_duration_ms: u64,
+    failures: Vec<String>,
+}
+
 #[test]
 fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -285,6 +377,322 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     tracker.flush();
 }
 
+#[test]
+fn concurrent_search_processes_do_not_block_incremental_index_json() {
+    let tracker = tracker_for("concurrent_search_processes_do_not_block_incremental_index_json");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    tracker.phase(
+        "seed_initial_fixture",
+        "Create baseline session and full index",
+        || {
+            make_codex_session(
+                &codex_home,
+                "2024/11/20",
+                "rollout-baseline-lock-search.jsonl",
+                "baselinelockanchor",
+                1_732_118_400_000,
+            );
+
+            cargo_bin_cmd!("cass")
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(&home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", &home)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        },
+    );
+
+    tracker.phase(
+        "verify_baseline_search_fixture",
+        "Confirm the baseline lexical query is searchable before starting concurrent readers",
+        || {
+            let baseline_output = cargo_bin_cmd!("cass")
+                .args([
+                    "search",
+                    "baselinelockanchor",
+                    "--json",
+                    "--mode",
+                    "lexical",
+                    "--fields",
+                    "minimal",
+                    "--limit",
+                    "5",
+                    "--data-dir",
+                ])
+                .arg(&data_dir)
+                .current_dir(&home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", &home)
+                .timeout(Duration::from_secs(20))
+                .output()
+                .expect("baseline lexical search should run");
+            assert!(
+                baseline_output.status.success(),
+                "baseline lexical search should succeed before concurrency begins\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&baseline_output.stdout),
+                String::from_utf8_lossy(&baseline_output.stderr)
+            );
+            let baseline_json: serde_json::Value =
+                serde_json::from_slice(&baseline_output.stdout).expect("parse baseline search JSON");
+            let baseline_hits = baseline_json
+                .get("total_matches")
+                .and_then(|matches| matches.as_u64())
+                .unwrap_or_else(|| {
+                    baseline_json
+                        .get("hits")
+                        .and_then(|hits| hits.as_array())
+                        .map(|hits| hits.len() as u64)
+                        .unwrap_or(0)
+                });
+            assert!(
+                baseline_hits > 0,
+                "baseline lexical search fixture must be searchable before starting concurrent readers"
+            );
+        },
+    );
+
+    let stop_search = Arc::new(AtomicBool::new(false));
+    let index_running = Arc::new(AtomicBool::new(false));
+    let search_attempts_during_index = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    let search_home = home.clone();
+    let search_codex_home = codex_home.clone();
+    let search_data_dir = data_dir.clone();
+    let stop_search_worker = Arc::clone(&stop_search);
+    let index_running_worker = Arc::clone(&index_running);
+    let search_attempts_during_index_worker = Arc::clone(&search_attempts_during_index);
+
+    let search_handle = std::thread::spawn(move || {
+        let mut stats = SearchLoopStats::default();
+        let mut ready_sent = false;
+
+        loop {
+            if stop_search_worker.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if index_running_worker.load(Ordering::Relaxed) {
+                search_attempts_during_index_worker.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let search_start = Instant::now();
+            let output = cargo_bin_cmd!("cass")
+                .args([
+                    "search",
+                    "baselinelockanchor",
+                    "--json",
+                    "--mode",
+                    "lexical",
+                    "--fields",
+                    "minimal",
+                    "--limit",
+                    "5",
+                    "--data-dir",
+                ])
+                .arg(&search_data_dir)
+                .current_dir(&search_home)
+                .env("CODEX_HOME", &search_codex_home)
+                .env("HOME", &search_home)
+                .timeout(Duration::from_secs(20))
+                .output()
+                .expect("spawn concurrent cass search");
+            let elapsed_ms = search_start.elapsed().as_millis() as u64;
+            stats.attempts += 1;
+            stats.max_duration_ms = stats.max_duration_ms.max(elapsed_ms);
+
+            if output.status.success() {
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("parse concurrent search JSON");
+                let hit_count = parsed
+                    .get("total_matches")
+                    .and_then(|matches| matches.as_u64())
+                    .unwrap_or_else(|| {
+                        parsed
+                            .get("hits")
+                            .and_then(|hits| hits.as_array())
+                            .map(|hits| hits.len() as u64)
+                            .unwrap_or(0)
+                    });
+                if hit_count == 0 {
+                    stats.failures.push(format!(
+                        "concurrent search returned zero hits; stdout={}",
+                        String::from_utf8_lossy(&output.stdout)
+                    ));
+                } else {
+                    stats.successes += 1;
+                }
+            } else {
+                stats.failures.push(format!(
+                    "concurrent search failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
+            if !ready_sent {
+                ready_tx.send(()).ok();
+                ready_sent = true;
+            }
+
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        stats
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("concurrent search should start promptly");
+
+    tracker.phase(
+        "stage_incremental_fixture",
+        "Create a substantial incremental batch while searches continue",
+        || {
+            make_bulk_codex_sessions(
+                &codex_home,
+                "2024/11/21",
+                "rollout-incremental-lock-batch",
+                "incrementalloadanchor",
+                1_732_200_000_000,
+                40,
+                6,
+            );
+        },
+    );
+
+    let index_start = tracker.start(
+        "incremental_index_under_read_load",
+        Some("Run cass index --json while concurrent cass search processes read the same DB"),
+    );
+    index_running.store(true, Ordering::Relaxed);
+    let index_output = cargo_bin_cmd!("cass")
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .expect("run incremental index under concurrent search load");
+    index_running.store(false, Ordering::Relaxed);
+    let index_duration_ms = index_start.elapsed().as_millis() as u64;
+    tracker.end(
+        "incremental_index_under_read_load",
+        Some("Run cass index --json while concurrent cass search processes read the same DB"),
+        index_start,
+    );
+
+    stop_search.store(true, Ordering::Relaxed);
+    let search_stats = search_handle.join().expect("join concurrent search thread");
+
+    assert!(
+        index_output.status.success(),
+        "incremental index should succeed under concurrent search load\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&index_output.stdout),
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+    let index_json: serde_json::Value =
+        serde_json::from_slice(&index_output.stdout).expect("parse index json");
+    assert_eq!(
+        index_json.get("success").and_then(|v| v.as_bool()),
+        Some(true),
+        "index --json should report success"
+    );
+
+    assert!(
+        search_stats.failures.is_empty(),
+        "concurrent searches should not fail while index runs:\n{}",
+        search_stats.failures.join("\n---\n")
+    );
+    assert!(
+        search_stats.successes > 0,
+        "expected at least one successful concurrent search attempt"
+    );
+    assert!(
+        search_attempts_during_index.load(Ordering::Relaxed) > 0,
+        "expected real search overlap while index was running"
+    );
+
+    let after_messages = count_messages(&data_dir.join("agent_search.db")) as u64;
+    let expected_min_messages = 2 + (40_u64 * 6 * 2);
+    assert!(
+        after_messages >= expected_min_messages,
+        "incremental index should ingest the staged batch: expected at least {expected_min_messages} messages, got {after_messages}"
+    );
+
+    let verify_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "incrementalloadanchor",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("search for newly indexed batch");
+    assert!(
+        verify_search.status.success(),
+        "search for newly indexed batch should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verify_search.stdout),
+        String::from_utf8_lossy(&verify_search.stderr)
+    );
+    let verify_json: serde_json::Value =
+        serde_json::from_slice(&verify_search.stdout).expect("parse verification search JSON");
+    let verification_hits = verify_json
+        .get("total_matches")
+        .and_then(|matches| matches.as_u64())
+        .unwrap_or_else(|| {
+            verify_json
+                .get("hits")
+                .and_then(|hits| hits.as_array())
+                .map(|hits| hits.len() as u64)
+                .unwrap_or(0)
+        });
+    assert!(
+        verification_hits > 0,
+        "newly indexed batch should be searchable after concurrent index run"
+    );
+
+    tracker.metrics(
+        "concurrent_search_vs_index",
+        &E2ePerformanceMetrics::new()
+            .with_duration(index_duration_ms)
+            .with_custom("search_attempts", search_stats.attempts as u64)
+            .with_custom("search_successes", search_stats.successes as u64)
+            .with_custom(
+                "search_attempts_during_index",
+                search_attempts_during_index.load(Ordering::Relaxed) as u64,
+            )
+            .with_custom("max_search_duration_ms", search_stats.max_duration_ms)
+            .with_custom("messages_after_index", after_messages),
+    );
+    tracker.complete();
+}
+
 /// Test: Full index pipeline - index --full creates DB and index
 #[test]
 fn index_full_creates_artifacts() {
@@ -294,7 +702,7 @@ fn index_full_creates_artifacts() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
     verbose!("Created temp directory at {:?}", home);
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     verbose!("Data directory: {:?}", data_dir);
@@ -390,7 +798,7 @@ fn incremental_reindex_preserves_and_appends_messages() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -560,7 +968,7 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     let xdg_data = home.join(".local/share");
@@ -653,7 +1061,7 @@ fn search_returns_hits_with_match_type() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -731,7 +1139,7 @@ fn search_aggregations_include_agents() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let claude_home = home.join(".claude");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -814,7 +1222,7 @@ fn watch_once_indexes_specified_path() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -891,7 +1299,7 @@ fn search_with_filters() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -959,7 +1367,7 @@ fn search_returns_pagination_info() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -1034,7 +1442,7 @@ fn force_rebuild_recreates_index() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -1104,7 +1512,7 @@ fn index_json_output_mode() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -1211,7 +1619,7 @@ fn search_wildcard_query() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -1261,7 +1669,7 @@ fn trace_logging_to_file() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     let trace_dir = home.join("traces");
     fs::create_dir_all(&data_dir).unwrap();
@@ -1301,7 +1709,7 @@ fn empty_query_returns_recent() {
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
+    let codex_home = home.to_path_buf();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
@@ -1347,4 +1755,365 @@ fn empty_query_returns_recent() {
         !hits.is_empty(),
         "Empty query should return recent indexed conversations"
     );
+}
+
+#[test]
+fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
+    let tracker = tracker_for("large_message_minimal_search_stays_on_the_tantivy_fast_path");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    let large_content = format!(
+        "tantivy_large_anchor {}",
+        "overflowpayload ".repeat(180_000)
+    );
+
+    tracker.phase(
+        "seed_large_message_fixture",
+        "Create a real Codex rollout with a multi-megabyte message body",
+        || {
+            make_codex_session(
+                &codex_home,
+                "2024/11/22",
+                "rollout-large-tantivy-fast-path.jsonl",
+                &large_content,
+                1_732_300_000_000,
+            );
+        },
+    );
+
+    tracker.phase(
+        "index_large_message_fixture",
+        "Build the real index before searching the large message",
+        || {
+            cargo_bin_cmd!("cass")
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", home)
+                .timeout(Duration::from_secs(90))
+                .assert()
+                .success();
+        },
+    );
+
+    let search_started = tracker.start(
+        "search_large_message_minimal",
+        Some("Run a real lexical cass search against the multi-megabyte session"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "tantivy_large_anchor",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("search large indexed message");
+    tracker.end(
+        "search_large_message_minimal",
+        Some("Run a real lexical cass search against the multi-megabyte session"),
+        search_started,
+    );
+
+    assert!(
+        output.status.success(),
+        "large-message lexical search should stay healthy after indexing\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("large-message search JSON");
+    let hits = json
+        .get("total_matches")
+        .and_then(|matches| matches.as_u64())
+        .unwrap_or_else(|| {
+            json.get("hits")
+                .and_then(|hits| hits.as_array())
+                .map(|hits| hits.len() as u64)
+                .unwrap_or(0)
+        });
+    assert!(
+        hits > 0,
+        "large indexed message should remain searchable with minimal lexical fields"
+    );
+
+    tracker.flush();
+}
+
+#[test]
+fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_new_files() {
+    let tracker = tracker_for(
+        "incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_new_files",
+    );
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    tracker.phase(
+        "seed_baseline_archive",
+        "Create a real multi-session Codex archive and build the canonical DB plus lexical index",
+        || {
+            make_bulk_codex_sessions(
+                &codex_home,
+                "2024/11/23",
+                "rollout-repair-baseline",
+                "repairoldanchor",
+                1_732_400_000_000,
+                5,
+                4,
+            );
+
+            cargo_bin_cmd!("cass")
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(&home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", &home)
+                .timeout(Duration::from_secs(60))
+                .assert()
+                .success();
+        },
+    );
+
+    let db_path = data_dir.join("agent_search.db");
+    let baseline_messages = count_messages(&db_path) as u64;
+    assert!(
+        baseline_messages >= 40,
+        "baseline archive should populate the canonical DB with many messages"
+    );
+
+    tracker.phase(
+        "swap_in_sparse_real_tantivy_index",
+        "Replace the healthy lexical index with a real but sparse one built from a different archive",
+        || {
+            let sparse_home = home.join("sparse_home");
+            let sparse_codex_home = sparse_home.clone();
+            let sparse_data_dir = sparse_home.join("cass_data");
+            fs::create_dir_all(&sparse_data_dir).unwrap();
+
+            make_codex_session(
+                &sparse_codex_home,
+                "2024/11/23",
+                "rollout-sparse-replacement.jsonl",
+                "sparseanchoronly",
+                1_732_450_000_000,
+            );
+
+            cargo_bin_cmd!("cass")
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&sparse_data_dir)
+                .current_dir(&sparse_home)
+                .env("CODEX_HOME", &sparse_codex_home)
+                .env("HOME", &sparse_home)
+                .timeout(Duration::from_secs(60))
+                .assert()
+                .success();
+
+            let live_index = data_dir.join("index/v7");
+            let backup_index = data_dir.join("index/v7.baseline-backup");
+            let sparse_index = sparse_data_dir.join("index/v7");
+            fs::rename(&live_index, &backup_index).expect("move healthy index aside");
+            fs::rename(&sparse_index, &live_index)
+                .expect("replace healthy index with sparse real tantivy index");
+        },
+    );
+
+    let broken_sparse_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "repairoldanchor",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("search old token against intentionally sparse lexical index");
+    assert!(
+        broken_sparse_search.status.success(),
+        "search should still run even with a sparse lexical index\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&broken_sparse_search.stdout),
+        String::from_utf8_lossy(&broken_sparse_search.stderr)
+    );
+    assert_eq!(
+        total_matches_from_search_output(&broken_sparse_search.stdout),
+        0,
+        "the swapped-in sparse index should not contain the baseline token before repair"
+    );
+
+    tracker.phase(
+        "stage_new_incremental_session",
+        "Add a brand-new session after the sparse index swap so plain cass index must both repair and ingest",
+        || {
+            make_codex_session(
+                &codex_home,
+                "2024/11/24",
+                "rollout-repair-new-session.jsonl",
+                "repairnewanchor",
+                1_732_500_000_000,
+            );
+        },
+    );
+
+    let repair_started = tracker.start(
+        "repair_sparse_tantivy_then_incremental_scan",
+        Some("Run plain cass index --json and require canonical repair plus new-session ingestion"),
+    );
+    let repair_output = cargo_bin_cmd!("cass")
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .expect("run repairing incremental index");
+    let repair_duration_ms = repair_started.elapsed().as_millis() as u64;
+    tracker.end(
+        "repair_sparse_tantivy_then_incremental_scan",
+        Some("Run plain cass index --json and require canonical repair plus new-session ingestion"),
+        repair_started,
+    );
+
+    assert!(
+        repair_output.status.success(),
+        "plain index should repair the sparse Tantivy index and ingest new sessions\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repair_output.stdout),
+        String::from_utf8_lossy(&repair_output.stderr)
+    );
+
+    let repair_json: serde_json::Value =
+        serde_json::from_slice(&repair_output.stdout).expect("parse repair index json");
+    let repair_stats = repair_json
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+    assert_eq!(
+        repair_stats
+            .get("lexical_strategy")
+            .and_then(|value| value.as_str()),
+        Some("deferred_authoritative_db_rebuild")
+    );
+    assert_eq!(
+        repair_stats
+            .get("lexical_strategy_reason")
+            .and_then(|value| value.as_str()),
+        Some(
+            "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan"
+        )
+    );
+
+    let after_messages = count_messages(&db_path) as u64;
+    assert_eq!(
+        after_messages,
+        baseline_messages + 2,
+        "plain incremental index should still ingest the newly added session after repairing Tantivy"
+    );
+
+    let repaired_old_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "repairoldanchor",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("search repaired baseline token");
+    assert!(
+        repaired_old_search.status.success(),
+        "search should succeed after canonical lexical repair\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repaired_old_search.stdout),
+        String::from_utf8_lossy(&repaired_old_search.stderr)
+    );
+    assert!(
+        total_matches_from_search_output(&repaired_old_search.stdout) > 0,
+        "repair should restore baseline archive hits from the canonical DB"
+    );
+
+    let repaired_new_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            "repairnewanchor",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("search new incremental token after repair");
+    assert!(
+        repaired_new_search.status.success(),
+        "new incremental content should be searchable after the repair-first index run\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&repaired_new_search.stdout),
+        String::from_utf8_lossy(&repaired_new_search.stderr)
+    );
+    assert!(
+        total_matches_from_search_output(&repaired_new_search.stdout) > 0,
+        "repair-first incremental index should still ingest the newly added session"
+    );
+
+    tracker.metrics(
+        "repair_sparse_tantivy_then_incremental_scan",
+        &E2ePerformanceMetrics::new()
+            .with_duration(repair_duration_ms)
+            .with_custom("baseline_messages", baseline_messages)
+            .with_custom("messages_after_repair", after_messages),
+    );
+    tracker.flush();
 }

@@ -16487,17 +16487,18 @@ mod tests {
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let generation_rows: Vec<String> = reopened
+            .raw()
+            .query_map_collect(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_FRANKEN_REBUILD_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
         assert_eq!(
-            reopened
-                .raw()
-                .query_row_map(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                    fparams![],
-                    |row| row.get_typed::<i64>(0),
-                )
-                .unwrap(),
-            2,
-            "canonical open should not eagerly repair derived FTS artifacts"
+            generation_rows.len(),
+            0,
+            "canonical open should not eagerly rewrite FTS repair metadata"
         );
         reopened.ensure_search_fallback_fts_consistency().unwrap();
         let repaired = rusqlite::Connection::open(&db_path).unwrap();

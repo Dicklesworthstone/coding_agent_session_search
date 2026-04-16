@@ -2894,11 +2894,11 @@ impl SearchClient {
                 }
                 return Ok(paged_hits);
             }
-            // If Tantivy yields 0 results, we can optionally fall back to SQLite FTS
-            // if we suspect consistency issues, but for now let's trust Tantivy
-            // or fall through if you prefer robust fallback.
-            // Given the "speed first" requirement, we return early if we got hits.
-            // If empty, we *can* try SQLite just in case index is lagging.
+            tracing::debug!(
+                query = sanitized,
+                "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+            );
+            return Ok(Vec::new());
         }
 
         // Skip SQLite fallback when the query contains leading/internal wildcards that
@@ -8440,6 +8440,119 @@ mod tests {
         assert_eq!(hits[0].workspace, "/legacy");
         assert_eq!(hits[0].line_number, Some(5));
         assert_eq!(hits[0].content, "legacy auth token failure");
+        Ok(())
+    }
+
+    #[test]
+    fn tantivy_reader_skips_sqlite_fallback_on_empty_lexical_results() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+        index.commit()?;
+        let reader = fs_cass_open_search_reader(dir.path(), ReloadPolicy::Manual).ok();
+        assert!(
+            reader.is_some(),
+            "test fixture should open a Tantivy reader even with an empty index"
+        );
+
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/sqlite-only')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, 1, 'local', NULL, 'sqlite fallback only', '/tmp/sqlite-only.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(1, 1, 0, 'sqliteonlytoken overflow candidate', 42)",
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                1_i64,
+                "sqliteonlytoken overflow candidate",
+                "sqlite fallback only",
+                "codex",
+                "/sqlite-only",
+                "/tmp/sqlite-only.jsonl",
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let sqlite_hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "sqliteonlytoken",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(
+            sqlite_hits.len(),
+            1,
+            "fixture should prove sqlite fallback would have produced a hit"
+        );
+
+        let tantivy_authoritative_hits = client.search(
+            "sqliteonlytoken",
+            SearchFilters::default(),
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(
+            tantivy_authoritative_hits.is_empty(),
+            "a live Tantivy reader should prevent sqlite fallback from populating empty lexical results"
+        );
         Ok(())
     }
 

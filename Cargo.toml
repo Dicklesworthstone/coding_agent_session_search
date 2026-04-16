@@ -70,7 +70,7 @@ memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fa186910", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "ba9c598", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "546724a4c41f2b77dd9375e8e4b1f4bb1fdbf634", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -188,11 +188,11 @@ strip = false
 # commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
-# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
-# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-# [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
-# franken-agent-detection = { path = "../franken_agent_detection" }
+[patch."https://github.com/Dicklesworthstone/frankensqlite"]
+fsqlite = { path = "../frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+[patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
+franken-agent-detection = { path = "../franken_agent_detection" }
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation

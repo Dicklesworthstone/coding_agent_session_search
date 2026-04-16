@@ -669,6 +669,20 @@ impl LexicalRebuildState {
     fn is_incomplete(&self) -> bool {
         !self.completed
     }
+
+    fn reported_processed_conversations(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.processed_conversations)
+            .unwrap_or(self.processed_conversations)
+    }
+
+    fn reported_indexed_docs(&self) -> usize {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.indexed_docs)
+            .unwrap_or(self.indexed_docs)
+    }
 }
 
 fn acquire_index_run_lock(
@@ -957,6 +971,58 @@ fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     Ok(usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncrementalCanonicalLexicalRepairPlan {
+    canonical_messages: usize,
+    observed_tantivy_docs: Option<usize>,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncrementalCanonicalLexicalRepairContext {
+    full_refresh: bool,
+    force_rebuild: bool,
+    resume_lexical_rebuild: bool,
+    targeted_watch_once_only: bool,
+    salvage_messages_imported: usize,
+    canonical_messages: usize,
+    tantivy_requires_rebuild: bool,
+    observed_tantivy_docs: Option<usize>,
+}
+
+fn choose_incremental_canonical_lexical_repair_plan(
+    context: IncrementalCanonicalLexicalRepairContext,
+) -> Option<IncrementalCanonicalLexicalRepairPlan> {
+    if context.full_refresh
+        || context.force_rebuild
+        || context.resume_lexical_rebuild
+        || context.targeted_watch_once_only
+        || context.salvage_messages_imported > 0
+        || context.canonical_messages == 0
+    {
+        return None;
+    }
+
+    if context.tantivy_requires_rebuild {
+        return Some(IncrementalCanonicalLexicalRepairPlan {
+            canonical_messages: context.canonical_messages,
+            observed_tantivy_docs: context.observed_tantivy_docs,
+            reason: "incremental_index_repairs_missing_or_invalid_tantivy_from_authoritative_canonical_db_before_scan",
+        });
+    }
+
+    let observed_tantivy_docs = context.observed_tantivy_docs?;
+    if observed_tantivy_docs < context.canonical_messages {
+        return Some(IncrementalCanonicalLexicalRepairPlan {
+            canonical_messages: context.canonical_messages,
+            observed_tantivy_docs: Some(observed_tantivy_docs),
+            reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+        });
+    }
+
+    None
+}
+
 fn should_salvage_historical_databases(
     storage_rebuilt: bool,
     canonical_sessions_before_salvage: usize,
@@ -1081,8 +1147,8 @@ pub(crate) fn load_lexical_rebuild_checkpoint(
         total_conversations: state.db.total_conversations,
         storage_fingerprint: state.db.storage_fingerprint,
         committed_offset: state.committed_offset,
-        processed_conversations: state.processed_conversations,
-        indexed_docs: state.indexed_docs,
+        processed_conversations: state.reported_processed_conversations(),
+        indexed_docs: state.reported_indexed_docs(),
         schema_hash: state.schema_hash,
         page_size: state.page_size,
         completed: state.completed,
@@ -1169,8 +1235,8 @@ pub(crate) fn load_lexical_rebuild_snapshot(
         total_conversations: state.db.total_conversations,
         storage_fingerprint: state.db.storage_fingerprint,
         committed_offset: state.committed_offset,
-        processed_conversations: state.processed_conversations,
-        indexed_docs: state.indexed_docs,
+        processed_conversations: state.reported_processed_conversations(),
+        indexed_docs: state.reported_indexed_docs(),
         completed: state.completed,
         updated_at_ms: state.updated_at_ms,
     }))
@@ -2436,27 +2502,32 @@ pub fn run_index(
             .unwrap_or(false);
 
     // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
-    let mut needs_rebuild = storage_rebuilt
-        || opts.force_rebuild
-        || !index_path.join("meta.json").exists()
-        || !schema_matches;
+    let meta_path = index_path.join("meta.json");
+    let mut tantivy_requires_rebuild = opts.force_rebuild || !meta_path.exists() || !schema_matches;
+    let mut observed_tantivy_docs = None;
 
     // Preflight open: if the cass-compatible Tantivy reader can't open, force a
     // rebuild so we do a full scan and reindex messages into the new index
     // (SQLite is incremental-only by default).
-    if !needs_rebuild
-        && let Err(e) = frankensearch::lexical::cass_open_search_reader(
+    if !tantivy_requires_rebuild {
+        match frankensearch::lexical::cass_open_search_reader(
             &index_path,
             frankensearch::lexical::ReloadPolicy::Manual,
-        )
-    {
-        tracing::warn!(
-            error = %e,
-            path = %index_path.display(),
-            "tantivy open preflight failed; forcing rebuild"
-        );
-        needs_rebuild = true;
+        ) {
+            Ok((reader, _fields)) => {
+                observed_tantivy_docs = Some(reader.searcher().num_docs() as usize);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %index_path.display(),
+                    "tantivy open preflight failed; forcing rebuild"
+                );
+                tantivy_requires_rebuild = true;
+            }
+        }
     }
+    let mut needs_rebuild = storage_rebuilt || tantivy_requires_rebuild;
 
     if needs_rebuild && let Some(p) = &opts.progress {
         p.is_rebuilding.store(true, Ordering::Relaxed);
@@ -2641,6 +2712,23 @@ pub fn run_index(
         }
         let rebuild_from_canonical_only =
             canonical_only_full_rebuild && historical_salvage.conversations_imported == 0;
+        let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0 {
+            let canonical_messages = count_total_messages_exact(&storage)?;
+            choose_incremental_canonical_lexical_repair_plan(
+                IncrementalCanonicalLexicalRepairContext {
+                    full_refresh: opts.full,
+                    force_rebuild: opts.force_rebuild,
+                    resume_lexical_rebuild,
+                    targeted_watch_once_only,
+                    salvage_messages_imported: historical_salvage.messages_imported,
+                    canonical_messages,
+                    tantivy_requires_rebuild,
+                    observed_tantivy_docs,
+                },
+            )
+        } else {
+            None
+        };
 
         if historical_salvage.conversations_imported > 0
             || (opts.full && !rebuild_from_canonical_only)
@@ -2691,6 +2779,44 @@ pub fn run_index(
             }
             t_index = TantivyIndex::open_or_create(&index_path)?;
         } else {
+            if let Some(repair_plan) = incremental_canonical_lexical_repair {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    canonical_conversations = canonical_sessions_before_salvage,
+                    canonical_messages = repair_plan.canonical_messages,
+                    observed_tantivy_docs = repair_plan.observed_tantivy_docs,
+                    reason = repair_plan.reason,
+                    "repairing Tantivy from the authoritative canonical database before incremental source scan"
+                );
+                record_lexical_population_strategy(
+                    opts.progress.as_ref(),
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    repair_plan.reason,
+                );
+                tracing::info!(
+                    strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild.as_str(),
+                    reason = repair_plan.reason,
+                    "selected_lexical_population_strategy"
+                );
+
+                drop(t_index);
+                let rebuild_convs = count_total_conversations_exact(&storage)?;
+                let rebuild_docs = rebuild_tantivy_from_db(
+                    &opts.db_path,
+                    &opts.data_dir,
+                    rebuild_convs,
+                    opts.progress.clone(),
+                )?;
+                if let Some(p) = &opts.progress
+                    && let Ok(mut stats) = p.stats.lock()
+                {
+                    stats.total_conversations = rebuild_convs;
+                    stats.total_messages = rebuild_docs;
+                }
+                t_index = TantivyIndex::open_or_create(&index_path)?;
+                needs_rebuild = false;
+            }
+
             if targeted_watch_once_only {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -2703,7 +2829,7 @@ pub fn run_index(
                         opts.full,
                         historical_salvage.messages_imported,
                     );
-                record_lexical_population_strategy(
+                record_lexical_population_strategy_if_unset(
                     opts.progress.as_ref(),
                     lexical_strategy,
                     lexical_strategy_reason,
@@ -6669,6 +6795,72 @@ pub mod persist {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                     "historical_salvage_imported_messages_require_authoritative_db_rebuild",
                 )
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_prefers_authoritative_db_for_invalid_tantivy()
+        {
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: true,
+                        observed_tantivy_docs: None,
+                    },
+                ),
+                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
+                    canonical_messages: 42,
+                    observed_tantivy_docs: None,
+                    reason: "incremental_index_repairs_missing_or_invalid_tantivy_from_authoritative_canonical_db_before_scan",
+                })
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_prefers_authoritative_db_for_sparse_tantivy() {
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(3),
+                    },
+                ),
+                Some(crate::indexer::IncrementalCanonicalLexicalRepairPlan {
+                    canonical_messages: 42,
+                    observed_tantivy_docs: Some(3),
+                    reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+                })
+            );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_plan_stays_incremental_when_tantivy_covers_db() {
+            assert_eq!(
+                crate::indexer::choose_incremental_canonical_lexical_repair_plan(
+                    crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: false,
+                        force_rebuild: false,
+                        resume_lexical_rebuild: false,
+                        targeted_watch_once_only: false,
+                        salvage_messages_imported: 0,
+                        canonical_messages: 42,
+                        tantivy_requires_rebuild: false,
+                        observed_tantivy_docs: Some(42),
+                    },
+                ),
+                None
             );
         }
 
