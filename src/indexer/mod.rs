@@ -376,14 +376,18 @@ pub struct IndexingProgress {
 }
 
 impl IndexingProgress {
-    /// Human-readable label for the current phase.
-    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing.
-    pub fn phase_label(&self) -> &'static str {
-        match self.phase.load(Ordering::Relaxed) {
+    fn phase_label_for(phase: usize) -> &'static str {
+        match phase {
             1 => "scanning",
             2 => "indexing",
             _ => "preparing",
         }
+    }
+
+    /// Human-readable label for the current phase.
+    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing.
+    pub fn phase_label(&self) -> &'static str {
+        Self::phase_label_for(self.phase.load(Ordering::Relaxed))
     }
 
     /// Capture a JSON snapshot of the current progress state, suitable for
@@ -419,7 +423,7 @@ impl IndexingProgress {
         };
 
         serde_json::json!({
-            "phase": match phase { 1 => "scanning", 2 => "indexing", _ => "preparing" },
+            "phase": Self::phase_label_for(phase),
             "phase_code": phase,
             "total": total,
             "current": current,
@@ -561,7 +565,17 @@ impl Drop for RunIndexProgressReset {
 }
 
 const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
-const LEXICAL_REBUILD_PAGE_SIZE: i64 = 200;
+// Size of each SQL page fetched from the conversations table during a lexical
+// rebuild. Larger = fewer SQL round-trips and fewer OFFSET scans; the upper
+// bound is governed by:
+//   - Memory: a 1024-conv page × ~50 msg avg × ~6 KB/msg prepared = ~300 MB peak
+//     in the in-flight Vec before it's flushed to the Tantivy writer.
+//   - Checkpoint granularity: the `.lexical-rebuild-state.json` page_size must
+//     match the const on resume; changing this invalidates existing
+//     checkpoints and restarts the rebuild from 0. That's acceptable given the
+//     5–10× speedup this batch-size change unlocks.
+//   - SQL parameter limit: well below SQLite's 32k-param IN clause cap.
+const LEXICAL_REBUILD_PAGE_SIZE: i64 = 1024;
 pub(crate) const LEXICAL_REBUILD_PAGE_SIZE_PUBLIC: i64 = LEXICAL_REBUILD_PAGE_SIZE;
 
 #[derive(Debug)]
@@ -574,6 +588,7 @@ struct IndexRunLockGuard {
     db_path: PathBuf,
     job_id: String,
     job_kind: SearchMaintenanceJobKind,
+    metadata_write_lock: Arc<Mutex<()>>,
 }
 
 impl Drop for IndexRunLockGuard {
@@ -587,6 +602,10 @@ impl Drop for IndexRunLockGuard {
 
 impl IndexRunLockGuard {
     fn write_metadata(&mut self, mode: SearchMaintenanceMode) -> Result<()> {
+        let _write_guard = self
+            .metadata_write_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))?;
         self.updated_at_ms = FrankenStorage::now_millis();
         self.file.set_len(0).with_context(|| {
             format!(
@@ -630,7 +649,7 @@ struct IndexRunLockHeartbeat {
 }
 
 impl IndexRunLockHeartbeat {
-    fn start(data_dir: PathBuf, interval: Duration) -> Self {
+    fn start(data_dir: PathBuf, interval: Duration, metadata_write_lock: Arc<Mutex<()>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let join = thread::spawn(move || {
@@ -639,7 +658,9 @@ impl IndexRunLockHeartbeat {
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(err) = heartbeat_index_run_lock(&data_dir) {
+                if let Err(err) =
+                    heartbeat_index_run_lock_with_lock(&data_dir, Some(&metadata_write_lock))
+                {
                     tracing::debug!(
                         error = %err,
                         path = %data_dir.display(),
@@ -665,7 +686,16 @@ impl Drop for IndexRunLockHeartbeat {
     }
 }
 
-fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
+fn heartbeat_index_run_lock_with_lock(
+    data_dir: &Path,
+    metadata_write_lock: Option<&Arc<Mutex<()>>>,
+) -> Result<()> {
+    let _write_guard = metadata_write_lock
+        .map(|lock| {
+            lock.lock()
+                .map_err(|_| anyhow::anyhow!("index-run metadata write lock poisoned"))
+        })
+        .transpose()?;
     let lock_path = data_dir.join("index-run.lock");
     let existing = match fs::read_to_string(&lock_path) {
         Ok(contents) if !contents.is_empty() => contents,
@@ -699,6 +729,11 @@ fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
 
     fs::write(&lock_path, refreshed)
         .with_context(|| format!("writing index-run lock heartbeat {}", lock_path.display()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
+    heartbeat_index_run_lock_with_lock(data_dir, None)
 }
 
 fn index_run_lock_heartbeat_interval() -> Duration {
@@ -907,6 +942,7 @@ fn acquire_index_run_lock(
         db_path: db_path.to_path_buf(),
         job_id: String::new(),
         job_kind: maintenance_job_kind_for_mode(mode),
+        metadata_write_lock: Arc::new(Mutex::new(())),
     };
     guard.job_id = format!(
         "{}-{}-{}",
@@ -974,21 +1010,37 @@ fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
 }
 
 fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
+    // Each chunk within a page is the unit of SQL message-fetch batching and
+    // Tantivy writer feeding. On a multi-core box with the default 4-thread
+    // Tantivy writer, chunks of 512 conversations keep the writer threads
+    // saturated without blowing the configured per-thread heap (128 MB × 4).
+    // Capped at `page_size` so we never try to fetch beyond what's been paged
+    // from the conversations table.
     dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(128)
+        .unwrap_or(512)
         .min(usize::try_from(page_size.max(1)).unwrap_or(usize::MAX))
 }
 
 fn lexical_rebuild_initial_batch_fetch_conversation_limit(default_limit: usize) -> usize {
+    // Historically this returned a tiny "warmup" chunk (2 conversations) before
+    // ramping to the steady-state `batch_fetch_conversation_limit`. On large
+    // cold rebuilds (tens of thousands of conversations) that warmup is pure
+    // overhead: the 4-thread Tantivy writer starves for seconds on a
+    // 2-conversation first batch, and first-iteration latency isn't
+    // user-observable anyway (the real wall-clock signal is the total rebuild
+    // time). The default now matches the steady-state chunk size so the
+    // indexing threads ramp up immediately; operators can still override via
+    // `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS=N` on
+    // memory-constrained hosts that want a gentler ramp.
     dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(32)
-        .min(default_limit.max(1))
+        .map(|value| value.min(default_limit.max(1)))
+        .unwrap_or_else(|| default_limit.max(1))
 }
 
 fn lexical_rebuild_batch_fetch_message_limit() -> usize {
@@ -2730,8 +2782,11 @@ pub fn run_index(
     };
     let mut index_run_lock =
         acquire_index_run_lock(&opts.data_dir, &opts.db_path, initial_lock_mode)?;
-    let _index_run_lock_heartbeat =
-        IndexRunLockHeartbeat::start(opts.data_dir.clone(), index_run_lock_heartbeat_interval());
+    let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
+        opts.data_dir.clone(),
+        index_run_lock_heartbeat_interval(),
+        Arc::clone(&index_run_lock.metadata_write_lock),
+    );
 
     let (storage, storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
@@ -3883,10 +3938,17 @@ fn open_storage_for_index(
                 backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
                 "storage schema incompatible; rebuilt database before indexing"
             );
-            let storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-                db_path,
-                Duration::from_secs(10),
-            )?;
+            // `open_or_rebuild` has already backed up and `remove_database_files`'d
+            // the incompatible DB before returning `RebuildRequired`, so the path
+            // no longer exists. Use `FrankenStorage::open` (which creates +
+            // migrates a fresh DB) rather than `open_franken_storage_with_timeout`
+            // (which bails on missing-file).
+            let storage = FrankenStorage::open(db_path).with_context(|| {
+                format!(
+                    "opening fresh frankensqlite db after schema rebuild at {}",
+                    db_path.display()
+                )
+            })?;
             Ok((storage, true, true))
         }
         Err(err) if allow_full_recovery => {
@@ -3916,10 +3978,14 @@ fn open_storage_for_index(
                     "backed up canonical db after full-rebuild open failure"
                 );
             }
-            let storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-                db_path,
-                Duration::from_secs(10),
-            )?;
+            // Same rationale as the `RebuildRequired` branch: we just removed
+            // the DB, so we need `FrankenStorage::open` to create+migrate it.
+            let storage = FrankenStorage::open(db_path).with_context(|| {
+                format!(
+                    "opening fresh frankensqlite db after full-rebuild recovery at {}",
+                    db_path.display()
+                )
+            })?;
             Ok((storage, true, true))
         }
         Err(err) => Err(anyhow::anyhow!(
@@ -7968,6 +8034,46 @@ mod tests {
         assert!(updated_at_ms >= 222);
     }
 
+    #[test]
+    fn heartbeat_index_run_lock_waits_for_shared_metadata_write_lock() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        let metadata_write_lock = Arc::clone(&guard.metadata_write_lock);
+        let held_lock = metadata_write_lock
+            .lock()
+            .expect("hold metadata write lock");
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let finished_flag = Arc::clone(&finished);
+        let data_dir = tmp.path().to_path_buf();
+        let metadata_write_lock_for_thread = Arc::clone(&metadata_write_lock);
+
+        let handle = thread::spawn(move || {
+            started_flag.store(true, Ordering::SeqCst);
+            heartbeat_index_run_lock_with_lock(&data_dir, Some(&metadata_write_lock_for_thread))
+                .expect("heartbeat refresh with shared lock");
+            finished_flag.store(true, Ordering::SeqCst);
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "heartbeat must wait for the shared metadata write lock before rewriting the lock file"
+        );
+
+        drop(held_lock);
+        handle.join().expect("heartbeat thread should join cleanly");
+        assert!(finished.load(Ordering::SeqCst));
+        drop(guard);
+    }
+
     #[derive(Clone, Default)]
     struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -8563,6 +8669,16 @@ mod tests {
             }
             _ => panic!("expected second message to be a batch"),
         }
+    }
+
+    #[test]
+    fn snapshot_json_phase_label_matches_phase_code_sample() {
+        let progress = IndexingProgress::default();
+        progress.phase.store(2, Ordering::Relaxed);
+        let snapshot = progress.snapshot_json(2500);
+
+        assert_eq!(snapshot["phase_code"], serde_json::json!(2));
+        assert_eq!(snapshot["phase"], serde_json::json!("indexing"));
     }
 
     #[test]
@@ -9568,7 +9684,7 @@ mod tests {
             "expected batched chunk log, got:\n{logs}"
         );
         assert!(
-            logs.contains("page_size=200"),
+            logs.contains("page_size=1024"),
             "expected page_size in logs, got:\n{logs}"
         );
         assert!(
@@ -9612,7 +9728,7 @@ mod tests {
             "expected fallback warning log, got:\n{logs}"
         );
         assert!(
-            logs.contains("page_size=200"),
+            logs.contains("page_size=1024"),
             "expected page_size in logs, got:\n{logs}"
         );
         assert!(
@@ -11361,12 +11477,31 @@ mod tests {
     }
 
     #[test]
-    fn initial_batch_fetch_limit_defaults_to_small_warmup_chunk() {
+    fn initial_batch_fetch_limit_defaults_to_steady_state_chunk_size() {
+        // The initial chunk now matches the steady-state chunk size so the
+        // Tantivy writer threads don't starve on a 2-conversation first batch.
+        // Operators can still request a gentler ramp via
+        // `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS`.
         assert_eq!(
             lexical_rebuild_initial_batch_fetch_conversation_limit(16),
-            2
+            16,
+            "initial chunk should match the steady-state default_limit"
         );
-        assert_eq!(lexical_rebuild_initial_batch_fetch_conversation_limit(1), 1);
+        assert_eq!(
+            lexical_rebuild_initial_batch_fetch_conversation_limit(128),
+            128,
+            "initial chunk should match the steady-state default_limit"
+        );
+        assert_eq!(
+            lexical_rebuild_initial_batch_fetch_conversation_limit(1),
+            1,
+            "clamp to default_limit when it is the smaller value"
+        );
+        assert_eq!(
+            lexical_rebuild_initial_batch_fetch_conversation_limit(0),
+            1,
+            "never return 0 even if default_limit degenerates to 0"
+        );
     }
 
     #[test]
