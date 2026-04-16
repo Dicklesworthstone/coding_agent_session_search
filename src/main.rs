@@ -4,6 +4,10 @@ fn is_robot_mode_args() -> bool {
 }
 
 fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
+    if err.was_already_reported() {
+        std::process::exit(err.code);
+    }
+
     // If the message looks like JSON, output it directly (it's a pre-formatted robot error).
     // Also enforce JSON if robot mode flags were detected in raw args.
     if err.message.trim().starts_with('{') {

@@ -1579,6 +1579,8 @@ pub struct CliError {
     pub retryable: bool,
 }
 
+const CLI_ERROR_ALREADY_REPORTED_SENTINEL: &str = "__cass_error_already_reported__";
+
 pub type CliResult<T = ()> = std::result::Result<T, CliError>;
 
 impl std::fmt::Display for CliError {
@@ -1590,6 +1592,30 @@ impl std::fmt::Display for CliError {
 impl std::error::Error for CliError {}
 
 impl CliError {
+    pub fn already_reported(code: i32, kind: &'static str, retryable: bool) -> Self {
+        CliError {
+            code,
+            kind,
+            message: CLI_ERROR_ALREADY_REPORTED_SENTINEL.to_string(),
+            hint: None,
+            retryable,
+        }
+    }
+
+    pub fn already_reported_from(err: &CliError) -> Self {
+        CliError {
+            code: err.code,
+            kind: err.kind,
+            message: CLI_ERROR_ALREADY_REPORTED_SENTINEL.to_string(),
+            hint: err.hint.clone(),
+            retryable: err.retryable,
+        }
+    }
+
+    pub fn was_already_reported(&self) -> bool {
+        self.message == CLI_ERROR_ALREADY_REPORTED_SENTINEL
+    }
+
     fn usage(message: impl Into<String>, hint: Option<String>) -> Self {
         CliError {
             code: 2,
@@ -5262,7 +5288,7 @@ fn state_meta_json(
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
-    let assets = crate::search::asset_state::inspect_search_assets(
+    let mut assets = crate::search::asset_state::inspect_search_assets(
         crate::search::asset_state::InspectSearchAssetsInput {
             data_dir,
             db_path,
@@ -5331,6 +5357,20 @@ fn state_meta_json(
             },
         }
     });
+    let not_initialized = cass_not_initialized(db_exists, lexical_index_initialized, assets.lexical.rebuilding);
+    if not_initialized {
+        assets.semantic.status = "not_initialized";
+        assets.semantic.availability = "not_initialized";
+        assets.semantic.summary =
+            "semantic search is optional and has not been initialized yet".to_string();
+        assets.semantic.available = false;
+        assets.semantic.can_search = false;
+        assets.semantic.fallback_mode = Some("lexical");
+        assets.semantic.hint = Some(
+            "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical."
+                .to_string(),
+        );
+    }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
 
