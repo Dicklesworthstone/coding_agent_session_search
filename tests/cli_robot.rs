@@ -1982,6 +1982,10 @@ fn status_missing_db_reports_not_initialized() {
             .contains("optional"),
         "fresh installs should not surface semantic model absence as a failure: {json}"
     );
+    assert_eq!(json["semantic"]["embedder_id"], Value::Null);
+    assert_eq!(json["semantic"]["vector_index_path"], Value::Null);
+    assert_eq!(json["semantic"]["model_dir"], Value::Null);
+    assert_eq!(json["semantic"]["hnsw_path"], Value::Null);
 }
 
 #[test]
@@ -2071,6 +2075,10 @@ fn health_missing_db_reports_not_initialized() {
         json["state"]["semantic"]["status"],
         Value::String("not_initialized".to_string())
     );
+    assert_eq!(json["state"]["semantic"]["embedder_id"], Value::Null);
+    assert_eq!(json["state"]["semantic"]["vector_index_path"], Value::Null);
+    assert_eq!(json["state"]["semantic"]["model_dir"], Value::Null);
+    assert_eq!(json["state"]["semantic"]["hnsw_path"], Value::Null);
 }
 
 #[test]
