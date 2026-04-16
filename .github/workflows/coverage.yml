@@ -39,7 +39,12 @@ jobs:
   coverage:
     name: Test Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # llvm-cov instrumented tests take noticeably longer than plain `cargo
+    # test` (2-3x). Previously the job short-circuited at the compile step
+    # so 30 min sufficed; now it gets through compile + ~3500 tests, which
+    # can push past 30 min on a cold cache. Match CI's `test-rust` matrix
+    # timeout (45 min) for safety.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
