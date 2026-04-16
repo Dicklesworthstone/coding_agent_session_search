@@ -759,6 +759,24 @@ fn lexical_rebuild_commit_interval_message_bytes() -> usize {
         .unwrap_or(64 * 1024 * 1024)
 }
 
+fn lexical_rebuild_progress_heartbeat_interval_conversations() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(250)
+}
+
+fn lexical_rebuild_progress_heartbeat_interval() -> Duration {
+    Duration::from_millis(
+        dotenvy::var("CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_000),
+    )
+}
+
 fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS")
         .ok()
@@ -889,6 +907,23 @@ fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
     }
 }
 
+fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
+    match frankensearch::lexical::cass_open_search_reader(
+        index_path,
+        frankensearch::lexical::ReloadPolicy::Manual,
+    ) {
+        Ok((reader, _fields)) => Ok(Some(reader.searcher().num_docs() as usize)),
+        Err(err) => {
+            tracing::debug!(
+                path = %index_path.display(),
+                error = %err,
+                "live Tantivy reader unavailable while refreshing lexical checkpoint"
+            );
+            Ok(None)
+        }
+    }
+}
+
 fn pending_commit_landed(
     base_meta_fingerprint: Option<&str>,
     current_meta_fingerprint: Option<&str>,
@@ -919,6 +954,33 @@ fn reconcile_pending_lexical_commit(
     }
     persist_lexical_rebuild_state(index_path, &state)?;
     Ok(state)
+}
+
+fn persist_pending_lexical_rebuild_progress(
+    index_path: &Path,
+    state: &mut LexicalRebuildState,
+    next_offset: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+) -> Result<()> {
+    let base_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    let already_recorded = state.pending.as_ref().is_some_and(|pending| {
+        pending.next_offset == next_offset
+            && pending.processed_conversations == processed_conversations
+            && pending.indexed_docs == indexed_docs
+            && pending.base_meta_fingerprint == base_meta_fingerprint
+    });
+    if already_recorded {
+        return Ok(());
+    }
+
+    state.record_pending_commit(
+        next_offset,
+        processed_conversations,
+        indexed_docs,
+        base_meta_fingerprint,
+    );
+    persist_lexical_rebuild_state(index_path, state)
 }
 
 fn metadata_stamp(path: &Path) -> Result<(u64, i64)> {
@@ -1166,25 +1228,55 @@ fn refresh_completed_lexical_rebuild_checkpoint(
     data_dir: &Path,
 ) -> Result<()> {
     let index_path = index_dir(data_dir)?;
-    let Some(mut state) = load_lexical_rebuild_state(&index_path)? else {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    let total_messages = count_total_messages_exact(storage)?;
+    let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)? else {
         return Ok(());
     };
-
-    if !state.completed
-        || state.version != LEXICAL_REBUILD_STATE_VERSION
-        || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
-        || state.page_size != LEXICAL_REBUILD_PAGE_SIZE
-        || state.db.db_path != db_path.to_string_lossy()
-    {
+    if observed_tantivy_docs != total_messages {
+        tracing::debug!(
+            path = %index_path.display(),
+            observed_tantivy_docs,
+            canonical_messages = total_messages,
+            "skipping lexical checkpoint refresh because the live Tantivy index does not match the canonical message count"
+        );
         return Ok(());
     }
 
-    let total_conversations = count_total_conversations_exact(storage)?;
-    state.db.total_conversations = total_conversations;
-    state.db.storage_fingerprint = lexical_rebuild_storage_fingerprint(db_path)?;
+    let refreshed_db_state = lexical_rebuild_db_state(storage, db_path)?;
+    let db_path_string = db_path.to_string_lossy().into_owned();
+    let mut state = match load_lexical_rebuild_state(&index_path)? {
+        Some(state)
+            if state.version == LEXICAL_REBUILD_STATE_VERSION
+                && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
+                && state.page_size == LEXICAL_REBUILD_PAGE_SIZE
+                && state.db.db_path == db_path_string =>
+        {
+            state
+        }
+        Some(state) => {
+            tracing::info!(
+                path = %index_path.display(),
+                existing_db_path = %state.db.db_path,
+                existing_completed = state.completed,
+                "replacing stale lexical rebuild checkpoint from the live Tantivy index"
+            );
+            LexicalRebuildState::new(refreshed_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        }
+        None => {
+            tracing::info!(
+                path = %index_path.display(),
+                total_conversations,
+                total_messages,
+                "bootstrapping missing lexical rebuild checkpoint from the live Tantivy index"
+            );
+            LexicalRebuildState::new(refreshed_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+        }
+    };
+    state.db = refreshed_db_state;
     state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     state.processed_conversations = total_conversations;
-    state.indexed_docs = count_total_messages_exact(storage)?;
+    state.indexed_docs = total_messages;
     state.pending = None;
     state.completed = true;
     state.committed_meta_fingerprint = index_meta_fingerprint(&index_path)?;
@@ -2779,6 +2871,8 @@ pub fn run_index(
             }
             t_index = TantivyIndex::open_or_create(&index_path)?;
         } else {
+            let followup_scan_after_authoritative_repair =
+                incremental_canonical_lexical_repair.is_some();
             if let Some(repair_plan) = incremental_canonical_lexical_repair {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
@@ -2834,14 +2928,25 @@ pub fn run_index(
                     lexical_strategy,
                     lexical_strategy_reason,
                 );
-                tracing::info!(
-                    strategy = lexical_strategy.as_str(),
-                    reason = lexical_strategy_reason,
-                    full = opts.full,
-                    needs_rebuild,
-                    salvage_messages_imported = historical_salvage.messages_imported,
-                    "selected_lexical_population_strategy"
-                );
+                if followup_scan_after_authoritative_repair {
+                    tracing::info!(
+                        strategy = lexical_strategy.as_str(),
+                        reason = lexical_strategy_reason,
+                        full = opts.full,
+                        needs_rebuild,
+                        salvage_messages_imported = historical_salvage.messages_imported,
+                        "selected_followup_scan_lexical_strategy_after_authoritative_repair"
+                    );
+                } else {
+                    tracing::info!(
+                        strategy = lexical_strategy.as_str(),
+                        reason = lexical_strategy_reason,
+                        full = opts.full,
+                        needs_rebuild,
+                        salvage_messages_imported = historical_salvage.messages_imported,
+                        "selected_lexical_population_strategy"
+                    );
+                }
 
                 // Get last scan timestamp for incremental indexing.
                 // If full rebuild or force_rebuild, scan everything (since_ts = None).
@@ -3899,24 +4004,29 @@ pub(crate) fn rebuild_tantivy_from_db(
     let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
     let commit_interval_messages = lexical_rebuild_commit_interval_messages();
     let commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
+    let progress_heartbeat_interval_conversations =
+        lexical_rebuild_progress_heartbeat_interval_conversations();
+    let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
     let mut indexed_docs = rebuild_state.indexed_docs;
     let mut processed_conversations = rebuild_state.processed_conversations;
     let mut conversations_since_commit = 0usize;
     let mut messages_since_commit = 0usize;
     let mut message_bytes_since_commit = 0usize;
+    let mut conversations_since_progress_heartbeat = 0usize;
+    let mut last_progress_heartbeat = Instant::now();
     let commit_rebuild_progress = |offset: i64,
                                    processed_conversations: usize,
                                    indexed_docs: usize,
                                    rebuild_state: &mut LexicalRebuildState,
                                    t_index: &mut TantivyIndex|
      -> Result<()> {
-        rebuild_state.record_pending_commit(
+        persist_pending_lexical_rebuild_progress(
+            &index_path,
+            rebuild_state,
             offset,
             processed_conversations,
             indexed_docs,
-            index_meta_fingerprint(&index_path)?,
-        );
-        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
+        )?;
         t_index.commit()?;
         rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
         persist_lexical_rebuild_state(&index_path, rebuild_state)?;
@@ -4063,14 +4173,15 @@ pub(crate) fn rebuild_tantivy_from_db(
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if should_commit_lexical_rebuild(
+                let should_commit_now = should_commit_lexical_rebuild(
                     conversations_since_commit,
                     messages_since_commit,
                     message_bytes_since_commit,
                     commit_interval_conversations,
                     commit_interval_messages,
                     commit_interval_message_bytes,
-                ) {
+                );
+                if should_commit_now {
                     commit_rebuild_progress(
                         offset,
                         processed_conversations,
@@ -4081,6 +4192,25 @@ pub(crate) fn rebuild_tantivy_from_db(
                     conversations_since_commit = 0;
                     messages_since_commit = 0;
                     message_bytes_since_commit = 0;
+                    conversations_since_progress_heartbeat = 0;
+                    last_progress_heartbeat = Instant::now();
+                } else {
+                    conversations_since_progress_heartbeat =
+                        conversations_since_progress_heartbeat.saturating_add(1);
+                    if conversations_since_progress_heartbeat
+                        >= progress_heartbeat_interval_conversations
+                        || last_progress_heartbeat.elapsed() >= progress_heartbeat_interval
+                    {
+                        persist_pending_lexical_rebuild_progress(
+                            &index_path,
+                            &mut rebuild_state,
+                            offset,
+                            processed_conversations,
+                            indexed_docs,
+                        )?;
+                        conversations_since_progress_heartbeat = 0;
+                        last_progress_heartbeat = Instant::now();
+                    }
                 }
             }
 
@@ -4095,6 +4225,22 @@ pub(crate) fn rebuild_tantivy_from_db(
                     chunk_message_bytes_limit = batch_fetch_message_bytes_limit,
                     "lexical rebuild processed a batched message fetch chunk"
                 );
+            }
+
+            if conversations_since_commit > 0
+                && (conversations_since_progress_heartbeat
+                    >= progress_heartbeat_interval_conversations
+                    || last_progress_heartbeat.elapsed() >= progress_heartbeat_interval)
+            {
+                persist_pending_lexical_rebuild_progress(
+                    &index_path,
+                    &mut rebuild_state,
+                    offset,
+                    processed_conversations,
+                    indexed_docs,
+                )?;
+                conversations_since_progress_heartbeat = 0;
+                last_progress_heartbeat = Instant::now();
             }
         }
         if should_commit_lexical_rebuild(
@@ -4115,6 +4261,8 @@ pub(crate) fn rebuild_tantivy_from_db(
             conversations_since_commit = 0;
             messages_since_commit = 0;
             message_bytes_since_commit = 0;
+            conversations_since_progress_heartbeat = 0;
+            last_progress_heartbeat = Instant::now();
         }
     }
 
