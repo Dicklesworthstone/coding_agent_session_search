@@ -2574,11 +2574,11 @@ Update check state is stored in the data directory:
 | Dependency | Pinned revision |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | `6d046a5f` |
-| `franken-agent-detection` | `546724a4` |
-| `asupersync` | `08dd31df` |
-| `frankensearch` | `fa186910` |
-| `frankentui` | `7a91089` |
-| `toon` (`tru`) | `bc3f9da` |
+| `franken-agent-detection` | `f4f9061f` |
+| `asupersync` | `2028c111` |
+| `frankensearch` | `ca1f07b4` |
+| `frankentui` | `2d25a03d` |
+| `toon` (`tru`) | `5669b72a` |
 
 **Build-time validation**
 - `build.rs` validates the active local overrides against the expected package name, package version, patch path, and Cargo feature/default-features contract.

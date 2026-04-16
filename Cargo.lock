@@ -154,7 +154,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43d5b281e737544384e969a5ccad3f1cdd24b48086a0fc1b2a5262a26b8f4f4a"
 dependencies = [
  "anstyle",
- "anstyle-parse",
+ "anstyle-parse 0.2.7",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse 1.0.0",
  "anstyle-query",
  "anstyle-wincon",
  "colorchoice",
@@ -178,12 +193,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
 name = "anstyle-query"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -194,7 +218,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -365,7 +389,7 @@ name = "asupersync"
 version = "0.2.9"
 source = "git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df#08dd31df78ef3ba513954358862da8c7df459a92"
 dependencies = [
- "asupersync-macros",
+ "asupersync-macros 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "base64 0.22.1",
  "bincode-next",
  "crossbeam-deque",
@@ -384,6 +408,50 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "polling",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "signal-hook 0.3.18",
+ "slab",
+ "smallvec",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "asupersync"
+version = "0.2.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111#2028c111aaec541f882d452872e22f4185b8e95b"
+dependencies = [
+ "asupersync-macros 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "base64 0.22.1",
+ "bincode-next",
+ "crossbeam-deque",
+ "crossbeam-queue",
+ "franken-decision 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "franken-evidence 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "franken-kernel 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "futures-lite",
+ "getrandom 0.4.2",
+ "hashbrown 0.15.5",
+ "hmac",
+ "js-sys",
+ "libc",
+ "memchr",
+ "nix 0.31.2",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "prost",
  "ring",
  "rmp-serde",
  "rustls",
@@ -413,6 +481,16 @@ dependencies = [
 name = "asupersync-macros"
 version = "0.2.9"
 source = "git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df#08dd31df78ef3ba513954358862da8c7df459a92"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "asupersync-macros"
+version = "0.2.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111#2028c111aaec541f882d452872e22f4185b8e95b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -887,9 +965,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.5.60"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2797f34da339ce31042b27d23607e051786132987f595b02ba4f6a6dffb7030a"
+checksum = "1ddb117e43bbf7dacf0a4190fef4d345b9bad68dfc649cb349e7d17d28428e51"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -897,11 +975,11 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.60"
+version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24a241312cea5059b13574bb9b3861cabf758b879c15190b37b6d6fd63ab6876"
+checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
 dependencies = [
- "anstream",
+ "anstream 1.0.0",
  "anstyle",
  "clap_lex",
  "strsim",
@@ -912,18 +990,18 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.5.66"
+version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c757a3b7e39161a4e56f9365141ada2a6c915a8622c408ab6bb4b5d047371031"
+checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "clap_derive"
-version = "4.5.55"
+version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a92793da1a46a5f2a02a6f4c46c6496b28c43638adea8306fcb0caa1634f24e5"
+checksum = "f2ce8604710f6733aa641a2b3731eaa1e8b3d9973d5e3565da11800813f997a9"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -965,7 +1043,7 @@ dependencies = [
  "argon2",
  "arrayvec",
  "assert_cmd",
- "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
+ "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
  "base64 0.22.1",
  "blake3",
  "bloomfilter",
@@ -1073,7 +1151,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1604,7 +1682,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1700,7 +1778,7 @@ version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2daee4ea451f429a58296525ddf28b45a3b64f1acf6587e2067437bb11e218d"
 dependencies = [
- "anstream",
+ "anstream 0.6.21",
  "anstyle",
  "env_filter",
  "jiff",
@@ -1740,7 +1818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1980,6 +2058,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-decision"
+version = "0.2.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111#2028c111aaec541f882d452872e22f4185b8e95b"
+dependencies = [
+ "franken-evidence 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "franken-kernel 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111)",
+ "serde",
+]
+
+[[package]]
 name = "franken-evidence"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1999,6 +2087,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-evidence"
+version = "0.2.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111#2028c111aaec541f882d452872e22f4185b8e95b"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "franken-kernel"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2011,6 +2108,14 @@ dependencies = [
 name = "franken-kernel"
 version = "0.2.9"
 source = "git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df#08dd31df78ef3ba513954358862da8c7df459a92"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "franken-kernel"
+version = "0.2.9"
+source = "git+https://github.com/Dicklesworthstone/asupersync?rev=2028c111#2028c111aaec541f882d452872e22f4185b8e95b"
 dependencies = [
  "serde",
 ]
@@ -2441,8 +2546,8 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2456,8 +2561,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2465,8 +2570,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2474,13 +2579,14 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ahash",
  "arc-swap",
  "bitflags 2.11.0",
  "crossterm",
+ "libc",
  "signal-hook 0.4.3",
  "unicode-display-width",
  "unicode-segmentation",
@@ -2490,8 +2596,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2509,13 +2615,13 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 
 [[package]]
 name = "ftui-layout"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2525,8 +2631,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -2540,8 +2646,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2560,8 +2666,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2571,8 +2677,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2589,8 +2695,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2602,8 +2708,8 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/frankentui?rev=7a91089#7a91089366bd4644e086d5a422cb76b052e3de17"
+version = "0.3.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=2d25a03d#2d25a03dd453c4384287df2271dc8fdcf3247c06"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -4187,7 +4293,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4804,7 +4910,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5517,6 +5623,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.13.0",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6017,7 +6146,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6466,7 +6595,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6789,7 +6918,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7171,9 +7300,9 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.3.22"
+version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
  "matchers",
  "nu-ansi-term",
@@ -7192,8 +7321,8 @@ dependencies = [
 
 [[package]]
 name = "tru"
-version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/toon_rust?rev=bc3f9da#bc3f9daaa3546f8722ca4163d7500886c58a69d8"
+version = "0.2.2"
+source = "git+https://github.com/Dicklesworthstone/toon_rust?rev=5669b72a#5669b72a7d72ce36e23906a1a1178b6ae4bca28c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7798,7 +7927,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

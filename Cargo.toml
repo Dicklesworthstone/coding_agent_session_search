@@ -14,7 +14,7 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "08dd31df", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "2028c111", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
@@ -23,7 +23,7 @@ console = "*"
 colored = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
-toon = { version = "*", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "bc3f9da", package = "tru" }
+toon = { version = "*", git = "https://github.com/Dicklesworthstone/toon_rust", rev = "5669b72a", package = "tru" }
 tempfile = "*"
 rmp-serde = "*"  # MessagePack for binary metadata serialization (Opt 3.1)
 toml = "*"
@@ -44,10 +44,10 @@ regex = "*"
 portable-pty = "*"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
-ftui = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
-ftui-runtime = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089" }
-ftui-extras = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "7a91089", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+ftui = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d" }
+ftui-runtime = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d" }
+ftui-extras = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "*"
 walkdir = "*"
 glob = "*"
@@ -69,8 +69,8 @@ half = { version = "*", features = ["bytemuck"] }
 memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
-frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "fa186910", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "546724a4c41f2b77dd9375e8e4b1f4bb1fdbf634", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "ca1f07b4", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
+franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "f4f9061fcab3bc0148058a55f0df0ae6e7ba477d", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -164,12 +164,13 @@ inherits = "release"
 debug = true
 strip = false
 
-# TODO: Unify the asupersync version bifurcation.  The lockfile currently has
-# two copies of asupersync 0.2.9 (crates.io for frankensqlite, git for cass).
-# Uncommenting the patches below requires that the local asupersync AND
-# frankensqlite checkouts are mutually compatible.  As of 2026-04-08 the local
-# asupersync HEAD (55501ebb) has VtabModuleFactory API changes that the local
-# frankensqlite (74200d98) has not yet adopted.  Once frankensqlite is updated:
+# TODO: Unify the asupersync version split. The lockfile currently carries
+# three copies of asupersync 0.2.9:
+# - crates.io via frankensqlite
+# - git `08dd31df` via frankensearch
+# - git `2028c111` via cass directly
+# Keep the optional asupersync [patch] block disabled until the sibling repos
+# are validated together against the release lockfile and CI matrix.
 # [patch."https://github.com/Dicklesworthstone/asupersync"]
 # asupersync = { path = "../asupersync" }
 # franken-decision = { path = "../asupersync/franken_decision" }
