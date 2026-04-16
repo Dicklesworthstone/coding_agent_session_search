@@ -292,6 +292,46 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub db_available: bool,
 }
 
+const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedLexicalStorageFingerprint {
+    db_len: u64,
+    db_mtime_ms: i64,
+    wal_len: u64,
+    wal_mtime_ms: i64,
+}
+
+fn parse_lexical_storage_fingerprint(raw: &str) -> Option<ParsedLexicalStorageFingerprint> {
+    let mut parts = raw.split(':');
+    Some(ParsedLexicalStorageFingerprint {
+        db_len: parts.next()?.parse().ok()?,
+        db_mtime_ms: parts.next()?.parse().ok()?,
+        wal_len: parts.next()?.parse().ok()?,
+        wal_mtime_ms: parts.next()?.parse().ok()?,
+    })
+    .filter(|_| parts.next().is_none())
+}
+
+fn lexical_storage_fingerprints_match(current: &str, saved: &str) -> bool {
+    match (
+        parse_lexical_storage_fingerprint(current),
+        parse_lexical_storage_fingerprint(saved),
+    ) {
+        (Some(current), Some(saved)) => {
+            current.db_len == saved.db_len
+                && current.wal_len == saved.wal_len
+                && current.db_mtime_ms.abs_diff(saved.db_mtime_ms)
+                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
+                        .unwrap_or(u64::MAX)
+                && current.wal_mtime_ms.abs_diff(saved.wal_mtime_ms)
+                    <= u64::try_from(LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS)
+                        .unwrap_or(u64::MAX)
+        }
+        _ => current == saved,
+    }
+}
+
 pub(crate) fn inspect_search_assets(
     input: InspectSearchAssetsInput<'_>,
 ) -> Result<SearchAssetSnapshot> {
@@ -442,7 +482,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         checkpoint.map(|state| state.page_size == LEXICAL_REBUILD_PAGE_SIZE_PUBLIC);
     let checkpoint_fingerprint = checkpoint.map(|state| state.storage_fingerprint.as_str());
     let fingerprint_matches = match (current_db_fingerprint, checkpoint_fingerprint) {
-        (Some(current), Some(saved)) => Some(current == saved),
+        (Some(current), Some(saved)) => Some(lexical_storage_fingerprints_match(current, saved)),
         _ => None,
     };
     let checkpoint_incomplete = checkpoint.is_some_and(|state| !state.completed);
@@ -812,6 +852,22 @@ mod tests {
         assert!(post.len() > 0, "live-owner metadata must not be truncated");
 
         let _ = FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn lexical_storage_fingerprint_matching_tolerates_small_mtime_settle_jitter() {
+        assert!(lexical_storage_fingerprints_match(
+            "323584:1776310228000:329632:1776310227824",
+            "323584:1776310227832:329632:1776310227824",
+        ));
+    }
+
+    #[test]
+    fn lexical_storage_fingerprint_matching_rejects_real_size_drift() {
+        assert!(!lexical_storage_fingerprints_match(
+            "323584:1776310228000:329632:1776310227824",
+            "323584:1776310227832:400000:1776310227824",
+        ));
     }
 
     #[test]

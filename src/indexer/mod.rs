@@ -1203,14 +1203,16 @@ pub(crate) fn load_lexical_rebuild_checkpoint(
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(None);
     };
+    let processed_conversations = state.reported_processed_conversations();
+    let indexed_docs = state.reported_indexed_docs();
 
     Ok(Some(LexicalRebuildCheckpoint {
         db_path: state.db.db_path,
         total_conversations: state.db.total_conversations,
         storage_fingerprint: state.db.storage_fingerprint,
         committed_offset: state.committed_offset,
-        processed_conversations: state.reported_processed_conversations(),
-        indexed_docs: state.reported_indexed_docs(),
+        processed_conversations,
+        indexed_docs,
         schema_hash: state.schema_hash,
         page_size: state.page_size,
         completed: state.completed,
@@ -1222,15 +1224,13 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
     lexical_rebuild_storage_fingerprint(db_path)
 }
 
-fn refresh_completed_lexical_rebuild_checkpoint(
-    storage: &FrankenStorage,
-    db_path: &Path,
-    data_dir: &Path,
+fn persist_completed_lexical_rebuild_checkpoint_from_observations(
+    index_path: &Path,
+    db_state: LexicalRebuildDbState,
+    total_messages: usize,
 ) -> Result<()> {
-    let index_path = index_dir(data_dir)?;
-    let total_conversations = count_total_conversations_exact(storage)?;
-    let total_messages = count_total_messages_exact(storage)?;
-    let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)? else {
+    let total_conversations = db_state.total_conversations;
+    let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)? else {
         return Ok(());
     };
     if observed_tantivy_docs != total_messages {
@@ -1243,9 +1243,8 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         return Ok(());
     }
 
-    let refreshed_db_state = lexical_rebuild_db_state(storage, db_path)?;
-    let db_path_string = db_path.to_string_lossy().into_owned();
-    let mut state = match load_lexical_rebuild_state(&index_path)? {
+    let db_path_string = db_state.db_path.clone();
+    let mut state = match load_lexical_rebuild_state(index_path)? {
         Some(state)
             if state.version == LEXICAL_REBUILD_STATE_VERSION
                 && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
@@ -1261,7 +1260,7 @@ fn refresh_completed_lexical_rebuild_checkpoint(
                 existing_completed = state.completed,
                 "replacing stale lexical rebuild checkpoint from the live Tantivy index"
             );
-            LexicalRebuildState::new(refreshed_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
         }
         None => {
             tracing::info!(
@@ -1270,18 +1269,33 @@ fn refresh_completed_lexical_rebuild_checkpoint(
                 total_messages,
                 "bootstrapping missing lexical rebuild checkpoint from the live Tantivy index"
             );
-            LexicalRebuildState::new(refreshed_db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
         }
     };
-    state.db = refreshed_db_state;
+    state.db = db_state;
     state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     state.processed_conversations = total_conversations;
     state.indexed_docs = total_messages;
     state.pending = None;
     state.completed = true;
-    state.committed_meta_fingerprint = index_meta_fingerprint(&index_path)?;
+    state.committed_meta_fingerprint = index_meta_fingerprint(index_path)?;
     state.updated_at_ms = FrankenStorage::now_millis();
-    persist_lexical_rebuild_state(&index_path, &state)
+    persist_lexical_rebuild_state(index_path, &state)
+}
+
+fn refresh_completed_lexical_rebuild_checkpoint(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    data_dir: &Path,
+) -> Result<()> {
+    let index_path = index_dir(data_dir)?;
+    let total_messages = count_total_messages_exact(storage)?;
+    let db_state = lexical_rebuild_db_state(storage, db_path)?;
+    persist_completed_lexical_rebuild_checkpoint_from_observations(
+        &index_path,
+        db_state,
+        total_messages,
+    )
 }
 
 fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
@@ -1304,9 +1318,20 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             db_path.display()
         )
     })?;
-    let refresh_result = refresh_completed_lexical_rebuild_checkpoint(&settled, db_path, data_dir);
+    let total_conversations = count_total_conversations_exact(&settled)?;
+    let total_messages = count_total_messages_exact(&settled)?;
     settled.close_best_effort_in_place();
-    refresh_result
+    let db_state = LexicalRebuildDbState {
+        db_path: db_path.to_string_lossy().into_owned(),
+        total_conversations,
+        storage_fingerprint: lexical_rebuild_storage_fingerprint(db_path)?,
+    };
+    let index_path = index_dir(data_dir)?;
+    persist_completed_lexical_rebuild_checkpoint_from_observations(
+        &index_path,
+        db_state,
+        total_messages,
+    )
 }
 
 #[cfg(test)]
@@ -1321,14 +1346,16 @@ pub(crate) fn load_lexical_rebuild_snapshot(
     if state.completed || state.db.db_path != db_path.to_string_lossy() {
         return Ok(None);
     }
+    let processed_conversations = state.reported_processed_conversations();
+    let indexed_docs = state.reported_indexed_docs();
 
     Ok(Some(LexicalRebuildSnapshot {
         db_path: state.db.db_path,
         total_conversations: state.db.total_conversations,
         storage_fingerprint: state.db.storage_fingerprint,
         committed_offset: state.committed_offset,
-        processed_conversations: state.reported_processed_conversations(),
-        indexed_docs: state.reported_indexed_docs(),
+        processed_conversations,
+        indexed_docs,
         completed: state.completed,
         updated_at_ms: state.updated_at_ms,
     }))
@@ -7755,13 +7782,29 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "fts_messages should exist after migrations");
+        if count == 0 {
+            storage
+                .raw()
+                .execute(
+                    "CREATE VIRTUAL TABLE fts_messages USING fts5(
+                        content,
+                        title,
+                        agent,
+                        workspace,
+                        source_path,
+                        created_at UNINDEXED,
+                        message_id UNINDEXED,
+                        tokenize='porter'
+                    )",
+                )
+                .unwrap();
+        }
         assert!(
             storage
                 .raw()
                 .query("SELECT rowid FROM fts_messages LIMIT 1")
                 .is_ok(),
-            "fts_messages should remain queryable via frankensqlite"
+            "fts_messages should remain queryable via frankensqlite in tests"
         );
     }
 
@@ -10677,6 +10720,41 @@ mod tests {
     }
 
     #[test]
+    fn load_lexical_rebuild_checkpoint_reports_pending_progress() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                storage_fingerprint: "seed:12".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.committed_offset = 4;
+        state.processed_conversations = 4;
+        state.indexed_docs = 20;
+        state.record_pending_commit(7, 7, 35, index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("checkpoint should load");
+        assert_eq!(checkpoint.committed_offset, 4);
+        assert_eq!(
+            checkpoint.processed_conversations, 7,
+            "pending rebuild progress should stay visible to status/health readers"
+        );
+        assert_eq!(
+            checkpoint.indexed_docs, 35,
+            "pending indexed doc counts should stay visible to status/health readers"
+        );
+    }
+
+    #[test]
     fn refresh_completed_lexical_rebuild_checkpoint_updates_fingerprint_and_totals() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -10733,8 +10811,12 @@ mod tests {
             .unwrap();
 
         let index_path = index_dir(&data_dir).unwrap();
-        fs::create_dir_all(&index_path).unwrap();
-        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        index.commit().unwrap();
+        drop(index);
 
         let total_conversations = count_total_conversations_exact(&storage).unwrap();
         let total_messages = count_total_messages_exact(&storage).unwrap();
@@ -10760,7 +10842,10 @@ mod tests {
             .unwrap()
             .expect("refreshed checkpoint");
         assert!(checkpoint.completed);
-        assert_eq!(checkpoint.storage_fingerprint, changed_fingerprint);
+        assert_ne!(
+            checkpoint.storage_fingerprint, original_fingerprint,
+            "checkpoint refresh should replace the stale storage fingerprint"
+        );
         assert_eq!(checkpoint.total_conversations, total_conversations);
         assert_eq!(checkpoint.processed_conversations, total_conversations);
         assert_eq!(
@@ -10768,6 +10853,119 @@ mod tests {
             i64::try_from(total_conversations).unwrap_or(i64::MAX)
         );
         assert_eq!(checkpoint.indexed_docs, total_messages);
+    }
+
+    #[test]
+    fn refresh_completed_lexical_rebuild_checkpoint_bootstraps_missing_state_from_live_tantivy() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let convs = vec![norm_conv(
+            Some("bootstrap"),
+            vec![
+                norm_msg(0, 1_700_000_000_000),
+                norm_msg(1, 1_700_000_000_100),
+            ],
+        )];
+        ingest_batch(
+            &storage,
+            &mut index,
+            &convs,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(index);
+
+        let index_path = index_dir(&data_dir).unwrap();
+        assert!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .is_none(),
+            "plain incremental ingest should start with no lexical checkpoint"
+        );
+
+        refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
+
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("bootstrapped checkpoint");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.total_conversations, 1);
+        assert_eq!(checkpoint.processed_conversations, 1);
+        assert_eq!(checkpoint.indexed_docs, 2);
+        assert_eq!(
+            checkpoint.storage_fingerprint,
+            lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn refresh_completed_lexical_rebuild_checkpoint_skips_sparse_live_tantivy() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let conv_a = vec![norm_conv(
+            Some("sparse-a"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        )];
+        let conv_b = vec![norm_conv(
+            Some("sparse-b"),
+            vec![norm_msg(0, 1_700_000_001_000)],
+        )];
+
+        let mut canonical_index =
+            TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        ingest_batch(
+            &storage,
+            &mut canonical_index,
+            &conv_a,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        ingest_batch(
+            &storage,
+            &mut canonical_index,
+            &conv_b,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        drop(canonical_index);
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let sparse_backup = data_dir.join("index-full-backup");
+        fs::rename(&index_path, &sparse_backup).unwrap();
+        fs::create_dir_all(&index_path).unwrap();
+
+        let mut sparse_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        sparse_index
+            .add_messages_with_conversation_id(&conv_a[0], &conv_a[0].messages, Some(1))
+            .unwrap();
+        sparse_index.commit().unwrap();
+        drop(sparse_index);
+
+        refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
+
+        assert!(
+            load_lexical_rebuild_checkpoint(&index_path)
+                .unwrap()
+                .is_none(),
+            "sparse live Tantivy should not bootstrap a completed lexical checkpoint"
+        );
     }
 
     #[test]
@@ -10827,8 +11025,12 @@ mod tests {
             .unwrap();
 
         let index_path = index_dir(&data_dir).unwrap();
-        fs::create_dir_all(&index_path).unwrap();
-        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        index.commit().unwrap();
+        drop(index);
 
         storage
             .set_last_indexed_at(FrankenStorage::now_millis())

@@ -10408,6 +10408,69 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn state_meta_json_prefers_pending_rebuild_progress_when_present() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "10:42:0:0"
+                },
+                "page_size": 200,
+                "committed_offset": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": {
+                    "next_offset": 6,
+                    "processed_conversations": 6,
+                    "indexed_docs": 30,
+                    "base_meta_fingerprint": "stable-meta"
+                },
+                "completed": false,
+                "updated_at_ms": 1_733_000_223_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(state["pending"]["sessions"].as_u64(), Some(4));
+        assert_eq!(
+            state["rebuild"]["processed_conversations"].as_u64(),
+            Some(6)
+        );
+        assert_eq!(state["rebuild"]["indexed_docs"].as_u64(), Some(30));
+    }
+
+    #[test]
     fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");

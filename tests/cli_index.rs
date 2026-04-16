@@ -183,20 +183,56 @@ fn index_handles_existing_schema_13_db() {
 }
 
 /// Creates a Codex session file with the modern envelope format.
+fn codex_iso_timestamp(ts_ms: u64) -> String {
+    let ts_ms_i64 = i64::try_from(ts_ms).unwrap_or(i64::MAX);
+    chrono::DateTime::from_timestamp_millis(ts_ms_i64)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
 fn make_codex_session(root: &std::path::Path, date_path: &str, filename: &str, content: &str) {
     let sessions = root.join(format!("sessions/{date_path}"));
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join(filename);
-    // Modern Codex JSONL envelope format
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    let sample = format!(
-        r#"{{"type": "event_msg", "timestamp": {ts}, "payload": {{"type": "user_message", "message": "{content}"}}}}
-{{"type": "response_item", "timestamp": {}, "payload": {{"role": "assistant", "content": "{content}_response"}}}}"#,
-        ts + 1000
-    );
+    let workspace = root.to_string_lossy();
+    let lines = [
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts),
+            "type": "session_meta",
+            "payload": {
+                "id": filename,
+                "cwd": workspace,
+                "cli_version": "0.42.0"
+            }
+        }),
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts + 1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": content }]
+            }
+        }),
+        serde_json::json!({
+            "timestamp": codex_iso_timestamp(ts + 2_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": format!("{content}_response") }]
+            }
+        }),
+    ];
+    let mut sample = String::new();
+    for line in lines {
+        sample.push_str(&serde_json::to_string(&line).unwrap());
+        sample.push('\n');
+    }
     fs::write(file, sample).unwrap();
 }
 
@@ -449,6 +485,78 @@ fn index_json_reports_watch_once_incremental_lexical_strategy() {
             .get("lexical_strategy_reason")
             .and_then(|value| value.as_str()),
         Some("watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths")
+    );
+}
+
+#[test]
+#[serial]
+fn plain_index_recreates_missing_lexical_checkpoint_from_live_assets() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "checkpoint-bootstrap.jsonl",
+        "checkpoint_bootstrap_content",
+    );
+
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    initial_index.assert().success();
+
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve versioned tantivy index path");
+    let state_path = index_path.join(".lexical-rebuild-state.json");
+    let state_backup_path = index_path.join(".lexical-rebuild-state.backup.json");
+    if state_path.exists() {
+        fs::rename(&state_path, &state_backup_path).expect("hide lexical checkpoint");
+    }
+    assert!(
+        !state_path.exists(),
+        "test fixture should remove the visible lexical checkpoint"
+    );
+
+    let mut plain_index = base_cmd(home);
+    plain_index
+        .args(["index", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = plain_index.output().expect("run plain incremental index");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "plain incremental index should repair the missing lexical checkpoint. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        state_path.exists(),
+        "plain incremental index should recreate the lexical checkpoint"
+    );
+
+    let checkpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("read recreated checkpoint"))
+            .expect("parse recreated checkpoint");
+    assert_eq!(checkpoint["completed"], serde_json::Value::Bool(true));
+
+    let mut health = base_cmd(home);
+    health
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let health_output = health
+        .output()
+        .expect("run health after checkpoint bootstrap");
+    assert!(
+        health_output.status.success(),
+        "health should stay green after checkpoint bootstrap\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&health_output.stdout),
+        String::from_utf8_lossy(&health_output.stderr)
     );
 }
 

@@ -39,23 +39,68 @@ fn codex_iso_timestamp(ts_millis: u64) -> String {
         .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn write_jsonl_lines(file: &Path, lines: &[serde_json::Value]) {
+    let mut sample = String::new();
+    for line in lines {
+        sample.push_str(&serde_json::to_string(line).unwrap());
+        sample.push('\n');
+    }
+    fs::write(file, sample).unwrap();
+}
+
+fn append_jsonl_lines(file: &Path, lines: &[serde_json::Value]) {
+    use std::io::Write;
+
+    let mut handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(file)
+        .expect("open rollout for append");
+    for line in lines {
+        handle
+            .write_all(serde_json::to_string(line).unwrap().as_bytes())
+            .unwrap();
+        handle.write_all(b"\n").unwrap();
+    }
+}
+
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(root: &Path, date_path: &str, filename: &str, content: &str, ts: u64) {
     let sessions = root.join(format!("sessions/{date_path}"));
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join(filename);
     let workspace = root.to_string_lossy();
-    let meta_ts = codex_iso_timestamp(ts);
-    let user_ts = codex_iso_timestamp(ts + 1000);
-    let assistant_ts = codex_iso_timestamp(ts + 2000);
-    // Trailing newline is critical for append_codex_session to work correctly
-    let sample = format!(
-        r#"{{"timestamp": "{meta_ts}", "type": "session_meta", "payload": {{"id": "{filename}", "cwd": "{workspace}", "cli_version": "0.42.0"}}}}
-{{"timestamp": "{user_ts}", "type": "response_item", "payload": {{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "{content}"}}]}}}}
-{{"timestamp": "{assistant_ts}", "type": "response_item", "payload": {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "{content}_response"}}]}}}}
-"#,
+    write_jsonl_lines(
+        &file,
+        &[
+            serde_json::json!({
+                "timestamp": codex_iso_timestamp(ts),
+                "type": "session_meta",
+                "payload": {
+                    "id": filename,
+                    "cwd": workspace,
+                    "cli_version": "0.42.0"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": codex_iso_timestamp(ts + 1_000),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": content }]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": codex_iso_timestamp(ts + 2_000),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": format!("{content}_response") }]
+                }
+            }),
+        ],
     );
-    fs::write(file, sample).unwrap();
 }
 
 /// Helper to create Claude Code session.
@@ -72,18 +117,29 @@ fn make_claude_session(root: &Path, project: &str, filename: &str, content: &str
 
 /// Append an additional Codex message pair (user + assistant) to an existing rollout file.
 fn append_codex_session(file: &Path, content: &str, ts: u64) {
-    use std::io::Write;
-
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(file)
-        .expect("open rollout for append");
-    let user_ts = codex_iso_timestamp(ts);
-    let assistant_ts = codex_iso_timestamp(ts + 1000);
-    let sample = format!(
-        "{{\"timestamp\": \"{user_ts}\", \"type\": \"response_item\", \"payload\": {{\"type\": \"message\", \"role\": \"user\", \"content\": [{{\"type\": \"input_text\", \"text\": \"{content}\"}}]}}}}\n{{\"timestamp\": \"{assistant_ts}\", \"type\": \"response_item\", \"payload\": {{\"type\": \"message\", \"role\": \"assistant\", \"content\": [{{\"type\": \"text\", \"text\": \"{content}_response\"}}]}}}}\n",
+    append_jsonl_lines(
+        file,
+        &[
+            serde_json::json!({
+                "timestamp": codex_iso_timestamp(ts),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": content }]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": codex_iso_timestamp(ts + 1_000),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": format!("{content}_response") }]
+                }
+            }),
+        ],
     );
-    f.write_all(sample.as_bytes()).unwrap();
 }
 
 fn make_codex_session_with_turns(
@@ -99,25 +155,45 @@ fn make_codex_session_with_turns(
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join(filename);
     let workspace = root.to_string_lossy();
-    let mut sample = String::new();
-    let meta_ts = codex_iso_timestamp(ts);
-    sample.push_str(&format!(
-        r#"{{"timestamp": "{meta_ts}", "type": "session_meta", "payload": {{"id": "{filename}", "cwd": "{workspace}", "cli_version": "0.42.0"}}}}
-"#
-    ));
+    let mut lines = vec![serde_json::json!({
+        "timestamp": codex_iso_timestamp(ts),
+        "type": "session_meta",
+        "payload": {
+            "id": filename,
+            "cwd": workspace,
+            "cli_version": "0.42.0"
+        }
+    })];
 
     for turn in 0..turns {
         let turn_ts = ts + ((turn as u64) + 1) * 3_000;
-        let user_ts = codex_iso_timestamp(turn_ts);
-        let assistant_ts = codex_iso_timestamp(turn_ts + 1_000);
-        sample.push_str(&format!(
-            r#"{{"timestamp": "{user_ts}", "type": "response_item", "payload": {{"type": "message", "role": "user", "content": [{{"type": "input_text", "text": "{common_token} {unique_suffix} user_turn_{turn}"}}]}}}}
-{{"timestamp": "{assistant_ts}", "type": "response_item", "payload": {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "{common_token} {unique_suffix} assistant_turn_{turn}"}}]}}}}
-"#,
-        ));
+        lines.push(serde_json::json!({
+            "timestamp": codex_iso_timestamp(turn_ts),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("{common_token} {unique_suffix} user_turn_{turn}")
+                }]
+            }
+        }));
+        lines.push(serde_json::json!({
+            "timestamp": codex_iso_timestamp(turn_ts + 1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": format!("{common_token} {unique_suffix} assistant_turn_{turn}")
+                }]
+            }
+        }));
     }
 
-    fs::write(file, sample).unwrap();
+    write_jsonl_lines(&file, &lines);
 }
 
 fn make_bulk_codex_sessions(
