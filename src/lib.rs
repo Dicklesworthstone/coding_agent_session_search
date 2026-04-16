@@ -5662,10 +5662,11 @@ mod headless_asciicast_sentinel_tests {
     }
 
     #[test]
-    fn headless_asciicast_sentinel_overwrites_existing_stub_content() {
+    fn headless_asciicast_sentinel_overwrites_existing_placeholder_content() {
         let tmp = TempDir::new().expect("temp dir");
         let cast_path = tmp.path().join("existing.cast");
-        fs::write(&cast_path, "{\"version\":2}\n[0.0,\"o\",\"\"]\n").expect("write old stub");
+        fs::write(&cast_path, "{\"version\":2}\n[0.0,\"o\",\"\"]\n")
+            .expect("write old placeholder");
 
         write_headless_asciicast_sentinel(&cast_path).expect("rewrite sentinel cast");
 

@@ -119,6 +119,19 @@ function Read-TextResource {
   return Invoke-RestMethod -Uri $Location -ErrorAction Stop
 }
 
+function Resolve-ChecksumToken {
+  param([string]$Value)
+
+  if (-not $Value) { return $null }
+
+  $candidate = ($Value.Trim() -split '\s+', 2)[0]
+  if ($candidate -match '^[0-9a-fA-F]{64}$') {
+    return $candidate.ToLower()
+  }
+
+  return $null
+}
+
 # Map architecture to the naming convention used by release.yml
 $arch = "amd64"
 $zip = "cass-windows-${arch}.zip"
@@ -142,7 +155,14 @@ try {
   Write-Host "Downloading $url"
   Copy-ArtifactToFile -Location $url -Destination $zipFile
 
-  $checksumToUse = $Checksum
+  $checksumToUse = $null
+  if ($Checksum) {
+    $checksumToUse = Resolve-ChecksumToken $Checksum
+    if (-not $checksumToUse) {
+      Write-Error "Checksum must be a 64-character SHA256 value or a .sha256 line containing one."
+      exit 1
+    }
+  }
   if (-not $checksumToUse) {
     if (-not $ChecksumUrl) { $ChecksumUrl = Get-SiblingUrl $url "$zip.sha256" }
     Write-Host "Fetching checksum from $ChecksumUrl"
@@ -159,16 +179,17 @@ try {
           # SHA256SUMS.txt contains lines like: <hash>  <filename>
           foreach ($line in $raw -split "`n") {
             $parts = $line.Trim() -split '\s+', 2
-            if ($parts.Count -ge 2 -and $parts[1] -eq $zip -and $parts[0] -match '^[0-9a-fA-F]{64}$') {
-              $checksumToUse = $parts[0]
+            if ($parts.Count -ge 2 -and $parts[1] -eq $zip) {
+              $checksumToUse = Resolve-ChecksumToken $parts[0]
+            }
+            if ($checksumToUse) {
               $checksumFetched = $true
               break
             }
           }
         } else {
-          $candidate = ($raw.Trim() -split '\s+')[0]
-          if ($candidate -match '^[0-9a-fA-F]{64}$') {
-            $checksumToUse = $candidate
+          $checksumToUse = Resolve-ChecksumToken $raw
+          if ($checksumToUse) {
             $checksumFetched = $true
           }
         }

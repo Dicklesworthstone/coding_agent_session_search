@@ -351,9 +351,9 @@ fn install_sh_falls_back_to_shasum_when_sha256sum_fails() {
     let dest = tempfile::TempDir::new().unwrap();
     let home = isolated_home();
     let tool_dir = tempfile::TempDir::new().unwrap();
-    let fake_sha = tool_dir.path().join("sha256sum");
+    let sha256sum_fixture_path = tool_dir.path().join("sha256sum");
     make_executable_script(
-        &fake_sha,
+        &sha256sum_fixture_path,
         "#!/bin/sh\n# simulate an unavailable sha256sum implementation\nexit 127\n",
     );
 

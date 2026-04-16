@@ -876,7 +876,7 @@ mod tests {
     fn test_variable_virtual_list_coalesces_scroll_frames() -> Result<()> {
         run_node_module_assertions(
             r#"
-                class MockElement {
+                class FixtureElement {
                     constructor() {
                         this.style = {};
                         this.dataset = {};
@@ -919,7 +919,7 @@ mod tests {
                 const queuedFrames = [];
                 globalThis.document = {
                     createElement() {
-                        return new MockElement();
+                        return new FixtureElement();
                     },
                 };
                 globalThis.ResizeObserver = class {
@@ -938,12 +938,12 @@ mod tests {
                 try {
                     const { VariableHeightVirtualList } = await import('./src/pages_assets/virtual-list.js');
 
-                    const container = new MockElement();
+                    const container = new FixtureElement();
                     const list = new VariableHeightVirtualList({
                         container,
                         totalCount: 100,
                         estimatedItemHeight: 60,
-                        renderItem: () => new MockElement(),
+                        renderItem: () => new FixtureElement(),
                     });
 
                     queuedFrames.length = 0;
@@ -982,7 +982,7 @@ mod tests {
     fn test_virtual_list_scroll_to_index_renders_target_range_immediately() -> Result<()> {
         run_node_module_assertions(
             r#"
-                class MockElement {
+                class FixtureElement {
                     constructor() {
                         this.style = {};
                         this.dataset = {};
@@ -1027,7 +1027,7 @@ mod tests {
 
                 globalThis.document = {
                     createElement() {
-                        return new MockElement();
+                        return new FixtureElement();
                     },
                 };
                 globalThis.ResizeObserver = class {
@@ -1045,13 +1045,13 @@ mod tests {
                 try {
                     const { VirtualList } = await import('./src/pages_assets/virtual-list.js');
 
-                    const container = new MockElement();
+                    const container = new FixtureElement();
                     const list = new VirtualList({
                         container,
                         itemHeight: 40,
                         totalCount: 100,
                         renderItem: (index) => {
-                            const element = new MockElement();
+                            const element = new FixtureElement();
                             element.dataset.resultIndex = String(index);
                             return element;
                         },
@@ -1555,7 +1555,7 @@ mod tests {
                     };
                 }
 
-                class MockElement {
+                class FixtureElement {
                     constructor(tagName = 'div') {
                         this.tagName = tagName.toUpperCase();
                         this.children = [];
@@ -1613,7 +1613,7 @@ mod tests {
 
                 globalThis.document = {
                     createElement(tagName) {
-                        return new MockElement(tagName);
+                        return new FixtureElement(tagName);
                     },
                 };
                 globalThis.IntersectionObserver = class {
