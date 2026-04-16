@@ -178,7 +178,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Explicit feature list excludes `strict-path-dep-validation`, which is
+        # intentionally opt-in and requires specific sibling-repo git revisions
+        # (see build.rs CONTRACTS). `--all-features` would activate it and make
+        # the build fail because CI clones siblings at HEAD, not pinned revs.
+        run: cargo clippy --all-targets --features "qr encryption backtrace" -- -D warnings
 
   # Rust unit tests
   test-rust:
@@ -207,7 +211,9 @@ jobs:
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
       - name: Run tests
-        run: cargo test --all-features --verbose -- --nocapture
+        # Explicit feature list excludes `strict-path-dep-validation` — see the
+        # Lint job for rationale.
+        run: cargo test --features "qr encryption backtrace" --verbose -- --nocapture
         env:
           RUST_LOG: debug
 
@@ -227,7 +233,9 @@ jobs:
           for t in "${tests[@]}"; do
             args+=(--test "$t")
           done
-          E2E_LOG=1 cargo test --all-features --verbose "${args[@]}" -- --nocapture
+          # Explicit feature list excludes `strict-path-dep-validation` — see
+          # the Lint job for rationale.
+          E2E_LOG=1 cargo test --features "qr encryption backtrace" --verbose "${args[@]}" -- --nocapture
 
       - name: Validate E2E JSONL logs
         if: always()

@@ -19,7 +19,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # NOTE: `-D warnings` intentionally NOT set here. The coverage job compiles
+  # sibling path-dep crates via `[patch]` in Cargo.toml, which makes them
+  # behave like workspace members and bypass cargo's default `--cap-lints
+  # allow` for dependencies. Upstream warnings (e.g. fsqlite-pager
+  # dead_code) must not fail the coverage run — lint enforcement lives in
+  # the Lint job (ci.yml).
   # Phased coverage threshold - update per docs/COVERAGE_POLICY.md schedule
   COVERAGE_THRESHOLD: 60
 

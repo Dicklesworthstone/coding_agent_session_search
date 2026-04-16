@@ -30,6 +30,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Free disk space on runner
+        # The benchmark job compiles the full crate graph (including many
+        # sibling path-dep workspaces) and previously hit `No space left on
+        # device` during dependency download. Reclaim ~15-20 GiB by removing
+        # preinstalled toolchains we don't use (Android, dotnet, Haskell,
+        # GHC, large caches).
+        shell: bash
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0  # For comparing with main

@@ -5357,7 +5357,11 @@ fn state_meta_json(
             },
         }
     });
-    let not_initialized = cass_not_initialized(db_exists, lexical_index_initialized, assets.lexical.rebuilding);
+    let not_initialized = cass_not_initialized(
+        db_exists,
+        lexical_index_initialized,
+        assets.lexical.rebuilding,
+    );
     if not_initialized {
         assets.semantic.status = "not_initialized";
         assets.semantic.availability = "not_initialized";
