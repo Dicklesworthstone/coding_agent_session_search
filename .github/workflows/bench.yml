@@ -28,7 +28,12 @@ jobs:
   benchmark:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The crate graph (asupersync + frankensqlite + frankensearch + ftui
+    # path deps) takes ~20 min just to compile on a cold cache; the full
+    # criterion suite across 3 benches needs another 25+ min. 45 min was
+    # a hard-cancel risk. Bump to 90 min with cache warm most runs will
+    # finish much faster.
+    timeout-minutes: 90
     steps:
       - name: Free disk space on runner
         # The benchmark job compiles the full crate graph (including many
