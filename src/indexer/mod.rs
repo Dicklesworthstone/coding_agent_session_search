@@ -565,6 +565,109 @@ impl IndexRunLockGuard {
     }
 }
 
+fn heartbeat_index_run_lock(data_dir: &Path) -> Result<()> {
+    let lock_path = data_dir.join("index-run.lock");
+    let existing = match fs::read_to_string(&lock_path) {
+        Ok(contents) if !contents.is_empty() => contents,
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("reading index-run lock heartbeat {}", lock_path.display())
+            });
+        }
+    };
+
+    let mut wrote_updated_at = false;
+    let now_ms = FrankenStorage::now_millis();
+    let mut refreshed = String::with_capacity(existing.len() + 32);
+    for line in existing.lines() {
+        if line.strip_prefix("updated_at_ms=").is_some() {
+            refreshed.push_str("updated_at_ms=");
+            refreshed.push_str(&now_ms.to_string());
+            wrote_updated_at = true;
+        } else {
+            refreshed.push_str(line);
+        }
+        refreshed.push('\n');
+    }
+    if !wrote_updated_at {
+        refreshed.push_str("updated_at_ms=");
+        refreshed.push_str(&now_ms.to_string());
+        refreshed.push('\n');
+    }
+
+    fs::write(&lock_path, refreshed)
+        .with_context(|| format!("writing index-run lock heartbeat {}", lock_path.display()))
+}
+
+fn maybe_heartbeat_index_run_lock(
+    data_dir: &Path,
+    last_progress_heartbeat: &mut Instant,
+    progress_heartbeat_interval: Duration,
+) -> Result<()> {
+    if last_progress_heartbeat.elapsed() < progress_heartbeat_interval {
+        return Ok(());
+    }
+    heartbeat_index_run_lock(data_dir)?;
+    *last_progress_heartbeat = Instant::now();
+    Ok(())
+}
+
+fn normalize_lexical_messages_for_rebuild(
+    messages: Vec<crate::model::types::Message>,
+    data_dir: &Path,
+    last_progress_heartbeat: &mut Instant,
+    progress_heartbeat_interval: Duration,
+) -> (Vec<NormalizedMessage>, usize, usize) {
+    use crate::model::types::MessageRole;
+
+    let mut conversation_message_count = 0usize;
+    let mut conversation_message_bytes = 0usize;
+    let normalized_messages: Vec<NormalizedMessage> = messages
+        .into_iter()
+        .map(|msg| {
+            if let Err(err) = maybe_heartbeat_index_run_lock(
+                data_dir,
+                last_progress_heartbeat,
+                progress_heartbeat_interval,
+            ) {
+                tracing::debug!(
+                    error = %err,
+                    "failed to refresh index-run heartbeat during lexical message normalization"
+                );
+            }
+            conversation_message_count = conversation_message_count.saturating_add(1);
+            conversation_message_bytes =
+                conversation_message_bytes.saturating_add(msg.content.len());
+            let role = match msg.role {
+                MessageRole::User => "user".to_string(),
+                MessageRole::Agent => "assistant".to_string(),
+                MessageRole::Tool => "tool".to_string(),
+                MessageRole::System => "system".to_string(),
+                MessageRole::Other(other) => other,
+            };
+
+            NormalizedMessage {
+                idx: msg.idx,
+                role,
+                author: msg.author,
+                created_at: msg.created_at,
+                content: msg.content,
+                extra: msg.extra_json,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }
+        })
+        .collect();
+
+    (
+        normalized_messages,
+        conversation_message_count,
+        conversation_message_bytes,
+    )
+}
+
 fn maintenance_job_kind_for_mode(_mode: SearchMaintenanceMode) -> SearchMaintenanceJobKind {
     SearchMaintenanceJobKind::LexicalRefresh
 }
@@ -813,6 +916,16 @@ fn should_commit_lexical_rebuild(
     conversations_since_commit >= commit_interval_conversations
         || messages_since_commit >= commit_interval_messages
         || message_bytes_since_commit >= commit_interval_message_bytes
+}
+
+fn should_persist_lexical_rebuild_progress(
+    conversations_since_progress_persist: usize,
+    progress_heartbeat_interval_conversations: usize,
+    time_since_last_progress_persist: Duration,
+    progress_heartbeat_interval: Duration,
+) -> bool {
+    conversations_since_progress_persist >= progress_heartbeat_interval_conversations
+        || time_since_last_progress_persist >= progress_heartbeat_interval
 }
 
 fn write_json_pretty_atomically<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -3910,8 +4023,6 @@ pub(crate) fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<usize> {
-    use crate::model::types::MessageRole;
-
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
@@ -3993,6 +4104,7 @@ pub(crate) fn rebuild_tantivy_from_db(
         }
         Err(err) => return Err(err),
     };
+    t_index.configure_bulk_load_merge_policy();
 
     if !lexical_rebuild_state_path(&index_path).exists() {
         persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
@@ -4039,8 +4151,9 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut conversations_since_commit = 0usize;
     let mut messages_since_commit = 0usize;
     let mut message_bytes_since_commit = 0usize;
-    let mut conversations_since_progress_heartbeat = 0usize;
-    let mut last_progress_heartbeat = Instant::now();
+    let mut conversations_since_progress_persist = 0usize;
+    let mut last_progress_persist = Instant::now();
+    let mut last_lock_heartbeat = Instant::now();
     let commit_rebuild_progress = |offset: i64,
                                    processed_conversations: usize,
                                    indexed_docs: usize,
@@ -4059,42 +4172,6 @@ pub(crate) fn rebuild_tantivy_from_db(
         persist_lexical_rebuild_state(&index_path, rebuild_state)?;
         Ok(())
     };
-    let normalize_lexical_messages = |messages: Vec<crate::model::types::Message>| {
-        let mut conversation_message_count = 0usize;
-        let mut conversation_message_bytes = 0usize;
-        let normalized_messages: Vec<NormalizedMessage> = messages
-            .into_iter()
-            .map(|msg| {
-                conversation_message_count = conversation_message_count.saturating_add(1);
-                conversation_message_bytes =
-                    conversation_message_bytes.saturating_add(msg.content.len());
-                let role = match msg.role {
-                    MessageRole::User => "user".to_string(),
-                    MessageRole::Agent => "assistant".to_string(),
-                    MessageRole::Tool => "tool".to_string(),
-                    MessageRole::System => "system".to_string(),
-                    MessageRole::Other(other) => other,
-                };
-
-                NormalizedMessage {
-                    idx: msg.idx,
-                    role,
-                    author: msg.author,
-                    created_at: msg.created_at,
-                    content: msg.content,
-                    extra: msg.extra_json,
-                    snippets: Vec::new(),
-                    invocations: Vec::new(),
-                }
-            })
-            .collect();
-        (
-            normalized_messages,
-            conversation_message_count,
-            conversation_message_bytes,
-        )
-    };
-
     loop {
         let batch = storage.list_conversations_for_lexical_rebuild(
             page_size,
@@ -4167,7 +4244,12 @@ pub(crate) fn rebuild_tantivy_from_db(
                 ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
 
                 let (normalized_messages, conversation_message_count, conversation_message_bytes) =
-                    normalize_lexical_messages(messages);
+                    normalize_lexical_messages_for_rebuild(
+                        messages,
+                        data_dir,
+                        &mut last_lock_heartbeat,
+                        progress_heartbeat_interval,
+                    );
 
                 let normalized = NormalizedConversation {
                     agent_slug: conv.agent_slug,
@@ -4182,10 +4264,17 @@ pub(crate) fn rebuild_tantivy_from_db(
                 };
 
                 indexed_docs += normalized.messages.len();
-                t_index.add_messages_with_conversation_id(
+                t_index.add_messages_with_conversation_id_and_batch_hook(
                     &normalized,
                     &normalized.messages,
                     Some(conv_id),
+                    |_| {
+                        maybe_heartbeat_index_run_lock(
+                            data_dir,
+                            &mut last_lock_heartbeat,
+                            progress_heartbeat_interval,
+                        )
+                    },
                 )?;
                 messages_since_commit =
                     messages_since_commit.saturating_add(conversation_message_count);
@@ -4219,15 +4308,18 @@ pub(crate) fn rebuild_tantivy_from_db(
                     conversations_since_commit = 0;
                     messages_since_commit = 0;
                     message_bytes_since_commit = 0;
-                    conversations_since_progress_heartbeat = 0;
-                    last_progress_heartbeat = Instant::now();
+                    conversations_since_progress_persist = 0;
+                    last_progress_persist = Instant::now();
+                    last_lock_heartbeat = Instant::now();
                 } else {
-                    conversations_since_progress_heartbeat =
-                        conversations_since_progress_heartbeat.saturating_add(1);
-                    if conversations_since_progress_heartbeat
-                        >= progress_heartbeat_interval_conversations
-                        || last_progress_heartbeat.elapsed() >= progress_heartbeat_interval
-                    {
+                    conversations_since_progress_persist =
+                        conversations_since_progress_persist.saturating_add(1);
+                    if should_persist_lexical_rebuild_progress(
+                        conversations_since_progress_persist,
+                        progress_heartbeat_interval_conversations,
+                        last_progress_persist.elapsed(),
+                        progress_heartbeat_interval,
+                    ) {
                         persist_pending_lexical_rebuild_progress(
                             &index_path,
                             &mut rebuild_state,
@@ -4235,8 +4327,8 @@ pub(crate) fn rebuild_tantivy_from_db(
                             processed_conversations,
                             indexed_docs,
                         )?;
-                        conversations_since_progress_heartbeat = 0;
-                        last_progress_heartbeat = Instant::now();
+                        conversations_since_progress_persist = 0;
+                        last_progress_persist = Instant::now();
                     }
                 }
             }
@@ -4255,9 +4347,12 @@ pub(crate) fn rebuild_tantivy_from_db(
             }
 
             if conversations_since_commit > 0
-                && (conversations_since_progress_heartbeat
-                    >= progress_heartbeat_interval_conversations
-                    || last_progress_heartbeat.elapsed() >= progress_heartbeat_interval)
+                && should_persist_lexical_rebuild_progress(
+                    conversations_since_progress_persist,
+                    progress_heartbeat_interval_conversations,
+                    last_progress_persist.elapsed(),
+                    progress_heartbeat_interval,
+                )
             {
                 persist_pending_lexical_rebuild_progress(
                     &index_path,
@@ -4266,8 +4361,8 @@ pub(crate) fn rebuild_tantivy_from_db(
                     processed_conversations,
                     indexed_docs,
                 )?;
-                conversations_since_progress_heartbeat = 0;
-                last_progress_heartbeat = Instant::now();
+                conversations_since_progress_persist = 0;
+                last_progress_persist = Instant::now();
             }
         }
         if should_commit_lexical_rebuild(
@@ -4288,8 +4383,9 @@ pub(crate) fn rebuild_tantivy_from_db(
             conversations_since_commit = 0;
             messages_since_commit = 0;
             message_bytes_since_commit = 0;
-            conversations_since_progress_heartbeat = 0;
-            last_progress_heartbeat = Instant::now();
+            conversations_since_progress_persist = 0;
+            last_progress_persist = Instant::now();
+            last_lock_heartbeat = Instant::now();
         }
     }
 
@@ -7740,6 +7836,31 @@ mod tests {
         EnvGuard { key, previous }
     }
 
+    #[test]
+    fn heartbeat_index_run_lock_refreshes_updated_at_without_touching_identity_fields() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        std::fs::write(
+            &lock_path,
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\ndb_path=/tmp/db.sqlite\nmode=index\njob_id=lexical_refresh-123\njob_kind=lexical_refresh\nphase=index\n",
+        )
+        .unwrap();
+
+        heartbeat_index_run_lock(tmp.path()).unwrap();
+
+        let refreshed = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(refreshed.contains("pid=123"));
+        assert!(refreshed.contains("started_at_ms=111"));
+        assert!(refreshed.contains("db_path=/tmp/db.sqlite"));
+        assert!(refreshed.contains("job_id=lexical_refresh-123"));
+        let updated_at_ms = refreshed
+            .lines()
+            .find_map(|line| line.strip_prefix("updated_at_ms="))
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap();
+        assert!(updated_at_ms >= 222);
+    }
+
     #[derive(Clone, Default)]
     struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -11097,6 +11218,38 @@ mod tests {
             1_000,
             5_000,
             16 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn should_persist_lexical_rebuild_progress_when_conversation_threshold_is_hit() {
+        assert!(should_persist_lexical_rebuild_progress(
+            250,
+            250,
+            Duration::from_millis(10),
+            Duration::from_secs(2)
+        ));
+        assert!(!should_persist_lexical_rebuild_progress(
+            249,
+            250,
+            Duration::from_millis(10),
+            Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn should_persist_lexical_rebuild_progress_when_time_threshold_is_hit() {
+        assert!(should_persist_lexical_rebuild_progress(
+            1,
+            250,
+            Duration::from_secs(2),
+            Duration::from_secs(2)
+        ));
+        assert!(!should_persist_lexical_rebuild_progress(
+            1,
+            250,
+            Duration::from_millis(1999),
+            Duration::from_secs(2)
         ));
     }
 

@@ -559,10 +559,15 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let maintenance_activity_at_ms = maintenance_targets_current_db
         .then_some(())
         .and(maintenance.updated_at_ms.or(maintenance.started_at_ms));
-    let activity_at_ms = checkpoint
+    let checkpoint_activity_at_ms = checkpoint
         .filter(|_| checkpoint_progress_usable)
-        .and_then(|state| (state.updated_at_ms > 0).then_some(state.updated_at_ms))
-        .or(maintenance_activity_at_ms);
+        .and_then(|state| (state.updated_at_ms > 0).then_some(state.updated_at_ms));
+    let activity_at_ms = match (checkpoint_activity_at_ms, maintenance_activity_at_ms) {
+        (Some(checkpoint_ts), Some(maintenance_ts)) => Some(checkpoint_ts.max(maintenance_ts)),
+        (Some(checkpoint_ts), None) => Some(checkpoint_ts),
+        (None, Some(maintenance_ts)) => Some(maintenance_ts),
+        (None, None) => None,
+    };
 
     LexicalAssetState {
         status,
@@ -973,6 +978,53 @@ mod tests {
             state.status_reason.as_deref(),
             Some("lexical rebuild is in progress")
         );
+    }
+
+    #[test]
+    fn lexical_state_prefers_newer_maintenance_heartbeat_over_stale_checkpoint_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "before".to_string(),
+            committed_offset: 4,
+            processed_conversations: 4,
+            indexed_docs: 20,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: false,
+            updated_at_ms: 1_733_000_123_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot {
+                active: true,
+                pid: Some(std::process::id()),
+                started_at_ms: Some(1_733_000_111_000),
+                db_path: Some(db_path.clone()),
+                mode: Some(SearchMaintenanceMode::Index),
+                job_id: None,
+                job_kind: None,
+                phase: None,
+                updated_at_ms: Some(1_733_000_456_000),
+                orphaned: false,
+            },
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("after"),
+        });
+
+        assert_eq!(state.status, "building");
+        assert_eq!(state.activity_at_ms, Some(1_733_000_456_000));
     }
 
     #[test]

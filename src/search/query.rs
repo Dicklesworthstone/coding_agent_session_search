@@ -4280,6 +4280,30 @@ impl SearchClient {
                             elapsed_ms: latency.as_millis(),
                             result,
                         }),
+                    // frankensearch may emit a final reranked phase after the
+                    // quality-refined pass. cass's progressive consumers only
+                    // distinguish fast initial results from a better upgraded
+                    // replacement set, so reranked results flow through the
+                    // existing refined/upgrade path.
+                    FsSearchPhase::Reranked {
+                        results, latency, ..
+                    } => phase_client
+                        .progressive_phase_to_result(
+                            &results,
+                            ProgressivePhaseContext {
+                                query,
+                                filters: &phase_filters,
+                                field_mask,
+                                lexical_cache: lexical_snapshot.as_deref(),
+                                limit,
+                                fetch_limit,
+                            },
+                        )
+                        .map(|result| ProgressiveSearchEvent::Phase {
+                            kind: ProgressivePhaseKind::Refined,
+                            elapsed_ms: latency.as_millis(),
+                            result,
+                        }),
                     FsSearchPhase::RefinementFailed { error, latency, .. } => {
                         Ok(ProgressiveSearchEvent::RefinementFailed {
                             latency_ms: latency.as_millis(),

@@ -2018,7 +2018,6 @@ dependencies = [
 [[package]]
 name = "frankensearch"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "frankensearch-core",
@@ -2033,7 +2032,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-core"
 version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "serde",
@@ -2048,7 +2046,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-embed"
 version = "0.1.3"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "dirs",
@@ -2062,7 +2059,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-fusion"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "ahash",
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
@@ -2082,7 +2078,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-index"
 version = "0.1.2"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "ahash",
  "crc32fast",
@@ -2100,7 +2095,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-lexical"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "frankensearch-core",
@@ -2113,7 +2107,6 @@ dependencies = [
 [[package]]
 name = "frankensearch-rerank"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/frankensearch?rev=fa186910#fa18691011fa7bd0e56d6d117b8f8ce75cc342a4"
 dependencies = [
  "asupersync 0.2.9 (git+https://github.com/Dicklesworthstone/asupersync?rev=08dd31df)",
  "dirs",
@@ -2121,6 +2114,7 @@ dependencies = [
  "frankensearch-core",
  "ort",
  "serde",
+ "serde_json",
  "tokenizers",
  "tracing",
 ]

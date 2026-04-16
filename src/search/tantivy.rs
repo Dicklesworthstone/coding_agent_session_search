@@ -114,6 +114,10 @@ impl TantivyIndex {
         self.inner.commit().map_err(map_fs_err)
     }
 
+    pub fn configure_bulk_load_merge_policy(&mut self) {
+        self.inner.configure_bulk_load_merge_policy();
+    }
+
     pub fn reader(&self) -> Result<IndexReader> {
         self.inner.reader().map_err(map_fs_err)
     }
@@ -152,6 +156,24 @@ impl TantivyIndex {
         messages: &[NormalizedMessage],
         conversation_id: Option<i64>,
     ) -> Result<()> {
+        self.add_messages_with_conversation_id_and_batch_hook(
+            conv,
+            messages,
+            conversation_id,
+            |_| Ok(()),
+        )
+    }
+
+    pub fn add_messages_with_conversation_id_and_batch_hook<F>(
+        &mut self,
+        conv: &NormalizedConversation,
+        messages: &[NormalizedMessage],
+        conversation_id: Option<i64>,
+        mut on_batch_flushed: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
         // Provenance fields (P3.x): default to local, but honor metadata injected by indexer.
         let cass_origin = conv.metadata.get("cass").and_then(|c| c.get("origin"));
         let raw_source_id = cass_origin
@@ -208,7 +230,9 @@ impl TantivyIndex {
             if docs.len() >= TANTIVY_ADD_BATCH_MAX_MESSAGES
                 || pending_chars >= TANTIVY_ADD_BATCH_MAX_CHARS
             {
+                let flushed_docs = docs.len();
                 self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                on_batch_flushed(flushed_docs)?;
                 docs.clear();
                 pending_chars = 0;
             }
@@ -217,7 +241,9 @@ impl TantivyIndex {
         if docs.is_empty() {
             Ok(())
         } else {
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)
+            let flushed_docs = docs.len();
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            on_batch_flushed(flushed_docs)
         }
     }
 }
