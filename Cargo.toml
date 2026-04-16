@@ -14,7 +14,7 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "e64a95a2", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "2028c111", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
