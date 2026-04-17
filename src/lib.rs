@@ -48,6 +48,30 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
         .filter(|v| !v.is_empty())
 }
 
+fn resolve_watch_once_paths_from_sources(
+    watch: bool,
+    watch_once: Option<Vec<PathBuf>>,
+    env_watch_once_paths: Option<Vec<PathBuf>>,
+) -> Option<Vec<PathBuf>> {
+    let explicit = watch_once.filter(|paths| !paths.is_empty());
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    if watch {
+        return env_watch_once_paths.filter(|paths| !paths.is_empty());
+    }
+
+    None
+}
+
+fn resolve_watch_once_paths(
+    watch: bool,
+    watch_once: Option<Vec<PathBuf>>,
+) -> Option<Vec<PathBuf>> {
+    resolve_watch_once_paths_from_sources(watch, watch_once, read_watch_once_paths_env())
+}
+
 fn with_frankensqlite_connection<T, F>(
     db_path: &Path,
     context: &str,
@@ -5860,6 +5884,34 @@ fn resolve_progress(mode: ProgressMode, stdout_is_tty: bool) -> ProgressResolved
                 ProgressResolved::Plain
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_once_resolution_tests {
+    use super::resolve_watch_once_paths_from_sources;
+    use std::path::PathBuf;
+
+    #[test]
+    fn normal_index_ignores_test_watch_once_env_without_watch_mode() {
+        let env_paths = Some(vec![PathBuf::from("/tmp/leaked-watch-path.jsonl")]);
+        let resolved = resolve_watch_once_paths_from_sources(false, None, env_paths);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn watch_mode_can_consume_test_watch_once_env_paths() {
+        let env_paths = Some(vec![PathBuf::from("/tmp/watch-path.jsonl")]);
+        let resolved = resolve_watch_once_paths_from_sources(true, None, env_paths.clone());
+        assert_eq!(resolved, env_paths);
+    }
+
+    #[test]
+    fn explicit_watch_once_paths_win_even_without_watch_flag() {
+        let explicit = Some(vec![PathBuf::from("/tmp/session.jsonl")]);
+        let env_paths = Some(vec![PathBuf::from("/tmp/leaked-watch-path.jsonl")]);
+        let resolved = resolve_watch_once_paths_from_sources(false, explicit.clone(), env_paths);
+        assert_eq!(resolved, explicit);
     }
 }
 
@@ -15036,9 +15088,7 @@ fn run_index_with_data(
         }
     }
 
-    let watch_once_paths = watch_once
-        .filter(|paths| !paths.is_empty())
-        .or_else(read_watch_once_paths_env);
+    let watch_once_paths = resolve_watch_once_paths(watch, watch_once);
 
     // Decide whether to emit NDJSON progress events on stderr (structured output only).
     // Respect both the CLI flag and the CASS_INDEX_NO_PROGRESS_EVENTS env var.
