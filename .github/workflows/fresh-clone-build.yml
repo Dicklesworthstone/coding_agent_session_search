@@ -1,0 +1,84 @@
+# .github/workflows/fresh-clone-build.yml
+# Fresh-clone build regression guard: ensures a clone with NO sibling repos
+# still resolves dependencies. Catches accidental re-enabling of [patch]
+# sections that point at non-existent sibling paths.
+#
+# Context: issue #181 — the [patch] blocks in Cargo.toml that override
+# frankensqlite/franken_agent_detection/frankensearch to local path deps
+# cause `cargo metadata` to fail on a fresh clone because the sibling repos
+# aren't present. They must stay commented out by default; local devs
+# uncomment for sibling-workspace builds.
+name: Fresh Clone Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fresh-clone-build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fresh-clone-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fresh-clone-metadata:
+    name: Fresh-clone metadata resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (no siblings)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          # Checkout into a named subdirectory so the workspace layout has
+          # NO sibling repos next to it — the exact condition that tripped #181.
+          path: cass
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show Cargo.toml [patch] sections
+        working-directory: cass
+        run: |
+          echo "=== [patch] sections in Cargo.toml ==="
+          awk '/^\[patch/,/^$/' Cargo.toml || true
+
+      - name: Assert no active [patch] blocks for sibling repos
+        working-directory: cass
+        run: |
+          set -euo pipefail
+          # Any uncommented [patch."..."] line is a regression risk for #181.
+          # Cargo.toml comments start with `#`, so an active [patch] line
+          # starts at column 0 with `[patch`.
+          if grep -nE '^\[patch' Cargo.toml; then
+            echo ""
+            echo "ERROR: Cargo.toml has active [patch] block(s)."
+            echo "These point at local sibling paths and break fresh-clone builds (#181)."
+            echo "Re-comment them before merging. See the note in Cargo.toml."
+            exit 1
+          fi
+          echo "OK: no active [patch] blocks."
+
+      - name: cargo metadata (full resolution, no siblings present)
+        working-directory: cass
+        run: |
+          # Confirm `ls ..` has no frankensqlite/frankensearch/franken_agent_detection
+          if ls -d ../frankensqlite ../frankensearch ../franken_agent_detection 2>/dev/null; then
+            echo "Unexpected sibling repos present — test invalid."
+            exit 2
+          fi
+          cargo metadata --format-version 1 > /dev/null

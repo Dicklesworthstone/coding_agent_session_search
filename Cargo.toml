@@ -189,22 +189,25 @@ strip = false
 # commented out by default so that a clean clone builds without requiring
 # specific directory layout. See build.rs for validation details.
 #
-[patch."https://github.com/Dicklesworthstone/frankensqlite"]
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
-[patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
-franken-agent-detection = { path = "../franken_agent_detection" }
+# A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
+# — if you re-enable any of these [patch] blocks, that workflow will fail.
+#
+# [patch."https://github.com/Dicklesworthstone/frankensqlite"]
+# fsqlite = { path = "../frankensqlite/crates/fsqlite" }
+# fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+# [patch."https://github.com/Dicklesworthstone/franken_agent_detection"]
+# franken-agent-detection = { path = "../franken_agent_detection" }
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
-[patch."https://github.com/Dicklesworthstone/frankensearch"]
-frankensearch = { path = "../frankensearch/frankensearch" }
-frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
+# [patch."https://github.com/Dicklesworthstone/frankensearch"]
+# frankensearch = { path = "../frankensearch/frankensearch" }
+# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
+# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
+# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
+# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
+# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
+# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
