@@ -1113,30 +1113,44 @@ fn fetch_messages_for_lexical_rebuild_batch_chunked(
         return Ok(HashMap::new());
     }
 
+    let _ = sql_batch_fetch_conversation_limit;
     let mut grouped: HashMap<i64, Vec<crate::model::types::Message>> =
         HashMap::with_capacity(conversation_ids.len());
     let mut total_messages = 0usize;
     let mut total_content_bytes = 0usize;
 
-    for conversation_id_chunk in conversation_ids.chunks(sql_batch_fetch_conversation_limit.max(1)) {
-        let remaining_messages = max_messages.map(|limit| limit.saturating_sub(total_messages));
-        let remaining_content_bytes =
-            max_content_bytes.map(|limit| limit.saturating_sub(total_content_bytes));
-        let fetched = storage.fetch_messages_for_lexical_rebuild_batch(
-            conversation_id_chunk,
-            remaining_messages,
-            remaining_content_bytes,
-        )?;
-        for (conversation_id, messages) in fetched {
-            total_messages = total_messages.saturating_add(messages.len());
-            total_content_bytes = total_content_bytes.saturating_add(
-                messages
-                    .iter()
-                    .map(|message| message.content.len())
-                    .sum::<usize>(),
+    for &conversation_id in conversation_ids {
+        let messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        total_messages = total_messages.saturating_add(messages.len());
+        if let Some(limit) = max_messages
+            && total_messages > limit
+        {
+            anyhow::bail!(
+                "lexical rebuild batch fetch exceeded message guardrail: messages={} limit={} conversations={}",
+                total_messages,
+                limit,
+                conversation_ids.len()
             );
-            grouped.insert(conversation_id, messages);
         }
+
+        total_content_bytes = total_content_bytes.saturating_add(
+            messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>(),
+        );
+        if let Some(limit) = max_content_bytes
+            && total_content_bytes > limit
+        {
+            anyhow::bail!(
+                "lexical rebuild batch fetch exceeded content-byte guardrail: bytes={} limit={} conversations={}",
+                total_content_bytes,
+                limit,
+                conversation_ids.len()
+            );
+        }
+
+        grouped.insert(conversation_id, messages);
     }
 
     Ok(grouped)
