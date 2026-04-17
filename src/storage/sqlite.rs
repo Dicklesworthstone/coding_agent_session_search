@@ -3030,8 +3030,20 @@ impl FrankenStorage {
             .with_context(|| "closing frankensqlite connection")
     }
 
+    pub fn close_without_checkpoint(self) -> Result<()> {
+        self.conn
+            .close_without_checkpoint()
+            .with_context(|| "closing frankensqlite connection without final checkpoint")
+    }
+
     pub fn close_best_effort_in_place(&mut self) {
         self.conn.close_best_effort_in_place();
+    }
+
+    pub fn close_without_checkpoint_in_place(&mut self) -> Result<()> {
+        self.conn
+            .close_without_checkpoint_in_place()
+            .with_context(|| "closing frankensqlite connection without final checkpoint")
     }
 
     /// Access the raw frankensqlite connection.
@@ -4950,14 +4962,23 @@ impl FrankenStorage {
 
     /// Stream lexical rebuild message rows in `(conversation_id, idx)` order
     /// without materializing the full result set.
-    pub fn stream_messages_for_lexical_rebuild_from_conversation_id<F>(
+    pub fn stream_messages_for_lexical_rebuild_between_conversation_ids<F>(
         &self,
         start_conversation_id: i64,
+        end_conversation_id: i64,
         mut f: F,
     ) -> Result<()>
     where
         F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
     {
+        if end_conversation_id < start_conversation_id {
+            return Ok(());
+        }
+
+        const CALLBACK_FAILURE_SENTINEL: &str =
+            "cass lexical rebuild message stream callback failed";
+        const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild message stream early stop";
+
         let hinted_sql = "SELECT conversation_id, id, idx, role, author, created_at, content \
              FROM messages INDEXED BY idx_messages_conv_idx \
              WHERE conversation_id >= ?1 \
@@ -4969,6 +4990,7 @@ impl FrankenStorage {
 
         let params = [SqliteValue::Integer(start_conversation_id)];
         let mut callback_error: Option<anyhow::Error> = None;
+        let stop_requested = std::cell::Cell::new(false);
 
         let mut run = |sql: &str| -> Result<()> {
             let stmt = self
@@ -4985,10 +5007,16 @@ impl FrankenStorage {
                     created_at: row.get_typed(5)?,
                     content: row.get_typed(6)?,
                 };
+                if message_row.conversation_id > end_conversation_id {
+                    stop_requested.set(true);
+                    return Err(frankensqlite::FrankenError::Internal(
+                        EARLY_STOP_SENTINEL.to_string(),
+                    ));
+                }
                 if let Err(err) = f(message_row) {
                     callback_error = Some(err);
                     return Err(frankensqlite::FrankenError::Internal(
-                        "lexical rebuild message stream callback failed".to_string(),
+                        CALLBACK_FAILURE_SENTINEL.to_string(),
                     ));
                 }
                 Ok(())
@@ -4998,11 +5026,22 @@ impl FrankenStorage {
         };
 
         let result = run(hinted_sql).or_else(|err| {
-            if err
-                .to_string()
-                .contains("no such index: idx_messages_conv_idx")
-            {
-                run(fallback_sql)
+            let err_contains =
+                |needle: &str| err.chain().any(|cause| cause.to_string().contains(needle));
+            if stop_requested.get() && err_contains(EARLY_STOP_SENTINEL) {
+                Ok(())
+            } else if err_contains("no such index: idx_messages_conv_idx") {
+                run(fallback_sql).or_else(|fallback_err| {
+                    if stop_requested.get()
+                        && fallback_err
+                            .chain()
+                            .any(|cause| cause.to_string().contains(EARLY_STOP_SENTINEL))
+                    {
+                        Ok(())
+                    } else {
+                        Err(fallback_err)
+                    }
+                })
             } else {
                 Err(err)
             }
@@ -5011,6 +5050,23 @@ impl FrankenStorage {
             return Err(err).with_context(|| "processing streamed lexical rebuild messages");
         }
         result
+    }
+
+    /// Stream lexical rebuild message rows from a starting conversation id to
+    /// the end of the table.
+    pub fn stream_messages_for_lexical_rebuild_from_conversation_id<F>(
+        &self,
+        start_conversation_id: i64,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        self.stream_messages_for_lexical_rebuild_between_conversation_ids(
+            start_conversation_id,
+            i64::MAX,
+            f,
+        )
     }
 
     /// Get a source by ID.
@@ -15035,6 +15091,104 @@ mod tests {
                     "second-a".to_string(),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn stream_messages_for_lexical_rebuild_between_conversation_ids_respects_upper_bound() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let first = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-range-1".into()),
+            title: Some("Lexical range 1".into()),
+            source_path: PathBuf::from("/tmp/lexical-range-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_010),
+                content: "first-only".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let second = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-range-2".into()),
+            title: Some("Lexical range 2".into()),
+            source_path: PathBuf::from("/tmp/lexical-range-2.jsonl"),
+            started_at: Some(1_700_000_000_200),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: Some(84),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: Some("tool".into()),
+                created_at: Some(1_700_000_000_210),
+                content: "second-should-not-appear".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let first_id = storage
+            .insert_conversation_tree(agent_id, None, &first)
+            .unwrap()
+            .conversation_id;
+        let second_id = storage
+            .insert_conversation_tree(agent_id, None, &second)
+            .unwrap()
+            .conversation_id;
+
+        let mut streamed = Vec::new();
+        storage
+            .stream_messages_for_lexical_rebuild_between_conversation_ids(
+                first_id,
+                first_id,
+                |row| {
+                    streamed.push((row.conversation_id, row.idx, row.content));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(streamed, vec![(first_id, 0, "first-only".to_string())]);
+        assert!(
+            streamed
+                .iter()
+                .all(|(conversation_id, _, _)| *conversation_id != second_id),
+            "upper bound should exclude later conversation ids"
         );
     }
 

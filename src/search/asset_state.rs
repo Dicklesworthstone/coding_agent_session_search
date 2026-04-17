@@ -292,6 +292,7 @@ pub(crate) struct InspectSearchAssetsInput<'a> {
     pub maintenance: SearchMaintenanceSnapshot,
     pub semantic_preference: SemanticPreference,
     pub db_available: bool,
+    pub compute_lexical_fingerprint: bool,
 }
 
 const LEXICAL_STORAGE_FINGERPRINT_MTIME_TOLERANCE_MS: i64 = 1_000;
@@ -346,10 +347,11 @@ pub(crate) fn inspect_search_assets(
         maintenance,
         semantic_preference,
         db_available,
+        compute_lexical_fingerprint,
     } = input;
 
     Ok(SearchAssetSnapshot {
-        lexical: inspect_lexical_assets(
+        lexical: inspect_lexical_assets(InspectLexicalAssetsInput {
             data_dir,
             db_path,
             stale_threshold,
@@ -357,7 +359,8 @@ pub(crate) fn inspect_search_assets(
             now_secs,
             maintenance,
             db_available,
-        )?,
+            compute_lexical_fingerprint,
+        })?,
         semantic: inspect_semantic_assets(data_dir, db_path, semantic_preference),
     })
 }
@@ -418,19 +421,32 @@ pub(crate) fn semantic_state_from_availability(
     }
 }
 
-fn inspect_lexical_assets(
-    data_dir: &Path,
-    db_path: &Path,
+struct InspectLexicalAssetsInput<'a> {
+    data_dir: &'a Path,
+    db_path: &'a Path,
     stale_threshold: u64,
     last_indexed_at_ms: Option<i64>,
     now_secs: u64,
     maintenance: SearchMaintenanceSnapshot,
     db_available: bool,
-) -> Result<LexicalAssetState> {
+    compute_lexical_fingerprint: bool,
+}
+
+fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<LexicalAssetState> {
+    let InspectLexicalAssetsInput {
+        data_dir,
+        db_path,
+        stale_threshold,
+        last_indexed_at_ms,
+        now_secs,
+        maintenance,
+        db_available,
+        compute_lexical_fingerprint,
+    } = input;
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
         .with_context(|| format!("loading lexical checkpoint from {}", index_path.display()))?;
-    let current_db_fingerprint = if db_available {
+    let current_db_fingerprint = if db_available && compute_lexical_fingerprint {
         Some(
             lexical_storage_fingerprint_for_db(db_path).with_context(|| {
                 format!(
@@ -1247,6 +1263,7 @@ mod tests {
             maintenance: SearchMaintenanceSnapshot::default(),
             semantic_preference: SemanticPreference::HashFallback,
             db_available: false,
+            compute_lexical_fingerprint: false,
         })
         .expect("asset inspection should not fail when db availability is already known");
 

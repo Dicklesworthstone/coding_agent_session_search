@@ -36,6 +36,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 const CONTRACT_VERSION: &str = "1";
 const DEFAULT_STALE_THRESHOLD_SECS: u64 = 1800;
 
+#[cfg(test)]
 fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     dotenvy::var("CASS_TEST_WATCH_PATHS")
         .ok()
@@ -46,6 +47,11 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
+}
+
+#[cfg(not(test))]
+fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
+    None
 }
 
 fn resolve_watch_once_paths_from_sources(
@@ -65,10 +71,7 @@ fn resolve_watch_once_paths_from_sources(
     None
 }
 
-fn resolve_watch_once_paths(
-    watch: bool,
-    watch_once: Option<Vec<PathBuf>>,
-) -> Option<Vec<PathBuf>> {
+fn resolve_watch_once_paths(watch: bool, watch_once: Option<Vec<PathBuf>>) -> Option<Vec<PathBuf>> {
     resolve_watch_once_paths_from_sources(watch, watch_once, read_watch_once_paths_env())
 }
 
@@ -5393,6 +5396,7 @@ fn state_meta_json(
             maintenance: index_run.clone(),
             semantic_preference: crate::search::asset_state::SemanticPreference::DefaultModel,
             db_available: db_opened,
+            compute_lexical_fingerprint: include_counts,
         },
     )
     .unwrap_or_else(|err| {
@@ -5646,10 +5650,8 @@ fn refresh_state_database_counts_if_needed(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    let needs_refresh = current_counts_skipped
-        || !current_opened
-        || current_conversations <= 0
-        || current_messages <= 0;
+    let needs_refresh = !current_counts_skipped
+        && (!current_opened || current_conversations <= 0 || current_messages <= 0);
     if !needs_refresh || !db_path.exists() {
         return;
     }
@@ -5900,7 +5902,7 @@ mod watch_once_resolution_tests {
     }
 
     #[test]
-    fn watch_mode_can_consume_test_watch_once_env_paths() {
+    fn unit_test_watch_mode_can_consume_test_watch_once_env_paths() {
         let env_paths = Some(vec![PathBuf::from("/tmp/watch-path.jsonl")]);
         let resolved = resolve_watch_once_paths_from_sources(true, None, env_paths.clone());
         assert_eq!(resolved, env_paths);
@@ -10326,15 +10328,15 @@ fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<std::sync::Arc<indexer::IndexingProgress>>,
 ) -> CliResult<usize> {
-    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress).map_err(
-        |e| CliError {
+    indexer::rebuild_tantivy_from_db(db_path, data_dir, total_conversations, progress)
+        .map(|outcome| outcome.indexed_docs)
+        .map_err(|e| CliError {
             code: 5,
             kind: "doctor",
             message: format!("failed to rebuild Tantivy index from database: {e}"),
             hint: None,
             retryable: true,
-        },
-    )
+        })
 }
 
 fn wait_with_progress<T>(
@@ -10684,6 +10686,62 @@ mod cli_read_db_tests {
             "state probe should not report an error: {:?}",
             snapshot.open_error
         );
+    }
+
+    #[test]
+    fn refresh_state_database_counts_keeps_large_db_counts_skipped() {
+        let (_temp, db_path) = seed_cli_db();
+        let mut state = serde_json::json!({
+            "database": {
+                "opened": true,
+                "conversations": serde_json::Value::Null,
+                "messages": serde_json::Value::Null,
+                "counts_skipped": true
+            }
+        });
+
+        refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
+
+        let database = state
+            .get("database")
+            .and_then(|value| value.as_object())
+            .expect("database object");
+        assert_eq!(
+            database
+                .get("counts_skipped")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(
+            database
+                .get("conversations")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert!(
+            database
+                .get("messages")
+                .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn index_result_counts_from_progress_only_uses_exact_totals() {
+        let progress = crate::indexer::IndexingProgress::default();
+        {
+            let mut stats = progress.stats.lock().expect("stats lock");
+            stats.total_conversations = 7;
+            stats.total_messages = 11;
+            stats.total_counts_exact = true;
+        }
+        assert_eq!(index_result_counts_from_progress(&progress), Some((7, 11)));
+
+        let progress = crate::indexer::IndexingProgress::default();
+        {
+            let mut stats = progress.stats.lock().expect("stats lock");
+            stats.total_conversations = 7;
+            stats.total_messages = 11;
+        }
+        assert_eq!(index_result_counts_from_progress(&progress), None);
     }
 
     #[test]
@@ -14970,6 +15028,17 @@ fn run_view(
     Ok(())
 }
 
+fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Option<(i64, i64)> {
+    let stats = progress.stats.lock().ok()?;
+    if !stats.total_counts_exact {
+        return None;
+    }
+    Some((
+        i64::try_from(stats.total_conversations).unwrap_or(i64::MAX),
+        i64::try_from(stats.total_messages).unwrap_or(i64::MAX),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -15495,20 +15564,22 @@ fn run_index_with_data(
             tracing::debug!(?err, "index command failed");
         }
     } else if let Some(fmt) = structured_format {
-        // Get stats after successful indexing
-        let (conversations, messages) =
-            with_frankensqlite_connection(&db_path, "collecting index result counts", |conn| {
-                let convs: i64 = conn.query_row_map(
-                    "SELECT COUNT(*) FROM conversations",
-                    &[],
-                    |r: &frankensqlite::Row| r.get_typed(0),
-                )?;
-                let msgs: i64 = conn.query_row_map(
-                    "SELECT COUNT(*) FROM messages",
-                    &[],
-                    |r: &frankensqlite::Row| r.get_typed(0),
-                )?;
-                Ok((convs, msgs))
+        let (conversations, messages) = index_result_counts_from_progress(&index_progress)
+            .or_else(|| {
+                with_frankensqlite_connection(&db_path, "collecting index result counts", |conn| {
+                    let convs: i64 = conn.query_row_map(
+                        "SELECT COUNT(*) FROM conversations",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )?;
+                    let msgs: i64 = conn.query_row_map(
+                        "SELECT COUNT(*) FROM messages",
+                        &[],
+                        |r: &frankensqlite::Row| r.get_typed(0),
+                    )?;
+                    Ok((convs, msgs))
+                })
+                .ok()
             })
             .unwrap_or((0, 0));
         let mut payload = serde_json::json!({

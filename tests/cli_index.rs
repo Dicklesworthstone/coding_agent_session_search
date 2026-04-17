@@ -288,6 +288,10 @@ fn index_json_reports_full_refresh_lexical_strategy() {
             .and_then(|value| value.as_str()),
         Some("full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild")
     );
+    assert_eq!(
+        payload.get("messages").and_then(|value| value.as_i64()),
+        stats.get("total_messages").and_then(|value| value.as_i64())
+    );
 }
 
 #[test]
@@ -347,6 +351,10 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
             .get("lexical_strategy_reason")
             .and_then(|value| value.as_str()),
         Some("full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild")
+    );
+    assert_eq!(
+        payload.get("messages").and_then(|value| value.as_i64()),
+        stats.get("total_messages").and_then(|value| value.as_i64())
     );
 }
 

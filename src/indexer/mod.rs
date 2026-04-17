@@ -15,10 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use frankensqlite::{
-    Connection as FrankenConnection,
-    compat::{ConnectionExt, ParamValue, RowExt},
-};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -354,6 +351,8 @@ pub struct IndexingStats {
     pub total_conversations: usize,
     /// Total messages indexed
     pub total_messages: usize,
+    #[serde(skip_serializing)]
+    pub total_counts_exact: bool,
     /// Chosen lexical population strategy for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_strategy: Option<String>,
@@ -550,6 +549,17 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
 
     progress.phase.store(0, Ordering::Relaxed);
     progress.is_rebuilding.store(false, Ordering::Relaxed);
+}
+
+fn exact_total_counts_from_progress(
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Option<(usize, usize)> {
+    let progress = progress?;
+    let stats = progress.stats.lock().ok()?;
+    if !stats.total_counts_exact {
+        return None;
+    }
+    Some((stats.total_conversations, stats.total_messages))
 }
 
 struct RunIndexProgressReset {
@@ -1565,6 +1575,12 @@ struct IncrementalCanonicalLexicalRepairContext {
     observed_tantivy_docs: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LexicalRebuildOutcome {
+    pub indexed_docs: usize,
+    pub observed_messages: Option<usize>,
+}
+
 fn should_evaluate_incremental_canonical_lexical_repair(
     context: &IncrementalCanonicalLexicalRepairContext,
 ) -> bool {
@@ -1753,10 +1769,17 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     index_path: &Path,
     db_state: LexicalRebuildDbState,
     total_messages: usize,
+    observed_tantivy_docs: Option<usize>,
 ) -> Result<()> {
     let total_conversations = db_state.total_conversations;
-    let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)? else {
-        return Ok(());
+    let observed_tantivy_docs = match observed_tantivy_docs {
+        Some(observed_tantivy_docs) => observed_tantivy_docs,
+        None => {
+            let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)? else {
+                return Ok(());
+            };
+            observed_tantivy_docs
+        }
     };
     if observed_tantivy_docs != total_messages {
         tracing::debug!(
@@ -1820,6 +1843,7 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         &index_path,
         db_state,
         total_messages,
+        None,
     )
 }
 
@@ -1828,14 +1852,57 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
     db_path: &Path,
     data_dir: &Path,
     keep_storage_open: bool,
+    exact_counts: Option<(usize, usize)>,
 ) -> Result<()> {
+    if let Some((total_conversations, total_messages)) = exact_counts {
+        if keep_storage_open {
+            let db_state = LexicalRebuildDbState {
+                db_path: crate::normalize_path_identity(db_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                total_conversations,
+                total_messages,
+                storage_fingerprint: lexical_rebuild_content_fingerprint(
+                    storage,
+                    total_conversations,
+                )?,
+            };
+            let index_path = index_dir(data_dir)?;
+            return persist_completed_lexical_rebuild_checkpoint_from_observations(
+                &index_path,
+                db_state,
+                total_messages,
+                Some(total_messages),
+            );
+        }
+
+        // This run already knows the exact canonical row counts, so avoid
+        // re-opening or force-closing the large database during finalization.
+        // The lexical fingerprint is content-based (`COUNT/MAX(id)`), so the
+        // live canonical handle already has the authoritative values.
+        let db_state = LexicalRebuildDbState {
+            db_path: crate::normalize_path_identity(db_path)
+                .to_string_lossy()
+                .into_owned(),
+            total_conversations,
+            total_messages,
+            storage_fingerprint: lexical_rebuild_content_fingerprint(storage, total_conversations)?,
+        };
+        let index_path = index_dir(data_dir)?;
+        return persist_completed_lexical_rebuild_checkpoint_from_observations(
+            &index_path,
+            db_state,
+            total_messages,
+            Some(total_messages),
+        );
+    }
+
     if keep_storage_open {
         return refresh_completed_lexical_rebuild_checkpoint(storage, db_path, data_dir);
     }
 
-    // The lexical checkpoint fingerprint is derived from the DB/WAL files on
-    // disk. On some platforms the final close flush mutates those metadata
-    // stamps, so refresh the checkpoint after the writer handle has settled.
+    // Fallback for callers that do not already know the exact canonical row
+    // counts. This reopens the DB and recomputes them from disk.
     storage.close_best_effort_in_place();
     let mut settled = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
@@ -1859,6 +1926,7 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         &index_path,
         db_state,
         total_messages,
+        None,
     )
 }
 
@@ -3224,15 +3292,11 @@ pub fn run_index(
     // Record scan start time before scanning
     let scan_start_ts = FrankenStorage::now_millis();
 
-    // Keep sources table in sync with sources.toml for provenance integrity.
-    sync_sources_config_to_db(&storage);
-
-    let scan_roots = build_scan_roots(&storage, &opts.data_dir);
-    let additional_scan_roots: Vec<ScanRoot> = scan_roots
-        .iter()
-        .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == opts.data_dir))
-        .cloned()
-        .collect();
+    let keep_tantivy_open_after_rebuild = opts.watch
+        || opts
+            .watch_once_paths
+            .as_ref()
+            .is_some_and(|paths| !paths.is_empty());
 
     let t_index = if resume_lexical_rebuild {
         tracing::info!(
@@ -3249,7 +3313,7 @@ pub fn run_index(
             reason = "resume_incomplete_authoritative_db_rebuild_from_checkpoint",
             "selected_lexical_population_strategy"
         );
-        let rebuild_docs = rebuild_tantivy_from_db(
+        let rebuild = rebuild_tantivy_from_db(
             &opts.db_path,
             &opts.data_dir,
             initial_canonical_sessions_before_salvage,
@@ -3260,11 +3324,18 @@ pub fn run_index(
             && let Ok(mut stats) = p.stats.lock()
         {
             stats.total_conversations = initial_canonical_sessions_before_salvage;
-            stats.total_messages = rebuild_docs;
+            if let Some(observed_messages) = rebuild.observed_messages {
+                stats.total_messages = observed_messages;
+                stats.total_counts_exact = true;
+            }
         }
-        TantivyIndex::open_or_create(&index_path)?
+        if keep_tantivy_open_after_rebuild {
+            Some(TantivyIndex::open_or_create(&index_path)?)
+        } else {
+            None
+        }
     } else {
-        let mut t_index = TantivyIndex::open_or_create(&index_path)?;
+        let mut t_index: Option<TantivyIndex> = None;
 
         if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
             storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
@@ -3283,12 +3354,15 @@ pub fn run_index(
         }
 
         let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
-        let mut has_pending_historical_bundles =
-            storage.has_pending_historical_bundles(&opts.db_path)?;
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
         let canonical_only_full_rebuild =
             opts.force_rebuild && canonical_sessions_before_salvage > 0;
+        let mut has_pending_historical_bundles = if canonical_only_full_rebuild {
+            false
+        } else {
+            storage.has_pending_historical_bundles(&opts.db_path)?
+        };
         let targeted_watch_once_only = should_run_targeted_watch_once_only(
             opts.watch_once_paths
                 .as_ref()
@@ -3413,10 +3487,10 @@ pub fn run_index(
         }
 
         if rebuild_from_canonical_only {
-            drop(t_index);
+            drop(t_index.take());
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = count_total_conversations_exact(&storage)?;
-            let rebuild_docs = rebuild_tantivy_from_db(
+            let rebuild = rebuild_tantivy_from_db(
                 &opts.db_path,
                 &opts.data_dir,
                 rebuild_convs,
@@ -3433,9 +3507,14 @@ pub fn run_index(
                 stats.scan_ms = 0; // no scan phase in canonical-only rebuild
                 stats.index_ms = rebuild_ms;
                 stats.total_conversations = rebuild_convs;
-                stats.total_messages = rebuild_docs;
+                if let Some(observed_messages) = rebuild.observed_messages {
+                    stats.total_messages = observed_messages;
+                    stats.total_counts_exact = true;
+                }
             }
-            t_index = TantivyIndex::open_or_create(&index_path)?;
+            if keep_tantivy_open_after_rebuild {
+                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+            }
         } else {
             let followup_scan_after_authoritative_repair =
                 incremental_canonical_lexical_repair.is_some();
@@ -3459,9 +3538,9 @@ pub fn run_index(
                     "selected_lexical_population_strategy"
                 );
 
-                drop(t_index);
+                drop(t_index.take());
                 let rebuild_convs = count_total_conversations_exact(&storage)?;
-                let rebuild_docs = rebuild_tantivy_from_db(
+                let rebuild = rebuild_tantivy_from_db(
                     &opts.db_path,
                     &opts.data_dir,
                     rebuild_convs,
@@ -3471,9 +3550,12 @@ pub fn run_index(
                     && let Ok(mut stats) = p.stats.lock()
                 {
                     stats.total_conversations = rebuild_convs;
-                    stats.total_messages = rebuild_docs;
+                    if let Some(observed_messages) = rebuild.observed_messages {
+                        stats.total_messages = observed_messages;
+                        stats.total_counts_exact = true;
+                    }
                 }
-                t_index = TantivyIndex::open_or_create(&index_path)?;
+                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                 needs_rebuild = false;
             }
 
@@ -3532,12 +3614,20 @@ pub fn run_index(
                     tracing::info!("full_scan: no last_scan_ts or rebuild requested");
                 }
 
+                let additional_scan_roots =
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+
                 // Choose between streaming indexing (Opt 8.2) and batch indexing
+                if t_index.is_none() {
+                    t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                }
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     run_streaming_index(
                         &storage,
-                        &mut t_index,
+                        t_index
+                            .as_mut()
+                            .expect("tantivy index must remain open during streaming lexical scan"),
                         &opts,
                         since_ts,
                         lexical_strategy,
@@ -3550,7 +3640,9 @@ pub fn run_index(
                     );
                     run_batch_index(
                         &storage,
-                        &mut t_index,
+                        t_index
+                            .as_mut()
+                            .expect("tantivy index must remain open during batch lexical scan"),
                         &opts,
                         since_ts,
                         lexical_strategy,
@@ -3560,12 +3652,15 @@ pub fn run_index(
                 }
                 performed_scan = true;
 
-                t_index.commit()?;
+                t_index
+                    .as_mut()
+                    .expect("tantivy index must remain open for lexical commit")
+                    .commit()?;
 
                 if opts.full || historical_salvage.messages_imported > 0 {
-                    drop(t_index);
+                    drop(t_index.take());
                     let rebuild_convs = count_total_conversations_exact(&storage)?;
-                    let rebuild_docs = rebuild_tantivy_from_db(
+                    let rebuild = rebuild_tantivy_from_db(
                         &opts.db_path,
                         &opts.data_dir,
                         rebuild_convs,
@@ -3579,9 +3674,14 @@ pub fn run_index(
                         && let Ok(mut stats) = p.stats.lock()
                     {
                         stats.total_conversations = rebuild_convs;
-                        stats.total_messages = rebuild_docs;
+                        if let Some(observed_messages) = rebuild.observed_messages {
+                            stats.total_messages = observed_messages;
+                            stats.total_counts_exact = true;
+                        }
                     }
-                    t_index = TantivyIndex::open_or_create(&index_path)?;
+                    if keep_tantivy_open_after_rebuild {
+                        t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                    }
                 }
             }
         }
@@ -3763,6 +3863,7 @@ pub fn run_index(
         &opts.db_path,
         &opts.data_dir,
         opts.watch || opts.watch_once_paths.is_some(),
+        exact_total_counts_from_progress(opts.progress.as_ref()),
     )
     .with_context(|| {
         format!(
@@ -3781,6 +3882,9 @@ pub fn run_index(
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
+        let additional_scan_roots =
+            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
         // Before entering the long-lived watch loop, restore the steady-state
         // policy so idle watch sessions do not leave auto-checkpointing
@@ -3794,7 +3898,15 @@ pub fn run_index(
         let state = Mutex::new(load_watch_state(&opts.data_dir));
         let storage = Rc::new(Mutex::new(storage));
         let storage_for_watch = Rc::clone(&storage);
-        let t_index = Mutex::new(t_index);
+        let t_index = Mutex::new(match t_index {
+            Some(t_index) => t_index,
+            None => TantivyIndex::open_or_create(&index_path).with_context(|| {
+                format!(
+                    "opening Tantivy index before entering watch mode for {}",
+                    index_path.display()
+                )
+            })?,
+        });
 
         // CASS #163 item 3: When autocommit_retain cannot be disabled, the
         // long-lived read handle accumulates MVCC snapshots. Periodically
@@ -4019,7 +4131,7 @@ pub fn run_index(
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
-    storage.close().with_context(|| {
+    storage.close_without_checkpoint().with_context(|| {
         format!(
             "closing canonical db after {context}: {}",
             db_path.display()
@@ -4262,23 +4374,24 @@ fn open_storage_for_index(
 }
 
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
-    let mut conn = FrankenConnection::open(db_path.to_string_lossy().to_string())
-        .with_context(|| format!("opening frankensqlite db at {}", db_path.display()))?;
+    let mut storage = FrankenStorage::open_readonly(db_path)
+        .with_context(|| format!("opening frankensqlite db readonly at {}", db_path.display()))?;
 
-    let version = conn
+    let version = storage
+        .raw()
         .query("SELECT value FROM meta WHERE key = 'schema_version';")
         .ok()
         .and_then(|rows| rows.first().cloned())
         .and_then(|row| row.get_typed::<String>(0).ok())
         .and_then(|raw| raw.parse::<i64>().ok());
 
-    if let Err(close_err) = conn.close_in_place() {
+    if let Err(close_err) = storage.close_without_checkpoint_in_place() {
         tracing::warn!(
             error = %close_err,
             db_path = %db_path.display(),
-            "current_schema_fast_probe: close_in_place failed; falling back to best-effort close"
+            "current_schema_fast_probe: close_without_checkpoint_in_place failed; falling back to best-effort close"
         );
-        conn.close_best_effort_in_place();
+        storage.close_best_effort_in_place();
     }
 
     Ok(version == Some(crate::storage::sqlite::CURRENT_SCHEMA_VERSION))
@@ -4459,7 +4572,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     data_dir: &Path,
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
-) -> Result<usize> {
+) -> Result<LexicalRebuildOutcome> {
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
@@ -4571,7 +4684,10 @@ pub(crate) fn rebuild_tantivy_from_db(
             p.phase.store(0, Ordering::Relaxed);
             p.is_rebuilding.store(false, Ordering::Relaxed);
         }
-        return Ok(rebuild_state.indexed_docs);
+        return Ok(LexicalRebuildOutcome {
+            indexed_docs: rebuild_state.indexed_docs,
+            observed_messages: Some(rebuild_state.indexed_docs),
+        });
     }
 
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
@@ -4579,16 +4695,6 @@ pub(crate) fn rebuild_tantivy_from_db(
     let initial_batch_conversation_limit =
         lexical_rebuild_initial_batch_fetch_conversation_limit(batch_conversation_limit);
     let lexical_rebuild_worker_pool = build_lexical_rebuild_worker_pool()?;
-    let all_conversations = storage.list_conversations_for_lexical_rebuild(
-        i64::try_from(total_conversations.max(1)).unwrap_or(i64::MAX),
-        0,
-        &agent_slugs,
-        &workspace_paths,
-    )?;
-    let resume_offset = usize::try_from(rebuild_state.committed_offset.max(0))
-        .unwrap_or(usize::MAX)
-        .min(all_conversations.len());
-    let remaining_conversations = &all_conversations[resume_offset..];
     let mut current_batch_conversation_limit = if rebuild_state.committed_offset > 0 {
         batch_conversation_limit
     } else {
@@ -4603,6 +4709,7 @@ pub(crate) fn rebuild_tantivy_from_db(
         lexical_rebuild_progress_heartbeat_interval_conversations();
     let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
     let mut indexed_docs = rebuild_state.indexed_docs;
+    let mut observed_messages = rebuild_state.indexed_docs;
     let mut processed_conversations = rebuild_state.processed_conversations;
     let mut offset = rebuild_state.committed_offset;
     let mut conversations_since_commit = 0usize;
@@ -4635,6 +4742,8 @@ pub(crate) fn rebuild_tantivy_from_db(
         Ok(())
     };
 
+    let resume_committed_offset = rebuild_state.committed_offset;
+
     let mut finish_conversation = |conv: crate::storage::sqlite::LexicalRebuildConversationRow,
                                    messages: Vec<crate::model::types::Message>|
      -> Result<()> {
@@ -4643,6 +4752,7 @@ pub(crate) fn rebuild_tantivy_from_db(
             .iter()
             .map(|message| message.content.len())
             .sum::<usize>();
+        observed_messages = observed_messages.saturating_add(message_count);
         if let Some(conversation_id) = conv.id
             && !messages.is_empty()
         {
@@ -4738,6 +4848,17 @@ pub(crate) fn rebuild_tantivy_from_db(
 
         Ok(())
     };
+
+    let all_conversations = storage.list_conversations_for_lexical_rebuild(
+        i64::try_from(total_conversations.max(1)).unwrap_or(i64::MAX),
+        0,
+        &agent_slugs,
+        &workspace_paths,
+    )?;
+    let resume_offset = usize::try_from(resume_committed_offset.max(0))
+        .unwrap_or(usize::MAX)
+        .min(all_conversations.len());
+    let remaining_conversations = &all_conversations[resume_offset..];
 
     if let Some(start_conversation_id) = remaining_conversations.iter().find_map(|conv| conv.id) {
         let mut conversation_cursor = 0usize;
@@ -4876,7 +4997,10 @@ pub(crate) fn rebuild_tantivy_from_db(
         p.is_rebuilding.store(false, Ordering::Relaxed);
     }
 
-    Ok(indexed_docs)
+    Ok(LexicalRebuildOutcome {
+        indexed_docs,
+        observed_messages: Some(observed_messages),
+    })
 }
 
 fn ingest_batch(
@@ -5795,17 +5919,21 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     if let Err(err) =
         persist::with_ephemeral_writer(storage, false, "syncing configured sources", |writer| {
             for record in &records {
-                if let Err(e) = writer.upsert_source(record) {
+                if let Err(upsert_err) = writer.upsert_source(record) {
                     tracing::warn!(
                         source_id = %record.id,
-                        "failed to upsert source into db: {e}"
+                        error = %upsert_err,
+                        "failed to upsert configured source into db"
                     );
                 }
             }
             Ok(())
         })
     {
-        tracing::warn!(error = %err, "failed to sync configured sources with a fresh writer");
+        tracing::warn!(
+            error = %err,
+            "failed to sync configured sources with a short-lived writer"
+        );
     }
 }
 
@@ -5830,6 +5958,20 @@ fn expand_local_scan_root_path(path: &str) -> PathBuf {
 /// 2. Remote mirror roots (from registered sources in the database)
 ///
 /// Part of P2.2 - Indexer multi-root orchestration.
+fn additional_scan_roots_for_scan_or_watch(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+) -> Vec<ScanRoot> {
+    // Source-config syncing and scan-root discovery can be expensive on large
+    // machines with many historical bundles and configured mirrors. Defer that
+    // work until a source scan or watch session actually needs it.
+    sync_sources_config_to_db(storage);
+    build_scan_roots(storage, data_dir)
+        .into_iter()
+        .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
+        .collect()
+}
+
 pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
     let mut roots = Vec::new();
 
@@ -10014,8 +10156,9 @@ mod tests {
         let _conversation_limit = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "2");
 
         let logs = capture_logs(|| {
-            let indexed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-            assert_eq!(indexed, 4);
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            assert_eq!(rebuild.indexed_docs, 4);
+            assert_eq!(rebuild.observed_messages, Some(4));
         });
 
         assert!(
@@ -10043,6 +10186,42 @@ mod tests {
             "expected chunk_message_bytes in logs, got:
 {logs}"
         );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_resume_reports_total_observed_messages() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir).unwrap();
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+        let first = norm_conv(Some("resume-1"), vec![norm_msg(0, 100), norm_msg(1, 200)]);
+        persist::persist_conversation(&storage, &mut index, &first).unwrap();
+        index.commit().unwrap();
+
+        let _defer_guard = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let second = norm_conv(Some("resume-2"), vec![norm_msg(0, 300), norm_msg(1, 400)]);
+        persist::persist_conversation(&storage, &mut index, &second).unwrap();
+
+        let db_state = lexical_rebuild_db_state(&storage, &db_path).unwrap();
+        let committed_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.committed_offset = 1;
+        state.processed_conversations = 1;
+        state.indexed_docs = 2;
+        state.committed_meta_fingerprint = committed_meta_fingerprint;
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+        assert_eq!(rebuild.indexed_docs, 4);
+        assert_eq!(rebuild.observed_messages, Some(4));
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
@@ -10141,8 +10320,9 @@ mod tests {
             ],
         );
 
-        let indexed = rebuild_tantivy_from_db(&db_path, &data_dir, 3, None).unwrap();
-        assert_eq!(indexed, 4);
+        let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 3, None).unwrap();
+        assert_eq!(rebuild.indexed_docs, 4);
+        assert_eq!(rebuild.observed_messages, Some(4));
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
 
         let state = load_lexical_rebuild_state(&index_dir(&data_dir).unwrap())
@@ -11921,6 +12101,8 @@ mod tests {
         storage
             .set_last_indexed_at(FrankenStorage::now_millis())
             .unwrap();
+        let total_conversations = count_total_conversations_exact(&storage).unwrap();
+        let total_messages = count_total_messages_exact(&storage).unwrap();
         let mut state = LexicalRebuildState::new(
             lexical_rebuild_db_state(&storage, &db_path).unwrap(),
             LEXICAL_REBUILD_PAGE_SIZE,
@@ -11933,6 +12115,7 @@ mod tests {
             &db_path,
             &data_dir,
             false,
+            Some((total_conversations, total_messages)),
         )
         .unwrap();
 
@@ -11940,6 +12123,9 @@ mod tests {
             .unwrap()
             .expect("refreshed checkpoint");
         assert!(checkpoint.completed);
+        assert_eq!(checkpoint.total_conversations, total_conversations);
+        assert_eq!(checkpoint.processed_conversations, total_conversations);
+        assert_eq!(checkpoint.indexed_docs, total_messages);
         assert_eq!(
             checkpoint.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
@@ -12026,6 +12212,7 @@ mod tests {
             &db_path_variant,
             &data_dir,
             false,
+            None,
         )
         .unwrap();
 
