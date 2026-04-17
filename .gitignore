@@ -35,6 +35,10 @@ ubs-report.*
 parse_ubs.py
 fix_*.py
 
+# Local indexer working dirs and log output (regenerated on demand)
+/data/
+/logs/
+
 # One-off test source files
 test_empty_db.rs
 
@@ -133,6 +137,7 @@ user_requests_output.txt
 
 # Beads ephemeral files (locks, migration hints, backups)
 .beads/.bv.lock
+.beads/*.lock
 .beads/.migration-hint-ts
 .beads/*.bak_*
 
