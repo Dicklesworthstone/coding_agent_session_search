@@ -4,7 +4,7 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
-    Connection as FrankenConnection, Row as FrankenRow,
+    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -2948,6 +2948,18 @@ pub struct LexicalRebuildConversationRow {
     pub origin_host: Option<String>,
 }
 
+/// Lightweight message projection used by the streaming lexical rebuild path.
+#[derive(Debug, Clone)]
+pub struct LexicalRebuildMessageRow {
+    pub conversation_id: i64,
+    pub id: i64,
+    pub idx: i64,
+    pub role: String,
+    pub author: Option<String>,
+    pub created_at: Option<i64>,
+    pub content: String,
+}
+
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -4934,6 +4946,71 @@ impl FrankenStorage {
                 )
             })?;
         Ok(grouped)
+    }
+
+    /// Stream lexical rebuild message rows in `(conversation_id, idx)` order
+    /// without materializing the full result set.
+    pub fn stream_messages_for_lexical_rebuild_from_conversation_id<F>(
+        &self,
+        start_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(LexicalRebuildMessageRow) -> Result<()>,
+    {
+        let hinted_sql = "SELECT conversation_id, id, idx, role, author, created_at, content \
+             FROM messages INDEXED BY idx_messages_conv_idx \
+             WHERE conversation_id >= ?1 \
+             ORDER BY conversation_id ASC, idx ASC";
+        let fallback_sql = "SELECT conversation_id, id, idx, role, author, created_at, content \
+             FROM messages \
+             WHERE conversation_id >= ?1 \
+             ORDER BY conversation_id ASC, idx ASC";
+
+        let params = [SqliteValue::Integer(start_conversation_id)];
+        let mut callback_error: Option<anyhow::Error> = None;
+
+        let mut run = |sql: &str| -> Result<()> {
+            let stmt = self
+                .conn
+                .prepare(sql)
+                .with_context(|| "preparing lexical rebuild message stream query")?;
+            stmt.query_with_params_for_each(&params, |row| {
+                let message_row = LexicalRebuildMessageRow {
+                    conversation_id: row.get_typed(0)?,
+                    id: row.get_typed(1)?,
+                    idx: row.get_typed(2)?,
+                    role: row.get_typed(3)?,
+                    author: row.get_typed(4)?,
+                    created_at: row.get_typed(5)?,
+                    content: row.get_typed(6)?,
+                };
+                if let Err(err) = f(message_row) {
+                    callback_error = Some(err);
+                    return Err(frankensqlite::FrankenError::Internal(
+                        "lexical rebuild message stream callback failed".to_string(),
+                    ));
+                }
+                Ok(())
+            })
+            .with_context(|| "streaming lexical rebuild messages")?;
+            Ok(())
+        };
+
+        let result = run(hinted_sql).or_else(|err| {
+            if err
+                .to_string()
+                .contains("no such index: idx_messages_conv_idx")
+            {
+                run(fallback_sql)
+            } else {
+                Err(err)
+            }
+        });
+        if let Some(err) = callback_error {
+            return Err(err).with_context(|| "processing streamed lexical rebuild messages");
+        }
+        result
     }
 
     /// Get a source by ID.
@@ -14830,6 +14907,230 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("TEMP B-TREE")),
             "expected batched lexical rebuild fetch to avoid sorter temp b-trees, got {plan_details:?}"
+        );
+    }
+
+    #[test]
+    fn stream_messages_for_lexical_rebuild_groups_and_orders_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let first = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-stream-1".into()),
+            title: Some("Lexical stream 1".into()),
+            source_path: PathBuf::from("/tmp/lexical-stream-1.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: Some(42),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_010),
+                    content: "first-a".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_020),
+                    content: "first-b".into(),
+                    extra_json: serde_json::json!({"opaque": true}),
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let second = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("lexical-stream-2".into()),
+            title: Some("Lexical stream 2".into()),
+            source_path: PathBuf::from("/tmp/lexical-stream-2.jsonl"),
+            started_at: Some(1_700_000_000_200),
+            ended_at: Some(1_700_000_000_300),
+            approx_tokens: Some(84),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: Some("tool".into()),
+                created_at: Some(1_700_000_000_210),
+                content: "second-a".into(),
+                extra_json: serde_json::json!({"opaque": true}),
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let first_id = storage
+            .insert_conversation_tree(agent_id, None, &first)
+            .unwrap()
+            .conversation_id;
+        let second_id = storage
+            .insert_conversation_tree(agent_id, None, &second)
+            .unwrap()
+            .conversation_id;
+
+        let mut streamed = Vec::new();
+        storage
+            .stream_messages_for_lexical_rebuild_from_conversation_id(first_id, |row| {
+                streamed.push((
+                    row.conversation_id,
+                    row.idx,
+                    row.role,
+                    row.author,
+                    row.content,
+                ));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            streamed,
+            vec![
+                (
+                    first_id,
+                    0,
+                    "user".to_string(),
+                    Some("user".to_string()),
+                    "first-a".to_string(),
+                ),
+                (
+                    first_id,
+                    1,
+                    "agent".to_string(),
+                    Some("assistant".to_string()),
+                    "first-b".to_string(),
+                ),
+                (
+                    second_id,
+                    0,
+                    "tool".to_string(),
+                    Some("tool".to_string()),
+                    "second-a".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_stream_messages_query_avoids_sorter_temp_btrees() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        for (external_id, base_ts) in [
+            ("conv-1", 1_700_000_000_000_i64),
+            ("conv-2", 1_700_000_001_000_i64),
+        ] {
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(external_id.to_string()),
+                title: Some("Lexical rebuild".into()),
+                source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                started_at: Some(base_ts),
+                ended_at: Some(base_ts + 100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(base_ts + 10),
+                        content: format!("{external_id}-first"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: Some("assistant".into()),
+                        created_at: Some(base_ts + 20),
+                        content: format!("{external_id}-second"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
+
+        let first_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations ORDER BY id LIMIT 1",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let plan_details: Vec<String> = storage
+            .conn
+            .query_map_collect(
+                "EXPLAIN QUERY PLAN                  SELECT conversation_id, id, idx, role, author, created_at, content                  FROM messages INDEXED BY idx_messages_conv_idx                  WHERE conversation_id >= ?1                  ORDER BY conversation_id ASC, idx ASC",
+                fparams![first_id],
+                |row| row.get_typed(3),
+            )
+            .unwrap();
+
+        assert!(
+            plan_details.iter().any(|detail| {
+                detail.contains("idx_messages_conv_idx")
+                    || detail.contains("sqlite_autoindex_messages_1")
+            }),
+            "expected streamed lexical rebuild fetch to use the conversation_id/idx index, got {plan_details:?}"
+        );
+        assert!(
+            !plan_details
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "expected streamed lexical rebuild fetch to avoid sorter temp b-trees, got {plan_details:?}"
         );
     }
 
