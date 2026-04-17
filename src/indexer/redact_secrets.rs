@@ -127,7 +127,7 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
 ///
 /// Set `CASS_REDACT_SECRETS=0` or `CASS_REDACT_SECRETS=false` to disable.
 pub fn redaction_enabled() -> bool {
-    match std::env::var("CASS_REDACT_SECRETS") {
+    match dotenvy::var("CASS_REDACT_SECRETS") {
         Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
         Err(_) => true,
     }

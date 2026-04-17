@@ -10174,7 +10174,7 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
 }
 
 fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
-    std::env::var(var)
+    dotenvy::var(var)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
