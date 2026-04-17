@@ -1,5 +1,9 @@
 use std::path::Path;
 
+use crate::connectors::NormalizedConversation;
+use crate::connectors::NormalizedMessage;
+use crate::search::canonicalize::is_hard_message_noise;
+use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Error, Result};
 use frankensearch::lexical::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
@@ -9,12 +13,6 @@ use frankensearch::lexical::{
     cass_fields_from_schema as fs_fields_from_schema, cass_index_dir as fs_index_dir,
     cass_schema_hash_matches,
 };
-use rayon::prelude::*;
-
-use crate::connectors::NormalizedConversation;
-use crate::connectors::NormalizedMessage;
-use crate::search::canonicalize::is_hard_message_noise;
-use crate::sources::provenance::LOCAL_SOURCE_ID;
 
 fn normalized_index_source_id(
     source_id: Option<&str>,
@@ -143,11 +141,6 @@ fn cass_doc_context(conv: &NormalizedConversation, conversation_id: Option<i64>)
     }
 }
 
-#[derive(Default)]
-struct PreparedCassDocumentBatch {
-    docs: Vec<FsCassDocument>,
-}
-
 fn cass_document_for_message(
     context: &CassDocContext,
     msg: &NormalizedMessage,
@@ -170,61 +163,6 @@ fn cass_document_for_message(
         origin_kind: context.origin_kind.clone(),
         origin_host: context.origin_host.clone(),
     })
-}
-
-fn build_cass_documents_for_message_slice_serial(
-    context: &CassDocContext,
-    messages: &[NormalizedMessage],
-) -> PreparedCassDocumentBatch {
-    let docs = messages
-        .iter()
-        .filter_map(|msg| cass_document_for_message(context, msg))
-        .collect();
-    PreparedCassDocumentBatch { docs }
-}
-
-fn build_cass_documents_for_message_slice(
-    context: &CassDocContext,
-    messages: &[NormalizedMessage],
-) -> PreparedCassDocumentBatch {
-    const PARALLEL_MESSAGE_THRESHOLD: usize = 256;
-
-    if messages.len() < PARALLEL_MESSAGE_THRESHOLD {
-        return build_cass_documents_for_message_slice_serial(context, messages);
-    }
-
-    let docs = messages
-        .par_iter()
-        .map(|msg| cass_document_for_message(context, msg))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect();
-    PreparedCassDocumentBatch { docs }
-}
-
-fn build_cass_documents_for_conversations(
-    conversations: Vec<(&NormalizedConversation, Option<i64>)>,
-) -> Vec<PreparedCassDocumentBatch> {
-    const PARALLEL_CONVERSATION_THRESHOLD: usize = 8;
-    const PARALLEL_MESSAGE_THRESHOLD: usize = 256;
-
-    let total_messages: usize = conversations
-        .iter()
-        .map(|(conv, _)| conv.messages.len())
-        .sum();
-    let build_one = |(conv, conversation_id): (&NormalizedConversation, Option<i64>)| {
-        let context = cass_doc_context(conv, conversation_id);
-        build_cass_documents_for_message_slice_serial(&context, &conv.messages)
-    };
-
-    if conversations.len() < PARALLEL_CONVERSATION_THRESHOLD
-        || total_messages < PARALLEL_MESSAGE_THRESHOLD
-    {
-        return conversations.into_iter().map(build_one).collect();
-    }
-
-    conversations.into_par_iter().map(build_one).collect()
 }
 
 fn push_cass_document_into_pending(
@@ -342,7 +280,10 @@ impl TantivyIndex {
         let mut docs: Vec<FsCassDocument> = Vec::new();
         let mut pending_chars = 0usize;
 
-        for doc in build_cass_documents_for_message_slice(&context, messages).docs {
+        for msg in messages {
+            let Some(doc) = cass_document_for_message(&context, msg) else {
+                continue;
+            };
             push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
             if docs.len() >= max_messages || pending_chars >= max_chars {
                 let flushed_docs = docs.len();
@@ -372,8 +313,12 @@ impl TantivyIndex {
         let mut pending_chars = 0usize;
         let mut indexed_docs = 0usize;
 
-        for batch in build_cass_documents_for_conversations(conversations.into_iter().collect()) {
-            for doc in batch.docs {
+        for (conv, conversation_id) in conversations {
+            let context = cass_doc_context(conv, conversation_id);
+            for msg in &conv.messages {
+                let Some(doc) = cass_document_for_message(&context, msg) else {
+                    continue;
+                };
                 push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
                 if docs.len() >= max_messages || pending_chars >= max_chars {
                     indexed_docs = indexed_docs.saturating_add(docs.len());
@@ -521,5 +466,51 @@ mod tests {
         reader.reload().expect("reload");
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), conv.messages.len() as u64);
+    }
+
+    #[test]
+    fn add_conversations_with_ids_streams_large_payloads_without_dropping_docs() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut idx = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        let content = "y".repeat(2048);
+        let conversations: Vec<_> = (0..24)
+            .map(|conv_idx| {
+                let messages = (0..256)
+                    .map(|msg_idx| NormalizedMessage {
+                        idx: msg_idx,
+                        role: "assistant".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + i64::from(conv_idx * 1_000 + msg_idx)),
+                        content: format!("conv-{conv_idx}-msg-{msg_idx}-{content}"),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    })
+                    .collect();
+                NormalizedConversation {
+                    agent_slug: "codex".to_string(),
+                    external_id: Some(format!("conv-{conv_idx}")),
+                    title: Some(format!("Conversation {conv_idx}")),
+                    workspace: Some(PathBuf::from("/tmp/workspace")),
+                    source_path: PathBuf::from(format!("/tmp/rollout-{conv_idx}.jsonl")),
+                    started_at: Some(1_700_000_000_000 + i64::from(conv_idx)),
+                    ended_at: Some(1_700_000_000_999 + i64::from(conv_idx)),
+                    metadata: Value::Null,
+                    messages,
+                }
+            })
+            .collect();
+        let expected_docs: usize = conversations.iter().map(|conv| conv.messages.len()).sum();
+
+        let indexed_docs = idx
+            .add_conversations_with_ids(conversations.iter().map(|conv| (conv, Some(42))))
+            .expect("add conversations");
+        assert_eq!(indexed_docs, expected_docs);
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), expected_docs as u64);
     }
 }
