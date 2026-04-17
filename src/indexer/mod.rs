@@ -1006,6 +1006,14 @@ fn lexical_rebuild_commit_interval_conversations() -> usize {
         .unwrap_or(10_000)
 }
 
+fn lexical_rebuild_initial_commit_interval_conversations() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2_048)
+}
+
 fn lexical_rebuild_commit_interval_messages() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES")
         .ok()
@@ -1014,12 +1022,45 @@ fn lexical_rebuild_commit_interval_messages() -> usize {
         .unwrap_or(200_000)
 }
 
+fn lexical_rebuild_initial_commit_interval_messages() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50_000)
+}
+
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
     dotenvy::var("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(512 * 1024 * 1024)
+}
+
+fn lexical_rebuild_initial_commit_interval_message_bytes() -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128 * 1024 * 1024)
+}
+
+fn lexical_rebuild_commit_intervals_for_state(
+    rebuild_state: &LexicalRebuildState,
+) -> (usize, usize, usize) {
+    let steady_conversations = lexical_rebuild_commit_interval_conversations();
+    let steady_messages = lexical_rebuild_commit_interval_messages();
+    let steady_message_bytes = lexical_rebuild_commit_interval_message_bytes();
+    if rebuild_state.committed_offset > 0 {
+        return (steady_conversations, steady_messages, steady_message_bytes);
+    }
+
+    (
+        lexical_rebuild_initial_commit_interval_conversations().min(steady_conversations),
+        lexical_rebuild_initial_commit_interval_messages().min(steady_messages),
+        lexical_rebuild_initial_commit_interval_message_bytes().min(steady_message_bytes),
+    )
 }
 
 fn lexical_rebuild_progress_heartbeat_interval_conversations() -> usize {
@@ -4437,9 +4478,11 @@ pub(crate) fn rebuild_tantivy_from_db(
     let batch_fetch_message_bytes_limit = lexical_rebuild_batch_fetch_message_bytes_limit();
     let sql_batch_fetch_conversation_limit =
         lexical_rebuild_sql_batch_fetch_conversation_limit(batch_fetch_conversation_limit);
-    let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
-    let commit_interval_messages = lexical_rebuild_commit_interval_messages();
-    let commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
+    let (
+        mut commit_interval_conversations,
+        mut commit_interval_messages,
+        mut commit_interval_message_bytes,
+    ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
     let progress_heartbeat_interval_conversations =
         lexical_rebuild_progress_heartbeat_interval_conversations();
     let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
@@ -4610,6 +4653,11 @@ pub(crate) fn rebuild_tantivy_from_db(
                     message_bytes_since_commit = 0;
                     conversations_since_progress_persist = 0;
                     last_progress_persist = Instant::now();
+                    (
+                        commit_interval_conversations,
+                        commit_interval_messages,
+                        commit_interval_message_bytes,
+                    ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
                 } else {
                     conversations_since_progress_persist =
                         conversations_since_progress_persist.saturating_add(1);
@@ -4688,6 +4736,11 @@ pub(crate) fn rebuild_tantivy_from_db(
             message_bytes_since_commit = 0;
             conversations_since_progress_persist = 0;
             last_progress_persist = Instant::now();
+            (
+                commit_interval_conversations,
+                commit_interval_messages,
+                commit_interval_message_bytes,
+            ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
         }
     }
 
@@ -11796,6 +11849,45 @@ mod tests {
             5_000,
             16 * 1024 * 1024
         ));
+    }
+
+    #[test]
+    fn lexical_rebuild_commit_intervals_start_smaller_before_first_durable_commit() {
+        let state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 400,
+                total_messages: 800,
+                storage_fingerprint: "seed:400".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+
+        let (conversations, messages, message_bytes) =
+            lexical_rebuild_commit_intervals_for_state(&state);
+        assert_eq!(conversations, 2_048);
+        assert_eq!(messages, 50_000);
+        assert_eq!(message_bytes, 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn lexical_rebuild_commit_intervals_return_to_steady_state_after_first_commit() {
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 400,
+                total_messages: 800,
+                storage_fingerprint: "seed:400".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.committed_offset = 2_048;
+
+        let (conversations, messages, message_bytes) =
+            lexical_rebuild_commit_intervals_for_state(&state);
+        assert_eq!(conversations, 10_000);
+        assert_eq!(messages, 200_000);
+        assert_eq!(message_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
