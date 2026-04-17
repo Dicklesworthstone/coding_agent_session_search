@@ -1202,23 +1202,17 @@ fn lexical_rebuild_batch_fetch_conversation_limit(page_size: i64) -> usize {
 }
 
 fn lexical_rebuild_initial_batch_fetch_conversation_limit(default_limit: usize) -> usize {
-    // Historically this returned a tiny "warmup" chunk (2 conversations) before
-    // ramping to the steady-state `batch_fetch_conversation_limit`. On large
-    // cold rebuilds (tens of thousands of conversations) that warmup is pure
-    // overhead: the Tantivy writer pool (up to `CASS_MAX_WRITER_THREADS`
-    // threads) starves for seconds on a 2-conversation first batch, and
-    // first-iteration latency isn't user-observable anyway (the real
-    // wall-clock signal is the total rebuild time). The default now matches
-    // the steady-state chunk size so the indexing threads ramp up
-    // immediately; operators can still override via
-    // `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS=N` on
-    // memory-constrained hosts that want a gentler ramp.
+    // Keep the very first durable rebuild slice bounded to one SQL batch by
+    // default. This caps peak RSS and gets the first restartable checkpoint to
+    // disk much sooner on corpora with unusually large conversations. After
+    // the first durable commit, the rebuild immediately ramps back to the
+    // steady-state `batch_fetch_conversation_limit`.
     dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.min(default_limit.max(1)))
-        .unwrap_or_else(|| default_limit.max(1))
+        .unwrap_or_else(|| 32.min(default_limit.max(1)))
 }
 
 fn lexical_rebuild_batch_fetch_message_limit() -> usize {
@@ -12240,20 +12234,20 @@ mod tests {
     }
 
     #[test]
-    fn initial_batch_fetch_limit_defaults_to_steady_state_chunk_size() {
-        // The initial chunk now matches the steady-state chunk size so the
-        // Tantivy writer threads don't starve on a 2-conversation first batch.
-        // Operators can still request a gentler ramp via
-        // `CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS`.
+    fn initial_batch_fetch_limit_defaults_to_bounded_warmup_chunk() {
+        // The first durable rebuild chunk should stay small enough to land an
+        // early restartable checkpoint without exploding RSS. Once that commit
+        // lands, the rebuild immediately ramps back to the steady-state chunk
+        // size.
         assert_eq!(
             lexical_rebuild_initial_batch_fetch_conversation_limit(16),
             16,
-            "initial chunk should match the steady-state default_limit"
+            "initial chunk should respect smaller steady-state limits"
         );
         assert_eq!(
             lexical_rebuild_initial_batch_fetch_conversation_limit(128),
-            128,
-            "initial chunk should match the steady-state default_limit"
+            32,
+            "initial chunk should default to one SQL batch when steady-state is larger"
         );
         assert_eq!(
             lexical_rebuild_initial_batch_fetch_conversation_limit(1),
