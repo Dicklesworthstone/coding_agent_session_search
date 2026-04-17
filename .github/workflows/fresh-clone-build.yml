@@ -76,9 +76,16 @@ jobs:
       - name: cargo metadata (full resolution, no siblings present)
         working-directory: cass
         run: |
-          # Confirm `ls ..` has no frankensqlite/frankensearch/franken_agent_detection
-          if ls -d ../frankensqlite ../frankensearch ../franken_agent_detection 2>/dev/null; then
-            echo "Unexpected sibling repos present — test invalid."
-            exit 2
-          fi
+          set -euo pipefail
+          # Confirm no sibling repo is present — otherwise we'd resolve through
+          # the user's local copy and miss the regression we're trying to catch.
+          # Check each sibling separately (GNU `ls -d a b c` returns non-zero
+          # when any argument doesn't exist, so a mix of present/missing looks
+          # the same exit-code-wise as all-missing — not a usable discriminator).
+          for sibling in frankensqlite frankensearch franken_agent_detection; do
+            if [ -e "../$sibling" ]; then
+              echo "Unexpected sibling ../$sibling is present — test invalid."
+              exit 2
+            fi
+          done
           cargo metadata --format-version 1 > /dev/null
