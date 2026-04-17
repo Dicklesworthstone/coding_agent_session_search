@@ -55,6 +55,9 @@ use std::iter::Peekable;
 type BatchClassificationMap =
     HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
 
+type LexicalRebuildMessageBatch = HashMap<i64, Vec<crate::model::types::Message>>;
+type LexicalRebuildMessageBatchChunk = (Vec<i64>, LexicalRebuildMessageBatch);
+
 fn message_id_from_db(raw: i64) -> Option<u64> {
     u64::try_from(raw).ok()
 }
@@ -1264,7 +1267,7 @@ fn fetch_messages_for_lexical_rebuild_batch_chunked(
     max_content_bytes: Option<usize>,
     sql_batch_fetch_conversation_limit: usize,
     worker_pool: Option<&ThreadPool>,
-) -> Result<HashMap<i64, Vec<crate::model::types::Message>>> {
+) -> Result<LexicalRebuildMessageBatch> {
     if conversation_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1283,47 +1286,44 @@ fn fetch_messages_for_lexical_rebuild_batch_chunked(
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    let mut chunk_results: Vec<(Vec<i64>, HashMap<i64, Vec<crate::model::types::Message>>)> =
-        if let Some(pool) = worker_pool {
-            let db_path = storage
-                .database_path()
-                .with_context(|| "resolving lexical rebuild database path")?;
-            pool.install(|| {
-                conversation_chunks
-                    .par_iter()
-                    .map(|chunk| {
-                        let readonly =
-                            FrankenStorage::open_readonly(&db_path).with_context(|| {
-                                format!(
-                                    "opening readonly lexical rebuild batch worker for {}",
-                                    db_path.display()
-                                )
-                            })?;
-                        let grouped =
-                            readonly.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
-                        readonly.close().with_context(|| {
-                            format!(
-                                "closing readonly lexical rebuild batch worker for {}",
-                                db_path.display()
-                            )
-                        })?;
-                        Ok((chunk.clone(), grouped))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?
-        } else {
+    let mut chunk_results: Vec<LexicalRebuildMessageBatchChunk> = if let Some(pool) = worker_pool {
+        let db_path = storage
+            .database_path()
+            .with_context(|| "resolving lexical rebuild database path")?;
+        pool.install(|| {
             conversation_chunks
-                .iter()
+                .par_iter()
                 .map(|chunk| {
+                    let readonly = FrankenStorage::open_readonly(&db_path).with_context(|| {
+                        format!(
+                            "opening readonly lexical rebuild batch worker for {}",
+                            db_path.display()
+                        )
+                    })?;
                     let grouped =
-                        storage.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
+                        readonly.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
+                    readonly.close().with_context(|| {
+                        format!(
+                            "closing readonly lexical rebuild batch worker for {}",
+                            db_path.display()
+                        )
+                    })?;
                     Ok((chunk.clone(), grouped))
                 })
-                .collect::<Result<Vec<_>>>()?
-        };
+                .collect::<Result<Vec<_>>>()
+        })?
+    } else {
+        conversation_chunks
+            .iter()
+            .map(|chunk| {
+                let grouped =
+                    storage.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
+                Ok((chunk.clone(), grouped))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
-    let mut grouped: HashMap<i64, Vec<crate::model::types::Message>> =
-        HashMap::with_capacity(conversation_ids.len());
+    let mut grouped: LexicalRebuildMessageBatch = HashMap::with_capacity(conversation_ids.len());
     let mut total_messages = 0usize;
     let mut total_content_bytes = 0usize;
 
