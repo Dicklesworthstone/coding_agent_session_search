@@ -116,7 +116,8 @@ fn cass_doc_context(conv: &NormalizedConversation, conversation_id: Option<i64>)
             .and_then(|o| o.get("host"))
             .and_then(|v| v.as_str()),
     );
-    let source_id = normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
+    let source_id =
+        normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
     let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
 
     CassDocContext {

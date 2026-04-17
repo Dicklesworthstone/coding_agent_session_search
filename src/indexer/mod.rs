@@ -829,17 +829,14 @@ fn prepare_lexical_rebuild_conversation(
     messages: Vec<crate::model::types::Message>,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
 ) -> PreparedLexicalRebuildConversation {
-    let (kind, host_label) = source_map
-        .get(&conv.source_id)
-        .cloned()
-        .unwrap_or_else(|| {
-            let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
-                SourceKind::Local
-            } else {
-                SourceKind::Ssh
-            };
-            (fallback_kind, None)
-        });
+    let (kind, host_label) = source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
+        let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
+            SourceKind::Local
+        } else {
+            SourceKind::Ssh
+        };
+        (fallback_kind, None)
+    });
     let host = conv.origin_host.as_deref().or(host_label.as_deref());
     let mut metadata = serde_json::Value::Object(serde_json::Map::new());
     ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
@@ -892,7 +889,9 @@ fn prepare_lexical_rebuild_batch(
 
     let prepare_jobs = || {
         jobs.into_par_iter()
-            .map(|(conv, messages)| prepare_lexical_rebuild_conversation(conv, messages, source_map))
+            .map(|(conv, messages)| {
+                prepare_lexical_rebuild_conversation(conv, messages, source_map)
+            })
             .collect::<Vec<_>>()
     };
 
@@ -1286,22 +1285,22 @@ fn fetch_messages_for_lexical_rebuild_batch_chunked(
 
     let mut chunk_results: Vec<(Vec<i64>, HashMap<i64, Vec<crate::model::types::Message>>)> =
         if let Some(pool) = worker_pool {
-            let db_path = storage.db_path().to_path_buf();
+            let db_path = storage
+                .database_path()
+                .with_context(|| "resolving lexical rebuild database path")?;
             pool.install(|| {
                 conversation_chunks
                     .par_iter()
                     .map(|chunk| {
-                        let readonly = FrankenStorage::open_readonly(&db_path).with_context(|| {
-                            format!(
-                                "opening readonly lexical rebuild batch worker for {}",
-                                db_path.display()
-                            )
-                        })?;
-                        let grouped = readonly.fetch_messages_for_lexical_rebuild_batch(
-                            chunk,
-                            None,
-                            None,
-                        )?;
+                        let readonly =
+                            FrankenStorage::open_readonly(&db_path).with_context(|| {
+                                format!(
+                                    "opening readonly lexical rebuild batch worker for {}",
+                                    db_path.display()
+                                )
+                            })?;
+                        let grouped =
+                            readonly.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
                         readonly.close().with_context(|| {
                             format!(
                                 "closing readonly lexical rebuild batch worker for {}",
@@ -1316,11 +1315,8 @@ fn fetch_messages_for_lexical_rebuild_batch_chunked(
             conversation_chunks
                 .iter()
                 .map(|chunk| {
-                    let grouped = storage.fetch_messages_for_lexical_rebuild_batch(
-                        chunk,
-                        None,
-                        None,
-                    )?;
+                    let grouped =
+                        storage.fetch_messages_for_lexical_rebuild_batch(chunk, None, None)?;
                     Ok((chunk.clone(), grouped))
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -4722,7 +4718,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                 }
             }
 
-            let mut batch_messages_by_conversation = if conv_ids.is_empty() {
+            let batch_messages_by_conversation = if conv_ids.is_empty() {
                 Ok(HashMap::new())
             } else {
                 fetch_messages_for_lexical_rebuild_batch_chunked(
@@ -4765,11 +4761,12 @@ pub(crate) fn rebuild_tantivy_from_db(
                         .iter()
                         .map(|conversation| conversation.message_bytes)
                         .sum();
-                    indexed_docs = indexed_docs.saturating_add(t_index.add_conversations_with_ids(
-                        prepared_batch
-                            .iter()
-                            .map(|conversation| (&conversation.normalized, Some(conversation.conversation_id))),
-                    )?);
+                    indexed_docs =
+                        indexed_docs.saturating_add(t_index.add_conversations_with_ids(
+                            prepared_batch.iter().map(|conversation| {
+                                (&conversation.normalized, Some(conversation.conversation_id))
+                            }),
+                        )?);
                     messages_since_commit =
                         messages_since_commit.saturating_add(chunk_message_count);
                     message_bytes_since_commit =
@@ -4836,14 +4833,18 @@ pub(crate) fn rebuild_tantivy_from_db(
                         };
 
                         let messages = storage.fetch_messages_for_lexical_rebuild(conv_id)?;
-                        let prepared = prepare_lexical_rebuild_conversation(conv, messages, &source_map);
+                        let prepared =
+                            prepare_lexical_rebuild_conversation(conv, messages, &source_map);
                         chunk_message_count =
                             chunk_message_count.saturating_add(prepared.message_count);
                         chunk_message_bytes =
                             chunk_message_bytes.saturating_add(prepared.message_bytes);
-                        indexed_docs = indexed_docs.saturating_add(t_index.add_conversations_with_ids(
-                            std::iter::once((&prepared.normalized, Some(prepared.conversation_id))),
-                        )?);
+                        indexed_docs = indexed_docs.saturating_add(
+                            t_index.add_conversations_with_ids(std::iter::once((
+                                &prepared.normalized,
+                                Some(prepared.conversation_id),
+                            )))?,
+                        );
                         messages_since_commit =
                             messages_since_commit.saturating_add(prepared.message_count);
                         message_bytes_since_commit =
