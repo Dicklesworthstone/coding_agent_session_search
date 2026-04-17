@@ -9,6 +9,7 @@ use frankensearch::lexical::{
     cass_fields_from_schema as fs_fields_from_schema, cass_index_dir as fs_index_dir,
     cass_schema_hash_matches,
 };
+use rayon::prelude::*;
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
@@ -142,17 +143,20 @@ fn cass_doc_context(conv: &NormalizedConversation, conversation_id: Option<i64>)
     }
 }
 
-fn append_cass_document_for_message(
-    docs: &mut Vec<FsCassDocument>,
-    pending_chars: &mut usize,
+#[derive(Default)]
+struct PreparedCassDocumentBatch {
+    docs: Vec<FsCassDocument>,
+}
+
+fn cass_document_for_message(
     context: &CassDocContext,
     msg: &NormalizedMessage,
-) {
+) -> Option<FsCassDocument> {
     if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
-        return;
+        return None;
     }
 
-    docs.push(FsCassDocument {
+    Some(FsCassDocument {
         agent: context.agent.clone(),
         workspace: context.workspace.clone(),
         workspace_original: context.workspace_original.clone(),
@@ -165,8 +169,71 @@ fn append_cass_document_for_message(
         source_id: context.source_id.clone(),
         origin_kind: context.origin_kind.clone(),
         origin_host: context.origin_host.clone(),
-    });
-    *pending_chars = pending_chars.saturating_add(msg.content.len());
+    })
+}
+
+fn build_cass_documents_for_message_slice_serial(
+    context: &CassDocContext,
+    messages: &[NormalizedMessage],
+) -> PreparedCassDocumentBatch {
+    let docs = messages
+        .iter()
+        .filter_map(|msg| cass_document_for_message(context, msg))
+        .collect();
+    PreparedCassDocumentBatch { docs }
+}
+
+fn build_cass_documents_for_message_slice(
+    context: &CassDocContext,
+    messages: &[NormalizedMessage],
+) -> PreparedCassDocumentBatch {
+    const PARALLEL_MESSAGE_THRESHOLD: usize = 256;
+
+    if messages.len() < PARALLEL_MESSAGE_THRESHOLD {
+        return build_cass_documents_for_message_slice_serial(context, messages);
+    }
+
+    let docs = messages
+        .par_iter()
+        .map(|msg| cass_document_for_message(context, msg))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect();
+    PreparedCassDocumentBatch { docs }
+}
+
+fn build_cass_documents_for_conversations(
+    conversations: Vec<(&NormalizedConversation, Option<i64>)>,
+) -> Vec<PreparedCassDocumentBatch> {
+    const PARALLEL_CONVERSATION_THRESHOLD: usize = 8;
+    const PARALLEL_MESSAGE_THRESHOLD: usize = 256;
+
+    let total_messages: usize = conversations
+        .iter()
+        .map(|(conv, _)| conv.messages.len())
+        .sum();
+    let build_one = |(conv, conversation_id): (&NormalizedConversation, Option<i64>)| {
+        let context = cass_doc_context(conv, conversation_id);
+        build_cass_documents_for_message_slice_serial(&context, &conv.messages)
+    };
+
+    if conversations.len() < PARALLEL_CONVERSATION_THRESHOLD
+        || total_messages < PARALLEL_MESSAGE_THRESHOLD
+    {
+        return conversations.into_iter().map(build_one).collect();
+    }
+
+    conversations.into_par_iter().map(build_one).collect()
+}
+
+fn push_cass_document_into_pending(
+    docs: &mut Vec<FsCassDocument>,
+    pending_chars: &mut usize,
+    doc: FsCassDocument,
+) {
+    *pending_chars = pending_chars.saturating_add(doc.content.len());
+    docs.push(doc);
 }
 
 /// Returns true if the given stored hash matches the current schema hash.
@@ -275,8 +342,8 @@ impl TantivyIndex {
         let mut docs: Vec<FsCassDocument> = Vec::new();
         let mut pending_chars = 0usize;
 
-        for msg in messages {
-            append_cass_document_for_message(&mut docs, &mut pending_chars, &context, msg);
+        for doc in build_cass_documents_for_message_slice(&context, messages).docs {
+            push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
             if docs.len() >= max_messages || pending_chars >= max_chars {
                 let flushed_docs = docs.len();
                 self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
@@ -305,10 +372,9 @@ impl TantivyIndex {
         let mut pending_chars = 0usize;
         let mut indexed_docs = 0usize;
 
-        for (conv, conversation_id) in conversations {
-            let context = cass_doc_context(conv, conversation_id);
-            for msg in &conv.messages {
-                append_cass_document_for_message(&mut docs, &mut pending_chars, &context, msg);
+        for batch in build_cass_documents_for_conversations(conversations.into_iter().collect()) {
+            for doc in batch.docs {
+                push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
                 if docs.len() >= max_messages || pending_chars >= max_chars {
                     indexed_docs = indexed_docs.saturating_add(docs.len());
                     self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;

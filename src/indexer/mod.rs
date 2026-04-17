@@ -603,6 +603,15 @@ fn lexical_rebuild_db_state_matches(
     saved: &LexicalRebuildDbState,
     current: &LexicalRebuildDbState,
 ) -> bool {
+    saved.total_conversations == current.total_conversations
+        && saved.storage_fingerprint == current.storage_fingerprint
+        && lexical_rebuild_db_paths_match(&saved.db_path, &current.db_path)
+}
+
+fn lexical_rebuild_db_state_matches_legacy(
+    saved: &LexicalRebuildDbState,
+    current: &LexicalRebuildDbState,
+) -> bool {
     let messages_match = saved.total_messages == 0
         || current.total_messages == 0
         || saved.total_messages == current.total_messages;
@@ -962,9 +971,16 @@ impl LexicalRebuildState {
     }
 
     fn matches_run(&self, db: &LexicalRebuildDbState, _page_size: i64) -> bool {
+        let db_matches = if self.db.storage_fingerprint.starts_with("content-v1:")
+            && db.storage_fingerprint.starts_with("content-v1:")
+        {
+            lexical_rebuild_db_state_matches(&self.db, db)
+        } else {
+            lexical_rebuild_db_state_matches_legacy(&self.db, db)
+        };
         self.version == LEXICAL_REBUILD_STATE_VERSION
             && self.schema_hash == crate::search::tantivy::SCHEMA_HASH
-            && lexical_rebuild_db_state_matches(&self.db, db)
+            && db_matches
             && lexical_rebuild_page_size_is_compatible(self.page_size)
     }
 
@@ -1577,30 +1593,36 @@ fn persist_pending_lexical_rebuild_progress(
     persist_lexical_rebuild_state(index_path, state)
 }
 
-fn metadata_stamp(path: &Path) -> Result<(u64, i64)> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("reading metadata for {}", path.display()))?;
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|ts| ts.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    Ok((metadata.len(), modified_ms))
+fn lexical_rebuild_content_fingerprint(
+    storage: &FrankenStorage,
+    total_conversations: usize,
+) -> Result<String> {
+    let (max_conversation_id, max_message_id): (i64, i64) = storage
+        .raw()
+        .query_row_map(
+            "SELECT \
+                COALESCE((SELECT MAX(id) FROM conversations), 0), \
+                COALESCE((SELECT MAX(id) FROM messages), 0)",
+            &[] as &[ParamValue],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .context("computing lexical rebuild content fingerprint")?;
+    Ok(format!(
+        "content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}"
+    ))
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-    let (db_len, db_mtime_ms) = metadata_stamp(db_path)?;
-    let (wal_len, wal_mtime_ms) = match fs::metadata(&wal_path) {
-        Ok(_) => metadata_stamp(&wal_path)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading metadata for {}", wal_path.display()));
-        }
-    };
-    Ok(format!("{db_len}:{db_mtime_ms}:{wal_len}:{wal_mtime_ms}"))
+    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening readonly storage to compute lexical fingerprint for {}",
+            db_path.display()
+        )
+    })?;
+    let total_conversations = count_total_conversations_exact(&storage)?;
+    let fingerprint = lexical_rebuild_content_fingerprint(&storage, total_conversations)?;
+    storage.close_best_effort_in_place();
+    Ok(fingerprint)
 }
 
 fn count_total_conversations_exact(storage: &FrankenStorage) -> Result<usize> {
@@ -1644,6 +1666,16 @@ struct IncrementalCanonicalLexicalRepairContext {
     canonical_messages: usize,
     tantivy_requires_rebuild: bool,
     observed_tantivy_docs: Option<usize>,
+}
+
+fn should_evaluate_incremental_canonical_lexical_repair(
+    context: &IncrementalCanonicalLexicalRepairContext,
+) -> bool {
+    !context.full_refresh
+        && !context.force_rebuild
+        && !context.resume_lexical_rebuild
+        && !context.targeted_watch_once_only
+        && context.salvage_messages_imported == 0
 }
 
 fn choose_incremental_canonical_lexical_repair_plan(
@@ -1715,7 +1747,6 @@ fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i6
         )
         .context(format!("counting meta rows matching {pattern}"))
 }
-
 fn full_rebuild_requires_historical_restart(
     storage: &FrankenStorage,
     db_path: &Path,
@@ -1747,13 +1778,14 @@ fn lexical_rebuild_db_state(
     storage: &FrankenStorage,
     db_path: &Path,
 ) -> Result<LexicalRebuildDbState> {
+    let total_conversations = count_total_conversations_exact(storage)?;
     Ok(LexicalRebuildDbState {
         db_path: crate::normalize_path_identity(db_path)
             .to_string_lossy()
             .into_owned(),
-        total_conversations: count_total_conversations_exact(storage)?,
-        total_messages: count_total_messages_exact(storage)?,
-        storage_fingerprint: lexical_rebuild_storage_fingerprint(db_path)?,
+        total_conversations,
+        total_messages: 0,
+        storage_fingerprint: lexical_rebuild_content_fingerprint(storage, total_conversations)?,
     })
 }
 
@@ -1766,7 +1798,6 @@ fn has_pending_lexical_rebuild(
     };
     Ok(state.matches_run(db_state, LEXICAL_REBUILD_PAGE_SIZE) && state.is_incomplete())
 }
-
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct LexicalRebuildSnapshot {
@@ -3436,18 +3467,24 @@ pub fn run_index(
         }
         let rebuild_from_canonical_only =
             canonical_only_full_rebuild && historical_salvage.conversations_imported == 0;
-        let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0 {
+        let repair_context = IncrementalCanonicalLexicalRepairContext {
+            full_refresh: opts.full,
+            force_rebuild: opts.force_rebuild,
+            resume_lexical_rebuild,
+            targeted_watch_once_only,
+            salvage_messages_imported: historical_salvage.messages_imported,
+            canonical_messages: 0,
+            tantivy_requires_rebuild,
+            observed_tantivy_docs,
+        };
+        let incremental_canonical_lexical_repair = if canonical_sessions_before_salvage > 0
+            && should_evaluate_incremental_canonical_lexical_repair(&repair_context)
+        {
             let canonical_messages = count_total_messages_exact(&storage)?;
             choose_incremental_canonical_lexical_repair_plan(
                 IncrementalCanonicalLexicalRepairContext {
-                    full_refresh: opts.full,
-                    force_rebuild: opts.force_rebuild,
-                    resume_lexical_rebuild,
-                    targeted_watch_once_only,
-                    salvage_messages_imported: historical_salvage.messages_imported,
                     canonical_messages,
-                    tantivy_requires_rebuild,
-                    observed_tantivy_docs,
+                    ..repair_context
                 },
             )
         } else {
@@ -7649,6 +7686,62 @@ pub mod persist {
         }
 
         #[test]
+        fn incremental_canonical_lexical_repair_short_circuits_when_full_or_force_paths_apply() {
+            let base = crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                full_refresh: false,
+                force_rebuild: false,
+                resume_lexical_rebuild: false,
+                targeted_watch_once_only: false,
+                salvage_messages_imported: 0,
+                canonical_messages: 0,
+                tantivy_requires_rebuild: true,
+                observed_tantivy_docs: None,
+            };
+
+            assert!(crate::indexer::should_evaluate_incremental_canonical_lexical_repair(&base));
+            assert!(
+                !crate::indexer::should_evaluate_incremental_canonical_lexical_repair(
+                    &crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        full_refresh: true,
+                        ..base
+                    }
+                )
+            );
+            assert!(
+                !crate::indexer::should_evaluate_incremental_canonical_lexical_repair(
+                    &crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        force_rebuild: true,
+                        ..base
+                    }
+                )
+            );
+            assert!(
+                !crate::indexer::should_evaluate_incremental_canonical_lexical_repair(
+                    &crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        resume_lexical_rebuild: true,
+                        ..base
+                    }
+                )
+            );
+            assert!(
+                !crate::indexer::should_evaluate_incremental_canonical_lexical_repair(
+                    &crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        targeted_watch_once_only: true,
+                        ..base
+                    }
+                )
+            );
+            assert!(
+                !crate::indexer::should_evaluate_incremental_canonical_lexical_repair(
+                    &crate::indexer::IncrementalCanonicalLexicalRepairContext {
+                        salvage_messages_imported: 1,
+                        ..base
+                    }
+                )
+            );
+        }
+
+        #[test]
         fn incremental_canonical_lexical_repair_plan_prefers_authoritative_db_for_invalid_tantivy()
         {
             assert_eq!(
@@ -11510,18 +11603,18 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_rejects_resume_when_total_messages_change() {
+    fn lexical_rebuild_rejects_resume_when_content_fingerprint_changes() {
         let checkpoint_db_state = LexicalRebuildDbState {
             db_path: "/tmp/agent_search.db".to_string(),
             total_conversations: 400,
-            total_messages: 800,
-            storage_fingerprint: "seed:400".to_string(),
+            total_messages: 0,
+            storage_fingerprint: "content-v1:400:1200:4800".to_string(),
         };
         let current_db_state = LexicalRebuildDbState {
             db_path: "/tmp/agent_search.db".to_string(),
             total_conversations: 400,
-            total_messages: 801,
-            storage_fingerprint: "seed:401".to_string(),
+            total_messages: 0,
+            storage_fingerprint: "content-v1:400:1200:4801".to_string(),
         };
         let state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
 
@@ -11634,9 +11727,9 @@ mod tests {
             "pending indexed doc counts should stay visible to status/health readers"
         );
     }
-
     #[test]
-    fn refresh_completed_lexical_rebuild_checkpoint_updates_fingerprint_and_totals() {
+    fn refresh_completed_lexical_rebuild_checkpoint_preserves_content_fingerprint_across_meta_only_writes()
+     {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -11715,7 +11808,10 @@ mod tests {
             .set_last_indexed_at(FrankenStorage::now_millis())
             .unwrap();
         let changed_fingerprint = lexical_rebuild_storage_fingerprint(&db_path).unwrap();
-        assert_ne!(original_fingerprint, changed_fingerprint);
+        assert_eq!(
+            original_fingerprint, changed_fingerprint,
+            "meta-only writes should not churn the lexical content fingerprint"
+        );
 
         refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
 
@@ -11723,10 +11819,7 @@ mod tests {
             .unwrap()
             .expect("refreshed checkpoint");
         assert!(checkpoint.completed);
-        assert_ne!(
-            checkpoint.storage_fingerprint, original_fingerprint,
-            "checkpoint refresh should replace the stale storage fingerprint"
-        );
+        assert_eq!(checkpoint.storage_fingerprint, original_fingerprint);
         assert_eq!(checkpoint.total_conversations, total_conversations);
         assert_eq!(checkpoint.processed_conversations, total_conversations);
         assert_eq!(
