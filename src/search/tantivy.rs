@@ -68,11 +68,104 @@ fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
 }
 
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
-const TANTIVY_ADD_BATCH_MAX_MESSAGES: usize = 512;
-const TANTIVY_ADD_BATCH_MAX_CHARS: usize = 1024 * 1024;
+
+fn tantivy_add_batch_max_messages() -> usize {
+    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4_096)
+}
+
+fn tantivy_add_batch_max_chars() -> usize {
+    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_CHARS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16 * 1024 * 1024)
+}
 
 fn map_fs_err(err: frankensearch::SearchError) -> Error {
     Error::new(err)
+}
+
+#[derive(Clone)]
+struct CassDocContext {
+    agent: String,
+    workspace: Option<String>,
+    workspace_original: Option<String>,
+    source_path: String,
+    title: Option<String>,
+    started_at_fallback: Option<i64>,
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+    conversation_id: Option<i64>,
+}
+
+fn cass_doc_context(conv: &NormalizedConversation, conversation_id: Option<i64>) -> CassDocContext {
+    let cass_origin = conv.metadata.get("cass").and_then(|c| c.get("origin"));
+    let raw_source_id = cass_origin
+        .and_then(|o| o.get("source_id"))
+        .and_then(|v| v.as_str());
+    let raw_origin_kind = cass_origin
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str());
+    let origin_host = normalized_index_origin_host(
+        cass_origin
+            .and_then(|o| o.get("host"))
+            .and_then(|v| v.as_str()),
+    );
+    let source_id = normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
+    let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
+
+    CassDocContext {
+        agent: conv.agent_slug.clone(),
+        workspace: conv
+            .workspace
+            .as_ref()
+            .map(|ws| ws.to_string_lossy().to_string()),
+        workspace_original: conv
+            .metadata
+            .get("cass")
+            .and_then(|c| c.get("workspace_original"))
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        source_path: conv.source_path.to_string_lossy().to_string(),
+        title: conv.title.clone(),
+        started_at_fallback: conv.started_at,
+        source_id,
+        origin_kind,
+        origin_host,
+        conversation_id,
+    }
+}
+
+fn append_cass_document_for_message(
+    docs: &mut Vec<FsCassDocument>,
+    pending_chars: &mut usize,
+    context: &CassDocContext,
+    msg: &NormalizedMessage,
+) {
+    if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+        return;
+    }
+
+    docs.push(FsCassDocument {
+        agent: context.agent.clone(),
+        workspace: context.workspace.clone(),
+        workspace_original: context.workspace_original.clone(),
+        source_path: context.source_path.clone(),
+        msg_idx: msg.idx.max(0) as u64,
+        created_at: msg.created_at.or(context.started_at_fallback),
+        title: context.title.clone(),
+        content: msg.content.clone(),
+        conversation_id: context.conversation_id,
+        source_id: context.source_id.clone(),
+        origin_kind: context.origin_kind.clone(),
+        origin_host: context.origin_host.clone(),
+    });
+    *pending_chars = pending_chars.saturating_add(msg.content.len());
 }
 
 /// Returns true if the given stored hash matches the current schema hash.
@@ -175,62 +268,15 @@ impl TantivyIndex {
     where
         F: FnMut(usize) -> Result<()>,
     {
-        // Provenance fields (P3.x): default to local, but honor metadata injected by indexer.
-        let cass_origin = conv.metadata.get("cass").and_then(|c| c.get("origin"));
-        let raw_source_id = cass_origin
-            .and_then(|o| o.get("source_id"))
-            .and_then(|v| v.as_str());
-        let raw_origin_kind = cass_origin
-            .and_then(|o| o.get("kind"))
-            .and_then(|v| v.as_str());
-        let origin_host = normalized_index_origin_host(
-            cass_origin
-                .and_then(|o| o.get("host"))
-                .and_then(|v| v.as_str()),
-        );
-        let source_id =
-            normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
-        let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
-
-        let source_path = conv.source_path.to_string_lossy().to_string();
-        let workspace = conv
-            .workspace
-            .as_ref()
-            .map(|ws| ws.to_string_lossy().to_string());
-        let workspace_original = conv
-            .metadata
-            .get("cass")
-            .and_then(|c| c.get("workspace_original"))
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned);
-        let title = conv.title.clone();
-        let started_at_fallback = conv.started_at;
-
+        let context = cass_doc_context(conv, conversation_id);
+        let max_messages = tantivy_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
         let mut docs: Vec<FsCassDocument> = Vec::new();
         let mut pending_chars = 0usize;
-        for msg in messages {
-            if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
-                continue;
-            }
-            docs.push(FsCassDocument {
-                agent: conv.agent_slug.clone(),
-                workspace: workspace.clone(),
-                workspace_original: workspace_original.clone(),
-                source_path: source_path.clone(),
-                msg_idx: msg.idx.max(0) as u64,
-                created_at: msg.created_at.or(started_at_fallback),
-                title: title.clone(),
-                content: msg.content.clone(),
-                conversation_id,
-                source_id: source_id.clone(),
-                origin_kind: origin_kind.clone(),
-                origin_host: origin_host.clone(),
-            });
-            pending_chars = pending_chars.saturating_add(msg.content.len());
 
-            if docs.len() >= TANTIVY_ADD_BATCH_MAX_MESSAGES
-                || pending_chars >= TANTIVY_ADD_BATCH_MAX_CHARS
-            {
+        for msg in messages {
+            append_cass_document_for_message(&mut docs, &mut pending_chars, &context, msg);
+            if docs.len() >= max_messages || pending_chars >= max_chars {
                 let flushed_docs = docs.len();
                 self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
                 on_batch_flushed(flushed_docs)?;
@@ -246,6 +292,37 @@ impl TantivyIndex {
             self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
             on_batch_flushed(flushed_docs)
         }
+    }
+
+    pub fn add_conversations_with_ids<'a, I>(&mut self, conversations: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (&'a NormalizedConversation, Option<i64>)>,
+    {
+        let max_messages = tantivy_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut docs: Vec<FsCassDocument> = Vec::new();
+        let mut pending_chars = 0usize;
+        let mut indexed_docs = 0usize;
+
+        for (conv, conversation_id) in conversations {
+            let context = cass_doc_context(conv, conversation_id);
+            for msg in &conv.messages {
+                append_cass_document_for_message(&mut docs, &mut pending_chars, &context, msg);
+                if docs.len() >= max_messages || pending_chars >= max_chars {
+                    indexed_docs = indexed_docs.saturating_add(docs.len());
+                    self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                    docs.clear();
+                    pending_chars = 0;
+                }
+            }
+        }
+
+        if !docs.is_empty() {
+            indexed_docs = indexed_docs.saturating_add(docs.len());
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+        }
+
+        Ok(indexed_docs)
     }
 }
 
