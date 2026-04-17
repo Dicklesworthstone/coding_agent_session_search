@@ -5177,6 +5177,73 @@ fn format_timestamp_millis_rfc3339(ts: i64) -> Option<String> {
     chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
 }
 
+pub(crate) fn normalize_path_identity(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let lexical = {
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    let can_pop = normalized
+                        .components()
+                        .next_back()
+                        .is_some_and(|tail| matches!(tail, std::path::Component::Normal(_)));
+                    if can_pop {
+                        normalized.pop();
+                    } else {
+                        normalized.push(component.as_os_str());
+                    }
+                }
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    normalized.push(component.as_os_str());
+                }
+                std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    };
+    std::fs::canonicalize(&lexical).unwrap_or_else(|_| {
+        let mut suffix = Vec::new();
+        let mut cursor = lexical.as_path();
+        loop {
+            match std::fs::canonicalize(cursor) {
+                Ok(prefix) => {
+                    let mut resolved = prefix;
+                    for component in suffix.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return resolved;
+                }
+                Err(_) => {
+                    let Some(name) = cursor.file_name() else {
+                        return lexical.clone();
+                    };
+                    suffix.push(name.to_os_string());
+                    let Some(parent) = cursor.parent() else {
+                        return lexical.clone();
+                    };
+                    cursor = parent;
+                }
+            }
+        }
+    })
+}
+
+pub(crate) fn path_identities_match(lhs: &Path, rhs: &Path) -> bool {
+    normalize_path_identity(lhs) == normalize_path_identity(rhs)
+}
+
+pub(crate) fn stored_path_identity_matches(saved: &str, current: &Path) -> bool {
+    path_identities_match(Path::new(saved), current)
+}
+
 fn read_index_run_lock_snapshot(
     data_dir: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
@@ -5188,7 +5255,11 @@ fn probe_index_run_lock(
     db_path: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
     let snapshot = read_index_run_lock_snapshot(data_dir);
-    if snapshot.db_path.as_deref() != Some(db_path) {
+    if snapshot
+        .db_path
+        .as_deref()
+        .is_none_or(|lock_db_path| !path_identities_match(lock_db_path, db_path))
+    {
         return crate::search::asset_state::SearchMaintenanceSnapshot::default();
     }
     snapshot
@@ -5337,6 +5408,7 @@ fn state_meta_json(
                     db_matches: None,
                     schema_matches: None,
                     page_size_matches: None,
+                    page_size_compatible: None,
                 },
             },
             semantic: crate::search::asset_state::SemanticAssetState {
@@ -5437,6 +5509,7 @@ fn state_meta_json(
                 "db_matches": lexical.checkpoint.db_matches,
                 "schema_matches": lexical.checkpoint.schema_matches,
                 "page_size_matches": lexical.checkpoint.page_size_matches,
+                "page_size_compatible": lexical.checkpoint.page_size_compatible,
             }
         },
         "database": {
@@ -6840,6 +6913,7 @@ fn run_cli_search(
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
     let tantivy_index_initialized = index_path.join("meta.json").exists();
+    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
     let client = SearchClient::open_with_options(
         &index_path,
@@ -6857,7 +6931,15 @@ fn run_cli_search(
         retryable: true,
     })?
     .ok_or_else(|| {
-        let (message, hint) = if cass_not_initialized(db_exists, tantivy_index_initialized, false) {
+        let (message, hint) = if rebuild_active && !tantivy_index_initialized {
+            (
+                format!(
+                    "cass is already building the initial search index in {}. Search will become available when that index run finishes.",
+                    data_dir.display()
+                ),
+                Some("Wait for the active 'cass index' run to finish, or inspect progress with 'cass status --json'.".to_string()),
+            )
+        } else if cass_not_initialized(db_exists, tantivy_index_initialized, rebuild_active) {
             (
                 format!(
                     "cass has not been initialized in {} yet, so search cannot run until the first index completes.",
@@ -10675,6 +10757,102 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn state_meta_json_matches_active_rebuild_for_equivalent_db_path_spellings() {
+        let (temp, db_path) = seed_cli_db();
+        let db_path_variant = temp.path().join(".").join("agent_search.db");
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}
+started_at_ms={}
+db_path={}
+mode=index",
+            std::process::id(),
+            1_733_000_556_000_i64,
+            db_path_variant.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+    }
+
+    #[test]
+    fn state_meta_json_matches_active_rebuild_for_equivalent_missing_db_path_spellings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let db_path_variant = temp.path().join(".").join("agent_search.db");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}
+started_at_ms={}
+db_path={}
+mode=index",
+            std::process::id(),
+            1_733_000_557_000_i64,
+            db_path_variant.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["exists"].as_bool(), Some(false));
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pid"].as_u64(),
+            Some(std::process::id() as u64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_path_identity_resolves_existing_symlink_parent_for_missing_leaf() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let real_dir = temp.path().join("real");
+        std::fs::create_dir_all(&real_dir).expect("real dir");
+        let alias_dir = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).expect("symlink");
+
+        let via_symlink = alias_dir.join("agent_search.db");
+        let via_real_dir = real_dir.join("agent_search.db");
+
+        assert_eq!(
+            normalize_path_identity(&via_symlink),
+            normalize_path_identity(&via_real_dir)
+        );
+        assert!(path_identities_match(&via_symlink, &via_real_dir));
+    }
+
+    #[test]
     fn state_meta_json_reports_active_rebuild_before_lexical_snapshot_exists() {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
@@ -11468,7 +11646,13 @@ fn run_doctor(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let index_meta_path = index_path.join("meta.json");
     let lock_path = data_dir.join(".index.lock");
+    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
+    let not_initialized =
+        !fix && cass_not_initialized(db_path.exists(), index_meta_path.exists(), rebuild_active);
+    let explanation = not_initialized.then(|| cass_not_initialized_explanation(&data_dir));
+    let recommended_action = not_initialized.then(cass_not_initialized_recommended_action);
 
     // Track all checks and their results
     #[derive(serde::Serialize)]
@@ -11502,7 +11686,17 @@ fn run_doctor(
     }
 
     // 1. Check data directory exists and is writable
-    if data_dir.exists() {
+    if !data_dir.exists() && not_initialized {
+        add_check!(
+            "data_directory",
+            "pass",
+            format!(
+                "Data directory not created yet: {} (it will be created on the first index run)",
+                data_dir.display()
+            ),
+            false
+        );
+    } else if data_dir.exists() {
         if std::fs::metadata(&data_dir)
             .map(|m| !m.permissions().readonly())
             .unwrap_or(false)
@@ -11726,13 +11920,20 @@ fn run_doctor(
                 needs_rebuild = true;
             }
         }
+    } else if not_initialized {
+        add_check!(
+            "database",
+            "warn",
+            "Database not initialized yet - no archive has been created in this data dir",
+            false
+        );
     } else {
         add_check!("database", "fail", "Database not found", true);
         needs_rebuild = true;
     }
 
     // 4. Check Tantivy index exists and is readable
-    if index_path.join("meta.json").exists() {
+    if index_meta_path.exists() {
         match frankensearch::lexical::cass_open_search_reader(
             &index_path,
             frankensearch::lexical::ReloadPolicy::Manual,
@@ -11779,6 +11980,13 @@ fn run_doctor(
                 needs_rebuild = true;
             }
         }
+    } else if not_initialized {
+        add_check!(
+            "index",
+            "warn",
+            "Search index not initialized yet - run the first index to build Tantivy metadata",
+            false
+        );
     } else {
         add_check!("index", "fail", "Search index not found", true);
         needs_rebuild = true;
@@ -12103,6 +12311,14 @@ fn run_doctor(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let all_pass = checks.iter().all(|c| c.status == "pass");
+    let healthy = fail_count == 0 && !not_initialized;
+    let doctor_status = if not_initialized {
+        "not_initialized"
+    } else if fail_count == 0 {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
 
     // Output
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -12115,7 +12331,11 @@ fn run_doctor(
 
     if let Some(fmt) = structured_format {
         let payload = serde_json::json!({
-            "healthy": fail_count == 0,
+            "status": doctor_status,
+            "healthy": healthy,
+            "initialized": !not_initialized,
+            "explanation": explanation,
+            "recommended_action": recommended_action,
             "issues_found": issues_found,
             "issues_fixed": issues_fixed,
             "failures": fail_count,
@@ -12168,7 +12388,15 @@ fn run_doctor(
         }
 
         println!();
-        if all_pass {
+        if not_initialized {
+            println!("{} Not initialized yet ({elapsed_ms}ms)", "○".yellow());
+            if let Some(explanation) = &explanation {
+                println!("  {explanation}");
+            }
+            if let Some(action) = &recommended_action {
+                println!("  {action}");
+            }
+        } else if all_pass {
             println!("{} All checks passed ({elapsed_ms}ms)", "✓".green());
         } else {
             let summary_icon = if fail_count > 0 {

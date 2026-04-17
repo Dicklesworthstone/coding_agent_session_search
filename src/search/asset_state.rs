@@ -12,7 +12,8 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 
 use crate::indexer::{
-    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint, lexical_storage_fingerprint_for_db,
+    LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
+    lexical_rebuild_page_size_is_compatible, lexical_storage_fingerprint_for_db,
     load_lexical_rebuild_checkpoint,
 };
 use crate::search::ann_index::hnsw_index_path;
@@ -261,6 +262,7 @@ pub(crate) struct LexicalCheckpointState {
     pub db_matches: Option<bool>,
     pub schema_matches: Option<bool>,
     pub page_size_matches: Option<bool>,
+    pub page_size_compatible: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,17 +478,20 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         current_db_fingerprint,
     } = input;
     let exists = index_path.join("meta.json").exists();
-    let checkpoint_db_matches = checkpoint.map(|state| state.db_path == db_path.to_string_lossy());
+    let checkpoint_db_matches =
+        checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
     let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
     let page_size_matches =
         checkpoint.map(|state| state.page_size == LEXICAL_REBUILD_PAGE_SIZE_PUBLIC);
+    let page_size_compatible =
+        checkpoint.map(|state| lexical_rebuild_page_size_is_compatible(state.page_size));
     let checkpoint_fingerprint = checkpoint.map(|state| state.storage_fingerprint.as_str());
     let fingerprint_matches = match (current_db_fingerprint, checkpoint_fingerprint) {
         (Some(current), Some(saved)) => Some(lexical_storage_fingerprints_match(current, saved)),
         _ => None,
     };
     let checkpoint_incomplete = checkpoint.is_some_and(|state| !state.completed);
-    let contract_mismatch = schema_matches == Some(false) || page_size_matches == Some(false);
+    let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
     let fingerprint_mismatch = fingerprint_matches == Some(false);
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
@@ -497,7 +502,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let maintenance_targets_current_db = maintenance
         .db_path
         .as_ref()
-        .is_none_or(|lock_db_path| lock_db_path == db_path);
+        .is_none_or(|lock_db_path| crate::path_identities_match(lock_db_path, db_path));
     let watch_active = maintenance.active
         && maintenance_targets_current_db
         && maintenance
@@ -542,7 +547,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let checkpoint_progress_usable = checkpoint.is_some()
         && checkpoint_db_matches == Some(true)
         && schema_matches == Some(true)
-        && page_size_matches == Some(true)
+        && page_size_compatible == Some(true)
         && if active_rebuild_progress {
             true
         } else {
@@ -602,6 +607,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
             db_matches: checkpoint_db_matches,
             schema_matches,
             page_size_matches,
+            page_size_compatible,
         },
     }
 }
@@ -974,7 +980,7 @@ mod tests {
             processed_conversations: 4,
             indexed_docs: 20,
             schema_hash: SCHEMA_HASH.to_string(),
-            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            page_size: 200,
             completed: false,
             updated_at_ms: 1_733_000_123_000,
         };
@@ -1008,9 +1014,60 @@ mod tests {
         assert_eq!(state.processed_conversations, Some(4));
         assert_eq!(state.total_conversations, Some(10));
         assert_eq!(state.indexed_docs, Some(20));
+        assert_eq!(state.checkpoint.page_size_matches, Some(false));
+        assert_eq!(state.checkpoint.page_size_compatible, Some(true));
         assert_eq!(
             state.status_reason.as_deref(),
             Some("lexical rebuild is in progress")
+        );
+    }
+
+    #[test]
+    fn lexical_state_hides_progress_for_incompatible_page_size_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "before".to_string(),
+            committed_offset: 4,
+            processed_conversations: 4,
+            indexed_docs: 20,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: 13,
+            completed: false,
+            updated_at_ms: 1_733_000_123_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("before"),
+        });
+
+        assert_eq!(state.status, "stale");
+        assert!(state.stale);
+        assert_eq!(state.pending_sessions, 0);
+        assert_eq!(state.processed_conversations, None);
+        assert_eq!(state.total_conversations, None);
+        assert_eq!(state.indexed_docs, None);
+        assert_eq!(state.checkpoint.page_size_matches, Some(false));
+        assert_eq!(state.checkpoint.page_size_compatible, Some(false));
+        assert!(
+            state
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("contract"))
         );
     }
 

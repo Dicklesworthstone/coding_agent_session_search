@@ -584,7 +584,28 @@ const LEXICAL_REBUILD_STATE_VERSION: u8 = 2;
 // in-flight rebuild from offset 0. That's acceptable given the 5–10×
 // throughput gain this batch-size change unlocks.
 const LEXICAL_REBUILD_PAGE_SIZE: i64 = 1024;
+const LEXICAL_REBUILD_LEGACY_COMPAT_PAGE_SIZE: i64 = 200;
 pub(crate) const LEXICAL_REBUILD_PAGE_SIZE_PUBLIC: i64 = LEXICAL_REBUILD_PAGE_SIZE;
+
+pub(crate) fn lexical_rebuild_page_size_is_compatible(page_size: i64) -> bool {
+    page_size == LEXICAL_REBUILD_PAGE_SIZE || page_size == LEXICAL_REBUILD_LEGACY_COMPAT_PAGE_SIZE
+}
+
+fn lexical_rebuild_db_paths_match(saved: &str, current: &str) -> bool {
+    crate::path_identities_match(Path::new(saved), Path::new(current))
+}
+
+fn lexical_rebuild_db_state_matches(
+    saved: &LexicalRebuildDbState,
+    current: &LexicalRebuildDbState,
+) -> bool {
+    let messages_match = saved.total_messages == 0
+        || current.total_messages == 0
+        || saved.total_messages == current.total_messages;
+    saved.total_conversations == current.total_conversations
+        && messages_match
+        && lexical_rebuild_db_paths_match(&saved.db_path, &current.db_path)
+}
 
 #[derive(Debug)]
 struct IndexRunLockGuard {
@@ -804,6 +825,8 @@ fn maintenance_job_kind_for_mode(_mode: SearchMaintenanceMode) -> SearchMaintena
 struct LexicalRebuildDbState {
     db_path: String,
     total_conversations: usize,
+    #[serde(default)]
+    total_messages: usize,
     storage_fingerprint: String,
 }
 
@@ -849,11 +872,11 @@ impl LexicalRebuildState {
         }
     }
 
-    fn matches_run(&self, db: &LexicalRebuildDbState, page_size: i64) -> bool {
+    fn matches_run(&self, db: &LexicalRebuildDbState, _page_size: i64) -> bool {
         self.version == LEXICAL_REBUILD_STATE_VERSION
             && self.schema_hash == crate::search::tantivy::SCHEMA_HASH
-            && &self.db == db
-            && self.page_size == page_size
+            && lexical_rebuild_db_state_matches(&self.db, db)
+            && lexical_rebuild_page_size_is_compatible(self.page_size)
     }
 
     fn record_pending_commit(
@@ -947,7 +970,7 @@ fn acquire_index_run_lock(
         _path: lock_path,
         started_at_ms: FrankenStorage::now_millis(),
         updated_at_ms: FrankenStorage::now_millis(),
-        db_path: db_path.to_path_buf(),
+        db_path: crate::normalize_path_identity(db_path),
         job_id: String::new(),
         job_kind: maintenance_job_kind_for_mode(mode),
         metadata_write_lock: Arc::new(Mutex::new(())),
@@ -1066,6 +1089,57 @@ fn lexical_rebuild_batch_fetch_message_bytes_limit() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(128 * 1024 * 1024)
+}
+
+fn lexical_rebuild_sql_batch_fetch_conversation_limit(
+    batch_fetch_conversation_limit: usize,
+) -> usize {
+    dotenvy::var("CASS_TANTIVY_REBUILD_SQL_BATCH_FETCH_CONVERSATIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32)
+        .min(batch_fetch_conversation_limit.max(1))
+}
+
+fn fetch_messages_for_lexical_rebuild_batch_chunked(
+    storage: &FrankenStorage,
+    conversation_ids: &[i64],
+    max_messages: Option<usize>,
+    max_content_bytes: Option<usize>,
+    sql_batch_fetch_conversation_limit: usize,
+) -> Result<HashMap<i64, Vec<crate::model::types::Message>>> {
+    if conversation_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut grouped: HashMap<i64, Vec<crate::model::types::Message>> =
+        HashMap::with_capacity(conversation_ids.len());
+    let mut total_messages = 0usize;
+    let mut total_content_bytes = 0usize;
+
+    for conversation_id_chunk in conversation_ids.chunks(sql_batch_fetch_conversation_limit.max(1)) {
+        let remaining_messages = max_messages.map(|limit| limit.saturating_sub(total_messages));
+        let remaining_content_bytes =
+            max_content_bytes.map(|limit| limit.saturating_sub(total_content_bytes));
+        let fetched = storage.fetch_messages_for_lexical_rebuild_batch(
+            conversation_id_chunk,
+            remaining_messages,
+            remaining_content_bytes,
+        )?;
+        for (conversation_id, messages) in fetched {
+            total_messages = total_messages.saturating_add(messages.len());
+            total_content_bytes = total_content_bytes.saturating_add(
+                messages
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>(),
+            );
+            grouped.insert(conversation_id, messages);
+        }
+    }
+
+    Ok(grouped)
 }
 
 fn should_commit_lexical_rebuild(
@@ -1230,6 +1304,24 @@ fn reconcile_pending_lexical_commit(
     }
     persist_lexical_rebuild_state(index_path, &state)?;
     Ok(state)
+}
+
+fn normalize_lexical_rebuild_state_for_current_run(
+    index_path: &Path,
+    state: &mut LexicalRebuildState,
+) -> Result<()> {
+    if state.page_size == LEXICAL_REBUILD_PAGE_SIZE {
+        return Ok(());
+    }
+    if !lexical_rebuild_page_size_is_compatible(state.page_size) {
+        anyhow::bail!(
+            "refusing to normalize incompatible lexical rebuild checkpoint page_size={} at {}",
+            state.page_size,
+            index_path.display()
+        );
+    }
+    state.page_size = LEXICAL_REBUILD_PAGE_SIZE;
+    persist_lexical_rebuild_state(index_path, state)
 }
 
 fn persist_pending_lexical_rebuild_progress(
@@ -1430,8 +1522,11 @@ fn lexical_rebuild_db_state(
     db_path: &Path,
 ) -> Result<LexicalRebuildDbState> {
     Ok(LexicalRebuildDbState {
-        db_path: db_path.to_string_lossy().into_owned(),
+        db_path: crate::normalize_path_identity(db_path)
+            .to_string_lossy()
+            .into_owned(),
         total_conversations: count_total_conversations_exact(storage)?,
+        total_messages: count_total_messages_exact(storage)?,
         storage_fingerprint: lexical_rebuild_storage_fingerprint(db_path)?,
     })
 }
@@ -1524,8 +1619,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
         Some(state)
             if state.version == LEXICAL_REBUILD_STATE_VERSION
                 && state.schema_hash == crate::search::tantivy::SCHEMA_HASH
-                && state.page_size == LEXICAL_REBUILD_PAGE_SIZE
-                && state.db.db_path == db_path_string =>
+                && lexical_rebuild_db_paths_match(&state.db.db_path, &db_path_string) =>
         {
             state
         }
@@ -1549,6 +1643,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
         }
     };
     state.db = db_state;
+    state.page_size = LEXICAL_REBUILD_PAGE_SIZE;
     state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     state.processed_conversations = total_conversations;
     state.indexed_docs = total_messages;
@@ -1598,8 +1693,11 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
     let total_messages = count_total_messages_exact(&settled)?;
     settled.close_best_effort_in_place();
     let db_state = LexicalRebuildDbState {
-        db_path: db_path.to_string_lossy().into_owned(),
+        db_path: crate::normalize_path_identity(db_path)
+            .to_string_lossy()
+            .into_owned(),
         total_conversations,
+        total_messages,
         storage_fingerprint: lexical_rebuild_storage_fingerprint(db_path)?,
     };
     let index_path = index_dir(data_dir)?;
@@ -1619,7 +1717,7 @@ pub(crate) fn load_lexical_rebuild_snapshot(
         return Ok(None);
     };
 
-    if state.completed || state.db.db_path != db_path.to_string_lossy() {
+    if state.completed || !crate::stored_path_identity_matches(&state.db.db_path, db_path) {
         return Ok(None);
     }
     let processed_conversations = state.reported_processed_conversations();
@@ -4224,7 +4322,9 @@ pub(crate) fn rebuild_tantivy_from_db(
     let db_state = lexical_rebuild_db_state(&storage, db_path)?;
     let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
         Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
-            reconcile_pending_lexical_commit(&index_path, state)?
+            let mut state = reconcile_pending_lexical_commit(&index_path, state)?;
+            normalize_lexical_rebuild_state_for_current_run(&index_path, &mut state)?;
+            state
         }
         Some(state) => {
             tracing::info!(
@@ -4321,6 +4421,8 @@ pub(crate) fn rebuild_tantivy_from_db(
         lexical_rebuild_initial_batch_fetch_conversation_limit(batch_fetch_conversation_limit);
     let batch_fetch_message_limit = lexical_rebuild_batch_fetch_message_limit();
     let batch_fetch_message_bytes_limit = lexical_rebuild_batch_fetch_message_bytes_limit();
+    let sql_batch_fetch_conversation_limit =
+        lexical_rebuild_sql_batch_fetch_conversation_limit(batch_fetch_conversation_limit);
     let commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
     let commit_interval_messages = lexical_rebuild_commit_interval_messages();
     let commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
@@ -4390,10 +4492,12 @@ pub(crate) fn rebuild_tantivy_from_db(
             let mut batch_messages_by_conversation = if conv_ids.is_empty() {
                 Ok(HashMap::new())
             } else {
-                storage.fetch_messages_for_lexical_rebuild_batch(
+                fetch_messages_for_lexical_rebuild_batch_chunked(
+                    &storage,
                     &conv_ids,
                     Some(batch_fetch_message_limit),
                     Some(batch_fetch_message_bytes_limit),
+                    sql_batch_fetch_conversation_limit,
                 )
             };
             let using_batched_fetch = batch_messages_by_conversation.is_ok();
@@ -4401,6 +4505,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                 tracing::warn!(
                     page_size,
                     chunk_conversations = conv_ids.len(),
+                    sql_chunk_limit = sql_batch_fetch_conversation_limit,
                     chunk_message_limit = batch_fetch_message_limit,
                     chunk_message_bytes_limit = batch_fetch_message_bytes_limit,
                     error = %error,
@@ -4520,6 +4625,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                     chunk_messages = chunk_message_count,
                     chunk_message_bytes = chunk_message_bytes,
                     chunk_limit = batch_fetch_conversation_limit,
+                    sql_chunk_limit = sql_batch_fetch_conversation_limit,
                     chunk_message_limit = batch_fetch_message_limit,
                     chunk_message_bytes_limit = batch_fetch_message_bytes_limit,
                     "lexical rebuild processed a batched message fetch chunk"
@@ -11001,6 +11107,7 @@ mod tests {
         let db_state = LexicalRebuildDbState {
             db_path: "/tmp/agent_search.db".to_string(),
             total_conversations: 400,
+            total_messages: 800,
             storage_fingerprint: "seed:400".to_string(),
         };
         let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
@@ -11026,6 +11133,7 @@ mod tests {
         let db_state = LexicalRebuildDbState {
             db_path: "/tmp/agent_search.db".to_string(),
             total_conversations: 400,
+            total_messages: 800,
             storage_fingerprint: "seed:400".to_string(),
         };
         let mut state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
@@ -11044,6 +11152,133 @@ mod tests {
     }
 
     #[test]
+    fn legacy_lexical_rebuild_page_size_still_counts_as_pending_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let state = LexicalRebuildState::new(db_state.clone(), 200);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        assert!(has_pending_lexical_rebuild(&index_path, &db_state).unwrap());
+    }
+
+    #[test]
+    fn pending_lexical_rebuild_matches_equivalent_db_path_spellings() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let db_path = tmp.path().join("agent_search.db");
+        fs::write(&db_path, b"db").unwrap();
+        let db_path_variant = tmp.path().join(".").join("agent_search.db");
+
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: db_path_variant.to_string_lossy().into_owned(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let current_db_state = LexicalRebuildDbState {
+            db_path: crate::normalize_path_identity(&db_path)
+                .to_string_lossy()
+                .into_owned(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let state = LexicalRebuildState::new(checkpoint_db_state, 200);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        assert!(has_pending_lexical_rebuild(&index_path, &current_db_state).unwrap());
+    }
+
+    #[test]
+    fn legacy_lexical_rebuild_matches_despite_storage_fingerprint_drift_when_counts_match() {
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 0,
+            storage_fingerprint: "22396870656:1776366130822:8536672:1776366130775".to_string(),
+        };
+        let current_db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "22396870656:1776384918595:8577872:1776384918548".to_string(),
+        };
+        let state = LexicalRebuildState::new(checkpoint_db_state, 200);
+
+        assert!(state.matches_run(&current_db_state, LEXICAL_REBUILD_PAGE_SIZE));
+    }
+
+    #[test]
+    fn lexical_rebuild_rejects_resume_when_total_messages_change() {
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let current_db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 801,
+            storage_fingerprint: "seed:401".to_string(),
+        };
+        let state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+
+        assert!(!state.matches_run(&current_db_state, LEXICAL_REBUILD_PAGE_SIZE));
+    }
+
+    #[test]
+    fn normalize_legacy_lexical_rebuild_page_size_adopts_current_contract() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, 200);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        normalize_lexical_rebuild_state_for_current_run(&index_path, &mut state).unwrap();
+        assert_eq!(state.page_size, LEXICAL_REBUILD_PAGE_SIZE);
+        let persisted = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("normalized checkpoint");
+        assert_eq!(persisted.page_size, LEXICAL_REBUILD_PAGE_SIZE);
+    }
+
+    #[test]
+    fn incompatible_lexical_rebuild_page_size_does_not_count_as_pending_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 400,
+            total_messages: 800,
+            storage_fingerprint: "seed:400".to_string(),
+        };
+        let state = LexicalRebuildState::new(db_state.clone(), 13);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        assert!(!has_pending_lexical_rebuild(&index_path, &db_state).unwrap());
+    }
+
+    #[test]
     fn clear_lexical_rebuild_state_removes_stale_snapshot() {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("index");
@@ -11053,6 +11288,7 @@ mod tests {
             LexicalRebuildDbState {
                 db_path: "/tmp/agent_search.db".to_string(),
                 total_conversations: 12,
+                total_messages: 24,
                 storage_fingerprint: "seed:12".to_string(),
             },
             LEXICAL_REBUILD_PAGE_SIZE,
@@ -11083,6 +11319,7 @@ mod tests {
             LexicalRebuildDbState {
                 db_path: "/tmp/agent_search.db".to_string(),
                 total_conversations: 12,
+                total_messages: 24,
                 storage_fingerprint: "seed:12".to_string(),
             },
             LEXICAL_REBUILD_PAGE_SIZE,
@@ -11410,6 +11647,100 @@ mod tests {
         assert_eq!(
             checkpoint.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn final_checkpoint_refresh_normalizes_db_path_identity() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let db_path_variant = data_dir.join(".").join("agent_search.db");
+        let mut storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = norm_conv(
+            Some("checkpoint-path-normalize"),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace: conv.workspace.clone(),
+                    external_id: conv.external_id.clone(),
+                    title: conv.title.clone(),
+                    source_path: conv.source_path.clone(),
+                    started_at: conv.started_at,
+                    ended_at: conv.ended_at,
+                    approx_tokens: None,
+                    metadata_json: conv.metadata.clone(),
+                    messages: conv
+                        .messages
+                        .iter()
+                        .map(|m| crate::model::types::Message {
+                            id: None,
+                            idx: m.idx,
+                            role: crate::model::types::MessageRole::User,
+                            author: m.author.clone(),
+                            created_at: m.created_at,
+                            content: m.content.clone(),
+                            extra_json: m.extra.clone(),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: "local".to_string(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        index.commit().unwrap();
+        drop(index);
+
+        storage
+            .set_last_indexed_at(FrankenStorage::now_millis())
+            .unwrap();
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        refresh_completed_lexical_rebuild_checkpoint_for_final_state(
+            &mut storage,
+            &db_path_variant,
+            &data_dir,
+            false,
+        )
+        .unwrap();
+
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("refreshed checkpoint");
+        assert_eq!(
+            checkpoint.db_path,
+            crate::normalize_path_identity(&db_path)
+                .to_string_lossy()
+                .into_owned()
         );
     }
 

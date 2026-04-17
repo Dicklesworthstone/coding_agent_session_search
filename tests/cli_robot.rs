@@ -1,9 +1,11 @@
 use assert_cmd::Command;
+use fs2::FileExt;
 use predicates::prelude::*;
 use predicates::str::contains;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
 use walkdir::WalkDir;
@@ -2082,6 +2084,178 @@ fn health_missing_db_reports_not_initialized() {
     assert_eq!(json["state"]["semantic"]["vector_index_path"], Value::Null);
     assert_eq!(json["state"]["semantic"]["model_dir"], Value::Null);
     assert_eq!(json["state"]["semantic"]["hnsw_path"], Value::Null);
+}
+
+#[test]
+fn doctor_not_initialized_ignores_active_lock_for_other_db() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let db_path = data_dir.join("agent_search.db");
+    let other_db_path = data_dir.join("other-agent-search.db");
+    let lock_path = data_dir.join("index-run.lock");
+
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.try_lock_exclusive().unwrap();
+    writeln!(
+        lock_file,
+        "pid={}
+started_at_ms={}
+db_path={}
+mode=index
+job_kind=lexical_refresh
+phase=rebuilding",
+        std::process::id(),
+        1_733_001_222_000_i64,
+        other_db_path.display()
+    )
+    .unwrap();
+    lock_file.flush().unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "doctor",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
+    assert_eq!(json["initialized"], Value::Bool(false));
+    assert_eq!(json["failures"], Value::from(0));
+}
+
+#[test]
+fn doctor_missing_data_dir_reports_not_initialized_without_failure() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("fresh-cass-home");
+
+    let mut cmd = base_cmd();
+    cmd.args(["doctor", "--json", "--data-dir", data_dir.to_str().unwrap()]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert!(
+        output.stderr.is_empty(),
+        "doctor --json on a fresh install should explain initialization state without emitting an error: {stdout}"
+    );
+    assert_eq!(json["status"], Value::String("not_initialized".to_string()));
+    assert_eq!(json["initialized"], Value::Bool(false));
+    assert_eq!(json["healthy"], Value::Bool(false));
+    assert_eq!(json["failures"], Value::from(0));
+    assert!(
+        json["explanation"]
+            .as_str()
+            .unwrap_or("")
+            .contains("fresh install"),
+        "doctor should explain the cold-start state: {json}"
+    );
+    assert!(
+        json["recommended_action"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cass index --full"),
+        "doctor should point users at the initial index run: {json}"
+    );
+    assert!(
+        json["checks"]
+            .as_array()
+            .map(|checks| checks.iter().any(|check| {
+                check["name"] == Value::String("database".to_string())
+                    && check["status"] == Value::String("warn".to_string())
+            }))
+            .unwrap_or(false),
+        "doctor should classify missing database as informational on fresh installs: {json}"
+    );
+    assert!(
+        json["checks"]
+            .as_array()
+            .map(|checks| checks.iter().any(|check| {
+                check["name"] == Value::String("index".to_string())
+                    && check["status"] == Value::String("warn".to_string())
+            }))
+            .unwrap_or(false),
+        "doctor should classify missing index as informational on fresh installs: {json}"
+    );
+}
+
+#[test]
+fn search_missing_index_reports_current_rebuild_in_progress() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let db_path = data_dir.join("agent_search.db");
+    let lock_path = data_dir.join("index-run.lock");
+
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.try_lock_exclusive().unwrap();
+    writeln!(
+        lock_file,
+        "pid={}
+started_at_ms={}
+db_path={}
+mode=index
+job_kind=lexical_refresh
+phase=rebuilding",
+        std::process::id(),
+        1_733_001_333_000_i64,
+        db_path.display()
+    )
+    .unwrap();
+    lock_file.flush().unwrap();
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "auth",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+    ]);
+
+    let assert = cmd.assert().failure();
+    let output = assert.get_output();
+    assert_eq!(output.status.code(), Some(3));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: Value = serde_json::from_str(stderr.trim()).expect("valid JSON");
+
+    assert_eq!(
+        json["error"]["kind"],
+        Value::String("missing-index".to_string())
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already building the initial search index"),
+        "search should explain that the first index run is already in progress: {json}"
+    );
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cass status --json"),
+        "search should point callers at status while waiting for the initial index build: {json}"
+    );
 }
 
 #[test]
