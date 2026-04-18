@@ -95,13 +95,13 @@ pub fn is_tool_acknowledgement(role: Option<&str>, text: &str) -> bool {
         return false;
     }
 
+    if trimmed.len() > 200 {
+        return false;
+    }
+
     let lower = trimmed.to_ascii_lowercase();
     if is_short_acknowledgement(&lower) {
         return true;
-    }
-
-    if trimmed.len() > 200 {
-        return false;
     }
 
     let toolish = role_is(role, "tool");
