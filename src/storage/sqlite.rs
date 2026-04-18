@@ -285,6 +285,45 @@ pub(crate) fn open_franken_storage_with_timeout(
     }
 }
 
+pub(crate) fn open_current_schema_storage_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Option<FrankenStorage>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut storage = FrankenStorage {
+        conn: open_franken_raw_connection_with_timeout(path, timeout)?,
+    };
+    storage.apply_open_stage_busy_timeout();
+
+    let version = storage
+        .raw()
+        .query("SELECT value FROM meta WHERE key = 'schema_version';")
+        .ok()
+        .and_then(|rows| rows.first().cloned())
+        .and_then(|row| row.get_typed::<String>(0).ok())
+        .and_then(|raw| raw.parse::<i64>().ok());
+
+    if version != Some(CURRENT_SCHEMA_VERSION) {
+        if let Err(close_err) = storage.close_without_checkpoint_in_place() {
+            tracing::debug!(
+                error = %close_err,
+                db_path = %path.display(),
+                "open_current_schema_storage_with_timeout: close_without_checkpoint_in_place failed; falling back to best-effort close"
+            );
+            storage.close_best_effort_in_place();
+        }
+        return Ok(None);
+    }
+
+    transition_from_meta_version(&storage.conn)?;
+    storage.repair_missing_current_schema_objects()?;
+    storage.apply_config()?;
+    Ok(Some(storage))
+}
+
 pub(crate) fn open_franken_readonly_storage_with_timeout(
     path: &Path,
     timeout: Duration,

@@ -4284,23 +4284,16 @@ fn open_storage_for_index(
     allow_full_recovery: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
     if db_path.exists() {
-        match current_schema_fast_probe(db_path) {
-            Ok(true) => match crate::storage::sqlite::open_franken_storage_with_timeout(
-                db_path,
-                Duration::from_secs(10),
-            ) {
-                Ok(storage) => return Ok((storage, false, false)),
-                Err(err) => tracing::warn!(
-                    db_path = %db_path.display(),
-                    error = ?err,
-                    "fast current-schema storage open failed; falling back to compatibility recovery"
-                ),
-            },
-            Ok(false) => {}
+        match crate::storage::sqlite::open_current_schema_storage_with_timeout(
+            db_path,
+            Duration::from_secs(10),
+        ) {
+            Ok(Some(storage)) => return Ok((storage, false, false)),
+            Ok(None) => {}
             Err(err) => tracing::warn!(
                 db_path = %db_path.display(),
                 error = ?err,
-                "fast current-schema probe failed; falling back to compatibility recovery"
+                "single-open current-schema storage path failed; falling back to compatibility recovery"
             ),
         }
     }
@@ -4373,6 +4366,7 @@ fn open_storage_for_index(
     }
 }
 
+#[cfg(test)]
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
         .with_context(|| format!("opening frankensqlite db readonly at {}", db_path.display()))?;
@@ -9619,6 +9613,37 @@ mod tests {
         drop(storage);
 
         assert!(!current_schema_fast_probe(&db_path).unwrap());
+    }
+
+    #[test]
+    fn open_storage_for_index_fast_current_schema_path_preserves_transition_state() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("current-schema-transition.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .raw()
+                .execute("DROP TABLE _schema_migrations")
+                .unwrap();
+        }
+
+        assert!(current_schema_fast_probe(&db_path).unwrap());
+
+        let (storage, rebuilt, opened_fresh_for_full) =
+            open_storage_for_index(&db_path, false).unwrap();
+        assert!(!rebuilt);
+        assert!(!opened_fresh_for_full);
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        );
+        assert!(
+            storage
+                .raw()
+                .query("SELECT version FROM _schema_migrations LIMIT 1;")
+                .is_ok()
+        );
     }
 
     #[test]

@@ -68,12 +68,25 @@ fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
 
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 
+fn tantivy_writer_parallelism_hint() -> usize {
+    let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32);
+
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .clamp(1, max_threads)
+}
+
 fn tantivy_add_batch_max_messages() -> usize {
     dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(4_096)
+        .unwrap_or_else(|| 4_096.max(tantivy_writer_parallelism_hint().saturating_mul(512)))
 }
 
 fn tantivy_add_batch_max_chars() -> usize {
@@ -81,7 +94,10 @@ fn tantivy_add_batch_max_chars() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(16 * 1024 * 1024)
+        .unwrap_or_else(|| {
+            (16 * 1024 * 1024)
+                .max(tantivy_writer_parallelism_hint().saturating_mul(2 * 1024 * 1024))
+        })
 }
 
 fn map_fs_err(err: frankensearch::SearchError) -> Error {
