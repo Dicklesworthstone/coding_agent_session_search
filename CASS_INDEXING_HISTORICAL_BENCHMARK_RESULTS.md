@@ -459,3 +459,43 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260418-r56-grouped-null-author/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260418-r57-grouped-lite-row/logs/summary.json`
 - `/tmp/cass-real-bench-20260418-r57-grouped-lite-row/logs/index.stderr.log`
+
+
+## Corrected Runner Harness + Micro-Lever Sweep
+
+### Goal
+- Remove the full-CLI link step from the optimization loop without changing the authoritative indexer code path, then re-test two micro-levers on the real canonical corpus with a same-harness control.
+
+### Harness Notes
+- A tiny `/tmp/cass_runner_r59` wrapper was compiled directly against the freshly built `coding_agent_search` profiling rlib with `panic=abort`.
+- The first wrapper attempt was invalid because it omitted the normal `IndexingProgress`, which forced a slow final lexical fingerprint refresh (`fingerprint_messages step_ms=12887`). That measurement is retained only as a harness-debug artifact and is not used for decision-making.
+- The corrected runner uses `IndexingProgress::default()` so it matches the normal `cass index --force-rebuild` fast path closely enough for same-harness comparisons.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r58-exact-flatten` | replace flattened-doc `collect()` with exact-capacity append | 64.589 | 792.466 | 72826.152 | 330.693 | 60.486 | 58.328 | 7.623 | 6.658 | 7.269 | rejected |
+| `r59-grouped-reserve64-invalid` | fixed grouped-message reserve of `64` on the first wrapper harness | 72.479 | 706.203 | 64898.708 | 294.696 | 54.819 | 52.781 | 7.982 | 6.842 | 7.139 | invalid harness; wrapper paid final fingerprint tail |
+| `r60-grouped-reserve64-corrected` | same reserve `64`, corrected wrapper harness | 59.431 | 861.247 | 79146.927 | 359.395 | 55.692 | 53.624 | 8.040 | 6.829 | 7.118 | tied / not a real win |
+| `r61-noise-fast-reject` | skip lowercase work for messages already rejected by the existing `>200` ack cutoff | 59.421 | 861.390 | 79160.104 | 359.455 | 55.829 | 53.800 | 8.011 | 6.809 | 7.030 | effectively neutral, kept as harmless cleanup |
+| `r62-corrected-control-noreserve` | corrected wrapper harness control with reserve removed, fast-reject still present | 59.436 | 861.184 | 79141.168 | 359.369 | 55.589 | 53.561 | 7.918 | 6.873 | 6.940 | control for reserve verdict |
+
+### Takeaways
+- The exact-capacity flattened-doc append looked plausible but was a clean loser on the real corpus and was reverted.
+- The first wrapper harness run surfaced an important control-plane issue: omitting `IndexingProgress` from the standalone runner disabled the existing fast-path that skips final lexical checkpoint refresh, which injected a bogus `~12.9s` fingerprint tail into wall clock.
+- Once the harness was corrected, the grouped reserve experiment collapsed to noise. `r60` and `r62` are effectively identical, so the reserve change was reverted.
+- The long-message fast-reject before lowercase is also basically noise on end-to-end wall time, but it is behavior-preserving and directionally sensible because it avoids useless lowercase allocation for messages that the existing rule would reject immediately anyway.
+- The corrected same-harness plateau is now about `59.42-59.44s`, which is materially faster than the older `62.586s` CLI-binary result, but this cycle should still be treated mainly as a harness-corrected micro-lever sweep rather than a big architectural breakthrough.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r58-exact-flatten/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r58-exact-flatten/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r59-grouped-reserve64/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r59-grouped-reserve64/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r60-grouped-reserve64-corrected/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r60-grouped-reserve64-corrected/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r61-noise-fast-reject/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r61-noise-fast-reject/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r62-corrected-control-noreserve/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r62-corrected-control-noreserve/logs/index.stderr.log`
