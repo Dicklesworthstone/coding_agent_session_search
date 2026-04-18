@@ -1663,11 +1663,11 @@ fn full_rebuild_requires_historical_restart(
     Ok(false)
 }
 
-fn lexical_rebuild_db_state(
+fn lexical_rebuild_db_state_with_total_conversations(
     storage: &FrankenStorage,
     db_path: &Path,
+    total_conversations: usize,
 ) -> Result<LexicalRebuildDbState> {
-    let total_conversations = count_total_conversations_exact(storage)?;
     Ok(LexicalRebuildDbState {
         db_path: crate::normalize_path_identity(db_path)
             .to_string_lossy()
@@ -1676,6 +1676,14 @@ fn lexical_rebuild_db_state(
         total_messages: 0,
         storage_fingerprint: lexical_rebuild_content_fingerprint(storage, total_conversations)?,
     })
+}
+
+fn lexical_rebuild_db_state(
+    storage: &FrankenStorage,
+    db_path: &Path,
+) -> Result<LexicalRebuildDbState> {
+    let total_conversations = count_total_conversations_exact(storage)?;
+    lexical_rebuild_db_state_with_total_conversations(storage, db_path, total_conversations)
 }
 
 fn has_pending_lexical_rebuild(
@@ -4575,7 +4583,8 @@ pub(crate) fn rebuild_tantivy_from_db(
     let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
 
     let index_path = index_dir(data_dir)?;
-    let db_state = lexical_rebuild_db_state(&storage, db_path)?;
+    let db_state =
+        lexical_rebuild_db_state_with_total_conversations(&storage, db_path, total_conversations)?;
     let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
         Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
             let mut state = reconcile_pending_lexical_commit(&index_path, state)?;
@@ -4607,7 +4616,7 @@ pub(crate) fn rebuild_tantivy_from_db(
         fs::create_dir_all(&index_path).with_context(|| {
             format!("creating rebuilt index directory {}", index_path.display())
         })?;
-        rebuild_state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
     }
 
     let mut t_index = match TantivyIndex::open_or_create(&index_path) {
@@ -4631,10 +4640,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                     index_path.display()
                 )
             })?;
-            rebuild_state = LexicalRebuildState::new(
-                lexical_rebuild_db_state(&storage, db_path)?,
-                LEXICAL_REBUILD_PAGE_SIZE,
-            );
+            rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
             TantivyIndex::open_or_create(&index_path)?
         }
         Err(err) => return Err(err),
