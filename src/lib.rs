@@ -22529,9 +22529,7 @@ fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
             "BatchMode=yes",
             "--",
             host,
-            "sh",
-            "-c",
-            &cmd,
+            &remote_cmd,
         ])
         .output();
 
