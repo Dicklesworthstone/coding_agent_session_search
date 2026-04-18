@@ -5122,6 +5122,7 @@ impl FrankenStorage {
         const CALLBACK_FAILURE_SENTINEL: &str =
             "cass lexical rebuild grouped message stream callback failed";
         const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild grouped message stream early stop";
+        const GROUPED_LEXICAL_REBUILD_MESSAGE_RESERVE: usize = 64;
 
         let hinted_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages INDEXED BY idx_messages_conv_idx              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
         let fallback_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
@@ -5136,7 +5137,8 @@ impl FrankenStorage {
                 .prepare(sql)
                 .with_context(|| "preparing grouped lexical rebuild message stream query")?;
             let mut current_conversation_id: Option<i64> = None;
-            let mut current_messages: Vec<LexicalRebuildGroupedMessageRow> = Vec::new();
+            let mut current_messages: Vec<LexicalRebuildGroupedMessageRow> =
+                Vec::with_capacity(GROUPED_LEXICAL_REBUILD_MESSAGE_RESERVE);
             let mut current_last_message_id = 0i64;
             let mut flush_current =
                 |current_conversation_id: &mut Option<i64>,
@@ -5146,7 +5148,10 @@ impl FrankenStorage {
                     let Some(conversation_id) = current_conversation_id.take() else {
                         return Ok(());
                     };
-                    let messages = std::mem::take(current_messages);
+                    let messages = std::mem::replace(
+                        current_messages,
+                        Vec::with_capacity(GROUPED_LEXICAL_REBUILD_MESSAGE_RESERVE),
+                    );
                     let last_message_id = std::mem::take(current_last_message_id);
                     if let Err(err) = f(conversation_id, messages, last_message_id) {
                         callback_error = Some(err);

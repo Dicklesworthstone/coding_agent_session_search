@@ -889,18 +889,13 @@ fn prepare_lexical_rebuild_batch(
             .collect::<Vec<_>>()
     };
 
-    let mut prepared_doc_shards = if let Some(pool) = worker_pool {
+    let prepared_doc_shards = if let Some(pool) = worker_pool {
         pool.install(prepare_jobs)
     } else {
         prepare_jobs()
     };
 
-    let total_docs = prepared_doc_shards.iter().map(Vec::len).sum();
-    let mut docs = Vec::with_capacity(total_docs);
-    for shard in &mut prepared_doc_shards {
-        docs.append(shard);
-    }
-    docs
+    prepared_doc_shards.into_iter().flatten().collect()
 }
 
 #[allow(clippy::too_many_arguments)]
