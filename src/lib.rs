@@ -22511,7 +22511,16 @@ fn sh_quote(value: &str) -> String {
 /// Check if a remote path exists
 fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
     let quoted = sh_quote(path);
-    let cmd = format!("test -d {quoted} && ls -1 {quoted} | wc -l");
+    let script = format!("test -d {quoted} && ls -1 {quoted} | wc -l");
+    // IMPORTANT (#190): `ssh` concatenates multiple post-host argv into a
+    // single remote command string before shipping to the server, separated
+    // by spaces — so passing `host, "sh", "-c", script` ends up running
+    //   sh -c test -d '...' && ls -1 '...' | wc -l
+    // on the remote, where `&&` and `|` are interpreted by the surrounding
+    // shell rather than by the `sh -c` argument, and `sh -c` only ever
+    // receives `test` as its command. Combine into a single argument so the
+    // quoted script survives the round trip intact.
+    let remote_cmd = format!("sh -c {}", sh_quote(&script));
     let output = std::process::Command::new("ssh")
         .args([
             "-o",

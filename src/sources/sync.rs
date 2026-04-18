@@ -40,21 +40,63 @@ use ssh2::{Session, Sftp};
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{Shutdown, TcpStream};
 
-/// Returns true when the system `rsync` supports the `--protect-args` flag.
-/// This flag was introduced in rsync 3.0.0 and is generally safer for paths
-/// with special characters. openrsync (macOS 15+) does not support it.
-fn supports_protect_args() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
+/// Which variant of rsync's "pass args protected to the remote" flag the
+/// system `rsync` accepts. The flag was introduced in rsync 3.0.0 as
+/// `--protect-args`; rsync 3.4.0 renamed the primary form to
+/// `--secluded-args` (`-s`) and current Homebrew `rsync 3.4.1` prints only
+/// the new name in `--help`, so a simple substring probe for `--protect-args`
+/// mis-classifies it as unsupported and falls through to the quoted-path
+/// rsync branch — which breaks (#191). openrsync (macOS 15+) supports
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RsyncArgProtection {
+    /// Neither flag supported — callers must manually quote remote paths for
+    /// the remote login shell.
+    None,
+    /// rsync 3.0.0..3.4.0 — original flag name.
+    ProtectArgs,
+    /// rsync 3.4.0+ (incl. Homebrew 3.4.1) — renamed primary form.
+    SecludedArgs,
+}
+
+impl RsyncArgProtection {
+    fn is_supported(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// CLI flag to pass to rsync, or `None` if no protection variant is
+    /// available.
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            Self::ProtectArgs => Some("--protect-args"),
+            Self::SecludedArgs => Some("--secluded-args"),
+            Self::None => None,
+        }
+    }
+}
+
+fn detect_rsync_arg_protection() -> RsyncArgProtection {
+    static CACHED: OnceLock<RsyncArgProtection> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        Command::new("rsync")
-            .arg("--help")
-            .output()
-            .ok()
-            .map(|o| {
-                let help = String::from_utf8_lossy(&o.stdout);
-                help.contains("--protect-args")
-            })
-            .unwrap_or(false)
+        let Some(out) = Command::new("rsync").arg("--help").output().ok() else {
+            return RsyncArgProtection::None;
+        };
+        // rsync prints to stdout on GNU/Linux and Homebrew macOS, but some
+        // forks / older builds print help on stderr — check both so we never
+        // misclassify a supported rsync as unsupported.
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        // Prefer the newer name when both are listed (forward-compat with a
+        // hypothetical rsync that keeps both as aliases): `--secluded-args`
+        // is what current rsync actually prints in help output, and using
+        // the printed name is the one guaranteed to be accepted.
+        if combined.contains("--secluded-args") {
+            RsyncArgProtection::SecludedArgs
+        } else if combined.contains("--protect-args") {
+            RsyncArgProtection::ProtectArgs
+        } else {
+            RsyncArgProtection::None
+        }
     })
 }
 
@@ -562,7 +604,8 @@ impl SyncEngine {
 
         // Build rsync command
         // NOTE: NO --delete flag! Safe additive sync only.
-        let protect_args_supported = supports_protect_args();
+        let arg_protection = detect_rsync_arg_protection();
+        let protect_args_supported = arg_protection.is_supported();
         let remote_spec = remote_spec_for_rsync(host, &expanded_path, protect_args_supported);
         let ssh_opts = strict_ssh_command_for_rsync(self.connection_timeout);
 
@@ -583,8 +626,8 @@ impl SyncEngine {
         let timeout_str = self.transfer_timeout.to_string();
         let mut cmd = Command::new("rsync");
         cmd.args(["-avz", "--stats", "--partial"]);
-        if protect_args_supported {
-            cmd.arg("--protect-args");
+        if let Some(flag) = arg_protection.flag() {
+            cmd.arg(flag);
         }
         cmd.args([
             "--timeout",
@@ -1968,6 +2011,26 @@ Total transferred file size: 1,234 bytes
             remote_spec_for_rsync("work-mac", "/tmp/has space", false),
             "work-mac:'/tmp/has space'"
         );
+    }
+
+    #[test]
+    fn rsync_arg_protection_enum_maps_flags_correctly() {
+        // Regression for #191: Homebrew rsync 3.4.1 renamed the flag to
+        // --secluded-args; earlier 3.0–3.3 use --protect-args. The caller
+        // must pass the name the installed rsync actually accepts in its
+        // own --help listing.
+        assert_eq!(
+            RsyncArgProtection::ProtectArgs.flag(),
+            Some("--protect-args")
+        );
+        assert_eq!(
+            RsyncArgProtection::SecludedArgs.flag(),
+            Some("--secluded-args")
+        );
+        assert_eq!(RsyncArgProtection::None.flag(), None);
+        assert!(RsyncArgProtection::ProtectArgs.is_supported());
+        assert!(RsyncArgProtection::SecludedArgs.is_supported());
+        assert!(!RsyncArgProtection::None.is_supported());
     }
 
     #[test]
