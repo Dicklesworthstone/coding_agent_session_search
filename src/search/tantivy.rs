@@ -67,13 +67,14 @@ fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
 }
 
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
+const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
 
 fn tantivy_writer_parallelism_hint() -> usize {
     let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(32);
+        .unwrap_or(DEFAULT_TANTIVY_MAX_WRITER_THREADS);
 
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)

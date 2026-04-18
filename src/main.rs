@@ -55,6 +55,27 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
+const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
+
+fn apply_default_tantivy_writer_thread_cap() {
+    let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    if configured.is_none() {
+        // Empirical full-corpus benchmarking on a 128-core host found that a
+        // 26-thread Tantivy writer beats the previous 32-thread default by
+        // reducing startup overhead and writer contention without hurting the
+        // rebuild window.
+        unsafe {
+            std::env::set_var(
+                "CASS_TANTIVY_MAX_WRITER_THREADS",
+                DEFAULT_TANTIVY_MAX_WRITER_THREADS.to_string(),
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Check for AVX support before anything else. ONNX Runtime requires AVX
     // instructions and will crash with SIGILL on CPUs that lack them.
@@ -77,6 +98,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();
+    apply_default_tantivy_writer_thread_cap();
 
     let raw_args: Vec<String> = std::env::args().collect();
     let parsed = match coding_agent_search::parse_cli(raw_args) {

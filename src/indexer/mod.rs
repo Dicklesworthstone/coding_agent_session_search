@@ -3331,7 +3331,7 @@ pub fn run_index(
             // handles starting fresh after the scan succeeds.  (CASS #164)
         }
 
-        let canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+        let canonical_sessions_before_salvage = initial_canonical_sessions_before_salvage;
         // See CASS #153: plain --full must always rescan the filesystem.
         // --force-rebuild with existing sessions skips rescan (fast path).
         let canonical_only_full_rebuild =
@@ -3467,7 +3467,7 @@ pub fn run_index(
         if rebuild_from_canonical_only {
             drop(t_index.take());
             let rebuild_start = std::time::Instant::now();
-            let rebuild_convs = count_total_conversations_exact(&storage)?;
+            let rebuild_convs = canonical_sessions_before_salvage;
             let rebuild = rebuild_tantivy_from_db(
                 &opts.db_path,
                 &opts.data_dir,
@@ -10248,10 +10248,13 @@ mod tests {
             .unwrap()
             .expect("completed checkpoint after rebuild");
         assert!(checkpoint.completed);
-        assert_eq!(checkpoint.total_messages, 4);
         assert_eq!(checkpoint.processed_conversations, 2);
         assert_eq!(checkpoint.committed_offset, 2);
         assert_eq!(checkpoint.indexed_docs, 4);
+        let state = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("completed lexical rebuild state after rebuild");
+        assert_eq!(state.db.total_messages, 4);
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
