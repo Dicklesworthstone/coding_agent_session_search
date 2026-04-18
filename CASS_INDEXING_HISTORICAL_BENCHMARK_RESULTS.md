@@ -149,3 +149,46 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260417-r13-writer26/logs/summary.json`
 - `/tmp/cass-real-bench-20260417-r14-default26/logs/summary.json`
 - `/tmp/cass-real-bench-20260417-r15-default26-repeat/logs/summary.json`
+
+
+## Prepare-Phase Optimization Cycle
+
+### Goal
+- Eliminate the remaining `~24s` serialized prepare cost in the canonical-only `--force-rebuild` path without changing the final lexical checkpoint contract.
+
+### Measured Rounds
+1. Replaced the combined `MAX(id)` fingerprint query with `ORDER BY id DESC LIMIT 1` subqueries. No measurable startup win.
+2. Added prep-stage instrumentation around DB-state construction. This proved path normalization was effectively free.
+3. Split the lexical content fingerprint into separate `conversations` and `messages` queries. Result: `conversations` took `~0.8s`, while `messages` consumed the remaining `~40s` startup stall.
+4. Accepted code change: canonical-only fresh-start rebuilds now defer the expensive initial `messages` fingerprint instead of blocking startup on it, while still persisting the exact final `content-v1` fingerprint synthesized from the streamed rebuild observations.
+5. Verified the change with a fresh release-build full-corpus benchmark on the real canonical DB.
+
+### Code Changes Kept
+- `src/indexer/mod.rs`
+  - Added a deferred-startup fingerprint mode for canonical-only fresh-start rebuilds.
+  - Fresh-start rebuilds now skip the blocking initial `messages` high-water fingerprint query during prepare.
+  - The completed lexical checkpoint still lands with the exact `content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}` fingerprint by deriving the max IDs from the authoritative streamed rebuild itself.
+  - Added a regression test proving the deferred-startup path still persists the exact completed fingerprint.
+
+### Result
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Avg Proc CPU % | Peak RSS GiB | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `r16-deferred-startup-fingerprint` | defer initial canonical-only force-rebuild content fingerprint; persist exact completed fingerprint from streamed observations | 71.645 | 714.429 | 65654.627 | 298.129 | 1085.203 | 20.888 | accepted |
+
+### Phase Breakdown
+
+| Label | Prepare s | Index Window s | Post-Index Tail s |
+|---|---:|---:|---:|
+| `r16-deferred-startup-fingerprint` | 0.600 | 66.047 | 1.397 |
+
+### Takeaways
+- The prepare-phase bottleneck was real and specific: the `messages` side of the lexical content fingerprint was consuming roughly `40s` before indexing even began.
+- Deferring that work on the explicit fresh-start canonical-only rebuild path collapsed prepare time from about `24.0s` to about `0.6s` in the real release benchmark.
+- Overall wall clock improved from the previous accepted best `75.557s` to `71.645s` (`~5.2%` faster overall on the same corpus and harness).
+- The final completed checkpoint contract was preserved. The optimization changes startup behavior, not the settled lexical checkpoint semantics.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/summary.json`
+- `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/index.stdout.json`

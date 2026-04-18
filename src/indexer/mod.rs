@@ -923,6 +923,7 @@ fn flush_streamed_lexical_rebuild_batch(
     current_batch_conversation_limit: &mut usize,
     batch_conversation_limit: usize,
     page_size: i64,
+    perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<()> {
     if pending_conversations.is_empty() {
         return Ok(());
@@ -932,18 +933,36 @@ fn flush_streamed_lexical_rebuild_batch(
     let chunk_message_count = *pending_batch_message_count;
     let chunk_message_bytes = *pending_batch_message_bytes;
     let chunk_limit = *current_batch_conversation_limit;
+    let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
     let prepared_batch = prepare_lexical_rebuild_batch(
         pending_conversations,
         pending_messages_by_conversation,
         source_map,
         lexical_rebuild_worker_pool,
     );
+    let add_started = perf_profile.as_ref().map(|_| Instant::now());
     *indexed_docs =
         (*indexed_docs).saturating_add(
             t_index.add_conversations_with_ids(prepared_batch.iter().map(|conversation| {
                 (&conversation.normalized, Some(conversation.conversation_id))
             }))?,
         );
+    if let Some(profile) = perf_profile {
+        profile.batch_flushes = profile.batch_flushes.saturating_add(1);
+        profile.batch_conversations = profile
+            .batch_conversations
+            .saturating_add(batch_conversations);
+        profile.batch_messages = profile.batch_messages.saturating_add(chunk_message_count);
+        profile.batch_message_bytes = profile
+            .batch_message_bytes
+            .saturating_add(chunk_message_bytes);
+        if let Some(started) = prepare_started {
+            profile.prepare_duration += started.elapsed();
+        }
+        if let Some(started) = add_started {
+            profile.add_duration += started.elapsed();
+        }
+    }
     *messages_since_commit = (*messages_since_commit).saturating_add(chunk_message_count);
     *message_bytes_since_commit = (*message_bytes_since_commit).saturating_add(chunk_message_bytes);
     tracing::info!(
@@ -962,8 +981,113 @@ fn flush_streamed_lexical_rebuild_batch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn commit_lexical_rebuild_progress(
+    index_path: &Path,
+    rebuild_state: &mut LexicalRebuildState,
+    offset: i64,
+    processed_conversations: usize,
+    indexed_docs: usize,
+    t_index: &mut TantivyIndex,
+    mut perf_profile: Option<&mut LexicalRebuildPerfProfile>,
+) -> Result<()> {
+    let pending_progress_started = perf_profile.as_ref().map(|_| Instant::now());
+    persist_pending_lexical_rebuild_progress(
+        index_path,
+        rebuild_state,
+        offset,
+        processed_conversations,
+        indexed_docs,
+    )?;
+    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), pending_progress_started) {
+        profile.pending_progress_duration += started.elapsed();
+    }
+    let commit_started = perf_profile.as_ref().map(|_| Instant::now());
+    t_index.commit()?;
+    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), commit_started) {
+        profile.commit_count = profile.commit_count.saturating_add(1);
+        profile.commit_duration += started.elapsed();
+    }
+    let meta_fingerprint_started = perf_profile.as_ref().map(|_| Instant::now());
+    let meta_fingerprint = index_meta_fingerprint(index_path)?;
+    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), meta_fingerprint_started) {
+        profile.meta_fingerprint_duration += started.elapsed();
+    }
+    let checkpoint_persist_started = perf_profile.as_ref().map(|_| Instant::now());
+    rebuild_state.finalize_commit(meta_fingerprint);
+    persist_lexical_rebuild_state(index_path, rebuild_state)?;
+    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), checkpoint_persist_started) {
+        profile.checkpoint_persist_duration += started.elapsed();
+    }
+    Ok(())
+}
+
 fn maintenance_job_kind_for_mode(_mode: SearchMaintenanceMode) -> SearchMaintenanceJobKind {
     SearchMaintenanceJobKind::LexicalRefresh
+}
+
+#[derive(Debug, Default)]
+struct LexicalRebuildPerfProfile {
+    batch_flushes: usize,
+    commit_count: usize,
+    heartbeat_persist_count: usize,
+    batch_conversations: usize,
+    batch_messages: usize,
+    batch_message_bytes: usize,
+    prepare_duration: Duration,
+    add_duration: Duration,
+    commit_duration: Duration,
+    pending_progress_duration: Duration,
+    heartbeat_progress_duration: Duration,
+    checkpoint_persist_duration: Duration,
+    meta_fingerprint_duration: Duration,
+}
+
+impl LexicalRebuildPerfProfile {
+    fn from_env() -> Option<Self> {
+        std::env::var_os("CASS_TANTIVY_REBUILD_PROFILE").map(|_| Self::default())
+    }
+
+    fn millis(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    fn log_summary(&self) {
+        let flushes = self.batch_flushes.max(1) as f64;
+        let commits = self.commit_count.max(1) as f64;
+        let heartbeat_persists = self.heartbeat_persist_count.max(1) as f64;
+        eprintln!(
+            concat!(
+                "CASS_REBUILD_PROFILE ",
+                "flushes={} commits={} heartbeat_persists={} ",
+                "batch_conversations={} batch_messages={} batch_message_bytes={} ",
+                "prepare_ms={:.3} add_ms={:.3} commit_ms={:.3} ",
+                "pending_progress_ms={:.3} heartbeat_progress_ms={:.3} ",
+                "checkpoint_persist_ms={:.3} meta_fingerprint_ms={:.3} ",
+                "avg_prepare_ms_per_flush={:.3} avg_add_ms_per_flush={:.3} ",
+                "avg_commit_ms_per_commit={:.3} avg_pending_progress_ms_per_commit={:.3} ",
+                "avg_heartbeat_progress_ms={:.3}"
+            ),
+            self.batch_flushes,
+            self.commit_count,
+            self.heartbeat_persist_count,
+            self.batch_conversations,
+            self.batch_messages,
+            self.batch_message_bytes,
+            Self::millis(self.prepare_duration),
+            Self::millis(self.add_duration),
+            Self::millis(self.commit_duration),
+            Self::millis(self.pending_progress_duration),
+            Self::millis(self.heartbeat_progress_duration),
+            Self::millis(self.checkpoint_persist_duration),
+            Self::millis(self.meta_fingerprint_duration),
+            Self::millis(self.prepare_duration) / flushes,
+            Self::millis(self.add_duration) / flushes,
+            Self::millis(self.commit_duration) / commits,
+            Self::millis(self.pending_progress_duration) / commits,
+            Self::millis(self.heartbeat_progress_duration) / heartbeat_persists,
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1500,22 +1624,57 @@ fn persist_pending_lexical_rebuild_progress(
     persist_lexical_rebuild_state(index_path, state)
 }
 
+fn lexical_rebuild_content_fingerprint_value(
+    total_conversations: usize,
+    max_conversation_id: i64,
+    max_message_id: i64,
+) -> String {
+    format!("content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}")
+}
+
+fn lexical_rebuild_deferred_content_fingerprint(total_conversations: usize) -> String {
+    format!("content-pending-v1:{total_conversations}")
+}
+
 fn lexical_rebuild_content_fingerprint(
     storage: &FrankenStorage,
     total_conversations: usize,
 ) -> Result<String> {
-    let (max_conversation_id, max_message_id): (i64, i64) = storage
+    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let conversations_started = Instant::now();
+    let max_conversation_id: i64 = storage
         .raw()
         .query_row_map(
-            "SELECT \
-                COALESCE((SELECT MAX(id) FROM conversations), 0), \
-                COALESCE((SELECT MAX(id) FROM messages), 0)",
+            "SELECT COALESCE((SELECT id FROM conversations ORDER BY id DESC LIMIT 1), 0)",
             &[] as &[ParamValue],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            |row| row.get_typed(0),
         )
-        .context("computing lexical rebuild content fingerprint")?;
-    Ok(format!(
-        "content-v1:{total_conversations}:{max_conversation_id}:{max_message_id}"
+        .context("computing lexical rebuild conversation fingerprint")?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE step=fingerprint_conversations step_ms={}",
+            conversations_started.elapsed().as_millis()
+        );
+    }
+    let messages_started = Instant::now();
+    let max_message_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COALESCE((SELECT id FROM messages ORDER BY id DESC LIMIT 1), 0)",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .context("computing lexical rebuild message fingerprint")?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE step=fingerprint_messages step_ms={}",
+            messages_started.elapsed().as_millis()
+        );
+    }
+    Ok(lexical_rebuild_content_fingerprint_value(
+        total_conversations,
+        max_conversation_id,
+        max_message_id,
     ))
 }
 
@@ -1580,6 +1739,11 @@ pub(crate) struct LexicalRebuildOutcome {
     pub indexed_docs: usize,
     pub observed_messages: Option<usize>,
     pub exact_checkpoint_persisted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LexicalRebuildStartupOptions {
+    defer_initial_content_fingerprint: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -1668,14 +1832,45 @@ fn lexical_rebuild_db_state_with_total_conversations(
     db_path: &Path,
     total_conversations: usize,
 ) -> Result<LexicalRebuildDbState> {
+    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let normalize_started = Instant::now();
+    let normalized_db_path = crate::normalize_path_identity(db_path)
+        .to_string_lossy()
+        .into_owned();
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE step=normalize_db_path step_ms={}",
+            normalize_started.elapsed().as_millis()
+        );
+    }
+    let fingerprint_started = Instant::now();
+    let storage_fingerprint = lexical_rebuild_content_fingerprint(storage, total_conversations)?;
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE step=compute_storage_fingerprint step_ms={}",
+            fingerprint_started.elapsed().as_millis()
+        );
+    }
     Ok(LexicalRebuildDbState {
+        db_path: normalized_db_path,
+        total_conversations,
+        total_messages: 0,
+        storage_fingerprint,
+    })
+}
+
+fn deferred_lexical_rebuild_db_state(
+    db_path: &Path,
+    total_conversations: usize,
+) -> LexicalRebuildDbState {
+    LexicalRebuildDbState {
         db_path: crate::normalize_path_identity(db_path)
             .to_string_lossy()
             .into_owned(),
         total_conversations,
         total_messages: 0,
-        storage_fingerprint: lexical_rebuild_content_fingerprint(storage, total_conversations)?,
-    })
+        storage_fingerprint: lexical_rebuild_deferred_content_fingerprint(total_conversations),
+    }
 }
 
 fn lexical_rebuild_db_state(
@@ -3476,11 +3671,14 @@ pub fn run_index(
             drop(t_index.take());
             let rebuild_start = std::time::Instant::now();
             let rebuild_convs = canonical_sessions_before_salvage;
-            let rebuild = rebuild_tantivy_from_db(
+            let rebuild = rebuild_tantivy_from_db_with_options(
                 &opts.db_path,
                 &opts.data_dir,
                 rebuild_convs,
                 opts.progress.clone(),
+                LexicalRebuildStartupOptions {
+                    defer_initial_content_fingerprint: true,
+                },
             )?;
             exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
             let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
@@ -4564,6 +4762,22 @@ pub(crate) fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<LexicalRebuildOutcome> {
+    rebuild_tantivy_from_db_with_options(
+        db_path,
+        data_dir,
+        total_conversations,
+        progress,
+        LexicalRebuildStartupOptions::default(),
+    )
+}
+
+fn rebuild_tantivy_from_db_with_options(
+    db_path: &Path,
+    data_dir: &Path,
+    total_conversations: usize,
+    progress: Option<Arc<IndexingProgress>>,
+    options: LexicalRebuildStartupOptions,
+) -> Result<LexicalRebuildOutcome> {
     let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
     let prep_started = Instant::now();
     let mut prep_step_started = Instant::now();
@@ -4603,25 +4817,42 @@ pub(crate) fn rebuild_tantivy_from_db(
     log_prep_step("build_lookups", &mut prep_step_started);
 
     let index_path = index_dir(data_dir)?;
-    let db_state =
-        lexical_rebuild_db_state_with_total_conversations(&storage, db_path, total_conversations)?;
-    let mut rebuild_state = match load_lexical_rebuild_state(&index_path)? {
-        Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
-            let mut state = reconcile_pending_lexical_commit(&index_path, state)?;
-            normalize_lexical_rebuild_state_for_current_run(&index_path, &mut state)?;
-            state
+    let db_state = if options.defer_initial_content_fingerprint {
+        deferred_lexical_rebuild_db_state(db_path, total_conversations)
+    } else {
+        lexical_rebuild_db_state_with_total_conversations(&storage, db_path, total_conversations)?
+    };
+
+    log_prep_step(
+        if options.defer_initial_content_fingerprint {
+            "prepare_db_state_deferred_fingerprint"
+        } else {
+            "compute_db_state_fingerprint"
+        },
+        &mut prep_step_started,
+    );
+
+    let mut rebuild_state = if options.defer_initial_content_fingerprint {
+        LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+    } else {
+        match load_lexical_rebuild_state(&index_path)? {
+            Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
+                let mut state = reconcile_pending_lexical_commit(&index_path, state)?;
+                normalize_lexical_rebuild_state_for_current_run(&index_path, &mut state)?;
+                state
+            }
+            Some(state) => {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    existing_db_path = %state.db.db_path,
+                    existing_total_conversations = state.db.total_conversations,
+                    existing_storage_fingerprint = %state.db.storage_fingerprint,
+                    "discarding incompatible lexical rebuild checkpoint and restarting from zero"
+                );
+                LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
+            }
+            None => LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
         }
-        Some(state) => {
-            tracing::info!(
-                db_path = %db_path.display(),
-                existing_db_path = %state.db.db_path,
-                existing_total_conversations = state.db.total_conversations,
-                existing_storage_fingerprint = %state.db.storage_fingerprint,
-                "discarding incompatible lexical rebuild checkpoint and restarting from zero"
-            );
-            LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
-        }
-        None => LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
     };
 
     log_prep_step("load_checkpoint_state", &mut prep_step_started);
@@ -4748,25 +4979,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     let mut pending_messages_by_conversation: LexicalRebuildMessageBatch = HashMap::new();
     let mut pending_batch_message_count = 0usize;
     let mut pending_batch_message_bytes = 0usize;
-
-    let commit_rebuild_progress = |offset: i64,
-                                   processed_conversations: usize,
-                                   indexed_docs: usize,
-                                   rebuild_state: &mut LexicalRebuildState,
-                                   t_index: &mut TantivyIndex|
-     -> Result<()> {
-        persist_pending_lexical_rebuild_progress(
-            &index_path,
-            rebuild_state,
-            offset,
-            processed_conversations,
-            indexed_docs,
-        )?;
-        t_index.commit()?;
-        rebuild_state.finalize_commit(index_meta_fingerprint(&index_path)?);
-        persist_lexical_rebuild_state(&index_path, rebuild_state)?;
-        Ok(())
-    };
+    let mut perf_profile = LexicalRebuildPerfProfile::from_env();
 
     let resume_committed_offset = rebuild_state.committed_offset;
 
@@ -4812,6 +5025,7 @@ pub(crate) fn rebuild_tantivy_from_db(
                 &mut current_batch_conversation_limit,
                 batch_conversation_limit,
                 page_size,
+                perf_profile.as_mut(),
             )?;
         }
 
@@ -4837,13 +5051,16 @@ pub(crate) fn rebuild_tantivy_from_db(
                 &mut current_batch_conversation_limit,
                 batch_conversation_limit,
                 page_size,
+                perf_profile.as_mut(),
             )?;
-            commit_rebuild_progress(
+            commit_lexical_rebuild_progress(
+                &index_path,
+                &mut rebuild_state,
                 offset,
                 processed_conversations,
                 indexed_docs,
-                &mut rebuild_state,
                 &mut t_index,
+                perf_profile.as_mut(),
             )?;
             conversations_since_commit = 0;
             messages_since_commit = 0;
@@ -4861,6 +5078,7 @@ pub(crate) fn rebuild_tantivy_from_db(
             last_progress_persist.elapsed(),
             progress_heartbeat_interval,
         ) {
+            let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
             persist_pending_lexical_rebuild_progress(
                 &index_path,
                 &mut rebuild_state,
@@ -4868,6 +5086,12 @@ pub(crate) fn rebuild_tantivy_from_db(
                 processed_conversations,
                 indexed_docs,
             )?;
+            if let (Some(profile), Some(started)) =
+                (perf_profile.as_mut(), heartbeat_progress_started)
+            {
+                profile.heartbeat_persist_count = profile.heartbeat_persist_count.saturating_add(1);
+                profile.heartbeat_progress_duration += started.elapsed();
+            }
             conversations_since_progress_persist = 0;
             last_progress_persist = Instant::now();
         }
@@ -4881,6 +5105,16 @@ pub(crate) fn rebuild_tantivy_from_db(
         &agent_slugs,
         &workspace_paths,
     )?;
+    let max_conversation_id = if options.defer_initial_content_fingerprint {
+        all_conversations
+            .iter()
+            .filter_map(|conv| conv.id)
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut max_message_id = 0i64;
     let resume_offset = usize::try_from(resume_committed_offset.max(0))
         .unwrap_or(usize::MAX)
         .min(all_conversations.len());
@@ -4943,6 +5177,9 @@ pub(crate) fn rebuild_tantivy_from_db(
                     current_conversation_id = Some(message_row.conversation_id);
                 }
 
+                if options.defer_initial_content_fingerprint {
+                    max_message_id = max_message_id.max(message_row.id);
+                }
                 let message = crate::model::types::Message {
                     id: Some(message_row.id),
                     idx: message_row.idx,
@@ -4979,6 +5216,8 @@ pub(crate) fn rebuild_tantivy_from_db(
         }
     }
 
+    drop(finish_conversation);
+
     flush_streamed_lexical_rebuild_batch(
         &mut pending_conversations,
         &mut pending_messages_by_conversation,
@@ -4993,6 +5232,7 @@ pub(crate) fn rebuild_tantivy_from_db(
         &mut current_batch_conversation_limit,
         batch_conversation_limit,
         page_size,
+        perf_profile.as_mut(),
     )?;
 
     if conversations_since_commit > 0
@@ -5000,12 +5240,14 @@ pub(crate) fn rebuild_tantivy_from_db(
         || message_bytes_since_commit > 0
         || rebuild_state.pending.is_some()
     {
-        commit_rebuild_progress(
+        commit_lexical_rebuild_progress(
+            &index_path,
+            &mut rebuild_state,
             offset,
             processed_conversations,
             indexed_docs,
-            &mut rebuild_state,
             &mut t_index,
+            perf_profile.as_mut(),
         )?;
     }
 
@@ -5015,6 +5257,13 @@ pub(crate) fn rebuild_tantivy_from_db(
             db_path.display()
         )
     })?;
+    if options.defer_initial_content_fingerprint {
+        rebuild_state.db.storage_fingerprint = lexical_rebuild_content_fingerprint_value(
+            total_conversations,
+            max_conversation_id,
+            max_message_id,
+        );
+    }
     rebuild_state.db.total_messages = observed_messages;
     rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     rebuild_state.processed_conversations = processed_conversations;
@@ -5025,6 +5274,10 @@ pub(crate) fn rebuild_tantivy_from_db(
     if let Some(p) = &progress {
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
+    }
+
+    if let Some(profile) = perf_profile.as_ref() {
+        profile.log_summary();
     }
 
     Ok(LexicalRebuildOutcome {
@@ -10297,6 +10550,44 @@ mod tests {
             .unwrap()
             .expect("completed lexical rebuild state after rebuild");
         assert_eq!(state.db.total_messages, 4);
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_deferred_startup_fingerprint_persists_exact_completed_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let rebuild = rebuild_tantivy_from_db_with_options(
+            &db_path,
+            &data_dir,
+            2,
+            None,
+            LexicalRebuildStartupOptions {
+                defer_initial_content_fingerprint: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(rebuild.indexed_docs, 4);
+        assert_eq!(rebuild.observed_messages, Some(4));
+        assert!(rebuild.exact_checkpoint_persisted);
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("completed checkpoint after deferred-fingerprint rebuild");
+        assert!(checkpoint.completed);
+        assert_eq!(
+            checkpoint.storage_fingerprint,
+            lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
