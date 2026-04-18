@@ -10283,6 +10283,7 @@ fn run_health(
     }
 }
 
+#[allow(dead_code)]
 fn ensure_cass_origin(
     metadata: &mut serde_json::Value,
     source_id: &str,

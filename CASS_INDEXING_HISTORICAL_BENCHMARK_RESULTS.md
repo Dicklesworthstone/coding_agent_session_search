@@ -192,3 +192,270 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/summary.json`
 - `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260417-r16-deferred-startup-fingerprint/logs/index.stdout.json`
+
+
+## Profile-Guided Commit-Cadence Optimization Cycle
+
+### Goal
+- Use explicit rebuild-stage telemetry to find the dominant remaining service center in the canonical-only force-rebuild path, then retune that lever without regressing correctness.
+
+### Alien-Artifact Framing
+- Treat the streamed lexical rebuild as a tandem queue. Measure each service center directly before tuning thresholds.
+- Use cliff detection rather than monotonicity assumptions: a larger checkpoint interval should help until segment merge or writer flush costs cross a threshold, then it will sharply regress.
+
+### Code Changes Kept
+- `src/indexer/mod.rs`
+  - Added opt-in rebuild-stage telemetry behind `CASS_TANTIVY_REBUILD_PROFILE`.
+  - The profiler records flush count, commit count, heartbeat persists, and cumulative prepare/add/commit/progress durations, then emits a single `CASS_REBUILD_PROFILE ...` summary line on stderr.
+  - Raised the steady-state lexical rebuild commit threshold from `200_000` messages to `800_000` messages.
+  - Raised the initial lexical rebuild message threshold from `50_000` to `800_000` messages because the initial slice is already bounded by conversation and byte ceilings.
+  - Reworked the streamed conversation closure lifetime into a lexical scope so strict clippy stays clean without any artificial `drop(...)` hack.
+  - Updated the interval tests to match the new accepted default.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Commits | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `r17-profile-baseline` | profiling on; prior code-default commit cadence | 77.712 | 658.652 | 60528.875 | 274.853 | 25 | 13798.996 | baseline |
+| `r18-commit400k` | env override `CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES=400000` | 71.674 | 714.140 | 65628.100 | 298.008 | 13 | 7991.407 | improved |
+| `r19-commit800k` | env override `CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES=800000` | 70.748 | 723.482 | 66486.597 | 301.906 | 8 | 6857.534 | improved |
+| `r20-commit1200k` | env override `CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES=1200000` | 95.824 | 534.159 | 49088.192 | 222.903 | 7 | 25784.196 | rejected cliff |
+| `r21-commit800k-initial800k` | env override `800000` for steady and initial message thresholds | 68.648 | 745.620 | 68521.021 | 311.144 | 8 | 6866.053 | best env-only |
+| `r22-commit800k-initmsg800k-initconv10k` | also raise initial conversation threshold to `10000` | 69.642 | 734.977 | 67543.018 | 306.703 | 8 | 7310.640 | rejected |
+| `r23-default800k` | code-default `800000` steady and initial message thresholds, no env override | 69.650 | 734.890 | 67535.035 | 306.667 | 8 | 6845.780 | accepted |
+
+### Accepted Profile Breakdown
+
+| Label | Flushes | Heartbeat Persists | Prepare ms | Add ms | Commit ms | Pending Progress ms | Heartbeat Progress ms | Checkpoint Persist ms | Meta Fingerprint ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `r23-default800k` | 105 | 21 | 10674.415 | 10474.053 | 6845.780 | 28.714 | 46.044 | 11.613 | 0.355 |
+
+### Takeaways
+- The new profiler made the next lever obvious: commit fences were still the biggest remaining serialized service center after the earlier prepare/startup fixes.
+- Raising the commit cadence from the old default to `800k` messages cut commit overhead from `~13.8s` in the profiled baseline to `~6.85s` in the accepted code-default run.
+- There is a real cliff. Pushing to `1.2M` messages looked attractive on paper but detonated commit cost to `~25.8s` and regressed wall clock badly.
+- The accepted code-default run improved wall clock from the previous accepted best `71.645s` to `69.650s` (`~2.8%` faster overall).
+- Relative to this cycle's measured profiled baseline, the accepted code-default run improved wall clock from `77.712s` to `69.650s` (`~10.4%` faster).
+- On the accepted run, the remaining measured service centers are still substantial: prepare `~10.7s`, add `~10.5s`, commit `~6.85s`.
+- The next plausible frontier is no longer commit cadence. It is the unmeasured stream-assembly path between ordered DB rows and prepared Tantivy batches, plus any remaining per-batch preparation overhead hidden inside the `prepare` bucket.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r17-profile-baseline/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r17-profile-baseline/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r18-commit400k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r18-commit400k/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r19-commit800k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r19-commit800k/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r20-commit1200k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r20-commit1200k/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r21-commit800k-initial800k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r21-commit800k-initial800k/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r22-commit800k-initmsg800k-initconv10k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r22-commit800k-initmsg800k-initconv10k/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r23-default800k/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r23-default800k/logs/index.stderr.log`
+
+
+
+## Debug Current-Tree Queue-Geometry Rejection Cycle
+
+### Goal
+- Re-test the suspected stream-assembly bottleneck on the live corpus using a current-tree debug binary fetched from a warm remote worker, then separate real wins from deceptive mid-run progress improvements.
+
+### Environment Notes
+- These rounds used `/tmp/cass-remote-debug`, a current-tree debug binary built remotely on `ts2` and copied back with `scp`.
+- A full optimized remote build was also started, but it remained in cold dependency compilation long enough that it stopped being the critical path for this cycle.
+- Because these are debug-binary measurements, use them to rank local hypotheses, not to replace the accepted release-profile history above.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Outcome |
+|---|---|---:|---:|---:|---:|---|
+| `r31-batch256-debug` | env override `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=256` | 486.567 | 105.196 | 9666.912 | 44.074 | baseline for outer-batch sweep |
+| `r32-batch384-debug` | env override `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=384` | 481.607 | 106.280 | 9766.487 | 44.528 | best in initial debug outer-batch sweep |
+| `r33-batch512-debug` | env override `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=512` | 486.576 | 105.194 | 9666.740 | 44.073 | rejected |
+| `r35-patched-default-debug` | experimental shard-flatten removal in streamed rebuild path; default queue settings | 488.574 | 104.764 | 9627.619 | 43.718 | rejected |
+| `r36-patched-batch384-debug` | shard-flatten removal plus `batch_fetch_conversations=384` | 497.716 | 102.840 | 9450.773 | 42.915 | rejected |
+| `r37-inner8192-32m-debug` | reverted code path; smaller inner Tantivy add batches via `CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES=8192` and `CASS_TANTIVY_ADD_BATCH_MAX_CHARS=33554432` | 496.674 | 103.055 | 9470.603 | 43.005 | rejected |
+
+### Profile Highlights
+
+| Label | Flushes | Commits | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---:|---:|---:|---:|---:|---|
+| `r31-batch256-debug` | 205 | 8 | 43024.856 | 41193.042 | 71299.504 | baseline |
+| `r32-batch384-debug` | 140 | 8 | 42326.307 | 40683.233 | 69395.433 | best initial sweep |
+| `r33-batch512-debug` | 105 | 8 | 39905.467 | 38428.934 | 73655.906 | rejected |
+| `r35-patched-default-debug` | 105 | 8 | 39479.486 | 38680.342 | 73528.180 | rejected |
+| `r36-patched-batch384-debug` | 140 | 8 | 42291.806 | 41356.877 | 69321.667 | rejected |
+| `r37-inner8192-32m-debug` | 105 | 8 | 54022.954 | 53226.469 | 66625.334 | rejected |
+
+### Takeaways
+- The outer-batch sweep alone was real but small: `384` conversations per outer chunk beat `256` and `512`, but only by about `1.0%` in this debug matrix. That is not the kind of leverage that justifies large code churn by itself.
+- The streamed shard-flatten removal was a deceptive non-win. It made some mid-run progress windows look faster, but end-to-end wall clock stayed flat or regressed. The change was reverted.
+- Shrinking the inner Tantivy add-batch amplitude reduced peak RSS slightly and trimmed commit time, but it exploded prepare/add overhead badly enough to lose overall.
+- The long flat spots in progress are still present after these queue-geometry variants. That keeps the dominant suspicion on Tantivy-side commit/segment behavior, not on one extra user-space flatten or on simply making batches smaller.
+- The best result in this cycle remains `r32-batch384-debug`, and even that is only a modest improvement over the surrounding debug variants. No new code-default optimization was accepted from this cycle.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r31-batch256-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r31-batch256-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r32-batch384-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r32-batch384-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r33-batch512-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r33-batch512-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r35-patched-default-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r35-patched-default-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r36-patched-batch384-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r36-patched-batch384-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r37-inner8192-32m-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r37-inner8192-32m-debug/logs/index.stderr.log`
+
+
+## Local-Override Lexical Writer Control And Rejection Cycle
+
+### Goal
+- Re-check the real lexical writer bottleneck with a clean, optimized profiling binary and use that tighter control to test the remaining high-EV levers: merge suppression, writer-thread count, relaxed early commit fencing, and the one outer batch size that had shown a weak positive hint.
+
+### Environment Notes
+- `Cargo.toml` already pins `frankensearch` rev `8e07d082`, and the local checkout used for the temporary override was at the same `HEAD`.
+- The local override was only used to make it easy to benchmark a temporary `no_merge` experiment and to build a fresh profiling binary on `ts2`.
+- The accepted control run below is therefore behaviorally equivalent to the current effective dependency path. The temporary `no_merge` knob was later reverted from the sibling `frankensearch` checkout.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Flushes | Commits | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r38-localfs-default-debug` | local override debug control | 503.834 | 101.591 | 9336.013 | 42.394 | 105 | 8 | 40665.826 | 39869.950 | 75391.760 | baseline for override cycle |
+| `r39-localfs-no-merge-debug` | temporary `CASS_TANTIVY_DISABLE_BULK_LOAD_MERGES=1` | 515.105 | 99.368 | 9131.745 | 41.466 | 105 | 8 | 40923.727 | 40124.853 | 81082.569 | rejected |
+| `r40-localfs-w16-debug` | `CASS_TANTIVY_MAX_WRITER_THREADS=16` | 580.127 | 88.231 | 8108.235 | 36.818 | 105 | 8 | 52056.020 | 51258.220 | 144175.618 | rejected hard |
+| `r41-localfs-default-profiling` | fresh optimized profiling control | 63.582 | 805.025 | 73980.243 | 335.934 | 105 | 8 | 7494.415 | 7221.018 | 7186.305 | accepted fresh best |
+| `r42-localfs-w20-profiling` | `CASS_TANTIVY_MAX_WRITER_THREADS=20` | 67.632 | 756.814 | 69549.805 | 315.816 | 105 | 8 | 9002.267 | 8701.574 | 7136.817 | rejected |
+| `r43-localfs-w32-profiling` | `CASS_TANTIVY_MAX_WRITER_THREADS=32` | 68.693 | 745.131 | 68476.142 | 310.941 | 105 | 8 | 8079.636 | 7770.994 | 7171.754 | rejected |
+| `r44-localfs-commit1m-profiling` | relax initial fence and raise message commit target to `1_000_000` | 67.637 | 756.760 | 69544.827 | 315.793 | 104 | 6 | 7848.833 | 7564.444 | 8795.677 | rejected |
+| `r45-localfs-batch384-profiling` | `CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS=384` | 66.635 | 768.136 | 70590.234 | 320.540 | 140 | 8 | 8218.176 | 7856.156 | 7337.777 | rejected |
+
+### Accepted Control Breakdown
+
+| Label | Flushes | Heartbeat Persists | Prepare ms | Add ms | Commit ms | Pending Progress ms | Heartbeat Progress ms | Checkpoint Persist ms | Meta Fingerprint ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `r41-localfs-default-profiling` | 105 | 21 | 7494.415 | 7221.018 | 7186.305 | 24.703 | 50.732 | 13.898 | 0.367 |
+
+### Takeaways
+- The strongest new datum in this cycle is the fresh optimized control itself: `r41-localfs-default-profiling` completed in `63.582s`, materially faster than the prior documented best `69.650s` (`~8.7%` faster).
+- Suppressing bulk-load merges entirely was a clean loser. `r39` increased commit cost from `75.392s` to `81.083s` in the debug matrix, so the problem is not “too many merges, just turn them off.”
+- Lowering writer threads was also a loser. `r42` and especially `r40` showed that reducing writer parallelism hurt `prepare` and `add` much more than it helped `commit`.
+- Raising writer threads to `32` was also worse than the control. `r43` kept commit cost roughly flat while regressing both `prepare` and `add`, which implies the current default writer-thread cap is already close to the local optimum.
+- Relaxing the initial restartability fence did reduce commit count (`8 -> 6` in `r44`), but it still lost overall because per-commit cost rose sharply and the larger slices made `prepare`/`add` worse. “Fewer commits” is not the objective function by itself.
+- Re-testing the old outer-batch `384` hint on the optimized control binary also lost. It increased flush count from `105` to `140` and regressed wall clock despite a superficially good debug hint earlier.
+- No new code-default optimization was accepted from this cycle. The only durable artifact kept in this repo is the benchmark history update documenting the new control and the rejected levers around it.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r38-localfs-default-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r38-localfs-default-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r39-localfs-no-merge-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r39-localfs-no-merge-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r40-localfs-w16-debug/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r40-localfs-w16-debug/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r41-localfs-default-profiling/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r41-localfs-default-profiling/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r42-localfs-w20-profiling/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r42-localfs-w20-profiling/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r43-localfs-w32-profiling/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r43-localfs-w32-profiling/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r44-localfs-commit1m-profiling/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r44-localfs-commit1m-profiling/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r45-localfs-batch384-profiling/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r45-localfs-batch384-profiling/logs/index.stderr.log`
+
+## Streamed Rebuild Queueing Experiments: Rejected
+
+### Goal
+- Test whether removing the outer flattened-doc materialization, and then overlapping prepare with add via a bounded ordered pipeline, could reduce the effective `prepare + add` portion of lexical rebuild without hurting commit behavior.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `r46-localdebug-pipeline` | shard streaming plus bounded ordered prepare→add pipeline, debug | 499.811 | 102.409 | 9411.169 | 42.735 | 917.130 | 39825.243 | 73981.459 | rejected |
+| `r47-profiling-pipeline` | same bounded ordered pipeline, optimized profiling build | 63.582 | 805.020 | 73979.837 | 335.932 | 382.818 | 7386.208 | 7066.819 | rejected as benchmark-neutral |
+| `r48-profiling-shardstream` | shard streaming only, no pipeline, optimized profiling build | 63.587 | 804.962 | 73974.492 | 335.908 | 407.439 | 7414.252 | 7057.664 | rejected as slightly slower |
+
+### Takeaways
+- The bounded ordered pipeline did exactly what the internal counters said it would do: it nearly eliminated standalone `prepare_ms`. That did **not** translate into end-to-end wall-clock improvement on the real corpus.
+- On the trusted profiling run, the pipeline path (`r47`) ended effectively tied with the standing best control (`r41-localfs-default-profiling` at `63.582s`). The saved prepare time simply reappeared inside the broader add/consumer critical path.
+- The debug run for the same pipeline path (`r46`) was a clearer loser at `499.811s` versus the prior nearby debug point `481.607s`, confirming that the more complex queueing path was not a robust improvement.
+- The simpler shard-streaming-only variant (`r48`) was also not good enough. It landed at `63.587s`, fractionally slower than the standing best control, so the extra hot-path complexity was not justified.
+- Final decision from this cycle: revert both experiments. The repo should not keep either the bounded ordered pipeline or the shard-streaming-only hot-path change based on this evidence.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r46-localdebug-pipeline/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r46-localdebug-pipeline/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r47-profiling-pipeline/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r47-profiling-pipeline/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r48-profiling-shardstream/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r48-profiling-shardstream/logs/index.stderr.log`
+
+
+## Rebuild Scan-Path Breakdown And Grouped Message Streaming
+
+### Goal
+- Measure the previously unaccounted lexical rebuild wall time inside the post-`ready_to_index` scan path, then attack the real hotspot instead of continuing speculative queue-shape experiments.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Total ms | Conversation List ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r49-prep-scan-control` | control run with new internal prep + rebuild breakdown enabled | 64.604 | 792.289 | 72809.885 | 330.620 | 60512.503 | 309.320 | 58307.003 | 14969.626 | 7635.771 | 7350.405 | 6382.053 | diagnostic baseline |
+| `r50-profile-scan-breakdown` | same control on current-tree profiling binary with retained scan timers | 64.597 | 792.379 | 72818.079 | 330.657 | 60512.503 | 309.320 | 58307.003 | 14969.626 | 8202.398 | 7016.905 | 7201.437 | confirms hotspot location |
+| `r51-grouped-message-stream` | storage streams one callback per conversation instead of one per message row | 63.565 | 805.234 | 73999.505 | 336.021 | 60219.208 | 315.846 | 58084.419 | 15053.749 | 8180.393 | 7029.454 | 7339.476 | accepted |
+| `r52-grouped-plus-move` | consume preloaded conversation rows via iterator instead of cloning each envelope | 63.574 | 805.131 | 73990.004 | 335.978 | 59920.119 | 318.789 | 57818.331 | 14710.652 | 7948.957 | 6828.904 | 7198.409 | retained, effectively tied |
+| `r53-grouped-plus-move-repeat` | repeat of retained current tree | 63.588 | 804.948 | 73973.232 | 335.902 | 59714.698 | 312.742 | 57637.359 | 14639.930 | 7908.375 | 6825.523 | 7055.011 | repeat confirms tie-stable behavior |
+
+### Takeaways
+- The earlier external “prepare” bucket was misleading. Internal prep before `ready_to_index` is only about `0.4s`; the real fixed cost was the scan path after startup.
+- The dominant hotspot was not conversation listing. `conversation_list_ms` stayed around `0.31s`, so materializing the conversation envelope vector was never the main problem.
+- The real cost center was the message scan/merge window itself: roughly `58.3s` on the control run. That made the highest-EV lever clear: cut outer per-message callback and merge overhead.
+- Grouped message streaming did that. `r51` improved wall clock from `64.597s` to `63.565s`, about `1.6%` faster, while also increasing throughput to about `74.0k` messages/sec.
+- The follow-on move-based conversation iterator was basically wall-clock neutral versus grouped-only, but it did reduce the internal scan and finish counters slightly on both retained samples. The current tree keeps it because it removes pointless conversation-envelope clone churn without evidence of regression.
+- The core scan path is still the frontier. Even after the accepted grouped-stream change, `message_stream_ms` is still about `57.6-58.1s`, which remains much larger than `prepare + add + commit`.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r49-prep-scan-control/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r49-prep-scan-control/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r50-profile-scan-breakdown/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r50-profile-scan-breakdown/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r51-grouped-message-stream/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r51-grouped-message-stream/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r52-grouped-plus-move/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r52-grouped-plus-move/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r53-grouped-plus-move-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r53-grouped-plus-move-repeat/logs/index.stderr.log`
+
+## Grouped Stream Late-Materialization Sweep
+
+### Goal
+- Continue attacking the measured `message_stream_ms` hotspot inside the authoritative canonical-DB lexical rebuild by stripping per-row work that the grouped scan path did not actually need.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Total ms | Conversation List ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r55-precompute-message-bytes` | precompute message-byte totals during grouped scan and pass them into `finish_conversation` | 64.628 | 791.992 | 72782.587 | 330.496 | 60521.117 | 296.913 | 58495.152 | 15302.675 | 8567.230 | 7448.500 | 7058.829 | rejected |
+| `r56-grouped-null-author` | grouped scan projects `NULL AS author` instead of decoding unused author text | 63.593 | 804.885 | 73967.407 | 335.876 | 60051.317 | 311.745 | 58010.494 | 14689.677 | 8109.158 | 6959.775 | 6846.188 | effectively neutral |
+| `r57-grouped-lite-row` | grouped scan emits a lite row (`idx`, `created_at`, `content`, tool-bit) plus per-conversation last message id | 62.586 | 817.830 | 75157.021 | 341.278 | 58814.138 | 307.244 | 56816.733 | 14415.829 | 7660.826 | 6557.957 | 7170.979 | accepted fresh best |
+
+### Takeaways
+- Moving the message-byte summation earlier was a clean loser. `r55` regressed wall clock and worsened every important internal bucket (`message_stream`, `prepare`, and `add`). That lever was reverted.
+- Simply pruning grouped `author` decode was too small to matter by itself. `r56` landed essentially tied with the retained grouped-stream baseline, so it was only useful as a proof that narrow projection pruning in this area is behaviorally safe.
+- The stronger late-materialization lever did pay off. `r57` cut wall time to `62.586s`, improving on the prior retained `r53` repeat (`63.588s`) by about `1.6%`.
+- The accepted win is visible in the right internal buckets: `message_stream_ms` dropped from `57637.359` on `r53` to `56816.733` on `r57`, while `prepare_ms` and `add_ms` also improved materially.
+- The canonical corpus currently has zero `tool` rows (`SELECT count(*) FROM messages WHERE role='tool'` returned `0`), which made it especially clear that carrying full role strings through this grouped rebuild path was unnecessary overhead on this workload.
+- After `r57`, the dominant remaining cost is still the raw grouped scan and content transfer itself. The next frontier is likely the unavoidable `content` payload movement, not another tiny metadata field.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r55-precompute-message-bytes/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r55-precompute-message-bytes/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r56-grouped-null-author/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r56-grouped-null-author/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r57-grouped-lite-row/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r57-grouped-lite-row/logs/index.stderr.log`

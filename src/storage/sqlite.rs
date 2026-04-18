@@ -2999,6 +2999,17 @@ pub struct LexicalRebuildMessageRow {
     pub content: String,
 }
 
+/// Even lighter message projection used only by the grouped lexical rebuild
+/// stream hot path. It keeps just the per-message fields the rebuild consumes
+/// and tracks the final message id at conversation scope instead.
+#[derive(Debug, Clone)]
+pub struct LexicalRebuildGroupedMessageRow {
+    pub idx: i64,
+    pub is_tool_role: bool,
+    pub created_at: Option<i64>,
+    pub content: String,
+}
+
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -5018,11 +5029,11 @@ impl FrankenStorage {
             "cass lexical rebuild message stream callback failed";
         const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild message stream early stop";
 
-        let hinted_sql = "SELECT conversation_id, id, idx, role, author, created_at, content \
+        let hinted_sql = "SELECT conversation_id, id, idx, role, NULL AS author, created_at, content \
              FROM messages INDEXED BY idx_messages_conv_idx \
              WHERE conversation_id >= ?1 \
              ORDER BY conversation_id ASC, idx ASC";
-        let fallback_sql = "SELECT conversation_id, id, idx, role, author, created_at, content \
+        let fallback_sql = "SELECT conversation_id, id, idx, role, NULL AS author, created_at, content \
              FROM messages \
              WHERE conversation_id >= ?1 \
              ORDER BY conversation_id ASC, idx ASC";
@@ -5089,6 +5100,139 @@ impl FrankenStorage {
             return Err(err).with_context(|| "processing streamed lexical rebuild messages");
         }
         result
+    }
+
+    /// Stream grouped lexical rebuild message rows in `(conversation_id, idx)`
+    /// order without paying an outer callback dispatch for every individual
+    /// message. The storage layer still scans every row, but it emits one
+    /// callback per conversation.
+    pub fn stream_grouped_messages_for_lexical_rebuild_between_conversation_ids<F>(
+        &self,
+        start_conversation_id: i64,
+        end_conversation_id: i64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Vec<LexicalRebuildGroupedMessageRow>, i64) -> Result<()>,
+    {
+        if end_conversation_id < start_conversation_id {
+            return Ok(());
+        }
+
+        const CALLBACK_FAILURE_SENTINEL: &str =
+            "cass lexical rebuild grouped message stream callback failed";
+        const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild grouped message stream early stop";
+
+        let hinted_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages INDEXED BY idx_messages_conv_idx              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
+        let fallback_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
+
+        let params = [SqliteValue::Integer(start_conversation_id)];
+        let mut callback_error: Option<anyhow::Error> = None;
+        let stop_requested = std::cell::Cell::new(false);
+
+        let mut run = |sql: &str| -> Result<()> {
+            let stmt = self
+                .conn
+                .prepare(sql)
+                .with_context(|| "preparing grouped lexical rebuild message stream query")?;
+            let mut current_conversation_id: Option<i64> = None;
+            let mut current_messages: Vec<LexicalRebuildGroupedMessageRow> = Vec::new();
+            let mut current_last_message_id = 0i64;
+            let mut flush_current =
+                |current_conversation_id: &mut Option<i64>,
+                 current_messages: &mut Vec<LexicalRebuildGroupedMessageRow>,
+                 current_last_message_id: &mut i64|
+                 -> std::result::Result<(), frankensqlite::FrankenError> {
+                    let Some(conversation_id) = current_conversation_id.take() else {
+                        return Ok(());
+                    };
+                    let messages = std::mem::take(current_messages);
+                    let last_message_id = std::mem::take(current_last_message_id);
+                    if let Err(err) = f(conversation_id, messages, last_message_id) {
+                        callback_error = Some(err);
+                        return Err(frankensqlite::FrankenError::Internal(
+                            CALLBACK_FAILURE_SENTINEL.to_string(),
+                        ));
+                    }
+                    Ok(())
+                };
+
+            let query_result = stmt.query_with_params_for_each(&params, |row| {
+                let conversation_id: i64 = row.get_typed(0)?;
+                let message_id: i64 = row.get_typed(1)?;
+                let message_row = LexicalRebuildGroupedMessageRow {
+                    idx: row.get_typed(2)?,
+                    is_tool_role: row.get_typed::<i64>(3)? != 0,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                };
+                if conversation_id > end_conversation_id {
+                    stop_requested.set(true);
+                    return Err(frankensqlite::FrankenError::Internal(
+                        EARLY_STOP_SENTINEL.to_string(),
+                    ));
+                }
+                if current_conversation_id != Some(conversation_id) {
+                    flush_current(
+                        &mut current_conversation_id,
+                        &mut current_messages,
+                        &mut current_last_message_id,
+                    )?;
+                    current_conversation_id = Some(conversation_id);
+                }
+                current_last_message_id = message_id;
+                current_messages.push(message_row);
+                Ok(())
+            });
+
+            match query_result {
+                Ok(()) => {}
+                Err(err)
+                    if stop_requested.get() && err.to_string().contains(EARLY_STOP_SENTINEL) => {}
+                Err(err) => {
+                    return Err(err).with_context(|| "streaming grouped lexical rebuild messages");
+                }
+            }
+
+            flush_current(
+                &mut current_conversation_id,
+                &mut current_messages,
+                &mut current_last_message_id,
+            )
+            .with_context(|| "flushing grouped lexical rebuild messages")?;
+            Ok(())
+        };
+
+        let result = run(hinted_sql).or_else(|err| {
+            let err_contains =
+                |needle: &str| err.chain().any(|cause| cause.to_string().contains(needle));
+            if err_contains("no such index: idx_messages_conv_idx") {
+                run(fallback_sql)
+            } else {
+                Err(err)
+            }
+        });
+        if let Some(err) = callback_error {
+            return Err(err).with_context(|| "processing grouped lexical rebuild messages");
+        }
+        result
+    }
+
+    /// Stream grouped lexical rebuild message rows from a starting conversation
+    /// id to the end of the table.
+    pub fn stream_grouped_messages_for_lexical_rebuild_from_conversation_id<F>(
+        &self,
+        start_conversation_id: i64,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(i64, Vec<LexicalRebuildGroupedMessageRow>, i64) -> Result<()>,
+    {
+        self.stream_grouped_messages_for_lexical_rebuild_between_conversation_ids(
+            start_conversation_id,
+            i64::MAX,
+            f,
+        )
     }
 
     /// Stream lexical rebuild message rows from a starting conversation id to

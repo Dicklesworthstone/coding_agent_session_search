@@ -14,7 +14,7 @@ use frankensearch::lexical::{
     cass_schema_hash_matches,
 };
 
-fn normalized_index_source_id(
+pub(crate) fn normalized_index_source_id(
     source_id: Option<&str>,
     origin_kind: Option<&str>,
     origin_host: Option<&str>,
@@ -41,7 +41,7 @@ fn normalized_index_source_id(
     LOCAL_SOURCE_ID.to_string()
 }
 
-fn normalized_index_origin_kind(source_id: &str, origin_kind: Option<&str>) -> String {
+pub(crate) fn normalized_index_origin_kind(source_id: &str, origin_kind: Option<&str>) -> String {
     if let Some(kind) = origin_kind.map(str::trim).filter(|value| !value.is_empty()) {
         if kind.eq_ignore_ascii_case("local") {
             return LOCAL_SOURCE_ID.to_string();
@@ -59,7 +59,7 @@ fn normalized_index_origin_kind(source_id: &str, origin_kind: Option<&str>) -> S
     }
 }
 
-fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
+pub(crate) fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<String> {
     origin_host
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -320,6 +320,34 @@ impl TantivyIndex {
         }
     }
 
+    pub fn add_prebuilt_documents<I>(&mut self, documents: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = FsCassDocument>,
+    {
+        let max_messages = tantivy_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut docs: Vec<FsCassDocument> = Vec::with_capacity(max_messages);
+        let mut pending_chars = 0usize;
+        let mut indexed_docs = 0usize;
+
+        for doc in documents {
+            push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
+            if docs.len() >= max_messages || pending_chars >= max_chars {
+                indexed_docs = indexed_docs.saturating_add(docs.len());
+                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                docs.clear();
+                pending_chars = 0;
+            }
+        }
+
+        if !docs.is_empty() {
+            indexed_docs = indexed_docs.saturating_add(docs.len());
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+        }
+
+        Ok(indexed_docs)
+    }
+
     pub fn add_conversations_with_ids<'a, I>(&mut self, conversations: I) -> Result<usize>
     where
         I: IntoIterator<Item = (&'a NormalizedConversation, Option<i64>)>,
@@ -522,6 +550,39 @@ mod tests {
         let indexed_docs = idx
             .add_conversations_with_ids(conversations.iter().map(|conv| (conv, Some(42))))
             .expect("add conversations");
+        assert_eq!(indexed_docs, expected_docs);
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), expected_docs as u64);
+    }
+
+    #[test]
+    fn add_prebuilt_documents_streams_large_payloads_without_dropping_docs() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut idx = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        let content = "z".repeat(2048);
+        let docs: Vec<_> = (0..6_144)
+            .map(|msg_idx| FsCassDocument {
+                agent: "codex".to_string(),
+                workspace: Some("/tmp/workspace".to_string()),
+                workspace_original: None,
+                source_path: "/tmp/prebuilt-rollout.jsonl".to_string(),
+                msg_idx: msg_idx as u64,
+                created_at: Some(1_700_000_000_000 + msg_idx as i64),
+                title: Some("Prebuilt Batch".to_string()),
+                content: format!("prebuilt-msg-{msg_idx}-{content}"),
+                conversation_id: Some(7),
+                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                origin_kind: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                origin_host: None,
+            })
+            .collect();
+        let expected_docs = docs.len();
+
+        let indexed_docs = idx.add_prebuilt_documents(docs).expect("add prebuilt docs");
         assert_eq!(indexed_docs, expected_docs);
         idx.commit().expect("commit");
 

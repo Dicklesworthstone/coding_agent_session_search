@@ -21,6 +21,7 @@ use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
+use crate::connectors::NormalizedConversation;
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector, chatgpt::ChatGptConnector,
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
@@ -29,14 +30,11 @@ use crate::connectors::{
     kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
-use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
-use crate::ensure_cass_origin;
-use crate::model::types::MessageRole;
 use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
@@ -53,7 +51,13 @@ use std::iter::Peekable;
 type BatchClassificationMap =
     HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
 
-type LexicalRebuildMessageBatch = HashMap<i64, Vec<crate::model::types::Message>>;
+type LexicalRebuildMessageBatch = Vec<PendingLexicalRebuildConversation>;
+
+#[derive(Debug)]
+struct PendingLexicalRebuildConversation {
+    conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
+    messages: Vec<crate::storage::sqlite::LexicalRebuildGroupedMessageRow>,
+}
 
 fn message_id_from_db(raw: i64) -> Option<u64> {
     u64::try_from(raw).ok()
@@ -798,46 +802,22 @@ fn index_run_lock_heartbeat_interval() -> Duration {
     )
 }
 
-fn normalize_lexical_messages_for_rebuild(
-    messages: Vec<crate::model::types::Message>,
-) -> Vec<NormalizedMessage> {
-    use crate::model::types::MessageRole;
-
-    messages
-        .into_iter()
-        .map(|msg| {
-            let role = match msg.role {
-                MessageRole::User => "user".to_string(),
-                MessageRole::Agent => "assistant".to_string(),
-                MessageRole::Tool => "tool".to_string(),
-                MessageRole::System => "system".to_string(),
-                MessageRole::Other(other) => other,
-            };
-
-            NormalizedMessage {
-                idx: msg.idx,
-                role,
-                author: msg.author,
-                created_at: msg.created_at,
-                content: msg.content,
-                extra: msg.extra_json,
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }
-        })
-        .collect()
+fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
+    is_tool_role.then_some("tool")
 }
 
-struct PreparedLexicalRebuildConversation {
-    conversation_id: i64,
-    normalized: NormalizedConversation,
-}
-
-fn prepare_lexical_rebuild_conversation(
-    conv: crate::storage::sqlite::LexicalRebuildConversationRow,
-    messages: Vec<crate::model::types::Message>,
+fn prepare_lexical_rebuild_documents_for_conversation(
+    pending: PendingLexicalRebuildConversation,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
-) -> PreparedLexicalRebuildConversation {
+) -> Vec<frankensearch::lexical::CassDocument> {
+    let PendingLexicalRebuildConversation {
+        conversation: conv,
+        messages,
+    } = pending;
+    let Some(conversation_id) = conv.id else {
+        return Vec::new();
+    };
+
     let (kind, host_label) = source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
         let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
             SourceKind::Local
@@ -846,72 +826,86 @@ fn prepare_lexical_rebuild_conversation(
         };
         (fallback_kind, None)
     });
-    let host = conv.origin_host.as_deref().or(host_label.as_deref());
-    let mut metadata = serde_json::Value::Object(serde_json::Map::new());
-    ensure_cass_origin(&mut metadata, &conv.source_id, kind, host);
+    let origin_host = crate::search::tantivy::normalized_index_origin_host(
+        conv.origin_host.as_deref().or(host_label.as_deref()),
+    );
+    let source_id = crate::search::tantivy::normalized_index_source_id(
+        Some(&conv.source_id),
+        Some(kind.as_str()),
+        origin_host.as_deref(),
+    );
+    let origin_kind =
+        crate::search::tantivy::normalized_index_origin_kind(&source_id, Some(kind.as_str()));
+    let agent = conv.agent_slug;
+    let workspace = conv
+        .workspace
+        .as_ref()
+        .map(|ws| ws.to_string_lossy().to_string());
+    let source_path = conv.source_path.to_string_lossy().to_string();
+    let title = conv.title;
+    let started_at_fallback = conv.started_at;
+    let mut docs = Vec::with_capacity(messages.len());
 
-    let normalized_messages = normalize_lexical_messages_for_rebuild(messages);
-    let conversation_id = conv.id.unwrap_or_default();
-    let normalized = NormalizedConversation {
-        agent_slug: conv.agent_slug,
-        external_id: conv.external_id,
-        title: conv.title,
-        workspace: conv.workspace,
-        source_path: conv.source_path,
-        started_at: conv.started_at,
-        ended_at: conv.ended_at,
-        metadata,
-        messages: normalized_messages,
-    };
+    for message in messages {
+        if is_hard_message_noise(
+            lexical_rebuild_noise_role(message.is_tool_role),
+            &message.content,
+        ) {
+            continue;
+        }
 
-    PreparedLexicalRebuildConversation {
-        conversation_id,
-        normalized,
+        docs.push(frankensearch::lexical::CassDocument {
+            agent: agent.clone(),
+            workspace: workspace.clone(),
+            workspace_original: None,
+            source_path: source_path.clone(),
+            msg_idx: message.idx.max(0) as u64,
+            created_at: message.created_at.or(started_at_fallback),
+            title: title.clone(),
+            content: message.content,
+            conversation_id: Some(conversation_id),
+            source_id: source_id.clone(),
+            origin_kind: origin_kind.clone(),
+            origin_host: origin_host.clone(),
+        });
     }
+
+    docs
 }
 
 fn prepare_lexical_rebuild_batch(
-    conv_chunk: &[crate::storage::sqlite::LexicalRebuildConversationRow],
-    batch_messages_by_conversation: &mut HashMap<i64, Vec<crate::model::types::Message>>,
+    batch: &mut LexicalRebuildMessageBatch,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
     worker_pool: Option<&ThreadPool>,
-) -> Vec<PreparedLexicalRebuildConversation> {
-    let jobs: Vec<_> = conv_chunk
-        .iter()
-        .cloned()
-        .filter_map(|conv| {
-            conv.id.map(|conversation_id| {
-                let messages = batch_messages_by_conversation
-                    .remove(&conversation_id)
-                    .unwrap_or_default();
-                (conv, messages)
-            })
-        })
-        .collect();
-
+) -> Vec<frankensearch::lexical::CassDocument> {
+    let jobs = std::mem::take(batch);
     if jobs.is_empty() {
         return Vec::new();
     }
 
     let prepare_jobs = || {
         jobs.into_par_iter()
-            .map(|(conv, messages)| {
-                prepare_lexical_rebuild_conversation(conv, messages, source_map)
-            })
+            .map(|pending| prepare_lexical_rebuild_documents_for_conversation(pending, source_map))
             .collect::<Vec<_>>()
     };
 
-    if let Some(pool) = worker_pool {
+    let mut prepared_doc_shards = if let Some(pool) = worker_pool {
         pool.install(prepare_jobs)
     } else {
         prepare_jobs()
+    };
+
+    let total_docs = prepared_doc_shards.iter().map(Vec::len).sum();
+    let mut docs = Vec::with_capacity(total_docs);
+    for shard in &mut prepared_doc_shards {
+        docs.append(shard);
     }
+    docs
 }
 
 #[allow(clippy::too_many_arguments)]
 fn flush_streamed_lexical_rebuild_batch(
-    pending_conversations: &mut Vec<crate::storage::sqlite::LexicalRebuildConversationRow>,
-    pending_messages_by_conversation: &mut LexicalRebuildMessageBatch,
+    pending_batch: &mut LexicalRebuildMessageBatch,
     pending_batch_message_count: &mut usize,
     pending_batch_message_bytes: &mut usize,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
@@ -925,28 +919,20 @@ fn flush_streamed_lexical_rebuild_batch(
     page_size: i64,
     perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<()> {
-    if pending_conversations.is_empty() {
+    if pending_batch.is_empty() {
         return Ok(());
     }
 
-    let batch_conversations = pending_conversations.len();
+    let batch_conversations = pending_batch.len();
     let chunk_message_count = *pending_batch_message_count;
     let chunk_message_bytes = *pending_batch_message_bytes;
     let chunk_limit = *current_batch_conversation_limit;
     let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
-    let prepared_batch = prepare_lexical_rebuild_batch(
-        pending_conversations,
-        pending_messages_by_conversation,
-        source_map,
-        lexical_rebuild_worker_pool,
-    );
+    let prepared_doc_shards =
+        prepare_lexical_rebuild_batch(pending_batch, source_map, lexical_rebuild_worker_pool);
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
     *indexed_docs =
-        (*indexed_docs).saturating_add(
-            t_index.add_conversations_with_ids(prepared_batch.iter().map(|conversation| {
-                (&conversation.normalized, Some(conversation.conversation_id))
-            }))?,
-        );
+        (*indexed_docs).saturating_add(t_index.add_prebuilt_documents(prepared_doc_shards)?);
     if let Some(profile) = perf_profile {
         profile.batch_flushes = profile.batch_flushes.saturating_add(1);
         profile.batch_conversations = profile
@@ -973,8 +959,7 @@ fn flush_streamed_lexical_rebuild_batch(
         chunk_limit,
         "lexical rebuild flushed a streamed conversation batch"
     );
-    pending_conversations.clear();
-    pending_messages_by_conversation.clear();
+    pending_batch.clear();
     *pending_batch_message_count = 0;
     *pending_batch_message_bytes = 0;
     *current_batch_conversation_limit = batch_conversation_limit;
@@ -1028,12 +1013,16 @@ fn maintenance_job_kind_for_mode(_mode: SearchMaintenanceMode) -> SearchMaintena
 
 #[derive(Debug, Default)]
 struct LexicalRebuildPerfProfile {
+    total_duration: Duration,
     batch_flushes: usize,
     commit_count: usize,
     heartbeat_persist_count: usize,
     batch_conversations: usize,
     batch_messages: usize,
     batch_message_bytes: usize,
+    conversation_list_duration: Duration,
+    message_stream_duration: Duration,
+    finish_conversation_duration: Duration,
     prepare_duration: Duration,
     add_duration: Duration,
     commit_duration: Duration,
@@ -1056,11 +1045,23 @@ impl LexicalRebuildPerfProfile {
         let flushes = self.batch_flushes.max(1) as f64;
         let commits = self.commit_count.max(1) as f64;
         let heartbeat_persists = self.heartbeat_persist_count.max(1) as f64;
+        let accounted_duration = self.conversation_list_duration
+            + self.message_stream_duration
+            + self.prepare_duration
+            + self.add_duration
+            + self.commit_duration
+            + self.pending_progress_duration
+            + self.heartbeat_progress_duration
+            + self.checkpoint_persist_duration
+            + self.meta_fingerprint_duration;
+        let residual_duration = self.total_duration.saturating_sub(accounted_duration);
         eprintln!(
             concat!(
                 "CASS_REBUILD_PROFILE ",
                 "flushes={} commits={} heartbeat_persists={} ",
                 "batch_conversations={} batch_messages={} batch_message_bytes={} ",
+                "total_ms={:.3} conversation_list_ms={:.3} message_stream_ms={:.3} ",
+                "finish_conversation_ms={:.3} residual_ms={:.3} ",
                 "prepare_ms={:.3} add_ms={:.3} commit_ms={:.3} ",
                 "pending_progress_ms={:.3} heartbeat_progress_ms={:.3} ",
                 "checkpoint_persist_ms={:.3} meta_fingerprint_ms={:.3} ",
@@ -1074,6 +1075,11 @@ impl LexicalRebuildPerfProfile {
             self.batch_conversations,
             self.batch_messages,
             self.batch_message_bytes,
+            Self::millis(self.total_duration),
+            Self::millis(self.conversation_list_duration),
+            Self::millis(self.message_stream_duration),
+            Self::millis(self.finish_conversation_duration),
+            Self::millis(residual_duration),
             Self::millis(self.prepare_duration),
             Self::millis(self.add_duration),
             Self::millis(self.commit_duration),
@@ -1296,15 +1302,19 @@ fn lexical_rebuild_commit_interval_messages() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(200_000)
+        .unwrap_or(800_000)
 }
 
 fn lexical_rebuild_initial_commit_interval_messages() -> usize {
+    // The initial rebuild slice is already bounded by smaller conversation and
+    // byte ceilings. Keeping an extra 50k-message cap forced unnecessary early
+    // commit fences on large canonical rebuilds without providing meaningfully
+    // earlier restartability.
     dotenvy::var("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(50_000)
+        .unwrap_or(800_000)
 }
 
 fn lexical_rebuild_commit_interval_message_bytes() -> usize {
@@ -4974,137 +4984,25 @@ fn rebuild_tantivy_from_db_with_options(
     let mut message_bytes_since_commit = 0usize;
     let mut conversations_since_progress_persist = 0usize;
     let mut last_progress_persist = Instant::now();
-    let mut pending_conversations: Vec<crate::storage::sqlite::LexicalRebuildConversationRow> =
+    let mut pending_batch: LexicalRebuildMessageBatch =
         Vec::with_capacity(current_batch_conversation_limit.max(1));
-    let mut pending_messages_by_conversation: LexicalRebuildMessageBatch = HashMap::new();
     let mut pending_batch_message_count = 0usize;
     let mut pending_batch_message_bytes = 0usize;
     let mut perf_profile = LexicalRebuildPerfProfile::from_env();
+    let rebuild_profile_started = perf_profile.as_ref().map(|_| Instant::now());
 
     let resume_committed_offset = rebuild_state.committed_offset;
 
-    let mut finish_conversation = |conv: crate::storage::sqlite::LexicalRebuildConversationRow,
-                                   messages: Vec<crate::model::types::Message>|
-     -> Result<()> {
-        let message_count = messages.len();
-        let message_bytes = messages
-            .iter()
-            .map(|message| message.content.len())
-            .sum::<usize>();
-        observed_messages = observed_messages.saturating_add(message_count);
-        if let Some(conversation_id) = conv.id
-            && !messages.is_empty()
-        {
-            pending_messages_by_conversation.insert(conversation_id, messages);
-        }
-        pending_batch_message_count = pending_batch_message_count.saturating_add(message_count);
-        pending_batch_message_bytes = pending_batch_message_bytes.saturating_add(message_bytes);
-        pending_conversations.push(conv);
-
-        offset = offset.saturating_add(1);
-        processed_conversations = processed_conversations.saturating_add(1);
-        conversations_since_commit = conversations_since_commit.saturating_add(1);
-        conversations_since_progress_persist =
-            conversations_since_progress_persist.saturating_add(1);
-        if let Some(p) = &progress {
-            p.current.fetch_add(1, Ordering::Relaxed);
-        }
-
-        if pending_conversations.len() >= current_batch_conversation_limit {
-            flush_streamed_lexical_rebuild_batch(
-                &mut pending_conversations,
-                &mut pending_messages_by_conversation,
-                &mut pending_batch_message_count,
-                &mut pending_batch_message_bytes,
-                &source_map,
-                lexical_rebuild_worker_pool.as_ref(),
-                &mut t_index,
-                &mut indexed_docs,
-                &mut messages_since_commit,
-                &mut message_bytes_since_commit,
-                &mut current_batch_conversation_limit,
-                batch_conversation_limit,
-                page_size,
-                perf_profile.as_mut(),
-            )?;
-        }
-
-        if should_commit_lexical_rebuild(
-            conversations_since_commit,
-            messages_since_commit.saturating_add(pending_batch_message_count),
-            message_bytes_since_commit.saturating_add(pending_batch_message_bytes),
-            commit_interval_conversations,
-            commit_interval_messages,
-            commit_interval_message_bytes,
-        ) {
-            flush_streamed_lexical_rebuild_batch(
-                &mut pending_conversations,
-                &mut pending_messages_by_conversation,
-                &mut pending_batch_message_count,
-                &mut pending_batch_message_bytes,
-                &source_map,
-                lexical_rebuild_worker_pool.as_ref(),
-                &mut t_index,
-                &mut indexed_docs,
-                &mut messages_since_commit,
-                &mut message_bytes_since_commit,
-                &mut current_batch_conversation_limit,
-                batch_conversation_limit,
-                page_size,
-                perf_profile.as_mut(),
-            )?;
-            commit_lexical_rebuild_progress(
-                &index_path,
-                &mut rebuild_state,
-                offset,
-                processed_conversations,
-                indexed_docs,
-                &mut t_index,
-                perf_profile.as_mut(),
-            )?;
-            conversations_since_commit = 0;
-            messages_since_commit = 0;
-            message_bytes_since_commit = 0;
-            conversations_since_progress_persist = 0;
-            last_progress_persist = Instant::now();
-            (
-                commit_interval_conversations,
-                commit_interval_messages,
-                commit_interval_message_bytes,
-            ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
-        } else if should_persist_lexical_rebuild_progress(
-            conversations_since_progress_persist,
-            progress_heartbeat_interval_conversations,
-            last_progress_persist.elapsed(),
-            progress_heartbeat_interval,
-        ) {
-            let heartbeat_progress_started = perf_profile.as_ref().map(|_| Instant::now());
-            persist_pending_lexical_rebuild_progress(
-                &index_path,
-                &mut rebuild_state,
-                offset,
-                processed_conversations,
-                indexed_docs,
-            )?;
-            if let (Some(profile), Some(started)) =
-                (perf_profile.as_mut(), heartbeat_progress_started)
-            {
-                profile.heartbeat_persist_count = profile.heartbeat_persist_count.saturating_add(1);
-                profile.heartbeat_progress_duration += started.elapsed();
-            }
-            conversations_since_progress_persist = 0;
-            last_progress_persist = Instant::now();
-        }
-
-        Ok(())
-    };
-
+    let conversation_list_started = perf_profile.as_ref().map(|_| Instant::now());
     let all_conversations = storage.list_conversations_for_lexical_rebuild(
         i64::try_from(total_conversations.max(1)).unwrap_or(i64::MAX),
         0,
         &agent_slugs,
         &workspace_paths,
     )?;
+    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), conversation_list_started) {
+        profile.conversation_list_duration += started.elapsed();
+    }
     let max_conversation_id = if options.defer_initial_content_fingerprint {
         all_conversations
             .iter()
@@ -5118,109 +5016,190 @@ fn rebuild_tantivy_from_db_with_options(
     let resume_offset = usize::try_from(resume_committed_offset.max(0))
         .unwrap_or(usize::MAX)
         .min(all_conversations.len());
-    let remaining_conversations = &all_conversations[resume_offset..];
+    let mut remaining_conversations = all_conversations.into_iter().skip(resume_offset).peekable();
 
-    if let Some(start_conversation_id) = remaining_conversations.iter().find_map(|conv| conv.id) {
-        let mut conversation_cursor = 0usize;
-        let mut current_conversation_id: Option<i64> = None;
-        let mut current_messages: Vec<crate::model::types::Message> = Vec::new();
-
-        storage.stream_messages_for_lexical_rebuild_from_conversation_id(
-            start_conversation_id,
-            |message_row| {
-                loop {
-                    if conversation_cursor >= remaining_conversations.len() {
-                        return Ok(());
-                    }
-                    let next_conversation_id = remaining_conversations[conversation_cursor]
-                        .id
-                        .unwrap_or_default();
-                    if Some(message_row.conversation_id) == current_conversation_id {
-                        break;
-                    }
-                    if let Some(active_id) = current_conversation_id
-                        && active_id != message_row.conversation_id
-                    {
-                        let conv = remaining_conversations[conversation_cursor].clone();
-                        let messages = std::mem::take(&mut current_messages);
-                        current_conversation_id = None;
-                        finish_conversation(conv, messages)?;
-                        conversation_cursor = conversation_cursor.saturating_add(1);
-                        continue;
-                    }
-                    if next_conversation_id < message_row.conversation_id {
-                        let conv = remaining_conversations[conversation_cursor].clone();
-                        finish_conversation(conv, Vec::new())?;
-                        conversation_cursor = conversation_cursor.saturating_add(1);
-                        continue;
-                    }
-                    break;
-                }
-
-                if conversation_cursor >= remaining_conversations.len() {
-                    return Ok(());
-                }
-
-                let expected_conversation_id = remaining_conversations[conversation_cursor]
-                    .id
-                    .unwrap_or_default();
-                if expected_conversation_id != message_row.conversation_id {
-                    tracing::debug!(
-                        expected_conversation_id,
-                        observed_conversation_id = message_row.conversation_id,
-                        "skipping out-of-order lexical rebuild message row"
-                    );
-                    return Ok(());
-                }
-
-                if current_conversation_id != Some(message_row.conversation_id) {
-                    current_conversation_id = Some(message_row.conversation_id);
-                }
-
-                if options.defer_initial_content_fingerprint {
-                    max_message_id = max_message_id.max(message_row.id);
-                }
-                let message = crate::model::types::Message {
-                    id: Some(message_row.id),
-                    idx: message_row.idx,
-                    role: match message_row.role.as_str() {
-                        "user" => MessageRole::User,
-                        "agent" | "assistant" => MessageRole::Agent,
-                        "tool" => MessageRole::Tool,
-                        "system" => MessageRole::System,
-                        other => MessageRole::Other(other.to_string()),
-                    },
-                    author: message_row.author,
-                    created_at: message_row.created_at,
-                    content: message_row.content,
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                };
-                current_messages.push(message);
-                Ok(())
-            },
-        )?;
-
-        if current_conversation_id.is_some() && conversation_cursor < remaining_conversations.len()
+    {
+        let mut message_stream_duration = Duration::ZERO;
         {
-            let conv = remaining_conversations[conversation_cursor].clone();
-            let messages = std::mem::take(&mut current_messages);
-            finish_conversation(conv, messages)?;
-            conversation_cursor = conversation_cursor.saturating_add(1);
-        }
+            let mut finish_conversation =
+                |conv: crate::storage::sqlite::LexicalRebuildConversationRow,
+                 messages: Vec<crate::storage::sqlite::LexicalRebuildGroupedMessageRow>|
+                 -> Result<()> {
+                    let finish_started = perf_profile.as_ref().map(|_| Instant::now());
+                    let message_count = messages.len();
+                    let message_bytes = messages
+                        .iter()
+                        .map(|message| message.content.len())
+                        .sum::<usize>();
+                    observed_messages = observed_messages.saturating_add(message_count);
+                    pending_batch_message_count =
+                        pending_batch_message_count.saturating_add(message_count);
+                    pending_batch_message_bytes =
+                        pending_batch_message_bytes.saturating_add(message_bytes);
+                    pending_batch.push(PendingLexicalRebuildConversation {
+                        conversation: conv,
+                        messages,
+                    });
 
-        while conversation_cursor < remaining_conversations.len() {
-            let conv = remaining_conversations[conversation_cursor].clone();
-            finish_conversation(conv, Vec::new())?;
-            conversation_cursor = conversation_cursor.saturating_add(1);
+                    offset = offset.saturating_add(1);
+                    processed_conversations = processed_conversations.saturating_add(1);
+                    conversations_since_commit = conversations_since_commit.saturating_add(1);
+                    conversations_since_progress_persist =
+                        conversations_since_progress_persist.saturating_add(1);
+                    if let Some(p) = &progress {
+                        p.current.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if pending_batch.len() >= current_batch_conversation_limit {
+                        flush_streamed_lexical_rebuild_batch(
+                            &mut pending_batch,
+                            &mut pending_batch_message_count,
+                            &mut pending_batch_message_bytes,
+                            &source_map,
+                            lexical_rebuild_worker_pool.as_ref(),
+                            &mut t_index,
+                            &mut indexed_docs,
+                            &mut messages_since_commit,
+                            &mut message_bytes_since_commit,
+                            &mut current_batch_conversation_limit,
+                            batch_conversation_limit,
+                            page_size,
+                            perf_profile.as_mut(),
+                        )?;
+                    }
+
+                    if should_commit_lexical_rebuild(
+                        conversations_since_commit,
+                        messages_since_commit.saturating_add(pending_batch_message_count),
+                        message_bytes_since_commit.saturating_add(pending_batch_message_bytes),
+                        commit_interval_conversations,
+                        commit_interval_messages,
+                        commit_interval_message_bytes,
+                    ) {
+                        flush_streamed_lexical_rebuild_batch(
+                            &mut pending_batch,
+                            &mut pending_batch_message_count,
+                            &mut pending_batch_message_bytes,
+                            &source_map,
+                            lexical_rebuild_worker_pool.as_ref(),
+                            &mut t_index,
+                            &mut indexed_docs,
+                            &mut messages_since_commit,
+                            &mut message_bytes_since_commit,
+                            &mut current_batch_conversation_limit,
+                            batch_conversation_limit,
+                            page_size,
+                            perf_profile.as_mut(),
+                        )?;
+                        commit_lexical_rebuild_progress(
+                            &index_path,
+                            &mut rebuild_state,
+                            offset,
+                            processed_conversations,
+                            indexed_docs,
+                            &mut t_index,
+                            perf_profile.as_mut(),
+                        )?;
+                        conversations_since_commit = 0;
+                        messages_since_commit = 0;
+                        message_bytes_since_commit = 0;
+                        conversations_since_progress_persist = 0;
+                        last_progress_persist = Instant::now();
+                        (
+                            commit_interval_conversations,
+                            commit_interval_messages,
+                            commit_interval_message_bytes,
+                        ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
+                    } else if should_persist_lexical_rebuild_progress(
+                        conversations_since_progress_persist,
+                        progress_heartbeat_interval_conversations,
+                        last_progress_persist.elapsed(),
+                        progress_heartbeat_interval,
+                    ) {
+                        let heartbeat_progress_started =
+                            perf_profile.as_ref().map(|_| Instant::now());
+                        persist_pending_lexical_rebuild_progress(
+                            &index_path,
+                            &mut rebuild_state,
+                            offset,
+                            processed_conversations,
+                            indexed_docs,
+                        )?;
+                        if let (Some(profile), Some(started)) =
+                            (perf_profile.as_mut(), heartbeat_progress_started)
+                        {
+                            profile.heartbeat_persist_count =
+                                profile.heartbeat_persist_count.saturating_add(1);
+                            profile.heartbeat_progress_duration += started.elapsed();
+                        }
+                        conversations_since_progress_persist = 0;
+                        last_progress_persist = Instant::now();
+                    }
+
+                    if let (Some(profile), Some(started)) = (perf_profile.as_mut(), finish_started)
+                    {
+                        profile.finish_conversation_duration += started.elapsed();
+                    }
+                    Ok(())
+                };
+
+            if let Some(start_conversation_id) =
+                remaining_conversations.peek().and_then(|conv| conv.id)
+            {
+                let message_stream_started = Instant::now();
+
+                storage.stream_grouped_messages_for_lexical_rebuild_from_conversation_id(
+                    start_conversation_id,
+                    |observed_conversation_id, messages, last_message_id| {
+                        while let Some(expected) = remaining_conversations.peek() {
+                            let expected_conversation_id = expected.id.unwrap_or_default();
+                            if expected_conversation_id < observed_conversation_id {
+                                let conv = remaining_conversations
+                                    .next()
+                                    .expect("peeked conversation must exist");
+                                finish_conversation(conv, Vec::new())?;
+                                continue;
+                            }
+                            break;
+                        }
+
+                        let Some(expected) = remaining_conversations.peek() else {
+                            return Ok(());
+                        };
+                        let expected_conversation_id = expected.id.unwrap_or_default();
+                        if expected_conversation_id != observed_conversation_id {
+                            tracing::debug!(
+                                expected_conversation_id,
+                                observed_conversation_id,
+                                "skipping out-of-order grouped lexical rebuild messages"
+                            );
+                            return Ok(());
+                        }
+
+                        if options.defer_initial_content_fingerprint {
+                            max_message_id = max_message_id.max(last_message_id);
+                        }
+                        let conv = remaining_conversations
+                            .next()
+                            .expect("expected conversation must exist");
+                        finish_conversation(conv, messages)?;
+                        Ok(())
+                    },
+                )?;
+
+                for conv in remaining_conversations.by_ref() {
+                    finish_conversation(conv, Vec::new())?;
+                }
+                message_stream_duration += message_stream_started.elapsed();
+            }
+        }
+        if let Some(profile) = perf_profile.as_mut() {
+            profile.message_stream_duration += message_stream_duration;
         }
     }
 
-    drop(finish_conversation);
-
     flush_streamed_lexical_rebuild_batch(
-        &mut pending_conversations,
-        &mut pending_messages_by_conversation,
+        &mut pending_batch,
         &mut pending_batch_message_count,
         &mut pending_batch_message_bytes,
         &source_map,
@@ -5276,7 +5255,10 @@ fn rebuild_tantivy_from_db_with_options(
         p.is_rebuilding.store(false, Ordering::Relaxed);
     }
 
-    if let Some(profile) = perf_profile.as_ref() {
+    if let Some(profile) = perf_profile.as_mut() {
+        if let Some(started) = rebuild_profile_started {
+            profile.total_duration = started.elapsed();
+        }
         profile.log_summary();
     }
 
@@ -7433,6 +7415,7 @@ pub mod persist {
     #[cfg(test)]
     mod persist_internal_tests {
         use super::*;
+        use crate::connectors::NormalizedMessage;
         use fsqlite_types::value::SqliteValue;
         use serial_test::serial;
 
@@ -7582,7 +7565,7 @@ pub mod persist {
 
         #[test]
         fn begin_concurrent_persist_writes_all_conversations() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -7695,7 +7678,7 @@ pub mod persist {
 
         #[test]
         fn begin_concurrent_single_conversation_works() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -7756,7 +7739,7 @@ pub mod persist {
         #[test]
         #[serial]
         fn persist_conversations_batched_can_defer_inline_lexical_updates() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -7829,7 +7812,7 @@ pub mod persist {
         #[test]
         #[serial]
         fn begin_concurrent_persist_can_defer_inline_lexical_updates() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8079,7 +8062,7 @@ pub mod persist {
         #[test]
         #[serial]
         fn persist_conversations_batched_falls_back_for_duplicate_keys() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use crate::sources::provenance::{Source, SourceKind};
             use frankensqlite::compat::{ConnectionExt, RowExt};
@@ -8201,7 +8184,7 @@ pub mod persist {
         #[test]
         #[serial]
         fn persist_conversations_batched_registers_missing_remote_source_in_serial_path() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8272,7 +8255,7 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_registers_missing_remote_source_in_begin_concurrent_path()
         {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8346,7 +8329,7 @@ pub mod persist {
         #[test]
         #[serial]
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_serial_runs() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8474,7 +8457,7 @@ pub mod persist {
         #[serial]
         fn persist_conversations_batched_reuses_auto_registered_remote_source_across_begin_concurrent_runs()
          {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8601,7 +8584,7 @@ pub mod persist {
 
         #[test]
         fn persist_conversation_registers_missing_remote_source() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
             use crate::search::tantivy::TantivyIndex;
             use frankensqlite::compat::{ConnectionExt, RowExt};
 
@@ -8665,7 +8648,7 @@ pub mod persist {
 
         #[test]
         fn duplicate_conversation_keys_present_for_shared_source_path_without_external_id() {
-            use crate::connectors::{NormalizedConversation, NormalizedMessage};
+            use crate::connectors::NormalizedConversation;
 
             let convs = vec![
                 NormalizedConversation {
@@ -12634,7 +12617,7 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_commit_intervals_start_smaller_before_first_durable_commit() {
+    fn lexical_rebuild_commit_intervals_keep_initial_slice_bounded_before_first_commit() {
         let state = LexicalRebuildState::new(
             LexicalRebuildDbState {
                 db_path: "/tmp/agent_search.db".to_string(),
@@ -12648,7 +12631,7 @@ mod tests {
         let (conversations, messages, message_bytes) =
             lexical_rebuild_commit_intervals_for_state(&state);
         assert_eq!(conversations, 2_048);
-        assert_eq!(messages, 50_000);
+        assert_eq!(messages, 800_000);
         assert_eq!(message_bytes, 128 * 1024 * 1024);
     }
 
@@ -12668,7 +12651,7 @@ mod tests {
         let (conversations, messages, message_bytes) =
             lexical_rebuild_commit_intervals_for_state(&state);
         assert_eq!(conversations, 10_000);
-        assert_eq!(messages, 200_000);
+        assert_eq!(messages, 800_000);
         assert_eq!(message_bytes, 512 * 1024 * 1024);
     }
 
