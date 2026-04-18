@@ -15,6 +15,7 @@ use frankensqlite::{
 };
 use rusqlite::OptionalExtension as RusqliteOptionalExtension;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -3010,6 +3011,8 @@ pub struct LexicalRebuildGroupedMessageRow {
     pub content: String,
 }
 
+pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 48]>;
+
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
 
@@ -5113,7 +5116,7 @@ impl FrankenStorage {
         mut f: F,
     ) -> Result<()>
     where
-        F: FnMut(i64, Vec<LexicalRebuildGroupedMessageRow>, i64) -> Result<()>,
+        F: FnMut(i64, LexicalRebuildGroupedMessageRows, i64) -> Result<()>,
     {
         if end_conversation_id < start_conversation_id {
             return Ok(());
@@ -5136,11 +5139,11 @@ impl FrankenStorage {
                 .prepare(sql)
                 .with_context(|| "preparing grouped lexical rebuild message stream query")?;
             let mut current_conversation_id: Option<i64> = None;
-            let mut current_messages: Vec<LexicalRebuildGroupedMessageRow> = Vec::new();
+            let mut current_messages: LexicalRebuildGroupedMessageRows = SmallVec::new();
             let mut current_last_message_id = 0i64;
             let mut flush_current =
                 |current_conversation_id: &mut Option<i64>,
-                 current_messages: &mut Vec<LexicalRebuildGroupedMessageRow>,
+                 current_messages: &mut LexicalRebuildGroupedMessageRows,
                  current_last_message_id: &mut i64|
                  -> std::result::Result<(), frankensqlite::FrankenError> {
                     let Some(conversation_id) = current_conversation_id.take() else {
@@ -5226,7 +5229,7 @@ impl FrankenStorage {
         f: F,
     ) -> Result<()>
     where
-        F: FnMut(i64, Vec<LexicalRebuildGroupedMessageRow>, i64) -> Result<()>,
+        F: FnMut(i64, LexicalRebuildGroupedMessageRows, i64) -> Result<()>,
     {
         self.stream_grouped_messages_for_lexical_rebuild_between_conversation_ids(
             start_conversation_id,

@@ -56,7 +56,7 @@ type LexicalRebuildMessageBatch = Vec<PendingLexicalRebuildConversation>;
 #[derive(Debug)]
 struct PendingLexicalRebuildConversation {
     conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
-    messages: Vec<crate::storage::sqlite::LexicalRebuildGroupedMessageRow>,
+    messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
 }
 
 fn message_id_from_db(raw: i64) -> Option<u64> {
@@ -5018,7 +5018,7 @@ fn rebuild_tantivy_from_db_with_options(
         {
             let mut finish_conversation =
                 |conv: crate::storage::sqlite::LexicalRebuildConversationRow,
-                 messages: Vec<crate::storage::sqlite::LexicalRebuildGroupedMessageRow>|
+                 messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows|
                  -> Result<()> {
                     let finish_started = perf_profile.as_ref().map(|_| Instant::now());
                     let message_count = messages.len();
@@ -5152,7 +5152,10 @@ fn rebuild_tantivy_from_db_with_options(
                                 let conv = remaining_conversations
                                     .next()
                                     .expect("peeked conversation must exist");
-                                finish_conversation(conv, Vec::new())?;
+                                finish_conversation(
+                                    conv,
+                                    crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new(),
+                                )?;
                                 continue;
                             }
                             break;
@@ -5183,7 +5186,10 @@ fn rebuild_tantivy_from_db_with_options(
                 )?;
 
                 for conv in remaining_conversations.by_ref() {
-                    finish_conversation(conv, Vec::new())?;
+                    finish_conversation(
+                        conv,
+                        crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new(),
+                    )?;
                 }
                 message_stream_duration += message_stream_started.elapsed();
             }
