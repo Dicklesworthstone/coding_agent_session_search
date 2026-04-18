@@ -3011,7 +3011,7 @@ pub struct LexicalRebuildGroupedMessageRow {
     pub content: String,
 }
 
-pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 48]>;
+pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 64]>;
 
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
 pub type SqliteStorage = FrankenStorage;
