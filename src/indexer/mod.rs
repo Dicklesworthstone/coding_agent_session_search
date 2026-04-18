@@ -1650,40 +1650,15 @@ fn should_run_targeted_watch_once_only(
         && canonical_sessions_before_salvage > 0
 }
 
-fn count_meta_entries_like(storage: &FrankenStorage, pattern: &str) -> Result<i64> {
-    storage
-        .raw()
-        .query_row_map(
-            "SELECT COUNT(*) FROM meta WHERE key LIKE ?1",
-            &[ParamValue::from(pattern)],
-            |row| row.get_typed(0),
-        )
-        .context(format!("counting meta rows matching {pattern}"))
-}
 fn full_rebuild_requires_historical_restart(
-    storage: &FrankenStorage,
-    db_path: &Path,
-    canonical_sessions_before_salvage: usize,
+    _storage: &FrankenStorage,
+    _db_path: &Path,
+    _canonical_sessions_before_salvage: usize,
 ) -> Result<bool> {
-    let bundles = crate::storage::sqlite::discover_historical_database_bundles(db_path);
-    if bundles.is_empty() {
-        return Ok(false);
-    }
-
-    let in_progress = count_meta_entries_like(storage, "historical_bundle_progress:%")? > 0;
-    if in_progress && canonical_sessions_before_salvage > 0 {
-        tracing::warn!(
-            db_path = %db_path.display(),
-            "ignoring stale historical salvage progress markers because the canonical database is already healthy and populated"
-        );
-    }
-
-    // Do not compare MAX(messages.id) across separate SQLite files. Those ids are only local
-    // row identifiers inside each database, so using them as a global freshness watermark
-    // produces false positives and can cause a healthy canonical database to be replaced.
-    //
-    // If historical bundles still contain unique conversations/messages, incremental salvage
-    // should import that delta into the populated canonical database without resetting it.
+    // Historical-bundle restart probing was intentionally retired. The old
+    // code always returned `false`, but still walked candidate bundle roots and
+    // inspected meta markers before deciding not to restart. That work is now
+    // handled by the later salvage decision path when it actually matters.
     Ok(false)
 }
 
@@ -3813,23 +3788,29 @@ pub fn run_index(
         }
     }
 
-    // Update last_scan_ts after successful scan and commit. Pure lexical-resume
-    // runs intentionally preserve the previous scan watermark.
+    // Update the final DB watermarks in one short-lived writer so the shutdown
+    // path only pays the writer open/preflight/close cost once.
+    let now_ms = FrankenStorage::now_millis();
+    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+        persist::with_ephemeral_writer(
+            &storage,
+            false,
+            "updating final index run metadata after index run",
+            |writer| {
+                if performed_scan {
+                    writer.set_last_scan_ts(scan_start_ts)?;
+                }
+                writer.set_last_indexed_at(now_ms)
+            },
+        )
+    })
+    .with_context(|| {
+        format!(
+            "updating final index-run metadata after index run for {}",
+            opts.db_path.display()
+        )
+    })?;
     if performed_scan {
-        persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
-            persist::with_ephemeral_writer(
-                &storage,
-                false,
-                "updating final last_scan_ts after index run",
-                |writer| writer.set_last_scan_ts(scan_start_ts),
-            )
-        })
-        .with_context(|| {
-            format!(
-                "updating last_scan_ts after index run for {}",
-                opts.db_path.display()
-            )
-        })?;
         tracing::info!(
             scan_start_ts,
             "updated last_scan_ts for incremental indexing"
@@ -3840,23 +3821,6 @@ pub fn run_index(
             "preserving last_scan_ts because this run only resumed the lexical rebuild"
         );
     }
-
-    // Update last_indexed_at so `cass status` reflects the latest index time
-    let now_ms = FrankenStorage::now_millis();
-    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
-        persist::with_ephemeral_writer(
-            &storage,
-            false,
-            "updating final last_indexed_at after index run",
-            |writer| writer.set_last_indexed_at(now_ms),
-        )
-    })
-    .with_context(|| {
-        format!(
-            "updating last_indexed_at after index run for {}",
-            opts.db_path.display()
-        )
-    })?;
     tracing::info!(now_ms, "updated last_indexed_at for status display");
     refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         &mut storage,
