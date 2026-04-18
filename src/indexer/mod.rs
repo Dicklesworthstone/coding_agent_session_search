@@ -1579,6 +1579,7 @@ struct IncrementalCanonicalLexicalRepairContext {
 pub(crate) struct LexicalRebuildOutcome {
     pub indexed_docs: usize,
     pub observed_messages: Option<usize>,
+    pub exact_checkpoint_persisted: bool,
 }
 
 fn should_evaluate_incremental_canonical_lexical_repair(
@@ -3273,6 +3274,7 @@ pub fn run_index(
             .as_ref()
             .is_some_and(|paths| !paths.is_empty());
 
+    let mut exact_completed_lexical_checkpoint = false;
     let t_index = if resume_lexical_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -3294,6 +3296,7 @@ pub fn run_index(
             initial_canonical_sessions_before_salvage,
             opts.progress.clone(),
         )?;
+        exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
         // Populate stats for resumed lexical rebuild path
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
@@ -3471,6 +3474,7 @@ pub fn run_index(
                 rebuild_convs,
                 opts.progress.clone(),
             )?;
+            exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
             let rebuild_ms = rebuild_start.elapsed().as_millis() as u64;
             // Populate stats for canonical-only rebuild path (no scan occurs).
             // Without this, indexing_stats in JSON output would be all zeros
@@ -3521,6 +3525,7 @@ pub fn run_index(
                     rebuild_convs,
                     opts.progress.clone(),
                 )?;
+                exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                 if let Some(p) = &opts.progress
                     && let Ok(mut stats) = p.stats.lock()
                 {
@@ -3641,6 +3646,7 @@ pub fn run_index(
                         rebuild_convs,
                         opts.progress.clone(),
                     )?;
+                    exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
                     // Update stats to reflect the authoritative rebuild
                     // totals. The scan-phase stats tracked only what the
                     // connectors discovered; the DB rebuild is the source of
@@ -3788,29 +3794,23 @@ pub fn run_index(
         }
     }
 
-    // Update the final DB watermarks in one short-lived writer so the shutdown
-    // path only pays the writer open/preflight/close cost once.
-    let now_ms = FrankenStorage::now_millis();
-    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
-        persist::with_ephemeral_writer(
-            &storage,
-            false,
-            "updating final index run metadata after index run",
-            |writer| {
-                if performed_scan {
-                    writer.set_last_scan_ts(scan_start_ts)?;
-                }
-                writer.set_last_indexed_at(now_ms)
-            },
-        )
-    })
-    .with_context(|| {
-        format!(
-            "updating final index-run metadata after index run for {}",
-            opts.db_path.display()
-        )
-    })?;
+    // Update last_scan_ts after successful scan and commit. Pure lexical-resume
+    // runs intentionally preserve the previous scan watermark.
     if performed_scan {
+        persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+            persist::with_ephemeral_writer(
+                &storage,
+                false,
+                "updating final last_scan_ts after index run",
+                |writer| writer.set_last_scan_ts(scan_start_ts),
+            )
+        })
+        .with_context(|| {
+            format!(
+                "updating last_scan_ts after index run for {}",
+                opts.db_path.display()
+            )
+        })?;
         tracing::info!(
             scan_start_ts,
             "updated last_scan_ts for incremental indexing"
@@ -3821,20 +3821,45 @@ pub fn run_index(
             "preserving last_scan_ts because this run only resumed the lexical rebuild"
         );
     }
-    tracing::info!(now_ms, "updated last_indexed_at for status display");
-    refresh_completed_lexical_rebuild_checkpoint_for_final_state(
-        &mut storage,
-        &opts.db_path,
-        &opts.data_dir,
-        opts.watch || opts.watch_once_paths.is_some(),
-        exact_total_counts_from_progress(opts.progress.as_ref()),
-    )
+
+    // Update last_indexed_at so `cass status` reflects the latest index time
+    let now_ms = FrankenStorage::now_millis();
+    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+        persist::with_ephemeral_writer(
+            &storage,
+            false,
+            "updating final last_indexed_at after index run",
+            |writer| writer.set_last_indexed_at(now_ms),
+        )
+    })
     .with_context(|| {
         format!(
-            "refreshing completed lexical checkpoint after index run for {}",
+            "updating last_indexed_at after index run for {}",
             opts.db_path.display()
         )
     })?;
+    tracing::info!(now_ms, "updated last_indexed_at for status display");
+    let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
+    if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "skipping final lexical checkpoint refresh because the authoritative rebuild already persisted exact completed state"
+        );
+    } else {
+        refresh_completed_lexical_rebuild_checkpoint_for_final_state(
+            &mut storage,
+            &opts.db_path,
+            &opts.data_dir,
+            opts.watch || opts.watch_once_paths.is_some(),
+            exact_total_counts,
+        )
+        .with_context(|| {
+            format!(
+                "refreshing completed lexical checkpoint after index run for {}",
+                opts.db_path.display()
+            )
+        })?;
+    }
 
     if opts.full {
         tracing::info!(
@@ -4632,9 +4657,9 @@ pub(crate) fn rebuild_tantivy_from_db(
     if rebuild_state.completed
         || rebuild_state.committed_offset >= i64::try_from(total_conversations).unwrap_or(i64::MAX)
     {
-        storage.close().with_context(|| {
+        storage.close_without_checkpoint().with_context(|| {
             format!(
-                "closing readonly database after confirming completed Tantivy rebuild: {}",
+                "closing readonly database after confirming completed Tantivy rebuild without checkpoint: {}",
                 db_path.display()
             )
         })?;
@@ -4645,6 +4670,7 @@ pub(crate) fn rebuild_tantivy_from_db(
         return Ok(LexicalRebuildOutcome {
             indexed_docs: rebuild_state.indexed_docs,
             observed_messages: Some(rebuild_state.indexed_docs),
+            exact_checkpoint_persisted: false,
         });
     }
 
@@ -4941,12 +4967,16 @@ pub(crate) fn rebuild_tantivy_from_db(
         )?;
     }
 
-    storage.close().with_context(|| {
+    storage.close_without_checkpoint().with_context(|| {
         format!(
-            "closing readonly database after Tantivy rebuild: {}",
+            "closing readonly database after Tantivy rebuild without checkpoint: {}",
             db_path.display()
         )
     })?;
+    rebuild_state.db.total_messages = observed_messages;
+    rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.processed_conversations = processed_conversations;
+    rebuild_state.indexed_docs = indexed_docs;
     rebuild_state.mark_completed(index_meta_fingerprint(&index_path)?);
     persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
 
@@ -4958,6 +4988,7 @@ pub(crate) fn rebuild_tantivy_from_db(
     Ok(LexicalRebuildOutcome {
         indexed_docs,
         observed_messages: Some(observed_messages),
+        exact_checkpoint_persisted: true,
     })
 }
 
@@ -10148,6 +10179,7 @@ mod tests {
             let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
             assert_eq!(rebuild.observed_messages, Some(4));
+            assert!(rebuild.exact_checkpoint_persisted);
         });
 
         assert!(
@@ -10211,6 +10243,15 @@ mod tests {
         let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
         assert_eq!(rebuild.indexed_docs, 4);
         assert_eq!(rebuild.observed_messages, Some(4));
+        assert!(rebuild.exact_checkpoint_persisted);
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("completed checkpoint after rebuild");
+        assert!(checkpoint.completed);
+        assert_eq!(checkpoint.total_messages, 4);
+        assert_eq!(checkpoint.processed_conversations, 2);
+        assert_eq!(checkpoint.committed_offset, 2);
+        assert_eq!(checkpoint.indexed_docs, 4);
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
 
