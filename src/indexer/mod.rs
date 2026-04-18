@@ -4564,6 +4564,20 @@ pub(crate) fn rebuild_tantivy_from_db(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<LexicalRebuildOutcome> {
+    let prep_profile = std::env::var_os("CASS_PREP_PROFILE").is_some();
+    let prep_started = Instant::now();
+    let mut prep_step_started = Instant::now();
+    let log_prep_step = |step: &str, step_started: &mut Instant| {
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE step={step} step_ms={} total_ms={}",
+                step_started.elapsed().as_millis(),
+                prep_started.elapsed().as_millis()
+            );
+        }
+        *step_started = Instant::now();
+    };
+
     let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
@@ -4571,16 +4585,22 @@ pub(crate) fn rebuild_tantivy_from_db(
         )
     })?;
 
+    log_prep_step("open_readonly", &mut prep_step_started);
+
     let sources = storage.list_sources().unwrap_or_default();
     let mut source_map: HashMap<String, (SourceKind, Option<String>)> = HashMap::new();
     for source in sources {
         source_map.insert(source.id, (source.kind, source.host_label));
     }
 
+    log_prep_step("load_sources", &mut prep_step_started);
+
     // Pre-fetch agent/workspace lookup maps to avoid 3-table JOINs in the
     // rebuild query path — frankensqlite materialises the full Cartesian
     // product for multi-table JOINs, causing 200x+ regressions.
     let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
+
+    log_prep_step("build_lookups", &mut prep_step_started);
 
     let index_path = index_dir(data_dir)?;
     let db_state =
@@ -4604,6 +4624,8 @@ pub(crate) fn rebuild_tantivy_from_db(
         None => LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE),
     };
 
+    log_prep_step("load_checkpoint_state", &mut prep_step_started);
+
     let restart_from_zero = rebuild_state.completed
         || (rebuild_state.committed_offset == 0 && rebuild_state.pending.is_none());
     if restart_from_zero {
@@ -4618,6 +4640,8 @@ pub(crate) fn rebuild_tantivy_from_db(
         })?;
         rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
     }
+
+    log_prep_step("restart_from_zero_reset", &mut prep_step_started);
 
     let mut t_index = match TantivyIndex::open_or_create(&index_path) {
         Ok(index) => index,
@@ -4645,10 +4669,22 @@ pub(crate) fn rebuild_tantivy_from_db(
         }
         Err(err) => return Err(err),
     };
+    log_prep_step("open_tantivy", &mut prep_step_started);
+
     t_index.configure_bulk_load_merge_policy();
 
     if !lexical_rebuild_state_path(&index_path).exists() {
         persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+    }
+
+    log_prep_step("persist_initial_checkpoint", &mut prep_step_started);
+
+    if prep_profile {
+        eprintln!(
+            "CASS_PREP_PROFILE step=ready_to_index step_ms={} total_ms={}",
+            prep_step_started.elapsed().as_millis(),
+            prep_started.elapsed().as_millis()
+        );
     }
 
     if let Some(p) = &progress {
