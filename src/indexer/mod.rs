@@ -806,18 +806,24 @@ fn lexical_rebuild_noise_role(is_tool_role: bool) -> Option<&'static str> {
     is_tool_role.then_some("tool")
 }
 
-fn prepare_lexical_rebuild_documents_for_conversation(
-    pending: PendingLexicalRebuildConversation,
-    source_map: &HashMap<String, (SourceKind, Option<String>)>,
-) -> Vec<frankensearch::lexical::CassDocument> {
-    let PendingLexicalRebuildConversation {
-        conversation: conv,
-        messages,
-    } = pending;
-    let Some(conversation_id) = conv.id else {
-        return Vec::new();
-    };
+#[derive(Debug, Clone)]
+struct LexicalRebuildDocRefContext {
+    agent: String,
+    workspace: Option<String>,
+    source_path: String,
+    title: Option<String>,
+    started_at_fallback: Option<i64>,
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+    conversation_id: i64,
+}
 
+fn lexical_rebuild_doc_ref_context_for_conversation(
+    conv: &crate::storage::sqlite::LexicalRebuildConversationRow,
+    source_map: &HashMap<String, (SourceKind, Option<String>)>,
+) -> Option<LexicalRebuildDocRefContext> {
+    let conversation_id = conv.id?;
     let (kind, host_label) = source_map.get(&conv.source_id).cloned().unwrap_or_else(|| {
         let fallback_kind = if conv.source_id == LOCAL_SOURCE_ID {
             SourceKind::Local
@@ -836,66 +842,21 @@ fn prepare_lexical_rebuild_documents_for_conversation(
     );
     let origin_kind =
         crate::search::tantivy::normalized_index_origin_kind(&source_id, Some(kind.as_str()));
-    let agent = conv.agent_slug;
-    let workspace = conv
-        .workspace
-        .as_ref()
-        .map(|ws| ws.to_string_lossy().to_string());
-    let source_path = conv.source_path.to_string_lossy().to_string();
-    let title = conv.title;
-    let started_at_fallback = conv.started_at;
-    let mut docs = Vec::with_capacity(messages.len());
 
-    for message in messages {
-        if is_hard_message_noise(
-            lexical_rebuild_noise_role(message.is_tool_role),
-            &message.content,
-        ) {
-            continue;
-        }
-
-        docs.push(frankensearch::lexical::CassDocument {
-            agent: agent.clone(),
-            workspace: workspace.clone(),
-            workspace_original: None,
-            source_path: source_path.clone(),
-            msg_idx: message.idx.max(0) as u64,
-            created_at: message.created_at.or(started_at_fallback),
-            title: title.clone(),
-            content: message.content,
-            conversation_id: Some(conversation_id),
-            source_id: source_id.clone(),
-            origin_kind: origin_kind.clone(),
-            origin_host: origin_host.clone(),
-        });
-    }
-
-    docs
-}
-
-fn prepare_lexical_rebuild_batch(
-    batch: &mut LexicalRebuildMessageBatch,
-    source_map: &HashMap<String, (SourceKind, Option<String>)>,
-    worker_pool: Option<&ThreadPool>,
-) -> Vec<frankensearch::lexical::CassDocument> {
-    let jobs = std::mem::take(batch);
-    if jobs.is_empty() {
-        return Vec::new();
-    }
-
-    let prepare_jobs = || {
-        jobs.into_par_iter()
-            .map(|pending| prepare_lexical_rebuild_documents_for_conversation(pending, source_map))
-            .collect::<Vec<_>>()
-    };
-
-    let prepared_doc_shards = if let Some(pool) = worker_pool {
-        pool.install(prepare_jobs)
-    } else {
-        prepare_jobs()
-    };
-
-    prepared_doc_shards.into_iter().flatten().collect()
+    Some(LexicalRebuildDocRefContext {
+        agent: conv.agent_slug.clone(),
+        workspace: conv
+            .workspace
+            .as_ref()
+            .map(|ws| ws.to_string_lossy().to_string()),
+        source_path: conv.source_path.to_string_lossy().to_string(),
+        title: conv.title.clone(),
+        started_at_fallback: conv.started_at,
+        source_id,
+        origin_kind,
+        origin_host,
+        conversation_id,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -923,11 +884,67 @@ fn flush_streamed_lexical_rebuild_batch(
     let chunk_message_bytes = *pending_batch_message_bytes;
     let chunk_limit = *current_batch_conversation_limit;
     let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
-    let prepared_doc_shards =
-        prepare_lexical_rebuild_batch(pending_batch, source_map, lexical_rebuild_worker_pool);
+    let build_contexts = || {
+        pending_batch
+            .par_iter()
+            .map(|pending| {
+                lexical_rebuild_doc_ref_context_for_conversation(&pending.conversation, source_map)
+            })
+            .collect::<Vec<_>>()
+    };
+    let contexts = if let Some(pool) = lexical_rebuild_worker_pool {
+        pool.install(build_contexts)
+    } else {
+        build_contexts()
+    };
+    let build_doc_shards = || {
+        pending_batch
+            .par_iter()
+            .zip(contexts.par_iter())
+            .map(|(pending, context)| {
+                let Some(context) = context.as_ref() else {
+                    return Vec::new();
+                };
+                let mut docs = Vec::with_capacity(pending.messages.len());
+                for message in &pending.messages {
+                    if is_hard_message_noise(
+                        lexical_rebuild_noise_role(message.is_tool_role),
+                        &message.content,
+                    ) {
+                        continue;
+                    }
+                    docs.push(frankensearch::lexical::CassDocumentRef {
+                        agent: context.agent.as_str(),
+                        workspace: context.workspace.as_deref(),
+                        workspace_original: None,
+                        source_path: context.source_path.as_str(),
+                        msg_idx: message.idx.max(0) as u64,
+                        created_at: message.created_at.or(context.started_at_fallback),
+                        title: context.title.as_deref(),
+                        content: message.content.as_str(),
+                        source_id: context.source_id.as_str(),
+                        origin_kind: context.origin_kind.as_str(),
+                        origin_host: context.origin_host.as_deref(),
+                        conversation_id: Some(context.conversation_id),
+                    });
+                }
+                docs
+            })
+            .collect::<Vec<_>>()
+    };
+    let prepared_doc_shards = if let Some(pool) = lexical_rebuild_worker_pool {
+        pool.install(build_doc_shards)
+    } else {
+        build_doc_shards()
+    };
+    let doc_capacity = prepared_doc_shards.iter().map(|shard| shard.len()).sum();
+    let mut prepared_docs = Vec::with_capacity(doc_capacity);
+    for shard in prepared_doc_shards {
+        prepared_docs.extend(shard);
+    }
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
     *indexed_docs =
-        (*indexed_docs).saturating_add(t_index.add_prebuilt_documents(prepared_doc_shards)?);
+        (*indexed_docs).saturating_add(t_index.add_prebuilt_document_refs_slice(&prepared_docs)?);
     if let Some(profile) = perf_profile {
         profile.batch_flushes = profile.batch_flushes.saturating_add(1);
         profile.batch_conversations = profile

@@ -788,3 +788,100 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260419-r87-borrowed-docrefs-parallel/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260419-r88-borrowed-docrefs-parallel-repeat/logs/summary.json`
 - `/tmp/cass-real-bench-20260419-r88-borrowed-docrefs-parallel-repeat/logs/index.stderr.log`
+
+
+## Rejected Edge-Ngram and Preview Micro-Optimizations
+
+### Goal
+- Probe two remaining per-document string hot paths inside `frankensearch` lexical ingest after the retained borrowed-ref handoff win: edge-ngram generation and preview construction.
+
+### Alien/Queueing Framing
+- Both ideas targeted the same measured symptom: residual per-message transform cost after ownership transport had already been tightened.
+- The graveyard lesson here is that local micro-allocation reductions can still lose globally once branch behavior, UTF-8 scanning shape, and downstream writer overlap are accounted for. “Fewer obvious allocations” is not itself a proof of lower end-to-end service time.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Both experiments only rewrote pure string-preparation helpers.
+- Tie-breaking unchanged: yes. No query, schema, commit, or batch-boundary changes.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: helper behavior pinned with direct unit tests; real-corpus benchmark rejected both runtime changes.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | Outcome |
+|---|---|---:|---:|---:|---|
+| `r89-edgegrams-streaming` | remove per-word edge-ngram index `Vec` and stream prefixes directly | 56.400 | 907.535 | 83400.780 | rejected |
+| `r90-preview-slice` | build previews from one bounded UTF-8 slice instead of char-by-char pushes | 57.250 | 894.061 | 82162.515 | rejected |
+
+### Takeaways
+- Both ideas lost cleanly against the retained baseline `r88-borrowed-docrefs-parallel-repeat = 55.200s`.
+- `r89` shows the classic micro-optimization trap: deleting a small heap allocation inside a tight loop changed the local work shape, but the real corpus still got slower end-to-end.
+- `r90` was even worse. The slice-based preview path looked cheaper on paper, but on the real workload it produced the slowest result of the pass.
+- Conclusion: keep the previous retained runtime path unchanged. The remaining high-EV frontier is still deeper lexical ingest structure, not isolated helper rewrites of already-bounded string transforms.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r89-edgegrams-streaming/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r90-preview-slice/logs/summary.json`
+
+
+## Rejected SmallVec Doc-Ref Shard Buffer
+
+### Goal
+- Test whether per-conversation `CassDocumentRef` shard construction in the retained borrowed-ref rebuild path was still paying enough heap-allocation tax to justify an inline buffer.
+
+### Alien/Queueing Framing
+- This was a local buffer-shape probe on the post-`r88` path: each conversation still builds a temporary doc-ref shard before the batch is flattened and handed to Tantivy.
+- The expected value case was simple and valid: previous `SmallVec` use in the storage scan path had already produced one real win, so it was reasonable to re-test the same primitive at the next queue boundary.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Only the temporary per-conversation shard container changed.
+- Tie-breaking unchanged: yes. Same conversation order, message order, batch boundaries, and lexical fields.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile-gated before the benchmark; runtime change rejected on the real corpus and reverted.
+
+### Measured Round
+
+| Label | Change | Wall s | Conv/s | Msg/s | Outcome |
+|---|---|---:|---:|---:|---|
+| `r91-docref-smallvec16` | `SmallVec<[CassDocumentRef; 16]>` for per-conversation borrowed-ref shards | 57.270 | 893.749 | 82133.822 | rejected |
+
+### Takeaways
+- This was not a marginal loss; it was a clear regression against the retained baseline `r88 = 55.200s`.
+- The result reinforces the current frontier diagnosis: once the big ownership-transport win landed, more local container tweaking in the rebuild-prep layer stopped paying for itself.
+- Conclusion: keep plain `Vec` for the temporary doc-ref shards and continue looking deeper than local buffer microstructure.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r91-docref-smallvec16/logs/summary.json`
+
+## Rejected Streamed Message-Byte Carry
+
+### Goal
+- Test whether the grouped lexical rebuild stream could cheaply carry per-conversation `message_bytes` forward and avoid the second `messages.iter().map(|m| m.content.len()).sum()` pass inside `finish_conversation`.
+
+### Alien/Queueing Framing
+- This was a one-pass sufficient-statistics probe on the dominant grouped stream path.
+- The hypothesis was orthodox and high-EV: the storage scan already touches every row, so it should be cheaper to accumulate byte totals there than to walk every grouped message slice again on the indexer side.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Row order, conversation boundaries, and batch/commit decisions were unchanged.
+- Tie-breaking unchanged: yes. Only an extra aggregate was threaded through the existing callback contract.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile-gated before benchmark; runtime change rejected on the real corpus and reverted.
+
+### Measured Round
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r92-streamed-message-bytes` | carry grouped `message_bytes` from SQLite scan into `finish_conversation` | 59.475 | 860.612 | 79088.625 | 53.779 | 13.497 | 5.911 | 5.198 | 7.216 | rejected |
+
+### Takeaways
+- This did not merely fail to help wall clock; it regressed the local target bucket too. `finish_conversation_ms` worsened from the retained `r88` value of `12.301s` to `13.497s`.
+- `prepare_ms` and `add_ms` also moved in the wrong direction, so the extra callback plumbing and per-row accumulation cost more than the removed second pass.
+- Conclusion: keep the simpler existing callback contract and continue hunting deeper than this local sufficient-statistics tweak.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r92-streamed-message-bytes/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r92-streamed-message-bytes/logs/index.stderr.log`
+

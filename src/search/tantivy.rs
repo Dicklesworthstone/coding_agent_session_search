@@ -7,11 +7,11 @@ use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Error, Result};
 use frankensearch::lexical::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
-    CassFields as FsCassFields, CassMergeStatus as FsCassMergeStatus,
-    CassTantivyIndex as FsCassTantivyIndex, Index, IndexReader, Schema,
-    cass_build_schema as fs_build_schema, cass_ensure_tokenizer as fs_ensure_tokenizer,
-    cass_fields_from_schema as fs_fields_from_schema, cass_index_dir as fs_index_dir,
-    cass_schema_hash_matches,
+    CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
+    CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
+    IndexReader, Schema, cass_build_schema as fs_build_schema,
+    cass_ensure_tokenizer as fs_ensure_tokenizer, cass_fields_from_schema as fs_fields_from_schema,
+    cass_index_dir as fs_index_dir, cass_schema_hash_matches,
 };
 
 pub(crate) fn normalized_index_source_id(
@@ -99,6 +99,14 @@ fn tantivy_add_batch_max_chars() -> usize {
             (16 * 1024 * 1024)
                 .max(tantivy_writer_parallelism_hint().saturating_mul(2 * 1024 * 1024))
         })
+}
+
+fn tantivy_prebuilt_add_batch_max_messages() -> usize {
+    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| 16_384.max(tantivy_writer_parallelism_hint().saturating_mul(512)))
 }
 
 fn map_fs_err(err: frankensearch::SearchError) -> Error {
@@ -320,32 +328,77 @@ impl TantivyIndex {
         }
     }
 
-    pub fn add_prebuilt_documents<I>(&mut self, documents: I) -> Result<usize>
-    where
-        I: IntoIterator<Item = FsCassDocument>,
-    {
-        let max_messages = tantivy_add_batch_max_messages();
+    pub fn add_prebuilt_documents_slice(&mut self, documents: &[FsCassDocument]) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();
-        let mut docs: Vec<FsCassDocument> = Vec::with_capacity(max_messages);
-        let mut pending_chars = 0usize;
         let mut indexed_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
 
-        for doc in documents {
-            push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
-            if docs.len() >= max_messages || pending_chars >= max_chars {
-                indexed_docs = indexed_docs.saturating_add(docs.len());
-                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
-                docs.clear();
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                indexed_docs = indexed_docs.saturating_add(batch_end - batch_start);
+                self.inner
+                    .add_cass_documents(&documents[batch_start..batch_end])
+                    .map_err(map_fs_err)?;
+                batch_start = batch_end;
                 pending_chars = 0;
             }
         }
 
-        if !docs.is_empty() {
-            indexed_docs = indexed_docs.saturating_add(docs.len());
-            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+        if batch_start < documents.len() {
+            indexed_docs = indexed_docs.saturating_add(documents.len() - batch_start);
+            self.inner
+                .add_cass_documents(&documents[batch_start..])
+                .map_err(map_fs_err)?;
         }
 
         Ok(indexed_docs)
+    }
+
+    pub fn add_prebuilt_document_refs_slice<'a>(
+        &mut self,
+        documents: &[FsCassDocumentRef<'a>],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut indexed_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                indexed_docs = indexed_docs.saturating_add(batch_end - batch_start);
+                self.inner
+                    .add_cass_document_refs(&documents[batch_start..batch_end])
+                    .map_err(map_fs_err)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            indexed_docs = indexed_docs.saturating_add(documents.len() - batch_start);
+            self.inner
+                .add_cass_document_refs(&documents[batch_start..])
+                .map_err(map_fs_err)?;
+        }
+
+        Ok(indexed_docs)
+    }
+
+    pub fn add_prebuilt_documents<I>(&mut self, documents: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = FsCassDocument>,
+    {
+        let docs = documents.into_iter().collect::<Vec<_>>();
+        self.add_prebuilt_documents_slice(&docs)
     }
 
     pub fn add_conversations_with_ids<'a, I>(&mut self, conversations: I) -> Result<usize>
