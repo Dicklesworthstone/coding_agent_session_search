@@ -885,3 +885,202 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260418-r92-streamed-message-bytes/logs/summary.json`
 - `/tmp/cass-real-bench-20260418-r92-streamed-message-bytes/logs/index.stderr.log`
 
+
+
+## Clean 048d5fa8 Baseline Reset, Rejected Repin, and Retained Edge-Ngram Helper Reversal
+
+### Goal
+- Re-establish the true control on the current clean tree, then test whether the faster older `cass_generate_edge_ngrams` helper was a real lever or just another edge-ngram false positive.
+
+### Alien/Queueing Framing
+- This pass corrected the control plane before changing the data plane. The repo had drifted back to the clean git-pinned `frankensearch` `048d5fa8` state, so the old `r88` local-override number was no longer the right baseline.
+- The graveyard lesson was the same constants-over-asymptotics warning that already showed up in the rejected `r89` streaming rewrite: fewer obvious temporaries does not guarantee a lower service-time envelope. Here, the older per-word index-vector helper won decisively once measured against the true clean control.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. The retained change only swaps the `frankensearch` source from the pinned git checkout to the local sibling checkout containing the older `cass_generate_edge_ngrams` helper; document order, batch order, commit cadence, and lexical schema are unchanged.
+- Tie-breaking unchanged: yes. No query, scoring, or shard-order changes.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile-gated and re-benchmarked on the real corpus; the bad `3c486a1d` repin was rejected and reverted.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `r93-clean-048d5fa8` | fresh control on current clean git-pinned `frankensearch` `048d5fa8` | 60.447 | 846.706 | 77815.221 | 54.886 | 5.288 | 4.608 | 7.270 | control |
+| `r94-repin-3c486a1d` | repin `frankensearch` git rev to `3c486a1d` | 61.466 | 832.662 | 76524.167 | 55.693 | 5.605 | 4.924 | 9.791 | rejected |
+| `r95-048d5fa8-old-edgegrams` | scratch dependency checkout: restore older `cass_generate_edge_ngrams` helper | 58.431 | 876.018 | 80503.520 | 52.655 | 5.249 | 4.582 | 7.572 | candidate |
+| `r96-048d5fa8-old-edgegrams-repeat` | repeat same scratch helper reversal | 57.420 | 891.407 | 81918.620 | 51.514 | 5.053 | 4.407 | 7.162 | candidate-repeat |
+| `r97-local-frankensearch-patch` | retained tree: enable local `frankensearch` `[patch]` override using sibling checkout with older helper | 56.410 | 907.375 | 83386.041 | 51.082 | 5.010 | 4.347 | 7.219 | kept |
+
+### Takeaways
+- The clean current baseline is `r93 = 60.447s`. That is the correct control for this pass, not the earlier local-override `r88` number.
+- The simple git repin to `3c486a1d` was wrong. `r94 = 61.466s` lost cleanly and was reverted.
+- Restoring the older helper inside `frankensearch-lexical::cass_generate_edge_ngrams` is a real win in the current environment. The retained-tree confirmation `r97 = 56.410s` improves on the clean control by about `6.7%` (`60.447s -> 56.410s`).
+- The internal buckets support the wall-clock result. Against `r93`, `r97` cut `message_stream_ms` from `54.886s` to `51.082s`, `prepare_ms` from `5.288s` to `5.010s`, and `add_ms` from `4.608s` to `4.347s`.
+- Conclusion: keep the local `frankensearch` override in `Cargo.toml` and the older edge-ngram helper in the sibling `frankensearch` checkout. The remaining frontier is still deeper lexical ingest structure, but this pass produced another retained real-corpus win.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r93-clean-048d5fa8/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r93-clean-048d5fa8/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r94-repin-3c486a1d/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r94-repin-3c486a1d/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r95-048d5fa8-old-edgegrams/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r95-048d5fa8-old-edgegrams/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r96-048d5fa8-old-edgegrams-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r96-048d5fa8-old-edgegrams-repeat/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r97-local-frankensearch-patch/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r97-local-frankensearch-patch/logs/index.stderr.log`
+
+
+## Retained Stack-Buffered Edge-Ngram Helper
+
+### Goal
+- Keep the faster old edge-ngram semantics from `r97`, but remove the remaining per-word heap `Vec<usize>` allocation inside `cass_generate_edge_ngrams`.
+
+### Alien/Queueing Framing
+- This is a bounded automaton/state-buffer rewrite rather than a new algorithm. The helper only ever needs the first 21 boundary indices, so a fixed stack buffer is enough to preserve the exact prefix envelope while avoiding heap traffic on every token.
+- The earlier streaming rewrite failed because it changed the work shape too much. This version keeps the winning old semantics and only changes the storage substrate for the bounded index set.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Prefixes are emitted in the same per-word order as before.
+- Tie-breaking unchanged: yes. No schema, query, commit, or batch-boundary changes.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: helper unit tests for expected prefixes and 20-char cap passed in local `frankensearch`; retained-tree cass rebuild tests also passed.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r97-local-frankensearch-patch` | retained control with old helper + local sibling override | 56.410 | 907.375 | 83386.041 | 51.082 | 12.597 | 5.010 | 4.347 | 7.219 | control |
+| `r98-stack-edgegrams` | replace per-word `Vec<usize>` with fixed `[usize; 21]` buffer | 55.385 | 924.172 | 84929.680 | 49.419 | 11.002 | 3.021 | 2.390 | 7.590 | candidate |
+| `r99-stack-edgegrams-repeat` | repeat same stack-buffer helper | 55.401 | 923.901 | 84904.713 | 49.438 | 11.013 | 3.120 | 2.460 | 7.595 | kept |
+
+### Takeaways
+- The repeat held almost exactly: `55.385s` and `55.401s`.
+- Against the retained `r97` control, the kept helper improves wall clock by about `1.8%` (`56.410s -> 55.401s`).
+- The hot buckets moved sharply in the expected direction. Against `r97`, `r99` reduced `prepare_ms` from `5.010s` to `3.120s`, `add_ms` from `4.347s` to `2.460s`, and `finish_conversation_ms` from `12.597s` to `11.013s`.
+- Conclusion: keep the stack-buffered helper in the sibling `frankensearch` checkout along with the existing local override. The remaining frontier is now even less about prefix-helper folklore and more about deeper lexical document-build structure.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r98-stack-edgegrams/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r98-stack-edgegrams/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r99-stack-edgegrams-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r99-stack-edgegrams-repeat/logs/index.stderr.log`
+
+
+## Retained Fused Content Prefix + Preview Scan
+
+### Goal
+- Remove the second scan over message content during lexical document build by fusing `content_prefix` generation and preview extraction into one pass, while preserving the exact outputs of `cass_generate_edge_ngrams(content)` and `cass_build_preview(content, 400)`.
+
+### Alien/Queueing Framing
+- This is a deterministic finite-state scanner on the hottest per-document path. The content string was being traversed once for edge-ngram generation and again for preview extraction; the fused helper keeps the same output contract but collapses those traversals into a single bounded state machine.
+- The risk gate was constants-sensitive rather than algorithmic. Prior preview-only rewrites had lost, so this version kept the old winning prefix semantics and differential-tested the fused helper directly against the existing standalone helpers before benchmarking.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Token boundary handling, per-word prefix ordering, and preview truncation semantics are unchanged.
+- Tie-breaking unchanged: yes. No query, schema, commit, or batch-boundary changes.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: local `frankensearch-lexical` test confirms the fused helper matches `cass_generate_edge_ngrams` plus `cass_build_preview(..., 400)` on representative ASCII, Unicode, punctuation, CJK, and long-input samples; retained-tree cass rebuild tests also passed.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r99-stack-edgegrams-repeat` | retained control with stack-buffered edge-ngram helper | 55.401 | 923.901 | 84904.713 | 49.438 | 11.013 | 3.120 | 2.460 | 7.595 | control |
+| `r100-fused-content-scan` | one-pass fused `content_prefix + preview` builder | 54.411 | 940.717 | 86450.119 | 48.770 | 10.503 | 3.224 | 2.565 | 6.803 | candidate |
+| `r101-fused-content-scan-repeat` | repeat same fused content scan | 54.377 | 941.292 | 86502.946 | 48.432 | 10.628 | 2.972 | 2.347 | 7.399 | kept |
+
+### Takeaways
+- The repeat held: `54.411s` and `54.377s`.
+- Against the retained `r99` control, the kept fused helper improves wall clock by about `1.8%` (`55.401s -> 54.377s`).
+- Against the clean `r93` baseline (`60.447s`), the current retained tree is now about `10.0%` faster.
+- The hot buckets moved in the right direction again. Against `r99`, `r101` reduced `message_stream_ms` from `49.438s` to `48.432s`, `finish_conversation_ms` from `11.013s` to `10.628s`, `prepare_ms` from `3.120s` to `2.972s`, and `add_ms` from `2.460s` to `2.347s`.
+- Conclusion: keep the fused content builder in the sibling `frankensearch` checkout together with the existing local override. The next frontier is no longer obvious string rescans; it is deeper document materialization and writer interaction structure.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r100-fused-content-scan/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r100-fused-content-scan/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r101-fused-content-scan-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r101-fused-content-scan-repeat/logs/index.stderr.log`
+
+
+## Corrected Actual Cass Tokenizer Retest
+
+### Goal
+- Re-run the custom `CassTokenizer` change on a freshly relinked runner after discovering that the earlier `r102`/`r103` numbers were produced by a stale binary that still contained `RegexTokenStream`.
+
+### Alien/Queueing Framing
+- The original hotspot diagnosis was still valid: the retained `r101` tree spent a dominant share of ingest CPU inside Tantivy regex tokenization (`regex_automata::dfa::search::find_fwd` at `38.17%` children / `34.73%` self, `RegexTokenStream::advance` at `29.29%` children in `/tmp/cass-r101-control.perf.data`).
+- The correction was procedural rather than conceptual. After forcing a fresh cass relink and confirming `/tmp/cass_runner_r59` actually contained `CassTokenizer`, the same finite-state rewrite could be measured honestly.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Token order, offsets, and positions are still differential-tested against the legacy regex tokenizer.
+- Tie-breaking unchanged: yes. No schema, query, commit cadence, or batch geometry changes.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: `cass_tokenizer_matches_legacy_regex_boundaries` passed on the sibling `frankensearch` checkout, and the retained-tree cass rebuild tests still passed.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r101-fused-content-scan-repeat` | retained control with fused content-prefix + preview scan | 54.377 | 941.292 | 86502.946 | 48.432 | 10.628 | 2.972 | 2.347 | 7.399 | control |
+| `r104-actual-cass-tokenizer` | fresh relink, actual `CassTokenizer` binary confirmed | 53.226 | 961.655 | 88374.253 | 48.050 | 9.793 | 2.964 | 2.322 | 6.314 | candidate |
+| `r105-actual-cass-tokenizer-repeat` | repeat same actual tokenizer build | 54.262 | 943.287 | 86686.240 | 48.840 | 9.837 | 3.047 | 2.383 | 6.181 | candidate-repeat |
+| `r106-actual-cass-tokenizer-tiebreak` | third run on same actual tokenizer build | 54.169 | 944.918 | 86836.170 | 48.664 | 9.960 | 3.147 | 2.473 | 6.478 | kept-control |
+
+### Takeaways
+- `r102` and `r103` were invalid and should not be used. They came from a stale runner that still contained Tantivy's regex tokenizer.
+- On the correctly relinked binary, the tokenizer rewrite still stays on the positive side, but it is a small edge rather than the earlier claimed clean repeat-held win. Against `r101`, the corrected candidate mean is `53.886s` (`0.492s`, about `0.90%` faster) and the median is `54.169s` (`0.209s`, about `0.38%` faster).
+- A fresh `perf` sample on the actual tokenizer tree (`/tmp/cass-r106-actual.perf.data`) confirmed that regex DFA cost was removed and the dominant ingest CPU shifted to the custom token stream plus Tantivy postings work. That made the next frontier clear.
+- Conclusion: keep the custom tokenizer in the local working tree as the live control for the next round, but downgrade the historical claim. The real value here is modest; the large retained win came from the follow-on postings change below.
+
+### Artifacts
+- `/tmp/cass-r101-control.perf.data`
+- `/tmp/cass-r106-actual.perf.data`
+- `/tmp/cass-real-bench-20260419-r104-actual-cass-tokenizer/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r104-actual-cass-tokenizer/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r105-actual-cass-tokenizer-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r105-actual-cass-tokenizer-repeat/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r106-actual-cass-tokenizer-tiebreak/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r106-actual-cass-tokenizer-tiebreak/logs/index.stderr.log`
+
+## Retained Prefix-Field Freq-Only Postings
+
+### Goal
+- Reduce Tantivy postings write cost by storing term frequencies but not positions for `title_prefix` and `content_prefix`, because those fields are only used by `TermQuery` paths and never by `PhraseQuery`.
+
+### Alien/Queueing Framing
+- The actual `r106` profile moved the bottleneck from regex DFA into Tantivy postings (`SpecializedPostingsWriter<TfAndPositionRecorder>::subscribe` and related serialization paths) while token-prep time stayed comparatively smaller.
+- This made the highest-EV move a structural schema reduction rather than another tokenizer trick: keep BM25 term-frequency scoring on prefix fields, but stop paying to record positions that no query path ever reads.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Document order, token order, batch order, and commit cadence are unchanged.
+- Tie-breaking unchanged: yes in the intended scoring contract. `title_prefix` and `content_prefix` still store frequencies, and phrase queries continue to target only `title` and `content`.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: new `frankensearch-lexical` test asserts that both prefix fields now store `IndexRecordOption::WithFreqs`; the tokenizer differential test and fused-helper differential test still pass; retained-tree cass rebuild tests also passed.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r106-actual-cass-tokenizer-tiebreak` | live control with actual custom tokenizer | 54.169 | 944.918 | 86836.170 | 48.664 | 9.960 | 3.147 | 2.473 | 6.478 | control |
+| `r107-prefix-freqs-candidate` | `title_prefix` / `content_prefix` store freqs without positions | 51.367 | 996.448 | 91571.686 | 45.986 | 7.434 | 3.033 | 2.370 | 3.837 | candidate |
+| `r108-prefix-freqs-repeat` | repeat same freq-only prefix postings schema | 52.362 | 977.519 | 89832.120 | 46.525 | 7.401 | 3.039 | 2.381 | 3.778 | kept |
+
+### Takeaways
+- This is a real retained win. Against the live `r106` control, the two runs improved wall clock by `2.801s` (`5.17%`) and `1.807s` (`3.34%`); the candidate mean is `51.865s`, about `4.25%` faster than control.
+- The bucket movement matches the hypothesis almost perfectly. Against `r106`, the repeat `r108` cut `message_stream_ms` from `48.664s` to `46.525s`, `finish_conversation_ms` from `9.960s` to `7.401s`, and `commit_ms` from `6.478s` to `3.778s`, while `prepare_ms` and `add_ms` stayed essentially flat.
+- Relative to the clean `r93 = 60.447s` baseline, the current retained tree is now about `13.4%` faster on the real corpus using the conservative repeated `r108` number.
+- Conclusion: keep the freq-only prefix postings schema in the sibling `frankensearch` checkout together with the existing local override. The next frontier is now even deeper inside Tantivy ingest and writer interaction rather than in token-boundary work.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r107-prefix-freqs-candidate/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r107-prefix-freqs-candidate/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r108-prefix-freqs-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r108-prefix-freqs-repeat/logs/index.stderr.log`

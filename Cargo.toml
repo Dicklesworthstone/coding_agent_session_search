@@ -200,14 +200,14 @@ strip = false
 #
 # Enable strict validation before uncommenting any additional sibling path overrides:
 # cargo check --features strict-path-dep-validation
-# [patch."https://github.com/Dicklesworthstone/frankensearch"]
-# frankensearch = { path = "../frankensearch/frankensearch" }
-# frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
-# frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
-# frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
-# frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
-# frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
-# frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
+[patch."https://github.com/Dicklesworthstone/frankensearch"]
+frankensearch = { path = "../frankensearch/frankensearch" }
+frankensearch-core = { path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-index = { path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-embed = { path = "../frankensearch/crates/frankensearch-embed" }
+frankensearch-fusion = { path = "../frankensearch/crates/frankensearch-fusion" }
+frankensearch-lexical = { path = "../frankensearch/crates/frankensearch-lexical" }
+frankensearch-rerank = { path = "../frankensearch/crates/frankensearch-rerank" }
 
 [workspace.metadata.dist]
 targets = ["x86_64-unknown-linux-gnu"]
