@@ -1125,3 +1125,38 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260419-r110-preview-stored-only-repeat/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260419-r111-preview-stored-only-tiebreak/logs/summary.json`
 - `/tmp/cass-real-bench-20260419-r111-preview-stored-only-tiebreak/logs/index.stderr.log`
+
+
+## Rejected Prefix Direct-Term Stream
+
+### Goal
+- Eliminate the hot `hyphen_normalize` tokenizer stack on `title_prefix` and `content_prefix` by precomputing the exact legacy prefix-field term stream up front, then indexing those fields with a cheap whitespace-plus-lowercase analyzer.
+
+### Alien/Queueing Framing
+- The fresh `r111` profile still showed `RemoveLongFilterStream<...CassTokenStream>::advance` and Tantivy postings subscription dominating ingest CPU, so the highest-EV hypothesis was to remove analyzer-layer work from the already-precomputed prefix fields.
+- The design used a proof-carrying direct term stream: preserve the indexed prefix terms exactly, but move their construction out of Tantivy’s tokenizer pipeline.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes in the attempted design. Document order, flush cadence, commit cadence, and field/query structure were unchanged.
+- Tie-breaking unchanged: yes by construction in the proof harness. A differential test showed the new direct prefix stream produced the same analyzed token sequence as the legacy prefix analyzer on representative ASCII, CJK, accented, and mixed-script samples.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: the new `frankensearch-lexical` differential test passed locally before the benchmark run.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r111-preview-stored-only-tiebreak` | live retained control | 51.378 | 996.248 | 91553.265 | 46.606 | 7.665 | 3.184 | 2.543 | 3.867 | control |
+| `r112-prefix-direct-terms` | precompute exact prefix-field terms + whitespace tokenizer | 53.383 | 958.818 | 88113.512 | 47.855 | 8.161 | 3.733 | 3.038 | 3.665 | rejected |
+
+### Takeaways
+- This candidate lost clearly on the first real-corpus run: `+2.006s` slower than control (`+3.90%`). That is too large to justify a repeat.
+- The failure mode is visible in the stage buckets. Relative to `r111`, `message_stream_ms` rose from `46.606s` to `47.855s`, `finish_conversation_ms` rose from `7.665s` to `8.161s`, and both `prepare_ms` and `add_ms` got materially worse. `commit_ms` improved slightly, but nowhere near enough to offset the added precompute cost.
+- The direct term-stream proof was not the problem; the cost model was. Moving the exact token construction out of Tantivy and into cass’s prep path simply shifted too much work into the single-threaded prebuild side.
+- Conclusion: reject the direct-prefix-term / dedicated-prefix-tokenizer rewrite and restore the prior retained tree.
+
+### Artifacts
+- `/tmp/cass-r111-control.perf.data`
+- `/tmp/cass-real-bench-20260419-r112-prefix-direct-terms/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r112-prefix-direct-terms/logs/index.stderr.log`
