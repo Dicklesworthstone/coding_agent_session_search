@@ -1084,3 +1084,44 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260419-r107-prefix-freqs-candidate/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260419-r108-prefix-freqs-repeat/logs/summary.json`
 - `/tmp/cass-real-bench-20260419-r108-prefix-freqs-repeat/logs/index.stderr.log`
+
+
+## Retained Preview Stored-Only Field
+
+### Goal
+- Remove useless tokenization and postings work for `preview`, which cass stores as a fallback display field but never targets in lexical query construction.
+
+### Alien/Queueing Framing
+- The control profile after `r108` still showed Tantivy tokenization and postings dominating rebuild cost, so the highest-EV next lever was to cut write amplification from a field that did not contribute to retrieval.
+- This lines up with the graveyard guidance to eliminate needless index work before chasing more exotic local hot-loop tricks: if a field only needs stored retrieval semantics, indexing it is pure ingest tax.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Document build order, flush cadence, commit cadence, and query result ordering are unchanged.
+- Tie-breaking unchanged: yes. `preview` is still stored and retrievable, but lexical query construction does not target it; the fallback read path in `src/search/query.rs` still reads the stored field.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: new `frankensearch-lexical` test asserts that `preview` is stored-only; prefix-field and fused-helper tests still pass; retained-tree cass rebuild tests also passed.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r108-prefix-freqs-repeat` | live control with freq-only prefix postings | 52.362 | 977.519 | 89832.120 | 46.525 | 7.401 | 3.039 | 2.381 | 3.778 | control |
+| `r109-preview-stored-only` | `preview` changed from `TEXT | STORED` to `STORED` | 51.365 | 996.493 | 91575.771 | 46.188 | 7.464 | 3.178 | 2.542 | 3.597 | candidate |
+| `r110-preview-stored-only-repeat` | repeat same stored-only preview schema | 52.379 | 977.213 | 89804.033 | 47.100 | 7.868 | 3.301 | 2.639 | 3.752 | statistical tie |
+| `r111-preview-stored-only-tiebreak` | tiebreak repeat on same schema | 51.378 | 996.248 | 91553.265 | 46.606 | 7.665 | 3.184 | 2.543 | 3.867 | kept |
+
+### Takeaways
+- This is a modest but retained win. Against the live `r108` control, two of three runs improved wall clock by `0.997s` (`1.90%`) and `0.984s` (`1.88%`); the middle repeat was effectively flat at `-0.016s` (`-0.03%`). The three-run candidate mean is `51.707s`, about `1.25%` faster than control.
+- The strongest deterministic gain is index size. Removing `preview` postings shrank the produced index from `3,452,397,136` bytes to `3,236,213,871` bytes on `r111`, a reduction of `216,183,265` bytes (`6.26%`).
+- The rebuild stage buckets were noisier than the wall clock on this round, so the keep decision is based primarily on repeated end-to-end time plus the structural proof that `preview` indexing was unused work.
+- Relative to the clean `r93 = 60.447s` baseline, the current retained tree is now about `15.0%` faster on the real corpus using the conservative repeated `r111` number.
+- Conclusion: keep `preview` as stored-only in the sibling `frankensearch` checkout together with the existing local override. The next frontier is likely deeper Tantivy writer/postings structure again, not more unused-field cleanup.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r109-preview-stored-only/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r109-preview-stored-only/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r110-preview-stored-only-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r110-preview-stored-only-repeat/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r111-preview-stored-only-tiebreak/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r111-preview-stored-only-tiebreak/logs/index.stderr.log`
