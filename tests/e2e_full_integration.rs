@@ -442,16 +442,47 @@ fn e2e_database_integrity() {
         .expect("orphan conv check");
     assert_eq!(orphan_convs, 0, "No orphan conversations should exist");
 
-    // FTS table should have entries for indexed messages
-    let fts_count: i64 = conn
-        .query_row_map("SELECT COUNT(*) FROM fts_messages", &[], |r| r.get_typed(0))
-        .expect("fts count");
+    // The current contentless FTS table is considered healthy if frankensqlite can
+    // query it and at least one row is visible through the canonical doctor probe.
+    let fts_probe_rows: Vec<i64> = conn
+        .query_map_collect("SELECT rowid FROM fts_messages LIMIT 1", &[], |r| {
+            r.get_typed(0)
+        })
+        .expect("fts probe");
     let msg_count = count_messages(&db_path);
-    assert!(fts_count > 0, "FTS should have entries after indexing");
+    assert!(
+        !fts_probe_rows.is_empty(),
+        "FTS should expose at least one indexed row after indexing"
+    );
     verbose!(
-        "DB integrity OK: {} messages, {} FTS entries, 0 orphans",
+        "DB integrity OK: {} messages, FTS queryable with {} visible probe rows, 0 orphans",
         msg_count,
-        fts_count
+        fts_probe_rows.len()
+    );
+
+    let doctor_output = Command::new(cass_bin())
+        .args(["doctor", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .output()
+        .expect("doctor command should execute");
+
+    assert!(
+        doctor_output.status.success(),
+        "Doctor should succeed after indexing. stderr: {}",
+        String::from_utf8_lossy(&doctor_output.stderr)
+    );
+
+    let doctor_json: Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("valid doctor JSON");
+    assert_eq!(
+        doctor_json["healthy"].as_bool(),
+        Some(true),
+        "Doctor should report a healthy DB after full index: {doctor_json}"
     );
 }
 

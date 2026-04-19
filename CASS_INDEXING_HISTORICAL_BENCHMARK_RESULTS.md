@@ -1160,3 +1160,467 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-r111-control.perf.data`
 - `/tmp/cass-real-bench-20260419-r112-prefix-direct-terms/logs/summary.json`
 - `/tmp/cass-real-bench-20260419-r112-prefix-direct-terms/logs/index.stderr.log`
+
+
+## Rejected CJK Bigram Fast Path
+
+### Goal
+- Remove the unconditional per-token `Vec<char>` allocation inside `CjkBigramDecompose` by scanning tokens allocation-free first and only materializing bigrams for all-CJK multi-character tokens.
+
+### Alien/Queueing Framing
+- The fresh retained-tree profile still had `RemoveLongFilterStream<...CassTokenStream>::advance` dominating rebuild CPU, and the CJK filter was one of the last remaining analyzer stages doing per-token heap work even for plain ASCII tokens.
+- This was a classic graveyard hot-loop candidate: keep semantics fixed, eliminate useless allocation on the common path, and let the writer stage stay unchanged.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes in the attempted design. Token order, document order, flush cadence, and commit cadence were unchanged.
+- Tie-breaking unchanged: yes. The attempted rewrite emitted the same bigram sequence for CJK tokens and passed through non-CJK tokens unchanged.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: focused lexical tests passed before benchmarking, including existing CJK bigram tests and a temporary differential proof against the legacy helper.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r113-cjk-fastpath-control` | retained control on rebuilt real profiling binary | 56.513 | 905.714 | 83233.432 | 50.738 | 7.505 | 3.092 | 2.445 | 3.731 | control |
+| `r114-cjk-fastpath-candidate` | allocation-free CJK scan + reverse-slice bigram build | 56.508 | 905.806 | 83241.865 | 50.639 | 7.361 | 3.136 | 2.429 | 3.555 | candidate |
+| `r115-cjk-fastpath-repeat` | repeat same fast-path build | 56.506 | 905.830 | 83244.053 | 51.011 | 7.481 | 3.139 | 2.437 | 3.761 | statistical tie |
+
+### Takeaways
+- This is noise, not a keeper. The candidate mean (`56.507s`) beat control (`56.513s`) by only `0.006s`, about `0.01%`, which is far below the threshold worth retaining.
+- The first candidate run looked mildly encouraging in stage buckets, but the repeat gave that back: `message_stream_ms` rose from `50.639s` to `51.011s`, `finish_conversation_ms` rose from `7.361s` to `7.481s`, and `commit_ms` overshot control.
+- The attempted proof was sound; the economics were not. Removing this small analyzer allocation simply does not move enough real end-to-end work on the current retained tree.
+- Conclusion: reject the CJK fast-path rewrite and restore the prior retained source state.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r113-cjk-fastpath-control/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r113-cjk-fastpath-control/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r114-cjk-fastpath-candidate/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r114-cjk-fastpath-candidate/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r115-cjk-fastpath-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r115-cjk-fastpath-repeat/logs/index.stderr.log`
+
+
+## Retained Tantivy Content Externalization
+
+### Goal
+- Stop storing full `content` in the lexical Tantivy documents, keep it indexed-only, and hydrate missing content from the authoritative SQLite database at search time.
+
+### Alien/Queueing Framing
+- This was a direct write-amplification attack from the graveyard playbook: remove a large duplicated payload from the inverted-index write path, keep query semantics intact, and pay the recovery cost only on the relatively colder read path that actually needs full content.
+- The highest-EV hypothesis was that Tantivy segment build and commit would materially benefit from deleting a multi-gigabyte stored-field stream, especially after the earlier prefix/postings wins had already squeezed easier analyzer hot loops.
+
+### Behavior Preservation Proof
+- Indexed search semantics preserved: yes. `content` remains indexed, so lexical matching, prefix terms, BM25 scoring, and ranking inputs are unchanged.
+- Result payload semantics preserved: yes. cass now hydrates missing content by `(conversation_id, msg_idx)` when available, with a compatibility fallback keyed by `(source_id, source_path, msg_idx)` for ad hoc indexes built without embedded `conversation_id`.
+- Snippet behavior preserved: yes. When Tantivy no longer stores `content`, cass synthesizes a snippet document from the hydrated content and reuses the existing snippet renderer.
+- Harness correction: the new regression proof uses a dedicated `search-index/` subdir because `TantivyIndex::open_or_create(dir.path())` rebuild semantics are allowed to clear the target directory, which would invalidate a sibling temp `cass.db` in the same root.
+- Golden/replay verification before benchmarking:
+  - `cass_content_field_is_indexed_not_stored`
+  - `tantivy_search_hydrates_long_content_when_content_field_is_not_stored`
+  - `add_prebuilt_documents_streams_large_payloads_without_dropping_docs`
+  - `rebuild_tantivy_from_db_logs_streamed_batch_stats`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r113-cjk-fastpath-control` | retained control on rebuilt real profiling binary | 56.513 | 905.714 | 83233.432 | 50.738 | 7.505 | 3.092 | 2.445 | 3.731 | control |
+| `r116-content-externalized` | `content` changed from indexed+stored to indexed-only; search hydrates from SQLite | 54.233 | 943.802 | 86733.614 | — | — | — | — | — | candidate |
+| `r117-content-externalized-repeat` | repeat on same retained tree | 55.142 | 928.232 | 85302.775 | — | — | — | — | — | repeat |
+| `r118-content-externalized-profile` | profiled confirmation run with `CASS_TANTIVY_REBUILD_PROFILE=1` | 54.025 | 947.429 | 87066.916 | 49.067 | 6.674 | 2.971 | 2.333 | 3.106 | kept |
+
+### Takeaways
+- This is a retained win. The conservative repeated result improved from `56.513s` to `55.142s`, about `2.43%` faster. The three-run candidate mean was `54.467s`, about `3.62%` faster than control.
+- The profiled run moved the right buckets:
+  - `message_stream_ms`: `50.738s -> 49.067s` (`-3.29%`)
+  - `finish_conversation_ms`: `7.505s -> 6.674s` (`-11.08%`)
+  - `prepare_ms`: `3.092s -> 2.971s` (`-3.90%`)
+  - `add_ms`: `2.445s -> 2.333s` (`-4.59%`)
+  - `commit_ms`: `3.731s -> 3.106s` (`-16.75%`)
+- The index-size effect is large and deterministic. The rebuilt index dropped from `3,215,812,765` bytes on control to `2,399,327,541` bytes on the profiled kept run, a reduction of `816,485,224` bytes (`25.39%`).
+- Conclusion: keep the content-externalization change. It is a real end-to-end ingest win, not just a size-only cleanup.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r116-content-externalized/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r116-content-externalized/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r117-content-externalized-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r117-content-externalized-repeat/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r118-content-externalized-profile/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r118-content-externalized-profile/logs/index.stderr.log`
+
+
+## Rejected Authoritative Rebuild `source_path` Externalization
+
+### Goal
+- Stop storing `source_path` on the authoritative DB rebuild path only, and hydrate it from SQLite by `conversation_id` at lexical search time.
+
+### Alien/Queueing Framing
+- This was the next obvious write-amplification lever after full `content` externalization: `source_path` was still a large repeated stored payload on every lexical message document, but unlike `content` it is not indexed for matching.
+- The high-EV hypothesis was that removing that repeated stored field from the hot authoritative rebuild stream would shave segment-write and commit work while keeping ad hoc index behavior unchanged.
+
+### Behavior Preservation Proof
+- Indexed search semantics preserved in the candidate: yes. `source_path` is not part of lexical matching, so ranking and BM25 clause construction were unchanged.
+- Result payload semantics preserved in the candidate: yes. Missing stored `source_path` values were backfilled from SQLite by `conversation_id` before `SearchHit` construction.
+- Post-search `session_paths` filtering preserved in the candidate: yes. A dedicated regression test proved that authoritative rebuild docs with omitted `source_path` still matched `session_paths` filters after hydration.
+- Golden/replay verification before benchmarking:
+  - `cass_document_refs_may_omit_source_path`
+  - `tantivy_search_hydrates_source_path_when_authoritative_rebuild_omits_it`
+  - `tantivy_search_hydrates_long_content_when_content_field_is_not_stored`
+  - `add_prebuilt_documents_streams_large_payloads_without_dropping_docs`
+  - `rebuild_tantivy_from_db_logs_streamed_batch_stats`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r118-content-externalized-profile` | retained control | 54.025 | 947.429 | 87066.916 | 49.067 | 6.674 | 2.971 | 2.333 | 3.106 | 2399327541 | control |
+| `r119-source-path-externalized` | authoritative rebuild omits stored `source_path`; search hydrates by `conversation_id` | 54.004 | 947.807 | 87101.646 | 48.919 | 6.604 | 2.966 | 2.312 | 3.058 | 2367926029 | candidate |
+| `r120-source-path-externalized-repeat` | repeat on same tree | 54.121 | 945.749 | 86912.510 | 49.562 | 6.907 | 3.116 | 2.453 | 3.135 | 2368123163 | reject |
+
+### Takeaways
+- This is not a keeper. `r119` beat the retained control by only `0.0215s` (`0.04%`), and the repeat `r120` lost by `0.0960s` (`0.18%`).
+- The two candidate runs average `54.062s`, which is slightly slower than the retained `r118 = 54.025s`. That is noise at best, and not a repeat-held win.
+- The candidate did shrink the rebuilt index by about `31.3 MB` (`1.30%`) versus `r118`, but that size-only improvement is too small to justify the added search-time hydration path and extra complexity.
+- Conclusion: reject the authoritative-rebuild-only `source_path` externalization and restore the prior retained tree.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r119-source-path-externalized/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r119-source-path-externalized/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r120-source-path-externalized-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r120-source-path-externalized-repeat/logs/index.stderr.log`
+
+
+## Retained Cass-Specific Fused Normalize+Limit Filter
+
+### Goal
+- Replace the generic `LowerCaser + RemoveLongFilter::limit(256)` pair in the cass Tantivy analyzer with a cass-specific fused filter that performs the same normalization in one pass.
+
+### Alien/Queueing Framing
+- This is a certified data-plane rewrite rather than a schema trick: keep the exact token stream contract, but collapse two generic analyzer stages into one cass-specific fast path.
+- The saved `perf` evidence already showed the analyzer chain dominating authoritative rebuild CPU, so the highest-EV next lever was a proof-backed specialization of the remaining generic normalization layer.
+
+### Behavior Preservation Proof
+- Token boundary semantics preserved: yes. `CassTokenizer`, `HyphenDecompose`, and `CjkBigramDecompose` are unchanged.
+- Lowercasing semantics preserved: yes. `CassTokenizer` only emits ASCII alphanumeric runs and CJK runs, so `String::make_ascii_lowercase()` is behaviorally equivalent to Tantivy's generic `LowerCaser` on the emitted token language.
+- Long-token filtering preserved: yes. The fused filter drops tokens whose UTF-8 byte length exceeds `256`, matching `RemoveLongFilter::limit(256)`.
+- Schema/index compatibility preserved: yes. Field definitions, analyzer name, and lexical query construction are unchanged, so no schema/version bump was needed.
+- Golden/replay verification before benchmarking:
+  - `cass_tokenizer_matches_legacy_regex_boundaries`
+  - `cass_normalize_and_limit_matches_legacy_pipeline`
+  - `cass_build_content_prefix_and_preview_matches_existing_helpers`
+  - `tantivy_search_hydrates_long_content_when_content_field_is_not_stored`
+  - `add_prebuilt_documents_streams_large_payloads_without_dropping_docs`
+  - `rebuild_tantivy_from_db_logs_streamed_batch_stats`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r118-content-externalized-profile` | retained control | 54.025 | 947.429 | 87066.916 | 49.067 | 6.674 | 2.971 | 2.333 | 3.106 | 2399327541 | control |
+| `r121-fast-normalize-filter` | replace generic lowercase + long-token filters with fused cass-specific normalizer | 53.051 | 964.826 | 88665.643 | 48.676 | 6.589 | 2.889 | 2.258 | 3.112 | 2398780869 | candidate |
+| `r122-fast-normalize-filter-repeat` | repeat on same retained tree | 53.123 | 963.526 | 88546.247 | 48.719 | 6.665 | 2.895 | 2.254 | 3.126 | 2399846232 | kept |
+
+### Takeaways
+- This is a retained win. The conservative repeated result improved from `54.025s` to `53.123s`, about `1.67%` faster.
+- The two candidate runs averaged `53.087s`, about `1.74%` faster than the retained control.
+- The hot rebuild buckets moved in the right direction on both runs:
+  - `message_stream_ms`: `49.067s -> 48.676s / 48.719s` (`-0.71%` to `-0.80%`)
+  - `finish_conversation_ms`: `6.674s -> 6.589s / 6.665s` (`-0.13%` to `-1.28%`)
+  - `prepare_ms`: `2.971s -> 2.889s / 2.895s` (`-2.56%` to `-2.76%`)
+  - `add_ms`: `2.333s -> 2.258s / 2.254s` (`-3.18%` to `-3.41%`)
+  - `commit_ms`: essentially flat/noise (`3.106s -> 3.112s / 3.126s`)
+- Index size stayed effectively unchanged, which is what we want for a pure CPU-path rewrite. This is an ingest-speed win without a schema tradeoff.
+- Conclusion: keep the fused cass-specific normalize+limit filter. It trims the remaining generic analyzer overhead while preserving the exact lexical token stream.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r121-fast-normalize-filter/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r121-fast-normalize-filter/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r122-fast-normalize-filter-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r122-fast-normalize-filter-repeat/logs/index.stderr.log`
+
+
+## Rejected ASCII-Byte DFA Tokenizer Scan
+
+### Goal
+- Replace the hot ASCII path in `CassTokenStream::advance` with a byte-wise DFA so UTF-8 decoding only happens on non-ASCII bytes.
+
+### Alien/Parser Framing
+- This was a certified parser-kernel rewrite: keep the tokenizer language and offsets identical, but switch the dominant ASCII scan from per-character decoding to a deterministic byte machine.
+- The idea was directly motivated by the retained `perf` evidence that `CassTokenStream::advance` still dominated authoritative rebuild CPU after the fused normalize+limit win.
+
+### Behavior Preservation Proof
+- Token boundary semantics preserved in the candidate: yes. `cass_tokenizer_matches_legacy_regex_boundaries` still matched the legacy regex tokenizer on the existing adversarial fixture set.
+- Analyzer output semantics preserved in the candidate: yes. `cass_normalize_and_limit_matches_legacy_pipeline` still held because the downstream analyzer stages were unchanged.
+- Golden/replay verification before benchmarking:
+  - `cass_tokenizer_matches_legacy_regex_boundaries`
+  - `cass_normalize_and_limit_matches_legacy_pipeline`
+  - `cass_build_content_prefix_and_preview_matches_existing_helpers`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r122-fast-normalize-filter-repeat` | retained control | 53.123 | 963.526 | 88546.247 | 48.719 | 6.665 | 2.895 | 2.254 | 3.126 | control |
+| `r123-ascii-dfa-tokenizer` | byte-wise ASCII DFA in `CassTokenStream::advance` | 53.192 | 962.277 | 88431.379 | 48.651 | 6.592 | 2.896 | 2.247 | 3.120 | reject |
+| `r124-ascii-dfa-tokenizer-repeat` | attempted repeat | — | — | — | — | — | — | — | — | harness failure |
+
+### Takeaways
+- This is not a keeper. The only completed corpus run, `r123`, was slightly slower than the retained `r122` control (`53.192s` vs `53.123s`, about `0.13%` worse).
+- The internal rebuild buckets moved slightly in the right direction, but not enough to overcome wall-time noise. That is exactly the kind of near-tie that should be rejected, not rationalized into a win.
+- The attempted repeat `r124` failed before launch because the profiling binary path used by the local harness disappeared (`target-optscan/profiling/cass` missing). Since the first run already failed to beat control, the missing repeat is not worth re-running via another full profiling rebuild cycle.
+- Conclusion: reject the ASCII-byte DFA tokenizer scan and restore the prior retained tree.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r123-ascii-dfa-tokenizer/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r123-ascii-dfa-tokenizer/logs/index.stderr.log`
+
+
+## Retained Prefix Presence-Only Postings
+
+### Goal
+- Reduce Tantivy write amplification on the cass prefix fields by storing only term presence for `title_prefix` and `content_prefix`, instead of term frequencies.
+
+### Alien/Postings Framing
+- The retained `perf` evidence after the tokenizer and content-externalization wins left a clear remaining hotspot family: Tantivy postings subscription work, especially the `TermFrequencyRecorder` path that prefix fields still paid for on every emitted edge n-gram.
+- The high-EV hypothesis was that cass only needs prefix-field membership to satisfy prefix matching; exact `title` and `content` fields still carry the full BM25 term-frequency and positional signal. That makes frequency-tracked prefix postings redundant cost on the hot rebuild path.
+
+### Behavior Preservation Proof
+- Exact lexical semantics preserved: yes. `title` and `content` remain indexed with `WithFreqsAndPositions`, so exact-term BM25 scoring and phrase matching are unchanged.
+- Prefix matching semantics preserved: yes. Prefix fields remain indexed and queryable; only their posting detail drops from `WithFreqs` to `Basic`, which keeps term presence while removing redundant per-doc frequency tracking.
+- Title-only lexical retrieval preserved: yes. `title` field storage and indexing are unchanged.
+- Golden/replay verification before benchmarking:
+  - `cass_prefix_fields_store_basic_without_freqs_or_positions`
+  - `prefix_wildcard_matches_start_of_term`
+  - `edge_ngram_enables_prefix_search`
+  - `title_field_is_searchable`
+  - `wildcard_fallback_short_query_triggers_prefix`
+  - `add_prebuilt_documents_streams_large_payloads_without_dropping_docs`
+  - `rebuild_tantivy_from_db_logs_streamed_batch_stats`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r122-fast-normalize-filter-repeat` | retained control | 53.123 | 963.526 | 88546.247 | 48.719 | 6.665 | 2.895 | 2.254 | 3.126 | 2399846232 | control |
+| `r125-prefix-basic-postings` | switch `title_prefix` / `content_prefix` postings from `WithFreqs` to `Basic` | 51.716 | 989.732 | 90954.487 | 47.672 | 6.126 | 2.873 | 2.260 | 2.666 | 2062700780 | candidate |
+| `r126-prefix-basic-postings-repeat` | repeat on same retained tree | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | 2063387147 | kept |
+
+### Takeaways
+- This is a retained win. The conservative repeated result improved from `53.123s` to `51.528s`, about `3.00%` faster.
+- The two candidate runs averaged `51.622s`, about `2.82%` faster than the retained control.
+- The rebuilt index also got materially smaller: `2,399,846,232` bytes on `r122` down to `2,063,387,147` bytes on repeated `r126`, a reduction of `336,459,085` bytes (`14.02%`).
+- The hot rebuild buckets moved in the right direction overall:
+  - `message_stream_ms`: `48.719s -> 47.533s` (`-2.44%`)
+  - `finish_conversation_ms`: `6.665s -> 6.146s` (`-7.79%`)
+  - `prepare_ms`: `2.895s -> 2.862s` (`-1.13%`)
+  - `commit_ms`: `3.126s -> 2.693s` (`-13.86%`)
+  - `add_ms`: essentially flat/noise (`2.254s -> 2.261s`)
+- Conclusion: keep the prefix-field `Basic` postings change. cass still gets prefix matching, but no longer pays per-document frequency bookkeeping for edge n-gram fields.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r125-prefix-basic-postings/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r125-prefix-basic-postings/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r126-prefix-basic-postings-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r126-prefix-basic-postings-repeat/logs/index.stderr.log`
+
+
+## Rejected Prefix-Term Dedup Under Basic Postings
+
+### Goal
+- Exploit the fact that `title_prefix` and `content_prefix` now use `IndexRecordOption::Basic` by deduplicating repeated prefix terms within a document before handing them to Tantivy.
+
+### Alien/Set-Semantics Framing
+- This was the obvious algebraic follow-on to the retained prefix-postings win: once prefix fields are presence-only, duplicate per-document prefix terms become semantically idempotent.
+- A direct sample against the authoritative cass database suggested a plausible opportunity. On 1,000 recent conversations, the generated prefix stream averaged `191.005` total prefix terms, `126.334` unique prefix terms, and `64.671` duplicates per document (`33.86%` duplicate ratio).
+- The candidate therefore introduced exact per-document deduplication in the prefix builders using an `AHashSet<&str>`, while preserving first-occurrence order so the emitted term stream remained deterministic.
+
+### Behavior Preservation Proof
+- Prefix matching semantics preserved in the candidate: yes. Prefix fields already use presence-only postings, so duplicate term suppression does not change the logical per-document term set.
+- Deterministic output ordering preserved in the candidate: yes. The first occurrence of each prefix term was still emitted in encounter order.
+- Golden/replay verification before benchmarking:
+  - `cass_generate_edge_ngrams_deduplicates_repeated_prefix_terms`
+  - `cass_build_content_prefix_and_preview_matches_existing_helpers`
+  - `prefix_wildcard_matches_start_of_term`
+  - `edge_ngram_enables_prefix_search`
+  - `wildcard_fallback_short_query_triggers_prefix`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r126-prefix-basic-postings-repeat` | retained control | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | 2063387147 | control |
+| `r127-prefix-dedup-basic-postings` | exact per-document dedup of repeated prefix terms via `AHashSet<&str>` | 53.484 | 957.008 | 87947.197 | 49.199 | 7.379 | 4.186 | 3.589 | 2.534 | 2063387344 | reject |
+
+### Takeaways
+- This is not a keeper. `r127` regressed from `51.528s` to `53.484s`, about `3.80%` slower than the retained control.
+- The candidate barely changed the rebuilt index size (`+197` bytes), so the dedup bookkeeping cost was pure overhead on the hot rebuild path.
+- The algebra was correct but the implementation economics were wrong: hashing and probing every candidate prefix term cost more than simply feeding the duplicates through Tantivy's already-cheap presence-only postings path.
+- The stage buckets make that failure mode explicit: `prepare_ms` and `add_ms` both ballooned, and `finish_conversation_ms` got materially worse too, even though `commit_ms` improved slightly.
+- Conclusion: reject exact prefix-term dedup under `Basic` postings and restore the prior retained tree.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r127-prefix-dedup-basic-postings/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r127-prefix-dedup-basic-postings/logs/index.stderr.log`
+
+
+## Rejected Preview Field Elision
+
+### Goal
+- Stop materializing the stored `preview` payload into Tantivy documents during authoritative cass rebuilds, relying on the existing SQLite content-hydration path for lexical snippets instead.
+
+### Alien/Compression Framing
+- After the retained content-hydration keeper, `preview` looked like a classic stale cache artifact: snippets already hydrate full content from SQLite whenever `content` or `snippet` is requested, so the stored preview field had become a residual duplicate of the first 400 content characters.
+- A direct corpus probe on the authoritative cass database suggested a large apparent byte opportunity: `4,703,804` messages with average preview length `112.23` characters, or about `527,918,461` raw preview characters total.
+- The candidate therefore elided preview materialization from the hot lexical document-build path while keeping the schema field and query-side fallback machinery intact.
+
+### Behavior Preservation Proof
+- Lexical content hydration preserved in the candidate: yes. `tantivy_search_hydrates_long_content_when_content_field_is_not_stored` still passed, proving full content and snippets could render from SQLite without stored Tantivy content.
+- Prefix generation semantics preserved in the candidate: yes. `cass_build_content_prefix_and_preview_matches_existing_helpers` still held for the retained helper logic, and the candidate only removed preview emission from built docs.
+- Direct preview-elision proof before benchmarking:
+  - `cass_built_documents_do_not_materialize_preview_field`
+  - `tantivy_search_hydrates_long_content_when_content_field_is_not_stored`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r126-prefix-basic-postings-repeat` | retained control | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | 2063387147 | control |
+| `r128-preview-elided` | omit stored `preview` payload from built Tantivy docs | 53.243 | 961.351 | 88346.359 | 49.222 | 7.405 | 4.201 | 3.598 | 2.599 | 2063298121 | reject |
+
+### Takeaways
+- This is not a keeper. `r128` regressed from `51.528s` to `53.243s`, about `3.33%` slower than the retained control.
+- The rebuilt index barely moved: `2,063,387,147` bytes down to `2,063,298,121`, a reduction of only `89,026` bytes (`0.0043%`). The huge raw preview-character count compressed away so effectively inside Tantivy's stored-field path that it did not translate into real index-size savings.
+- The stage profile shows the failure clearly: `prepare_ms` and `add_ms` both got much worse, and `finish_conversation_ms` regressed heavily too. The tiny `commit_ms` improvement was nowhere near enough to compensate.
+- Conclusion: reject preview-field elision. In this workload, the stored preview path is not the real write-amplification lever anymore.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r128-preview-elided/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r128-preview-elided/logs/index.stderr.log`
+
+
+## Rejected Conversation-Level Title-Prefix Precompute
+
+### Goal
+- Precompute `title_prefix` once per conversation and reuse it for every message document in that conversation, instead of regenerating the same edge-ngram string for each message during lexical rebuild.
+
+### Alien/Common-Subexpression Framing
+- This was a classic conversation-constant memoization probe. In cass, `title` is constant across all messages in a conversation, so `cass_generate_edge_ngrams(title)` looked like repeated deterministic work on the hot rebuild path.
+- The relevant graveyard/optimization pattern is common-subexpression elimination at the ownership boundary: lift a pure derived artifact from per-message work into per-conversation context, then transport it through the existing borrowed-doc pipeline.
+- The EV case looked strong on paper because the corpus averages about `91.9` messages per conversation, so each surviving conversation title could have been reused many times.
+
+### Behavior Preservation Proof
+- Title search semantics preserved in the candidate: yes. The title text itself was unchanged, and the precomputed prefix payload was built with the exact same `cass_generate_edge_ngrams` helper as the old per-message path.
+- Prefix-field bytes preserved in the candidate: yes. `cass_precomputed_title_prefix_matches_runtime_generation` proved that a precomputed `title_prefix` payload matched the runtime-generated payload exactly.
+- Golden/replay verification before benchmarking:
+  - `cass_precomputed_title_prefix_matches_runtime_generation`
+  - `cass_content_field_is_indexed_not_stored`
+  - `add_prebuilt_documents_streams_large_payloads_without_dropping_docs`
+  - `rebuild_tantivy_from_db_logs_streamed_batch_stats`
+  - `title_field_is_searchable`
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r126-prefix-basic-postings-repeat` | retained control | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | 2063387147 | control |
+| `r131-title-prefix-precompute` | precompute `title_prefix` once per conversation and reuse it across message docs | 52.610 | 972.910 | 89408.600 | 48.005 | 6.095 | 2.788 | 2.147 | 2.704 | 2062980960 | reject |
+
+### Takeaways
+- This is not a keeper. `r131` regressed from `51.528s` to `52.610s`, about `2.10%` slower than the retained control, so it was rejected without spending another full repeat run.
+- The candidate did improve some local buckets: `prepare_ms` fell from `2.862s` to `2.788s`, `add_ms` from `2.261s` to `2.147s`, and `finish_conversation_ms` edged down from `6.146s` to `6.095s`.
+- But the dominant service center moved the wrong way: `message_stream_ms` rose from `47.533s` to `48.005s`. That means the saved per-message prefix generation work was overpaid by the new per-conversation precompute and transport overhead inside the broader rebuild pipeline.
+- The rebuilt index shrank slightly (`-406,187` bytes, about `0.02%`), but not enough to matter.
+- Conclusion: reject conversation-level `title_prefix` precompute and keep the simpler retained tree.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r131-title-prefix-precompute/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r131-title-prefix-precompute/logs/index.stderr.log`
+
+
+## Rejected Retained-Tree Writer-Thread Retune
+
+### Goal
+- Re-test the Tantivy writer-thread count on the current retained tree after the later content externalization, fused normalization, and prefix-postings wins materially changed the per-document service demand.
+
+### Alien/Queueing Framing
+- This was a straightforward queueing-theory retune on the write service center. The old `26`-writer default was chosen on a much heavier tree, so the natural hypothesis was that the new retained tree might want a different concurrency point.
+- Two adjacent probes were worth real money: `24` as the lower-contention candidate, and `28` as the only nearby higher-throughput neighbor that had ever looked competitive on older baselines.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. This was env-only thread-count tuning; document order, schema, batch boundaries, and query behavior were unchanged.
+- Tie-breaking unchanged: yes. No ranking or retrieval semantics changed.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: env-only benchmark sweep on the retained tree; source restored untouched.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r126-prefix-basic-postings-repeat` | retained control (`26` writer threads) | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | control |
+| `r132-writer24-retained` | env-only `CASS_TANTIVY_MAX_WRITER_THREADS=24` | 52.415 | 976.526 | 89742.968 | 47.903 | 6.161 | 2.781 | 2.140 | 2.772 | reject |
+| `r133-writer28-retained` | env-only `CASS_TANTIVY_MAX_WRITER_THREADS=28` | 51.466 | 994.539 | 91396.371 | 47.807 | 6.093 | 2.816 | 2.172 | 2.646 | inconclusive first hit |
+| `r134-writer28-retained-repeat` | repeat of the same `28`-writer env override | 52.636 | 972.434 | 89366.477 | 48.192 | 6.056 | 2.839 | 2.174 | 2.604 | reject |
+
+### Takeaways
+- `24` is a clean loser on the current retained tree: `52.415s` versus `51.528s`, about `1.72%` slower than control.
+- `28` looked like a tiny single-run win (`51.466s`, about `0.12%` faster), but the repeat lost hard enough (`52.636s`, about `2.15%` slower) that the two-run mean is still worse than control by about `1.02%`.
+- The profile shape explains why this branch is not the frontier anymore. `24` reduced `prepare_ms` and `add_ms`, but paid it back in worse `message_stream_ms` and `commit_ms`. `28` slightly improved `commit_ms`, but both runs worsened `message_stream_ms` and `prepare_ms` relative to the retained control.
+- Conclusion: keep the existing `26`-writer retained tree. On the current workload, writer-pool sizing is not the next keeper.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r132-writer24-retained/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r132-writer24-retained/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r133-writer28-retained/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r133-writer28-retained/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r134-writer28-retained-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r134-writer28-retained-repeat/logs/index.stderr.log`
+
+## Rejected HyphenDecompose State-Machine Rewrite
+
+- Date: 2026-04-19
+- Labels: `r126-prefix-basic-postings-repeat` (retained control), `r135-hyphen-decompose-state` (candidate)
+
+### Goal
+
+- Remove the remaining avoidable allocation churn inside `HyphenDecompose` by replacing the `contains('-') + split('-') + collect::<Vec<_>>() + token.clone()` path with a direct reverse byte scan plus an explicit compound/parts state machine.
+
+### Alien / Optimization Framing
+
+- `extreme-software-optimization`: this was a classic buffer-reuse / allocation-elision probe on a still-hot analyzer stack.
+- `alien-artifact-coding`: the proof obligation was exact token-stream isomorphism, especially preserving compound-first emission followed by left-to-right sub-parts at the same position.
+- `alien-graveyard`: the relevant primitive was simple hot-loop allocation suppression, not a heavier data-structure swap.
+
+### Behavior Preservation Proof
+
+- Added a focused analyzer test for the exact expected stream order: `cass_hyphen_decompose_emits_compound_then_parts`.
+- Re-ran the broader retained tokenizer/analyzer guards before benchmarking:
+  - `cargo fmt --check` in `/data/projects/frankensearch`
+  - `cargo test -p frankensearch-lexical cass_hyphen_decompose_emits_compound_then_parts -- --nocapture`
+  - `cargo test -p frankensearch-lexical cass_tokenizer_matches_legacy_regex_boundaries -- --nocapture`
+  - `cargo test -p frankensearch-lexical cass_normalize_and_limit_matches_legacy_pipeline -- --nocapture`
+
+### Benchmark Result
+
+| Label | Change | Wall s | Conv/s | Msg/s | `message_stream_ms` | `finish_conversation_ms` | `prepare_ms` | `add_ms` | `commit_ms` | `index_size_bytes` | Outcome |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `r126-prefix-basic-postings-repeat` | retained control | 51.528 | 993.347 | 91286.726 | 47.533 | 6.146 | 2.862 | 2.261 | 2.693 | 2063387147 | control |
+| `r135-hyphen-decompose-state` | no-`Vec`, no-compound-clone `HyphenDecompose` state machine | 52.548 | 974.054 | 89513.723 | 47.907 | 6.289 | 2.999 | 2.392 | 2.669 | 2063082645 | reject |
+
+### Interpretation
+
+- The candidate lost clearly enough that it did not earn a repeat: `52.548s` versus retained `51.528s`, about `1.98%` slower.
+- The tiny index-size reduction (`-304,502` bytes, about `0.015%`) was noise relative to the runtime loss.
+- The loss shows up in the hot buckets that matter most to rebuild throughput:
+  - `message_stream_ms`: `47.533s -> 47.907s`
+  - `finish_conversation_ms`: `6.146s -> 6.289s`
+  - `prepare_ms`: `2.862s -> 2.999s`
+  - `add_ms`: `2.261s -> 2.392s`
+  - `commit_ms` improved slightly (`2.693s -> 2.669s`) but nowhere near enough to pay for the extra work elsewhere.
+- Conclusion: reject the `HyphenDecompose` state-machine rewrite and restore the prior retained tree.
+
+### Artifacts
+
+- `/tmp/cass-real-bench-20260419-r135-hyphen-decompose-state/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r135-hyphen-decompose-state/logs/index.stderr.log`

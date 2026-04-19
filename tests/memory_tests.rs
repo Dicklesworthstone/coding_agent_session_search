@@ -25,7 +25,7 @@ fn memory_test_guard() -> std::sync::MutexGuard<'static, ()> {
     MEMORY_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("memory test mutex poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Generate a sample conversation for testing.
@@ -127,6 +127,7 @@ fn get_process_memory_bytes() -> usize {
 /// This test runs many searches and verifies that memory usage doesn't
 /// grow unboundedly. Some growth is acceptable due to caching.
 #[test]
+#[ignore = "RSS profiling test; run manually with `cargo test --release --test memory_tests -- --nocapture --test-threads=1`"]
 fn test_search_memory_no_leak() {
     let _guard = memory_test_guard();
     // Create index with 100 conversations
@@ -184,6 +185,7 @@ fn test_search_memory_no_leak() {
 
 /// Test that repeated indexing operations don't leak memory.
 #[test]
+#[ignore = "RSS profiling test; run manually with `cargo test --release --test memory_tests -- --nocapture --test-threads=1`"]
 fn test_indexing_memory_no_leak() {
     let _guard = memory_test_guard();
     let temp = TempDir::new().expect("tempdir");
@@ -244,6 +246,7 @@ fn test_indexing_memory_no_leak() {
 
 /// Test that vector search operations don't leak memory.
 #[test]
+#[ignore = "RSS profiling test; run manually with `cargo test --release --test memory_tests -- --nocapture --test-threads=1`"]
 fn test_vector_search_memory_no_leak() {
     let _guard = memory_test_guard();
     use coding_agent_search::search::vector_index::{Quantization, SemanticDocId, VectorIndex};

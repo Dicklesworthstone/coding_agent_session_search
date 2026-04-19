@@ -4090,9 +4090,15 @@ pub fn run_index(
     }
 
     if opts.full {
+        storage.rebuild_fts().with_context(|| {
+            format!(
+                "rebuilding frankensqlite-owned fallback FTS after full index run for {}",
+                opts.db_path.display()
+            )
+        })?;
         tracing::info!(
             db_path = %opts.db_path.display(),
-            "skipping legacy stock-SQLite FTS compatibility rebuild after full index run; lexical search now relies on the frankensqlite-owned canonical DB plus Tantivy index"
+            "rebuilt frankensqlite-owned fallback FTS after full index run"
         );
     }
 
@@ -7095,23 +7101,27 @@ pub mod persist {
 
     /// Extract provenance (source_id, origin_host) from conversation metadata.
     ///
-    /// Looks for `metadata.cass.origin` object with source_id and host fields.
-    /// Returns ("local", None) if no provenance is found.
+    /// Looks for `metadata.cass.origin` object with source_id/kind/host fields and
+    /// normalizes them the same way the lexical index does so host-only remote
+    /// metadata does not get misclassified as local during persistence.
     fn extract_provenance(metadata: &serde_json::Value) -> (String, Option<String>) {
-        let source_id = metadata
-            .get("cass")
-            .and_then(|c| c.get("origin"))
+        let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
+        let raw_source_id = cass_origin
             .and_then(|o| o.get("source_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("local")
-            .to_string();
-
-        let origin_host = metadata
-            .get("cass")
-            .and_then(|c| c.get("origin"))
-            .and_then(|o| o.get("host"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
+            .and_then(|v| v.as_str());
+        let raw_origin_kind = cass_origin
+            .and_then(|o| o.get("kind"))
+            .and_then(|v| v.as_str());
+        let origin_host = crate::search::tantivy::normalized_index_origin_host(
+            cass_origin
+                .and_then(|o| o.get("host"))
+                .and_then(|v| v.as_str()),
+        );
+        let source_id = crate::search::tantivy::normalized_index_source_id(
+            raw_source_id,
+            raw_origin_kind,
+            origin_host.as_deref(),
+        );
 
         (source_id, origin_host)
     }
@@ -8661,6 +8671,67 @@ pub mod persist {
                     "remote-single-source".to_string(),
                     Some("builder-3".to_string())
                 )]
+            );
+        }
+
+        #[test]
+        fn persist_conversation_host_only_remote_source_infers_source_id_from_host() {
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("single-host-only-remote.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("host-only-remote-session".into()),
+                title: Some("Host only remote session".into()),
+                workspace: Some(std::path::PathBuf::from("/ws/remote")),
+                source_path: std::path::PathBuf::from("/log/host-only-remote.jsonl"),
+                started_at: Some(3_100),
+                ended_at: Some(3_110),
+                metadata: serde_json::json!({
+                    "cass": {
+                        "origin": {
+                            "source_id": "   ",
+                            "host": "builder-4"
+                        }
+                    }
+                }),
+                messages: vec![NormalizedMessage {
+                    idx: 0,
+                    role: "assistant".into(),
+                    author: Some("tester".into()),
+                    created_at: Some(3_105),
+                    content: "host only remote content".into(),
+                    extra: serde_json::json!({}),
+                    snippets: vec![],
+                    invocations: Vec::new(),
+                }],
+            };
+
+            persist_conversation(&storage, &mut t_index, &conv)
+                .expect("host-only remote provenance should be auto-registered as remote");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let source_ids = reader.get_source_ids().unwrap();
+            assert_eq!(source_ids, vec!["builder-4".to_string()]);
+
+            let provenance: Vec<(String, Option<String>)> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT source_id, origin_host FROM conversations",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                provenance,
+                vec![("builder-4".to_string(), Some("builder-4".to_string()))]
             );
         }
 
@@ -11471,6 +11542,31 @@ mod tests {
             messages: vec![],
         });
         assert_eq!(conv.source_id, "laptop");
+        assert_eq!(conv.origin_host, Some("user@laptop.local".to_string()));
+    }
+
+    #[test]
+    fn extract_provenance_infers_remote_source_from_host_without_source_id() {
+        let metadata = serde_json::json!({
+            "cass": {
+                "origin": {
+                    "source_id": "   ",
+                    "host": "user@laptop.local"
+                }
+            }
+        });
+        let conv = persist::map_to_internal(&NormalizedConversation {
+            agent_slug: "test".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: PathBuf::from("/test"),
+            started_at: None,
+            ended_at: None,
+            metadata,
+            messages: vec![],
+        });
+        assert_eq!(conv.source_id, "user@laptop.local");
         assert_eq!(conv.origin_host, Some("user@laptop.local".to_string()));
     }
 

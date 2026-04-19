@@ -4,7 +4,7 @@ use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, 
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow};
 use frankensqlite::{
-    Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
+    Connection as FrankenConnection, Row as FrankenRow,
     compat::{
         ConnectionExt as FrankenConnectionExt, OpenFlags as FrankenOpenFlags,
         OptionalExtension as FrankenOptionalExtension, ParamValue, RowExt as FrankenRowExt,
@@ -5028,87 +5028,47 @@ impl FrankenStorage {
             return Ok(());
         }
 
-        const CALLBACK_FAILURE_SENTINEL: &str =
-            "cass lexical rebuild message stream callback failed";
-        const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild message stream early stop";
+        let conversation_ids: Vec<i64> = self
+            .conn
+            .query_map_collect(
+                "SELECT id FROM conversations WHERE id >= ?1 AND id <= ?2 ORDER BY id ASC",
+                fparams![start_conversation_id, end_conversation_id],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "listing conversation ids for streamed lexical rebuild")?;
 
-        let hinted_sql = "SELECT conversation_id, id, idx, role, NULL AS author, created_at, content \
-             FROM messages INDEXED BY idx_messages_conv_idx \
-             WHERE conversation_id >= ?1 \
-             ORDER BY conversation_id ASC, idx ASC";
-        let fallback_sql = "SELECT conversation_id, id, idx, role, NULL AS author, created_at, content \
-             FROM messages \
-             WHERE conversation_id >= ?1 \
-             ORDER BY conversation_id ASC, idx ASC";
+        for conversation_id in conversation_ids {
+            let messages = self
+                .fetch_messages_for_lexical_rebuild(conversation_id)
+                .with_context(|| {
+                    format!("streaming lexical rebuild messages for conversation {conversation_id}")
+                })?;
 
-        let params = [SqliteValue::Integer(start_conversation_id)];
-        let mut callback_error: Option<anyhow::Error> = None;
-        let stop_requested = std::cell::Cell::new(false);
-
-        let mut run = |sql: &str| -> Result<()> {
-            let stmt = self
-                .conn
-                .prepare(sql)
-                .with_context(|| "preparing lexical rebuild message stream query")?;
-            stmt.query_with_params_for_each(&params, |row| {
-                let message_row = LexicalRebuildMessageRow {
-                    conversation_id: row.get_typed(0)?,
-                    id: row.get_typed(1)?,
-                    idx: row.get_typed(2)?,
-                    role: row.get_typed(3)?,
-                    author: row.get_typed(4)?,
-                    created_at: row.get_typed(5)?,
-                    content: row.get_typed(6)?,
-                };
-                if message_row.conversation_id > end_conversation_id {
-                    stop_requested.set(true);
-                    return Err(frankensqlite::FrankenError::Internal(
-                        EARLY_STOP_SENTINEL.to_string(),
-                    ));
-                }
-                if let Err(err) = f(message_row) {
-                    callback_error = Some(err);
-                    return Err(frankensqlite::FrankenError::Internal(
-                        CALLBACK_FAILURE_SENTINEL.to_string(),
-                    ));
-                }
-                Ok(())
-            })
-            .with_context(|| "streaming lexical rebuild messages")?;
-            Ok(())
-        };
-
-        let result = run(hinted_sql).or_else(|err| {
-            let err_contains =
-                |needle: &str| err.chain().any(|cause| cause.to_string().contains(needle));
-            if stop_requested.get() && err_contains(EARLY_STOP_SENTINEL) {
-                Ok(())
-            } else if err_contains("no such index: idx_messages_conv_idx") {
-                run(fallback_sql).or_else(|fallback_err| {
-                    if stop_requested.get()
-                        && fallback_err
-                            .chain()
-                            .any(|cause| cause.to_string().contains(EARLY_STOP_SENTINEL))
-                    {
-                        Ok(())
-                    } else {
-                        Err(fallback_err)
-                    }
-                })
-            } else {
-                Err(err)
+            for message in messages {
+                let message_id = message.id.ok_or_else(|| {
+                    anyhow!(
+                        "lexical rebuild message missing id for conversation {conversation_id} idx {}",
+                        message.idx
+                    )
+                })?;
+                f(LexicalRebuildMessageRow {
+                    conversation_id,
+                    id: message_id,
+                    idx: message.idx,
+                    role: role_str(&message.role),
+                    author: message.author,
+                    created_at: message.created_at,
+                    content: message.content,
+                })?;
             }
-        });
-        if let Some(err) = callback_error {
-            return Err(err).with_context(|| "processing streamed lexical rebuild messages");
         }
-        result
+
+        Ok(())
     }
 
     /// Stream grouped lexical rebuild message rows in `(conversation_id, idx)`
-    /// order without paying an outer callback dispatch for every individual
-    /// message. The storage layer still scans every row, but it emits one
-    /// callback per conversation.
+    /// order by reusing the canonical per-message stream and coalescing rows
+    /// per conversation.
     pub fn stream_grouped_messages_for_lexical_rebuild_between_conversation_ids<F>(
         &self,
         start_conversation_id: i64,
@@ -5122,103 +5082,51 @@ impl FrankenStorage {
             return Ok(());
         }
 
-        const CALLBACK_FAILURE_SENTINEL: &str =
-            "cass lexical rebuild grouped message stream callback failed";
-        const EARLY_STOP_SENTINEL: &str = "cass lexical rebuild grouped message stream early stop";
+        let mut current_conversation_id: Option<i64> = None;
+        let mut current_messages: LexicalRebuildGroupedMessageRows = SmallVec::new();
+        let mut current_last_message_id = 0i64;
+        let mut flush_current = |current_conversation_id: &mut Option<i64>,
+                                 current_messages: &mut LexicalRebuildGroupedMessageRows,
+                                 current_last_message_id: &mut i64|
+         -> Result<()> {
+            let Some(conversation_id) = current_conversation_id.take() else {
+                return Ok(());
+            };
+            let messages = std::mem::take(current_messages);
+            let last_message_id = std::mem::take(current_last_message_id);
+            f(conversation_id, messages, last_message_id)
+        };
 
-        let hinted_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages INDEXED BY idx_messages_conv_idx              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
-        let fallback_sql = "SELECT conversation_id, id, idx, CASE WHEN role = 'tool' THEN 1 ELSE 0 END AS is_tool_role, created_at, content              FROM messages              WHERE conversation_id >= ?1              ORDER BY conversation_id ASC, idx ASC";
-
-        let params = [SqliteValue::Integer(start_conversation_id)];
-        let mut callback_error: Option<anyhow::Error> = None;
-        let stop_requested = std::cell::Cell::new(false);
-
-        let mut run = |sql: &str| -> Result<()> {
-            let stmt = self
-                .conn
-                .prepare(sql)
-                .with_context(|| "preparing grouped lexical rebuild message stream query")?;
-            let mut current_conversation_id: Option<i64> = None;
-            let mut current_messages: LexicalRebuildGroupedMessageRows = SmallVec::new();
-            let mut current_last_message_id = 0i64;
-            let mut flush_current =
-                |current_conversation_id: &mut Option<i64>,
-                 current_messages: &mut LexicalRebuildGroupedMessageRows,
-                 current_last_message_id: &mut i64|
-                 -> std::result::Result<(), frankensqlite::FrankenError> {
-                    let Some(conversation_id) = current_conversation_id.take() else {
-                        return Ok(());
-                    };
-                    let messages = std::mem::take(current_messages);
-                    let last_message_id = std::mem::take(current_last_message_id);
-                    if let Err(err) = f(conversation_id, messages, last_message_id) {
-                        callback_error = Some(err);
-                        return Err(frankensqlite::FrankenError::Internal(
-                            CALLBACK_FAILURE_SENTINEL.to_string(),
-                        ));
-                    }
-                    Ok(())
-                };
-
-            let query_result = stmt.query_with_params_for_each(&params, |row| {
-                let conversation_id: i64 = row.get_typed(0)?;
-                let message_id: i64 = row.get_typed(1)?;
-                let message_row = LexicalRebuildGroupedMessageRow {
-                    idx: row.get_typed(2)?,
-                    is_tool_role: row.get_typed::<i64>(3)? != 0,
-                    created_at: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
-                };
-                if conversation_id > end_conversation_id {
-                    stop_requested.set(true);
-                    return Err(frankensqlite::FrankenError::Internal(
-                        EARLY_STOP_SENTINEL.to_string(),
-                    ));
-                }
-                if current_conversation_id != Some(conversation_id) {
+        self.stream_messages_for_lexical_rebuild_between_conversation_ids(
+            start_conversation_id,
+            end_conversation_id,
+            |row| {
+                if current_conversation_id != Some(row.conversation_id) {
                     flush_current(
                         &mut current_conversation_id,
                         &mut current_messages,
                         &mut current_last_message_id,
                     )?;
-                    current_conversation_id = Some(conversation_id);
+                    current_conversation_id = Some(row.conversation_id);
                 }
-                current_last_message_id = message_id;
-                current_messages.push(message_row);
+                current_last_message_id = row.id;
+                current_messages.push(LexicalRebuildGroupedMessageRow {
+                    idx: row.idx,
+                    is_tool_role: row.role == "tool",
+                    created_at: row.created_at,
+                    content: row.content,
+                });
                 Ok(())
-            });
+            },
+        )
+        .with_context(|| "streaming grouped lexical rebuild messages")?;
 
-            match query_result {
-                Ok(()) => {}
-                Err(err)
-                    if stop_requested.get() && err.to_string().contains(EARLY_STOP_SENTINEL) => {}
-                Err(err) => {
-                    return Err(err).with_context(|| "streaming grouped lexical rebuild messages");
-                }
-            }
-
-            flush_current(
-                &mut current_conversation_id,
-                &mut current_messages,
-                &mut current_last_message_id,
-            )
-            .with_context(|| "flushing grouped lexical rebuild messages")?;
-            Ok(())
-        };
-
-        let result = run(hinted_sql).or_else(|err| {
-            let err_contains =
-                |needle: &str| err.chain().any(|cause| cause.to_string().contains(needle));
-            if err_contains("no such index: idx_messages_conv_idx") {
-                run(fallback_sql)
-            } else {
-                Err(err)
-            }
-        });
-        if let Some(err) = callback_error {
-            return Err(err).with_context(|| "processing grouped lexical rebuild messages");
-        }
-        result
+        flush_current(
+            &mut current_conversation_id,
+            &mut current_messages,
+            &mut current_last_message_id,
+        )
+        .with_context(|| "flushing grouped lexical rebuild messages")
     }
 
     /// Stream grouped lexical rebuild message rows from a starting conversation
@@ -5687,12 +5595,19 @@ impl FrankenStorage {
         };
 
         let rows = stmt.query_map([], |row| {
+            let raw_source_id: String = row.get(0)?;
             let kind_str: String = row.get(1)?;
+            let raw_host_label: Option<String> = row.get(2)?;
             let config_json_raw: Option<String> = row.get(5)?;
+            let (source_id, source_kind, host_label) = normalized_storage_source_parts(
+                Some(raw_source_id.as_str()),
+                Some(kind_str.as_str()),
+                raw_host_label.as_deref(),
+            );
             Ok(Source {
-                id: row.get(0)?,
-                kind: SourceKind::parse(&kind_str).unwrap_or_default(),
-                host_label: row.get(2)?,
+                id: source_id,
+                kind: source_kind,
+                host_label,
                 machine_id: row.get(3)?,
                 platform: row.get(4)?,
                 config_json: config_json_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
@@ -5927,7 +5842,15 @@ impl FrankenStorage {
             let agent_slug: String = row.get(1)?;
             let workspace_path: Option<String> = row.get(2)?;
             let source_path: String = row.get(5)?;
-            let source_id: Option<String> = row.get(10)?;
+            let raw_source_id: Option<String> = row.get(10)?;
+            let raw_origin_host: Option<String> = row.get(11)?;
+            let source_id = crate::search::tantivy::normalized_index_source_id(
+                raw_source_id.as_deref(),
+                None,
+                raw_origin_host.as_deref(),
+            );
+            let origin_host =
+                crate::search::tantivy::normalized_index_origin_host(raw_origin_host.as_deref());
 
             let messages = message_stmt
                 .query_map(rusqlite::params![conversation_row_id], |msg_row| {
@@ -5974,8 +5897,8 @@ impl FrankenStorage {
                 approx_tokens: row.get(8)?,
                 metadata_json: parse_json_column(row.get(9)?),
                 messages,
-                source_id: source_id.unwrap_or_else(|| LOCAL_SOURCE_ID.to_string()),
-                origin_host: row.get(11)?,
+                source_id,
+                origin_host,
             };
 
             if !known_sources.contains(&conversation.source_id) {
@@ -6113,12 +6036,23 @@ impl FrankenStorage {
                 continue;
             }
 
-            let source = open_historical_bundle_for_salvage(&bundle).with_context(|| {
+            let source = match open_historical_bundle_for_salvage(&bundle).with_context(|| {
                 format!(
                     "opening historical bundle {} for salvage",
                     bundle.root_path.display()
                 )
-            })?;
+            }) {
+                Ok(source) => source,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %bundle.root_path.display(),
+                        error = %err,
+                        "skipping unreadable historical cass database bundle during salvage"
+                    );
+                    self.clear_historical_bundle_progress(&bundle)?;
+                    continue;
+                }
+            };
 
             self.import_historical_sources(&source.conn)?;
             let (imported_conversations, imported_messages) =
@@ -6166,6 +6100,8 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        let normalized_conv = normalized_conversation_for_storage(conv);
+        let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let defer_analytics_updates = defer_analytics_updates_enabled();
@@ -7231,7 +7167,9 @@ impl FrankenStorage {
             HashSet<MessageReplayFingerprint>,
         > = HashMap::new();
 
-        for &(agent_id, workspace_id, conv) in conversations {
+        for &(agent_id, workspace_id, raw_conv) in conversations {
+            let normalized_conv = normalized_conversation_for_storage(raw_conv);
+            let conv = normalized_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
             let mut inserted_messages: Vec<(i64, &Message)> =
@@ -7793,41 +7731,58 @@ impl FrankenStorage {
     }
 }
 
+fn normalized_storage_source_parts(
+    source_id: Option<&str>,
+    origin_kind: Option<&str>,
+    origin_host: Option<&str>,
+) -> (String, SourceKind, Option<String>) {
+    let host_label = crate::search::tantivy::normalized_index_origin_host(origin_host);
+    let source_id = crate::search::tantivy::normalized_index_source_id(
+        source_id,
+        origin_kind,
+        host_label.as_deref(),
+    );
+
+    if source_id == LOCAL_SOURCE_ID {
+        (source_id, SourceKind::Local, None)
+    } else {
+        (source_id, SourceKind::Ssh, host_label)
+    }
+}
+
+fn normalized_source_for_conversation(conv: &Conversation) -> Source {
+    let (id, kind, host_label) = normalized_storage_source_parts(
+        Some(conv.source_id.as_str()),
+        None,
+        conv.origin_host.as_deref(),
+    );
+    Source {
+        id,
+        kind,
+        host_label,
+        machine_id: None,
+        platform: None,
+        config_json: None,
+        created_at: None,
+        updated_at: None,
+    }
+}
+
+fn normalized_conversation_for_storage<'a>(conv: &'a Conversation) -> Cow<'a, Conversation> {
+    let normalized_source = normalized_source_for_conversation(conv);
+    if normalized_source.id == conv.source_id && normalized_source.host_label == conv.origin_host {
+        Cow::Borrowed(conv)
+    } else {
+        let mut normalized = conv.clone();
+        normalized.source_id = normalized_source.id;
+        normalized.origin_host = normalized_source.host_label;
+        Cow::Owned(normalized)
+    }
+}
+
 impl FrankenStorage {
     fn ensure_source_for_conversation(&self, conv: &Conversation) -> Result<()> {
-        let trimmed_source_id = conv.source_id.trim();
-        let trimmed_origin_host = conv
-            .origin_host
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-
-        let source = if trimmed_source_id.eq_ignore_ascii_case(LOCAL_SOURCE_ID)
-            || (trimmed_source_id.is_empty() && trimmed_origin_host.is_none())
-        {
-            Source {
-                id: conv.source_id.clone(),
-                kind: SourceKind::Local,
-                host_label: None,
-                machine_id: None,
-                platform: None,
-                config_json: None,
-                created_at: None,
-                updated_at: None,
-            }
-        } else {
-            Source {
-                id: conv.source_id.clone(),
-                kind: SourceKind::Ssh,
-                host_label: trimmed_origin_host,
-                machine_id: None,
-                platform: None,
-                config_json: None,
-                created_at: None,
-                updated_at: None,
-            }
-        };
+        let source = normalized_source_for_conversation(conv);
         self.upsert_source(&source)
     }
 
@@ -7837,8 +7792,9 @@ impl FrankenStorage {
     ) -> Result<()> {
         let mut seen = HashSet::with_capacity(conversations.len());
         for &(_, _, conv) in conversations {
-            if seen.insert(conv.source_id.clone()) {
-                self.ensure_source_for_conversation(conv)?;
+            let source = normalized_source_for_conversation(conv);
+            if seen.insert(source.id.clone()) {
+                self.upsert_source(&source)?;
             }
         }
         Ok(())
@@ -7953,31 +7909,38 @@ fn ensure_sources_in_tx(
 ) -> Result<()> {
     let mut seen = HashSet::new();
     for &(_, _, conv) in conversations {
-        if !seen.insert(conv.source_id.clone()) {
+        let (source_id, source_kind, host_label) = normalized_storage_source_parts(
+            Some(conv.source_id.as_str()),
+            None,
+            conv.origin_host.as_deref(),
+        );
+        if !seen.insert(source_id.clone()) {
             continue;
         }
         let exists: i64 = tx.query_row_map(
             "SELECT COUNT(*) FROM sources WHERE id = ?1",
-            fparams![conv.source_id.as_str()],
+            fparams![source_id.as_str()],
             |row| row.get_typed(0),
         )?;
         if exists == 0 {
-            let kind_str = if conv.source_id == LOCAL_SOURCE_ID {
-                "local"
-            } else {
-                "ssh"
-            };
+            let kind_str = source_kind.to_string();
             let now = FrankenStorage::now_millis();
             tracing::debug!(
                 target: "cass::fk_guard",
-                source_id = %conv.source_id,
-                kind = kind_str,
+                source_id = %source_id,
+                kind = kind_str.as_str(),
                 "inserting source row inside transaction to satisfy FK constraint"
             );
             tx.execute_compat(
-                "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?4)",
-                fparams![conv.source_id.as_str(), kind_str, now, now],
+                "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                fparams![
+                    source_id.as_str(),
+                    kind_str.as_str(),
+                    host_label.as_deref(),
+                    now,
+                    now
+                ],
             )?;
         }
     }
@@ -14152,6 +14115,99 @@ mod tests {
     }
 
     #[test]
+    fn salvage_historical_databases_normalizes_host_only_remote_provenance() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
+            if let Some(parent) = db_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let storage = SqliteStorage::open(db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            for conv in conversations {
+                storage
+                    .insert_conversation_tree(agent_id, None, conv)
+                    .unwrap();
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+
+        let host_only_remote = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: None,
+            title: Some("Recovered Host Only Remote".into()),
+            source_path: PathBuf::from("/tmp/host-only-history.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_999),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "host-only remote".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "   ".into(),
+            origin_host: Some("builder-5".into()),
+        };
+
+        let historical_db = dir
+            .path()
+            .join("backups/agent_search.db.20260322T020200.bak");
+        seed_historical_db(&historical_db, std::slice::from_ref(&host_only_remote));
+
+        let historical_storage = SqliteStorage::open(&historical_db).unwrap();
+        historical_storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+                fparams!["   ", "ssh", "builder-5", 0_i64, 0_i64],
+            )
+            .unwrap();
+        historical_storage
+            .raw()
+            .execute_compat(
+                "UPDATE conversations SET source_id = ?1, origin_host = ?2 WHERE source_path = ?3",
+                fparams!["   ", "builder-5", "/tmp/host-only-history.jsonl"],
+            )
+            .unwrap();
+        historical_storage
+            .raw()
+            .execute_compat("DELETE FROM sources WHERE id = ?1", fparams!["builder-5"])
+            .unwrap();
+        drop(historical_storage);
+
+        let first = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(first.bundles_imported, 1);
+        assert_eq!(first.messages_imported, 1);
+
+        let source_ids = storage.get_source_ids().unwrap();
+        assert_eq!(source_ids, vec!["builder-5".to_string()]);
+
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_id, "builder-5");
+        assert_eq!(conversations[0].origin_host.as_deref(), Some("builder-5"));
+    }
+
+    #[test]
     fn historical_salvage_retry_splits_single_conversation_until_it_fits() {
         use crate::model::types::{Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -15379,7 +15435,224 @@ mod tests {
     }
 
     #[test]
-    fn lexical_rebuild_stream_messages_query_avoids_sorter_temp_btrees() {
+    fn stream_messages_for_lexical_rebuild_between_conversation_ids_handles_mixed_ranges() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let claude_agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let aider_agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "aider".into(),
+                name: "Aider".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        type MessageSpec = (i64, MessageRole, Option<String>, Option<i64>, String);
+
+        let mut expected = Vec::new();
+        let mut first_conversation_id = None;
+        let mut last_conversation_id = None;
+        let mut insert_conversation =
+            |agent_id: i64,
+             external_id: &str,
+             title: &str,
+             source_path: &str,
+             started_at: i64,
+             message_specs: Vec<MessageSpec>| {
+                let conversation = Conversation {
+                    id: None,
+                    agent_slug: if agent_id == aider_agent_id {
+                        "aider".into()
+                    } else {
+                        "claude_code".into()
+                    },
+                    workspace: Some(PathBuf::from("/tmp/workspace")),
+                    external_id: Some(external_id.to_string()),
+                    title: Some(title.to_string()),
+                    source_path: PathBuf::from(source_path),
+                    started_at: Some(started_at),
+                    ended_at: Some(started_at + 100),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: message_specs
+                        .iter()
+                        .map(|(idx, role, author, created_at, content)| Message {
+                            id: None,
+                            idx: *idx,
+                            role: role.clone(),
+                            author: author.clone(),
+                            created_at: *created_at,
+                            content: content.clone(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                };
+                let conversation_id = storage
+                    .insert_conversation_tree(agent_id, None, &conversation)
+                    .unwrap()
+                    .conversation_id;
+                if first_conversation_id.is_none() {
+                    first_conversation_id = Some(conversation_id);
+                }
+                last_conversation_id = Some(conversation_id);
+                expected.extend(message_specs.into_iter().map(
+                    |(idx, role, author, created_at, content)| {
+                        (
+                            conversation_id,
+                            idx,
+                            match role {
+                                MessageRole::User => "user".to_string(),
+                                MessageRole::Agent => "agent".to_string(),
+                                MessageRole::Tool => "tool".to_string(),
+                                MessageRole::System => "system".to_string(),
+                                MessageRole::Other(other) => other,
+                            },
+                            author,
+                            created_at,
+                            content,
+                        )
+                    },
+                ));
+            };
+
+        for (label, base_ts) in [
+            ("alpha", 1_700_000_000_000_i64),
+            ("beta", 1_700_000_001_000_i64),
+            ("gamma", 1_700_000_002_000_i64),
+            ("delta", 1_700_000_003_000_i64),
+            ("epsilon", 1_700_000_004_000_i64),
+        ] {
+            insert_conversation(
+                claude_agent_id,
+                &format!("lexical-{label}"),
+                &format!("Lexical {label}"),
+                &format!("/tmp/{label}.jsonl"),
+                base_ts,
+                vec![
+                    (
+                        0,
+                        MessageRole::User,
+                        None,
+                        Some(base_ts + 10),
+                        format!("{label}_content"),
+                    ),
+                    (
+                        1,
+                        MessageRole::Agent,
+                        None,
+                        Some(base_ts + 20),
+                        format!("{label}_content_response"),
+                    ),
+                ],
+            );
+        }
+
+        insert_conversation(
+            aider_agent_id,
+            "lexical-aider-history",
+            "Aider Chat: coding_agent_session_search",
+            "/tmp/.aider.chat.history.md",
+            1_764_619_673_394,
+            vec![
+                (
+                    0,
+                    MessageRole::System,
+                    Some("system".to_string()),
+                    None,
+                    "# aider chat started at 2025-12-01 20:07:47".to_string(),
+                ),
+                (
+                    1,
+                    MessageRole::User,
+                    Some("user".to_string()),
+                    None,
+                    "/tmp/workspace/.venv/bin/aider --no-git --message hello world".to_string(),
+                ),
+            ],
+        );
+        insert_conversation(
+            aider_agent_id,
+            "lexical-aider-fixture",
+            "Aider Chat: aider",
+            "/tmp/tests/fixtures/aider/.aider.chat.history.md",
+            1_764_621_401_399,
+            vec![
+                (
+                    0,
+                    MessageRole::User,
+                    Some("user".to_string()),
+                    None,
+                    "/add src/main.rs".to_string(),
+                ),
+                (
+                    1,
+                    MessageRole::Agent,
+                    Some("assistant".to_string()),
+                    None,
+                    "Added src/main.rs to the chat.
+
+#### /add src/main.rs"
+                        .to_string(),
+                ),
+                (
+                    2,
+                    MessageRole::User,
+                    Some("user".to_string()),
+                    None,
+                    "Please refactor.".to_string(),
+                ),
+                (
+                    3,
+                    MessageRole::Agent,
+                    Some("assistant".to_string()),
+                    None,
+                    "Sure, here is the code.".to_string(),
+                ),
+            ],
+        );
+
+        let mut streamed = Vec::new();
+        storage
+            .stream_messages_for_lexical_rebuild_between_conversation_ids(
+                first_conversation_id.unwrap(),
+                last_conversation_id.unwrap(),
+                |row| {
+                    streamed.push((
+                        row.conversation_id,
+                        row.idx,
+                        row.role,
+                        row.author,
+                        row.created_at,
+                        row.content,
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn lexical_rebuild_stream_queries_use_rowid_and_per_conversation_probes() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
@@ -15449,28 +15722,50 @@ mod tests {
                 |row| row.get_typed(0),
             )
             .unwrap();
+        let last_id: i64 = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations ORDER BY id DESC LIMIT 1",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
 
-        let plan_details: Vec<String> = storage
+        let conversation_plan_details: Vec<String> = storage
             .conn
             .query_map_collect(
-                "EXPLAIN QUERY PLAN                  SELECT conversation_id, id, idx, role, author, created_at, content                  FROM messages INDEXED BY idx_messages_conv_idx                  WHERE conversation_id >= ?1                  ORDER BY conversation_id ASC, idx ASC",
+                "EXPLAIN QUERY PLAN                  SELECT id FROM conversations                  WHERE id >= ?1 AND id <= ?2                  ORDER BY id ASC",
+                fparams![first_id, last_id],
+                |row| row.get_typed(3),
+            )
+            .unwrap();
+        assert!(
+            !conversation_plan_details
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE")),
+            "expected streamed lexical rebuild conversation listing to avoid sorter temp b-trees, got {conversation_plan_details:?}"
+        );
+
+        let message_plan_details: Vec<String> = storage
+            .conn
+            .query_map_collect(
+                "EXPLAIN QUERY PLAN                  SELECT id, idx, role, author, created_at, content                  FROM messages INDEXED BY sqlite_autoindex_messages_1                  WHERE conversation_id = ?1                  ORDER BY idx",
                 fparams![first_id],
                 |row| row.get_typed(3),
             )
             .unwrap();
-
         assert!(
-            plan_details.iter().any(|detail| {
-                detail.contains("idx_messages_conv_idx")
-                    || detail.contains("sqlite_autoindex_messages_1")
-            }),
-            "expected streamed lexical rebuild fetch to use the conversation_id/idx index, got {plan_details:?}"
+            message_plan_details
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_messages_1")
+                    || detail.contains("idx_messages_conv_idx")),
+            "expected per-conversation lexical rebuild fetch to use the conversation_id/idx index, got {message_plan_details:?}"
         );
         assert!(
-            !plan_details
+            !message_plan_details
                 .iter()
                 .any(|detail| detail.contains("TEMP B-TREE")),
-            "expected streamed lexical rebuild fetch to avoid sorter temp b-trees, got {plan_details:?}"
+            "expected per-conversation lexical rebuild fetch to avoid sorter temp b-trees, got {message_plan_details:?}"
         );
     }
 
@@ -15532,6 +15827,29 @@ mod tests {
         assert_eq!(ordered_paths, vec![smaller_healthy, larger_corrupt]);
         assert!(bundles[0].supports_direct_readonly);
         assert!(!bundles[1].supports_direct_readonly);
+    }
+
+    #[test]
+    fn salvage_historical_databases_skips_unreadable_quarantined_bundles() {
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+
+        let quarantined = dir.path().join("agent_search.corrupt.20260324_212907");
+        fs::write(&quarantined, b"not a sqlite database").unwrap();
+
+        let discovered: Vec<PathBuf> = discover_historical_database_bundles(&canonical_db)
+            .into_iter()
+            .map(|bundle| bundle.root_path)
+            .collect();
+        assert_eq!(discovered, vec![quarantined]);
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(outcome.bundles_considered, 1);
+        assert_eq!(outcome.bundles_imported, 0);
+        assert_eq!(outcome.conversations_imported, 0);
+        assert_eq!(outcome.messages_imported, 0);
+        assert!(storage.list_conversations(10, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -16064,7 +16382,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_conversation_tree_blank_local_source_stays_local() {
+    fn insert_conversation_tree_blank_local_source_normalizes_to_local_id() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -16108,16 +16426,22 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap();
 
+        assert!(storage.get_source("   ").unwrap().is_none());
         let source = storage
-            .get_source("   ")
+            .get_source(LOCAL_SOURCE_ID)
             .unwrap()
-            .expect("blank source row should exist");
+            .expect("local source row should exist");
         assert_eq!(source.kind, SourceKind::Local);
         assert_eq!(source.host_label, None);
+
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_id, LOCAL_SOURCE_ID);
+        assert_eq!(conversations[0].origin_host, None);
     }
 
     #[test]
-    fn insert_conversation_tree_blank_remote_source_stays_remote() {
+    fn insert_conversation_tree_blank_remote_source_normalizes_to_origin_host() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -16161,12 +16485,83 @@ mod tests {
             .insert_conversation_tree(agent_id, None, &conversation)
             .unwrap();
 
+        assert!(storage.get_source("   ").unwrap().is_none());
         let source = storage
-            .get_source("   ")
+            .get_source("user@work-laptop")
             .unwrap()
-            .expect("blank source row should exist");
+            .expect("normalized remote source row should exist");
         assert_eq!(source.kind, SourceKind::Ssh);
         assert_eq!(source.host_label.as_deref(), Some("user@work-laptop"));
+
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_id, "user@work-laptop");
+        assert_eq!(
+            conversations[0].origin_host.as_deref(),
+            Some("user@work-laptop")
+        );
+    }
+
+    #[test]
+    fn insert_conversations_batched_normalizes_host_only_remote_source_id() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("batched-blank-remote-source".into()),
+            title: Some("Batched blank remote source".into()),
+            source_path: dir.path().join("batched-blank-remote.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_001),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "   ".into(),
+            origin_host: Some("user@batch-host".into()),
+        };
+
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        assert!(storage.get_source("   ").unwrap().is_none());
+        let source = storage
+            .get_source("user@batch-host")
+            .unwrap()
+            .expect("normalized batched remote source row should exist");
+        assert_eq!(source.kind, SourceKind::Ssh);
+        assert_eq!(source.host_label.as_deref(), Some("user@batch-host"));
+
+        let conversations = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].source_id, "user@batch-host");
+        assert_eq!(
+            conversations[0].origin_host.as_deref(),
+            Some("user@batch-host")
+        );
     }
 
     #[test]

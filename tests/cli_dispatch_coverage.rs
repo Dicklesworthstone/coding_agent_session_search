@@ -57,6 +57,31 @@ fn simple_cmd() -> Command {
     cmd
 }
 
+fn run_on_large_stack<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name("cass-cli-dispatch-parse-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack test thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn parse_cli_ok<const N: usize>(
+    args: [&'static str; N],
+    context: &'static str,
+) -> coding_agent_search::Cli {
+    run_on_large_stack(move || {
+        <coding_agent_search::Cli as clap::Parser>::try_parse_from(args).expect(context)
+    })
+}
+
 fn sample_agent(slug: &str, name: &str) -> Agent {
     Agent {
         id: None,
@@ -1424,12 +1449,11 @@ fn missing_required_arg_returns_error() {
 // Clap parsing tests for new commands
 // =============================================================================
 
-use clap::Parser;
-use coding_agent_search::{AnalyticsBucketing, AnalyticsCommand, Cli, Commands};
+use coding_agent_search::{AnalyticsBucketing, AnalyticsCommand, Commands};
 
 #[test]
 fn parse_completions_bash() {
-    let cli = Cli::try_parse_from(["cass", "completions", "bash"]).expect("parse completions bash");
+    let cli = parse_cli_ok(["cass", "completions", "bash"], "parse completions bash");
     match cli.command {
         Some(Commands::Completions { shell }) => {
             assert_eq!(shell, clap_complete::Shell::Bash);
@@ -1440,8 +1464,10 @@ fn parse_completions_bash() {
 
 #[test]
 fn parse_health_with_stale_threshold() {
-    let cli = Cli::try_parse_from(["cass", "health", "--stale-threshold", "600"])
-        .expect("parse health with threshold");
+    let cli = parse_cli_ok(
+        ["cass", "health", "--stale-threshold", "600"],
+        "parse health with threshold",
+    );
     match cli.command {
         Some(Commands::Health {
             stale_threshold, ..
@@ -1454,8 +1480,10 @@ fn parse_health_with_stale_threshold() {
 
 #[test]
 fn parse_doctor_with_fix() {
-    let cli = Cli::try_parse_from(["cass", "doctor", "--fix", "--verbose"])
-        .expect("parse doctor with fix");
+    let cli = parse_cli_ok(
+        ["cass", "doctor", "--fix", "--verbose"],
+        "parse doctor with fix",
+    );
     match cli.command {
         Some(Commands::Doctor { fix, verbose, .. }) => {
             assert!(fix, "fix should be true");
@@ -1467,15 +1495,17 @@ fn parse_doctor_with_fix() {
 
 #[test]
 fn parse_timeline_with_filters() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "timeline",
-        "--since",
-        "2024-01-01",
-        "--agent",
-        "claude",
-    ])
-    .expect("parse timeline with filters");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "timeline",
+            "--since",
+            "2024-01-01",
+            "--agent",
+            "claude",
+        ],
+        "parse timeline with filters",
+    );
     match cli.command {
         Some(Commands::Timeline { since, agent, .. }) => {
             assert_eq!(since, Some("2024-01-01".to_string()));
@@ -1487,16 +1517,18 @@ fn parse_timeline_with_filters() {
 
 #[test]
 fn parse_expand_with_context() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "expand",
-        "/path/to/session.jsonl",
-        "--line",
-        "100",
-        "-C",
-        "5",
-    ])
-    .expect("parse expand with context");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "expand",
+            "/path/to/session.jsonl",
+            "--line",
+            "100",
+            "-C",
+            "5",
+        ],
+        "parse expand with context",
+    );
     match cli.command {
         Some(Commands::Expand {
             path,
@@ -1514,8 +1546,10 @@ fn parse_expand_with_context() {
 
 #[test]
 fn parse_context_with_limit() {
-    let cli = Cli::try_parse_from(["cass", "context", "/path/to/session.jsonl", "--limit", "10"])
-        .expect("parse context with limit");
+    let cli = parse_cli_ok(
+        ["cass", "context", "/path/to/session.jsonl", "--limit", "10"],
+        "parse context with limit",
+    );
     match cli.command {
         Some(Commands::Context { path, limit, .. }) => {
             assert_eq!(path.to_str().unwrap(), "/path/to/session.jsonl");
@@ -1527,16 +1561,18 @@ fn parse_context_with_limit() {
 
 #[test]
 fn parse_sessions_with_workspace_and_limit() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "sessions",
-        "--workspace",
-        "/path/to/project",
-        "--limit",
-        "3",
-        "--json",
-    ])
-    .expect("parse sessions with workspace and limit");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "sessions",
+            "--workspace",
+            "/path/to/project",
+            "--limit",
+            "3",
+            "--json",
+        ],
+        "parse sessions with workspace and limit",
+    );
     match cli.command {
         Some(Commands::Sessions {
             workspace,
@@ -2174,14 +2210,16 @@ fn sessions_current_prefers_closest_workspace_over_newer_parent_workspace() {
 
 #[test]
 fn parse_export_with_format() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "export",
-        "/path/to/session.jsonl",
-        "--format",
-        "json",
-    ])
-    .expect("parse export with format");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "export",
+            "/path/to/session.jsonl",
+            "--format",
+            "json",
+        ],
+        "parse export with format",
+    );
     match cli.command {
         Some(Commands::Export { path, format, .. }) => {
             assert_eq!(path.to_str().unwrap(), "/path/to/session.jsonl");
@@ -2193,14 +2231,16 @@ fn parse_export_with_format() {
 
 #[test]
 fn parse_export_html_with_encrypt() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "export-html",
-        "/path/to/session.jsonl",
-        "--encrypt",
-        "--password-stdin",
-    ])
-    .expect("parse export-html with encrypt");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "export-html",
+            "/path/to/session.jsonl",
+            "--encrypt",
+            "--password-stdin",
+        ],
+        "parse export-html with encrypt",
+    );
     match cli.command {
         Some(Commands::ExportHtml {
             session,
@@ -2414,31 +2454,33 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
 
 #[test]
 fn parse_analytics_tokens_with_shared_flags() {
-    let cli = Cli::try_parse_from([
-        "cass",
-        "analytics",
-        "tokens",
-        "--group-by",
-        "week",
-        "--since",
-        "2026-01-01",
-        "--until",
-        "2026-01-31",
-        "--days",
-        "7",
-        "--agent",
-        "claude",
-        "--agent",
-        "codex",
-        "--workspace",
-        "/tmp/ws-a",
-        "--workspace",
-        "/tmp/ws-b",
-        "--source",
-        "remote",
-        "--json",
-    ])
-    .expect("parse analytics tokens with shared flags");
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "analytics",
+            "tokens",
+            "--group-by",
+            "week",
+            "--since",
+            "2026-01-01",
+            "--until",
+            "2026-01-31",
+            "--days",
+            "7",
+            "--agent",
+            "claude",
+            "--agent",
+            "codex",
+            "--workspace",
+            "/tmp/ws-a",
+            "--workspace",
+            "/tmp/ws-b",
+            "--source",
+            "remote",
+            "--json",
+        ],
+        "parse analytics tokens with shared flags",
+    );
 
     match cli.command {
         Some(Commands::Analytics(AnalyticsCommand::Tokens { common, group_by })) => {
@@ -2457,8 +2499,10 @@ fn parse_analytics_tokens_with_shared_flags() {
 
 #[test]
 fn parse_analytics_models_subcommand_name_maps_to_variant() {
-    let cli = Cli::try_parse_from(["cass", "analytics", "models", "--group-by", "day", "--json"])
-        .expect("parse analytics models");
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "models", "--group-by", "day", "--json"],
+        "parse analytics models",
+    );
     match cli.command {
         Some(Commands::Analytics(AnalyticsCommand::AnalyticsModels { common, group_by })) => {
             assert_eq!(group_by, AnalyticsBucketing::Day);
@@ -3179,11 +3223,10 @@ fn analytics_rebuild_help_shows_force_flag() {
 
 #[test]
 fn analytics_rebuild_parses_force_and_json_flags() {
-    use clap::Parser;
-    use coding_agent_search::{AnalyticsCommand, Cli, Commands};
-
-    let cli = Cli::try_parse_from(["cass", "analytics", "rebuild", "--force", "--json"])
-        .expect("parse analytics rebuild with force+json");
+    let cli = parse_cli_ok(
+        ["cass", "analytics", "rebuild", "--force", "--json"],
+        "parse analytics rebuild with force+json",
+    );
 
     match cli.command {
         Some(Commands::Analytics(AnalyticsCommand::Rebuild { common, force })) => {

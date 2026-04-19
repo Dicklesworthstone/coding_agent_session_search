@@ -27,15 +27,15 @@ pub(crate) fn normalized_index_source_id(
         return trimmed_source_id.to_string();
     }
 
+    let trimmed_origin_host = origin_host.map(str::trim).filter(|value| !value.is_empty());
     let trimmed_origin_kind = origin_kind.unwrap_or_default().trim();
     if trimmed_origin_kind.eq_ignore_ascii_case("ssh")
         || trimmed_origin_kind.eq_ignore_ascii_case("remote")
     {
-        return origin_host
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("remote")
-            .to_string();
+        return trimmed_origin_host.unwrap_or("remote").to_string();
+    }
+    if let Some(origin_host) = trimmed_origin_host {
+        return origin_host.to_string();
     }
 
     LOCAL_SOURCE_ID.to_string()
@@ -610,6 +610,13 @@ mod tests {
         reader.reload().expect("reload");
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), expected_docs as u64);
+    }
+
+    #[test]
+    fn normalized_index_source_id_infers_remote_from_origin_host_without_kind() {
+        let source_id = normalized_index_source_id(Some("   "), None, Some("dev@laptop"));
+        assert_eq!(source_id, "dev@laptop");
+        assert_eq!(normalized_index_origin_kind(&source_id, None), "remote");
     }
 
     #[test]

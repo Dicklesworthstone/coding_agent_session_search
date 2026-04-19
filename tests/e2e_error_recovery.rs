@@ -27,8 +27,8 @@ use tempfile::TempDir;
 #[path = "util/mod.rs"]
 mod util;
 
-use util::ConversationFixtureBuilder;
 use util::e2e_log::PhaseTracker;
+use util::{ConversationFixtureBuilder, EnvGuard};
 
 // =============================================================================
 // E2E Logger Support
@@ -251,17 +251,30 @@ fn test_corrupted_index_triggers_rebuild() {
     let data_dir = temp.path().to_path_buf();
     let db_path = data_dir.join("agent_search.db");
     let index_dir = data_dir.join("tantivy_index");
+    let home_dir = data_dir.join("home");
+    let xdg_data = data_dir.join("xdg-data");
+    let xdg_config = data_dir.join("xdg-config");
+    fs::create_dir_all(&home_dir).expect("create temp home");
+    fs::create_dir_all(&xdg_data).expect("create temp xdg data");
+    fs::create_dir_all(&xdg_config).expect("create temp xdg config");
+    let codex_home = data_dir.join(".codex");
+    fs::create_dir_all(&codex_home).expect("create temp codex home");
+    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
+    let _guard_xdg_data = EnvGuard::set("XDG_DATA_HOME", xdg_data.to_string_lossy());
+    let _guard_xdg_config = EnvGuard::set("XDG_CONFIG_HOME", xdg_config.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    let _guard_ignore_sources = EnvGuard::set("CASS_IGNORE_SOURCES_CONFIG", "1");
 
-    // Phase 1: Create database and fixtures
+    // Phase 1: Create database and fixture tree inside the isolated sandbox.
     let start = tracker.start(
         "create_fixtures",
-        Some("Create test database and session files"),
+        Some("Create isolated test database and session files"),
     );
     create_test_database(&db_path, 3).expect("create db");
-    create_connector_fixtures(&data_dir, 3).expect("create fixtures");
+    create_connector_fixtures(&home_dir, 3).expect("create fixtures");
     tracker.end(
         "create_fixtures",
-        Some("Create test database and session files"),
+        Some("Create isolated test database and session files"),
         start,
     );
 

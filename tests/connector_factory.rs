@@ -1,5 +1,5 @@
 use coding_agent_search::connectors::factory::FactoryConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -15,6 +15,14 @@ fn write_jsonl(dir: &Path, rel_path: &str, lines: &[&str]) -> std::path::PathBuf
     }
     fs::write(&path, lines.join("\n")).unwrap();
     path
+}
+
+fn explicit_scan_ctx(root: &Path, since_ts: Option<i64>) -> ScanContext {
+    ScanContext::with_roots(
+        std::path::PathBuf::new(),
+        vec![ScanRoot::local(root.to_path_buf())],
+        since_ts,
+    )
 }
 
 // ============================================================================
@@ -50,7 +58,7 @@ fn scan_parses_basic_session() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
@@ -89,7 +97,7 @@ fn scan_multiple_sessions() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 2);
@@ -122,7 +130,7 @@ fn scan_infers_title_from_first_user_message() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
@@ -140,7 +148,7 @@ fn scan_empty_dir_returns_empty() {
     fs::create_dir_all(&root).unwrap();
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
@@ -163,7 +171,7 @@ fn scan_skips_invalid_jsonl_lines() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
@@ -189,7 +197,7 @@ fn scan_skips_empty_content_messages() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
@@ -211,7 +219,7 @@ fn scan_skips_session_with_no_messages() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
@@ -239,7 +247,7 @@ fn scan_skips_settings_json() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     // Should only pick up the .jsonl, not the .settings.json
@@ -268,7 +276,7 @@ fn scan_preserves_message_ordering() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs[0].messages[0].idx, 0);
@@ -300,7 +308,7 @@ fn scan_respects_since_ts() {
 
     let connector = FactoryConnector::new();
     let far_future = chrono::Utc::now().timestamp_millis() + 86_400_000;
-    let ctx = ScanContext::local_default(root, Some(far_future));
+    let ctx = explicit_scan_ctx(&root, Some(far_future));
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
@@ -325,7 +333,7 @@ fn scan_extracts_workspace_from_session_start() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
@@ -358,7 +366,7 @@ fn scan_extracts_model_as_author() {
     );
 
     let connector = FactoryConnector::new();
-    let ctx = ScanContext::local_default(root, None);
+    let ctx = explicit_scan_ctx(&root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs[0].messages[0].author.as_deref(), Some("gpt-4o"));

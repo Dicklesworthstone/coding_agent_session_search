@@ -10,6 +10,26 @@ use tempfile::TempDir;
 mod util;
 use util::EnvGuard;
 
+fn run_on_large_stack<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name("cass-cli-index-parse-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack test thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn parse_cli_ok<const N: usize>(args: [&'static str; N], context: &'static str) -> Cli {
+    run_on_large_stack(move || <Cli as Parser>::try_parse_from(args).expect(context))
+}
+
 fn base_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
@@ -38,8 +58,10 @@ fn index_help_prints_usage() {
 
 #[test]
 fn index_parses_semantic_flags() {
-    let cli = Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"])
-        .expect("parse index flags");
+    let cli = parse_cli_ok(
+        ["cass", "index", "--semantic", "--embedder", "fastembed"],
+        "parse index flags",
+    );
 
     match cli.command {
         Some(Commands::Index {
@@ -54,7 +76,7 @@ fn index_parses_semantic_flags() {
 
 #[test]
 fn index_default_embedder_is_fastembed() {
-    let cli = Cli::try_parse_from(["cass", "index", "--semantic"]).expect("parse index flags");
+    let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {

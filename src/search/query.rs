@@ -59,6 +59,13 @@ use frankensqlite::params;
 /// transfer safe.
 struct SendConnection(Connection);
 
+type TantivyContentExactKey = (i64, i64);
+type TantivyContentFallbackKey = (String, String, i64);
+type TantivyHydratedContentMaps = (
+    HashMap<TantivyContentExactKey, String>,
+    HashMap<TantivyContentFallbackKey, String>,
+);
+
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
 unsafe impl Send for SendConnection {}
@@ -1133,11 +1140,27 @@ struct SearchHitKey {
     content_hash: u64,
 }
 
-fn normalized_search_source_id_sql_expr(column: &str) -> String {
+fn normalized_search_source_id_sql_expr(
+    source_id_column: &str,
+    origin_kind_column: &str,
+    origin_host_column: &str,
+) -> String {
     format!(
-        "CASE WHEN TRIM(COALESCE({column}, '')) = '' THEN '{local}' \
-         WHEN LOWER(TRIM(COALESCE({column}, ''))) = '{local}' THEN '{local}' \
-         ELSE TRIM(COALESCE({column}, '')) END",
+        "CASE \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN \
+                CASE \
+                    WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+                    ELSE TRIM(COALESCE({source_id_column}, '')) \
+                END \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) IN ('ssh', 'remote') THEN \
+                CASE \
+                    WHEN TRIM(COALESCE({origin_host_column}, '')) = '' THEN 'remote' \
+                    ELSE TRIM(COALESCE({origin_host_column}, '')) \
+                END \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN TRIM(COALESCE({origin_host_column}, '')) \
+            ELSE '{local}' \
+         END",
         local = crate::sources::provenance::LOCAL_SOURCE_ID,
     )
 }
@@ -1164,15 +1187,15 @@ fn normalized_search_hit_source_id_parts(
         return trimmed_source_id.to_string();
     }
 
+    let trimmed_origin_host = origin_host.map(str::trim).filter(|value| !value.is_empty());
     let trimmed_origin_kind = origin_kind.trim();
     if trimmed_origin_kind.eq_ignore_ascii_case("ssh")
         || trimmed_origin_kind.eq_ignore_ascii_case("remote")
     {
-        return origin_host
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("remote")
-            .to_string();
+        return trimmed_origin_host.unwrap_or("remote").to_string();
+    }
+    if let Some(origin_host) = trimmed_origin_host {
+        return origin_host.to_string();
     }
 
     crate::sources::provenance::LOCAL_SOURCE_ID.to_string()
@@ -3674,7 +3697,8 @@ impl SearchClient {
             .ok_or_else(|| anyhow!("progressive search requires database connection"))?;
 
         let mut resolved_by_key = HashMap::new();
-        let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
 
         const CHUNK_SIZE: usize = 300;
         for chunk in exact_query_keys.chunks(CHUNK_SIZE) {
@@ -3684,6 +3708,7 @@ impl SearchClient {
                 ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE ",
             );
             let mut params = Vec::with_capacity(chunk.len().saturating_mul(2));
@@ -3771,6 +3796,7 @@ impl SearchClient {
                 ", c.source_path, m.idx, m.id, c.agent_id, c.workspace_id, m.role, m.created_at, m.content, c.title
                  FROM messages m
                  JOIN conversations c ON m.conversation_id = c.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE ",
             );
             let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
@@ -3940,7 +3966,8 @@ impl SearchClient {
         } else {
             "''"
         };
-        let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         // LEFT JOIN + COALESCE on agents so search hits for conversations
         // with NULL agent_id (legacy V1 schema) still surface instead of
         // being silently dropped from results.  Consistent with the fts/
@@ -4857,6 +4884,115 @@ impl SearchClient {
         *guard = Some(generation);
     }
 
+    fn hydrate_tantivy_hit_contents(
+        &self,
+        exact_keys: &[TantivyContentExactKey],
+        fallback_keys: &[TantivyContentFallbackKey],
+    ) -> Result<TantivyHydratedContentMaps> {
+        if exact_keys.is_empty() && fallback_keys.is_empty() {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
+
+        let sqlite_guard = match self.sqlite_guard() {
+            Ok(guard) => guard,
+            Err(_) => return Ok((HashMap::new(), HashMap::new())),
+        };
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return Ok((HashMap::new(), HashMap::new()));
+        };
+
+        let mut hydrated_exact = HashMap::new();
+        let mut hydrated_fallback = HashMap::new();
+        const CHUNK_SIZE: usize = 300;
+
+        if !exact_keys.is_empty() {
+            let mut unique_exact_keys = Vec::with_capacity(exact_keys.len());
+            let mut seen = HashSet::with_capacity(exact_keys.len());
+            for key in exact_keys {
+                if seen.insert(*key) {
+                    unique_exact_keys.push(*key);
+                }
+            }
+
+            for chunk in unique_exact_keys.chunks(CHUNK_SIZE) {
+                let mut sql = String::from(
+                    "SELECT c.id, m.idx, m.content
+                     FROM messages m
+                     JOIN conversations c ON m.conversation_id = c.id
+                     WHERE ",
+                );
+                let mut params = Vec::with_capacity(chunk.len().saturating_mul(2));
+                for (idx, (conversation_id, line_idx)) in chunk.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(" OR ");
+                    }
+                    sql.push_str("(c.id = ? AND m.idx = ?)");
+                    params.push(ParamValue::from(*conversation_id));
+                    params.push(ParamValue::from(*line_idx));
+                }
+
+                let rows: Vec<(i64, i64, String)> =
+                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                    })?;
+
+                for (conversation_id, line_idx, content) in rows {
+                    hydrated_exact.insert((conversation_id, line_idx), content);
+                }
+            }
+        }
+
+        if !fallback_keys.is_empty() {
+            let normalized_source_sql =
+                normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+            let mut unique_fallback_keys = Vec::with_capacity(fallback_keys.len());
+            let mut seen = HashSet::with_capacity(fallback_keys.len());
+            for key in fallback_keys {
+                if seen.insert(key.clone()) {
+                    unique_fallback_keys.push(key.clone());
+                }
+            }
+
+            for chunk in unique_fallback_keys.chunks(CHUNK_SIZE) {
+                let mut sql = format!(
+                    "SELECT {normalized_source_sql}, c.source_path, m.idx, m.content
+                     FROM messages m
+                     JOIN conversations c ON m.conversation_id = c.id
+                     LEFT JOIN sources s ON c.source_id = s.id
+                     WHERE "
+                );
+                let mut params = Vec::with_capacity(chunk.len().saturating_mul(3));
+                for (idx, (source_id, source_path, line_idx)) in chunk.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(" OR ");
+                    }
+                    sql.push_str(&format!(
+                        "({normalized_source_sql} = ? AND c.source_path = ? AND m.idx = ?)"
+                    ));
+                    params.push(ParamValue::from(source_id.clone()));
+                    params.push(ParamValue::from(source_path.clone()));
+                    params.push(ParamValue::from(*line_idx));
+                }
+
+                let rows: Vec<(String, String, i64, String)> =
+                    franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    })?;
+
+                for (source_id, source_path, line_idx, content) in rows {
+                    hydrated_fallback.insert((source_id, source_path, line_idx), content);
+                }
+            }
+        }
+
+        Ok((hydrated_exact, hydrated_fallback))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search_tantivy(
         &self,
@@ -4869,11 +5005,30 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        struct PendingTantivyHit {
+            score: f32,
+            doc: TantivyDocument,
+            title: String,
+            stored_content: String,
+            stored_preview: String,
+            agent: String,
+            source_path: String,
+            workspace: String,
+            workspace_original: Option<String>,
+            created_at: Option<i64>,
+            line_number: Option<usize>,
+            source_id: String,
+            conversation_id: Option<i64>,
+            raw_origin_kind: Option<String>,
+            origin_host: Option<String>,
+        }
+
         self.maybe_reload_reader(reader)?;
         let searcher = self.searcher_for_thread(reader);
         self.track_generation(searcher.generation().generation_id());
 
-        let needs_content = field_mask.needs_content() || field_mask.wants_snippet();
+        let wants_snippet = field_mask.wants_snippet();
+        let needs_content = field_mask.needs_content() || wants_snippet;
 
         // Delegate cass-compatible query parsing + Tantivy clause construction to frankensearch.
         // cass retains ownership of paging/fallback orchestration and stored-field hydration.
@@ -4897,7 +5052,7 @@ impl SearchClient {
         let q: Box<dyn Query> = fs_cass_build_tantivy_query(raw_query, &fs_filters, fields);
 
         let prefix_only = is_prefix_only(sanitized_query);
-        let snippet_generator = if prefix_only || !field_mask.wants_snippet() {
+        let snippet_generator = if prefix_only || !wants_snippet {
             None
         } else {
             let snippet_cfg = FsSnippetConfig {
@@ -4910,17 +5065,14 @@ impl SearchClient {
 
         let top_docs = fs_execute_query_with_offset(&searcher, &*q, limit, offset)?;
         let tantivy_total_count = top_docs.total_count;
-        // Compute match type once for all results (not per-hit)
         let query_match_type = dominant_match_type(sanitized_query);
-        let mut hits = Vec::new();
+        let mut pending_hits = Vec::with_capacity(top_docs.hits.len());
+        let mut missing_exact_content_keys = Vec::new();
+        let mut missing_fallback_content_keys = Vec::new();
+
         for ranked_hit in top_docs.hits {
             let score = ranked_hit.bm25_score;
             let doc: TantivyDocument = fs_load_doc(&searcher, ranked_hit.doc_address)?;
-            let raw_content = doc
-                .get_first(fields.content)
-                .or_else(|| doc.get_first(fields.preview))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
             let title = if field_mask.wants_title() {
                 doc.get_first(fields.title)
                     .and_then(|v| v.as_str())
@@ -4929,31 +5081,18 @@ impl SearchClient {
             } else {
                 String::new()
             };
-            let content = if needs_content {
-                raw_content.to_string()
-            } else {
-                String::new()
-            };
-            let agent = doc
-                .get_first(fields.agent)
+            let stored_content = doc
+                .get_first(fields.content)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let snippet = if field_mask.wants_snippet() {
-                if let Some(r#gen) = &snippet_generator {
-                    fs_render_snippet_html(r#gen, &doc, "<b>", "</b>")
-                        .map(|html| html.replace("<b>", "**").replace("</b>", "**"))
-                        .unwrap_or_default()
-                } else if let Some(sn) = cached_prefix_snippet(&content, sanitized_query, 160) {
-                    sn
-                } else {
-                    quick_prefix_snippet(&content, sanitized_query, 160)
-                }
-            } else {
-                String::new()
-            };
-            let source = doc
-                .get_first(fields.source_path)
+            let stored_preview = doc
+                .get_first(fields.preview)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let agent = doc
+                .get_first(fields.agent)
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -4962,7 +5101,6 @@ impl SearchClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            // workspace_original: pre-rewrite path (P6.2)
             let workspace_original = doc
                 .get_first(fields.workspace_original)
                 .and_then(|v| v.as_str())
@@ -4974,55 +5112,169 @@ impl SearchClient {
                 .and_then(|v| v.as_u64())
                 .and_then(|i| usize::try_from(i).ok())
                 .map(|i| i.saturating_add(1));
-            let hash_basis = if content.is_empty() {
-                raw_content
-            } else {
-                content.as_str()
-            };
-            let content_hash = stable_hit_hash(hash_basis, &source, line_number, created_at);
-            // Provenance fields (P3.3)
             let raw_source_id = doc
                 .get_first(fields.source_id)
                 .and_then(|v| v.as_str())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
             let conversation_id = fields
                 .conversation_id
                 .and_then(|field| doc.get_first(field))
                 .and_then(|v| v.as_i64());
-            let raw_origin_kind = doc.get_first(fields.origin_kind).and_then(|v| v.as_str());
+            let source_path = doc
+                .get_first(fields.source_path)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw_origin_kind = doc
+                .get_first(fields.origin_kind)
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let origin_host = doc
                 .get_first(fields.origin_host)
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
             let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id,
-                raw_origin_kind.unwrap_or_default(),
+                raw_source_id.as_str(),
+                raw_origin_kind.as_deref().unwrap_or_default(),
                 origin_host.as_deref(),
             );
-            let origin_kind =
-                normalized_search_hit_origin_kind(&source_id, raw_origin_kind).to_string();
-            hits.push(SearchHit {
-                title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id,
+
+            if needs_content
+                && let Some(line_idx) = line_number
+                    .and_then(|line| line.checked_sub(1))
+                    .and_then(|line| i64::try_from(line).ok())
+                && stored_content.is_empty()
+            {
+                if let Some(conversation_id) = conversation_id {
+                    missing_exact_content_keys.push((conversation_id, line_idx));
+                } else {
+                    missing_fallback_content_keys.push((
+                        source_id.clone(),
+                        source_path.clone(),
+                        line_idx,
+                    ));
+                }
+            }
+
+            pending_hits.push(PendingTantivyHit {
                 score,
-                source_path: source,
+                doc,
+                title,
+                stored_content,
+                stored_preview,
                 agent,
+                source_path,
                 workspace,
                 workspace_original,
                 created_at,
                 line_number,
-                match_type: query_match_type,
                 source_id,
-                origin_kind,
+                conversation_id,
+                raw_origin_kind,
                 origin_host,
             });
         }
-        // Store the true total from Tantivy's Count collector so
-        // search_with_fallback can report it as total_matches.
+
+        let (hydrated_contents, hydrated_fallback_contents) = if needs_content
+            && (!missing_exact_content_keys.is_empty() || !missing_fallback_content_keys.is_empty())
+        {
+            self.hydrate_tantivy_hit_contents(
+                &missing_exact_content_keys,
+                &missing_fallback_content_keys,
+            )?
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+        let mut hits = Vec::with_capacity(pending_hits.len());
+        for pending in pending_hits {
+            let hydrated_content = pending
+                .line_number
+                .and_then(|line| line.checked_sub(1))
+                .and_then(|line| i64::try_from(line).ok())
+                .and_then(|line_idx| {
+                    if let Some(conversation_id) = pending.conversation_id {
+                        hydrated_contents.get(&(conversation_id, line_idx)).cloned()
+                    } else {
+                        hydrated_fallback_contents
+                            .get(&(
+                                pending.source_id.clone(),
+                                pending.source_path.clone(),
+                                line_idx,
+                            ))
+                            .cloned()
+                    }
+                });
+            let effective_content = if !pending.stored_content.is_empty() {
+                pending.stored_content.clone()
+            } else if let Some(content) = hydrated_content {
+                content
+            } else {
+                pending.stored_preview.clone()
+            };
+            let snippet = if wants_snippet {
+                if let Some(r#gen) = &snippet_generator {
+                    let rendered = if !pending.stored_content.is_empty() {
+                        fs_render_snippet_html(r#gen, &pending.doc, "<b>", "</b>")
+                    } else if !effective_content.is_empty() {
+                        let mut snippet_doc = TantivyDocument::new();
+                        snippet_doc.add_text(fields.content, &effective_content);
+                        fs_render_snippet_html(r#gen, &snippet_doc, "<b>", "</b>")
+                    } else {
+                        None
+                    };
+                    rendered
+                        .map(|html| html.replace("<b>", "**").replace("</b>", "**"))
+                        .or_else(|| cached_prefix_snippet(&effective_content, sanitized_query, 160))
+                        .unwrap_or_else(|| {
+                            quick_prefix_snippet(&effective_content, sanitized_query, 160)
+                        })
+                } else if let Some(sn) =
+                    cached_prefix_snippet(&effective_content, sanitized_query, 160)
+                {
+                    sn
+                } else {
+                    quick_prefix_snippet(&effective_content, sanitized_query, 160)
+                }
+            } else {
+                String::new()
+            };
+            let content = if field_mask.needs_content() {
+                effective_content.clone()
+            } else {
+                String::new()
+            };
+            let content_hash = stable_hit_hash(
+                &effective_content,
+                &pending.source_path,
+                pending.line_number,
+                pending.created_at,
+            );
+            let origin_kind = normalized_search_hit_origin_kind(
+                &pending.source_id,
+                pending.raw_origin_kind.as_deref(),
+            )
+            .to_string();
+            hits.push(SearchHit {
+                title: pending.title,
+                snippet,
+                content,
+                content_hash,
+                conversation_id: pending.conversation_id,
+                score: pending.score,
+                source_path: pending.source_path,
+                agent: pending.agent,
+                workspace: pending.workspace,
+                workspace_original: pending.workspace_original,
+                created_at: pending.created_at,
+                line_number: pending.line_number,
+                match_type: query_match_type,
+                source_id: pending.source_id,
+                origin_kind,
+                origin_host: pending.origin_host,
+            });
+        }
         if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
             *tc = Some(tantivy_total_count);
         }
@@ -5104,7 +5356,8 @@ impl SearchClient {
         } else {
             "''"
         };
-        let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
         let mut sql = format!(
             "SELECT {title_expr},
@@ -5117,7 +5370,7 @@ impl SearchClient {
                     c.id,
                     {normalized_source_sql},
                     c.origin_host,
-                    COALESCE(s.kind, 'local'),
+                    s.kind,
                     bm25(fts_messages)
              FROM fts_messages
              LEFT JOIN messages m ON {message_join}
@@ -5299,7 +5552,8 @@ impl SearchClient {
         // by degrading to 'unknown' consistently with e1c08e7c / 8a0c547c.
         // The agent filter below becomes an EXISTS guard instead of a slug
         // equality on the joined column.
-        let normalized_source_sql = normalized_search_source_id_sql_expr("c.source_id");
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         let mut sql = format!(
             "SELECT c.id, {title_expr}, m.content, \
                  COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'), \
@@ -9164,6 +9418,112 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
+    {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                content='',
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'remote title', '/tmp/remote-filter.jsonl')",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(1, 1, 0, 'remote filter proof', 42)",
+        )?;
+        conn.execute_compat(
+            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            params![
+                1_i64,
+                "remote filter proof",
+                "remote title",
+                "codex",
+                "/tmp/remote-filter.jsonl",
+                42_i64
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let remote_hits = client.search(
+            "remote",
+            SearchFilters {
+                source_filter: SourceFilter::Remote,
+                ..Default::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(remote_hits.len(), 1);
+        assert_eq!(remote_hits[0].source_id, "dev@laptop");
+        assert_eq!(remote_hits[0].origin_kind, "remote");
+        assert_eq!(remote_hits[0].origin_host.as_deref(), Some("dev@laptop"));
+
+        let source_hits = client.search(
+            "remote",
+            SearchFilters {
+                source_filter: SourceFilter::SourceId("dev@laptop".into()),
+                ..Default::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(source_hits.len(), 1);
+        assert_eq!(source_hits[0].source_id, "dev@laptop");
+        assert_eq!(source_hits[0].origin_kind, "remote");
+
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
@@ -9587,6 +9947,7 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent_id INTEGER NOT NULL,
@@ -9788,6 +10149,7 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent_id INTEGER NOT NULL,
@@ -9893,6 +10255,7 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent_id INTEGER NOT NULL,
@@ -9974,6 +10337,7 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent_id INTEGER NOT NULL,
@@ -10055,6 +10419,7 @@ mod tests {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent_id INTEGER NOT NULL,
@@ -10121,6 +10486,89 @@ mod tests {
             source_id: "   ".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            conversation_id: None,
+        };
+
+        let resolved = client.resolve_semantic_doc_ids_for_hits(&[hit])?;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].as_ref().map(|doc| doc.message_id), Some(11));
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
+    -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                role TEXT,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );",
+        )?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
+             VALUES(1, 1, NULL, '   ', 'dev@laptop', 'Legacy Remote', '/tmp/legacy-remote.jsonl')",
+        )?;
+        let content = "legacy remote semantic message".to_string();
+        conn.execute_with_params(
+            "INSERT INTO messages(id, conversation_id, idx, role, content, created_at)
+             VALUES(?1, 1, 0, 'assistant', ?2, 100)",
+            &[
+                fsqlite_types::value::SqliteValue::Integer(11),
+                fsqlite_types::value::SqliteValue::Text(content.clone().into()),
+            ],
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let hit = SearchHit {
+            title: "Legacy Remote".into(),
+            snippet: String::new(),
+            content: String::new(),
+            content_hash: stable_hit_hash(&content, "/tmp/legacy-remote.jsonl", Some(1), Some(100)),
+            score: 0.0,
+            source_path: "/tmp/legacy-remote.jsonl".into(),
+            agent: "codex".into(),
+            workspace: String::new(),
+            workspace_original: None,
+            created_at: Some(100),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "dev@laptop".into(),
+            origin_kind: "remote".into(),
+            origin_host: Some("dev@laptop".into()),
             conversation_id: None,
         };
 
@@ -11977,6 +12425,95 @@ mod tests {
     // ============================================================
 
     #[test]
+    fn tantivy_search_hydrates_long_content_when_content_field_is_not_stored() -> Result<()> {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let workspace_id = storage.ensure_workspace(dir.path(), None)?;
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent)?;
+        let long_content = format!(
+            "{}needle appears past the preview boundary for hydration proof",
+            "padding ".repeat(70)
+        );
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(dir.path().to_path_buf()),
+            external_id: Some("hydrate-long-content".into()),
+            title: Some("hydrated lexical doc".into()),
+            source_path: dir.path().join("hydrate.jsonl"),
+            started_at: Some(1_700_000_123_000),
+            ended_at: Some(1_700_000_123_000),
+            approx_tokens: Some(32),
+            metadata_json: json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_123_000),
+                content: long_content.clone(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+            origin_host: None,
+        };
+        storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        storage.close()?;
+
+        let index_path = dir.path().join("search-index");
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let normalized = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("hydrate-long-content".into()),
+            title: Some("hydrated lexical doc".into()),
+            workspace: Some(dir.path().to_path_buf()),
+            source_path: dir.path().join("hydrate.jsonl"),
+            started_at: Some(1_700_000_123_000),
+            ended_at: Some(1_700_000_123_000),
+            metadata: json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: Some("user".into()),
+                created_at: Some(1_700_000_123_000),
+                content: long_content.clone(),
+                extra: json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        index.add_conversation(&normalized)?;
+        index.commit()?;
+
+        let client = SearchClient::open(&index_path, Some(&db_path))?.expect("db-backed client");
+        let hits = client.search("needle", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+
+        assert_eq!(hits.len(), 1, "expected one lexical hit");
+        assert_eq!(hits[0].title, "hydrated lexical doc");
+        assert!(
+            hits[0]
+                .content
+                .contains("needle appears past the preview boundary"),
+            "lexical hit should hydrate full content from sqlite when Tantivy content is not stored"
+        );
+        assert!(
+            hits[0].snippet.to_lowercase().contains("needle"),
+            "snippet should still be rendered from hydrated content"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn filter_fidelity_agent_filter_respected() -> Result<()> {
         // Multiple agents; filter should return only matching agent
         let dir = TempDir::new()?;
@@ -12399,6 +12936,52 @@ mod tests {
 
         let client = SearchClient::open(dir.path(), None)?.expect("index present");
         let hits = client.search("remote", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source_id, "dev@laptop");
+        assert_eq!(hits[0].origin_kind, "remote");
+        assert_eq!(hits[0].origin_host.as_deref(), Some("dev@laptop"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_hits_infer_remote_origin_from_host_without_kind() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut index = TantivyIndex::open_or_create(dir.path())?;
+
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("legacy host-only lexical doc".into()),
+            workspace: None,
+            source_path: dir.path().join("legacy-host-only-lexical.jsonl"),
+            started_at: Some(100),
+            ended_at: None,
+            metadata: serde_json::json!({
+                "cass": {
+                    "origin": {
+                        "source_id": "   ",
+                        "host": "dev@laptop"
+                    }
+                }
+            }),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(100),
+                content: "legacy remote lexical".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: Vec::new(),
+            }],
+        };
+        index.add_conversation(&conv)?;
+        index.commit()?;
+
+        let client = SearchClient::open(dir.path(), None)?.expect("index present");
+        let hits = client.search("legacy", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source_id, "dev@laptop");
