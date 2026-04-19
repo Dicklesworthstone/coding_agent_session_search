@@ -499,3 +499,217 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260418-r61-noise-fast-reject/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260418-r62-corrected-control-noreserve/logs/summary.json`
 - `/tmp/cass-real-bench-20260418-r62-corrected-control-noreserve/logs/index.stderr.log`
+
+
+## SmallVec Grouped-Stream Capacity Sweep
+
+### Goal
+- Attack the still-dominant grouped message-stream hot path by removing heap-first allocation for the common case: many conversations are small, so the grouped row buffer should start stack-first and spill only when needed.
+
+### Alien/Queueing Framing
+- This is a small-object allocation optimization, not a batching change. The queueing model stays the same; only the per-conversation buffer representation changes.
+- With median conversation size `38`, p90 `194`, p95 `379`, and p99 `1029`, a spillable inline buffer should capture a large fraction of conversations without paying the struct-bloat cost of a very large inline capacity.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r63-smallvec48` | grouped message rows stored in `SmallVec<[row; 48]>` | 58.430 | 876.000 | 80502.742 | 365.552 | 55.271 | 53.163 | 8.014 | 6.876 | 7.103 | accepted candidate |
+| `r64-smallvec64` | widen inline capacity to `64` | 58.418 | 876.187 | 80519.918 | 365.630 | 54.386 | 52.313 | 7.739 | 6.597 | 6.970 | plateau / tied |
+| `r65-smallvec32` | shrink inline capacity to `32` | 58.417 | 876.194 | 80520.544 | 365.633 | 54.456 | 52.312 | 7.832 | 6.650 | 6.911 | plateau / retained best-by-size |
+| `r66-smallvec16` | shrink inline capacity further to `16` | 60.457 | 846.629 | 77803.579 | 353.295 | 56.311 | 54.086 | 8.065 | 6.869 | 7.008 | rejected |
+
+### Takeaways
+- `SmallVec` itself is the real win. Moving from the old heap-first grouped buffer path (`r62` corrected control at `59.436s`) to the stack-first path cut wall time by about `1.0s`, roughly `1.7%`.
+- The gain is visible in the right service center: `message_stream_ms` fell from `53665.752` on the corrected no-`SmallVec` control to about `52312-53163` on the `SmallVec` variants, with `prepare`, `add`, and `commit` also trending down.
+- The inline-capacity sweep found a flat optimum band rather than a sharp point. `32`, `48`, and `64` all beat the old control; `32` and `64` are essentially tied on wall time.
+- Pushing the inline buffer below that band breaks the win. `r66-smallvec16` regressed sharply to `60.457s`, so the common-case stack capture needs more than `16` inline slots on this corpus.
+- The retained setting should therefore bias toward the smaller inline footprint on the plateau. `32` keeps the common-case stack win while minimizing per-conversation struct bulk inside pending batches.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r63-smallvec48/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r63-smallvec48/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r64-smallvec64/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r64-smallvec64/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r65-smallvec32/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r65-smallvec32/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260418-r66-smallvec16/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r66-smallvec16/logs/index.stderr.log`
+
+## Rejected Byte-Pass Fusion Follow-Up
+
+### Goal
+- Test a pass-fusion idea from the grouped lexical rebuild hot path: carry per-conversation `message_bytes` forward from the SQLite grouping scan so `finish_conversation` no longer walks every grouped message again just to total `content.len()`.
+
+### Alien/Graveyard Framing
+- This was a straight pass-fusion experiment: eliminate a redundant per-conversation walk and keep the observable rebuild behavior identical.
+- The measured hotspot evidence for trying it was the still-large `finish_conversation_ms` bucket inside the corrected runner harness.
+
+### Measured Round
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r67-bytepass-fused` | compute grouped `message_bytes` during SQLite scan and pass them into `finish_conversation` | 59.445 | 861.053 | 79129.163 | 359.315 | 55.490 | 53.390 | 14.889 | 7.970 | 6.813 | 7.229 | rejected |
+
+### Takeaways
+- The idea was clean but it was not a win. `r67` lost by about `1.0s` against the retained `r65-smallvec32` baseline (`58.417s`).
+- The internal counters did not justify keeping it either: `message_stream_ms` rose back to `53390.355`, far above the retained `52311.599` on `r65`.
+- That means the extra byte-summing pass in `finish_conversation` is not the binding constraint here. The real remaining cost is still deeper in the grouped scan / lexical ingest path, not this tiny per-conversation fold.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260418-r67-bytepass-fused/logs/summary.json`
+- `/tmp/cass-real-bench-20260418-r67-bytepass-fused/logs/index.stderr.log`
+
+## High-Thread Tantivy Add-Batch Sweep
+
+### Goal
+- Re-test the outer Tantivy add-batch geometry on the corrected same-harness runner now that the retained `SmallVec<[row; 32]>` path is in place and the machine was materially less loaded than during the older plateau measurements.
+
+### Alien/Queueing Framing
+- This was a queue/service tuning pass, not a semantics change. The hypothesis was that the default outer `add_prebuilt_documents` batch cap was underfeeding the lexical writer on the 26-thread path.
+- Because batching changes are notoriously noisy, this sweep used a sequential-validation rule: do not keep a candidate unless the improvement survives a repeat or a code-default reproduction.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r68-control-repeat` | current retained tree, no add-batch override | 57.413 | 891.515 | 81928.571 | 372.026 | 53.953 | 51.905 | 7.745 | 6.619 | 6.946 | fresh control |
+| `r69-addbatch16384` | `CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES=16384` | 57.422 | 891.378 | 81915.930 | 371.969 | 53.991 | 52.158 | 7.372 | 6.255 | 6.392 | effectively tied |
+| `r70-addbatch24576` | `CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES=24576` | 56.412 | 907.342 | 83382.974 | 378.630 | 53.344 | 51.305 | 6.474 | 5.336 | 6.843 | promising outlier |
+| `r71-addbatch32768` | `CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES=32768` | 78.505 | 651.998 | 59917.336 | 272.076 | 53.027 | 50.791 | 5.967 | 4.842 | 7.496 | hard regression / cliff |
+| `r73-code-default-addbatch24576` | compiled code default changed to `24576` on high-thread path, no env override | 57.425 | 891.330 | 81911.507 | 371.949 | not separately inspected | not separately inspected | not separately inspected | not separately inspected | not separately inspected | failed reproduction |
+| `r74-addbatch24576-repeat` | repeat of the `24576` env override after the code-default non-repro | 57.418 | 891.451 | 81922.692 | 372.000 | not separately inspected | not separately inspected | not separately inspected | not separately inspected | not separately inspected | failed reproduction |
+
+### Takeaways
+- The new clean-machine control (`r68`) was already materially faster than the older `58.417s` plateau, so this whole sweep had to be judged against `57.413s`, not against stale noisier runs.
+- `16384` was just noise. It improved some internal `prepare`/`add` counters but did not move wall clock.
+- `24576` produced one excellent run (`56.412s`) with much better internal `prepare_ms` and `add_ms`, but it failed both validation checks: the compiled code-default run (`r73`) and a straight env repeat (`r74`) fell back to `~57.42s`.
+- `32768` exposed a real cliff: the internal rebuild profile still looked superficially fine, but end-to-end wall time exploded to `78.505s`, which strongly suggests large outer batches can trigger delayed downstream costs outside the profiled rebuild buckets.
+- Conclusion: do not keep any add-batch default change from this sweep. The `24576` result was a false positive under sequential validation, not a stable optimization.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r68-control-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r68-control-repeat/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r69-addbatch16384/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r69-addbatch16384/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r70-addbatch24576/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r70-addbatch24576/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r71-addbatch32768/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r71-addbatch32768/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r73-code-default-addbatch24576/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r73-code-default-addbatch24576/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r74-addbatch24576-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r74-addbatch24576-repeat/logs/index.stderr.log`
+
+
+
+## Rejected Prepare-Chunking Sweep
+
+### Goal
+- Test a morsel-style prepare-stage rewrite in the lexical rebuild hot path: replace one `Vec<CassDocument>` allocation per conversation with chunked worker-local accumulation and a single final extend pass.
+
+### Alien/Queueing Framing
+- This was a queue-shape and allocation-churn experiment inspired by morsel-driven parallelism, not a semantic change. Ordering was intentionally preserved by keeping contiguous conversation chunks, preserving in-chunk order, and flattening chunk outputs in chunk order.
+- The EV case for trying it was the still-material `prepare_ms` bucket on the fresh corrected control (`r68`), which suggested that per-conversation allocation and flatten overhead might still be worth attacking locally.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r75-chunked-prepare` | chunked worker-local doc accumulation in `prepare_lexical_rebuild_batch` | 57.416 | 891.473 | 81924.629 | 372.008 | 53.954 | 51.845 | 14.185 | 7.649 | 6.665 | 6.928 | tie / rejected |
+| `r76-chunked-prepare-repeat` | repeat of the same chunked worker-local prepare path | 57.420 | 891.407 | 81918.571 | 371.981 | 53.926 | 51.913 | 14.376 | 7.754 | 6.748 | 6.976 | failed repeat |
+
+### Takeaways
+- This lever did not earn its complexity. Both measured rounds were fractionally slower than the fresh retained control (`r68-control-repeat` at `57.413s`).
+- `r75` briefly looked directionally interesting because `prepare_ms` fell from the control's `7.745s` to `7.649s`, but the savings were too small and were mostly given back in `add_ms`; end-to-end wall time did not move.
+- The repeat removed any doubt. `r76` drifted the wrong way in every interesting internal bucket: `message_stream_ms`, `finish_conversation_ms`, `prepare_ms`, `add_ms`, and `commit_ms` all worsened versus `r75`.
+- Conclusion: revert the chunked prepare rewrite. The simpler per-conversation prepare path remains the correct retained implementation until there is evidence for a materially larger prepare-stage lever.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r75-chunked-prepare/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r75-chunked-prepare/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r76-chunked-prepare-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r76-chunked-prepare-repeat/logs/index.stderr.log`
+
+
+## Accepted Slice-Based Prebuilt-Doc Add Fast Path
+
+### Goal
+- Remove the extra wrapper-side buffering pass in the lexical rebuild add path. The rebuild already prepares a full `Vec<CassDocument>` per flush, but `TantivyIndex::add_prebuilt_documents` was moving every document into a second staging `Vec` before borrowing it back into `frankensearch`'s slice API.
+
+### Alien/Queueing Framing
+- This is a zero-copy ownership-transfer style optimization at the wrapper boundary, not a batching-policy change. The batch geometry stays the same; the change is that the rebuild path now submits contiguous slices of the already-prepared document vector instead of rebuilding a second buffer just to recover those same contiguous slices.
+- The relevant graveyard pattern is ownership-preserving zero-copy handoff: keep the hot path on existing contiguous buffers and avoid gratuitous queue copies when the downstream consumer already accepts borrowed slices.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Batches are contiguous windows over the original prepared-doc vector, and those windows are submitted in original order.
+- Tie-breaking unchanged: yes. No sort keys or batch thresholds changed.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile gates green plus targeted lexical-add and streamed-rebuild tests green.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | DB MiB/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r77-slice-add-fastpath` | rebuild path calls new slice-based prebuilt-doc fast path; no second staging vec | 55.395 | 924.002 | 84914.020 | 385.583 | 52.342 | 50.421 | 13.213 | 5.813 | 4.714 | 6.492 | accepted candidate |
+| `r78-slice-add-fastpath-repeat` | repeat of the same retained slice-based fast path | 56.409 | 907.398 | 83388.187 | 378.654 | 52.607 | 50.535 | 13.249 | 5.675 | 4.551 | 6.792 | accepted repeat |
+
+### Takeaways
+- This is a real retained win. Both rounds beat the fresh retained control (`r68-control-repeat` at `57.413s`).
+- The repeat held with a clear margin: `57.413s -> 56.409s`, about `1.7%` faster, while the first round reached `55.395s`.
+- The internal profile moved in the right service centers. Against `r68`, the repeat cut `prepare_ms` from `7.745s` to `5.675s` and `add_ms` from `6.619s` to `4.551s`, with `message_stream_ms` also dropping by about `1.37s`.
+- That matches the hypothesis: the wrapper-side rebuffering pass was expensive enough to matter on the real corpus, and deleting it improved both the handoff into frankensearch and the apparent upstream critical path.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r77-slice-add-fastpath/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r77-slice-add-fastpath/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r78-slice-add-fastpath-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r78-slice-add-fastpath-repeat/logs/index.stderr.log`
+
+
+## Accepted Prebuilt Add-Batch Default Retune
+
+### Goal
+- Re-evaluate the lexical rebuild add-batch default after the accepted slice-based prebuilt-doc fast path changed the hot-path balance. The earlier add-batch sweep was taken on an older tree, so its conclusions were no longer trustworthy for the retained slice fast path.
+
+### Alien/Queueing Framing
+- This is a queue geometry retune, but only at the prebuilt-doc boundary where the retained slice fast path now hands already-prepared contiguous documents directly into Tantivy/frankensearch.
+- The relevant queueing rule is local retuning after a service-center change: once the wrapper-side copy stage was removed, the old batch-size optimum became stale and needed to be re-measured on the new pipeline rather than inherited by folklore.
+- Scope stays intentionally narrow. Regular per-message indexing keeps the older default; only the prebuilt lexical rebuild slice path gets the raised floor.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Only batch window size changed; document order within and across batches is unchanged.
+- Tie-breaking unchanged: yes. Search fields, batch submission order, and commit cadence all stay the same.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile gates green plus targeted lexical-add and streamed-rebuild tests green.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r79-control-after-slice` | fresh retained control on the slice fast-path tree; code default unchanged | 56.402 | 907.501 | 83397.578 | 52.663 | 50.546 | 13.286 | 5.667 | 4.540 | 6.758 | control |
+| `r80-addbatch16384-after-slice` | env-only retune with `CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES=16384` on the retained slice tree | 55.404 | 923.855 | 84900.539 | 52.122 | 50.258 | 12.945 | 5.300 | 4.155 | 6.608 | promising |
+| `r81-addbatch16384-repeat-after-slice` | repeat of the same env-only `16384` retune | 55.404 | 923.858 | 84900.830 | 51.903 | 50.078 | 12.591 | 5.331 | 4.200 | 6.158 | accepted env repeat |
+| `r82-code-default-prebuilt16384` | code default raised to `16384` for the prebuilt-doc slice path only | 56.409 | 907.395 | 83387.895 | 52.736 | 50.745 | 13.169 | 5.402 | 4.191 | 6.888 | noisy miss / inconclusive |
+| `r83-code-default-prebuilt16384-repeat` | no-env repeat of the retained code-default prebuilt-only `16384` change | 55.384 | 924.187 | 84931.058 | 51.884 | 50.180 | 12.799 | 5.387 | 4.242 | 6.269 | accepted |
+
+### Takeaways
+- The old add-batch conclusions were stale once the slice fast path removed the wrapper-side rebuffering pass. Re-measuring on the retained tree found a different stable point.
+- `16384` is the new retained default floor for the prebuilt lexical rebuild slice path. The accepted code-default repeat (`r83`) improved the fresh retained control from `56.402s` to `55.384s`, about `1.8%` faster.
+- The internal profile moved in the right places. Against `r79`, the accepted `r83` cut `prepare_ms` from `5.667s` to `5.387s`, `add_ms` from `4.540s` to `4.242s`, `commit_ms` from `6.758s` to `6.269s`, and `finish_conversation_ms` from `13.286s` to `12.799s`.
+- `r82` is deliberately kept in the history even though it lost, because a single no-env miss after two strong env repeats was not enough evidence to throw away the lever. The second no-env repeat settled the question.
+- Scope discipline mattered. The retained code raises the default only for prebuilt rebuild batches; the regular per-message indexing path stays untouched because it was not the measured winner.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r79-control-after-slice/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r79-control-after-slice/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r80-addbatch16384-after-slice/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r80-addbatch16384-after-slice/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r81-addbatch16384-repeat-after-slice/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r81-addbatch16384-repeat-after-slice/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r82-code-default-prebuilt16384/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r82-code-default-prebuilt16384/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r83-code-default-prebuilt16384-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r83-code-default-prebuilt16384-repeat/logs/index.stderr.log`
