@@ -22555,12 +22555,45 @@ fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
                 },
             }
         }
-        Ok(_) => DiagnosticCheck {
-            name: format!("Remote Path: {}", path),
-            status: "fail".into(),
-            message: "Path does not exist".into(),
-            remediation: Some("Remove this path or create it on the remote".into()),
-        },
+        Ok(out) => {
+            // ssh exited non-zero. Distinguish SSH transport failures (which
+            // would make the "Path does not exist" message + "Remove this
+            // path" remediation actively misleading — the operator would
+            // delete a valid path because ssh can't even reach the remote)
+            // from the intended "remote shell returned non-zero because
+            // `test -d` failed" case. Inspect stderr for the usual ssh(1)
+            // transport-level error signatures.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr_lower = stderr.to_ascii_lowercase();
+            let looks_like_ssh_failure = stderr_lower.contains("connection refused")
+                || stderr_lower.contains("connection timed out")
+                || stderr_lower.contains("connection closed")
+                || stderr_lower.contains("permission denied")
+                || stderr_lower.contains("host key verification failed")
+                || stderr_lower.contains("could not resolve hostname")
+                || stderr_lower.contains("no route to host")
+                || stderr_lower.contains("network is unreachable")
+                || stderr_lower.contains("operation timed out");
+            if looks_like_ssh_failure {
+                DiagnosticCheck {
+                    name: format!("Remote Path: {}", path),
+                    status: "warn".into(),
+                    message: format!("SSH transport failed: {}", stderr.trim()),
+                    remediation: Some(
+                        "Check ssh connectivity, host keys, and credentials before \
+                         interpreting this path as missing"
+                            .into(),
+                    ),
+                }
+            } else {
+                DiagnosticCheck {
+                    name: format!("Remote Path: {}", path),
+                    status: "fail".into(),
+                    message: "Path does not exist".into(),
+                    remediation: Some("Remove this path or create it on the remote".into()),
+                }
+            }
+        }
         Err(e) => DiagnosticCheck {
             name: format!("Remote Path: {}", path),
             status: "warn".into(),
