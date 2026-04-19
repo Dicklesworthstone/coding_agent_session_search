@@ -713,3 +713,78 @@ cass --db /home/ubuntu/.local/share/coding-agent-search/agent_search.db   index 
 - `/tmp/cass-real-bench-20260419-r82-code-default-prebuilt16384/logs/index.stderr.log`
 - `/tmp/cass-real-bench-20260419-r83-code-default-prebuilt16384-repeat/logs/summary.json`
 - `/tmp/cass-real-bench-20260419-r83-code-default-prebuilt16384-repeat/logs/index.stderr.log`
+
+
+## Rejected Frankensearch Internal Add-Plan Batch Sweep
+
+### Goal
+- Re-test the inner `frankensearch` parallel-add chunk geometry after the retained slice fast path and prebuilt `16384` outer-batch retune changed the upstream handoff shape.
+
+### Alien/Queueing Framing
+- This is a second-stage queueing probe: the retained outer batch now hands the writer a different workload, so the internal `cass_parallel_add_target_batch_docs` constant inside `frankensearch` might have become stale even if the outer retune held.
+- The relevant graveyard rule is coupled service-center retuning: once an upstream boundary changes, a downstream chunking heuristic must be revalidated rather than assumed.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Only internal chunk geometry changed via env overrides.
+- Tie-breaking unchanged: yes. No schema, sort, or query behavior changed.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: env-only benchmark sweep; retained source tree unchanged.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r84-paraddocs1024` | env-only `CASS_TANTIVY_PARALLEL_ADD_BATCH_DOCS=1024` | 58.291 | 878.092 | 80695.006 | 55.035 | 53.135 | 14.644 | 7.427 | 6.303 | 6.211 | rejected |
+| `r85-paraddocs256` | env-only `CASS_TANTIVY_PARALLEL_ADD_BATCH_DOCS=256` | 57.080 | 896.723 | 82407.160 | 53.697 | 51.770 | 12.930 | 4.737 | 3.583 | 7.101 | rejected |
+
+### Takeaways
+- The whole inner-add batch-doc sweep is a non-winner on the retained tree. `1024` was a hard regression, and `256` also lost despite looking directionally nicer in `prepare_ms` and `add_ms`.
+- The `256` round is especially informative: it cut `prepare_ms` and `add_ms` substantially, but the savings came back as a much worse `commit_ms` bill. That is exactly the kind of coupled-queue trap that makes isolated thermostat tuning unreliable.
+- Conclusion: keep the default `512` internal add-plan target inside `frankensearch`. The retained tree is better served by a structural lever than by further inner-batch folklore.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r84-paraddocs1024/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r84-paraddocs1024/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r85-paraddocs256/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r85-paraddocs256/logs/index.stderr.log`
+
+
+## Accepted Borrowed Prebuilt-Doc Refs via Local Frankensearch Override
+
+### Goal
+- Remove the intermediate owned `CassDocument` layer from the lexical rebuild path. The grouped rebuild batch already owns the conversation rows and message strings, so cloning them into `CassDocument` and then cloning again into Tantivy documents was redundant.
+
+### Alien/Queueing Framing
+- This is an ownership-transport optimization using the exact pinned `frankensearch` rev already declared by cass (`8e07d082`). The local patch override only changes source resolution so the sibling checkout can expose a borrowed-doc API; it does not switch cass to a different upstream revision.
+- The relevant graveyard pattern is ownership-preserving zero-copy handoff plus local-to-global queue repair. The winning shape was not merely “borrowed refs”; it was “borrowed refs while preserving the old parallel shard prep geometry.”
+- That distinction mattered. The first serial borrowed-ref prototype (`r86`) regressed badly because it deleted clone work and parallel fanout at the same time. Restoring parallel shard construction on borrowed refs produced the actual win.
+
+### Behavior Preservation Proof
+- Ordering preserved: yes. Each borrowed ref is emitted in the same `(conversation_id, idx)` order as the old owned-doc path, and the slice batching logic is unchanged.
+- Tie-breaking unchanged: yes. Same schema fields, same commit cadence, same batch boundaries, same search semantics.
+- Floating-point: N/A.
+- RNG seeds: unchanged / N/A.
+- Golden/replay verification: compile gates green plus targeted lexical-add and streamed-rebuild tests green.
+
+### Measured Rounds
+
+| Label | Change | Wall s | Conv/s | Msg/s | Rebuild ms | Message Stream ms | Finish Conversation ms | Prepare ms | Add ms | Commit ms | Outcome |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `r86-borrowed-docrefs` | first borrowed-ref prototype with serial ref construction | 59.469 | 860.706 | 79097.240 | 56.175 | 54.111 | 13.858 | 6.145 | 5.087 | 7.232 | rejected prototype |
+| `r87-borrowed-docrefs-parallel` | borrowed refs plus restored parallel shard construction | 55.258 | 926.288 | 85124.121 | 52.357 | 50.513 | 12.007 | 4.985 | 4.324 | 6.558 | accepted candidate |
+| `r88-borrowed-docrefs-parallel-repeat` | repeat of the retained parallel borrowed-ref path | 55.200 | 927.264 | 85213.782 | 52.372 | 50.456 | 12.301 | 4.840 | 4.189 | 7.194 | accepted repeat |
+
+### Takeaways
+- This is a real but modest retained win. The repeat held against the previous retained baseline (`r83-code-default-prebuilt16384-repeat` at `55.384s`): `55.384s -> 55.200s`, about `0.3%` faster.
+- The improvement is small enough that the failed `r86` prototype matters. Without the parallel shard construction, the borrowed-ref idea was decisively wrong. With parallel shard construction restored, the clone-elimination becomes net positive.
+- The repeat profile supports the story. Against `r83`, `r88` cut `prepare_ms` from `5.387s` to `4.840s` and `finish_conversation_ms` from `12.799s` to `12.301s`, while `add_ms` stayed effectively tied (`4.242s -> 4.189s`). `commit_ms` drifted up, which is why the total win stayed small.
+- Conclusion: keep the borrowed prebuilt-doc ref path and the local `frankensearch` override, but describe it honestly as a narrow structural win rather than a breakthrough.
+
+### Artifacts
+- `/tmp/cass-real-bench-20260419-r86-borrowed-docrefs/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r86-borrowed-docrefs/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r87-borrowed-docrefs-parallel/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r87-borrowed-docrefs-parallel/logs/index.stderr.log`
+- `/tmp/cass-real-bench-20260419-r88-borrowed-docrefs-parallel-repeat/logs/summary.json`
+- `/tmp/cass-real-bench-20260419-r88-borrowed-docrefs-parallel-repeat/logs/index.stderr.log`
