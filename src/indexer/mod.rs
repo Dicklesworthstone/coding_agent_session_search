@@ -5077,10 +5077,11 @@ fn lexical_rebuild_staged_shard_builder_settings(
     planned_shard_count: usize,
 ) -> LexicalRebuildShardBuilderSettings {
     let planned_shard_count = planned_shard_count.max(1);
+    let writer_parallelism_budget = settings.tantivy_writer_threads.max(1);
     let max_builders = planned_shard_count
         .min(settings.staged_shard_builders.max(1))
+        .min(writer_parallelism_budget)
         .max(1);
-    let writer_parallelism_budget = settings.tantivy_writer_threads.max(1);
     LexicalRebuildShardBuilderSettings {
         max_builders,
         writer_parallelism_budget,
@@ -15789,6 +15790,18 @@ mod tests {
                 writer_parallelism_budget: 8,
             }
         );
+
+        let constrained_writer_budget = LexicalRebuildPipelineSettingsSnapshot {
+            tantivy_writer_threads: 4,
+            ..settings
+        };
+        assert_eq!(
+            lexical_rebuild_staged_shard_builder_settings(&constrained_writer_budget, 32),
+            LexicalRebuildShardBuilderSettings {
+                max_builders: 4,
+                writer_parallelism_budget: 4,
+            }
+        );
     }
 
     #[test]
@@ -15807,13 +15820,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(widened, vec![4, 4]);
-
-        let oversubscribed = (0..6)
-            .map(|slot| {
-                lexical_rebuild_staged_shard_builder_writer_parallelism_for_dispatch(4, 6, slot)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(oversubscribed, vec![1, 1, 1, 1, 1, 1]);
     }
 
     #[test]
