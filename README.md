@@ -67,6 +67,11 @@ cass expand /path/to/session.jsonl -n 42 -C 3 --json
 # 5) Discover the full machine API
 cass robot-docs guide
 cass robot-docs schemas
+
+# 6) Exclude a noisy agent harness from future indexing
+cass sources agents list --json
+cass sources agents exclude openclaw
+cass sources agents include openclaw
 ```
 
 **Output conventions**
@@ -531,6 +536,31 @@ cass sources doctor [--source <name>] [--json]
 
 # Sync sessions
 cass sources sync [--source <name>] [--no-index] [--verbose] [--dry-run] [--json]
+```
+
+#### Excluding Noisy Agent Harnesses
+
+If one harness is generating mostly junk or looped output, you can disable it persistently even if its files remain on disk:
+
+```bash
+# Inspect current include/exclude state
+cass sources agents list --json
+
+# Stop indexing this harness in future runs
+cass sources agents exclude openclaw
+
+# Re-enable it later
+cass sources agents include openclaw
+```
+
+`cass` stores this preference in `sources.toml` (`~/.config/cass/sources.toml` on Linux, `~/Library/Application Support/cass/sources.toml` on macOS), so future scans, syncs, and watch-mode updates remember it automatically.
+
+By default, `cass sources agents exclude <agent>` also removes already archived local data for that agent and rebuilds the lexical index so the exclusion frees space instead of only blocking future imports.
+
+If you want to block future indexing but keep the data already archived:
+
+```bash
+cass sources agents exclude openclaw --keep-indexed-data
 ```
 
 #### Sync Engine Internals
