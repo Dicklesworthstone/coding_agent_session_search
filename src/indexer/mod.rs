@@ -22977,6 +22977,7 @@ mod tests {
         let status = matching_lexical_rebuild_state_status(&index_path, &db_state).unwrap();
         assert!(!status.has_pending_resume);
         assert!(status.has_completed_checkpoint);
+        assert_eq!(status.completed_indexed_docs, Some(0));
     }
 
     #[test]
@@ -22995,6 +22996,7 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
+                completed_indexed_docs: Some(0),
             },
             exact_counts,
             no_mutations,
@@ -23005,6 +23007,7 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
+                completed_indexed_docs: Some(0),
             },
             exact_counts,
             no_mutations,
@@ -23015,6 +23018,7 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: false,
+                completed_indexed_docs: None,
             },
             exact_counts,
             no_mutations,
@@ -23025,6 +23029,7 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
+                completed_indexed_docs: Some(0),
             },
             Some((1, 2)),
             no_mutations,
@@ -23035,6 +23040,7 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
+                completed_indexed_docs: Some(0),
             },
             exact_counts,
             changed,
@@ -23045,9 +23051,88 @@ mod tests {
             MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
+                completed_indexed_docs: Some(0),
             },
             exact_counts,
             no_mutations,
+        ));
+    }
+
+    #[test]
+    fn skip_post_full_scan_authoritative_rebuild_requires_matching_completed_checkpoint_doc_match_and_no_mutations()
+     {
+        let checkpoint = MatchingLexicalRebuildStateStatus {
+            has_pending_resume: false,
+            has_completed_checkpoint: true,
+            completed_indexed_docs: Some(42),
+        };
+
+        assert!(should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            false,
+            false,
+            0,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            true,
+            0,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            1,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            checkpoint,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 0,
+            },
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            MatchingLexicalRebuildStateStatus::default(),
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(41),
+        ));
+        assert!(!should_skip_post_full_scan_authoritative_rebuild(
+            true,
+            false,
+            0,
+            checkpoint,
+            CanonicalMutationCounts::default(),
+            None,
         ));
     }
 
