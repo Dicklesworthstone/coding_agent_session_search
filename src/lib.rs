@@ -5494,6 +5494,26 @@ fn state_meta_json(
     let mut lexical_rebuild_pipeline_json =
         serde_json::to_value(&lexical_rebuild_pipeline).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut pipeline) = lexical_rebuild_pipeline_json {
+        let controller_loadavg_high_watermark_1m = pipeline
+            .remove("controller_loadavg_high_watermark_1m_milli")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as f64 / 1000.0);
+        let controller_loadavg_low_watermark_1m = pipeline
+            .remove("controller_loadavg_low_watermark_1m_milli")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as f64 / 1000.0);
+        pipeline.insert(
+            "controller_loadavg_high_watermark_1m".to_string(),
+            controller_loadavg_high_watermark_1m
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        pipeline.insert(
+            "controller_loadavg_low_watermark_1m".to_string(),
+            controller_loadavg_low_watermark_1m
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
         let runtime_value = lexical_rebuild_pipeline_runtime
             .map(|runtime| {
                 serde_json::json!({
@@ -5505,6 +5525,36 @@ fn state_meta_json(
                     "active_page_prep_jobs": runtime.active_page_prep_jobs,
                     "ordered_buffered_pages": runtime.ordered_buffered_pages,
                     "budget_generation": runtime.budget_generation,
+                    "host_loadavg_1m": runtime.host_loadavg_1m_milli.map(|value| f64::from(value) / 1000.0),
+                    "controller_mode": if runtime.controller_mode.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(runtime.controller_mode)
+                    },
+                    "controller_reason": if runtime.controller_reason.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(runtime.controller_reason)
+                    },
+                    "staged_merge_workers_max": runtime.staged_merge_workers_max,
+                    "staged_merge_allowed_jobs": runtime.staged_merge_allowed_jobs,
+                    "staged_merge_active_jobs": runtime.staged_merge_active_jobs,
+                    "staged_merge_ready_artifacts": runtime.staged_merge_ready_artifacts,
+                    "staged_merge_ready_groups": runtime.staged_merge_ready_groups,
+                    "staged_merge_controller_reason": if runtime.staged_merge_controller_reason.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(runtime.staged_merge_controller_reason)
+                    },
+                    "staged_shard_build_workers_max": runtime.staged_shard_build_workers_max,
+                    "staged_shard_build_allowed_jobs": runtime.staged_shard_build_allowed_jobs,
+                    "staged_shard_build_active_jobs": runtime.staged_shard_build_active_jobs,
+                    "staged_shard_build_pending_jobs": runtime.staged_shard_build_pending_jobs,
+                    "staged_shard_build_controller_reason": if runtime.staged_shard_build_controller_reason.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(runtime.staged_shard_build_controller_reason)
+                    },
                     "updated_at": format_timestamp_millis_rfc3339(runtime.updated_at_ms),
                 })
             })
@@ -10845,6 +10895,19 @@ mod cli_read_db_tests {
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
         let _reserved_cores = set_env("CASS_TANTIVY_REBUILD_RESERVED_CORES", "4");
+        let _controller_mode = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_MODE", "steady");
+        let _controller_clear_samples =
+            set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_CLEAR_SAMPLES", "5");
+        let _controller_hold_ms =
+            set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_HOLD_MS", "2345");
+        let _controller_loadavg_high = set_env(
+            "CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_HIGH_WATERMARK_1M",
+            "7.5",
+        );
+        let _controller_loadavg_low = set_env(
+            "CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_LOW_WATERMARK_1M",
+            "6.25",
+        );
         let _steady_fetch = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "210");
         let _startup_fetch = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
@@ -10870,6 +10933,9 @@ mod cli_read_db_tests {
             "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
             "888888",
         );
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "5");
+        let _shard_builders = set_env("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS", "4");
+        let _merge_workers = set_env("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS", "2");
 
         let (temp, db_path) = seed_cli_db();
         let state = state_meta_json(temp.path(), &db_path, 60, true);
@@ -10882,6 +10948,26 @@ mod cli_read_db_tests {
         assert_eq!(
             pipeline["reserved_cores"].as_u64(),
             Some(4_u64.min(available_parallelism.saturating_sub(1)))
+        );
+        assert_eq!(
+            pipeline["tantivy_writer_threads"].as_u64(),
+            Some(available_parallelism.min(5))
+        );
+        assert_eq!(pipeline["staged_shard_builders"].as_u64(), Some(4));
+        assert_eq!(pipeline["staged_merge_workers"].as_u64(), Some(2));
+        assert_eq!(pipeline["controller_mode"].as_str(), Some("steady"));
+        assert_eq!(
+            pipeline["controller_restore_clear_samples"].as_u64(),
+            Some(5)
+        );
+        assert_eq!(pipeline["controller_restore_hold_ms"].as_u64(), Some(2345));
+        assert_eq!(
+            pipeline["controller_loadavg_high_watermark_1m"].as_f64(),
+            Some(7.5)
+        );
+        assert_eq!(
+            pipeline["controller_loadavg_low_watermark_1m"].as_f64(),
+            Some(6.25)
         );
         assert_eq!(
             pipeline["page_size"].as_i64(),
@@ -10940,6 +11026,7 @@ mod cli_read_db_tests {
                 },
                 "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 4,
+                "committed_conversation_id": 4,
                 "processed_conversations": 4,
                 "indexed_docs": 20,
                 "committed_meta_fingerprint": null,
@@ -10955,6 +11042,20 @@ mod cli_read_db_tests {
                     "active_page_prep_jobs": 2,
                     "ordered_buffered_pages": 4,
                     "budget_generation": 1,
+                    "host_loadavg_1m_milli": 7_250,
+                    "controller_mode": "pressure_limited",
+                    "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
+                    "staged_merge_workers_max": 3,
+                    "staged_merge_allowed_jobs": 1,
+                    "staged_merge_active_jobs": 1,
+                    "staged_merge_ready_artifacts": 5,
+                    "staged_merge_ready_groups": 1,
+                    "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
+                    "staged_shard_build_workers_max": 6,
+                    "staged_shard_build_allowed_jobs": 5,
+                    "staged_shard_build_active_jobs": 4,
+                    "staged_shard_build_pending_jobs": 2,
+                    "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
                     "updated_at_ms": 1_733_000_124_000_i64
                 }
             }))
@@ -10995,9 +11096,93 @@ mod cli_read_db_tests {
         assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
         assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
         assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
+        assert_eq!(runtime["host_loadavg_1m"].as_f64(), Some(7.25));
+        assert_eq!(
+            runtime["controller_mode"].as_str(),
+            Some("pressure_limited")
+        );
+        assert_eq!(
+            runtime["controller_reason"].as_str(),
+            Some("queue_depth_3_reached_pipeline_capacity_3")
+        );
+        assert_eq!(runtime["staged_merge_workers_max"].as_u64(), Some(3));
+        assert_eq!(runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
+        assert_eq!(runtime["staged_merge_active_jobs"].as_u64(), Some(1));
+        assert_eq!(runtime["staged_merge_ready_artifacts"].as_u64(), Some(5));
+        assert_eq!(runtime["staged_merge_ready_groups"].as_u64(), Some(1));
+        assert_eq!(
+            runtime["staged_merge_controller_reason"].as_str(),
+            Some("page_prep_workers_saturated_6_of_6")
+        );
+        assert_eq!(runtime["staged_shard_build_workers_max"].as_u64(), Some(6));
+        assert_eq!(runtime["staged_shard_build_allowed_jobs"].as_u64(), Some(5));
+        assert_eq!(runtime["staged_shard_build_active_jobs"].as_u64(), Some(4));
+        assert_eq!(runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
+        assert_eq!(
+            runtime["staged_shard_build_controller_reason"].as_str(),
+            Some("reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1")
+        );
         assert_eq!(
             runtime["updated_at"].as_str(),
             format_timestamp_millis_rfc3339(1_733_000_124_000_i64).as_deref()
+        );
+    }
+
+    #[test]
+    fn state_meta_json_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "10:42:0:0"
+                },
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+                "committed_offset": 4,
+                "committed_conversation_id": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": false,
+                "updated_at_ms": 1_733_000_123_000_i64
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        assert_eq!(state["index"]["rebuilding"].as_bool(), Some(true));
+        assert_eq!(state["rebuild"]["active"].as_bool(), Some(true));
+        assert_eq!(
+            state["rebuild"]["pipeline"]["runtime"],
+            serde_json::Value::Null
         );
     }
 
@@ -11019,6 +11204,7 @@ mod cli_read_db_tests {
                 },
                 "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 4,
+                "committed_conversation_id": 4,
                 "processed_conversations": 4,
                 "indexed_docs": 20,
                 "committed_meta_fingerprint": null,
@@ -11078,11 +11264,13 @@ mod cli_read_db_tests {
                 },
                 "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 4,
+                "committed_conversation_id": 4,
                 "processed_conversations": 4,
                 "indexed_docs": 20,
                 "committed_meta_fingerprint": null,
                 "pending": {
                     "next_offset": 6,
+                    "next_conversation_id": 6,
                     "processed_conversations": 6,
                     "indexed_docs": 30,
                     "base_meta_fingerprint": "stable-meta"
@@ -11420,6 +11608,7 @@ mode=index",
                 },
                 "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
                 "committed_offset": 10,
+                "committed_conversation_id": 10,
                 "processed_conversations": 10,
                 "indexed_docs": 20,
                 "committed_meta_fingerprint": null,

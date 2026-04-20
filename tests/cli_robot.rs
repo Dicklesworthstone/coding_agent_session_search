@@ -288,6 +288,76 @@ fn state_matches_status() {
 }
 
 #[test]
+fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
+    let fixture = isolated_search_demo_data();
+    let data_dir = fixture.path();
+    let db_path = data_dir.join("agent_search.db");
+    let index_path = data_dir.join("index");
+
+    fs::write(
+        index_path.join(".lexical-rebuild-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 2,
+            "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
+            "db": {
+                "db_path": db_path.display().to_string(),
+                "total_conversations": 10,
+                "total_messages": 20,
+                "storage_fingerprint": "10:20:0:0"
+            },
+            "page_size": 1000,
+            "committed_offset": 4,
+            "committed_conversation_id": 4,
+            "processed_conversations": 4,
+            "indexed_docs": 8,
+            "committed_meta_fingerprint": null,
+            "pending": null,
+            "completed": false,
+            "updated_at_ms": 1_733_000_123_000_i64
+        }))
+        .expect("serialize rebuild state"),
+    )
+    .expect("write rebuild state");
+
+    let lock_path = data_dir.join("index-run.lock");
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    lock_file.try_lock_exclusive().expect("hold index lock");
+    writeln!(
+        lock_file,
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
+        std::process::id(),
+        1_733_001_444_000_i64,
+        db_path.display()
+    )
+    .expect("write lock metadata");
+    lock_file.flush().expect("flush lock metadata");
+
+    let mut cmd = base_cmd();
+    cmd.args([
+        "state",
+        "--json",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid state json");
+
+    assert_eq!(json["index"]["rebuilding"], Value::Bool(true));
+    assert_eq!(json["rebuild"]["active"], Value::Bool(true));
+    assert_eq!(json["rebuild"]["pipeline"]["runtime"], Value::Null);
+}
+
+#[test]
 fn search_cursor_and_token_budget() {
     let data_dir = "tests/fixtures/search_demo_data";
     // First page with small token budget to force clamping
