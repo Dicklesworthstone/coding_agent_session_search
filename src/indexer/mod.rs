@@ -16279,9 +16279,7 @@ mod tests {
             2,
         )
         .unwrap();
-        let reader = final_artifact.index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 2);
+        assert_eq!(final_artifact.docs, 2);
         assert_eq!(
             final_artifact.publish_path, shard_path,
             "single-input finalization should reuse the existing shard artifact directly"
@@ -16293,7 +16291,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_staged_lexical_rebuild_publish_artifact_assembles_multiple_inputs_without_doc_remerge()
+    fn finalize_staged_lexical_rebuild_publish_artifact_publishes_federated_multi_input_frontier_without_doc_remerge()
      {
         let tmp = TempDir::new().unwrap();
         let merge_stage_root = tmp.path().join("merge-stage");
@@ -16358,17 +16356,26 @@ mod tests {
             3,
         )
         .unwrap();
-        let reader = final_artifact.index.reader().unwrap();
-        reader.reload().unwrap();
-        assert_eq!(reader.searcher().num_docs(), 6);
+        assert_eq!(final_artifact.docs, 6);
         assert_eq!(
-            final_artifact.index.segment_count(),
+            final_artifact.segments,
             3,
-            "multi-input finalization should assemble a multi-segment publish generation instead of remerging docs"
+            "multi-input finalization should preserve the final shard frontier without remerging docs"
         );
         assert_eq!(
             final_artifact.publish_path, merged_path,
-            "multi-input finalization should materialize the assembled publish generation at the requested output path"
+            "multi-input finalization should materialize the federated publish bundle at the requested output path"
+        );
+        assert_eq!(
+            crate::search::tantivy::open_federated_search_readers(
+                &merged_path,
+                frankensearch::lexical::ReloadPolicy::Manual,
+            )
+            .unwrap()
+            .expect("federated readers")
+            .len(),
+            3,
+            "multi-input finalization should publish the three final shard artifacts as a federated lexical bundle"
         );
         assert!(
             !merge_stage_root.join("round-00000").exists(),
@@ -17995,13 +18002,10 @@ mod tests {
 
     fn tantivy_doc_count_for_data_dir(data_dir: &Path) -> u64 {
         let index_path = index_dir(data_dir).unwrap();
-        let (reader, _fields) = frankensearch::lexical::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
-        )
-        .unwrap();
-        reader.reload().unwrap();
-        reader.searcher().num_docs()
+        crate::search::tantivy::searchable_index_summary(&index_path)
+            .unwrap()
+            .expect("searchable lexical index summary")
+            .docs as u64
     }
 
     fn token_usage_extra(input_tokens: i64, output_tokens: i64) -> serde_json::Value {
@@ -20736,23 +20740,33 @@ mod tests {
         );
         assert!(
             logs.contains(
-                "assembling final staged lexical rebuild generation from compatible artifacts without remerging docs"
+                "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
             ),
-            "expected assembled final publish generation log, got:\n{logs}"
+            "expected federated final publish log, got:\n{logs}"
         );
         assert!(
             !logs.contains("running staged lexical rebuild merge round"),
-            "multi-artifact publish generation assembly should avoid the fallback merge-tree tail: {logs}"
+            "federated multi-artifact publish should avoid the fallback merge-tree tail: {logs}"
         );
         let index_path = index_dir(&data_dir).unwrap();
         assert_eq!(
-            frankensearch::lexical::Index::open_in_dir(&index_path)
-                .unwrap()
-                .searchable_segment_metas()
-                .unwrap()
-                .len(),
+            crate::search::tantivy::open_federated_search_readers(
+                &index_path,
+                frankensearch::lexical::ReloadPolicy::Manual,
+            )
+            .unwrap()
+            .expect("published federated readers")
+            .len(),
             3,
-            "published staged rebuild should preserve the three final shard artifacts as searchable segments"
+            "published staged rebuild should preserve the three final shard artifacts as a federated lexical bundle"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .expect("searchable summary")
+                .segments,
+            3,
+            "published staged rebuild should report the three preserved final shard segments"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 6);
     }

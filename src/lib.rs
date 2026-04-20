@@ -12543,14 +12543,10 @@ fn run_doctor(
     }
 
     // 4. Check Tantivy index exists and is readable
-    if index_meta_path.exists() {
-        match frankensearch::lexical::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
-        ) {
-            Ok((reader, _fields)) => {
-                let searcher = reader.searcher();
-                let num_docs = searcher.num_docs();
+    if crate::search::tantivy::searchable_index_exists(&index_path) {
+        match crate::search::tantivy::searchable_index_summary(&index_path) {
+            Ok(Some(summary)) => {
+                let num_docs = summary.docs;
                 add_check!(
                     "index",
                     "pass",
@@ -12584,6 +12580,10 @@ fn run_doctor(
                         }
                     }
                 }
+            }
+            Ok(None) => {
+                add_check!("index", "fail", "Search index metadata is missing", true);
+                needs_rebuild = true;
             }
             Err(e) => {
                 add_check!("index", "fail", format!("Cannot open index: {}", e), true);
