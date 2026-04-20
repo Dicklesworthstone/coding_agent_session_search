@@ -773,6 +773,15 @@ fn resolve_lexical_population_strategy(
     (strategy, reason)
 }
 
+fn lexical_population_strategy_requires_inline_tantivy(
+    strategy: LexicalPopulationStrategy,
+) -> bool {
+    !matches!(
+        strategy,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+    )
+}
+
 fn record_lexical_population_strategy(
     progress: Option<&Arc<IndexingProgress>>,
     strategy: LexicalPopulationStrategy,
@@ -1125,11 +1134,13 @@ fn record_exact_total_counts_in_progress(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct MatchingLexicalRebuildStateStatus {
     has_pending_resume: bool,
     has_completed_checkpoint: bool,
     completed_indexed_docs: Option<usize>,
+    completed_exact_totals: Option<(usize, usize)>,
+    completed_storage_fingerprint: Option<String>,
 }
 
 fn matching_lexical_rebuild_state_status(
@@ -1152,13 +1163,82 @@ fn matching_lexical_rebuild_state_status(
         has_pending_resume: state.is_incomplete(),
         has_completed_checkpoint,
         completed_indexed_docs: has_completed_checkpoint.then_some(state.indexed_docs),
+        completed_exact_totals: has_completed_checkpoint
+            .then_some((state.db.total_conversations, state.indexed_docs)),
+        completed_storage_fingerprint: has_completed_checkpoint
+            .then_some(state.db.storage_fingerprint),
     })
+}
+
+fn should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+    full_rebuild: bool,
+    resume_lexical_rebuild: bool,
+    canonical_only_full_rebuild: bool,
+    initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
+) -> bool {
+    full_rebuild
+        && !resume_lexical_rebuild
+        && !canonical_only_full_rebuild
+        && initial_checkpoint_status.has_completed_checkpoint
+}
+
+fn should_preflight_existing_tantivy_reader(
+    resume_lexical_rebuild: bool,
+    full_rebuild: bool,
+) -> bool {
+    !resume_lexical_rebuild && !full_rebuild
+}
+
+fn should_probe_live_tantivy_docs_for_post_full_scan_skip(
+    full_rebuild: bool,
+    rebuild_was_required: bool,
+    salvage_messages_imported: usize,
+    initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
+    scan_canonical_mutations: CanonicalMutationCounts,
+    observed_tantivy_docs: Option<usize>,
+) -> bool {
+    full_rebuild
+        && !rebuild_was_required
+        && salvage_messages_imported == 0
+        && !scan_canonical_mutations.changed()
+        && initial_checkpoint_status.has_completed_checkpoint
+        && observed_tantivy_docs.is_none()
+}
+
+fn observed_tantivy_docs_for_post_full_scan_skip(
+    index_path: &Path,
+    full_rebuild: bool,
+    rebuild_was_required: bool,
+    salvage_messages_imported: usize,
+    initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
+    scan_canonical_mutations: CanonicalMutationCounts,
+    observed_tantivy_docs: Option<usize>,
+) -> Result<Option<usize>> {
+    if should_probe_live_tantivy_docs_for_post_full_scan_skip(
+        full_rebuild,
+        rebuild_was_required,
+        salvage_messages_imported,
+        initial_checkpoint_status,
+        scan_canonical_mutations,
+        observed_tantivy_docs,
+    ) {
+        live_tantivy_doc_count(index_path)
+    } else {
+        Ok(observed_tantivy_docs)
+    }
+}
+
+fn should_force_authoritative_rebuild(
+    canonical_storage_rebuilt: bool,
+    tantivy_requires_rebuild: bool,
+) -> bool {
+    canonical_storage_rebuilt || tantivy_requires_rebuild
 }
 
 fn should_skip_noop_final_lexical_checkpoint_refresh(
     full_rebuild: bool,
     rebuild_was_required: bool,
-    initial_checkpoint_status: MatchingLexicalRebuildStateStatus,
+    initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
     exact_total_counts: Option<(usize, usize)>,
     canonical_mutations: CanonicalMutationCounts,
 ) -> bool {
@@ -1173,7 +1253,7 @@ fn should_skip_post_full_scan_authoritative_rebuild(
     full_rebuild: bool,
     rebuild_was_required: bool,
     salvage_messages_imported: usize,
-    initial_checkpoint_status: MatchingLexicalRebuildStateStatus,
+    initial_checkpoint_status: &MatchingLexicalRebuildStateStatus,
     scan_canonical_mutations: CanonicalMutationCounts,
     observed_tantivy_docs: Option<usize>,
 ) -> bool {
@@ -4783,7 +4863,7 @@ fn choose_incremental_canonical_lexical_repair_plan(
 }
 
 fn should_salvage_historical_databases(
-    storage_rebuilt: bool,
+    canonical_storage_rebuilt: bool,
     canonical_sessions_before_salvage: usize,
     has_pending_historical_bundles: bool,
     canonical_only_full_rebuild: bool,
@@ -4791,7 +4871,9 @@ fn should_salvage_historical_databases(
     if canonical_only_full_rebuild {
         return false;
     }
-    storage_rebuilt || canonical_sessions_before_salvage == 0 || has_pending_historical_bundles
+    canonical_storage_rebuilt
+        || canonical_sessions_before_salvage == 0
+        || has_pending_historical_bundles
 }
 
 fn should_run_targeted_watch_once_only(
@@ -4815,16 +4897,49 @@ fn should_repair_fallback_fts_after_full_index_run(
     full_rebuild && !canonical_only_full_rebuild
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FallbackFtsRepairOutcome {
+    SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
+    Repaired(FtsConsistencyRepair),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DailyStatsRepairOutcome {
+    SkippedKnownHealthyForFingerprint {
+        archive_fingerprint: String,
+    },
+    AlreadyHealthy,
+    Rebuilt {
+        rows_created: i64,
+        total_sessions: i64,
+    },
+}
+
 fn repair_fallback_fts_after_full_index_run(
     storage: &FrankenStorage,
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
-) -> Result<Option<FtsConsistencyRepair>> {
+    known_archive_fingerprint: Option<&str>,
+) -> Result<Option<FallbackFtsRepairOutcome>> {
     if !should_repair_fallback_fts_after_full_index_run(full_rebuild, canonical_only_full_rebuild) {
         return Ok(None);
     }
 
-    Ok(Some(storage.ensure_search_fallback_fts_consistency()?))
+    if let Some(archive_fingerprint) = known_archive_fingerprint
+        && storage.fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
+    {
+        return Ok(Some(
+            FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                archive_fingerprint: archive_fingerprint.to_string(),
+            },
+        ));
+    }
+
+    let repair = storage.ensure_search_fallback_fts_consistency()?;
+    if let Some(archive_fingerprint) = known_archive_fingerprint {
+        storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
+    }
+    Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
 }
 
 fn full_rebuild_requires_historical_restart(
@@ -5717,7 +5832,19 @@ pub(crate) fn load_lexical_rebuild_snapshot(
     }))
 }
 
-fn repair_daily_stats_if_drifted(storage: &FrankenStorage, db_path: &Path) -> Result<()> {
+fn repair_daily_stats_if_drifted(
+    storage: &FrankenStorage,
+    db_path: &Path,
+    known_archive_fingerprint: Option<&str>,
+) -> Result<DailyStatsRepairOutcome> {
+    if let Some(archive_fingerprint) = known_archive_fingerprint
+        && storage.daily_stats_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
+    {
+        return Ok(DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
+            archive_fingerprint: archive_fingerprint.to_string(),
+        });
+    }
+
     let health = storage.daily_stats_health().with_context(|| {
         format!(
             "checking daily_stats health before index planning for {}",
@@ -5726,7 +5853,10 @@ fn repair_daily_stats_if_drifted(storage: &FrankenStorage, db_path: &Path) -> Re
     })?;
 
     if health.populated && health.drift == 0 {
-        return Ok(());
+        if let Some(archive_fingerprint) = known_archive_fingerprint {
+            storage.record_daily_stats_archive_fingerprint(archive_fingerprint)?;
+        }
+        return Ok(DailyStatsRepairOutcome::AlreadyHealthy);
     }
 
     tracing::warn!(
@@ -5753,7 +5883,24 @@ fn repair_daily_stats_if_drifted(storage: &FrankenStorage, db_path: &Path) -> Re
         "rebuilt daily_stats before index planning"
     );
 
-    Ok(())
+    if let Some(archive_fingerprint) = known_archive_fingerprint {
+        storage.record_daily_stats_archive_fingerprint(archive_fingerprint)?;
+    }
+
+    Ok(DailyStatsRepairOutcome::Rebuilt {
+        rows_created: rebuilt.rows_created,
+        total_sessions: rebuilt.total_sessions,
+    })
+}
+
+fn should_repair_daily_stats_after_historical_salvage(
+    checked_pre_scan: bool,
+    full_refresh: bool,
+    rebuild_from_canonical_only: bool,
+    salvage_messages_imported: usize,
+) -> bool {
+    salvage_messages_imported > 0
+        || (full_refresh && !rebuild_from_canonical_only && !checked_pre_scan)
 }
 
 // =============================================================================
@@ -6293,7 +6440,7 @@ fn run_streaming_consumer(
     rx: Receiver<IndexMessage>,
     num_producers: usize,
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
+    mut t_index: Option<&mut TantivyIndex>,
     flow_limiter: Arc<StreamingByteLimiter>,
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -6359,7 +6506,7 @@ fn run_streaming_consumer(
                 // Ingest the batch
                 let ingest_result = ingest_batch(
                     storage,
-                    t_index,
+                    t_index.as_deref_mut(),
                     &conversations,
                     progress,
                     lexical_strategy,
@@ -6370,10 +6517,12 @@ fn run_streaming_consumer(
 
                 // Periodic commit to make results visible incrementally (every 5s)
                 if last_commit.elapsed() >= Duration::from_secs(5) {
-                    if let Err(e) = t_index.commit() {
-                        tracing::warn!("incremental commit failed: {}", e);
-                    } else {
-                        tracing::debug!("incremental commit completed");
+                    if let Some(t_index) = t_index.as_deref_mut() {
+                        if let Err(e) = t_index.commit() {
+                            tracing::warn!("incremental commit failed: {}", e);
+                        } else {
+                            tracing::debug!("incremental commit completed");
+                        }
                     }
                     // Persist scan_start_ts so that if the process is killed,
                     // the next run does a delta scan from this point instead of
@@ -6466,7 +6615,9 @@ fn run_streaming_consumer(
     }
 
     // Final commit to ensure all data is persisted
-    t_index.commit()?;
+    if let Some(t_index) = t_index {
+        t_index.commit()?;
+    }
 
     let index_ms = index_start.elapsed().as_millis() as u64;
 
@@ -6508,7 +6659,7 @@ fn run_streaming_consumer(
 /// providing backpressure when indexing falls behind scanning.
 fn run_streaming_index(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
+    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -6522,17 +6673,58 @@ fn run_streaming_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
-        get_connector_factories(),
+        configured_connector_factories(),
         scan_start_ts,
     )
 }
 
 type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
 
+fn configured_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
+    filter_disabled_connector_factories(get_connector_factories())
+}
+
+fn filter_disabled_connector_factories(
+    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+) -> Vec<(&'static str, ConnectorFactory)> {
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return connector_factories;
+    }
+
+    let config = match SourcesConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "failed to load sources config while filtering disabled connectors"
+            );
+            return connector_factories;
+        }
+    };
+
+    let disabled_agents = config.configured_disabled_agents();
+    if disabled_agents.is_empty() {
+        return connector_factories;
+    }
+
+    let filtered = connector_factories
+        .into_iter()
+        .filter(|(name, _)| !config.is_agent_disabled(name))
+        .collect::<Vec<_>>();
+
+    tracing::info!(
+        disabled_agents = ?disabled_agents,
+        enabled_connectors = filtered.len(),
+        "skipping disabled connectors from indexing configuration"
+    );
+
+    filtered
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_streaming_index_with_connector_factories(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
+    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -6540,6 +6732,20 @@ fn run_streaming_index_with_connector_factories(
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
 ) -> Result<CanonicalMutationCounts> {
+    if connector_factories.is_empty() {
+        tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
+        if let Some(p) = &opts.progress {
+            p.phase.store(1, Ordering::Relaxed);
+            p.total.store(0, Ordering::Relaxed);
+            p.current.store(0, Ordering::Relaxed);
+            p.discovered_agents.store(0, Ordering::Relaxed);
+            if let Ok(mut names) = p.discovered_agent_names.lock() {
+                names.clear();
+            }
+        }
+        return Ok(CanonicalMutationCounts::default());
+    }
+
     let buffered_connectors: Vec<&'static str> = connector_factories
         .iter()
         .filter_map(|(name, factory)| {
@@ -6660,15 +6866,37 @@ fn run_streaming_index_with_connector_factories(
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
 fn run_batch_index(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
+    t_index: Option<&mut TantivyIndex>,
     opts: &IndexOptions,
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     scan_start_ts: i64,
 ) -> Result<CanonicalMutationCounts> {
+    run_batch_index_with_connector_factories(
+        storage,
+        t_index,
+        opts,
+        since_ts,
+        lexical_strategy,
+        additional_scan_roots,
+        configured_connector_factories(),
+        scan_start_ts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_batch_index_with_connector_factories(
+    storage: &FrankenStorage,
+    mut t_index: Option<&mut TantivyIndex>,
+    opts: &IndexOptions,
+    since_ts: Option<i64>,
+    lexical_strategy: LexicalPopulationStrategy,
+    additional_scan_roots: Vec<ScanRoot>,
+    connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    scan_start_ts: i64,
+) -> Result<CanonicalMutationCounts> {
     let scan_start = std::time::Instant::now();
-    let connector_factories = get_connector_factories();
 
     // First pass: Scan all to get counts if we have progress tracker
     // Use parallel iteration for faster agent discovery
@@ -6831,7 +7059,7 @@ fn run_batch_index(
     for (name, convs, _discovered) in pending_batches {
         canonical_mutations = canonical_mutations.accumulate(ingest_batch(
             storage,
-            t_index,
+            t_index.as_deref_mut(),
             &convs,
             &opts.progress,
             lexical_strategy,
@@ -6898,12 +7126,13 @@ pub fn run_index(
         Arc::clone(&index_run_lock.metadata_write_lock),
     );
 
-    let (storage, storage_rebuilt, opened_fresh_for_full) =
+    let (storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let defer_checkpoints = !opts.watch;
     let mut storage = storage;
-    let mut storage_rebuilt = storage_rebuilt;
+    let mut canonical_storage_rebuilt = canonical_storage_rebuilt;
     let mut opened_fresh_for_full = opened_fresh_for_full;
+    let mut reopened_after_writable_preflight = false;
 
     // CASS #162 item 2: Verify the connection is writable early, before the
     // code reaches deep batch-insert paths where a readonly failure is hard
@@ -6932,7 +7161,9 @@ pub fn run_index(
                 opts.db_path.display()
             )
         })?;
-        storage_rebuilt = true;
+        // Reopening repairs handle availability only; it does not mean the
+        // canonical database content was reset or replaced.
+        reopened_after_writable_preflight = true;
     }
 
     persist::apply_index_writer_busy_timeout(&storage);
@@ -6953,7 +7184,7 @@ pub fn run_index(
             "full rebuild detected incomplete historical salvage state; restarting from a fresh canonical database"
         );
         storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-        storage_rebuilt = true;
+        canonical_storage_rebuilt = true;
         opened_fresh_for_full = true;
         persist::apply_index_writer_busy_timeout(&storage);
         persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
@@ -6977,11 +7208,49 @@ pub fn run_index(
     } else {
         false
     };
-    if opts.full && !resume_lexical_rebuild {
+    let preserve_matching_completed_checkpoint_during_full_scan =
+        should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+            opts.full,
+            resume_lexical_rebuild,
+            canonical_only_full_rebuild,
+            &initial_matching_lexical_checkpoint,
+        );
+    if opts.full
+        && !resume_lexical_rebuild
+        && !preserve_matching_completed_checkpoint_during_full_scan
+    {
         clear_lexical_rebuild_state(&index_path)?;
+    } else if preserve_matching_completed_checkpoint_during_full_scan {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            completed_indexed_docs = initial_matching_lexical_checkpoint.completed_indexed_docs,
+            "preserving matching completed lexical checkpoint during full scan until canonical mutations require a rebuild"
+        );
     }
+    let pre_scan_daily_stats_archive_fingerprint =
+        preserve_matching_completed_checkpoint_during_full_scan
+            .then_some(
+                initial_matching_lexical_checkpoint
+                    .completed_storage_fingerprint
+                    .as_deref(),
+            )
+            .flatten();
+    let mut checked_daily_stats_pre_scan = false;
     if opts.full && !canonical_only_full_rebuild {
-        repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+        if let DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
+            archive_fingerprint,
+        } = repair_daily_stats_if_drifted(
+            &storage,
+            &opts.db_path,
+            pre_scan_daily_stats_archive_fingerprint,
+        )? {
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                archive_fingerprint,
+                "skipping pre-scan daily_stats health probe because this full run preserved an archive fingerprint already known to be healthy"
+            );
+        }
+        checked_daily_stats_pre_scan = true;
     } else if canonical_only_full_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -6992,47 +7261,63 @@ pub fn run_index(
     let mut performed_scan = false;
     let mut scan_canonical_mutations = CanonicalMutationCounts::default();
 
-    // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
-    // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
-    let schema_hash_path = index_path.join("schema_hash.json");
-    let schema_matches = schema_hash_path.exists()
-        && std::fs::read_to_string(&schema_hash_path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|json| {
-                json.get("schema_hash")
-                    .and_then(|v| v.as_str())
-                    .map(schema_hash_matches)
-            })
-            .unwrap_or(false);
-
-    // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
-    let meta_path = index_path.join("meta.json");
-    let mut tantivy_requires_rebuild = opts.force_rebuild || !meta_path.exists() || !schema_matches;
+    let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
+    if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
+        // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
+        // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
+        let schema_hash_path = index_path.join("schema_hash.json");
+        let schema_matches = schema_hash_path.exists()
+            && std::fs::read_to_string(&schema_hash_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .and_then(|json| {
+                    json.get("schema_hash")
+                        .and_then(|v| v.as_str())
+                        .map(schema_hash_matches)
+                })
+                .unwrap_or(false);
 
-    // Preflight open: if the cass-compatible Tantivy reader can't open, force a
-    // rebuild so we do a full scan and reindex messages into the new index
-    // (SQLite is incremental-only by default).
-    if !tantivy_requires_rebuild {
-        match frankensearch::lexical::cass_open_search_reader(
-            &index_path,
-            frankensearch::lexical::ReloadPolicy::Manual,
-        ) {
-            Ok((reader, _fields)) => {
-                observed_tantivy_docs = Some(reader.searcher().num_docs() as usize);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %index_path.display(),
-                    "tantivy open preflight failed; forcing rebuild"
-                );
-                tantivy_requires_rebuild = true;
+        // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
+        let meta_path = index_path.join("meta.json");
+        tantivy_requires_rebuild = opts.force_rebuild || !meta_path.exists() || !schema_matches;
+
+        // Preflight open: if the cass-compatible Tantivy reader can't open, force a
+        // rebuild so we do a full scan and reindex messages into the new index
+        // (SQLite is incremental-only by default).
+        if !tantivy_requires_rebuild {
+            match frankensearch::lexical::cass_open_search_reader(
+                &index_path,
+                frankensearch::lexical::ReloadPolicy::Manual,
+            ) {
+                Ok((reader, _fields)) => {
+                    observed_tantivy_docs = Some(reader.searcher().num_docs() as usize);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %index_path.display(),
+                        "tantivy open preflight failed; forcing rebuild"
+                    );
+                    tantivy_requires_rebuild = true;
+                }
             }
         }
+    } else if resume_lexical_rebuild {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "skipping live Tantivy schema/reader preflight because checkpoint resume will rebuild directly from the canonical database"
+        );
+    } else if opts.full {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "deferring live Tantivy reader/doc-count preflight until after the full scan proves the canonical archive is unchanged"
+        );
+    } else {
+        tracing::info!(db_path = %opts.db_path.display(), "skipping live Tantivy reader preflight");
     }
-    let mut needs_rebuild = storage_rebuilt || tantivy_requires_rebuild;
+    let mut needs_rebuild =
+        should_force_authoritative_rebuild(canonical_storage_rebuilt, tantivy_requires_rebuild);
     let initial_needs_rebuild = needs_rebuild;
 
     if needs_rebuild && let Some(p) = &opts.progress {
@@ -7056,9 +7341,10 @@ pub fn run_index(
                     tracing::warn!(
                         old_index = %index_path.display(),
                         backup = %backup_path.display(),
-                        schema_matches,
+                        canonical_storage_rebuilt,
+                        tantivy_requires_rebuild,
                         "backed up existing Tantivy index before rebuild \
-                         (schema or metadata changed); remove the backup \
+                         (canonical db or index metadata changed); remove the backup \
                          manually once you have confirmed the new index is healthy"
                     );
                 }
@@ -7085,6 +7371,7 @@ pub fn run_index(
             .is_some_and(|paths| !paths.is_empty());
 
     let mut exact_completed_lexical_checkpoint = false;
+    let mut skipped_noop_full_scan_authoritative_rebuild = false;
     let t_index = if resume_lexical_rebuild {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -7163,14 +7450,15 @@ pub fn run_index(
         );
         let should_salvage_historical = !targeted_watch_once_only
             && should_salvage_historical_databases(
-                storage_rebuilt,
+                canonical_storage_rebuilt,
                 canonical_sessions_before_salvage,
                 has_pending_historical_bundles,
                 canonical_only_full_rebuild,
             );
         tracing::warn!(
             db_path = %opts.db_path.display(),
-            storage_rebuilt,
+            canonical_storage_rebuilt,
+            reopened_after_writable_preflight,
             opened_fresh_for_full,
             canonical_sessions_before_salvage,
             has_pending_historical_bundles,
@@ -7251,10 +7539,13 @@ pub fn run_index(
             None
         };
 
-        if historical_salvage.conversations_imported > 0
-            || (opts.full && !rebuild_from_canonical_only)
-        {
-            repair_daily_stats_if_drifted(&storage, &opts.db_path)?;
+        if should_repair_daily_stats_after_historical_salvage(
+            checked_daily_stats_pre_scan,
+            opts.full,
+            rebuild_from_canonical_only,
+            historical_salvage.messages_imported,
+        ) {
+            repair_daily_stats_if_drifted(&storage, &opts.db_path, None)?;
         }
 
         if rebuild_from_canonical_only {
@@ -7408,19 +7699,24 @@ pub fn run_index(
 
                 let additional_scan_roots =
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                let scan_requires_tantivy =
+                    lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
 
                 // Choose between streaming indexing (Opt 8.2) and batch indexing
-                if t_index.is_none() {
+                if scan_requires_tantivy && t_index.is_none() {
                     t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                } else if !scan_requires_tantivy {
+                    tracing::info!(
+                        strategy = lexical_strategy.as_str(),
+                        "scan phase is deferring Tantivy writer open/commit until the authoritative rebuild"
+                    );
                 }
                 if streaming_index_enabled() {
                     tracing::info!("using streaming indexing (Opt 8.2)");
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(run_streaming_index(
                             &storage,
-                            t_index.as_mut().expect(
-                                "tantivy index must remain open during streaming lexical scan",
-                            ),
+                            t_index.as_mut(),
                             &opts,
                             since_ts,
                             lexical_strategy,
@@ -7434,9 +7730,7 @@ pub fn run_index(
                     scan_canonical_mutations =
                         scan_canonical_mutations.accumulate(run_batch_index(
                             &storage,
-                            t_index
-                                .as_mut()
-                                .expect("tantivy index must remain open during batch lexical scan"),
+                            t_index.as_mut(),
                             &opts,
                             since_ts,
                             lexical_strategy,
@@ -7446,36 +7740,54 @@ pub fn run_index(
                 }
                 performed_scan = true;
 
-                t_index
-                    .as_mut()
-                    .expect("tantivy index must remain open for lexical commit")
-                    .commit()?;
+                if scan_requires_tantivy {
+                    t_index
+                        .as_mut()
+                        .expect("tantivy index must remain open for lexical commit")
+                        .commit()?;
+                }
 
                 if opts.full || historical_salvage.messages_imported > 0 {
+                    let post_scan_observed_tantivy_docs =
+                        observed_tantivy_docs_for_post_full_scan_skip(
+                            &index_path,
+                            opts.full,
+                            initial_needs_rebuild,
+                            historical_salvage.messages_imported,
+                            &initial_matching_lexical_checkpoint,
+                            scan_canonical_mutations,
+                            observed_tantivy_docs,
+                        )?;
                     if should_skip_post_full_scan_authoritative_rebuild(
                         opts.full,
                         initial_needs_rebuild,
                         historical_salvage.messages_imported,
-                        initial_matching_lexical_checkpoint,
+                        &initial_matching_lexical_checkpoint,
                         scan_canonical_mutations,
-                        observed_tantivy_docs,
+                        post_scan_observed_tantivy_docs,
                     ) {
                         tracing::info!(
                             db_path = %opts.db_path.display(),
-                            observed_tantivy_docs,
+                            observed_tantivy_docs = post_scan_observed_tantivy_docs,
                             completed_indexed_docs = initial_matching_lexical_checkpoint
                                 .completed_indexed_docs,
                             inserted_conversations = scan_canonical_mutations.inserted_conversations,
                             inserted_messages = scan_canonical_mutations.inserted_messages,
                             "skipping post-scan authoritative lexical rebuild because the full scan found no canonical changes and the live Tantivy index still matches the completed checkpoint"
                         );
-                        let exact_total_conversations = count_total_conversations_exact(&storage)?;
-                        let exact_total_messages = count_total_messages_exact(&storage)?;
+                        let (exact_total_conversations, exact_total_messages) =
+                            initial_matching_lexical_checkpoint
+                                .completed_exact_totals
+                                .unwrap_or((
+                                    count_total_conversations_exact(&storage)?,
+                                    count_total_messages_exact(&storage)?,
+                                ));
                         record_exact_total_counts_in_progress(
                             opts.progress.as_ref(),
                             exact_total_conversations,
                             exact_total_messages,
                         );
+                        skipped_noop_full_scan_authoritative_rebuild = true;
                     } else {
                         drop(t_index.take());
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
@@ -7646,10 +7958,17 @@ pub fn run_index(
             db_path = %opts.db_path.display(),
             "skipping final lexical checkpoint refresh because the authoritative rebuild already persisted exact completed state"
         );
+    } else if skipped_noop_full_scan_authoritative_rebuild {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            inserted_conversations = scan_canonical_mutations.inserted_conversations,
+            inserted_messages = scan_canonical_mutations.inserted_messages,
+            "skipping final lexical checkpoint refresh because the full scan preserved an already-matching completed checkpoint"
+        );
     } else if should_skip_noop_final_lexical_checkpoint_refresh(
         opts.full,
         initial_needs_rebuild,
-        initial_matching_lexical_checkpoint,
+        &initial_matching_lexical_checkpoint,
         exact_total_counts,
         scan_canonical_mutations,
     ) {
@@ -7675,27 +7994,46 @@ pub fn run_index(
         })?;
     }
 
-    if let Some(repair) =
-        repair_fallback_fts_after_full_index_run(&storage, opts.full, canonical_only_full_rebuild)
-            .with_context(|| {
-            format!(
-                "repairing frankensqlite-owned fallback FTS after full index run for {}",
-                opts.db_path.display()
-            )
-        })?
-    {
+    let fallback_fts_archive_fingerprint = skipped_noop_full_scan_authoritative_rebuild
+        .then_some(
+            initial_matching_lexical_checkpoint
+                .completed_storage_fingerprint
+                .as_deref(),
+        )
+        .flatten();
+    if let Some(repair) = repair_fallback_fts_after_full_index_run(
+        &storage,
+        opts.full,
+        canonical_only_full_rebuild,
+        fallback_fts_archive_fingerprint,
+    )
+    .with_context(|| {
+        format!(
+            "repairing frankensqlite-owned fallback FTS after full index run for {}",
+            opts.db_path.display()
+        )
+    })? {
         match repair {
-            FtsConsistencyRepair::AlreadyHealthy { rows } => {
+            FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                archive_fingerprint,
+            } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    archive_fingerprint,
+                    "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
+                );
+            }
+            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     rows,
                     "fallback FTS was already healthy after full index run; skipped rebuild"
                 );
             }
-            FtsConsistencyRepair::IncrementalCatchUp {
+            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::IncrementalCatchUp {
                 inserted_rows,
                 total_rows,
-            } => {
+            }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     inserted_rows,
@@ -7703,7 +8041,7 @@ pub fn run_index(
                     "incrementally repaired fallback FTS after full index run"
                 );
             }
-            FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+            FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::Rebuilt { inserted_rows }) => {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     inserted_rows,
@@ -11229,7 +11567,7 @@ fn rebuild_tantivy_from_db_with_options(
 
 fn ingest_batch(
     storage: &FrankenStorage,
-    t_index: &mut TantivyIndex,
+    t_index: Option<&mut TantivyIndex>,
     convs: &[NormalizedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
@@ -11267,7 +11605,7 @@ pub use crate::connectors::get_connector_factories;
 /// 1. Local roots detected by connectors
 /// 2. Remote mirror roots (assigned to ALL connectors since we don't know the mapping)
 fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind, ScanRoot)> {
-    let factories = get_connector_factories();
+    let factories = configured_connector_factories();
     let mut roots = Vec::new();
     let mut all_kinds = Vec::new();
 
@@ -11702,7 +12040,7 @@ fn reindex_paths(
 
             ingest_batch(
                 &storage,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 &opts.progress,
                 LexicalPopulationStrategy::IncrementalInline,
@@ -12488,7 +12826,7 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
-    use super::LexicalPopulationStrategy;
+    use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use std::time::Duration;
@@ -12933,11 +13271,19 @@ pub mod persist {
 
     fn persist_conversations_batched_begin_concurrent(
         db_path: &std::path::Path,
-        t_index: &mut TantivyIndex,
+        mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
+        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
+            && t_index.is_none()
+        {
+            anyhow::bail!(
+                "begin-concurrent batched persistence requires a Tantivy writer for {}",
+                lexical_strategy.as_str()
+            );
+        }
         let max_retries = begin_concurrent_retry_limit();
         let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
 
@@ -13036,11 +13382,14 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    t_index.add_messages_with_conversation_id(
-                        conv,
-                        &conv.messages,
-                        Some(outcome.conversation_id),
-                    )?;
+                    t_index
+                        .as_deref_mut()
+                        .expect("inline rebuild requires Tantivy writer")
+                        .add_messages_with_conversation_id(
+                            conv,
+                            &conv.messages,
+                            Some(outcome.conversation_id),
+                        )?;
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
                     if !outcome.inserted_indices.is_empty() {
@@ -13050,11 +13399,14 @@ pub mod persist {
                             .filter(|m| outcome.inserted_indices.contains(&m.idx))
                             .cloned()
                             .collect();
-                        t_index.add_messages_with_conversation_id(
-                            conv,
-                            &new_msgs,
-                            Some(outcome.conversation_id),
-                        )?;
+                        t_index
+                            .as_deref_mut()
+                            .expect("incremental inline updates require Tantivy writer")
+                            .add_messages_with_conversation_id(
+                                conv,
+                                &new_msgs,
+                                Some(outcome.conversation_id),
+                            )?;
                     }
                 }
             }
@@ -13252,13 +13604,21 @@ pub mod persist {
     /// Set `CASS_SQLITE_CACHE=0` to disable caching for debugging.
     pub(super) fn persist_conversations_batched(
         storage: &FrankenStorage,
-        t_index: &mut TantivyIndex,
+        mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
+        }
+        if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
+            && t_index.is_none()
+        {
+            anyhow::bail!(
+                "batched persistence requires a Tantivy writer for {}",
+                lexical_strategy.as_str()
+            );
         }
 
         let begin_concurrent_enabled = begin_concurrent_writes_enabled();
@@ -13369,11 +13729,14 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        t_index.add_messages_with_conversation_id(
-                            conv,
-                            &conv.messages,
-                            Some(outcome.conversation_id),
-                        )?;
+                        t_index
+                            .as_deref_mut()
+                            .expect("inline rebuild requires Tantivy writer")
+                            .add_messages_with_conversation_id(
+                                conv,
+                                &conv.messages,
+                                Some(outcome.conversation_id),
+                            )?;
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
                         if !outcome.inserted_indices.is_empty() {
@@ -13383,11 +13746,14 @@ pub mod persist {
                                 .filter(|m| outcome.inserted_indices.contains(&m.idx))
                                 .cloned()
                                 .collect();
-                            t_index.add_messages_with_conversation_id(
-                                conv,
-                                &new_msgs,
-                                Some(outcome.conversation_id),
-                            )?;
+                            t_index
+                                .as_deref_mut()
+                                .expect("incremental inline updates require Tantivy writer")
+                                .add_messages_with_conversation_id(
+                                    conv,
+                                    &new_msgs,
+                                    Some(outcome.conversation_id),
+                                )?;
                         }
                     }
                 }
@@ -13611,7 +13977,7 @@ pub mod persist {
 
             persist_conversations_batched_begin_concurrent(
                 &db_path,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -13712,7 +14078,7 @@ pub mod persist {
 
             persist_conversations_batched_begin_concurrent(
                 &db_path,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
                 false,
@@ -13785,7 +14151,7 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 false,
@@ -13860,7 +14226,7 @@ pub mod persist {
 
             persist_conversations_batched_begin_concurrent(
                 &db_path,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 false,
@@ -14153,7 +14519,7 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -14225,7 +14591,7 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -14297,7 +14663,7 @@ pub mod persist {
 
             persist_conversations_batched(
                 &storage,
-                &mut t_index,
+                Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::IncrementalInline,
                 false,
@@ -14386,7 +14752,7 @@ pub mod persist {
 
                 persist_conversations_batched(
                     &storage,
-                    &mut t_index,
+                    Some(&mut t_index),
                     &convs,
                     LexicalPopulationStrategy::IncrementalInline,
                     false,
@@ -14515,7 +14881,7 @@ pub mod persist {
 
                 persist_conversations_batched(
                     &storage,
-                    &mut t_index,
+                    Some(&mut t_index),
                     &convs,
                     LexicalPopulationStrategy::IncrementalInline,
                     false,
@@ -14801,6 +15167,24 @@ mod tests {
         }
     }
 
+    fn set_env_var(key: &'static str, value: impl AsRef<str>) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        // SAFETY: test helper toggles a process-local env var for isolation.
+        unsafe {
+            std::env::set_var(key, value.as_ref());
+        }
+        EnvGuard { key, previous }
+    }
+
+    fn unset_env_var(key: &'static str) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        // SAFETY: test helper toggles a process-local env var for isolation.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        EnvGuard { key, previous }
+    }
+
     fn ignore_sources_config() -> EnvGuard {
         let key = "CASS_IGNORE_SOURCES_CONFIG";
         let previous = dotenvy::var(key).ok();
@@ -14809,6 +15193,10 @@ mod tests {
             std::env::set_var(key, "1");
         }
         EnvGuard { key, previous }
+    }
+
+    fn never_constructed_connector_factory() -> Box<dyn Connector + Send> {
+        panic!("test should not construct connector factories while filtering by config");
     }
 
     fn set_env(key: &'static str, value: &str) -> EnvGuard {
@@ -17606,6 +17994,46 @@ mod tests {
         .expect("done message should send");
     }
 
+    struct DeferredBatchConnector;
+
+    impl Connector for DeferredBatchConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(vec![norm_conv(
+                Some("deferred-batch"),
+                vec![
+                    norm_msg(0, 1_700_000_000_000),
+                    norm_msg(1, 1_700_000_000_100),
+                ],
+            )])
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            for conversation in self.scan(ctx)? {
+                on_conversation(conversation)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn deferred_batch_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(DeferredBatchConnector)
+    }
+
     struct DetectedRemoteFailureConnector;
 
     impl Connector for DetectedRemoteFailureConnector {
@@ -18201,7 +18629,7 @@ mod tests {
             rx,
             1,
             &storage,
-            &mut index,
+            Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -18215,6 +18643,72 @@ mod tests {
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(stats.total_conversations, 0);
         assert_eq!(stats.total_messages, 0);
+    }
+
+    #[test]
+    fn streaming_consumer_can_defer_authoritative_lexical_updates_without_tantivy_writer() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let progress = Arc::new(IndexingProgress::default());
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+
+        send_conversation_batches(
+            &tx,
+            "codex",
+            vec![norm_conv(
+                Some("stream-deferred"),
+                vec![
+                    norm_msg(0, 1_700_000_000_000),
+                    norm_msg(1, 1_700_000_000_100),
+                ],
+            )],
+            true,
+        );
+        send_done(&tx, "codex", true);
+        drop(tx);
+
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            None,
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Some(FrankenStorage::now_millis()),
+        )
+        .expect("deferred streaming ingest should not require a Tantivy writer");
+
+        let conversation_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+
+        assert_eq!(discovered, vec!["codex".to_string()]);
+        assert_eq!(
+            mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 2,
+            }
+        );
+        assert_eq!(conversation_count, 1);
+        assert_eq!(message_count, 2);
+        assert!(
+            !index_dir(&data_dir).unwrap().join("meta.json").exists(),
+            "deferred streaming ingest should not materialize a live Tantivy index before the authoritative rebuild"
+        );
     }
 
     #[test]
@@ -18267,7 +18761,7 @@ mod tests {
             rx,
             2,
             &storage,
-            &mut index,
+            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -18332,7 +18826,7 @@ mod tests {
         let first = vec![norm_conv(Some("checkpoint-a"), vec![norm_msg(0, 1_000)])];
         ingest_batch(
             &storage,
-            &mut index,
+            Some(&mut index),
             &first,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -18347,7 +18841,7 @@ mod tests {
         let second = vec![norm_conv(Some("checkpoint-b"), vec![norm_msg(0, 2_000)])];
         ingest_batch(
             &storage,
-            &mut index,
+            Some(&mut index),
             &second,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -18420,7 +18914,7 @@ mod tests {
             rx,
             1,
             &storage,
-            &mut index,
+            Some(&mut index),
             flow_limiter,
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
@@ -18471,7 +18965,7 @@ mod tests {
 
         let error = run_streaming_index_with_connector_factories(
             &storage,
-            &mut index,
+            Some(&mut index),
             &opts,
             None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -18497,6 +18991,71 @@ mod tests {
                 .as_deref(),
             Some(message.as_str()),
             "progress tracker should expose the real panic instead of pretending indexing succeeded"
+        );
+    }
+
+    #[test]
+    fn batch_index_can_defer_authoritative_lexical_updates_without_tantivy_writer() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: true,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: Some(progress.clone()),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            vec![("codex", deferred_batch_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .expect("deferred batch ingest should not require a Tantivy writer");
+
+        let conversation_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+
+        assert_eq!(
+            mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 2,
+            }
+        );
+        assert_eq!(conversation_count, 1);
+        assert_eq!(message_count, 2);
+        assert_eq!(stats.total_conversations, 1);
+        assert_eq!(stats.total_messages, 2);
+        assert!(
+            !index_dir(&data_dir).unwrap().join("meta.json").exists(),
+            "deferred batch ingest should not materialize a live Tantivy index before the authoritative rebuild"
         );
     }
 
@@ -18858,11 +19417,93 @@ mod tests {
         assert_eq!(before.materialized_total, 99);
         assert!(before.drift > 0);
 
-        repair_daily_stats_if_drifted(&storage, &db_path).unwrap();
+        assert_eq!(
+            repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
+            DailyStatsRepairOutcome::Rebuilt {
+                rows_created: 4,
+                total_sessions: 1,
+            }
+        );
         let after = storage.daily_stats_health().unwrap();
         assert_eq!(after.conversation_count, 1);
         assert_eq!(after.materialized_total, 1);
         assert_eq!(after.drift, 0);
+    }
+
+    #[test]
+    fn repair_daily_stats_if_drifted_skips_known_healthy_archive_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some("daily-stats-known-healthy".into()),
+            title: Some("healthy".into()),
+            source_path: std::path::PathBuf::from("/tmp/healthy.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        let archive_fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
+        storage
+            .record_daily_stats_archive_fingerprint(&archive_fingerprint)
+            .unwrap();
+
+        assert_eq!(
+            repair_daily_stats_if_drifted(&storage, &db_path, Some(&archive_fingerprint)).unwrap(),
+            DailyStatsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                archive_fingerprint
+            }
+        );
+    }
+
+    #[test]
+    fn daily_stats_repair_after_historical_salvage_avoids_duplicate_plain_full_probe() {
+        assert!(
+            !should_repair_daily_stats_after_historical_salvage(true, true, false, 0),
+            "plain full runs should not re-check daily_stats after a pre-scan probe when no salvage changed canonical data"
+        );
+        assert!(should_repair_daily_stats_after_historical_salvage(
+            false, true, false, 0
+        ));
+        assert!(should_repair_daily_stats_after_historical_salvage(
+            true, true, false, 7
+        ));
+        assert!(!should_repair_daily_stats_after_historical_salvage(
+            false, true, true, 0
+        ));
+        assert!(!should_repair_daily_stats_after_historical_salvage(
+            true, false, false, 0
+        ));
     }
 
     #[test]
@@ -18938,10 +19579,12 @@ mod tests {
         ensure_fts_schema(&storage);
         seed_lexical_rebuild_fixture(&storage);
 
-        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false).unwrap();
+        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false, None).unwrap();
         assert_eq!(
             repair,
-            Some(FtsConsistencyRepair::AlreadyHealthy { rows: 4 })
+            Some(FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::AlreadyHealthy { rows: 4 }
+            ))
         );
     }
 
@@ -18952,10 +19595,43 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_lexical_rebuild_fixture(&storage);
 
-        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false).unwrap();
+        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false, None).unwrap();
         assert_eq!(
             repair,
-            Some(FtsConsistencyRepair::Rebuilt { inserted_rows: 4 })
+            Some(FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
+            ))
+        );
+    }
+
+    #[test]
+    fn full_run_fallback_fts_repair_skips_known_healthy_archive_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-known-healthy.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let archive_fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        storage
+            .record_search_fallback_fts_archive_fingerprint(&archive_fingerprint)
+            .unwrap();
+
+        let repair = repair_fallback_fts_after_full_index_run(
+            &storage,
+            true,
+            false,
+            Some(&archive_fingerprint),
+        )
+        .unwrap();
+        assert_eq!(
+            repair,
+            Some(
+                FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
+                    archive_fingerprint
+                }
+            )
         );
     }
 
@@ -22733,7 +23409,7 @@ mod tests {
         )];
         ingest_batch(
             &storage,
-            &mut index,
+            Some(&mut index),
             &convs,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -22785,7 +23461,7 @@ mod tests {
         let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         ingest_batch(
             &storage,
-            &mut index,
+            Some(&mut index),
             &convs,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -22844,7 +23520,7 @@ mod tests {
             TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         ingest_batch(
             &storage,
-            &mut canonical_index,
+            Some(&mut canonical_index),
             &conv_a,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -22853,7 +23529,7 @@ mod tests {
         .unwrap();
         ingest_batch(
             &storage,
-            &mut canonical_index,
+            Some(&mut canonical_index),
             &conv_b,
             &None,
             LexicalPopulationStrategy::IncrementalInline,
@@ -23001,6 +23677,7 @@ mod tests {
         assert!(!status.has_pending_resume);
         assert!(status.has_completed_checkpoint);
         assert_eq!(status.completed_indexed_docs, Some(0));
+        assert_eq!(status.completed_exact_totals, Some((0, 0)));
     }
 
     #[test]
@@ -23016,10 +23693,12 @@ mod tests {
         assert!(should_skip_noop_final_lexical_checkpoint_refresh(
             false,
             false,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
                 completed_indexed_docs: Some(0),
+                completed_exact_totals: Some((0, 0)),
+                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
             },
             exact_counts,
             no_mutations,
@@ -23027,10 +23706,12 @@ mod tests {
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             true,
             false,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
                 completed_indexed_docs: Some(0),
+                completed_exact_totals: Some((0, 0)),
+                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
             },
             exact_counts,
             no_mutations,
@@ -23038,10 +23719,12 @@ mod tests {
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
             false,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: false,
                 completed_indexed_docs: None,
+                completed_exact_totals: None,
+                completed_storage_fingerprint: None,
             },
             exact_counts,
             no_mutations,
@@ -23049,10 +23732,12 @@ mod tests {
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
             false,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
                 completed_indexed_docs: Some(0),
+                completed_exact_totals: Some((0, 0)),
+                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
             },
             Some((1, 2)),
             no_mutations,
@@ -23060,10 +23745,12 @@ mod tests {
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
             false,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
                 completed_indexed_docs: Some(0),
+                completed_exact_totals: Some((0, 0)),
+                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
             },
             exact_counts,
             changed,
@@ -23071,14 +23758,168 @@ mod tests {
         assert!(!should_skip_noop_final_lexical_checkpoint_refresh(
             false,
             true,
-            MatchingLexicalRebuildStateStatus {
+            &MatchingLexicalRebuildStateStatus {
                 has_pending_resume: false,
                 has_completed_checkpoint: true,
                 completed_indexed_docs: Some(0),
+                completed_exact_totals: Some((0, 0)),
+                completed_storage_fingerprint: Some("content-v1:0:0:0".to_string()),
             },
             exact_counts,
             no_mutations,
         ));
+    }
+
+    #[test]
+    fn preserve_matching_completed_lexical_checkpoint_during_full_scan_requires_plain_full_scan_with_checkpoint()
+     {
+        let completed = MatchingLexicalRebuildStateStatus {
+            has_pending_resume: false,
+            has_completed_checkpoint: true,
+            completed_indexed_docs: Some(42),
+            completed_exact_totals: Some((7, 42)),
+            completed_storage_fingerprint: Some("content-v1:7:42:42".to_string()),
+        };
+
+        assert!(
+            should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+                true, false, false, &completed
+            )
+        );
+        assert!(
+            !should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+                false, false, false, &completed
+            )
+        );
+        assert!(
+            !should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+                true, true, false, &completed
+            )
+        );
+        assert!(
+            !should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+                true, false, true, &completed
+            )
+        );
+        assert!(
+            !should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
+                true,
+                false,
+                false,
+                &MatchingLexicalRebuildStateStatus::default(),
+            )
+        );
+    }
+
+    #[test]
+    fn preflight_existing_tantivy_reader_is_skipped_for_resume_or_full_rebuilds() {
+        assert!(should_preflight_existing_tantivy_reader(false, false));
+        assert!(!should_preflight_existing_tantivy_reader(true, false));
+        assert!(!should_preflight_existing_tantivy_reader(false, true));
+    }
+
+    #[test]
+    fn live_tantivy_doc_probe_for_post_full_skip_only_runs_for_noop_full_candidates() {
+        let checkpoint = MatchingLexicalRebuildStateStatus {
+            has_pending_resume: false,
+            has_completed_checkpoint: true,
+            completed_indexed_docs: Some(42),
+            completed_exact_totals: Some((7, 42)),
+            completed_storage_fingerprint: Some("content-v1:7:42:42".to_string()),
+        };
+
+        assert!(should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            false,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            false,
+            false,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            true,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            false,
+            1,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            false,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 0,
+            },
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            false,
+            0,
+            &MatchingLexicalRebuildStateStatus::default(),
+            CanonicalMutationCounts::default(),
+            None,
+        ));
+        assert!(!should_probe_live_tantivy_docs_for_post_full_scan_skip(
+            true,
+            false,
+            0,
+            &checkpoint,
+            CanonicalMutationCounts::default(),
+            Some(42),
+        ));
+    }
+
+    #[test]
+    fn authoritative_rebuild_requirement_only_treats_canonical_storage_reset_as_rebuild() {
+        assert!(!should_force_authoritative_rebuild(false, false));
+        assert!(should_force_authoritative_rebuild(true, false));
+        assert!(should_force_authoritative_rebuild(false, true));
+    }
+
+    #[test]
+    #[serial]
+    fn configured_connector_factories_skip_disabled_agents_from_sources_config() {
+        let temp = TempDir::new().unwrap();
+        let config_home = temp.path().join("xdg-config");
+        fs::create_dir_all(config_home.join("cass")).unwrap();
+        fs::write(
+            config_home.join("cass").join("sources.toml"),
+            "disabled_agents = [\"openclaw\"]\n",
+        )
+        .unwrap();
+
+        let _config_home_guard = set_env_var("XDG_CONFIG_HOME", config_home.to_string_lossy());
+        let _sources_guard = unset_env_var("CASS_IGNORE_SOURCES_CONFIG");
+
+        let filtered = filter_disabled_connector_factories(vec![
+            ("openclaw", never_constructed_connector_factory),
+            ("codex", never_constructed_connector_factory),
+        ]);
+        let names = filtered
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["codex"]);
     }
 
     #[test]
@@ -23088,13 +23929,15 @@ mod tests {
             has_pending_resume: false,
             has_completed_checkpoint: true,
             completed_indexed_docs: Some(42),
+            completed_exact_totals: Some((7, 42)),
+            completed_storage_fingerprint: Some("content-v1:7:42:42".to_string()),
         };
 
         assert!(should_skip_post_full_scan_authoritative_rebuild(
             true,
             false,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
         ));
@@ -23102,7 +23945,7 @@ mod tests {
             false,
             false,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
         ));
@@ -23110,7 +23953,7 @@ mod tests {
             true,
             true,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
         ));
@@ -23118,7 +23961,7 @@ mod tests {
             true,
             false,
             1,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             Some(42),
         ));
@@ -23126,7 +23969,7 @@ mod tests {
             true,
             false,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 0,
@@ -23137,7 +23980,7 @@ mod tests {
             true,
             false,
             0,
-            MatchingLexicalRebuildStateStatus::default(),
+            &MatchingLexicalRebuildStateStatus::default(),
             CanonicalMutationCounts::default(),
             Some(42),
         ));
@@ -23145,7 +23988,7 @@ mod tests {
             true,
             false,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             Some(41),
         ));
@@ -23153,7 +23996,7 @@ mod tests {
             true,
             false,
             0,
-            checkpoint,
+            &checkpoint,
             CanonicalMutationCounts::default(),
             None,
         ));

@@ -10,6 +10,9 @@
 //! Note: Tests that require actual SSH connectivity are marked #[ignore].
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+use coding_agent_search::storage::sqlite::FrankenStorage;
+use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -38,6 +41,57 @@ fn read_sources_config(config_dir: &Path) -> String {
 
 fn cass_data_dir(data_root: &Path) -> std::path::PathBuf {
     data_root.join("coding-agent-search")
+}
+
+fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
+    let storage = FrankenStorage::open(db_path).unwrap();
+    let agent = Agent {
+        id: None,
+        slug: agent_slug.into(),
+        name: agent_slug.into(),
+        version: None,
+        kind: AgentKind::Cli,
+    };
+    let agent_id = storage.ensure_agent(&agent).unwrap();
+    let conversation = Conversation {
+        id: None,
+        agent_slug: agent_slug.into(),
+        workspace: Some("/tmp/workspace".into()),
+        external_id: Some(format!("{agent_slug}-{marker}")),
+        title: Some(format!("{agent_slug} {marker}")),
+        source_path: format!("/tmp/{agent_slug}-{marker}.jsonl").into(),
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_000_100),
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages: vec![
+            Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_010),
+                content: format!("{agent_slug} {marker} user"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+            Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                created_at: Some(1_700_000_000_020),
+                content: format!("{agent_slug} {marker} assistant"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            },
+        ],
+        source_id: "local".into(),
+        origin_host: None,
+    };
+    storage
+        .insert_conversation_tree(agent_id, None, &conversation)
+        .unwrap();
 }
 
 // =============================================================================
@@ -139,6 +193,226 @@ sync_schedule = "manual"
     );
 
     tracker.complete();
+}
+
+#[test]
+fn sources_agents_exclude_and_list_json() {
+    let tracker = tracker_for("sources_agents_exclude_and_list_json");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+
+    let start = tracker.start(
+        "exclude_agent",
+        Some("Exclude openclaw from future indexing runs"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "exclude", "openclaw"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources agents exclude command");
+    tracker.end(
+        "exclude_agent",
+        Some("Exclude openclaw from future indexing runs"),
+        start,
+    );
+    assert!(
+        output.status.success(),
+        "exclude failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config = read_sources_config(&config_dir);
+    assert!(
+        config.contains("disabled_agents") && config.contains("openclaw"),
+        "expected disabled_agents entry in config, got: {config}"
+    );
+
+    let start = tracker.start("list_agents_json", Some("List excluded agents in JSON"));
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "list", "--json"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources agents list command");
+    tracker.end(
+        "list_agents_json",
+        Some("List excluded agents in JSON"),
+        start,
+    );
+    assert!(
+        output.status.success(),
+        "list failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(json["disabled_agents"], serde_json::json!(["openclaw"]));
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "list", "--json"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources list --json command");
+    assert!(output.status.success(), "sources list --json failed");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(json["disabled_agents"], serde_json::json!(["openclaw"]));
+
+    tracker.complete();
+}
+
+#[test]
+fn sources_agents_include_removes_existing_exclusion() {
+    let tracker = tracker_for("sources_agents_include_removes_existing_exclusion");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    create_sources_config(&config_dir, "disabled_agents = [\"openclaw\"]\n");
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+
+    let start = tracker.start(
+        "include_agent",
+        Some("Re-enable openclaw for future indexing runs"),
+    );
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "include", "openclaw"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources agents include command");
+    tracker.end(
+        "include_agent",
+        Some("Re-enable openclaw for future indexing runs"),
+        start,
+    );
+    assert!(
+        output.status.success(),
+        "include failed: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "list", "--json"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .output()
+        .expect("sources agents list command");
+    assert!(output.status.success(), "sources agents list failed");
+    let json: Value = serde_json::from_slice(&output.stdout).expect("valid json");
+    assert_eq!(json["disabled_agents"], serde_json::json!([]));
+
+    tracker.complete();
+}
+
+#[test]
+fn sources_agents_exclude_purges_local_archive_data_by_default() {
+    let tracker = tracker_for("sources_agents_exclude_purges_local_archive_data_by_default");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp.path().join("config");
+    let data_root = tmp.path().join("data");
+    let data_dir = cass_data_dir(&data_root);
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
+    let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
+
+    seed_archive_conversation(&db_path, "openclaw", "purge-me");
+    seed_archive_conversation(&db_path, "codex", "keep-me");
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["sources", "agents", "exclude", "openclaw"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("sources agents exclude command");
+    assert!(
+        output.status.success(),
+        "exclude failed: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let storage = FrankenStorage::open(&db_path).unwrap();
+    let conversations = storage.list_conversations(10, 0).unwrap();
+    assert_eq!(conversations.len(), 1);
+    assert_eq!(conversations[0].agent_slug, "codex");
+
+    let search_output = cargo_bin_cmd!("cass")
+        .args(["search", "purge-me", "--robot", "--limit", "5"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("search removed agent data");
+    assert!(
+        search_output.status.success(),
+        "search after purge failed: {}\nstdout: {}\nstderr: {}",
+        search_output.status,
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let removed_hits: Value = serde_json::from_slice(&search_output.stdout).expect("valid json");
+    let removed_total = removed_hits
+        .get("total")
+        .or_else(|| removed_hits.get("count"))
+        .and_then(|value| value.as_i64())
+        .or_else(|| {
+            removed_hits
+                .get("results")
+                .and_then(|value| value.as_array())
+                .map(|values| values.len() as i64)
+        })
+        .or_else(|| {
+            removed_hits
+                .get("hits")
+                .and_then(|value| value.as_array())
+                .map(|values| values.len() as i64)
+        })
+        .unwrap_or(-1);
+    assert_eq!(
+        removed_total,
+        0,
+        "expected removed agent search to have no hits: {}",
+        String::from_utf8_lossy(&search_output.stdout)
+    );
+
+    let search_output = cargo_bin_cmd!("cass")
+        .args(["search", "keep-me", "--robot", "--limit", "5"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .output()
+        .expect("search retained agent data");
+    assert!(search_output.status.success(), "search kept agent failed");
+    let kept_hits: Value = serde_json::from_slice(&search_output.stdout).expect("valid json");
+    let kept_total = kept_hits
+        .get("total")
+        .or_else(|| kept_hits.get("count"))
+        .and_then(|value| value.as_i64())
+        .or_else(|| {
+            kept_hits
+                .get("results")
+                .and_then(|value| value.as_array())
+                .map(|values| values.len() as i64)
+        })
+        .or_else(|| {
+            kept_hits
+                .get("hits")
+                .and_then(|value| value.as_array())
+                .map(|values| values.len() as i64)
+        })
+        .unwrap_or_default();
+    assert!(
+        kept_total >= 1,
+        "expected retained codex data to remain searchable: {}",
+        String::from_utf8_lossy(&search_output.stdout)
+    );
 }
 
 /// Test: sources list --verbose shows additional details.

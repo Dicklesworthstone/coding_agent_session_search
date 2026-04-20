@@ -31,6 +31,9 @@
 //! from = "/opt/work"
 //! to = "/Volumes/Work"
 //! agents = ["claude-code"]
+//!
+//! # Disable noisy connectors globally, including the built-in local source.
+//! disabled_agents = ["openclaw"]
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -53,8 +56,16 @@ pub(crate) fn source_names_equal(lhs: &str, rhs: &str) -> bool {
     source_name_key(lhs) == source_name_key(rhs)
 }
 
-fn agent_name_key(name: &str) -> String {
+pub(crate) fn agent_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn normalize_agent_config_name(name: &str) -> Option<String> {
+    let normalized = match agent_name_key(name).as_str() {
+        "claude_code" => "claude".to_string(),
+        other => other.to_string(),
+    };
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn path_mapping_applies_to_agent(mapping: &PathMapping, agent: Option<&str>) -> bool {
@@ -100,6 +111,11 @@ pub struct SourcesConfig {
     /// List of configured sources.
     #[serde(default)]
     pub sources: Vec<SourceDefinition>,
+
+    /// Connectors to skip during indexing even if their files exist locally or
+    /// in configured remote mirrors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_agents: Vec<String>,
 }
 
 /// Definition of a single source (local or remote).
@@ -433,6 +449,14 @@ impl SourcesConfig {
             }
         }
 
+        for (idx, agent) in self.disabled_agents.iter().enumerate() {
+            if normalize_agent_config_name(agent).is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "disabled_agents[{idx}] cannot be empty"
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -479,6 +503,47 @@ impl SourcesConfig {
     /// Get all remote sources (SSH type).
     pub fn remote_sources(&self) -> impl Iterator<Item = &SourceDefinition> {
         self.sources.iter().filter(|s| s.is_remote())
+    }
+
+    pub fn configured_disabled_agents(&self) -> Vec<String> {
+        let mut disabled = self
+            .disabled_agents
+            .iter()
+            .filter_map(|agent| normalize_agent_config_name(agent))
+            .collect::<Vec<_>>();
+        disabled.sort();
+        disabled.dedup();
+        disabled
+    }
+
+    pub fn is_agent_disabled(&self, agent: &str) -> bool {
+        let Some(normalized) = normalize_agent_config_name(agent) else {
+            return false;
+        };
+        self.disabled_agents
+            .iter()
+            .filter_map(|candidate| normalize_agent_config_name(candidate))
+            .any(|candidate| candidate == normalized)
+    }
+
+    pub fn exclude_agent_from_indexing(&mut self, agent: &str) -> Result<bool, ConfigError> {
+        let normalized = normalize_agent_config_name(agent)
+            .ok_or_else(|| ConfigError::Validation("agent name cannot be empty".into()))?;
+        if self.is_agent_disabled(&normalized) {
+            return Ok(false);
+        }
+        self.disabled_agents.push(normalized);
+        Ok(true)
+    }
+
+    pub fn include_agent_in_indexing(&mut self, agent: &str) -> Result<bool, ConfigError> {
+        let normalized = normalize_agent_config_name(agent)
+            .ok_or_else(|| ConfigError::Validation("agent name cannot be empty".into()))?;
+        let initial_len = self.disabled_agents.len();
+        self.disabled_agents.retain(|existing| {
+            normalize_agent_config_name(existing).as_deref() != Some(&normalized)
+        });
+        Ok(self.disabled_agents.len() != initial_len)
     }
 }
 
@@ -1938,6 +2003,55 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains("server1"));
         assert!(names.contains("server2"));
+    }
+
+    #[test]
+    fn test_exclude_and_include_agents_normalize_and_dedup() {
+        let mut config = SourcesConfig::default();
+
+        assert!(config.exclude_agent_from_indexing(" OpenClaw ").unwrap());
+        assert!(!config.exclude_agent_from_indexing("open-claw").unwrap());
+        assert!(config.is_agent_disabled("openclaw"));
+        assert_eq!(config.configured_disabled_agents(), vec!["openclaw"]);
+
+        assert!(config.include_agent_in_indexing("open_claw").unwrap());
+        assert!(!config.is_agent_disabled("openclaw"));
+        assert!(config.configured_disabled_agents().is_empty());
+    }
+
+    #[test]
+    fn test_exclude_agent_aliases_collapse_to_internal_connector_slug() {
+        let mut config = SourcesConfig::default();
+
+        assert!(config.exclude_agent_from_indexing("claude-code").unwrap());
+        assert!(config.is_agent_disabled("claude"));
+        assert!(config.is_agent_disabled("claude_code"));
+        assert_eq!(config.configured_disabled_agents(), vec!["claude"]);
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_disabled_agent_entry() {
+        let mut config = SourcesConfig::default();
+        config.disabled_agents.push("   ".into());
+        let err = config
+            .validate()
+            .expect_err("disabled_agents entry should fail");
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn test_sources_config_roundtrip_preserves_disabled_agents() {
+        let mut config = SourcesConfig::default();
+        config.exclude_agent_from_indexing("openclaw").unwrap();
+        config.exclude_agent_from_indexing("claude-code").unwrap();
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: SourcesConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            deserialized.configured_disabled_agents(),
+            vec!["claude", "openclaw"]
+        );
     }
 
     #[test]

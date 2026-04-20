@@ -27121,6 +27121,7 @@ mod tests {
                 )],
                 ..Default::default()
             }],
+            disabled_agents: vec![],
         };
 
         let rewritten = actionable_path_for_hit_with_config(Some(&config), &hit);
@@ -27144,6 +27145,7 @@ mod tests {
                 )],
                 ..Default::default()
             }],
+            disabled_agents: vec![],
         };
 
         let rewritten = actionable_path_for_hit_with_config(Some(&config), &hit);
@@ -41934,6 +41936,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 crate::sources::SourceDefinition::ssh("gamma", "user@gamma"),
                 crate::sources::SourceDefinition::ssh("delta", "user@delta"),
             ],
+            disabled_agents: vec![],
         };
         let sync_status = crate::sources::SyncStatus::default();
 
@@ -42007,6 +42010,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 crate::sources::SourceDefinition::ssh("beta", "user@beta"),
                 crate::sources::SourceDefinition::ssh("alpha", "user@alpha"),
             ],
+            disabled_agents: vec![],
         };
         let sync_status = crate::sources::SyncStatus::default();
 
@@ -42125,6 +42129,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
 
         let config = crate::sources::SourcesConfig {
             sources: vec![crate::sources::SourceDefinition::ssh("beta", "user@beta")],
+            disabled_agents: vec![],
         };
         let sync_status = crate::sources::SyncStatus::default();
 

@@ -419,8 +419,16 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
         .get("messages")
         .and_then(|value| value.as_i64())
         .expect("initial message count");
+    let checkpoint_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .unwrap()
+        .join(".lexical-rebuild-state.json");
+    let checkpoint_modified_before = fs::metadata(&checkpoint_path)
+        .expect("initial lexical checkpoint")
+        .modified()
+        .expect("initial checkpoint mtime");
 
     fs::rename(&codex_home, home.join(".codex_hidden")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
 
     let mut cmd = base_cmd(home);
     cmd.args(["index", "--full", "--json", "--data-dir"])
@@ -461,6 +469,14 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
     assert_eq!(
         stats.get("total_messages").and_then(|value| value.as_i64()),
         Some(expected_messages)
+    );
+    let checkpoint_modified_after = fs::metadata(&checkpoint_path)
+        .expect("preserved lexical checkpoint")
+        .modified()
+        .expect("preserved checkpoint mtime");
+    assert_eq!(
+        checkpoint_modified_after, checkpoint_modified_before,
+        "repeat no-op full runs should preserve the matching lexical checkpoint instead of deleting and recreating it"
     );
 }
 

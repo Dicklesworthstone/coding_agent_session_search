@@ -811,7 +811,11 @@ pub const FTS5_REGISTER_SQL: &str = "\
     )";
 
 const FTS_FRANKEN_REBUILD_META_KEY: &str = "fts_frankensqlite_rebuild_generation";
+const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archive_fingerprint";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
+const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
+const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
+const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
@@ -4683,6 +4687,88 @@ impl FrankenStorage {
             .with_context(|| "listing agents")
     }
 
+    /// Count all archived conversations.
+    pub fn total_conversation_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Count all archived messages.
+    pub fn total_message_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Remove all archived conversations/messages for one agent slug.
+    ///
+    /// This only affects cass's local archive database. Source session files on
+    /// disk are untouched.
+    pub fn purge_agent_archive_data(&self, agent_slug: &str) -> Result<AgentArchivePurgeResult> {
+        let normalized = agent_slug.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(anyhow!("agent slug cannot be empty"));
+        }
+
+        let Some(agent_id) = self
+            .conn
+            .query_row_map(
+                "SELECT id FROM agents WHERE slug = ?1",
+                fparams![normalized.as_str()],
+                |row| row.get_typed::<i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(AgentArchivePurgeResult::default());
+        };
+
+        let conversations_deleted: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1",
+            fparams![agent_id],
+            |row| row.get_typed(0),
+        )?;
+        if conversations_deleted == 0 {
+            return Ok(AgentArchivePurgeResult::default());
+        }
+
+        let messages_deleted: i64 = self.conn.query_row_map(
+            "SELECT COUNT(*)
+             FROM messages
+             WHERE conversation_id IN (
+                 SELECT id FROM conversations WHERE agent_id = ?1
+             )",
+            fparams![agent_id],
+            |row| row.get_typed(0),
+        )?;
+
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
+            "DELETE FROM conversations WHERE agent_id = ?1",
+            fparams![agent_id],
+        )?;
+        tx.execute_compat(
+            "DELETE FROM agents
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversations WHERE agent_id = ?1
+               )",
+            fparams![agent_id],
+        )?;
+        tx.commit()?;
+
+        Ok(AgentArchivePurgeResult {
+            conversations_deleted: conversations_deleted.max(0) as usize,
+            messages_deleted: messages_deleted.max(0) as usize,
+        })
+    }
+
     /// List all registered workspaces.
     pub fn list_workspaces(&self) -> Result<Vec<crate::model::types::Workspace>> {
         self.conn
@@ -6649,6 +6735,68 @@ impl FrankenStorage {
         self.ensure_fts_consistency_via_frankensqlite()
     }
 
+    pub(crate) fn fallback_fts_is_known_healthy_for_archive_fingerprint(
+        &self,
+        archive_fingerprint: &str,
+    ) -> Result<bool> {
+        Ok(
+            self.read_fts_franken_rebuild_generation()? == Some(FTS_FRANKEN_REBUILD_GENERATION)
+                && self
+                    .read_fts_franken_rebuild_archive_fingerprint()?
+                    .as_deref()
+                    == Some(archive_fingerprint),
+        )
+    }
+
+    pub(crate) fn record_search_fallback_fts_archive_fingerprint(
+        &self,
+        archive_fingerprint: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![
+                    FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY,
+                    archive_fingerprint.to_string()
+                ],
+            )
+            .with_context(|| "recording frankensqlite FTS archive fingerprint")?;
+        Ok(())
+    }
+
+    pub(crate) fn daily_stats_is_known_healthy_for_archive_fingerprint(
+        &self,
+        archive_fingerprint: &str,
+    ) -> Result<bool> {
+        Ok(
+            self.read_daily_stats_health_generation()? == Some(DAILY_STATS_HEALTH_GENERATION)
+                && self.read_daily_stats_archive_fingerprint()?.as_deref()
+                    == Some(archive_fingerprint),
+        )
+    }
+
+    pub(crate) fn record_daily_stats_archive_fingerprint(
+        &self,
+        archive_fingerprint: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![
+                    DAILY_STATS_HEALTH_GENERATION_META_KEY,
+                    DAILY_STATS_HEALTH_GENERATION.to_string()
+                ],
+            )
+            .with_context(|| "recording daily_stats health generation")?;
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![DAILY_STATS_HEALTH_META_KEY, archive_fingerprint.to_string()],
+            )
+            .with_context(|| "recording daily_stats archive fingerprint")?;
+        Ok(())
+    }
+
     fn read_fts_franken_rebuild_generation(&self) -> Result<Option<i64>> {
         let value: Option<String> = self
             .conn
@@ -6659,6 +6807,40 @@ impl FrankenStorage {
             )
             .optional()?;
         Ok(value.and_then(|v| v.parse::<i64>().ok()))
+    }
+
+    fn read_fts_franken_rebuild_archive_fingerprint(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?)
+    }
+
+    fn read_daily_stats_health_generation(&self) -> Result<Option<i64>> {
+        let value: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![DAILY_STATS_HEALTH_GENERATION_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|value| value.parse::<i64>().ok()))
+    }
+
+    fn read_daily_stats_archive_fingerprint(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![DAILY_STATS_HEALTH_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?)
     }
 
     fn record_fts_franken_rebuild_generation(&self) -> Result<()> {
@@ -9204,6 +9386,168 @@ fn franken_update_conversation_token_summaries_in_tx(
 }
 
 impl FrankenStorage {
+    /// Rebuild token_daily_stats from the token_usage ledger.
+    pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
+        const CONVERSATION_BATCH_SIZE: usize = 1_000;
+        const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
+
+        let total_usage_rows: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM token_usage", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        tracing::info!(
+            target: "cass::analytics",
+            total_usage_rows,
+            "token_daily_stats_rebuild_start"
+        );
+
+        let mut tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM token_daily_stats")?;
+
+        let mut last_conversation_id = 0_i64;
+        let mut rows_created = 0_usize;
+
+        loop {
+            let conversation_rows = tx.query_map_collect(
+                "SELECT c.id, c.started_at, c.source_id,
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown')
+                 FROM conversations c
+                 WHERE c.id > ?1
+                 ORDER BY c.id
+                 LIMIT ?2",
+                fparams![last_conversation_id, CONVERSATION_BATCH_SIZE as i64],
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<Option<i64>>(1)?,
+                        row.get_typed::<String>(2)?,
+                        row.get_typed::<String>(3)?,
+                    ))
+                },
+            )?;
+            if conversation_rows.is_empty() {
+                break;
+            }
+
+            let mut aggregate = TokenStatsAggregator::new();
+
+            for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
+                last_conversation_id = conversation_id;
+                let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
+                let mut last_token_usage_id = 0_i64;
+                let mut session_model_family = String::from("unknown");
+
+                loop {
+                    let usage_rows = tx.query_map_collect(
+                        "SELECT id, day_id, role,
+                                COALESCE(model_family, 'unknown'),
+                                input_tokens, output_tokens, cache_read_tokens,
+                                cache_creation_tokens, thinking_tokens,
+                                has_tool_calls, tool_call_count,
+                                content_chars, estimated_cost_usd
+                         FROM token_usage
+                         WHERE conversation_id = ?1
+                           AND id > ?2
+                         ORDER BY id
+                         LIMIT ?3",
+                        fparams![
+                            conversation_id,
+                            last_token_usage_id,
+                            TOKEN_USAGE_BATCH_SIZE as i64
+                        ],
+                        |row| {
+                            Ok((
+                                row.get_typed::<i64>(0)?,
+                                row.get_typed::<i64>(1)?,
+                                row.get_typed::<String>(2)?,
+                                row.get_typed::<String>(3)?,
+                                row.get_typed::<Option<i64>>(4)?,
+                                row.get_typed::<Option<i64>>(5)?,
+                                row.get_typed::<Option<i64>>(6)?,
+                                row.get_typed::<Option<i64>>(7)?,
+                                row.get_typed::<Option<i64>>(8)?,
+                                row.get_typed::<i64>(9)?,
+                                row.get_typed::<i64>(10)?,
+                                row.get_typed::<i64>(11)?,
+                                row.get_typed::<Option<f64>>(12)?,
+                            ))
+                        },
+                    )?;
+                    if usage_rows.is_empty() {
+                        break;
+                    }
+
+                    for (
+                        token_usage_id,
+                        day_id,
+                        role,
+                        model_family,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                        thinking_tokens,
+                        has_tool_calls,
+                        tool_call_count,
+                        content_chars,
+                        estimated_cost_usd,
+                    ) in usage_rows
+                    {
+                        last_token_usage_id = token_usage_id;
+                        if model_family != "unknown" {
+                            session_model_family = model_family.clone();
+                        }
+                        let usage = crate::connectors::ExtractedTokenUsage {
+                            model_name: None,
+                            provider: None,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
+                            thinking_tokens,
+                            service_tier: None,
+                            has_tool_calls: has_tool_calls != 0,
+                            tool_call_count: u32::try_from(tool_call_count.max(0)).unwrap_or(0),
+                            data_source: franken_agent_detection::TokenDataSource::Api,
+                        };
+                        aggregate.record(
+                            &agent_slug,
+                            &source_id,
+                            day_id,
+                            &model_family,
+                            &role,
+                            &usage,
+                            content_chars,
+                            estimated_cost_usd.unwrap_or(0.0),
+                        );
+                    }
+                }
+
+                aggregate.record_session(
+                    &agent_slug,
+                    &source_id,
+                    conversation_day_id,
+                    &session_model_family,
+                );
+            }
+
+            let entries = aggregate.expand();
+            rows_created = rows_created.saturating_add(entries.len());
+            franken_update_token_daily_stats_batched_in_tx(&tx, &entries)?;
+        }
+
+        tx.commit()?;
+
+        tracing::info!(
+            target: "cass::analytics",
+            rows_created,
+            "token_daily_stats_rebuild_complete"
+        );
+
+        Ok(rows_created)
+    }
+
     /// Rebuild analytics tables (message_metrics + rollups) from existing
     /// messages in the database. Does NOT re-parse raw agent session files.
     pub fn rebuild_analytics(&self) -> Result<AnalyticsRebuildResult> {
@@ -10711,6 +11055,13 @@ pub struct AnalyticsRebuildResult {
 pub struct DailyStatsRebuildResult {
     pub rows_created: i64,
     pub total_sessions: i64,
+}
+
+/// Result of purging archived data for a single agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentArchivePurgeResult {
+    pub conversations_deleted: usize,
+    pub messages_deleted: usize,
 }
 
 /// Health status of daily stats table.
@@ -18519,5 +18870,113 @@ mod tests {
         let config = ConnectionManagerConfig::default();
         assert_eq!(config.reader_count, 4);
         assert!(config.max_writers > 0);
+    }
+
+    #[test]
+    fn purge_agent_archive_data_removes_only_target_agent_and_rebuilds_derived_tables() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        fn seed_conversation(storage: &FrankenStorage, agent_slug: &str, marker: &str) {
+            let agent = Agent {
+                id: None,
+                slug: agent_slug.into(),
+                name: agent_slug.into(),
+                version: None,
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation = Conversation {
+                id: None,
+                agent_slug: agent_slug.into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("{agent_slug}-{marker}")),
+                title: Some(format!("{agent_slug} {marker}")),
+                source_path: PathBuf::from(format!("/tmp/{agent_slug}-{marker}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_010),
+                        content: format!("{agent_slug} {marker} user"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: Some("assistant".into()),
+                        created_at: Some(1_700_000_000_020),
+                        content: format!("{agent_slug} {marker} assistant"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        seed_conversation(&storage, "openclaw", "purge-target");
+        seed_conversation(&storage, "codex", "keep-target");
+
+        let purge = storage.purge_agent_archive_data("openclaw").unwrap();
+        assert_eq!(purge.conversations_deleted, 1);
+        assert_eq!(purge.messages_deleted, 2);
+
+        storage.rebuild_fts().unwrap();
+        storage.rebuild_analytics().unwrap();
+        storage.rebuild_daily_stats().unwrap();
+        storage.rebuild_token_daily_stats().unwrap();
+
+        let agents = storage.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].slug, "codex");
+        assert_eq!(storage.total_conversation_count().unwrap(), 1);
+        assert_eq!(storage.total_message_count().unwrap(), 2);
+
+        let fts_rows: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(fts_rows, 2);
+
+        let total_daily_sessions: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COALESCE(SUM(session_count), 0)
+                 FROM daily_stats
+                 WHERE agent_slug = 'all' AND source_id = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(total_daily_sessions, 1);
+
+        let openclaw_token_rows: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM token_daily_stats WHERE agent_slug = 'openclaw'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(openclaw_token_rows, 0);
     }
 }

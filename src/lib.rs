@@ -1015,6 +1015,9 @@ pub enum SourcesCommand {
     /// Manage path mappings for a source (P6.3)
     #[command(subcommand)]
     Mappings(MappingsAction),
+    /// Manage persisted agent indexing exclusions
+    #[command(subcommand)]
+    Agents(AgentsAction),
     /// Auto-discover SSH hosts from ~/.ssh/config
     Discover {
         /// Platform preset for default paths (macos-defaults, linux-defaults)
@@ -1217,6 +1220,30 @@ pub enum MappingsAction {
         /// Optional agent to simulate (for agent-specific rules)
         #[arg(long)]
         agent: Option<String>,
+    },
+}
+
+/// Subcommands for managing persisted agent indexing exclusions.
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentsAction {
+    /// List globally excluded agents/connectors
+    List {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Exclude an agent/connector from future indexing runs
+    Exclude {
+        /// Agent slug to exclude (e.g. openclaw, claude_code, codex)
+        agent: String,
+        /// Persist the exclusion but leave already indexed archive data untouched
+        #[arg(long, default_value_t = false)]
+        keep_indexed_data: bool,
+    },
+    /// Re-include an agent/connector in future indexing runs
+    Include {
+        /// Agent slug to re-enable
+        agent: String,
     },
 }
 
@@ -6102,6 +6129,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Sources(SourcesCommand::Setup { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Sources(SourcesCommand::Agents(AgentsAction::List { json })) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Models(ModelsCommand::Status { json }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -6522,6 +6552,23 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         ],
         RobotTopic::Sources => vec![
             "sources:".to_string(),
+            String::new(),
+            "# Persisted agent indexing exclusions".to_string(),
+            "Use this when you want cass to ignore a connector entirely even if".to_string(),
+            "the backing session files still exist on disk.".to_string(),
+            String::new(),
+            "  cass sources agents list".to_string(),
+            "  cass sources agents list --json".to_string(),
+            "  cass sources agents exclude openclaw".to_string(),
+            "  cass sources agents exclude openclaw --keep-indexed-data".to_string(),
+            "  cass sources agents include openclaw".to_string(),
+            String::new(),
+            "Configuration is persisted in ~/.config/cass/sources.toml as:".to_string(),
+            "  disabled_agents = [\"openclaw\"]".to_string(),
+            "By default, `exclude` also purges already archived local data for that agent".to_string(),
+            "and rebuilds lexical search from the remaining archive. Use".to_string(),
+            "`--keep-indexed-data` if you only want to block future indexing.".to_string(),
+            "Exclusions apply to future local scans, remote mirror scans, and watch mode.".to_string(),
             String::new(),
             "# cass sources setup - Interactive Remote Sources Wizard".to_string(),
             String::new(),
@@ -22201,6 +22248,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             run_sources_sync(source, no_index, verbose, dry_run, structured_format)
         }
         SourcesCommand::Mappings(action) => run_mappings_command(action, cli),
+        SourcesCommand::Agents(action) => run_agents_command(action, cli),
         SourcesCommand::Discover {
             preset,
             skip_existing,
@@ -22264,6 +22312,7 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
             fmt
         }
     });
+    let disabled_agents = config.configured_disabled_agents();
 
     if let Some(fmt) = structured_format {
         let sources_json: Vec<serde_json::Value> = config
@@ -22284,6 +22333,7 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
         let output = serde_json::json!({
             "config_path": config_path,
             "sources": sources_json,
+            "disabled_agents": disabled_agents,
             "total": config.sources.len(),
         });
         return output_structured_value(output, fmt);
@@ -22292,10 +22342,17 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
     println!("CASS Sources Configuration");
     println!("===========================");
     println!("Config: {config_path}");
+    if !disabled_agents.is_empty() {
+        println!("Excluded agents: {}", disabled_agents.join(", "));
+    }
     println!();
 
     if config.sources.is_empty() {
         println!("No sources configured.");
+        if !disabled_agents.is_empty() {
+            println!();
+            println!("Indexing exclusions are still active for future runs.");
+        }
         println!();
         println!("To add a source, run:");
         println!("  cass sources add user@hostname --preset macos-defaults");
@@ -24502,6 +24559,283 @@ fn run_models_check_update(
         );
     }
 
+    Ok(())
+}
+
+fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
+    match action {
+        AgentsAction::List { json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_agents_list(structured_format)
+        }
+        AgentsAction::Exclude {
+            agent,
+            keep_indexed_data,
+        } => run_agents_exclude(&agent, keep_indexed_data, cli),
+        AgentsAction::Include { agent } => run_agents_include(&agent),
+    }
+}
+
+fn archive_agent_slug_for_exclusion(agent: &str) -> String {
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claude_code" => "claude_code".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn archive_data_dir_for_agents_command(cli: &Cli) -> PathBuf {
+    cli.db
+        .as_ref()
+        .and_then(|db_path| db_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(default_data_dir)
+}
+
+fn purge_excluded_agent_archive_data(
+    agent: &str,
+    cli: &Cli,
+) -> CliResult<crate::storage::sqlite::AgentArchivePurgeResult> {
+    use crate::storage::sqlite::{AgentArchivePurgeResult, FrankenStorage};
+
+    let db_path = cli.db.clone().unwrap_or_else(default_db_path);
+    if !db_path.is_file() {
+        return Ok(AgentArchivePurgeResult::default());
+    }
+
+    let data_dir = archive_data_dir_for_agents_command(cli);
+    let archive_agent_slug = archive_agent_slug_for_exclusion(agent);
+    let storage = match FrankenStorage::open(&db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                error = %err,
+                "skipping excluded-agent archive purge because the local archive could not be opened"
+            );
+            return Ok(AgentArchivePurgeResult::default());
+        }
+    };
+
+    let purge = storage
+        .purge_agent_archive_data(&archive_agent_slug)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "archive_purge",
+            message: format!("Failed to purge indexed data for '{archive_agent_slug}': {e}"),
+            hint: Some("The exclusion was still saved; run 'cass index --full' after fixing the archive if needed".into()),
+            retryable: false,
+        })?;
+    if purge.conversations_deleted == 0 {
+        return Ok(purge);
+    }
+
+    storage.rebuild_fts().map_err(|e| CliError {
+        code: 5,
+        kind: "archive_fts_rebuild",
+        message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
+        hint: Some("Run 'cass index --full' to refresh derived search data".into()),
+        retryable: false,
+    })?;
+    storage.rebuild_analytics().map_err(|e| CliError {
+        code: 5,
+        kind: "archive_analytics_rebuild",
+        message: format!(
+            "Purged '{archive_agent_slug}' but failed to rebuild analytics rollups: {e}"
+        ),
+        hint: Some("Run 'cass index --full' to refresh derived analytics data".into()),
+        retryable: false,
+    })?;
+    storage.rebuild_daily_stats().map_err(|e| CliError {
+        code: 5,
+        kind: "archive_daily_stats_rebuild",
+        message: format!("Purged '{archive_agent_slug}' but failed to rebuild daily stats: {e}"),
+        hint: Some("Run 'cass index --full' to refresh derived daily stats".into()),
+        retryable: false,
+    })?;
+    storage.rebuild_token_daily_stats().map_err(|e| CliError {
+        code: 5,
+        kind: "archive_token_daily_stats_rebuild",
+        message: format!(
+            "Purged '{archive_agent_slug}' but failed to rebuild token_daily_stats: {e}"
+        ),
+        hint: Some("Run 'cass index --full' to refresh token analytics".into()),
+        retryable: false,
+    })?;
+    let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
+        code: 5,
+        kind: "archive_count",
+        message: format!(
+            "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
+        ),
+        hint: Some("Run 'cass index --full' to refresh the archive".into()),
+        retryable: false,
+    })?;
+    drop(storage);
+
+    crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "lexical_rebuild",
+            message: format!(
+                "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
+            ),
+            hint: Some("Run 'cass index --full' to refresh lexical search data".into()),
+            retryable: false,
+        })?;
+
+    Ok(purge)
+}
+
+fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+
+    let config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    let disabled_agents = config.configured_disabled_agents();
+
+    if let Some(fmt) = output_format.or_else(robot_format_from_env) {
+        return output_structured_value(
+            serde_json::json!({
+                "disabled_agents": disabled_agents,
+                "total": disabled_agents.len(),
+            }),
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            },
+        );
+    }
+
+    if disabled_agents.is_empty() {
+        println!("No agents are excluded from indexing.");
+        println!();
+        println!("Exclude one with:");
+        println!("  cass sources agents exclude openclaw");
+        return Ok(());
+    }
+
+    println!("Excluded agents:");
+    for agent in disabled_agents {
+        println!("  - {agent}");
+    }
+    Ok(())
+}
+
+fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+
+    let mut config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let changed = config
+        .exclude_agent_from_indexing(agent)
+        .map_err(|e| CliError {
+            code: 11,
+            kind: "config",
+            message: format!("Failed to update excluded agents: {e}"),
+            hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
+            retryable: false,
+        })?;
+
+    config.save().map_err(|e| CliError {
+        code: 11,
+        kind: "config",
+        message: format!("Failed to save config: {e}"),
+        hint: Some("Check file permissions on config directory".into()),
+        retryable: false,
+    })?;
+
+    let purge = if keep_indexed_data {
+        crate::storage::sqlite::AgentArchivePurgeResult::default()
+    } else {
+        purge_excluded_agent_archive_data(agent, cli)?
+    };
+
+    if changed {
+        println!(
+            "Excluded '{}' from future indexing runs.",
+            agent.trim().to_ascii_lowercase()
+        );
+        println!("This applies to local scans, remote mirror scans, and watch mode.");
+    } else {
+        println!(
+            "'{}' was already excluded from indexing.",
+            agent.trim().to_ascii_lowercase()
+        );
+    }
+    if keep_indexed_data {
+        println!("Existing indexed archive data was left untouched.");
+    } else if purge.conversations_deleted > 0 {
+        println!(
+            "Purged {} conversations and {} messages already archived for that agent.",
+            purge.conversations_deleted, purge.messages_deleted
+        );
+        println!("Lexical search data was rebuilt from the remaining archive.");
+        println!(
+            "If you use semantic search assets, rerun `cass index --semantic` once to refresh them."
+        );
+    } else {
+        println!("No already archived data for that agent was present in the local archive.");
+    }
+    println!();
+    println!("View exclusions with:");
+    println!("  cass sources agents list");
+    Ok(())
+}
+
+fn run_agents_include(agent: &str) -> CliResult<()> {
+    use crate::sources::config::SourcesConfig;
+
+    let mut config = SourcesConfig::load().map_err(|e| CliError {
+        code: 9,
+        kind: "config",
+        message: format!("Failed to load sources config: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let changed = config
+        .include_agent_in_indexing(agent)
+        .map_err(|e| CliError {
+            code: 11,
+            kind: "config",
+            message: format!("Failed to update excluded agents: {e}"),
+            hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
+            retryable: false,
+        })?;
+
+    config.save().map_err(|e| CliError {
+        code: 11,
+        kind: "config",
+        message: format!("Failed to save config: {e}"),
+        hint: Some("Check file permissions on config directory".into()),
+        retryable: false,
+    })?;
+
+    if changed {
+        println!(
+            "Re-enabled '{}' for future indexing runs.",
+            agent.trim().to_ascii_lowercase()
+        );
+    } else {
+        println!(
+            "'{}' was not excluded from indexing.",
+            agent.trim().to_ascii_lowercase()
+        );
+    }
+    println!();
+    println!("View exclusions with:");
+    println!("  cass sources agents list");
     Ok(())
 }
 
