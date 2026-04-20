@@ -37,6 +37,7 @@ use parking_lot::RwLock;
 use std::cell::RefCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2166,6 +2167,12 @@ impl Default for SearchClientOptions {
     }
 }
 
+impl Drop for SearchClient {
+    fn drop(&mut self) {
+        FEDERATED_SEARCH_READERS.write().remove(&self.cache_namespace);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub cache_hits: u64,
@@ -2396,12 +2403,22 @@ struct WarmJob {
 #[derive(Clone)]
 struct SearcherCacheEntry {
     epoch: u64,
+    reader_key: usize,
     searcher: Searcher,
 }
 
 thread_local! {
     static THREAD_SEARCHER: RefCell<Option<SearcherCacheEntry>> = const { RefCell::new(None) };
 }
+
+#[derive(Clone)]
+struct FederatedIndexReader {
+    reader: IndexReader,
+    fields: FsCassFields,
+}
+
+static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Calculate Levenshtein edit distance between two strings.
 /// Used for typo detection in did-you-mean suggestions.
@@ -2681,10 +2698,35 @@ impl SearchClient {
         options: SearchClientOptions,
     ) -> Result<Option<Self>> {
         let tantivy = fs_cass_open_search_reader(index_path, ReloadPolicy::Manual).ok();
+        let cache_namespace = format!(
+            "v{}|schema:{}|index:{}",
+            CACHE_KEY_VERSION,
+            FS_CASS_SCHEMA_HASH,
+            index_path.display()
+        );
+        let federated_readers = if tantivy.is_none() {
+            crate::search::tantivy::open_federated_search_readers(
+                index_path,
+                ReloadPolicy::Manual,
+            )
+            .ok()
+            .flatten()
+            .filter(|readers| !readers.is_empty())
+            .map(|readers| {
+                Arc::new(
+                    readers
+                        .into_iter()
+                        .map(|(reader, fields)| FederatedIndexReader { reader, fields })
+                        .collect::<Vec<_>>(),
+                )
+            })
+        } else {
+            None
+        };
 
         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
 
-        if tantivy.is_none() && sqlite_path.is_some() {
+        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_some() {
             tracing::warn!(
                 index_path = %index_path.display(),
                 "Tantivy search index not found or incompatible. \
@@ -2693,13 +2735,12 @@ impl SearchClient {
             );
         }
 
-        if tantivy.is_none() && sqlite_path.is_none() {
+        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_none() {
             return Ok(None);
         }
 
         let reload_epoch = Arc::new(AtomicU64::new(0));
         let metrics = Metrics::default();
-        let cache_namespace = format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH);
 
         let warm_pair = if options.enable_warm
             && let Some((reader, fields)) = &tantivy
@@ -2713,6 +2754,14 @@ impl SearchClient {
         } else {
             None
         };
+
+        if let Some(readers) = &federated_readers {
+            FEDERATED_SEARCH_READERS
+                .write()
+                .insert(cache_namespace.clone(), Arc::clone(readers));
+        } else {
+            FEDERATED_SEARCH_READERS.write().remove(&cache_namespace);
+        }
 
         Ok(Some(Self {
             reader: tantivy,
@@ -2801,6 +2850,10 @@ impl SearchClient {
             let _ = self.maybe_reload_reader(reader);
             let searcher = self.searcher_for_thread(reader);
             self.track_generation(searcher.generation().generation_id());
+        } else if let Some(readers) = self.federated_readers() {
+            if let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())? {
+                self.track_generation(signature);
+            }
         }
 
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
@@ -2858,7 +2911,7 @@ impl SearchClient {
                 offset = 0,
                 "search_start"
             );
-            let hits = self.search_tantivy(
+            let (hits, tantivy_total_count) = self.search_tantivy(
                 reader,
                 fields,
                 query,
@@ -2868,6 +2921,9 @@ impl SearchClient {
                 0, // Always fetch from 0 for global dedup
                 field_mask,
             )?;
+            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                *tc = Some(tantivy_total_count);
+            }
             if !hits.is_empty() {
                 let initial_hit_count = hits.len();
                 let page_hits = |raw_hits: Vec<SearchHit>| {
@@ -2889,7 +2945,7 @@ impl SearchClient {
                         fallback_fetch_limit,
                         "retrying lexical fetch due to dedup shortfall"
                     );
-                    let retry_hits = self.search_tantivy(
+                    let (retry_hits, retry_total_count) = self.search_tantivy(
                         reader,
                         fields,
                         query,
@@ -2899,6 +2955,9 @@ impl SearchClient {
                         0,
                         field_mask,
                     )?;
+                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                        *tc = Some(retry_total_count);
+                    }
                     if !retry_hits.is_empty() {
                         (deduped_len, paged_hits) = page_hits(retry_hits);
                     }
@@ -2920,6 +2979,84 @@ impl SearchClient {
             tracing::debug!(
                 query = sanitized,
                 "tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
+            );
+            return Ok(Vec::new());
+        } else if let Some(readers) = self.federated_readers() {
+            tracing::info!(
+                backend = "tantivy-federated",
+                query = sanitized,
+                limit = initial_fetch_limit,
+                offset = 0,
+                shards = readers.len(),
+                "search_start"
+            );
+            let (hits, tantivy_total_count) = self.search_tantivy_federated(
+                readers.as_ref(),
+                query,
+                &sanitized,
+                filters.clone(),
+                initial_fetch_limit,
+                field_mask,
+            )?;
+            if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                *tc = Some(tantivy_total_count);
+            }
+            if !hits.is_empty() {
+                let initial_hit_count = hits.len();
+                let page_hits = |raw_hits: Vec<SearchHit>| {
+                    self.postprocess_hits_page(raw_hits, &sanitized, &filters, limit, offset)
+                };
+
+                let (mut deduped_len, mut paged_hits) = page_hits(hits);
+                let expected_federated_capacity = initial_fetch_limit.saturating_mul(readers.len());
+                let needs_retry = deduped_len < target_hits
+                    && initial_hit_count == expected_federated_capacity
+                    && initial_fetch_limit < fallback_fetch_limit;
+
+                if needs_retry {
+                    tracing::debug!(
+                        query = sanitized,
+                        target_hits,
+                        deduped_len,
+                        initial_fetch_limit,
+                        fallback_fetch_limit,
+                        shards = readers.len(),
+                        "retrying federated lexical fetch due to dedup shortfall"
+                    );
+                    let (retry_hits, retry_total_count) = self.search_tantivy_federated(
+                        readers.as_ref(),
+                        query,
+                        &sanitized,
+                        filters.clone(),
+                        fallback_fetch_limit,
+                        field_mask,
+                    )?;
+                    if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
+                        *tc = Some(retry_total_count);
+                    }
+                    if !retry_hits.is_empty() {
+                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    }
+                }
+
+                tracing::trace!(
+                    query = sanitized,
+                    target_hits,
+                    deduped_len,
+                    returned = paged_hits.len(),
+                    shards = readers.len(),
+                    "federated lexical fetch complete"
+                );
+
+                if can_use_cache && offset == 0 {
+                    self.put_cache(&sanitized, &filters, &paged_hits);
+                }
+                return Ok(paged_hits);
+            }
+            tracing::debug!(
+                query = sanitized,
+                shards = readers.len(),
+                "federated tantivy returned zero hits; skipping sqlite fallback because tantivy is authoritative when available"
             );
             return Ok(Vec::new());
         }
@@ -4854,20 +4991,77 @@ impl SearchClient {
 
     fn searcher_for_thread(&self, reader: &IndexReader) -> Searcher {
         let epoch = self.reload_epoch.load(Ordering::Relaxed);
+        let reader_key = reader as *const IndexReader as usize;
         THREAD_SEARCHER.with(|slot| {
             let mut slot = slot.borrow_mut();
             if let Some(entry) = slot.as_ref()
                 && entry.epoch == epoch
+                && entry.reader_key == reader_key
             {
                 return entry.searcher.clone();
             }
             let searcher = reader.searcher();
             *slot = Some(SearcherCacheEntry {
                 epoch,
+                reader_key,
                 searcher: searcher.clone(),
             });
             searcher
         })
+    }
+
+    fn federated_readers(&self) -> Option<Arc<Vec<FederatedIndexReader>>> {
+        FEDERATED_SEARCH_READERS
+            .read()
+            .get(&self.cache_namespace)
+            .cloned()
+    }
+
+    fn maybe_reload_federated_readers(
+        &self,
+        readers: &[FederatedIndexReader],
+    ) -> Result<Option<u64>> {
+        if !self.reload_on_search || readers.is_empty() {
+            return Ok(None);
+        }
+        const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(300);
+        let now = Instant::now();
+        let mut guard = self.last_reload.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .map(|t| now.duration_since(t) < MIN_RELOAD_INTERVAL)
+            .unwrap_or(false)
+        {
+            let signature = self.federated_generation_signature(readers);
+            return Ok(Some(signature));
+        }
+
+        let reload_started = Instant::now();
+        for shard in readers {
+            shard.reader.reload()?;
+        }
+        let elapsed = reload_started.elapsed();
+        *guard = Some(now);
+        let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.metrics.record_reload(elapsed);
+        tracing::debug!(
+            duration_ms = elapsed.as_millis() as u64,
+            reload_epoch = epoch,
+            shards = readers.len(),
+            "tantivy_reader_reload_federated"
+        );
+        Ok(Some(self.federated_generation_signature(readers)))
+    }
+
+    fn federated_generation_signature(&self, readers: &[FederatedIndexReader]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        readers.len().hash(&mut hasher);
+        for shard in readers {
+            self.searcher_for_thread(&shard.reader)
+                .generation()
+                .generation_id()
+                .hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     fn track_generation(&self, generation: u64) {
@@ -5004,7 +5198,7 @@ impl SearchClient {
         limit: usize,
         offset: usize,
         field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<(Vec<SearchHit>, usize)> {
         struct PendingTantivyHit {
             score: f32,
             doc: TantivyDocument,
@@ -5275,10 +5469,50 @@ impl SearchClient {
                 origin_host: pending.origin_host,
             });
         }
-        if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
-            *tc = Some(tantivy_total_count);
+        Ok((hits, tantivy_total_count))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_tantivy_federated(
+        &self,
+        readers: &[FederatedIndexReader],
+        raw_query: &str,
+        sanitized_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        field_mask: FieldMask,
+    ) -> Result<(Vec<SearchHit>, usize)> {
+        const FEDERATED_RRF_K: f32 = 60.0;
+
+        let mut combined_hits = Vec::new();
+        let mut total_count = 0usize;
+
+        for shard in readers {
+            let (mut shard_hits, shard_total_count) = self.search_tantivy(
+                &shard.reader,
+                &shard.fields,
+                raw_query,
+                sanitized_query,
+                filters.clone(),
+                limit,
+                0,
+                field_mask,
+            )?;
+            total_count = total_count.saturating_add(shard_total_count);
+            for (rank, hit) in shard_hits.iter_mut().enumerate() {
+                let shard_rank = rank as f32 + 1.0;
+                hit.score = 1.0 / (FEDERATED_RRF_K + shard_rank);
+            }
+            combined_hits.extend(shard_hits);
         }
-        Ok(hits)
+
+        combined_hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| SearchHitKey::from_hit(a).cmp(&SearchHitKey::from_hit(b)))
+        });
+
+        Ok((combined_hits, total_count))
     }
 
     fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
@@ -6297,15 +6531,22 @@ fn filters_fingerprint(filters: &SearchFilters) -> String {
 impl SearchClient {
     /// Return the total number of indexed Tantivy documents.
     pub fn total_docs(&self) -> usize {
-        self.reader
-            .as_ref()
-            .map(|(reader, _)| reader.searcher().num_docs() as usize)
+        if let Some((reader, _)) = &self.reader {
+            return reader.searcher().num_docs() as usize;
+        }
+        self.federated_readers()
+            .map(|readers| {
+                readers
+                    .iter()
+                    .map(|shard| shard.reader.searcher().num_docs() as usize)
+                    .sum()
+            })
             .unwrap_or(0)
     }
 
     /// Returns `true` if the Tantivy search index is available.
     pub fn has_tantivy(&self) -> bool {
-        self.reader.is_some()
+        self.reader.is_some() || self.federated_readers().is_some()
     }
 
     fn maybe_reload_reader(&self, reader: &IndexReader) -> Result<()> {

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
@@ -11,10 +11,13 @@ use frankensearch::lexical::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
     CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
     CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
-    IndexReader, Schema, cass_build_schema as fs_build_schema,
+    IndexReader, ReloadPolicy as FsReloadPolicy, Schema, cass_build_schema as fs_build_schema,
     cass_ensure_tokenizer as fs_ensure_tokenizer, cass_fields_from_schema as fs_fields_from_schema,
-    cass_index_dir as fs_index_dir, cass_schema_hash_matches, tantivy_crate,
+    cass_index_dir as fs_index_dir, cass_open_search_reader as fs_cass_open_search_reader,
+    cass_schema_hash_matches, tantivy_crate,
 };
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 
 pub(crate) fn normalized_index_source_id(
     source_id: Option<&str>,
@@ -214,6 +217,310 @@ pub fn schema_hash_matches(stored: &str) -> bool {
 pub type Fields = FsCassFields;
 pub type MergeStatus = FsCassMergeStatus;
 
+const FEDERATED_SEARCH_MANIFEST_FILE: &str = "federated-search-manifest.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchableIndexSummary {
+    pub docs: usize,
+    pub segments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FederatedSearchManifest {
+    version: u32,
+    kind: String,
+    schema_hash: String,
+    shards: Vec<FederatedSearchShardManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FederatedSearchShardManifest {
+    relative_path: String,
+    docs: usize,
+    segments: usize,
+    meta_fingerprint: String,
+}
+
+fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
+    index_path.join(FEDERATED_SEARCH_MANIFEST_FILE)
+}
+
+fn write_root_schema_hash_file(index_path: &Path) -> Result<()> {
+    fs::write(
+        index_path.join("schema_hash.json"),
+        format!("{{\"schema_hash\":\"{CASS_SCHEMA_HASH}\"}}"),
+    )
+    .with_context(|| {
+        format!(
+            "writing cass schema hash metadata for searchable index {}",
+            index_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn manifest_relative_shard_path(shard_idx: usize) -> String {
+    format!("shards/shard-{shard_idx:05}")
+}
+
+fn meta_fingerprint_for_existing_index_dir(index_path: &Path) -> Result<String> {
+    let meta_path = index_path.join("meta.json");
+    let bytes = fs::read(&meta_path)
+        .with_context(|| format!("reading Tantivy meta file {}", meta_path.display()))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn load_federated_search_manifest_internal(index_path: &Path) -> Result<Option<FederatedSearchManifest>> {
+    let manifest_path = federated_search_manifest_path(index_path);
+    match fs::read(&manifest_path) {
+        Ok(bytes) => serde_json::from_slice::<FederatedSearchManifest>(&bytes)
+            .with_context(|| {
+                format!(
+                    "parsing federated search manifest {}",
+                    manifest_path.display()
+                )
+            })
+            .map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "reading federated search manifest {}",
+                manifest_path.display()
+            )
+        }),
+    }
+}
+
+pub fn searchable_index_exists(index_path: &Path) -> bool {
+    index_path.join("meta.json").exists() || federated_search_manifest_path(index_path).exists()
+}
+
+pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
+    let meta_path = index_path.join("meta.json");
+    if meta_path.exists() {
+        return fs::metadata(meta_path).and_then(|m| m.modified()).ok();
+    }
+    fs::metadata(federated_search_manifest_path(index_path))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+pub fn searchable_index_fingerprint(index_path: &Path) -> Result<Option<String>> {
+    let meta_path = index_path.join("meta.json");
+    match fs::read(&meta_path) {
+        Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let manifest_path = federated_search_manifest_path(index_path);
+            match fs::read(&manifest_path) {
+                Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(err).with_context(|| {
+                    format!(
+                        "reading federated search manifest {}",
+                        manifest_path.display()
+                    )
+                }),
+            }
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("reading Tantivy meta file {}", meta_path.display()))
+        }
+    }
+}
+
+pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIndexSummary>> {
+    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
+        let docs = manifest.shards.iter().map(|shard| shard.docs).sum();
+        let segments = manifest.shards.iter().map(|shard| shard.segments).sum();
+        return Ok(Some(SearchableIndexSummary { docs, segments }));
+    }
+
+    let meta_path = index_path.join("meta.json");
+    if !meta_path.exists() {
+        return Ok(None);
+    }
+
+    let mut index = Index::open_in_dir(index_path).with_context(|| {
+        format!(
+            "opening searchable Tantivy index directory for summary: {}",
+            index_path.display()
+        )
+    })?;
+    ensure_tokenizer(&mut index);
+    let (reader, _fields) =
+        fs_cass_open_search_reader(index_path, FsReloadPolicy::Manual).map_err(map_fs_err)?;
+    Ok(Some(SearchableIndexSummary {
+        docs: reader.searcher().num_docs() as usize,
+        segments: index.searchable_segment_metas().map_err(map_fs_err)?.len(),
+    }))
+}
+
+pub fn open_federated_search_readers(
+    index_path: &Path,
+    reload_policy: FsReloadPolicy,
+) -> Result<Option<Vec<(IndexReader, Fields)>>> {
+    let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
+        return Ok(None);
+    };
+
+    if manifest.schema_hash != CASS_SCHEMA_HASH {
+        return Err(anyhow::anyhow!(
+            "federated search manifest schema mismatch: expected {}, got {}",
+            CASS_SCHEMA_HASH,
+            manifest.schema_hash
+        ));
+    }
+
+    let readers = manifest
+        .shards
+        .into_iter()
+        .map(|shard| {
+            let shard_path = index_path.join(&shard.relative_path);
+            fs_cass_open_search_reader(&shard_path, reload_policy)
+                .map_err(map_fs_err)
+                .with_context(|| {
+                    format!(
+                        "opening federated lexical shard reader {}",
+                        shard_path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(readers))
+}
+
+fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()> {
+    let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
+        return Ok(());
+    };
+
+    let stage_parent = index_path.parent().unwrap_or(index_path);
+    let materialize_root = tempfile::Builder::new()
+        .prefix("cass-federated-materialize-")
+        .tempdir_in(stage_parent)
+        .with_context(|| {
+            format!(
+                "creating staging directory to materialize federated lexical bundle {}",
+                index_path.display()
+            )
+        })?;
+    let materialized_index_path = materialize_root.path().join("index");
+    let shard_paths = manifest
+        .shards
+        .iter()
+        .map(|shard| index_path.join(&shard.relative_path))
+        .collect::<Vec<_>>();
+
+    TantivyIndex::assemble_compatible_index_directories(&materialized_index_path, &shard_paths)
+        .with_context(|| {
+            format!(
+                "materializing federated lexical bundle into mutable Tantivy index {}",
+                index_path.display()
+            )
+        })?;
+
+    if index_path.exists() {
+        fs::remove_dir_all(index_path).with_context(|| {
+            format!(
+                "removing federated lexical bundle before mutable materialization {}",
+                index_path.display()
+            )
+        })?;
+    }
+    fs::rename(&materialized_index_path, index_path).with_context(|| {
+        format!(
+            "publishing materialized mutable Tantivy index {} -> {}",
+            materialized_index_path.display(),
+            index_path.display()
+        )
+    })?;
+    materialize_root
+        .close()
+        .context("closing federated lexical materialization staging directory")?;
+    Ok(())
+}
+
+pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
+    output_path: &Path,
+    input_paths: &[P],
+) -> Result<SearchableIndexSummary> {
+    if input_paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "cannot publish federated lexical bundle without at least one input shard"
+        ));
+    }
+    ensure_empty_merge_output_directory(output_path)?;
+
+    let shard_root = output_path.join("shards");
+    fs::create_dir_all(&shard_root).with_context(|| {
+        format!(
+            "creating federated lexical shard root {}",
+            shard_root.display()
+        )
+    })?;
+
+    let mut manifest = FederatedSearchManifest {
+        version: 1,
+        kind: "cass-federated-lexical-index".to_string(),
+        schema_hash: CASS_SCHEMA_HASH.to_string(),
+        shards: Vec::with_capacity(input_paths.len()),
+    };
+    let mut total_docs = 0usize;
+    let mut total_segments = 0usize;
+
+    for (shard_idx, input_path) in input_paths.iter().enumerate() {
+        let input_path = input_path.as_ref();
+        let summary = searchable_index_summary(input_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "federated lexical publish input is not a searchable index: {}",
+                input_path.display()
+            )
+        })?;
+        let meta_fingerprint = meta_fingerprint_for_existing_index_dir(input_path)?;
+        let relative_path = manifest_relative_shard_path(shard_idx);
+        let destination_path = output_path.join(&relative_path);
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating parent directory for federated lexical shard {}",
+                    destination_path.display()
+                )
+            })?;
+        }
+        fs::rename(input_path, &destination_path).with_context(|| {
+            format!(
+                "moving staged lexical shard {} into federated publish bundle {}",
+                input_path.display(),
+                destination_path.display()
+            )
+        })?;
+
+        total_docs = total_docs.saturating_add(summary.docs);
+        total_segments = total_segments.saturating_add(summary.segments);
+        manifest.shards.push(FederatedSearchShardManifest {
+            relative_path,
+            docs: summary.docs,
+            segments: summary.segments,
+            meta_fingerprint,
+        });
+    }
+
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).context("serializing federated search manifest")?;
+    fs::write(federated_search_manifest_path(output_path), &manifest_bytes).with_context(|| {
+        format!(
+            "writing federated search manifest {}",
+            federated_search_manifest_path(output_path).display()
+        )
+    })?;
+    write_root_schema_hash_file(output_path)?;
+
+    Ok(SearchableIndexSummary {
+        docs: total_docs,
+        segments: total_segments,
+    })
+}
+
 pub struct TantivyIndex {
     inner: FsCassTantivyIndex,
     pub fields: Fields,
@@ -221,6 +528,7 @@ pub struct TantivyIndex {
 
 impl TantivyIndex {
     pub fn open_or_create(path: &Path) -> Result<Self> {
+        materialize_federated_search_bundle_for_write(path)?;
         let inner = FsCassTantivyIndex::open_or_create(path).map_err(map_fs_err)?;
         let fields = inner.fields();
         Ok(Self { inner, fields })
@@ -230,6 +538,7 @@ impl TantivyIndex {
         path: &Path,
         writer_parallelism: usize,
     ) -> Result<Self> {
+        materialize_federated_search_bundle_for_write(path)?;
         let inner = FsCassTantivyIndex::open_or_create_with_writer_parallelism(
             path,
             writer_parallelism.max(1),
