@@ -3003,7 +3003,7 @@ pub struct LexicalRebuildMessageRow {
 /// Even lighter message projection used only by the grouped lexical rebuild
 /// stream hot path. It keeps just the per-message fields the rebuild consumes
 /// and tracks the final message id at conversation scope instead.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexicalRebuildGroupedMessageRow {
     pub idx: i64,
     pub is_tool_role: bool,
@@ -4702,7 +4702,13 @@ impl FrankenStorage {
                 |row| {
                     let workspace_path: Option<String> = row.get_typed(2)?;
                     let source_path: String = row.get_typed(5)?;
-                    let source_id: Option<String> = row.get_typed(10)?;
+                    let raw_source_id: Option<String> = row.get_typed(10)?;
+                    let raw_origin_host: Option<String> = row.get_typed(11)?;
+                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                        raw_source_id.as_deref(),
+                        None,
+                        raw_origin_host.as_deref(),
+                    );
                     Ok(Conversation {
                         id: Some(row.get_typed(0)?),
                         agent_slug: row.get_typed(1)?,
@@ -4715,8 +4721,8 @@ impl FrankenStorage {
                         approx_tokens: row.get_typed(8)?,
                         metadata_json: franken_read_metadata_compat(row, 9, 12),
                         messages: Vec::new(),
-                        source_id: source_id.unwrap_or_else(|| "local".to_string()),
-                        origin_host: row.get_typed(11)?,
+                        source_id,
+                        origin_host,
                     })
                 },
             )
@@ -4775,7 +4781,13 @@ impl FrankenStorage {
                     let agent_id: Option<i64> = row.get_typed(1)?;
                     let workspace_id: Option<i64> = row.get_typed(2)?;
                     let source_path: String = row.get_typed(5)?;
-                    let source_id: Option<String> = row.get_typed(8)?;
+                    let raw_source_id: Option<String> = row.get_typed(8)?;
+                    let raw_origin_host: Option<String> = row.get_typed(9)?;
+                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                        raw_source_id.as_deref(),
+                        None,
+                        raw_origin_host.as_deref(),
+                    );
                     Ok(LexicalRebuildConversationRow {
                         id: Some(row.get_typed(0)?),
                         agent_slug: agent_id
@@ -4787,12 +4799,66 @@ impl FrankenStorage {
                         source_path: Path::new(&source_path).to_path_buf(),
                         started_at: row.get_typed(6)?,
                         ended_at: row.get_typed(7)?,
-                        source_id: source_id.unwrap_or_else(|| "local".to_string()),
-                        origin_host: row.get_typed(9)?,
+                        source_id,
+                        origin_host,
                     })
                 },
             )
             .with_context(|| "listing conversations for lexical rebuild")
+    }
+
+    /// List lexical rebuild conversations strictly after the given primary key.
+    ///
+    /// Keyset pagination keeps later rebuild pages as cheap as earlier ones,
+    /// avoiding the ever-growing `OFFSET` scan cost during large rebuilds.
+    pub fn list_conversations_for_lexical_rebuild_after_id(
+        &self,
+        limit: i64,
+        after_conversation_id: i64,
+        agent_slugs: &HashMap<i64, String>,
+        workspace_paths: &HashMap<i64, PathBuf>,
+    ) -> Result<Vec<LexicalRebuildConversationRow>> {
+        self.conn
+            .query_map_collect(
+                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                       started_at, ended_at, source_id, origin_host
+                FROM conversations
+                WHERE id > ?2
+                ORDER BY id ASC
+                LIMIT ?1",
+                fparams![limit, after_conversation_id],
+                |row| {
+                    let agent_id: Option<i64> = row.get_typed(1)?;
+                    let workspace_id: Option<i64> = row.get_typed(2)?;
+                    let source_path: String = row.get_typed(5)?;
+                    let raw_source_id: Option<String> = row.get_typed(8)?;
+                    let raw_origin_host: Option<String> = row.get_typed(9)?;
+                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                        raw_source_id.as_deref(),
+                        None,
+                        raw_origin_host.as_deref(),
+                    );
+                    Ok(LexicalRebuildConversationRow {
+                        id: Some(row.get_typed(0)?),
+                        agent_slug: agent_id
+                            .and_then(|aid| agent_slugs.get(&aid).cloned())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        workspace: workspace_id.and_then(|wid| workspace_paths.get(&wid).cloned()),
+                        external_id: row.get_typed(3)?,
+                        title: row.get_typed(4)?,
+                        source_path: Path::new(&source_path).to_path_buf(),
+                        started_at: row.get_typed(6)?,
+                        ended_at: row.get_typed(7)?,
+                        source_id,
+                        origin_host,
+                    })
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "listing conversations for lexical rebuild after id {after_conversation_id}"
+                )
+            })
     }
 
     /// Fetch messages for a conversation.
@@ -14490,6 +14556,104 @@ mod tests {
                 PathBuf::from("/tmp/c.jsonl"),
             ]
         );
+
+        let first_page = storage
+            .list_conversations_for_lexical_rebuild_after_id(2, 0, &agent_slugs, &workspace_paths)
+            .unwrap();
+        let first_page_paths: Vec<PathBuf> = first_page
+            .iter()
+            .map(|conv| conv.source_path.clone())
+            .collect();
+        assert_eq!(
+            first_page_paths,
+            vec![PathBuf::from("/tmp/a.jsonl"), PathBuf::from("/tmp/b.jsonl")]
+        );
+
+        let second_page = storage
+            .list_conversations_for_lexical_rebuild_after_id(
+                2,
+                first_page
+                    .last()
+                    .and_then(|conv| conv.id)
+                    .expect("first page should include an id"),
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        let second_page_paths: Vec<PathBuf> = second_page
+            .iter()
+            .map(|conv| conv.source_path.clone())
+            .collect();
+        assert_eq!(second_page_paths, vec![PathBuf::from("/tmp/c.jsonl")]);
+    }
+
+    #[test]
+    fn lexical_rebuild_listing_normalizes_host_only_remote_source_from_blank_source_id() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("legacy-blank-source".into()),
+            title: Some("Legacy blank source".into()),
+            source_path: PathBuf::from("/tmp/legacy-blank-source.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_000),
+                content: "hello".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let conversation_id = storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap()
+            .conversation_id;
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "UPDATE conversations SET source_id = ?1, origin_host = ?2 WHERE id = ?3",
+                fparams!["   ", "dev@laptop", conversation_id],
+            )
+            .unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+        let listed = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_id, "dev@laptop");
+        assert_eq!(listed[0].origin_host.as_deref(), Some("dev@laptop"));
+
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
+        let rebuild_listed = storage
+            .list_conversations_for_lexical_rebuild_after_id(10, 0, &agent_slugs, &workspace_paths)
+            .unwrap();
+        assert_eq!(rebuild_listed.len(), 1);
+        assert_eq!(rebuild_listed[0].source_id, "dev@laptop");
+        assert_eq!(rebuild_listed[0].origin_host.as_deref(), Some("dev@laptop"));
     }
 
     #[test]

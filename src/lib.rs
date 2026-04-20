@@ -5483,6 +5483,34 @@ fn state_meta_json(
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
+    let lexical_rebuild_pipeline = crate::indexer::lexical_rebuild_pipeline_settings_snapshot();
+    let lexical_rebuild_pipeline_runtime = if lexical.rebuilding {
+        crate::indexer::load_active_lexical_rebuild_pipeline_runtime(&index_path, db_path)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let mut lexical_rebuild_pipeline_json =
+        serde_json::to_value(&lexical_rebuild_pipeline).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut pipeline) = lexical_rebuild_pipeline_json {
+        let runtime_value = lexical_rebuild_pipeline_runtime
+            .map(|runtime| {
+                serde_json::json!({
+                    "queue_depth": runtime.queue_depth,
+                    "inflight_message_bytes": runtime.inflight_message_bytes,
+                    "pending_batch_conversations": runtime.pending_batch_conversations,
+                    "pending_batch_message_bytes": runtime.pending_batch_message_bytes,
+                    "page_prep_workers": runtime.page_prep_workers,
+                    "active_page_prep_jobs": runtime.active_page_prep_jobs,
+                    "ordered_buffered_pages": runtime.ordered_buffered_pages,
+                    "budget_generation": runtime.budget_generation,
+                    "updated_at": format_timestamp_millis_rfc3339(runtime.updated_at_ms),
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        pipeline.insert("runtime".to_string(), runtime_value);
+    }
 
     // Probe Tantivy index document count when the DB has messages.
     // This is cheap (one reader open) and only runs when it matters.
@@ -5574,7 +5602,8 @@ fn state_meta_json(
             }),
             "processed_conversations": lexical.processed_conversations,
             "total_conversations": lexical.total_conversations,
-            "indexed_docs": lexical.indexed_docs
+            "indexed_docs": lexical.indexed_docs,
+            "pipeline": lexical_rebuild_pipeline_json
         },
         "semantic": {
             "status": semantic.status,
@@ -10643,6 +10672,7 @@ mod cli_read_db_tests {
     use super::*;
     use crate::storage::sqlite::FrankenStorage;
     use fs2::FileExt;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn seed_cli_db() -> (TempDir, PathBuf) {
@@ -10780,6 +10810,194 @@ mod cli_read_db_tests {
             resolved,
             (5, 42),
             "fallback must use observed progress stats, not reopen the live DB"
+        );
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: &str) -> EnvGuard {
+        let previous = dotenvy::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        EnvGuard { key, previous }
+    }
+
+    #[test]
+    #[serial]
+    fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
+        let _reserved_cores = set_env("CASS_TANTIVY_REBUILD_RESERVED_CORES", "4");
+        let _steady_fetch = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "210");
+        let _startup_fetch = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "21",
+        );
+        let _steady_conversations =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "410");
+        let _startup_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "41",
+        );
+        let _steady_messages = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "510");
+        let _startup_messages = set_env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "51");
+        let _steady_message_bytes =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "610000");
+        let _startup_message_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "61000",
+        );
+        let _pipeline_channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "4");
+        let _page_prep_workers = set_env("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", "6");
+        let _pipeline_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
+            "888888",
+        );
+
+        let (temp, db_path) = seed_cli_db();
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        let pipeline = &state["rebuild"]["pipeline"];
+
+        assert_eq!(pipeline["workers"].as_u64(), Some(9));
+        let available_parallelism = pipeline["available_parallelism"]
+            .as_u64()
+            .expect("available_parallelism is reported");
+        assert_eq!(
+            pipeline["reserved_cores"].as_u64(),
+            Some(4_u64.min(available_parallelism.saturating_sub(1)))
+        );
+        assert_eq!(
+            pipeline["page_size"].as_i64(),
+            Some(crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC)
+        );
+        assert_eq!(
+            pipeline["steady_batch_fetch_conversations"].as_u64(),
+            Some(210)
+        );
+        assert_eq!(
+            pipeline["startup_batch_fetch_conversations"].as_u64(),
+            Some(21)
+        );
+        assert_eq!(
+            pipeline["steady_commit_every_conversations"].as_u64(),
+            Some(410)
+        );
+        assert_eq!(
+            pipeline["startup_commit_every_conversations"].as_u64(),
+            Some(41)
+        );
+        assert_eq!(pipeline["steady_commit_every_messages"].as_u64(), Some(510));
+        assert_eq!(pipeline["startup_commit_every_messages"].as_u64(), Some(51));
+        assert_eq!(
+            pipeline["steady_commit_every_message_bytes"].as_u64(),
+            Some(610000)
+        );
+        assert_eq!(
+            pipeline["startup_commit_every_message_bytes"].as_u64(),
+            Some(61000)
+        );
+        assert_eq!(pipeline["pipeline_channel_size"].as_u64(), Some(4));
+        assert_eq!(pipeline["page_prep_workers"].as_u64(), Some(6));
+        assert_eq!(
+            pipeline["pipeline_max_message_bytes_in_flight"].as_u64(),
+            Some(888888)
+        );
+        assert_eq!(pipeline["runtime"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn state_meta_json_reports_active_rebuild_pipeline_runtime() {
+        let (temp, db_path) = seed_cli_db();
+        let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(".lexical-rebuild-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 10,
+                    "storage_fingerprint": "10:42:0:0"
+                },
+                "page_size": crate::indexer::LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+                "committed_offset": 4,
+                "processed_conversations": 4,
+                "indexed_docs": 20,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": false,
+                "updated_at_ms": 1_733_000_123_000_i64,
+                "runtime": {
+                    "queue_depth": 3,
+                    "inflight_message_bytes": 65_536,
+                    "pending_batch_conversations": 9,
+                    "pending_batch_message_bytes": 131_072,
+                    "page_prep_workers": 6,
+                    "active_page_prep_jobs": 2,
+                    "ordered_buffered_pages": 4,
+                    "budget_generation": 1,
+                    "updated_at_ms": 1_733_000_124_000_i64
+                }
+            }))
+            .expect("serialize rebuild state"),
+        )
+        .expect("write rebuild state");
+
+        let lock_path = temp.path().join("index-run.lock");
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock file");
+        lock_file.try_lock_exclusive().expect("hold index lock");
+        writeln!(
+            lock_file,
+            "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index",
+            std::process::id(),
+            1_733_000_111_000_i64,
+            db_path.display()
+        )
+        .expect("write lock metadata");
+        lock_file.flush().expect("flush lock metadata");
+
+        let state = state_meta_json(temp.path(), &db_path, 60, true);
+        let runtime = &state["rebuild"]["pipeline"]["runtime"];
+
+        assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
+        assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
+        assert_eq!(runtime["pending_batch_conversations"].as_u64(), Some(9));
+        assert_eq!(
+            runtime["pending_batch_message_bytes"].as_u64(),
+            Some(131_072)
+        );
+        assert_eq!(runtime["page_prep_workers"].as_u64(), Some(6));
+        assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
+        assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
+        assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
+        assert_eq!(
+            runtime["updated_at"].as_str(),
+            format_timestamp_millis_rfc3339(1_733_000_124_000_i64).as_deref()
         );
     }
 
