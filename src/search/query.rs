@@ -2419,6 +2419,7 @@ struct FederatedIndexReader {
 
 static FEDERATED_SEARCH_READERS: Lazy<RwLock<HashMap<String, Arc<Vec<FederatedIndexReader>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+static SEARCH_CLIENT_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Calculate Levenshtein edit distance between two strings.
 /// Used for typo detection in did-you-mean suggestions.
@@ -2698,10 +2699,12 @@ impl SearchClient {
         options: SearchClientOptions,
     ) -> Result<Option<Self>> {
         let tantivy = fs_cass_open_search_reader(index_path, ReloadPolicy::Manual).ok();
+        let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let cache_namespace = format!(
-            "v{}|schema:{}|index:{}",
+            "v{}|schema:{}|client:{}|index:{}",
             CACHE_KEY_VERSION,
             FS_CASS_SCHEMA_HASH,
+            client_id,
             index_path.display()
         );
         let federated_readers = if tantivy.is_none() {
