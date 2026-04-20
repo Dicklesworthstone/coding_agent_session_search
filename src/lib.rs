@@ -5344,9 +5344,9 @@ fn cli_error_json_payload(err: &CliError, elapsed_ms: u128) -> serde_json::Value
 }
 
 fn cass_lexical_index_initialized(data_dir: &Path) -> bool {
-    crate::search::tantivy::expected_index_dir(data_dir)
-        .join("meta.json")
-        .exists()
+    crate::search::tantivy::searchable_index_exists(&crate::search::tantivy::expected_index_dir(
+        data_dir,
+    ))
 }
 
 fn cass_not_initialized(
@@ -5404,12 +5404,9 @@ fn state_meta_json(
     let counts_skipped = db_snapshot.counts_skipped;
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
-    let index_meta_path = index_path.join("meta.json");
-    let lexical_index_initialized = index_meta_path.exists();
+    let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
     if last_indexed_at.is_none() && lexical_index_initialized {
-        last_indexed_at = fs::metadata(&index_meta_path)
-            .and_then(|m| m.modified())
-            .ok()
+        last_indexed_at = crate::search::tantivy::searchable_index_modified_time(&index_path)
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64);
     }
@@ -7099,7 +7096,7 @@ fn run_cli_search(
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
-    let tantivy_index_initialized = index_path.join("meta.json").exists();
+    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
     let client = SearchClient::open_with_options(
@@ -9600,8 +9597,8 @@ fn run_diag(
     };
 
     // Check index existence
-    let index_meta_path = index_path.join("meta.json");
-    let (index_exists, index_size) = if index_meta_path.exists() {
+    let (index_exists, index_size) = if crate::search::tantivy::searchable_index_exists(&index_path)
+    {
         let size = fs_dir_size(&index_path);
         (true, size)
     } else {
@@ -12256,11 +12253,14 @@ fn run_doctor(
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
-    let index_meta_path = index_path.join("meta.json");
     let lock_path = data_dir.join(".index.lock");
     let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
-    let not_initialized =
-        !fix && cass_not_initialized(db_path.exists(), index_meta_path.exists(), rebuild_active);
+    let not_initialized = !fix
+        && cass_not_initialized(
+            db_path.exists(),
+            crate::search::tantivy::searchable_index_exists(&index_path),
+            rebuild_active,
+        );
     let explanation = not_initialized.then(|| cass_not_initialized_explanation(&data_dir));
     let recommended_action = not_initialized.then(cass_not_initialized_recommended_action);
 

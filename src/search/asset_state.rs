@@ -493,7 +493,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         checkpoint,
         current_db_fingerprint,
     } = input;
-    let exists = index_path.join("meta.json").exists();
+    let exists = crate::search::tantivy::searchable_index_exists(index_path);
     let checkpoint_db_matches =
         checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
     let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);

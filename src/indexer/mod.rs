@@ -4365,14 +4365,7 @@ fn clear_lexical_rebuild_state(index_path: &Path) -> Result<()> {
 }
 
 fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
-    let meta_path = index_path.join("meta.json");
-    match fs::read(&meta_path) {
-        Ok(bytes) => Ok(Some(blake3::hash(&bytes).to_hex().to_string())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => {
-            Err(err).with_context(|| format!("reading Tantivy meta file {}", meta_path.display()))
-        }
-    }
+    crate::search::tantivy::searchable_index_fingerprint(index_path)
 }
 
 fn completed_lexical_rebuild_meta_fingerprint(
@@ -4386,11 +4379,9 @@ fn completed_lexical_rebuild_meta_fingerprint(
 }
 
 fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
-    match frankensearch::lexical::cass_open_search_reader(
-        index_path,
-        frankensearch::lexical::ReloadPolicy::Manual,
-    ) {
-        Ok((reader, _fields)) => Ok(Some(reader.searcher().num_docs() as usize)),
+    match crate::search::tantivy::searchable_index_summary(index_path) {
+        Ok(Some(summary)) => Ok(Some(summary.docs)),
+        Ok(None) => Ok(None),
         Err(err) => {
             tracing::debug!(
                 path = %index_path.display(),
@@ -7280,19 +7271,20 @@ pub fn run_index(
                 .unwrap_or(false);
 
         // Treat missing schema hash as rebuild (open_or_create will wipe/recreate).
-        let meta_path = index_path.join("meta.json");
-        tantivy_requires_rebuild = opts.force_rebuild || !meta_path.exists() || !schema_matches;
+        tantivy_requires_rebuild = opts.force_rebuild
+            || !crate::search::tantivy::searchable_index_exists(&index_path)
+            || !schema_matches;
 
         // Preflight open: if the cass-compatible Tantivy reader can't open, force a
         // rebuild so we do a full scan and reindex messages into the new index
         // (SQLite is incremental-only by default).
         if !tantivy_requires_rebuild {
-            match frankensearch::lexical::cass_open_search_reader(
-                &index_path,
-                frankensearch::lexical::ReloadPolicy::Manual,
-            ) {
-                Ok((reader, _fields)) => {
-                    observed_tantivy_docs = Some(reader.searcher().num_docs() as usize);
+            match crate::search::tantivy::searchable_index_summary(&index_path) {
+                Ok(Some(summary)) => {
+                    observed_tantivy_docs = Some(summary.docs);
+                }
+                Ok(None) => {
+                    tantivy_requires_rebuild = true;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -9600,7 +9592,8 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
 
 struct LexicalRebuildFinalMergeArtifact {
     publish_path: PathBuf,
-    index: crate::search::tantivy::TantivyIndex,
+    docs: usize,
+    segments: usize,
 }
 
 fn finalize_staged_lexical_rebuild_publish_artifact(
@@ -9621,33 +9614,35 @@ fn finalize_staged_lexical_rebuild_publish_artifact(
             publish_path = %publish_path.display(),
             "reusing already-final staged lexical rebuild artifact without redundant final merge"
         );
-        let index = crate::search::tantivy::TantivyIndex::open_or_create(&publish_path)
-            .with_context(|| {
-                format!(
-                    "opening final staged lexical rebuild artifact at {}",
+        let summary = crate::search::tantivy::searchable_index_summary(&publish_path)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "single-input staged lexical rebuild artifact is not searchable: {}",
                     publish_path.display()
                 )
             })?;
         return Ok(LexicalRebuildFinalMergeArtifact {
             publish_path,
-            index,
+            docs: summary.docs,
+            segments: summary.segments,
         });
     }
 
     tracing::info!(
         publish_path = %output_path.display(),
         staged_artifacts = input_paths.len(),
-        "assembling final staged lexical rebuild generation from compatible artifacts without remerging docs"
+        "publishing staged lexical rebuild as federated lexical shard set without final assembly collapse"
     );
     let _ = stage_root;
     let _ = max_parallel_jobs;
-    let index = crate::search::tantivy::TantivyIndex::assemble_compatible_index_directories(
+    let summary = crate::search::tantivy::publish_federated_searchable_index_directories(
         output_path,
         input_paths,
     )?;
     Ok(LexicalRebuildFinalMergeArtifact {
         publish_path: output_path.to_path_buf(),
-        index,
+        docs: summary.docs,
+        segments: summary.segments,
     })
 }
 
@@ -10632,9 +10627,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &final_merge_stage_root,
         shard_merge_settings.workers,
     )?;
-    let merged_reader = final_merge_artifact.index.reader()?;
-    merged_reader.reload()?;
-    let merged_docs = merged_reader.searcher().num_docs() as usize;
+    let merged_docs = final_merge_artifact.docs;
     if merged_docs != indexed_docs {
         return Err(anyhow::anyhow!(
             "staged lexical rebuild merged {} docs but durable shard builds produced {} docs",
@@ -10644,8 +10637,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     }
     let staged_published_meta_fingerprint =
         index_meta_fingerprint(&final_merge_artifact.publish_path)?;
-    drop(merged_reader);
-    drop(final_merge_artifact.index);
     publish_staged_lexical_index(&final_merge_artifact.publish_path, index_path)?;
 
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
