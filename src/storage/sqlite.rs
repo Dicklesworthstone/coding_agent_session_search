@@ -2988,6 +2988,15 @@ pub struct LexicalRebuildConversationRow {
     pub origin_host: Option<String>,
 }
 
+/// Lightweight per-conversation footprint used to pre-plan lexical rebuild
+/// shard boundaries without re-reading full message bodies in the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexicalRebuildConversationFootprintRow {
+    pub conversation_id: i64,
+    pub message_count: usize,
+    pub message_bytes: usize,
+}
+
 /// Lightweight message projection used by the streaming lexical rebuild path.
 #[derive(Debug, Clone)]
 pub struct LexicalRebuildMessageRow {
@@ -4755,6 +4764,72 @@ impl FrankenStorage {
         Ok((agents, workspaces))
     }
 
+    /// List per-conversation message footprints in primary-key order.
+    ///
+    /// This deliberately avoids a conversations/messages JOIN because
+    /// frankensqlite can fall back to full materialization on multi-table
+    /// rebuild-path queries. Instead we merge two cheap ordered single-table
+    /// scans: one over conversation ids and one grouped aggregate over messages.
+    pub fn list_conversation_footprints_for_lexical_rebuild(
+        &self,
+    ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
+        let conversation_ids: Vec<i64> = self
+            .conn
+            .query_map_collect(
+                "SELECT id FROM conversations ORDER BY id ASC",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .with_context(|| "listing conversation ids for lexical rebuild footprints")?;
+        let aggregate_rows: Vec<(i64, i64, i64)> = self
+            .conn
+            .query_map_collect(
+                r"SELECT conversation_id,
+                          COUNT(*),
+                          COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                   FROM messages
+                   GROUP BY conversation_id
+                   ORDER BY conversation_id ASC",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .with_context(|| "aggregating lexical rebuild conversation footprints")?;
+
+        let mut aggregates = aggregate_rows.into_iter().peekable();
+        let mut footprints = Vec::with_capacity(conversation_ids.len());
+        for conversation_id in conversation_ids {
+            while let Some((aggregate_conversation_id, _, _)) = aggregates.peek() {
+                if *aggregate_conversation_id < conversation_id {
+                    aggregates.next();
+                } else {
+                    break;
+                }
+            }
+
+            let (message_count, message_bytes) = match aggregates.peek() {
+                Some((aggregate_conversation_id, _, _))
+                    if *aggregate_conversation_id == conversation_id =>
+                {
+                    let (_, count, bytes) = aggregates
+                        .next()
+                        .expect("peeked lexical rebuild aggregate row should exist");
+                    (
+                        usize::try_from(count.max(0)).unwrap_or(usize::MAX),
+                        usize::try_from(bytes.max(0)).unwrap_or(usize::MAX),
+                    )
+                }
+                _ => (0, 0),
+            };
+            footprints.push(LexicalRebuildConversationFootprintRow {
+                conversation_id,
+                message_count,
+                message_bytes,
+            });
+        }
+
+        Ok(footprints)
+    }
+
     /// List conversations in primary-key order for full lexical rebuilds.
     ///
     /// This avoids the user-facing recency sort, which forces SQLite to build a
@@ -4857,6 +4932,65 @@ impl FrankenStorage {
             .with_context(|| {
                 format!(
                     "listing conversations for lexical rebuild after id {after_conversation_id}"
+                )
+            })
+    }
+
+    /// List lexical rebuild conversations inside an `(after_id, through_id]`
+    /// primary-key window.
+    ///
+    /// This lets the rebuild producer respect planned shard boundaries without
+    /// falling back to client-side trimming or multi-table joins.
+    pub fn list_conversations_for_lexical_rebuild_after_id_through_id(
+        &self,
+        limit: i64,
+        after_conversation_id: i64,
+        through_conversation_id: i64,
+        agent_slugs: &HashMap<i64, String>,
+        workspace_paths: &HashMap<i64, PathBuf>,
+    ) -> Result<Vec<LexicalRebuildConversationRow>> {
+        if through_conversation_id <= after_conversation_id {
+            return Ok(Vec::new());
+        }
+        self.conn
+            .query_map_collect(
+                r"SELECT id, agent_id, workspace_id, external_id, title, source_path,
+                       started_at, ended_at, source_id, origin_host
+                FROM conversations
+                WHERE id > ?2 AND id <= ?3
+                ORDER BY id ASC
+                LIMIT ?1",
+                fparams![limit, after_conversation_id, through_conversation_id],
+                |row| {
+                    let agent_id: Option<i64> = row.get_typed(1)?;
+                    let workspace_id: Option<i64> = row.get_typed(2)?;
+                    let source_path: String = row.get_typed(5)?;
+                    let raw_source_id: Option<String> = row.get_typed(8)?;
+                    let raw_origin_host: Option<String> = row.get_typed(9)?;
+                    let (source_id, _, origin_host) = normalized_storage_source_parts(
+                        raw_source_id.as_deref(),
+                        None,
+                        raw_origin_host.as_deref(),
+                    );
+                    Ok(LexicalRebuildConversationRow {
+                        id: Some(row.get_typed(0)?),
+                        agent_slug: agent_id
+                            .and_then(|aid| agent_slugs.get(&aid).cloned())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        workspace: workspace_id.and_then(|wid| workspace_paths.get(&wid).cloned()),
+                        external_id: row.get_typed(3)?,
+                        title: row.get_typed(4)?,
+                        source_path: Path::new(&source_path).to_path_buf(),
+                        started_at: row.get_typed(6)?,
+                        ended_at: row.get_typed(7)?,
+                        source_id,
+                        origin_host,
+                    })
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "listing conversations for lexical rebuild after id {after_conversation_id} through id {through_conversation_id}"
                 )
             })
     }
@@ -14585,6 +14719,137 @@ mod tests {
             .map(|conv| conv.source_path.clone())
             .collect();
         assert_eq!(second_page_paths, vec![PathBuf::from("/tmp/c.jsonl")]);
+
+        let bounded_page = storage
+            .list_conversations_for_lexical_rebuild_after_id_through_id(
+                10,
+                0,
+                first_page
+                    .last()
+                    .and_then(|conv| conv.id)
+                    .expect("first page should include an id"),
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        let bounded_paths: Vec<PathBuf> = bounded_page
+            .iter()
+            .map(|conv| conv.source_path.clone())
+            .collect();
+        assert_eq!(
+            bounded_paths,
+            vec![PathBuf::from("/tmp/a.jsonl"), PathBuf::from("/tmp/b.jsonl")]
+        );
+    }
+
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_tracks_utf8_bytes_and_empty_conversations()
+    {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let insert = |external_id: &str, base_ts: i64, messages: Vec<Message>| {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.to_string()),
+                        title: Some(external_id.to_string()),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(base_ts),
+                        ended_at: Some(base_ts + 100),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages,
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap()
+                .conversation_id
+        };
+
+        let ascii_id = insert(
+            "footprint-ascii",
+            1_700_000_000_000,
+            vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_001),
+                    content: "abc".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_002),
+                    content: "defg".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+        );
+        let empty_id = insert("footprint-empty", 1_700_000_001_000, Vec::new());
+        let utf8_id = insert(
+            "footprint-utf8",
+            1_700_000_002_000,
+            vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_002_001),
+                content: "hé🙂".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+        );
+
+        let footprints = storage
+            .list_conversation_footprints_for_lexical_rebuild()
+            .unwrap();
+        assert_eq!(
+            footprints,
+            vec![
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: ascii_id,
+                    message_count: 2,
+                    message_bytes: 7,
+                },
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: empty_id,
+                    message_count: 0,
+                    message_bytes: 0,
+                },
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: utf8_id,
+                    message_count: 1,
+                    message_bytes: "hé🙂".len(),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1,17 +1,18 @@
+use std::fs;
 use std::path::Path;
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 use frankensearch::lexical::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument as FsCassDocument,
     CassDocumentRef as FsCassDocumentRef, CassFields as FsCassFields,
     CassMergeStatus as FsCassMergeStatus, CassTantivyIndex as FsCassTantivyIndex, Index,
     IndexReader, Schema, cass_build_schema as fs_build_schema,
     cass_ensure_tokenizer as fs_ensure_tokenizer, cass_fields_from_schema as fs_fields_from_schema,
-    cass_index_dir as fs_index_dir, cass_schema_hash_matches,
+    cass_index_dir as fs_index_dir, cass_schema_hash_matches, tantivy_crate,
 };
 
 pub(crate) fn normalized_index_source_id(
@@ -69,17 +70,22 @@ pub(crate) fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
 const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
 
-fn tantivy_writer_parallelism_hint() -> usize {
+pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
     let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_TANTIVY_MAX_WRITER_THREADS);
 
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .clamp(1, max_threads)
+    available_parallelism.max(1).clamp(1, max_threads)
+}
+
+pub(crate) fn tantivy_writer_parallelism_hint() -> usize {
+    tantivy_writer_parallelism_hint_for_available(
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1),
+    )
 }
 
 fn tantivy_add_batch_max_messages() -> usize {
@@ -219,6 +225,19 @@ impl TantivyIndex {
         Ok(Self { inner, fields })
     }
 
+    pub fn open_or_create_with_writer_parallelism(
+        path: &Path,
+        writer_parallelism: usize,
+    ) -> Result<Self> {
+        let inner = FsCassTantivyIndex::open_or_create_with_writer_parallelism(
+            path,
+            writer_parallelism.max(1),
+        )
+        .map_err(map_fs_err)?;
+        let fields = inner.fields();
+        Ok(Self { inner, fields })
+    }
+
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
         self.add_messages(conv, &conv.messages)
     }
@@ -265,6 +284,61 @@ impl TantivyIndex {
     /// Use sparingly - blocks until merge finishes.
     pub fn force_merge(&mut self) -> Result<()> {
         self.inner.force_merge().map_err(map_fs_err)
+    }
+
+    pub fn merge_compatible_index_directories<P: AsRef<Path>>(
+        output_path: &Path,
+        input_paths: &[P],
+    ) -> Result<Self> {
+        if input_paths.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cannot merge Tantivy index directories without at least one input"
+            ));
+        }
+        ensure_empty_merge_output_directory(output_path)?;
+
+        let indices = input_paths
+            .iter()
+            .map(|input_path| {
+                let input_path = input_path.as_ref();
+                let mut index = Index::open_in_dir(input_path).with_context(|| {
+                    format!(
+                        "opening compatible Tantivy index directory for merge: {}",
+                        input_path.display()
+                    )
+                })?;
+                ensure_tokenizer(&mut index);
+                Ok(index)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_directory = tantivy_crate::directory::MmapDirectory::open(output_path)
+            .with_context(|| {
+                format!(
+                    "opening Tantivy output directory for merged index: {}",
+                    output_path.display()
+                )
+            })?;
+        let mut merged = tantivy_crate::indexer::merge_indices(&indices, output_directory)
+            .with_context(|| {
+                format!(
+                    "merging {} compatible Tantivy index directories into {}",
+                    indices.len(),
+                    output_path.display()
+                )
+            })?;
+        ensure_tokenizer(&mut merged);
+        fs::write(
+            output_path.join("schema_hash.json"),
+            format!("{{\"schema_hash\":\"{CASS_SCHEMA_HASH}\"}}"),
+        )
+        .with_context(|| {
+            format!(
+                "writing cass schema hash metadata for merged Tantivy index {}",
+                output_path.display()
+            )
+        })?;
+        drop(merged);
+        Self::open_or_create(output_path)
     }
 
     pub fn add_messages(
@@ -454,6 +528,48 @@ pub fn index_dir(base: &Path) -> Result<std::path::PathBuf> {
 
 pub fn ensure_tokenizer(index: &mut Index) {
     fs_ensure_tokenizer(index);
+}
+
+fn ensure_empty_merge_output_directory(output_path: &Path) -> Result<()> {
+    match fs::metadata(output_path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "merged Tantivy output path is not a directory: {}",
+                    output_path.display()
+                ));
+            }
+            let mut entries = fs::read_dir(output_path).with_context(|| {
+                format!(
+                    "reading merged Tantivy output directory before merge: {}",
+                    output_path.display()
+                )
+            })?;
+            if entries.next().transpose()?.is_some() {
+                return Err(anyhow::anyhow!(
+                    "merged Tantivy output directory must be empty before merge: {}",
+                    output_path.display()
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(output_path).with_context(|| {
+                format!(
+                    "creating merged Tantivy output directory before merge: {}",
+                    output_path.display()
+                )
+            })?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "checking merged Tantivy output directory before merge: {}",
+                    output_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -650,5 +766,119 @@ mod tests {
         reader.reload().expect("reload");
         let searcher = reader.searcher();
         assert_eq!(searcher.num_docs(), expected_docs as u64);
+    }
+
+    #[test]
+    fn merge_compatible_index_directories_roundtrips_docs_into_single_segment() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let merged = root.path().join("merged");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_000_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        let conv_a = make_conv("merge-a", "Merge A", "alpha");
+        let conv_b = make_conv("merge-b", "Merge B", "beta");
+        shard_a_index
+            .add_conversation_with_id(&conv_a, Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&conv_b, Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let merged_index =
+            TantivyIndex::merge_compatible_index_directories(&merged, &[&shard_a, &shard_b])
+                .expect("merge shard indices");
+        assert_eq!(
+            merged_index.segment_count(),
+            1,
+            "merged shard indices should collapse into a single searchable segment"
+        );
+        let reader = merged_index.reader().expect("reader");
+        reader.reload().expect("reload");
+        assert_eq!(reader.searcher().num_docs(), 4);
+    }
+
+    #[test]
+    fn merge_compatible_index_directories_rejects_non_empty_output_directory() {
+        let root = TempDir::new().expect("temp dir");
+        let shard = root.path().join("shard");
+        let merged = root.path().join("merged");
+        fs::create_dir_all(&merged).expect("create merged dir");
+        fs::write(merged.join("sentinel.txt"), "occupied").expect("write sentinel");
+
+        let mut shard_index = TantivyIndex::open_or_create(&shard).expect("create shard");
+        let conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("merge-occupied".to_string()),
+            title: Some("Occupied".to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from("/tmp/merge-occupied.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            metadata: Value::Null,
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "assistant".to_string(),
+                author: None,
+                created_at: Some(1_700_000_000_010),
+                content: "occupied".to_string(),
+                extra: Value::Null,
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        shard_index
+            .add_conversation_with_id(&conv, Some(1))
+            .expect("index shard");
+        shard_index.commit().expect("commit shard");
+        drop(shard_index);
+
+        let error = match TantivyIndex::merge_compatible_index_directories(&merged, &[&shard]) {
+            Ok(_) => panic!("non-empty merge output dir should be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("must be empty"),
+            "unexpected error: {error:#}"
+        );
     }
 }
