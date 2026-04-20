@@ -557,6 +557,19 @@ impl ModelManifest {
     /// rustls/TCP connect race — see GH#193 for context). The script uses the
     /// pinned repo revision so checksums match.
     pub fn air_gap_bash_script(&self, base_url: Option<&str>) -> String {
+        // Single-quote URLs to avoid any shell interpretation. Model-download
+        // URLs are HTTP(S) with an allow-listed base (`normalize_mirror_base_url`
+        // rejects anything with query strings), and `ModelFile::name` is
+        // repo-scoped and hash-verified post-download, so no caller-reachable
+        // single quote can slip through. Even so, assert at debug-build time.
+        fn quote_url(url: &str) -> String {
+            debug_assert!(
+                !url.contains('\''),
+                "model download URL unexpectedly contains a single quote: {url}"
+            );
+            format!("'{url}'")
+        }
+
         let mut out = String::new();
         out.push_str("# Air-gap model install (bash / Git Bash / MSYS2)\n");
         out.push_str(
@@ -564,17 +577,20 @@ impl ModelManifest {
         );
         out.push_str("set -euo pipefail\n");
         out.push_str(&format!("DIR=\"${{DIR:-./{}_files}}\"\n", self.id));
-        out.push_str("mkdir -p \"$DIR\" && cd \"$DIR\"\n");
+        out.push_str("mkdir -p \"$DIR\"\n");
         for file in &self.files {
+            // Write with explicit `-o "$DIR/<local>"` rather than `-O` so the
+            // output filename is decoupled from the last URL path component.
+            // Manifest files can sit at any repo-internal path (`onnx/model.onnx`,
+            // etc.) but `--from-file` resolves each file by `local_name()`.
             let url = self.download_url_with_base(file, base_url);
             out.push_str(&format!(
-                "curl -fLO --retry 3 {url:?}  # {local} ({size} bytes)\n",
-                url = url,
-                local = file.local_name(),
-                size = file.size,
+                "curl -fL --retry 3 {} -o \"$DIR/{}\"  # {} bytes\n",
+                quote_url(&url),
+                file.local_name(),
+                file.size,
             ));
         }
-        out.push_str("cd - >/dev/null\n");
         out.push_str(&format!(
             "cass models install {} --from-file \"$DIR\" -y\n",
             self.id
@@ -585,17 +601,36 @@ impl ModelManifest {
     /// Generate a ready-to-paste PowerShell script that downloads every file
     /// via `Invoke-WebRequest` and then invokes `cass models install --from-file`.
     pub fn air_gap_powershell_script(&self, base_url: Option<&str>) -> String {
+        // Same single-quoting invariant as the bash path.
+        fn quote_url_ps(url: &str) -> String {
+            debug_assert!(
+                !url.contains('\''),
+                "model download URL unexpectedly contains a single quote: {url}"
+            );
+            format!("'{url}'")
+        }
+
         let mut out = String::new();
-        out.push_str("# Air-gap model install (PowerShell)\n");
+        out.push_str("# Air-gap model install (PowerShell 5.1+ and 7+)\n");
         out.push_str("$ErrorActionPreference = 'Stop'\n");
+        // Force TLS 1.2+ on Windows PowerShell 5.1 where default may be
+        // TLS 1.0/1.1; HuggingFace requires 1.2+. No-op on PowerShell 7+.
+        out.push_str(
+            "[System.Net.ServicePointManager]::SecurityProtocol = \
+             [System.Net.ServicePointManager]::SecurityProtocol -bor \
+             [System.Net.SecurityProtocolType]::Tls12\n",
+        );
         out.push_str(&format!("$dir = \"{}_files\"\n", self.id));
         out.push_str("New-Item -ItemType Directory -Force -Path $dir | Out-Null\n");
         for file in &self.files {
             let url = self.download_url_with_base(file, base_url);
+            // `-UseBasicParsing` keeps this compatible with Windows PowerShell
+            // 5.1 and avoids the IE engine dependency. Ignored on PS 7+.
             out.push_str(&format!(
-                "Invoke-WebRequest -Uri \"{url}\" -OutFile (Join-Path $dir \"{local}\")\n",
-                url = url,
-                local = file.local_name(),
+                "Invoke-WebRequest -UseBasicParsing -Uri {} -OutFile (Join-Path $dir '{}')  # {} bytes\n",
+                quote_url_ps(&url),
+                file.local_name(),
+                file.size,
             ));
         }
         out.push_str(&format!(
@@ -1771,6 +1806,76 @@ mod tests {
                 manifest.repo, manifest.revision, manifest.files[0].name
             )
         );
+    }
+
+    #[test]
+    fn air_gap_bash_script_uses_explicit_output_filenames() {
+        // Regression for a subtle bug in the initial #193 fix: using `curl -O`
+        // derives the output filename from the URL's last path component, which
+        // happens to match `local_name()` for this manifest but fails for
+        // files whose repo path has extra segments. `-o "$DIR/<local>"`
+        // makes the mapping explicit and matches what --from-file resolves.
+        let manifest = ModelManifest::minilm_v2();
+        let script = manifest.air_gap_bash_script(None);
+        assert!(script.contains("set -euo pipefail"));
+        assert!(script.contains("DIR=\"${DIR:-./all-minilm-l6-v2_files}\""));
+        for file in &manifest.files {
+            let local = file.local_name();
+            assert!(
+                script.contains(&format!("-o \"$DIR/{local}\"")),
+                "bash script must write {local} via explicit -o, got:\n{script}"
+            );
+        }
+        assert!(
+            script.contains("cass models install all-minilm-l6-v2 --from-file \"$DIR\" -y"),
+            "bash script must invoke install with --from-file"
+        );
+    }
+
+    #[test]
+    fn air_gap_bash_script_quotes_urls_with_single_quotes() {
+        // URLs must be single-quoted so the shell performs no interpolation.
+        let manifest = ModelManifest::minilm_v2();
+        let script = manifest.air_gap_bash_script(None);
+        let sample_url = manifest.download_url(&manifest.files[0]);
+        assert!(script.contains(&format!("'{sample_url}'")));
+    }
+
+    #[test]
+    fn air_gap_powershell_script_forces_tls12_and_basic_parsing() {
+        let manifest = ModelManifest::minilm_v2();
+        let script = manifest.air_gap_powershell_script(None);
+        assert!(
+            script.contains("SecurityProtocolType]::Tls12"),
+            "PowerShell script must opt into TLS 1.2 for Windows PowerShell 5.1 compat"
+        );
+        assert!(
+            script.contains("Invoke-WebRequest -UseBasicParsing"),
+            "PowerShell script must use -UseBasicParsing for PS 5.1 compat"
+        );
+        for file in &manifest.files {
+            let local = file.local_name();
+            assert!(
+                script.contains(&format!("(Join-Path $dir '{local}')")),
+                "PowerShell script must materialize output path for {local}, got:\n{script}"
+            );
+        }
+        assert!(
+            script.contains("cass models install all-minilm-l6-v2 --from-file $dir -y"),
+            "PowerShell script must invoke install with --from-file"
+        );
+    }
+
+    #[test]
+    fn air_gap_scripts_honor_mirror_base_url() {
+        let manifest = ModelManifest::minilm_v2();
+        let mirror = Some("https://mirror.example/cache");
+        let bash = manifest.air_gap_bash_script(mirror);
+        let ps = manifest.air_gap_powershell_script(mirror);
+        assert!(bash.contains("https://mirror.example/cache"));
+        assert!(!bash.contains("huggingface.co"));
+        assert!(ps.contains("https://mirror.example/cache"));
+        assert!(!ps.contains("huggingface.co"));
     }
 
     #[test]
