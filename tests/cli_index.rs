@@ -382,6 +382,69 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
 
 #[test]
 #[serial]
+fn repeat_full_json_marks_exact_totals_when_post_scan_rebuild_is_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2025/11/24",
+        "repeat-full-noop.jsonl",
+        "repeat_full_noop_content",
+    );
+
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir);
+    initial_index.assert().success();
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = cmd.output().expect("run repeat full index");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "repeat full index should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let stats = payload
+        .get("indexing_stats")
+        .and_then(|value| value.as_object())
+        .expect("indexing_stats object");
+
+    assert_eq!(
+        stats
+            .get("total_counts_exact")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "repeat no-op full runs should still report exact totals after skipping the redundant authoritative rebuild"
+    );
+    assert_eq!(
+        payload
+            .get("conversations")
+            .and_then(|value| value.as_i64()),
+        stats
+            .get("total_conversations")
+            .and_then(|value| value.as_i64())
+    );
+    assert_eq!(
+        payload.get("messages").and_then(|value| value.as_i64()),
+        stats.get("total_messages").and_then(|value| value.as_i64())
+    );
+}
+
+#[test]
+#[serial]
 fn index_json_reports_incremental_lexical_strategy() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();

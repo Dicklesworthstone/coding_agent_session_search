@@ -1111,6 +1111,20 @@ fn exact_total_counts_from_progress(
     Some((stats.total_conversations, stats.total_messages))
 }
 
+fn record_exact_total_counts_in_progress(
+    progress: Option<&Arc<IndexingProgress>>,
+    total_conversations: usize,
+    total_messages: usize,
+) {
+    if let Some(progress) = progress
+        && let Ok(mut stats) = progress.stats.lock()
+    {
+        stats.total_conversations = total_conversations;
+        stats.total_messages = total_messages;
+        stats.total_counts_exact = true;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct MatchingLexicalRebuildStateStatus {
     has_pending_resume: bool,
@@ -7098,10 +7112,13 @@ pub fn run_index(
             && let Ok(mut stats) = p.stats.lock()
         {
             stats.total_conversations = initial_canonical_sessions_before_salvage;
-            if let Some(observed_messages) = rebuild.observed_messages {
-                stats.total_messages = observed_messages;
-                stats.total_counts_exact = true;
-            }
+        }
+        if let Some(observed_messages) = rebuild.observed_messages {
+            record_exact_total_counts_in_progress(
+                opts.progress.as_ref(),
+                initial_canonical_sessions_before_salvage,
+                observed_messages,
+            );
         }
         if keep_tantivy_open_after_rebuild {
             Some(TantivyIndex::open_or_create(&index_path)?)
@@ -7280,10 +7297,13 @@ pub fn run_index(
                 stats.scan_ms = 0; // no scan phase in canonical-only rebuild
                 stats.index_ms = rebuild_ms;
                 stats.total_conversations = rebuild_convs;
-                if let Some(observed_messages) = rebuild.observed_messages {
-                    stats.total_messages = observed_messages;
-                    stats.total_counts_exact = true;
-                }
+            }
+            if let Some(observed_messages) = rebuild.observed_messages {
+                record_exact_total_counts_in_progress(
+                    opts.progress.as_ref(),
+                    rebuild_convs,
+                    observed_messages,
+                );
             }
             if keep_tantivy_open_after_rebuild {
                 t_index = Some(TantivyIndex::open_or_create(&index_path)?);
@@ -7320,14 +7340,12 @@ pub fn run_index(
                     opts.progress.clone(),
                 )?;
                 exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
-                if let Some(p) = &opts.progress
-                    && let Ok(mut stats) = p.stats.lock()
-                {
-                    stats.total_conversations = rebuild_convs;
-                    if let Some(observed_messages) = rebuild.observed_messages {
-                        stats.total_messages = observed_messages;
-                        stats.total_counts_exact = true;
-                    }
+                if let Some(observed_messages) = rebuild.observed_messages {
+                    record_exact_total_counts_in_progress(
+                        opts.progress.as_ref(),
+                        rebuild_convs,
+                        observed_messages,
+                    );
                 }
                 t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                 needs_rebuild = false;
@@ -7451,6 +7469,13 @@ pub fn run_index(
                             inserted_messages = scan_canonical_mutations.inserted_messages,
                             "skipping post-scan authoritative lexical rebuild because the full scan found no canonical changes and the live Tantivy index still matches the completed checkpoint"
                         );
+                        let exact_total_conversations = count_total_conversations_exact(&storage)?;
+                        let exact_total_messages = count_total_messages_exact(&storage)?;
+                        record_exact_total_counts_in_progress(
+                            opts.progress.as_ref(),
+                            exact_total_conversations,
+                            exact_total_messages,
+                        );
                     } else {
                         drop(t_index.take());
                         let rebuild_convs = count_total_conversations_exact(&storage)?;
@@ -7465,14 +7490,12 @@ pub fn run_index(
                         // totals. The scan-phase stats tracked only what the
                         // connectors discovered; the DB rebuild is the source of
                         // truth for full-index runs.
-                        if let Some(p) = &opts.progress
-                            && let Ok(mut stats) = p.stats.lock()
-                        {
-                            stats.total_conversations = rebuild_convs;
-                            if let Some(observed_messages) = rebuild.observed_messages {
-                                stats.total_messages = observed_messages;
-                                stats.total_counts_exact = true;
-                            }
+                        if let Some(observed_messages) = rebuild.observed_messages {
+                            record_exact_total_counts_in_progress(
+                                opts.progress.as_ref(),
+                                rebuild_convs,
+                                observed_messages,
+                            );
                         }
                         if keep_tantivy_open_after_rebuild {
                             t_index = Some(TantivyIndex::open_or_create(&index_path)?);
