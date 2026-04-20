@@ -4274,6 +4274,7 @@ fn error_indicates_missing_table(err: &impl std::fmt::Display) -> bool {
 
 pub struct InsertOutcome {
     pub conversation_id: i64,
+    pub conversation_inserted: bool,
     pub inserted_indices: Vec<i64>,
 }
 
@@ -4635,6 +4636,20 @@ impl FrankenStorage {
             fparams![ts.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Get the timestamp of the last successful index completion.
+    pub fn get_last_indexed_at(&self) -> Result<Option<i64>> {
+        let result: Result<String, _> = self.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+            fparams![],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(Some(s)) => Ok(s.parse().ok()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Set the timestamp of the last successful index completion (milliseconds since epoch).
@@ -6419,6 +6434,7 @@ impl FrankenStorage {
                 tx.commit()?;
                 return Ok(InsertOutcome {
                     conversation_id: existing_id,
+                    conversation_inserted: false,
                     inserted_indices,
                 });
             }
@@ -6507,6 +6523,7 @@ impl FrankenStorage {
         tx.commit()?;
         Ok(InsertOutcome {
             conversation_id: conv_id,
+            conversation_inserted: true,
             inserted_indices,
         })
     }
@@ -6616,6 +6633,7 @@ impl FrankenStorage {
 
         Ok(InsertOutcome {
             conversation_id,
+            conversation_inserted: false,
             inserted_indices,
         })
     }
@@ -7827,6 +7845,7 @@ impl FrankenStorage {
 
             outcomes.push(InsertOutcome {
                 conversation_id: conv_id,
+                conversation_inserted: session_count_delta > 0,
                 inserted_indices,
             });
         }
