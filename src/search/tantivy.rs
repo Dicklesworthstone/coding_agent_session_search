@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -341,6 +342,100 @@ impl TantivyIndex {
         Self::open_or_create(output_path)
     }
 
+    pub fn assemble_compatible_index_directories<P: AsRef<Path>>(
+        output_path: &Path,
+        input_paths: &[P],
+    ) -> Result<Self> {
+        if input_paths.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cannot assemble Tantivy index directories without at least one input"
+            ));
+        }
+        ensure_empty_merge_output_directory(output_path)?;
+
+        let mut combined_index_meta: Option<tantivy_crate::IndexMeta> = None;
+        let mut combined_segments = Vec::new();
+        let mut max_opstamp = 0u64;
+        let mut managed_paths = BTreeSet::new();
+
+        for input_path in input_paths {
+            let input_path = input_path.as_ref();
+            let mut index = Index::open_in_dir(input_path).with_context(|| {
+                format!(
+                    "opening compatible Tantivy index directory for assembly: {}",
+                    input_path.display()
+                )
+            })?;
+            ensure_tokenizer(&mut index);
+            let metas = index.load_metas().with_context(|| {
+                format!(
+                    "loading Tantivy metadata for assembled index input {}",
+                    input_path.display()
+                )
+            })?;
+
+            match &mut combined_index_meta {
+                Some(combined_meta) => {
+                    if metas.schema != combined_meta.schema {
+                        return Err(anyhow::anyhow!(
+                            "attempted to assemble Tantivy index directories with different schemas"
+                        ));
+                    }
+                    if metas.index_settings != combined_meta.index_settings {
+                        return Err(anyhow::anyhow!(
+                            "attempted to assemble Tantivy index directories with different index settings"
+                        ));
+                    }
+                }
+                None => {
+                    combined_index_meta = Some(tantivy_crate::IndexMeta {
+                        index_settings: metas.index_settings.clone(),
+                        segments: Vec::new(),
+                        schema: metas.schema.clone(),
+                        opstamp: 0,
+                        payload: None,
+                    });
+                }
+            }
+
+            max_opstamp = max_opstamp.max(metas.opstamp);
+            for segment in metas.segments {
+                for relative_path in segment.list_files() {
+                    let source_path = input_path.join(&relative_path);
+                    if !source_path.exists() {
+                        continue;
+                    }
+                    link_or_copy_searchable_index_file(&source_path, output_path, &relative_path)?;
+                    if !managed_paths.insert(relative_path.clone()) {
+                        return Err(anyhow::anyhow!(
+                            "assembled Tantivy index would contain duplicate segment file path {}",
+                            relative_path.display()
+                        ));
+                    }
+                }
+                combined_segments.push(segment);
+            }
+        }
+
+        let mut combined_index_meta = combined_index_meta.ok_or_else(|| {
+            anyhow::anyhow!("cannot assemble Tantivy index directories without index metadata")
+        })?;
+        combined_index_meta.segments = combined_segments;
+        combined_index_meta.opstamp = max_opstamp;
+        combined_index_meta.payload = Some(format!(
+            "Cass assembled {} compatible Tantivy segments from {} input directories",
+            combined_index_meta.segments.len(),
+            input_paths.len()
+        ));
+
+        write_searchable_generation_metadata(
+            output_path,
+            &combined_index_meta,
+            &mut managed_paths,
+        )?;
+        Self::open_or_create(output_path)
+    }
+
     pub fn add_messages(
         &mut self,
         conv: &NormalizedConversation,
@@ -569,6 +664,88 @@ fn ensure_empty_merge_output_directory(output_path: &Path) -> Result<()> {
             });
         }
     }
+    Ok(())
+}
+
+fn link_or_copy_searchable_index_file(
+    source_path: &Path,
+    output_path: &Path,
+    relative_path: &Path,
+) -> Result<()> {
+    let destination_path = output_path.join(relative_path);
+    if destination_path.exists() {
+        return Err(anyhow::anyhow!(
+            "assembled Tantivy output path already exists: {}",
+            destination_path.display()
+        ));
+    }
+
+    match fs::hard_link(source_path, &destination_path) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::CrossesDevices
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            fs::copy(source_path, &destination_path).with_context(|| {
+                format!(
+                    "copying Tantivy segment file into assembled generation {} -> {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "hard-linking Tantivy segment file into assembled generation {} -> {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        }),
+    }
+}
+
+fn write_searchable_generation_metadata(
+    output_path: &Path,
+    index_meta: &tantivy_crate::IndexMeta,
+    managed_paths: &mut BTreeSet<std::path::PathBuf>,
+) -> Result<()> {
+    let meta_path = output_path.join("meta.json");
+    fs::write(
+        &meta_path,
+        serde_json::to_vec_pretty(index_meta).context("serializing assembled Tantivy meta.json")?,
+    )
+    .with_context(|| {
+        format!(
+            "writing assembled Tantivy meta.json for {}",
+            output_path.display()
+        )
+    })?;
+    managed_paths.insert(std::path::PathBuf::from("meta.json"));
+    fs::write(
+        output_path.join(".managed.json"),
+        serde_json::to_vec(managed_paths).context("serializing assembled Tantivy managed paths")?,
+    )
+    .with_context(|| {
+        format!(
+            "writing assembled Tantivy managed file manifest for {}",
+            output_path.display()
+        )
+    })?;
+    fs::write(
+        output_path.join("schema_hash.json"),
+        format!("{{\"schema_hash\":\"{CASS_SCHEMA_HASH}\"}}"),
+    )
+    .with_context(|| {
+        format!(
+            "writing cass schema hash metadata for assembled Tantivy index {}",
+            output_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -879,6 +1056,79 @@ mod tests {
         assert!(
             format!("{error:#}").contains("must be empty"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn assemble_compatible_index_directories_roundtrips_docs_into_multi_segment_generation() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let assembled = root.path().join("assembled");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_001_000),
+            ended_at: Some(1_700_000_001_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_001_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_001_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        let conv_a = make_conv("assemble-a", "Assemble A", "alpha");
+        let conv_b = make_conv("assemble-b", "Assemble B", "beta");
+        shard_a_index
+            .add_conversation_with_id(&conv_a, Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&conv_b, Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let assembled_index =
+            TantivyIndex::assemble_compatible_index_directories(&assembled, &[&shard_a, &shard_b])
+                .expect("assemble shard indices");
+        let reader = assembled_index.reader().expect("reader");
+        reader.reload().expect("reload");
+        assert_eq!(reader.searcher().num_docs(), 4);
+        assert_eq!(
+            assembled_index.segment_count(),
+            2,
+            "assembled shard indices should preserve one searchable segment per input artifact"
+        );
+        assert!(
+            assembled.join(".managed.json").exists(),
+            "assembled index generation should persist a Tantivy managed-file manifest"
         );
     }
 }

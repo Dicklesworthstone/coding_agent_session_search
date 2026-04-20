@@ -2082,6 +2082,7 @@ struct LexicalRebuildShardBuildResult {
     shard_index_path: PathBuf,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct LexicalRebuildShardMergeWork {
     output_path: PathBuf,
@@ -9633,11 +9634,16 @@ fn finalize_staged_lexical_rebuild_publish_artifact(
         });
     }
 
-    let index = merge_lexical_rebuild_shard_index_tree(
+    tracing::info!(
+        publish_path = %output_path.display(),
+        staged_artifacts = input_paths.len(),
+        "assembling final staged lexical rebuild generation from compatible artifacts without remerging docs"
+    );
+    let _ = stage_root;
+    let _ = max_parallel_jobs;
+    let index = crate::search::tantivy::TantivyIndex::assemble_compatible_index_directories(
         output_path,
         input_paths,
-        stage_root,
-        max_parallel_jobs,
     )?;
     Ok(LexicalRebuildFinalMergeArtifact {
         publish_path: output_path.to_path_buf(),
@@ -9645,6 +9651,7 @@ fn finalize_staged_lexical_rebuild_publish_artifact(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn merge_lexical_rebuild_shard_index_tree(
     output_path: &Path,
     input_paths: &[PathBuf],
@@ -16295,6 +16302,90 @@ mod tests {
     }
 
     #[test]
+    fn finalize_staged_lexical_rebuild_publish_artifact_assembles_multiple_inputs_without_doc_remerge()
+     {
+        let tmp = TempDir::new().unwrap();
+        let merge_stage_root = tmp.path().join("merge-stage");
+        let merged_path = tmp.path().join("merged");
+        let make_packet =
+            |conversation_id: i64, external_id: &str, message_a: &str, message_b: &str| {
+                LexicalRebuildConversationPacket::from_canonical_replay(
+                    crate::storage::sqlite::LexicalRebuildConversationRow {
+                        id: Some(conversation_id),
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.into()),
+                        title: Some(format!("Shard {external_id}")),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(1_700_000_916_000 + conversation_id),
+                        ended_at: Some(1_700_000_916_100 + conversation_id),
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                    vec![
+                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                            idx: 0,
+                            is_tool_role: false,
+                            created_at: Some(1_700_000_916_010 + conversation_id),
+                            content: message_a.into(),
+                        },
+                        crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                            idx: 1,
+                            is_tool_role: false,
+                            created_at: Some(1_700_000_916_020 + conversation_id),
+                            content: message_b.into(),
+                        },
+                    ]
+                    .into_iter()
+                    .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
+                    Some(conversation_id * 10),
+                    &HashMap::new(),
+                )
+            };
+
+        let shard_paths = (0..3)
+            .map(|idx| {
+                let shard_path = tmp.path().join(format!("finalize-shard-{idx}"));
+                let packet = make_packet(
+                    i64::from(idx + 1),
+                    &format!("finalize-{idx}"),
+                    &format!("alpha-{idx}"),
+                    &format!("beta-{idx}"),
+                );
+                assert_eq!(
+                    build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
+                    2
+                );
+                shard_path
+            })
+            .collect::<Vec<_>>();
+
+        let final_artifact = finalize_staged_lexical_rebuild_publish_artifact(
+            &merged_path,
+            &shard_paths,
+            &merge_stage_root,
+            3,
+        )
+        .unwrap();
+        let reader = final_artifact.index.reader().unwrap();
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 6);
+        assert_eq!(
+            final_artifact.index.segment_count(),
+            3,
+            "multi-input finalization should assemble a multi-segment publish generation instead of remerging docs"
+        );
+        assert_eq!(
+            final_artifact.publish_path, merged_path,
+            "multi-input finalization should materialize the assembled publish generation at the requested output path"
+        );
+        assert!(
+            !merge_stage_root.join("round-00000").exists(),
+            "multi-input finalization should not materialize a fallback merge-tree round"
+        );
+    }
+
+    #[test]
     fn merge_lexical_rebuild_shard_index_tree_merges_small_frontier_without_round_directory() {
         let tmp = TempDir::new().unwrap();
         let merge_stage_root = tmp.path().join("merge-stage");
@@ -17913,9 +18004,11 @@ mod tests {
 
     fn tantivy_doc_count_for_data_dir(data_dir: &Path) -> u64 {
         let index_path = index_dir(data_dir).unwrap();
-        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-        index.commit().unwrap();
-        let reader = index.reader().unwrap();
+        let (reader, _fields) = frankensearch::lexical::cass_open_search_reader(
+            &index_path,
+            frankensearch::lexical::ReloadPolicy::Manual,
+        )
+        .unwrap();
         reader.reload().unwrap();
         reader.searcher().num_docs()
     }
@@ -20550,6 +20643,127 @@ mod tests {
             "an eagerly reduced single final artifact should not trigger a redundant final merge round: {logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 8);
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_multi_artifact_final_frontier_assembles_publish_generation_without_doc_remerge()
+     {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let base_ts = 1_700_000_100_000_i64;
+        let external_id = "lexical-fixture-3";
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(PathBuf::from("/tmp/workspace")),
+                    external_id: Some(external_id.into()),
+                    title: Some("Lexical rebuild fixture".into()),
+                    source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                    started_at: Some(base_ts),
+                    ended_at: Some(base_ts + 100),
+                    approx_tokens: Some(64),
+                    metadata_json: serde_json::Value::Null,
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: Some("user".into()),
+                            created_at: Some(base_ts + 10),
+                            content: format!("{external_id}-first"),
+                            extra_json: serde_json::json!({"opaque": true}),
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: Some("assistant".into()),
+                            created_at: Some(base_ts + 20),
+                            content: format!("{external_id}-second"),
+                            extra_json: serde_json::json!({"opaque": true}),
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
+        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
+        let _startup_fetch_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        );
+        let _commit_conversations = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
+        let _startup_commit_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "1",
+        );
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db_with_options(
+                &db_path,
+                &data_dir,
+                2,
+                None,
+                LexicalRebuildStartupOptions {
+                    defer_initial_content_fingerprint: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(rebuild.indexed_docs, 6);
+            assert_eq!(rebuild.observed_messages, Some(6));
+            assert!(rebuild.exact_checkpoint_persisted);
+        });
+
+        assert!(
+            logs.contains("staged shard-build path"),
+            "expected staged shard-build log, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(
+                "assembling final staged lexical rebuild generation from compatible artifacts without remerging docs"
+            ),
+            "expected assembled final publish generation log, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("running staged lexical rebuild merge round"),
+            "multi-artifact publish generation assembly should avoid the fallback merge-tree tail: {logs}"
+        );
+        let index_path = index_dir(&data_dir).unwrap();
+        assert_eq!(
+            frankensearch::lexical::Index::open_in_dir(&index_path)
+                .unwrap()
+                .searchable_segment_metas()
+                .unwrap()
+                .len(),
+            3,
+            "published staged rebuild should preserve the three final shard artifacts as searchable segments"
+        );
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 6);
     }
 
     #[test]
