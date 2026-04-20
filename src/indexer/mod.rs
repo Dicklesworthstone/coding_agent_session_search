@@ -6449,6 +6449,22 @@ fn spawn_lexical_rebuild_packet_producer(
     })
 }
 
+fn shutdown_lexical_rebuild_packet_producer_after_startup_error(
+    producer_handle: JoinHandle<()>,
+    pipeline_rx: Receiver<LexicalRebuildPipelineMessage>,
+    flow_limiter: &StreamingByteLimiter,
+) {
+    flow_limiter.close();
+    drop(pipeline_rx);
+    if let Err(payload) = producer_handle.join() {
+        let panic_message = panic_payload_message(payload);
+        tracing::warn!(
+            error = %panic_message,
+            "lexical rebuild packet producer panicked while startup was aborting"
+        );
+    }
+}
+
 fn rebuild_tantivy_from_db_with_options(
     db_path: &Path,
     data_dir: &Path,
@@ -6528,84 +6544,6 @@ fn rebuild_tantivy_from_db_with_options(
 
     log_prep_step("load_checkpoint_state", &mut prep_step_started);
 
-    let restart_from_zero = rebuild_state.completed
-        || (rebuild_state.committed_offset == 0 && rebuild_state.pending.is_none());
-    if restart_from_zero {
-        if let Err(err) = fs::remove_dir_all(&index_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err)
-                .with_context(|| format!("removing stale index {}", index_path.display()));
-        }
-        fs::create_dir_all(&index_path).with_context(|| {
-            format!("creating rebuilt index directory {}", index_path.display())
-        })?;
-        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-    }
-
-    log_prep_step("restart_from_zero_reset", &mut prep_step_started);
-
-    let mut t_index = match TantivyIndex::open_or_create(&index_path) {
-        Ok(index) => index,
-        Err(err) if rebuild_state.committed_offset > 0 || rebuild_state.pending.is_some() => {
-            tracing::warn!(
-                path = %index_path.display(),
-                error = %err,
-                "partial lexical index could not be reopened; restarting lexical rebuild from zero"
-            );
-            if let Err(remove_err) = fs::remove_dir_all(&index_path)
-                && remove_err.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(remove_err).with_context(|| {
-                    format!("removing unreadable index {}", index_path.display())
-                });
-            }
-            fs::create_dir_all(&index_path).with_context(|| {
-                format!(
-                    "recreating lexical index directory after open failure {}",
-                    index_path.display()
-                )
-            })?;
-            rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-            TantivyIndex::open_or_create(&index_path)?
-        }
-        Err(err) => return Err(err),
-    };
-    log_prep_step("open_tantivy", &mut prep_step_started);
-
-    t_index.configure_bulk_load_merge_policy();
-
-    if !lexical_rebuild_state_path(&index_path).exists() {
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
-    }
-
-    log_prep_step("persist_initial_checkpoint", &mut prep_step_started);
-
-    if prep_profile {
-        let step_ms = prep_step_started.elapsed().as_millis() as u64;
-        let total_ms = prep_started.elapsed().as_millis() as u64;
-        eprintln!(
-            "CASS_PREP_PROFILE step=ready_to_index step_ms={} total_ms={}",
-            step_ms, total_ms
-        );
-        tracing::info!(
-            component = "main",
-            step = "ready_to_index",
-            step_ms,
-            total_ms,
-            "lexical rebuild prep profile"
-        );
-    }
-
-    if let Some(p) = &progress {
-        p.phase.store(2, Ordering::Relaxed);
-        p.is_rebuilding.store(true, Ordering::Relaxed);
-        p.total.store(total_conversations, Ordering::Relaxed);
-        p.current
-            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        p.discovered_agents.store(0, Ordering::Relaxed);
-    }
-
     if rebuild_state.completed
         || rebuild_state.committed_offset >= i64::try_from(total_conversations).unwrap_or(i64::MAX)
     {
@@ -6621,9 +6559,35 @@ fn rebuild_tantivy_from_db_with_options(
         }
         return Ok(LexicalRebuildOutcome {
             indexed_docs: rebuild_state.indexed_docs,
-            observed_messages: Some(rebuild_state.indexed_docs),
+            observed_messages: Some(rebuild_state.db.total_messages.max(rebuild_state.indexed_docs)),
             exact_checkpoint_persisted: false,
         });
+    }
+
+    let restart_from_zero =
+        rebuild_state.committed_offset == 0 && rebuild_state.pending.is_none();
+    if restart_from_zero {
+        if let Err(err) = fs::remove_dir_all(&index_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err)
+                .with_context(|| format!("removing stale index {}", index_path.display()));
+        }
+        fs::create_dir_all(&index_path).with_context(|| {
+            format!("creating rebuilt index directory {}", index_path.display())
+        })?;
+        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+    }
+
+    log_prep_step("restart_from_zero_reset", &mut prep_step_started);
+
+    if let Some(p) = &progress {
+        p.phase.store(2, Ordering::Relaxed);
+        p.is_rebuilding.store(true, Ordering::Relaxed);
+        p.total.store(total_conversations, Ordering::Relaxed);
+        p.current
+            .store(rebuild_state.processed_conversations, Ordering::Relaxed);
+        p.discovered_agents.store(0, Ordering::Relaxed);
     }
 
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
@@ -6724,6 +6688,75 @@ fn rebuild_tantivy_from_db_with_options(
         lexical_rebuild_worker_pool.clone(),
         producer_telemetry.clone(),
     );
+
+    log_prep_step("start_packet_producer", &mut prep_step_started);
+
+    let mut t_index = match (|| -> Result<TantivyIndex> {
+        let mut t_index = match TantivyIndex::open_or_create(&index_path) {
+            Ok(index) => index,
+            Err(err) if rebuild_state.committed_offset > 0 || rebuild_state.pending.is_some() => {
+                tracing::warn!(
+                    path = %index_path.display(),
+                    error = %err,
+                    "partial lexical index could not be reopened; restarting lexical rebuild from zero"
+                );
+                if let Err(remove_err) = fs::remove_dir_all(&index_path)
+                    && remove_err.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(remove_err).with_context(|| {
+                        format!("removing unreadable index {}", index_path.display())
+                    });
+                }
+                fs::create_dir_all(&index_path).with_context(|| {
+                    format!(
+                        "recreating lexical index directory after open failure {}",
+                        index_path.display()
+                    )
+                })?;
+                rebuild_state =
+                    LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+                TantivyIndex::open_or_create(&index_path)?
+            }
+            Err(err) => return Err(err),
+        };
+        log_prep_step("open_tantivy", &mut prep_step_started);
+
+        t_index.configure_bulk_load_merge_policy();
+
+        if !lexical_rebuild_state_path(&index_path).exists() {
+            persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
+        }
+
+        log_prep_step("persist_initial_checkpoint", &mut prep_step_started);
+
+        if prep_profile {
+            let step_ms = prep_step_started.elapsed().as_millis() as u64;
+            let total_ms = prep_started.elapsed().as_millis() as u64;
+            eprintln!(
+                "CASS_PREP_PROFILE step=ready_to_index step_ms={} total_ms={}",
+                step_ms, total_ms
+            );
+            tracing::info!(
+                component = "main",
+                step = "ready_to_index",
+                step_ms,
+                total_ms,
+                "lexical rebuild prep profile"
+            );
+        }
+
+        Ok(t_index)
+    })() {
+        Ok(index) => index,
+        Err(err) => {
+            shutdown_lexical_rebuild_packet_producer_after_startup_error(
+                producer_handle,
+                pipeline_rx,
+                lexical_rebuild_flow_limiter.as_ref(),
+            );
+            return Err(err);
+        }
+    };
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
 
@@ -7069,6 +7102,17 @@ fn rebuild_tantivy_from_db_with_options(
         )?;
     }
 
+    drop(t_index);
+    if let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)?
+        && observed_tantivy_docs != indexed_docs
+    {
+        return Err(anyhow::anyhow!(
+            "lexical rebuild committed {} docs but a fresh Tantivy reader only sees {}",
+            indexed_docs,
+            observed_tantivy_docs
+        ));
+    }
+
     storage.close_without_checkpoint().with_context(|| {
         format!(
             "closing readonly database after Tantivy rebuild without checkpoint: {}",
@@ -7082,7 +7126,8 @@ fn rebuild_tantivy_from_db_with_options(
             max_message_id,
         );
     }
-    rebuild_state.db.total_messages = observed_messages;
+    let final_observed_messages = observed_messages.max(indexed_docs);
+    rebuild_state.db.total_messages = final_observed_messages;
     rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -7103,7 +7148,7 @@ fn rebuild_tantivy_from_db_with_options(
 
     Ok(LexicalRebuildOutcome {
         indexed_docs,
-        observed_messages: Some(observed_messages),
+        observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
     })
 }
@@ -13373,6 +13418,9 @@ mod tests {
             r#"step="open_readonly""#,
             r#"step="compute_db_state_fingerprint""#,
             r#"step="load_checkpoint_state""#,
+            r#"step="start_packet_producer""#,
+            r#"step="open_tantivy""#,
+            r#"step="persist_initial_checkpoint""#,
             r#"step="ready_to_index""#,
             r#"component="producer""#,
             r#"step="load_sources""#,
@@ -13386,6 +13434,83 @@ mod tests {
 {logs}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_skips_tantivy_open_when_checkpoint_is_complete() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+
+        let index_path = index_dir(&data_dir).unwrap();
+        std::fs::create_dir_all(&index_path).unwrap();
+        let fingerprint = lexical_storage_fingerprint_for_db(&db_path).unwrap();
+        std::fs::write(
+            lexical_rebuild_state_path(&index_path),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": LEXICAL_REBUILD_STATE_VERSION,
+                "schema_hash": crate::search::tantivy::SCHEMA_HASH,
+                "db": {
+                    "db_path": db_path.display().to_string(),
+                    "total_conversations": 2,
+                    "total_messages": 4,
+                    "storage_fingerprint": fingerprint,
+                },
+                "page_size": LEXICAL_REBUILD_PAGE_SIZE,
+                "committed_offset": 2,
+                "processed_conversations": 2,
+                "indexed_docs": 4,
+                "committed_meta_fingerprint": null,
+                "pending": null,
+                "completed": true,
+                "updated_at_ms": FrankenStorage::now_millis(),
+                "runtime": {
+                    "queue_depth": 0,
+                    "inflight_message_bytes": 0,
+                    "pending_batch_conversations": 0,
+                    "pending_batch_message_bytes": 0,
+                    "page_prep_workers": 0,
+                    "active_page_prep_jobs": 0,
+                    "ordered_buffered_pages": 0,
+                    "budget_generation": 0,
+                    "updated_at_ms": FrankenStorage::now_millis(),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let _prep_profile = set_env("CASS_PREP_PROFILE", "1");
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            assert_eq!(rebuild.indexed_docs, 4);
+            assert_eq!(rebuild.observed_messages, Some(4));
+            assert!(!rebuild.exact_checkpoint_persisted);
+        });
+
+        assert!(
+            !logs.contains(r#"step="open_tantivy""#),
+            "completed checkpoint should not reopen Tantivy: {logs}"
+        );
+        assert!(
+            !logs.contains(r#"step="start_packet_producer""#),
+            "completed checkpoint should not start producer warmup: {logs}"
+        );
+        assert!(
+            !logs.contains(r#"component="producer""#),
+            "completed checkpoint should not emit producer prep logs: {logs}"
+        );
+        assert!(
+            !index_path.join("meta.json").exists(),
+            "completed checkpoint fast-path should not create Tantivy metadata"
+        );
     }
 
     #[test]
@@ -13608,6 +13733,7 @@ mod tests {
         state.indexed_docs = 2;
         state.committed_meta_fingerprint = committed_meta_fingerprint;
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        drop(index);
 
         let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
         assert_eq!(rebuild.indexed_docs, 4);
