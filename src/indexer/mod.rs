@@ -42,7 +42,7 @@ use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
-    FrankenStorage, HistoricalSalvageOutcome, MigrationError,
+    FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome, MigrationError,
     seed_canonical_from_best_historical_bundle,
 };
 use semantic::{EmbeddingInput, SemanticIndexer};
@@ -1115,6 +1115,7 @@ fn exact_total_counts_from_progress(
 struct MatchingLexicalRebuildStateStatus {
     has_pending_resume: bool,
     has_completed_checkpoint: bool,
+    completed_indexed_docs: Option<usize>,
 }
 
 fn matching_lexical_rebuild_state_status(
@@ -1128,12 +1129,15 @@ fn matching_lexical_rebuild_state_status(
         return Ok(MatchingLexicalRebuildStateStatus::default());
     }
 
+    let has_completed_checkpoint = state.completed
+        && state.pending.is_none()
+        && state.execution_mode == LexicalRebuildExecutionMode::SharedWriter
+        && !state.runtime.is_observed();
+
     Ok(MatchingLexicalRebuildStateStatus {
         has_pending_resume: state.is_incomplete(),
-        has_completed_checkpoint: state.completed
-            && state.pending.is_none()
-            && state.execution_mode == LexicalRebuildExecutionMode::SharedWriter
-            && !state.runtime.is_observed(),
+        has_completed_checkpoint,
+        completed_indexed_docs: has_completed_checkpoint.then_some(state.indexed_docs),
     })
 }
 
@@ -1149,6 +1153,22 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
         && exact_total_counts.is_none()
         && !canonical_mutations.changed()
         && initial_checkpoint_status.has_completed_checkpoint
+}
+
+fn should_skip_post_full_scan_authoritative_rebuild(
+    full_rebuild: bool,
+    rebuild_was_required: bool,
+    salvage_messages_imported: usize,
+    initial_checkpoint_status: MatchingLexicalRebuildStateStatus,
+    scan_canonical_mutations: CanonicalMutationCounts,
+    observed_tantivy_docs: Option<usize>,
+) -> bool {
+    full_rebuild
+        && !rebuild_was_required
+        && salvage_messages_imported == 0
+        && !scan_canonical_mutations.changed()
+        && initial_checkpoint_status.has_completed_checkpoint
+        && initial_checkpoint_status.completed_indexed_docs == observed_tantivy_docs
 }
 
 struct RunIndexProgressReset {
@@ -4774,11 +4794,23 @@ fn should_run_targeted_watch_once_only(
         && canonical_sessions_before_salvage > 0
 }
 
-fn should_rebuild_fallback_fts_after_full_index_run(
+fn should_repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
 ) -> bool {
     full_rebuild && !canonical_only_full_rebuild
+}
+
+fn repair_fallback_fts_after_full_index_run(
+    storage: &FrankenStorage,
+    full_rebuild: bool,
+    canonical_only_full_rebuild: bool,
+) -> Result<Option<FtsConsistencyRepair>> {
+    if !should_repair_fallback_fts_after_full_index_run(full_rebuild, canonical_only_full_rebuild) {
+        return Ok(None);
+    }
+
+    Ok(Some(storage.ensure_search_fallback_fts_consistency()?))
 }
 
 fn full_rebuild_requires_historical_restart(
@@ -6919,8 +6951,6 @@ pub fn run_index(
     // rescan as expected (preserving the #153 fix).
     let canonical_only_full_rebuild =
         opts.force_rebuild && initial_canonical_sessions_before_salvage > 0;
-    let rebuild_fallback_fts_after_full_run =
-        should_rebuild_fallback_fts_after_full_index_run(opts.full, canonical_only_full_rebuild);
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let resume_lexical_rebuild = if opts.force_rebuild {
         // force_rebuild always starts from scratch; never resume a stale checkpoint.
@@ -7404,30 +7434,49 @@ pub fn run_index(
                     .commit()?;
 
                 if opts.full || historical_salvage.messages_imported > 0 {
-                    drop(t_index.take());
-                    let rebuild_convs = count_total_conversations_exact(&storage)?;
-                    let rebuild = rebuild_tantivy_from_db_deferred_startup(
-                        &opts.db_path,
-                        &opts.data_dir,
-                        rebuild_convs,
-                        opts.progress.clone(),
-                    )?;
-                    exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
-                    // Update stats to reflect the authoritative rebuild
-                    // totals. The scan-phase stats tracked only what the
-                    // connectors discovered; the DB rebuild is the source of
-                    // truth for full-index runs.
-                    if let Some(p) = &opts.progress
-                        && let Ok(mut stats) = p.stats.lock()
-                    {
-                        stats.total_conversations = rebuild_convs;
-                        if let Some(observed_messages) = rebuild.observed_messages {
-                            stats.total_messages = observed_messages;
-                            stats.total_counts_exact = true;
+                    if should_skip_post_full_scan_authoritative_rebuild(
+                        opts.full,
+                        initial_needs_rebuild,
+                        historical_salvage.messages_imported,
+                        initial_matching_lexical_checkpoint,
+                        scan_canonical_mutations,
+                        observed_tantivy_docs,
+                    ) {
+                        tracing::info!(
+                            db_path = %opts.db_path.display(),
+                            observed_tantivy_docs,
+                            completed_indexed_docs = initial_matching_lexical_checkpoint
+                                .completed_indexed_docs,
+                            inserted_conversations = scan_canonical_mutations.inserted_conversations,
+                            inserted_messages = scan_canonical_mutations.inserted_messages,
+                            "skipping post-scan authoritative lexical rebuild because the full scan found no canonical changes and the live Tantivy index still matches the completed checkpoint"
+                        );
+                    } else {
+                        drop(t_index.take());
+                        let rebuild_convs = count_total_conversations_exact(&storage)?;
+                        let rebuild = rebuild_tantivy_from_db_deferred_startup(
+                            &opts.db_path,
+                            &opts.data_dir,
+                            rebuild_convs,
+                            opts.progress.clone(),
+                        )?;
+                        exact_completed_lexical_checkpoint = rebuild.exact_checkpoint_persisted;
+                        // Update stats to reflect the authoritative rebuild
+                        // totals. The scan-phase stats tracked only what the
+                        // connectors discovered; the DB rebuild is the source of
+                        // truth for full-index runs.
+                        if let Some(p) = &opts.progress
+                            && let Ok(mut stats) = p.stats.lock()
+                        {
+                            stats.total_conversations = rebuild_convs;
+                            if let Some(observed_messages) = rebuild.observed_messages {
+                                stats.total_messages = observed_messages;
+                                stats.total_counts_exact = true;
+                            }
                         }
-                    }
-                    if keep_tantivy_open_after_rebuild {
-                        t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                        if keep_tantivy_open_after_rebuild {
+                            t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                        }
                     }
                 }
             }
@@ -7603,17 +7652,42 @@ pub fn run_index(
         })?;
     }
 
-    if rebuild_fallback_fts_after_full_run {
-        storage.rebuild_fts().with_context(|| {
+    if let Some(repair) =
+        repair_fallback_fts_after_full_index_run(&storage, opts.full, canonical_only_full_rebuild)
+            .with_context(|| {
             format!(
-                "rebuilding frankensqlite-owned fallback FTS after full index run for {}",
+                "repairing frankensqlite-owned fallback FTS after full index run for {}",
                 opts.db_path.display()
             )
-        })?;
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            "rebuilt frankensqlite-owned fallback FTS after full index run"
-        );
+        })?
+    {
+        match repair {
+            FtsConsistencyRepair::AlreadyHealthy { rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    rows,
+                    "fallback FTS was already healthy after full index run; skipped rebuild"
+                );
+            }
+            FtsConsistencyRepair::IncrementalCatchUp {
+                inserted_rows,
+                total_rows,
+            } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    total_rows,
+                    "incrementally repaired fallback FTS after full index run"
+                );
+            }
+            FtsConsistencyRepair::Rebuilt { inserted_rows } => {
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    inserted_rows,
+                    "rebuilt fallback FTS after full index run"
+                );
+            }
+        }
     } else if opts.full {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -18822,19 +18896,44 @@ mod tests {
     }
 
     #[test]
-    fn fallback_fts_rebuild_is_skipped_for_canonical_only_full_rebuild() {
-        assert!(!should_rebuild_fallback_fts_after_full_index_run(
-            true, true
-        ));
-        assert!(should_rebuild_fallback_fts_after_full_index_run(
-            true, false
-        ));
-        assert!(!should_rebuild_fallback_fts_after_full_index_run(
+    fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
+        assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
+        assert!(should_repair_fallback_fts_after_full_index_run(true, false));
+        assert!(!should_repair_fallback_fts_after_full_index_run(
             false, false
         ));
-        assert!(!should_rebuild_fallback_fts_after_full_index_run(
+        assert!(!should_repair_fallback_fts_after_full_index_run(
             false, true
         ));
+    }
+
+    #[test]
+    fn full_run_fallback_fts_repair_skips_rebuild_when_fts_is_already_healthy() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-healthy.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false).unwrap();
+        assert_eq!(
+            repair,
+            Some(FtsConsistencyRepair::AlreadyHealthy { rows: 4 })
+        );
+    }
+
+    #[test]
+    fn full_run_fallback_fts_repair_rebuilds_missing_schema_when_needed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-missing.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+
+        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false).unwrap();
+        assert_eq!(
+            repair,
+            Some(FtsConsistencyRepair::Rebuilt { inserted_rows: 4 })
+        );
     }
 
     #[test]
