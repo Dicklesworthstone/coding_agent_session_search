@@ -3325,6 +3325,10 @@ fn robot_docs_guide_provides_usage_info() {
         stdout.contains("search") || stdout.contains("cass") || stdout.contains("agent"),
         "guide topic should provide usage information"
     );
+    assert!(
+        stdout.contains("cass robot-docs sources"),
+        "guide topic should point agents at the sources topic for source management flows"
+    );
 }
 
 /// robot-docs exit-codes topic lists all exit codes
@@ -3360,6 +3364,35 @@ fn robot_docs_examples_provides_practical_examples() {
     assert!(
         stdout.contains("cass") && stdout.contains("--"),
         "examples topic should show cass command examples"
+    );
+    assert!(
+        stdout.contains("cass sources agents exclude openclaw"),
+        "examples topic should document persistent harness exclusion"
+    );
+}
+
+/// robot-docs sources topic documents remote sources and persistent agent exclusions
+#[test]
+fn robot_docs_sources_documents_agent_exclusions() {
+    let mut cmd = base_cmd();
+    cmd.args(["--color=never", "robot-docs", "sources"]);
+    let out = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "robot-docs sources should not emit ANSI when color=never"
+    );
+    assert!(
+        stdout.contains("cass sources agents exclude openclaw"),
+        "sources topic should document excluding a noisy harness"
+    );
+    assert!(
+        stdout.contains("--keep-indexed-data"),
+        "sources topic should document keeping already indexed data"
+    );
+    assert!(
+        stdout.contains("watch mode"),
+        "sources topic should explain that exclusions apply to future watch/index flows"
     );
 }
 
