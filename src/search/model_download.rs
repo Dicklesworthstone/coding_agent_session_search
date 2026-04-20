@@ -549,6 +549,61 @@ impl ModelManifest {
     pub fn download_url(&self, file: &ModelFile) -> String {
         self.download_url_with_base(file, None)
     }
+
+    /// Generate a ready-to-paste bash script that downloads every file in the
+    /// manifest via `curl` and then invokes `cass models install --from-file`.
+    ///
+    /// Use this when the in-process downloader fails (e.g. the known Windows
+    /// rustls/TCP connect race — see GH#193 for context). The script uses the
+    /// pinned repo revision so checksums match.
+    pub fn air_gap_bash_script(&self, base_url: Option<&str>) -> String {
+        let mut out = String::new();
+        out.push_str("# Air-gap model install (bash / Git Bash / MSYS2)\n");
+        out.push_str(
+            "# Run these commands, then re-run `cass models install --from-file \"$DIR\"`.\n",
+        );
+        out.push_str("set -euo pipefail\n");
+        out.push_str(&format!("DIR=\"${{DIR:-./{}_files}}\"\n", self.id));
+        out.push_str("mkdir -p \"$DIR\" && cd \"$DIR\"\n");
+        for file in &self.files {
+            let url = self.download_url_with_base(file, base_url);
+            out.push_str(&format!(
+                "curl -fLO --retry 3 {url:?}  # {local} ({size} bytes)\n",
+                url = url,
+                local = file.local_name(),
+                size = file.size,
+            ));
+        }
+        out.push_str("cd - >/dev/null\n");
+        out.push_str(&format!(
+            "cass models install {} --from-file \"$DIR\" -y\n",
+            self.id
+        ));
+        out
+    }
+
+    /// Generate a ready-to-paste PowerShell script that downloads every file
+    /// via `Invoke-WebRequest` and then invokes `cass models install --from-file`.
+    pub fn air_gap_powershell_script(&self, base_url: Option<&str>) -> String {
+        let mut out = String::new();
+        out.push_str("# Air-gap model install (PowerShell)\n");
+        out.push_str("$ErrorActionPreference = 'Stop'\n");
+        out.push_str(&format!("$dir = \"{}_files\"\n", self.id));
+        out.push_str("New-Item -ItemType Directory -Force -Path $dir | Out-Null\n");
+        for file in &self.files {
+            let url = self.download_url_with_base(file, base_url);
+            out.push_str(&format!(
+                "Invoke-WebRequest -Uri \"{url}\" -OutFile (Join-Path $dir \"{local}\")\n",
+                url = url,
+                local = file.local_name(),
+            ));
+        }
+        out.push_str(&format!(
+            "cass models install {} --from-file $dir -y\n",
+            self.id
+        ));
+        out
+    }
 }
 
 /// Progress callback for downloads.

@@ -23926,11 +23926,41 @@ fn run_models_install(
         }
         Err(e) => {
             pb.abandon_with_message("Download failed");
+            let err_str = e.to_string();
+            let looks_like_windows_tcp_race = cfg!(windows)
+                || err_str.contains("10057")
+                || err_str.contains("socket is not connected")
+                || err_str.contains("WSAENOTCONN");
+
+            if looks_like_windows_tcp_race {
+                eprintln!();
+                eprintln!(
+                    "{} Known issue on Windows: asupersync's TLS client can attempt to write \
+                     before the TCP connect completes (see cass#193).",
+                    "!".yellow()
+                );
+                eprintln!(
+                    "Workaround: download the files manually and install with --from-file.\n"
+                );
+                eprintln!("--- bash / Git Bash / MSYS2 ---");
+                eprintln!(
+                    "{}",
+                    manifest.air_gap_bash_script(mirror_base_url.as_deref())
+                );
+                eprintln!("--- PowerShell ---");
+                eprintln!(
+                    "{}",
+                    manifest.air_gap_powershell_script(mirror_base_url.as_deref())
+                );
+            }
+
             Err(CliError {
                 code: 23,
                 kind: "download",
                 message: format!("Model download failed: {}", e),
-                hint: Some(if mirror_base_url.is_some() {
+                hint: Some(if looks_like_windows_tcp_race {
+                    "Use the air-gap script printed above, then re-run with --from-file".into()
+                } else if mirror_base_url.is_some() {
                     "Check your mirror URL, connectivity, and try again".into()
                 } else {
                     "Check your network connection and try again".into()
