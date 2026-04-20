@@ -382,7 +382,7 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
 
 #[test]
 #[serial]
-fn repeat_full_json_marks_exact_totals_when_post_scan_rebuild_is_skipped() {
+fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let codex_home = home.join(".codex");
@@ -400,9 +400,27 @@ fn repeat_full_json_marks_exact_totals_when_post_scan_rebuild_is_skipped() {
 
     let mut initial_index = base_cmd(home);
     initial_index
-        .args(["index", "--full", "--data-dir"])
+        .args(["index", "--full", "--json", "--data-dir"])
         .arg(&data_dir);
-    initial_index.assert().success();
+    let initial_output = initial_index.output().expect("run initial full index");
+    assert!(
+        initial_output.status.success(),
+        "initial full index should succeed. stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&initial_output.stdout),
+        String::from_utf8_lossy(&initial_output.stderr)
+    );
+    let initial_payload: serde_json::Value =
+        serde_json::from_slice(&initial_output.stdout).expect("valid initial JSON output");
+    let expected_conversations = initial_payload
+        .get("conversations")
+        .and_then(|value| value.as_i64())
+        .expect("initial conversation count");
+    let expected_messages = initial_payload
+        .get("messages")
+        .and_then(|value| value.as_i64())
+        .expect("initial message count");
+
+    fs::rename(&codex_home, home.join(".codex_hidden")).unwrap();
 
     let mut cmd = base_cmd(home);
     cmd.args(["index", "--full", "--json", "--data-dir"])
@@ -423,23 +441,26 @@ fn repeat_full_json_marks_exact_totals_when_post_scan_rebuild_is_skipped() {
         .expect("indexing_stats object");
 
     assert_eq!(
-        stats
-            .get("total_counts_exact")
-            .and_then(|value| value.as_bool()),
-        Some(true),
-        "repeat no-op full runs should still report exact totals after skipping the redundant authoritative rebuild"
-    );
-    assert_eq!(
         payload
             .get("conversations")
             .and_then(|value| value.as_i64()),
-        stats
-            .get("total_conversations")
-            .and_then(|value| value.as_i64())
+        Some(expected_conversations),
+        "repeat no-op full runs should preserve canonical conversation totals even when the scan phase temporarily sees no source files"
     );
     assert_eq!(
         payload.get("messages").and_then(|value| value.as_i64()),
-        stats.get("total_messages").and_then(|value| value.as_i64())
+        Some(expected_messages),
+        "repeat no-op full runs should preserve canonical message totals even when the scan phase temporarily sees no source files"
+    );
+    assert_eq!(
+        stats
+            .get("total_conversations")
+            .and_then(|value| value.as_i64()),
+        Some(expected_conversations)
+    );
+    assert_eq!(
+        stats.get("total_messages").and_then(|value| value.as_i64()),
+        Some(expected_messages)
     );
 }
 
