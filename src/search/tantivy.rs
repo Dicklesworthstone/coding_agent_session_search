@@ -270,7 +270,9 @@ fn meta_fingerprint_for_existing_index_dir(index_path: &Path) -> Result<String> 
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn load_federated_search_manifest_internal(index_path: &Path) -> Result<Option<FederatedSearchManifest>> {
+fn load_federated_search_manifest_internal(
+    index_path: &Path,
+) -> Result<Option<FederatedSearchManifest>> {
     let manifest_path = federated_search_manifest_path(index_path);
     match fs::read(&manifest_path) {
         Ok(bytes) => serde_json::from_slice::<FederatedSearchManifest>(&bytes)
@@ -351,7 +353,10 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
         fs_cass_open_search_reader(index_path, FsReloadPolicy::Manual).map_err(map_fs_err)?;
     Ok(Some(SearchableIndexSummary {
         docs: reader.searcher().num_docs() as usize,
-        segments: index.searchable_segment_metas().map_err(map_fs_err)?.len(),
+        segments: index
+            .searchable_segment_metas()
+            .context("reading searchable segment metadata for Tantivy summary")?
+            .len(),
     }))
 }
 
@@ -1438,6 +1443,162 @@ mod tests {
         assert!(
             assembled.join(".managed.json").exists(),
             "assembled index generation should persist a Tantivy managed-file manifest"
+        );
+    }
+
+    #[test]
+    fn publish_federated_searchable_index_directories_writes_manifest_without_root_meta() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_002_000),
+            ended_at: Some(1_700_000_002_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_002_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_002_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("fed-a", "Fed A", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("fed-b", "Fed B", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        let summary =
+            publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+                .expect("publish federated bundle");
+        assert_eq!(summary.docs, 4);
+        assert_eq!(summary.segments, 2);
+        assert!(
+            !published.join("meta.json").exists(),
+            "federated publish root should not force a standard single-index meta.json"
+        );
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "federated publish root should persist its manifest"
+        );
+        let manifest = load_federated_search_manifest_internal(&published)
+            .expect("load manifest")
+            .expect("manifest present");
+        assert_eq!(manifest.shards.len(), 2);
+        assert_eq!(
+            searchable_index_summary(&published)
+                .expect("summary")
+                .expect("searchable summary")
+                .docs,
+            4
+        );
+    }
+
+    #[test]
+    fn open_or_create_materializes_federated_bundle_back_into_mutable_index() {
+        let root = TempDir::new().expect("temp dir");
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a).expect("create shard a");
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b).expect("create shard b");
+
+        let make_conv = |external_id: &str, title: &str, content: &str| NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some(external_id.to_string()),
+            title: Some(title.to_string()),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_003_000),
+            ended_at: Some(1_700_000_003_100),
+            metadata: Value::Null,
+            messages: vec![
+                NormalizedMessage {
+                    idx: 0,
+                    role: "user".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_010),
+                    content: format!("{content}-a"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+                NormalizedMessage {
+                    idx: 1,
+                    role: "assistant".to_string(),
+                    author: None,
+                    created_at: Some(1_700_000_003_020),
+                    content: format!("{content}-b"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                },
+            ],
+        };
+
+        shard_a_index
+            .add_conversation_with_id(&make_conv("mat-a", "Mat A", "alpha"), Some(10))
+            .expect("index shard a");
+        shard_b_index
+            .add_conversation_with_id(&make_conv("mat-b", "Mat B", "beta"), Some(20))
+            .expect("index shard b");
+        shard_a_index.commit().expect("commit shard a");
+        shard_b_index.commit().expect("commit shard b");
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        publish_federated_searchable_index_directories(&published, &[&shard_a, &shard_b])
+            .expect("publish federated bundle");
+        assert!(
+            published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "test fixture should start in federated bundle form"
+        );
+
+        let mutable_index =
+            TantivyIndex::open_or_create(&published).expect("materialize mutable index");
+        let reader = mutable_index.reader().expect("reader");
+        reader.reload().expect("reload");
+        assert_eq!(reader.searcher().num_docs(), 4);
+        assert!(
+            published.join("meta.json").exists(),
+            "writer open should materialize a standard writable Tantivy index"
+        );
+        assert!(
+            !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
+            "materialization should replace the federated bundle manifest"
         );
     }
 }

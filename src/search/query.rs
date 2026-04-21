@@ -2169,7 +2169,9 @@ impl Default for SearchClientOptions {
 
 impl Drop for SearchClient {
     fn drop(&mut self) {
-        FEDERATED_SEARCH_READERS.write().remove(&self.cache_namespace);
+        FEDERATED_SEARCH_READERS
+            .write()
+            .remove(&self.cache_namespace);
     }
 }
 
@@ -2708,21 +2710,18 @@ impl SearchClient {
             index_path.display()
         );
         let federated_readers = if tantivy.is_none() {
-            crate::search::tantivy::open_federated_search_readers(
-                index_path,
-                ReloadPolicy::Manual,
-            )
-            .ok()
-            .flatten()
-            .filter(|readers| !readers.is_empty())
-            .map(|readers| {
-                Arc::new(
-                    readers
-                        .into_iter()
-                        .map(|(reader, fields)| FederatedIndexReader { reader, fields })
-                        .collect::<Vec<_>>(),
-                )
-            })
+            crate::search::tantivy::open_federated_search_readers(index_path, ReloadPolicy::Manual)
+                .ok()
+                .flatten()
+                .filter(|readers| !readers.is_empty())
+                .map(|readers| {
+                    Arc::new(
+                        readers
+                            .into_iter()
+                            .map(|(reader, fields)| FederatedIndexReader { reader, fields })
+                            .collect::<Vec<_>>(),
+                    )
+                })
         } else {
             None
         };
@@ -14662,6 +14661,97 @@ mod tests {
 
         let hits = client.search("needle", filters, 10, 0, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn search_client_reads_federated_lexical_bundle_as_one_corpus() -> Result<()> {
+        let root = TempDir::new()?;
+        let shard_a = root.path().join("shard-a");
+        let shard_b = root.path().join("shard-b");
+        let published = root.path().join("published");
+
+        let mut shard_a_index = TantivyIndex::open_or_create(&shard_a)?;
+        let mut shard_b_index = TantivyIndex::open_or_create(&shard_b)?;
+
+        let make_conv =
+            |external_id: &str, title: &str, source_path: &str, tag: &str| NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some(external_id.into()),
+                title: Some(title.into()),
+                workspace: Some(std::path::PathBuf::from("/ws")),
+                source_path: std::path::PathBuf::from(source_path),
+                started_at: Some(1_700_000_100_000),
+                ended_at: Some(1_700_000_100_100),
+                metadata: json!({}),
+                messages: vec![
+                    NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: None,
+                        created_at: Some(1_700_000_100_010),
+                        content: format!("shared federated needle {tag} user"),
+                        extra: json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 1,
+                        role: "assistant".into(),
+                        author: None,
+                        created_at: Some(1_700_000_100_020),
+                        content: format!("shared federated needle {tag} assistant"),
+                        extra: json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    },
+                ],
+            };
+
+        let conv_a = make_conv(
+            "fed-query-a",
+            "Fed Query A",
+            "/tmp/fed-query-a.jsonl",
+            "alpha",
+        );
+        let conv_b = make_conv(
+            "fed-query-b",
+            "Fed Query B",
+            "/tmp/fed-query-b.jsonl",
+            "beta",
+        );
+
+        shard_a_index.add_conversation(&conv_a)?;
+        shard_b_index.add_conversation(&conv_b)?;
+        shard_a_index.commit()?;
+        shard_b_index.commit()?;
+        drop(shard_a_index);
+        drop(shard_b_index);
+
+        crate::search::tantivy::publish_federated_searchable_index_directories(
+            &published,
+            &[&shard_a, &shard_b],
+        )?;
+
+        let client = SearchClient::open(&published, None)?.expect("federated index present");
+        assert!(client.has_tantivy());
+        assert_eq!(client.total_docs(), 4);
+
+        let hits = client.search(
+            "shared federated needle",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 4);
+        let hit_paths = hits
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(hit_paths.contains("/tmp/fed-query-a.jsonl"));
+        assert!(hit_paths.contains("/tmp/fed-query-b.jsonl"));
 
         Ok(())
     }
