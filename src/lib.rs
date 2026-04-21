@@ -11000,6 +11000,20 @@ mod cli_read_db_tests {
             pipeline["reserved_cores"].as_u64(),
             Some(4_u64.min(available_parallelism.saturating_sub(1)))
         );
+        assert_eq!(pipeline["controller_mode"].as_str(), Some("steady"));
+        assert_eq!(
+            pipeline["controller_restore_clear_samples"].as_u64(),
+            Some(5)
+        );
+        assert_eq!(pipeline["controller_restore_hold_ms"].as_u64(), Some(2345));
+        assert_eq!(
+            pipeline["controller_loadavg_high_watermark_1m"].as_f64(),
+            Some(7.5)
+        );
+        assert_eq!(
+            pipeline["controller_loadavg_low_watermark_1m"].as_f64(),
+            Some(6.25)
+        );
         assert_eq!(
             pipeline["tantivy_writer_threads"].as_u64(),
             Some(available_parallelism.min(5))
