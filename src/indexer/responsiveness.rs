@@ -190,7 +190,7 @@ pub(crate) fn scale_worker_count(desired: usize, capacity_pct: u32) -> usize {
     if desired == 0 {
         return 0;
     }
-    let capacity = capacity_pct.min(100).max(1) as usize;
+    let capacity = capacity_pct.clamp(1, 100) as usize;
     let scaled = desired.saturating_mul(capacity) / 100;
     scaled.max(1)
 }
