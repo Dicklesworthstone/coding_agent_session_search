@@ -14,7 +14,7 @@ anyhow = "*"
 thiserror = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "fmt", "ansi"] }
-asupersync = { version = "*", git = "https://github.com/Dicklesworthstone/asupersync", rev = "310ff61f", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "0.3.0", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "*", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "*"
 clap_mangen = "*"
@@ -164,25 +164,22 @@ inherits = "release"
 debug = true
 strip = false
 
-# TODO: Unify the asupersync version split. The lockfile currently carries
-# three copies of asupersync 0.2.9:
-# - crates.io via frankensqlite
-# - git `08dd31df` via frankensearch
-# - git `2028c111` via cass directly
-# Keep the optional asupersync [patch] block disabled until the sibling repos
-# are validated together against the release lockfile and CI matrix.
-# [patch."https://github.com/Dicklesworthstone/asupersync"]
-# asupersync = { path = "../asupersync" }
-# franken-decision = { path = "../asupersync/franken_decision" }
-# franken-evidence = { path = "../asupersync/franken_evidence" }
-# franken-kernel = { path = "../asupersync/franken_kernel" }
+# Asupersync version split — now resolved by moving every source (direct
+# dep, frankensqlite transitive, frankensearch transitive) onto crates.io
+# asupersync 0.3.0. If you need to build against a local checkout of
+# asupersync (sibling at ../asupersync) during runtime-level hacking,
+# add the following [patch.crates-io] block LOCALLY and DO NOT COMMIT IT —
+# the fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
+# fail if any [patch] block pointing at sibling paths is committed:
+#
 # [patch.crates-io]
 # asupersync = { path = "../asupersync" }
 # franken-decision = { path = "../asupersync/franken_decision" }
 # franken-evidence = { path = "../asupersync/franken_evidence" }
 # franken-kernel = { path = "../asupersync/franken_kernel" }
-# build.rs validates the committed path overrides below and can validate the
-# optional sibling repos above when `strict-path-dep-validation` is enabled.
+#
+# build.rs validates the committed path overrides below and can validate
+# sibling repos above when `strict-path-dep-validation` is enabled.
 #
 # LOCAL DEVELOPMENT: Uncomment the [patch] sections below to build against
 # local sibling repo checkouts instead of pinned git revisions. These are
