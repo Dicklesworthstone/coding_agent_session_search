@@ -33,7 +33,7 @@
 //! reduces to a no-op.
 
 use std::sync::{
-    Arc, LazyLock, OnceLock,
+    Arc, LazyLock,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::thread;
@@ -291,21 +291,29 @@ impl Governor {
         if self
             .started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_err()
         {
-            let me = Arc::clone(self);
-            // Background sampler. One long-lived daemon thread per process.
-            thread::Builder::new()
-                .name("cass-responsiveness-governor".into())
-                .spawn(move || me.run())
-                .unwrap_or_else(|err| {
-                    tracing::warn!(
-                        error = %err,
-                        "failed to spawn cass responsiveness governor thread; running pinned at 100%"
-                    );
-                    // Ensure later callers don't infinitely try to start it.
-                    panic!("governor thread spawn failed");
-                });
+            // Another thread already claimed the spawn slot.
+            return;
+        }
+
+        let me = Arc::clone(self);
+        // Background sampler. One long-lived daemon thread per process.
+        let spawn_result = thread::Builder::new()
+            .name("cass-responsiveness-governor".into())
+            .spawn(move || me.run());
+
+        if let Err(err) = spawn_result {
+            // Spawn failed (usually RLIMIT_NPROC). Roll back the started flag
+            // so a later caller can retry when resource pressure eases, and
+            // leave `current_capacity` pinned at its initial 100. We
+            // deliberately do not panic: the indexer must keep making progress
+            // even when the governor can't.
+            self.started.store(false, Ordering::Release);
+            tracing::warn!(
+                error = %err,
+                "failed to spawn cass responsiveness governor thread; capacity pinned at 100% until a later start succeeds"
+            );
         }
     }
 
@@ -352,29 +360,6 @@ pub(crate) fn current_capacity_pct() -> u32 {
 /// current machine responsiveness policy. Always returns at least 1.
 pub(crate) fn effective_worker_count(desired: usize) -> usize {
     scale_worker_count(desired, current_capacity_pct())
-}
-
-/// Test-only override: pin the published capacity to a specific value and
-/// skip the background sampler. Intended for use by benchmarks and regression
-/// tests that want deterministic fan-out. The override persists until
-/// `clear_test_override` is called.
-#[cfg(test)]
-static TEST_OVERRIDE: OnceLock<AtomicU32> = OnceLock::new();
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn set_test_capacity_pct(pct: u32) {
-    TEST_OVERRIDE
-        .get_or_init(|| AtomicU32::new(100))
-        .store(pct, Ordering::Relaxed);
-}
-
-// Prevent an "unused" warning on non-test builds.
-#[cfg(not(test))]
-#[allow(dead_code)]
-fn _reserve_test_override_symbol() -> &'static OnceLock<AtomicU32> {
-    static RESERVED: OnceLock<AtomicU32> = OnceLock::new();
-    &RESERVED
 }
 
 fn env_u32(key: &str) -> Option<u32> {
