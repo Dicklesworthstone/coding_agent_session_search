@@ -164,12 +164,22 @@ inherits = "release"
 debug = true
 strip = false
 
-# Asupersync version split — now resolved by moving every source (direct
-# dep, frankensqlite transitive, frankensearch transitive) onto crates.io
-# asupersync 0.3.0. If you need to build against a local checkout of
-# asupersync (sibling at ../asupersync) during runtime-level hacking,
-# add the following [patch.crates-io] block LOCALLY and DO NOT COMMIT IT —
-# the fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
+# Asupersync version split — PARTIALLY resolved. The direct cass dep
+# is now on crates.io asupersync 0.3.0 (no more git rev pin), but the
+# lockfile still carries two older asupersync 0.2.9 copies pulled in
+# transitively:
+#   - registry copy via frankensqlite (crates.io frankensqlite still
+#     depends on asupersync 0.2.9)
+#   - git rev 08dd31df via frankensearch (this project's frankensearch
+#     dep uses rev db7530e5, which still references asupersync 0.2.9)
+# Both collapse into a single asupersync 0.3.0 entry once frankensqlite
+# and frankensearch cut matching 0.3-era releases on crates.io and we
+# bump the deps here to consume them.
+#
+# If you need to build against a local checkout of asupersync (sibling
+# at ../asupersync) during runtime-level hacking, add the following
+# [patch.crates-io] block LOCALLY and DO NOT COMMIT IT — the
+# fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
 # fail if any [patch] block pointing at sibling paths is committed:
 #
 # [patch.crates-io]
