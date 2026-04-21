@@ -3480,7 +3480,13 @@ fn lexical_rebuild_worker_parallelism() -> usize {
 }
 
 fn build_lexical_rebuild_worker_pool() -> Result<Option<ThreadPool>> {
-    let parallelism = lexical_rebuild_worker_parallelism();
+    // Apply the responsiveness governor to the pool size so we don't spawn
+    // more worker threads than the host can comfortably service. This affects
+    // only the pool itself; each downstream consumer (page-prep, shard
+    // builders, mergers) still applies its own governor clamp on top of its
+    // own hard cap, so you cannot accidentally exceed the pool size.
+    let raw = lexical_rebuild_worker_parallelism();
+    let parallelism = responsiveness::effective_worker_count(raw).max(1);
     if parallelism <= 1 {
         return Ok(None);
     }
@@ -3669,7 +3675,7 @@ pub(crate) fn lexical_rebuild_pipeline_settings_snapshot() -> LexicalRebuildPipe
     let available_parallelism = lexical_rebuild_available_parallelism();
     let reserved_cores = lexical_rebuild_reserved_cores_for_available(available_parallelism);
     let tantivy_writer_threads =
-        crate::search::tantivy::tantivy_writer_parallelism_hint_for_available(
+        crate::search::tantivy::tantivy_writer_parallelism_hint_for_available_governed(
             available_parallelism,
         );
     let controller_restore_hold = lexical_rebuild_controller_restore_hold();
@@ -4187,10 +4193,19 @@ fn lexical_rebuild_pipeline_channel_size() -> usize {
 fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
     worker_parallelism: usize,
 ) -> usize {
+    // Previously clamped at 8 as a hard guardrail against runaway fanout on
+    // large hosts. Now that the responsiveness governor applies a live
+    // capacity clamp on top of this (see `effective_worker_count` in the
+    // caller), we can safely raise the ceiling: on a many-core box the
+    // governor takes care of shrinking under pressure, and on a small host
+    // the `div_ceil(2)` factor keeps us from spawning more workers than
+    // cores. 16 was picked because it keeps the producer's fetch/prep
+    // overlap meaningful on 32+ core builders without saturating the DB
+    // read path on modest hosts.
     if worker_parallelism <= 1 {
         1
     } else {
-        worker_parallelism.div_ceil(2).clamp(2, 8)
+        worker_parallelism.div_ceil(2).clamp(2, 16)
     }
 }
 
@@ -5448,7 +5463,7 @@ fn lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(workers:
 }
 
 fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS")
+    let raw = dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_SHARD_BUILDERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -5456,7 +5471,11 @@ fn lexical_rebuild_staged_shard_builder_parallelism() -> usize {
             lexical_rebuild_default_staged_shard_builder_parallelism_for_workers(
                 lexical_rebuild_worker_parallelism(),
             )
-        })
+        });
+    // Apply the responsiveness governor so shard-builder fanout shrinks
+    // together with page-prep when the host is under pressure. On an idle
+    // box this is a no-op; under pressure it preserves interactive headroom.
+    responsiveness::effective_worker_count(raw).max(1)
 }
 
 fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: usize) -> usize {
@@ -5466,7 +5485,7 @@ fn lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(workers: 
 }
 
 fn lexical_rebuild_staged_merge_worker_parallelism() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS")
+    let raw = dotenvy::var("CASS_TANTIVY_REBUILD_STAGED_MERGE_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -5474,7 +5493,10 @@ fn lexical_rebuild_staged_merge_worker_parallelism() -> usize {
             lexical_rebuild_default_staged_merge_worker_parallelism_for_workers(
                 lexical_rebuild_worker_parallelism(),
             )
-        })
+        });
+    // Same governor wire-up as shard builders above: keep at most 1 merger on
+    // tiny hosts, scale with measured machine responsiveness.
+    responsiveness::effective_worker_count(raw).max(1)
 }
 
 fn lexical_rebuild_staged_shard_builder_settings(
@@ -6428,6 +6450,30 @@ fn spawn_connector_producer(
     })
 }
 
+/// Base commit cadence for the streaming indexing consumer. Default is 5s;
+/// can be overridden at process start via `CASS_STREAMING_CONSUMER_COMMIT_SECS`.
+/// Must return at least 1s to avoid pathological tight-loop commits even if
+/// the env var is misconfigured.
+fn streaming_consumer_commit_base_secs() -> u64 {
+    dotenvy::var("CASS_STREAMING_CONSUMER_COMMIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+}
+
+/// Effective commit interval for the streaming consumer. On an idle host this
+/// is the base value; under responsiveness pressure it scales with the
+/// governor capacity so commits happen more often, keeping the WAL and
+/// in-memory buffers from piling up. Clamped to at least 1s to avoid
+/// pathological tight-loop commits under an aggressive capacity floor.
+fn streaming_consumer_commit_interval() -> Duration {
+    let base = streaming_consumer_commit_base_secs();
+    let capacity = responsiveness::current_capacity_pct().clamp(1, 100) as u64;
+    let scaled = base.saturating_mul(capacity) / 100;
+    Duration::from_secs(scaled.max(1))
+}
+
 /// Run the streaming indexing consumer.
 ///
 /// Receives batches from producer threads and ingests them into storage.
@@ -6513,8 +6559,13 @@ fn run_streaming_consumer(
                 flow_limiter.release(byte_reservation);
                 canonical_mutations = canonical_mutations.accumulate(ingest_result?);
 
-                // Periodic commit to make results visible incrementally (every 5s)
-                if last_commit.elapsed() >= Duration::from_secs(5) {
+                // Periodic commit to make results visible incrementally.
+                // The base interval is 5s (tunable via
+                // CASS_STREAMING_CONSUMER_COMMIT_SECS); under responsiveness
+                // pressure it is scaled down so the writer hold time and
+                // buffered memory both shrink in lockstep with the rest of
+                // the pipeline.
+                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
                     if let Some(t_index) = t_index.as_deref_mut() {
                         if let Err(e) = t_index.commit() {
                             tracing::warn!("incremental commit failed: {}", e);
@@ -13110,13 +13161,19 @@ pub mod persist {
         franken: &FrankenStorage,
         base_idx: usize,
         chunk: &[NormalizedConversation],
+        internal_chunk: &[Conversation],
         max_retries: usize,
     ) -> Result<ChunkPersistResult> {
+        debug_assert_eq!(
+            chunk.len(),
+            internal_chunk.len(),
+            "parallel pre-map must produce one Conversation per NormalizedConversation"
+        );
         let mut outcomes = Vec::with_capacity(chunk.len());
         let mut agent_cache: HashMap<String, i64> = HashMap::new();
         let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
 
-        for (offset, conv) in chunk.iter().enumerate() {
+        for (offset, (conv, internal)) in chunk.iter().zip(internal_chunk.iter()).enumerate() {
             let idx = base_idx + offset;
 
             // Wrap the entire ensure_agent + ensure_workspace +
@@ -13124,7 +13181,6 @@ pub mod persist {
             // ensure_agent/workspace also write and can hit page conflicts.
             let agent_slug = conv.agent_slug.clone();
             let workspace = conv.workspace.clone();
-            let internal = map_to_internal(conv);
 
             ensure_embedded_source_registered(franken, &conv.metadata, "begin-concurrent chunk")?;
 
@@ -13154,7 +13210,7 @@ pub mod persist {
                 } else {
                     None
                 };
-                franken.insert_conversation_tree(agent_id, workspace_id, &internal)
+                franken.insert_conversation_tree(agent_id, workspace_id, internal)
             }) {
                 Ok(outcome) => outcomes.push((idx, outcome)),
                 Err(err) if is_retryable_franken_error(&err) => {
@@ -13175,6 +13231,7 @@ pub mod persist {
         db_path: &std::path::Path,
         base_idx: usize,
         chunk: &[NormalizedConversation],
+        internal_chunk: &[Conversation],
         max_retries: usize,
         defer_checkpoints: bool,
     ) -> Result<Vec<(usize, InsertOutcome)>> {
@@ -13193,7 +13250,8 @@ pub mod persist {
             );
         }
         let fallback_retries = max_retries.max(12);
-        let result = persist_chunk_with_writer(&franken, base_idx, chunk, fallback_retries);
+        let result =
+            persist_chunk_with_writer(&franken, base_idx, chunk, internal_chunk, fallback_retries);
         let close_result = franken.close().with_context(|| {
             format!(
                 "closing frankensqlite writer for begin-concurrent serial fallback: {}",
@@ -13291,11 +13349,21 @@ pub mod persist {
         let max_retries = begin_concurrent_retry_limit();
         let chunk_size = begin_concurrent_chunk_size().min(convs.len().max(1));
 
+        // Pre-compute internal conversations for the whole batch before we
+        // enter the per-chunk writer loops. map_to_internal is pure, CPU-heavy
+        // (string clones + optional secret redaction), and independent across
+        // conversations. Running it up front on the rayon pool pulls the
+        // allocator work out of every writer's retry window — so conflict
+        // retries re-run only SQLite I/O, not the allocation cost. See the
+        // matching hoist in the serial persist_conversations_batched path.
+        let internal_convs: Vec<Conversation> = convs.par_iter().map(map_to_internal).collect();
+
         let indexed_chunks: Vec<Result<ChunkPersistResult>> = convs
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
                 let base_idx = chunk_idx * chunk_size;
+                let internal_chunk = &internal_convs[base_idx..base_idx + chunk.len()];
                 let franken = FrankenStorage::open_writer(db_path).with_context(|| {
                     format!(
                         "opening frankensqlite writer for begin-concurrent mode: {}",
@@ -13311,7 +13379,13 @@ pub mod persist {
                         "failed to disable FK enforcement on begin-concurrent writer"
                     );
                 }
-                let result = persist_chunk_with_writer(&franken, base_idx, chunk, max_retries);
+                let result = persist_chunk_with_writer(
+                    &franken,
+                    base_idx,
+                    chunk,
+                    internal_chunk,
+                    max_retries,
+                );
                 let close_result = franken.close().with_context(|| {
                     format!(
                         "closing frankensqlite writer for begin-concurrent mode: {}",
@@ -13366,6 +13440,7 @@ pub mod persist {
                 db_path,
                 remaining_range.start,
                 &convs[remaining_range.clone()],
+                &internal_convs[remaining_range.clone()],
                 max_retries,
                 defer_checkpoints,
             )?;
@@ -14589,7 +14664,11 @@ pub mod persist {
                 .map(|i| NormalizedConversation {
                     agent_slug: format!("agent-{}", i % 4),
                     external_id: Some(format!("session-{i}")),
-                    title: Some(format!("Title {i} with sk_live_FAKE_SECRET_{i:04}")),
+                    // Secret format must match the Stripe redaction regex in
+                    // redact_secrets.rs: `\b[spr]k_live_[A-Za-z0-9]{20,}`.
+                    title: Some(format!(
+                        "Title {i} with sk_live_ABCdef0123456789AAAAbbbb{i:04}"
+                    )),
                     workspace: Some(std::path::PathBuf::from(format!("/ws/proj-{}", i % 3))),
                     source_path: std::path::PathBuf::from(format!("/log/s{i}.jsonl")),
                     started_at: Some(1_000 + i as i64),
@@ -14660,6 +14739,95 @@ pub mod persist {
                 assert!(
                     !title.contains("sk_live_"),
                     "title should have been redacted but contained a live secret marker: {title}"
+                );
+            }
+
+            t_index.commit().unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_parallel_pre_map_preserves_content_in_begin_concurrent_path()
+         {
+            // Mirror of the serial-path regression test: prove that the
+            // parallel pre-compute of internal_convs still feeds the
+            // begin-concurrent writers the *same* redacted, ordered data the
+            // old per-chunk map_to_internal loop produced.
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            // Use chunk_size 8 so the 32-conv batch splits across multiple
+            // rayon chunks. That exercises the per-chunk slicing of
+            // internal_convs.
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "8");
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("parallel-pre-map-concurrent.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            let convs: Vec<NormalizedConversation> = (0..32)
+                .map(|i| NormalizedConversation {
+                    agent_slug: format!("agent-bc-{}", i % 4),
+                    external_id: Some(format!("bc-session-{i}")),
+                    // Stripe regex requires `[A-Za-z0-9]{20,}` after sk_live_.
+                    title: Some(format!(
+                        "Title bc-{i} sk_live_ABCdef0123456789AAAAbbbb{i:04}"
+                    )),
+                    workspace: Some(std::path::PathBuf::from(format!("/ws/bc-{}", i % 3))),
+                    source_path: std::path::PathBuf::from(format!("/log/bc{i}.jsonl")),
+                    started_at: Some(2_000 + i as i64),
+                    ended_at: Some(2_010 + i as i64),
+                    metadata: serde_json::json!({}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(2_000 + i as i64),
+                        content: format!("bc hello {i}"),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    }],
+                })
+                .collect();
+
+            persist_conversations_batched(
+                &storage,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("begin-concurrent path with parallel pre-map should persist all conversations");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let conversation_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(conversation_count, convs.len() as i64);
+
+            let titles: Vec<String> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT title FROM conversations WHERE title IS NOT NULL ORDER BY id",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(titles.len(), convs.len());
+            for title in &titles {
+                assert!(
+                    !title.contains("sk_live_"),
+                    "begin-concurrent hoist must preserve secret redaction; found raw token: {title}"
                 );
             }
 
@@ -16743,6 +16911,16 @@ mod tests {
 
         let mut merge_coordinator =
             LexicalRebuildShardMergeCoordinator::new(eager_merge_stage_root);
+        // The coordinator's eager-merge gate defaults to
+        // allowed_pending_merge_jobs=0 so that production callers always
+        // opt in to the concurrency they want. Grant the test enough budget
+        // for at least one in-flight eager merge; without this, the gate
+        // at schedule_ready_merges swallows every ready group and the
+        // 4-way merge never fires (previously this was silently elided,
+        // which is the regression that made this test red).
+        merge_coordinator
+            .set_allowed_pending_merge_jobs(8, &merge_work_tx)
+            .unwrap();
         for (idx, shard_path) in shard_paths.iter().enumerate() {
             merge_coordinator
                 .queue_base_artifact(
@@ -17471,7 +17649,14 @@ mod tests {
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(32),
-            8
+            16,
+            "ceiling raised from 8 to 16 now that the responsiveness governor \
+             provides a live upper clamp; 32 cores give 32.div_ceil(2)=16"
+        );
+        assert_eq!(
+            lexical_rebuild_default_page_prep_worker_parallelism_for_workers(128),
+            16,
+            "128-core budget is still clamped at the 16-worker ceiling"
         );
     }
 

@@ -239,8 +239,10 @@ impl SemanticIndexer {
         // rayon parallelizes the canonicalize + hash prep across cores; the
         // ONNX embedder is then fed serially in `batch_size` chunks so its
         // internal thread pool stays saturated without being starved by the
-        // single-threaded prep loop we had before.
-        let window = self.batch_size.saturating_mul(4).max(self.batch_size);
+        // single-threaded prep loop we had before. `with_batch_size` and
+        // `resolved_default_batch_size` both guarantee `batch_size >= 1`,
+        // so saturating_mul(4) is always >= batch_size — no further clamp.
+        let window = self.batch_size.saturating_mul(4);
         for window_slice in messages.chunks(window) {
             let prepared_window = prepare_window(window_slice, parallel_prep_disabled());
             let skipped_in_window = window_slice.len() - prepared_window.len();

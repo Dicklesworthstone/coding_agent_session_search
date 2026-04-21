@@ -6448,6 +6448,17 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPECT_NO_COLOR=1                  honor global NO_COLOR".to_string(),
             "  CASS_TRACE_FILE                          default trace path".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
+            "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
+            "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
+            "  CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE=<F>  loadavg/core threshold for step-down (default 1.25)".to_string(),
+            "  CASS_RESPONSIVENESS_SEVERE_LOAD_PER_CORE=<F>  loadavg/core threshold for floor drop (default 1.75)".to_string(),
+            "  CASS_RESPONSIVENESS_MAX_PSI_AVG10=<F>    /proc/pressure/cpu some-avg10 step-down (default 20.0)".to_string(),
+            "  CASS_RESPONSIVENESS_SEVERE_PSI_AVG10=<F>  PSI severe threshold (default 40.0)".to_string(),
+            "  CASS_RESPONSIVENESS_GROWTH_TICKS=<N>     healthy ticks needed before each 25pp grow step (default 3)".to_string(),
+            "  CASS_RESPONSIVENESS_TICK_SECS=<N>        sampler interval in seconds (default 2)".to_string(),
+            "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
+            "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
+            "  CASS_SEMANTIC_PREP_PARALLEL=0            disable rayon-parallel canonicalize+hash prep".to_string(),
         ],
         RobotTopic::Paths => {
             let mut lines: Vec<String> = vec!["paths:".to_string()];
@@ -10301,6 +10312,13 @@ fn run_health(
     if let Some(fmt) = structured_format {
         // Always emit valid JSON — even on WAL corruption or other DB errors.
         // This is the core invariant for --json mode.
+        // Include a snapshot of the machine-responsiveness governor so
+        // operators can see *why* the indexer is running at reduced fan-out
+        // (or confirm that it is not). The snapshot is a cheap read of an
+        // in-memory ring buffer plus a handful of atomics; it does not fail.
+        let responsiveness =
+            serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot())
+                .unwrap_or(serde_json::Value::Null);
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -10321,6 +10339,7 @@ fn run_health(
                     .cloned()
                     .unwrap_or(serde_json::Value::Bool(false))
             },
+            "responsiveness": responsiveness,
             "state": state
         });
         output_structured_value(payload, fmt)?;
@@ -15026,6 +15045,46 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                     "items": { "type": "string" }
                 },
                 "latency_ms": { "type": "integer" },
+                "responsiveness": {
+                    "type": "object",
+                    "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
+                    "properties": {
+                        "current_capacity_pct": { "type": "integer", "description": "Published capacity scalar in [min_capacity_pct, 100]. Fan-out knobs multiply their caller-requested values by this percentage." },
+                        "healthy_streak": { "type": "integer", "description": "Consecutive healthy ticks seen by the sampler; growth_ticks consecutive healthy ticks trigger a 25pp grow step." },
+                        "shrink_count": { "type": "integer", "description": "Cumulative shrink events since governor startup." },
+                        "grow_count": { "type": "integer", "description": "Cumulative grow events since governor startup." },
+                        "ticks_total": { "type": "integer", "description": "Total sampler ticks observed since startup." },
+                        "disabled_via_env": { "type": "boolean", "description": "True when CASS_RESPONSIVENESS_DISABLE pins capacity at 100%." },
+                        "last_snapshot": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "load_per_core": { "type": ["number", "null"] },
+                                "psi_cpu_some_avg10": { "type": ["number", "null"] }
+                            }
+                        },
+                        "last_reason": { "type": ["string", "null"], "description": "One of: disabled, severe, pressured, pressured_floor_hold, healthy_hold, healthy_grow, healthy_ceiling_hold." },
+                        "recent_decisions": {
+                            "type": "array",
+                            "description": "Ring buffer of capacity changes and pressure events, oldest → newest.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "at_elapsed_ms": { "type": "integer" },
+                                    "prev_capacity_pct": { "type": "integer" },
+                                    "next_capacity_pct": { "type": "integer" },
+                                    "reason": { "type": "string" },
+                                    "snapshot": {
+                                        "type": "object",
+                                        "properties": {
+                                            "load_per_core": { "type": ["number", "null"] },
+                                            "psi_cpu_some_avg10": { "type": ["number", "null"] }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
                 "state": {
                     "type": "object",
                     "properties": {
