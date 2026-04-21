@@ -6458,7 +6458,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPONSIVENESS_TICK_SECS=<N>        sampler interval in seconds (default 2)".to_string(),
             "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
             "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
-            "  CASS_SEMANTIC_PREP_PARALLEL=0            disable rayon-parallel canonicalize+hash prep".to_string(),
+            "  CASS_SEMANTIC_PREP_PARALLEL=1            opt in to rayon-parallel canonicalize+hash prep (default off: serial is measurably faster on the common cheap-embedder path)".to_string(),
         ],
         RobotTopic::Paths => {
             let mut lines: Vec<String> = vec!["paths:".to_string()];

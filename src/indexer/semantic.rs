@@ -31,15 +31,26 @@ fn resolved_default_batch_size() -> usize {
         .unwrap_or(DEFAULT_SEMANTIC_BATCH_SIZE)
 }
 
-/// Disable the parallel canonicalize+hash prep step (for before/after profiling
-/// or as an escape hatch). When set to a truthy value the indexer falls back to
-/// the original serial prep loop.
-fn parallel_prep_disabled() -> bool {
+/// Opt in to the rayon-parallel canonicalize+hash prep step. **Default: OFF.**
+///
+/// The parallel path is kept because canonicalize+hash CAN dominate the
+/// embedding wall-clock on pathological inputs (very long messages, costly
+/// Unicode normalization). But criterion baselines captured under
+/// `tests/artifacts/perf/2026-04-21-profile-run/baselines.md` showed a
+/// 1.2×–2.3× **regression** on the hash embedder across every batch size
+/// tested (2 000 messages, mixed markdown/code/unicode): rayon's per-task
+/// scheduling overhead is larger than the per-message canonicalize+hash cost
+/// when the embedder itself is cheap. For the production ONNX (MiniLM)
+/// embedder, per-batch inference already dwarfs prep, so parallel prep never
+/// buys meaningful wall-clock — the prep step is ≤ 1% of total embed time.
+///
+/// Set `CASS_SEMANTIC_PREP_PARALLEL=1` / `true` / `yes` / `on` to opt in.
+fn parallel_prep_enabled() -> bool {
     dotenvy::var("CASS_SEMANTIC_PREP_PARALLEL")
         .ok()
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "0" | "false" | "no" | "off")
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
 }
@@ -96,9 +107,10 @@ struct Prepared<'a> {
     hash: [u8; 32],
 }
 
-/// Canonicalize + hash a window of messages. When parallel prep is enabled
-/// (the default), each message's canonicalize + SHA256 runs on the rayon
-/// thread pool. Results preserve input order via `par_iter().collect()`.
+/// Canonicalize + hash a window of messages. Default is serial; opt in to
+/// the rayon-parallel path via `CASS_SEMANTIC_PREP_PARALLEL=1` (see the
+/// `parallel_prep_enabled` docstring for why it is not the default).
+/// Parallel results preserve input order via `par_iter().filter_map().collect()`.
 /// Messages whose canonical form is empty are filtered out so the embedder
 /// batch is never polluted with useless inputs.
 fn prepare_window<'a>(window: &'a [EmbeddingInput], serial: bool) -> Vec<Prepared<'a>> {
@@ -244,7 +256,7 @@ impl SemanticIndexer {
         // so saturating_mul(4) is always >= batch_size — no further clamp.
         let window = self.batch_size.saturating_mul(4);
         for window_slice in messages.chunks(window) {
-            let prepared_window = prepare_window(window_slice, parallel_prep_disabled());
+            let prepared_window = prepare_window(window_slice, !parallel_prep_enabled());
             let skipped_in_window = window_slice.len() - prepared_window.len();
             if skipped_in_window > 0 {
                 pb.inc(skipped_in_window as u64);
@@ -480,6 +492,62 @@ mod tests {
         assert_eq!(index.embedder_id(), indexer.embedder_id());
         assert_eq!(index.dimension(), indexer.embedder_dimension());
         assert_eq!(index.record_count(), 2);
+    }
+
+    /// Golden-output regression: any change to the embedding prep pipeline,
+    /// the canonicalizer, the hash embedder's deterministic projection, or
+    /// the ordering semantics of `embed_messages` must not silently mutate
+    /// the bytes we write to the vector index. This digest is derived from a
+    /// frozen 64-message corpus processed through the hash embedder; a
+    /// mismatch means one of those contracts moved.
+    #[test]
+    fn embed_messages_golden_digest_hash_embedder() {
+        use ring::digest::{Context, SHA256};
+
+        let corpus: Vec<EmbeddingInput> = (0..64)
+            .map(|i| {
+                let body = match i % 5 {
+                    0 => format!("plain text message number {i}"),
+                    1 => format!("**bold** line {i} with _emphasis_"),
+                    2 => format!("```rust\nfn f_{i}() {{ println!(\"{i}\"); }}\n```"),
+                    3 => format!("   whitespace {i}   "),
+                    _ => format!("unicode \u{00E9}\u{0301} + emoji \u{1F600} {i}"),
+                };
+                EmbeddingInput::new(i as u64, body)
+            })
+            .collect();
+
+        let indexer = SemanticIndexer::new("hash", None)
+            .unwrap()
+            .with_batch_size(16)
+            .unwrap();
+        let embeddings = indexer.embed_messages(&corpus).unwrap();
+
+        // Digest over (message_id, content_hash, embedding f32 bytes) for every
+        // embedded message, in the order emitted. Preserves order + content +
+        // numeric equality without having to compare raw floats directly.
+        let mut ctx = Context::new(&SHA256);
+        for em in &embeddings {
+            ctx.update(&em.message_id.to_le_bytes());
+            ctx.update(&em.content_hash);
+            for v in &em.embedding {
+                ctx.update(&v.to_le_bytes());
+            }
+        }
+        let digest = hex::encode(ctx.finish().as_ref());
+
+        // Captured 2026-04-21 against a freshly built hash embedder, batch
+        // size 16, the frozen 64-message corpus above. Stable so long as
+        // the prep pipeline, canonicalizer, and HashEmbedder::embed
+        // implementation are all byte-preserving. If you intentionally
+        // changed any of those, update this value AND record the reason
+        // in the commit message.
+        const EXPECTED: &str = "eb6f86cc3b4a87e28711705ba0c28f7f3cb5760796cbbea4d0f9177a0103a03f";
+        assert_eq!(
+            digest, EXPECTED,
+            "embed_messages golden digest drifted; if this was intentional, \
+             update EXPECTED in this test and record the reason in the commit message"
+        );
     }
 
     #[test]
