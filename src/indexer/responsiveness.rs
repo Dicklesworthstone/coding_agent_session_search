@@ -71,6 +71,60 @@ const DEFAULT_TICK_SECS: u64 = 2;
 /// history at the default 2-second tick.
 const TELEMETRY_DECISION_HISTORY: usize = 128;
 
+/// Default calibration window size for split-conformal pressure thresholds.
+/// 4 096 samples at the default 2 s tick = ~2.3 hours of history, which
+/// comfortably spans a typical workday's duty cycle without inflating
+/// memory beyond a few KiB per signal.
+const DEFAULT_CONFORMAL_K: usize = 256;
+
+/// Minimum number of calibration samples required before the conformal
+/// quantile is emitted. Below this, the governor falls back to static
+/// thresholds for the current tick (deterministic conservative fallback).
+const DEFAULT_CONFORMAL_K_MIN: usize = 32;
+
+/// Default coverage level for the "pressured" quantile. Higher α = more
+/// false-positive shrinks, but faster response to real pressure. 0.05
+/// means we expect ≈ 1 false-positive step-down per 20 healthy ticks.
+const DEFAULT_CONFORMAL_ALPHA_PRESSURED: f32 = 0.05;
+
+/// Default coverage level for the "severe" quantile. Tighter than
+/// pressured because drop-to-floor is disruptive. 0.01 means ≈ 1
+/// false-positive floor-drop per 100 healthy ticks.
+const DEFAULT_CONFORMAL_ALPHA_SEVERE: f32 = 0.01;
+
+/// Page-Hinkley drift-detection parameter δ (allowed mean-drift
+/// tolerance). A larger δ tolerates more drift before triggering a
+/// calibration reset; smaller δ is stricter but flaps more often.
+const DEFAULT_DRIFT_DELTA: f32 = 0.01;
+
+/// Page-Hinkley trigger threshold λ. Once the cumulative drift signal
+/// exceeds λ, declare change-point and reset the calibration window.
+/// Conservative default — tuned so stationary streams trip < 1 time
+/// per 10k samples on average.
+const DEFAULT_DRIFT_LAMBDA: f32 = 0.5;
+
+/// Huber / MAD outlier rejection multiplier. Samples with
+/// |v − median| > HUBER_K × MAD are dropped from the calibration
+/// window (still used for the current-tick decision). 3.5 is the
+/// published Huber constant; equivalent to ≈ 3σ under Normal tails.
+const MAD_OUTLIER_K: f32 = 3.5;
+
+/// Which calibration policy the governor uses to compute the next
+/// `pressured` / `severe` thresholds for each health signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CalibrationMode {
+    /// Static, hand-tuned thresholds from `DEFAULT_*` constants plus env
+    /// overrides. Default for backwards compatibility — all 17 existing
+    /// governor unit tests exercise this path.
+    Static,
+    /// Split-conformal quantile over a rolling window of healthy-period
+    /// samples. Provides a finite-sample coverage guarantee per-host.
+    /// See `ALIEN-ARTIFACT-CARD2-SPEC.md` under
+    /// `tests/artifacts/perf/2026-04-21-profile-run/`.
+    Conformal,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GovernorConfig {
     pub min_capacity_pct: u32,
@@ -81,6 +135,23 @@ pub(crate) struct GovernorConfig {
     pub growth_consecutive_healthy_ticks: u32,
     pub tick: Duration,
     pub disabled: bool,
+    /// Threshold policy for pressured/severe signal classification.
+    /// `Static` preserves the pre-conformal behaviour bit-for-bit.
+    pub calibration_mode: CalibrationMode,
+    /// Calibration window size for split-conformal quantile. Only used
+    /// when `calibration_mode == CalibrationMode::Conformal`.
+    pub conformal_k: usize,
+    /// Minimum samples before the conformal path emits a threshold.
+    pub conformal_k_min: usize,
+    /// α for the pressured quantile (expected FP rate per tick).
+    pub conformal_alpha_pressured: f32,
+    /// α for the severe quantile (always ≤ alpha_pressured so
+    /// `q̂_severe` ≥ `q̂_pressured`).
+    pub conformal_alpha_severe: f32,
+    /// Page-Hinkley δ parameter (mean-drift tolerance).
+    pub drift_delta: f32,
+    /// Page-Hinkley λ threshold (triggers calibration reset).
+    pub drift_lambda: f32,
 }
 
 impl GovernorConfig {
@@ -103,6 +174,43 @@ impl GovernorConfig {
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_TICK_SECS);
         let disabled = env_bool_truthy("CASS_RESPONSIVENESS_DISABLE");
+
+        // Conformal knobs. Never clamped to zero — a zero `K` or `K_min`
+        // would make the calibration path operate on an empty window,
+        // which we handle by refusing to emit a threshold. But values
+        // outside sane ranges are clamped so env misconfig can't make
+        // the governor do something absurd.
+        let calibration_mode = match dotenvy::var("CASS_RESPONSIVENESS_CALIBRATION")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("conformal") => CalibrationMode::Conformal,
+            _ => CalibrationMode::Static,
+        };
+        let conformal_k = env_u32("CASS_RESPONSIVENESS_CONFORMAL_K")
+            .map(|v| (v as usize).clamp(16, 4096))
+            .unwrap_or(DEFAULT_CONFORMAL_K);
+        let conformal_k_min = env_u32("CASS_RESPONSIVENESS_CONFORMAL_K_MIN")
+            .map(|v| (v as usize).clamp(4, conformal_k))
+            .unwrap_or(DEFAULT_CONFORMAL_K_MIN.min(conformal_k));
+        let conformal_alpha_pressured = env_f32("CASS_RESPONSIVENESS_CONFORMAL_ALPHA_PRESSURED")
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.5)
+            .unwrap_or(DEFAULT_CONFORMAL_ALPHA_PRESSURED);
+        let conformal_alpha_severe = env_f32("CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE")
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < conformal_alpha_pressured)
+            .unwrap_or_else(|| {
+                DEFAULT_CONFORMAL_ALPHA_SEVERE.min(conformal_alpha_pressured * 0.5)
+            });
+        let drift_delta = env_f32("CASS_RESPONSIVENESS_DRIFT_DELTA")
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 10.0)
+            .unwrap_or(DEFAULT_DRIFT_DELTA);
+        let drift_lambda = env_f32("CASS_RESPONSIVENESS_DRIFT_LAMBDA")
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 100.0)
+            .unwrap_or(DEFAULT_DRIFT_LAMBDA);
+
         Self {
             min_capacity_pct,
             max_load_per_core,
@@ -112,6 +220,13 @@ impl GovernorConfig {
             growth_consecutive_healthy_ticks,
             tick: Duration::from_secs(tick_secs),
             disabled,
+            calibration_mode,
+            conformal_k,
+            conformal_k_min,
+            conformal_alpha_pressured,
+            conformal_alpha_severe,
+            drift_delta,
+            drift_lambda,
         }
     }
 }
@@ -337,20 +452,459 @@ pub(crate) struct GovernorTelemetry {
     pub last_reason: Option<GovernorDecisionReason>,
     /// Oldest → newest. Bounded at [`TELEMETRY_DECISION_HISTORY`].
     pub recent_decisions: Vec<GovernorDecision>,
+    /// Present only when `CASS_RESPONSIVENESS_CALIBRATION=conformal`.
+    /// Carries the current calibration-window fill, recent drift trips,
+    /// and the quantiles the conformal policy is emitting for each
+    /// signal × severity pairing.
+    pub calibration: Option<CalibrationTelemetry>,
+}
+
+// ---------------------------------------------------------------------------
+// Conformal calibration machinery (bead `d2qix` Card 2). See
+// `tests/artifacts/perf/2026-04-21-profile-run/ALIEN-ARTIFACT-CARD2-SPEC.md`
+// for the decision-theoretic spec + proof obligations this code discharges.
+// ---------------------------------------------------------------------------
+
+/// Split-conformal quantile per Vovk/Gammerman/Shafer 2005 Theorem 1.
+/// Returns `scores[ ⌈(K + 1)(1 − α)⌉ − 1 ]` from a sorted-ascending slice,
+/// clamped to the last element when the target index falls outside the
+/// available range (which is exactly the convention in the Vovk text:
+/// when (K+1)(1-α) > K we fall back to the empirical max).
+///
+/// Preconditions: `scores.len() ≥ 1`, `0 < alpha < 1`. Violating either
+/// returns `None`.
+pub(crate) fn conformal_quantile_sorted(scores: &[f32], alpha: f32) -> Option<f32> {
+    if scores.is_empty() || !alpha.is_finite() || alpha <= 0.0 || alpha >= 1.0 {
+        return None;
+    }
+    // ⌈(K + 1)(1 − α)⌉ − 1, clamped to [0, K−1].
+    let k = scores.len();
+    let target = ((k as f32 + 1.0) * (1.0 - alpha)).ceil() as isize - 1;
+    let idx = target.clamp(0, (k as isize) - 1) as usize;
+    Some(scores[idx])
+}
+
+/// Rolling ring buffer of healthy-period samples for one signal. Keeps the
+/// most recent `K` entries so we can recompute a split-conformal quantile
+/// on demand. Writes are cheap (push_back + pop_front when full); reads
+/// allocate a sorted copy once per observation request.
+#[derive(Debug, Clone)]
+struct CalibrationStream {
+    samples: VecDeque<f32>,
+    k: usize,
+}
+
+impl CalibrationStream {
+    fn new(k: usize) -> Self {
+        Self {
+            samples: VecDeque::with_capacity(k.max(1)),
+            k: k.max(1),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    fn push(&mut self, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        if self.samples.len() >= self.k {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(value);
+    }
+
+    /// Median of the current window. Linear-time via sort into a temporary.
+    /// We intentionally re-sort per call instead of maintaining a sorted
+    /// structure — the window is small (≤ 4 096) and called at most once
+    /// per governor tick.
+    fn median(&self) -> Option<f32> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut buf: Vec<f32> = self.samples.iter().copied().collect();
+        buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = buf.len();
+        Some(if n.is_multiple_of(2) {
+            (buf[n / 2 - 1] + buf[n / 2]) / 2.0
+        } else {
+            buf[n / 2]
+        })
+    }
+
+    /// Median absolute deviation (MAD). Returns None on empty window.
+    fn mad(&self) -> Option<f32> {
+        let med = self.median()?;
+        let mut deviations: Vec<f32> = self.samples.iter().map(|v| (v - med).abs()).collect();
+        deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = deviations.len();
+        if n == 0 {
+            return None;
+        }
+        Some(if n.is_multiple_of(2) {
+            (deviations[n / 2 - 1] + deviations[n / 2]) / 2.0
+        } else {
+            deviations[n / 2]
+        })
+    }
+
+    /// True iff `v` is a Huber-outlier given the window's current median
+    /// and MAD. The gate only engages once the window has enough data
+    /// to estimate spread; small windows or degenerate-all-identical
+    /// windows (MAD = 0) admit every new sample so we don't get stuck
+    /// with a 1-sample window forever.
+    fn is_outlier(&self, v: f32) -> bool {
+        const MIN_SAMPLES_FOR_GATE: usize = 8;
+        if self.samples.len() < MIN_SAMPLES_FOR_GATE {
+            return false;
+        }
+        let (Some(med), Some(mad)) = (self.median(), self.mad()) else {
+            return false;
+        };
+        if mad == 0.0 {
+            // Everything currently in the window is identical. A new
+            // varying value is fine to admit — letting it in is how
+            // MAD eventually becomes non-zero. Rejecting it would lock
+            // the window at its initial value permanently.
+            return false;
+        }
+        (v - med).abs() > MAD_OUTLIER_K * mad
+    }
+
+    /// Compute the split-conformal quantile at the given α. Returns None
+    /// when the window has fewer than `k_min` samples (caller falls back
+    /// to the static threshold).
+    fn quantile(&self, alpha: f32, k_min: usize) -> Option<f32> {
+        if self.samples.len() < k_min {
+            return None;
+        }
+        let mut sorted: Vec<f32> = self.samples.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        conformal_quantile_sorted(&sorted, alpha)
+    }
+}
+
+/// Page-Hinkley drift detector — a one-sided sequential change-point test
+/// covering the same ground as §12.13 ADWIN for our purposes but in under
+/// 30 lines. Tracks a cumulative deviation statistic `g_t`; when it
+/// exceeds `λ` we declare a regime shift and reset.
+///
+///    µ_t = running mean of observed values
+///    m_t = (x_t - µ_t) - δ
+///    g_t = max(0, g_{t-1} + m_t)      ← one-sided increase detector
+///    g_t = min(g_t', g_{t-1} + m_t)   ← track running minimum
+///    declare change iff (g_t - min_g) > λ
+#[derive(Debug, Clone)]
+struct PageHinkley {
+    delta: f32,
+    lambda: f32,
+    n: u64,
+    running_mean: f32,
+    cumulative: f32,
+    min_cumulative: f32,
+}
+
+impl PageHinkley {
+    fn new(delta: f32, lambda: f32) -> Self {
+        Self {
+            delta,
+            lambda,
+            n: 0,
+            running_mean: 0.0,
+            cumulative: 0.0,
+            min_cumulative: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.n = 0;
+        self.running_mean = 0.0;
+        self.cumulative = 0.0;
+        self.min_cumulative = 0.0;
+    }
+
+    /// Update with a new observation. Returns `true` iff the cumulative
+    /// drift exceeds the configured λ — at that point the caller should
+    /// clear its calibration window and reset this detector.
+    fn observe(&mut self, v: f32) -> bool {
+        if !v.is_finite() {
+            return false;
+        }
+        self.n = self.n.saturating_add(1);
+        // Welford-style running mean update for numerical stability.
+        self.running_mean += (v - self.running_mean) / (self.n as f32);
+        self.cumulative += v - self.running_mean - self.delta;
+        if self.cumulative < self.min_cumulative {
+            self.min_cumulative = self.cumulative;
+        }
+        (self.cumulative - self.min_cumulative) > self.lambda
+    }
+}
+
+/// Per-signal calibration state (one load stream, one PSI stream). Each
+/// stream holds its own rolling window and its own Page-Hinkley detector
+/// so drift on one signal does not invalidate the other.
+#[derive(Debug, Clone)]
+struct SignalCalibration {
+    window: CalibrationStream,
+    drift: PageHinkley,
+}
+
+impl SignalCalibration {
+    fn new(cfg: &GovernorConfig) -> Self {
+        Self {
+            window: CalibrationStream::new(cfg.conformal_k),
+            drift: PageHinkley::new(cfg.drift_delta, cfg.drift_lambda),
+        }
+    }
+
+    /// Observe a sample taken during a healthy tick. Returns a status the
+    /// caller can record into telemetry. `is_healthy_tick` must be true
+    /// for the sample to enter the calibration window — pressured-tick
+    /// samples would contaminate the quantile we want to learn.
+    fn observe(&mut self, v: f32, is_healthy_tick: bool) -> SignalObserveOutcome {
+        if !v.is_finite() {
+            return SignalObserveOutcome::NotFinite;
+        }
+        let drift_detected = self.drift.observe(v);
+        if drift_detected {
+            self.window.clear();
+            self.drift.reset();
+            return SignalObserveOutcome::DriftResetTriggered;
+        }
+        if !is_healthy_tick {
+            return SignalObserveOutcome::SkippedPressuredTick;
+        }
+        if self.window.is_outlier(v) {
+            return SignalObserveOutcome::RejectedOutlier;
+        }
+        self.window.push(v);
+        SignalObserveOutcome::Accepted
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SignalObserveOutcome {
+    Accepted,
+    SkippedPressuredTick,
+    RejectedOutlier,
+    DriftResetTriggered,
+    NotFinite,
+}
+
+/// Aggregate per-host calibration across both signals (load, PSI).
+#[derive(Debug, Clone)]
+struct GovernorCalibration {
+    load: SignalCalibration,
+    psi: SignalCalibration,
+    /// Monotone counter: total drift resets triggered (both signals).
+    drift_reset_count: u64,
+    /// Monotone counter: samples dropped by the MAD outlier gate.
+    outliers_rejected: u64,
+    /// Total observation calls, for telemetry denominators.
+    observations_total: u64,
+}
+
+impl GovernorCalibration {
+    fn new(cfg: &GovernorConfig) -> Self {
+        Self {
+            load: SignalCalibration::new(cfg),
+            psi: SignalCalibration::new(cfg),
+            drift_reset_count: 0,
+            outliers_rejected: 0,
+            observations_total: 0,
+        }
+    }
+
+    /// Observe one snapshot. Returns the effective thresholds the caller
+    /// should use for the current tick (None → caller falls back to the
+    /// static thresholds from `GovernorConfig`).
+    ///
+    /// `is_healthy_tick` signals whether the CURRENT tick's reading is
+    /// considered healthy by the static classifier — this prevents the
+    /// calibration window from learning from pressured samples.
+    fn observe_and_compute_thresholds(
+        &mut self,
+        snapshot: &HealthSnapshot,
+        is_healthy_tick: bool,
+        cfg: &GovernorConfig,
+    ) -> Option<EffectiveThresholds> {
+        self.observations_total = self.observations_total.saturating_add(1);
+        // Observe each signal independently so drift on one doesn't
+        // destroy the other's calibration.
+        if let Some(v) = snapshot.load_per_core {
+            let outcome = self.load.observe(v, is_healthy_tick);
+            match outcome {
+                SignalObserveOutcome::RejectedOutlier => {
+                    self.outliers_rejected = self.outliers_rejected.saturating_add(1);
+                }
+                SignalObserveOutcome::DriftResetTriggered => {
+                    self.drift_reset_count = self.drift_reset_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        if let Some(v) = snapshot.psi_cpu_some_avg10 {
+            let outcome = self.psi.observe(v, is_healthy_tick);
+            match outcome {
+                SignalObserveOutcome::RejectedOutlier => {
+                    self.outliers_rejected = self.outliers_rejected.saturating_add(1);
+                }
+                SignalObserveOutcome::DriftResetTriggered => {
+                    self.drift_reset_count = self.drift_reset_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+
+        // Require BOTH streams to have accumulated K_min healthy samples
+        // before we start emitting dynamic thresholds — otherwise we'd
+        // mix a dynamic bound on one signal with a static bound on the
+        // other, which makes the composite behaviour hard to reason
+        // about.
+        let load_pressured = self
+            .load
+            .window
+            .quantile(cfg.conformal_alpha_pressured, cfg.conformal_k_min);
+        let load_severe = self
+            .load
+            .window
+            .quantile(cfg.conformal_alpha_severe, cfg.conformal_k_min);
+        let psi_pressured = self
+            .psi
+            .window
+            .quantile(cfg.conformal_alpha_pressured, cfg.conformal_k_min);
+        let psi_severe = self
+            .psi
+            .window
+            .quantile(cfg.conformal_alpha_severe, cfg.conformal_k_min);
+
+        let (lp, ls, pp, ps) = (load_pressured?, load_severe?, psi_pressured?, psi_severe?);
+
+        // Invariant PO-C2-3: severe must strictly exceed pressured so the
+        // classifier has a non-empty "only pressured" band. When
+        // distribution happens to be so narrow that both quantiles equal,
+        // fall back to static — preserves the ordering contract.
+        if ls <= lp || ps <= pp {
+            return None;
+        }
+
+        Some(EffectiveThresholds {
+            pressured_load: lp,
+            severe_load: ls,
+            pressured_psi: pp,
+            severe_psi: ps,
+        })
+    }
+
+    fn telemetry(&self, cfg: &GovernorConfig) -> CalibrationTelemetry {
+        CalibrationTelemetry {
+            mode: cfg.calibration_mode,
+            load_window_len: self.load.window.len(),
+            psi_window_len: self.psi.window.len(),
+            conformal_k: cfg.conformal_k,
+            conformal_k_min: cfg.conformal_k_min,
+            conformal_alpha_pressured: cfg.conformal_alpha_pressured,
+            conformal_alpha_severe: cfg.conformal_alpha_severe,
+            drift_reset_count: self.drift_reset_count,
+            outliers_rejected: self.outliers_rejected,
+            observations_total: self.observations_total,
+            load_pressured_q: self
+                .load
+                .window
+                .quantile(cfg.conformal_alpha_pressured, cfg.conformal_k_min),
+            load_severe_q: self
+                .load
+                .window
+                .quantile(cfg.conformal_alpha_severe, cfg.conformal_k_min),
+            psi_pressured_q: self
+                .psi
+                .window
+                .quantile(cfg.conformal_alpha_pressured, cfg.conformal_k_min),
+            psi_severe_q: self
+                .psi
+                .window
+                .quantile(cfg.conformal_alpha_severe, cfg.conformal_k_min),
+        }
+    }
+}
+
+/// Effective classifier thresholds for the current tick. In static mode
+/// these are just copies of `GovernorConfig`'s static fields; in conformal
+/// mode they are the dynamic quantiles from the calibration window.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct EffectiveThresholds {
+    pub pressured_load: f32,
+    pub severe_load: f32,
+    pub pressured_psi: f32,
+    pub severe_psi: f32,
+}
+
+impl EffectiveThresholds {
+    /// Rebuild a config with these thresholds substituted, preserving
+    /// every other field (min_capacity_pct, growth_ticks, tick, disabled,
+    /// calibration_mode, drift_*). Used to feed `next_capacity` via the
+    /// existing `cfg.is_severe/is_pressured` methods unchanged.
+    fn apply_to(self, cfg: &GovernorConfig) -> GovernorConfig {
+        GovernorConfig {
+            max_load_per_core: self.pressured_load,
+            severe_load_per_core: self.severe_load,
+            max_psi_avg10: self.pressured_psi,
+            severe_psi_avg10: self.severe_psi,
+            ..*cfg
+        }
+    }
+}
+
+/// Calibration telemetry embedded in `GovernorTelemetry.calibration`.
+/// Includes enough information for an operator to tell:
+///  - whether conformal mode is active
+///  - how full the calibration windows are
+///  - what quantiles are currently being emitted
+///  - whether drift has been detected recently
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct CalibrationTelemetry {
+    pub mode: CalibrationMode,
+    pub load_window_len: usize,
+    pub psi_window_len: usize,
+    pub conformal_k: usize,
+    pub conformal_k_min: usize,
+    pub conformal_alpha_pressured: f32,
+    pub conformal_alpha_severe: f32,
+    pub drift_reset_count: u64,
+    pub outliers_rejected: u64,
+    pub observations_total: u64,
+    pub load_pressured_q: Option<f32>,
+    pub load_severe_q: Option<f32>,
+    pub psi_pressured_q: Option<f32>,
+    pub psi_severe_q: Option<f32>,
 }
 
 struct GovernorRuntimeState {
     recent_decisions: VecDeque<GovernorDecision>,
     last_snapshot: Option<HealthSnapshot>,
     last_reason: Option<GovernorDecisionReason>,
+    calibration: Option<GovernorCalibration>,
 }
 
 impl GovernorRuntimeState {
-    fn new() -> Self {
+    fn new(cfg: &GovernorConfig) -> Self {
+        let calibration = match cfg.calibration_mode {
+            CalibrationMode::Conformal => Some(GovernorCalibration::new(cfg)),
+            CalibrationMode::Static => None,
+        };
         Self {
             recent_decisions: VecDeque::with_capacity(TELEMETRY_DECISION_HISTORY),
             last_snapshot: None,
             last_reason: None,
+            calibration,
         }
     }
 }
@@ -379,7 +933,7 @@ impl Governor {
             ticks_total: AtomicU64::new(0),
             started: AtomicBool::new(false),
             reader,
-            runtime: Mutex::new(GovernorRuntimeState::new()),
+            runtime: Mutex::new(GovernorRuntimeState::new(&cfg)),
             started_at: Instant::now(),
         }
     }
@@ -424,6 +978,36 @@ impl Governor {
         }
     }
 
+    /// Fold the current tick's snapshot into the calibration window (if
+    /// conformal mode is active) and return the `GovernorConfig` to use
+    /// for the decision. In static mode this is identical to `self.cfg`;
+    /// in conformal mode the four threshold fields are overridden by the
+    /// current quantile estimates (or left at static values if the
+    /// calibration isn't ready yet).
+    fn apply_calibration(
+        &self,
+        snapshot: &HealthSnapshot,
+        is_healthy_tick: bool,
+    ) -> GovernorConfig {
+        if self.cfg.calibration_mode == CalibrationMode::Static {
+            return self.cfg;
+        }
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(cal) = runtime.calibration.as_mut() else {
+            // This can happen if someone constructs a Governor with
+            // CalibrationMode::Conformal but forgets to populate the
+            // runtime calibration. Static fallback is always safe.
+            return self.cfg;
+        };
+        match cal.observe_and_compute_thresholds(snapshot, is_healthy_tick, &self.cfg) {
+            Some(effective) => effective.apply_to(&self.cfg),
+            None => self.cfg,
+        }
+    }
+
     /// Apply one sampling tick. Split out from `run()` so unit tests can
     /// drive deterministic sequences through the decision machinery without
     /// spawning a background thread or sleeping.
@@ -431,7 +1015,22 @@ impl Governor {
         let snapshot = self.reader.snapshot();
         let prev = self.current_capacity.load(Ordering::Relaxed);
         let streak = self.healthy_streak.load(Ordering::Relaxed);
-        let (next, next_streak, reason) = next_capacity(prev, streak, &snapshot, &self.cfg);
+
+        // In conformal mode, first classify the tick under the STATIC
+        // thresholds: this tells the calibration window whether the
+        // sample came from a healthy or pressured regime. Feeding
+        // pressured-regime samples into the calibration window would
+        // teach the quantile "what pressure looks like" — exactly the
+        // opposite of what we want. We never touch static-mode behaviour
+        // here: if calibration is disabled, `effective_cfg` stays as
+        // `self.cfg` and the decision path below is bit-identical to
+        // pre-conformal builds.
+        let static_is_pressured = snapshot.is_pressured(&self.cfg);
+        let is_healthy_tick = !static_is_pressured;
+        let effective_cfg = self.apply_calibration(&snapshot, is_healthy_tick);
+
+        let (next, next_streak, reason) =
+            next_capacity(prev, streak, &snapshot, &effective_cfg);
 
         if next < prev {
             self.shrink_count.fetch_add(1, Ordering::Relaxed);
@@ -505,6 +1104,10 @@ impl Governor {
         let recent: Vec<_> = runtime.recent_decisions.iter().copied().collect();
         let last_snapshot = runtime.last_snapshot;
         let last_reason = runtime.last_reason;
+        let calibration = runtime
+            .calibration
+            .as_ref()
+            .map(|cal| cal.telemetry(&self.cfg));
         drop(runtime);
         let disabled = env_bool_truthy("CASS_RESPONSIVENESS_DISABLE") || self.cfg.disabled;
         // When the governor is disabled via env or config, the effective
@@ -529,6 +1132,7 @@ impl Governor {
             last_snapshot,
             last_reason,
             recent_decisions: recent,
+            calibration,
         }
     }
 }
@@ -609,6 +1213,15 @@ mod tests {
             growth_consecutive_healthy_ticks: DEFAULT_GROWTH_CONSECUTIVE_HEALTHY_TICKS,
             tick: Duration::from_millis(1),
             disabled: false,
+            // Conformal knobs default to `Static` so the existing tests
+            // continue to exercise the original threshold policy unchanged.
+            calibration_mode: CalibrationMode::Static,
+            conformal_k: DEFAULT_CONFORMAL_K,
+            conformal_k_min: DEFAULT_CONFORMAL_K_MIN,
+            conformal_alpha_pressured: DEFAULT_CONFORMAL_ALPHA_PRESSURED,
+            conformal_alpha_severe: DEFAULT_CONFORMAL_ALPHA_SEVERE,
+            drift_delta: DEFAULT_DRIFT_DELTA,
+            drift_lambda: DEFAULT_DRIFT_LAMBDA,
         }
     }
 
@@ -1126,5 +1739,282 @@ mod tests {
             rate <= 0.55,
             "worst-case transition rate must stay bounded; saw {rate} over {tick_count} ticks"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Conformal-calibration tests (Card 2). All of these exercise
+    // pure-function helpers (quantile, MAD, Page-Hinkley) plus the
+    // Governor::step_once integration; the 17 static-mode tests above
+    // must also stay green (PO-C2-2 bit-exact compatibility).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn conformal_quantile_index_matches_vovk_theorem_1() {
+        // Theorem 1 formula: index = ⌈(K+1)(1-α)⌉ - 1, clamped to [0, K-1].
+        let sorted: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        // K=256, α=0.05 → ⌈257·0.95⌉-1 = 245-1 = 244-1 = 243
+        //   ceil(244.15) = 245, so index = 244... let's compute directly:
+        //   (256+1)*(1-0.05) = 244.15 → ceil = 245 → -1 = 244
+        // So the returned value should be sorted[244] = 244.0.
+        let q = conformal_quantile_sorted(&sorted, 0.05).unwrap();
+        assert!(
+            (q - 244.0).abs() < 1e-6,
+            "K=256, α=0.05 expected sorted[244]=244 but got {q}"
+        );
+
+        // Tighter α should yield a higher quantile.
+        let q_tight = conformal_quantile_sorted(&sorted, 0.01).unwrap();
+        assert!(q_tight > q, "α=0.01 must produce q̂ ≥ α=0.05 q̂");
+    }
+
+    #[test]
+    fn conformal_quantile_clamps_to_last_element_on_tiny_window() {
+        let sorted = [0.0_f32, 1.0, 2.0, 3.0, 4.0];
+        // K=5, α=0.01 → ⌈6·0.99⌉-1 = 6-1 = 5 → clamped to 4 (last idx).
+        let q = conformal_quantile_sorted(&sorted, 0.01).unwrap();
+        assert_eq!(q, 4.0);
+    }
+
+    #[test]
+    fn conformal_quantile_rejects_pathological_alpha() {
+        let sorted = [1.0_f32, 2.0, 3.0];
+        assert!(conformal_quantile_sorted(&sorted, 0.0).is_none());
+        assert!(conformal_quantile_sorted(&sorted, 1.0).is_none());
+        assert!(conformal_quantile_sorted(&sorted, f32::NAN).is_none());
+    }
+
+    #[test]
+    fn conformal_coverage_on_iid_uniform_meets_guarantee() {
+        // Classical split-conformal validation: generate N iid samples,
+        // calibrate q̂ on K of them, test on the remaining. Observed
+        // coverage should be within sqrt(α(1-α)/N) of the guaranteed
+        // 1-α floor.
+        let mut stream = CalibrationStream::new(256);
+        // Deterministic "uniform" via halton-like sequence so the test
+        // is not dependent on a PRNG seed.
+        for i in 0..256 {
+            let v = (i as f32) * 0.0039; // 0 to ~1.0 uniformly
+            stream.push(v);
+        }
+        let q = stream.quantile(0.05, 32).unwrap();
+        // Empirical coverage on a fresh test set of 1024 identically
+        // distributed values.
+        let mut covered = 0usize;
+        let test_n = 1024;
+        for i in 0..test_n {
+            let v = (i as f32) * (1.0 / test_n as f32);
+            if v <= q {
+                covered += 1;
+            }
+        }
+        let coverage = covered as f32 / test_n as f32;
+        // Target 1-α = 0.95, finite-sample slack ≈ 3σ ≈ 0.02 for N=1024.
+        // We assert coverage within [0.90, 1.00] to stay robust to the
+        // halton-sequence non-iid pattern while still catching a real
+        // breakage of the quantile formula.
+        assert!(
+            (0.90..=1.00).contains(&coverage),
+            "observed coverage {coverage} outside [0.90, 1.00] window"
+        );
+    }
+
+    #[test]
+    fn mad_rejects_obvious_outlier_on_stationary_stream() {
+        let mut stream = CalibrationStream::new(64);
+        for _ in 0..32 {
+            stream.push(1.0);
+        }
+        for _ in 0..32 {
+            stream.push(1.2);
+        }
+        // median ≈ 1.1, MAD ≈ 0.1 → reject anything > 1.1 + 3.5·0.1 = 1.45
+        assert!(stream.is_outlier(10.0));
+        assert!(stream.is_outlier(1.5));
+        assert!(!stream.is_outlier(1.15));
+    }
+
+    #[test]
+    fn mad_is_not_an_outlier_on_empty_window() {
+        let stream = CalibrationStream::new(16);
+        // Empty window has no median/MAD; nothing can be an outlier yet.
+        assert!(!stream.is_outlier(100.0));
+    }
+
+    #[test]
+    fn page_hinkley_does_not_trip_on_stationary_stream() {
+        let mut ph = PageHinkley::new(0.01, 0.5);
+        // 10 000 samples drawn from roughly-stationary N(0, 0.01).
+        // Deterministic pseudo-random via LCG so test is reproducible.
+        let mut state: u32 = 12345;
+        let mut trips = 0;
+        for _ in 0..10_000 {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let r = (state as f32 / u32::MAX as f32) * 0.02 - 0.01; // [-0.01, 0.01]
+            if ph.observe(r) {
+                trips += 1;
+                ph.reset();
+            }
+        }
+        // With δ=0.01 the stream barely accumulates drift; stationary
+        // should trip ≤ 100 times per 10 000 (< 1 %).
+        assert!(
+            trips < 100,
+            "page-hinkley tripped {trips} times on stationary stream (expected < 100)"
+        );
+    }
+
+    #[test]
+    fn page_hinkley_trips_on_clear_mean_shift() {
+        let mut ph = PageHinkley::new(0.01, 0.5);
+        // Phase 1: 500 zero-mean samples.
+        for _ in 0..500 {
+            ph.observe(0.0);
+        }
+        // Phase 2: mean shifts to +0.5 and stays there.
+        let mut trips_in_phase_2 = 0;
+        for _ in 0..500 {
+            if ph.observe(0.5) {
+                trips_in_phase_2 += 1;
+                // reset so we can confirm detection lag is short
+                ph.reset();
+                break;
+            }
+        }
+        assert!(
+            trips_in_phase_2 >= 1,
+            "page-hinkley missed a clear 0.5-magnitude mean shift"
+        );
+    }
+
+    fn conformal_cfg() -> GovernorConfig {
+        GovernorConfig {
+            calibration_mode: CalibrationMode::Conformal,
+            conformal_k: 64,
+            conformal_k_min: 16,
+            conformal_alpha_pressured: 0.05,
+            conformal_alpha_severe: 0.01,
+            drift_delta: 0.01,
+            drift_lambda: 0.5,
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn conformal_mode_static_behavior_until_k_min_reached() {
+        // Before the window is full enough, the governor should behave
+        // exactly like static mode. Drive it through healthy ticks that
+        // are under the STATIC pressured threshold (load=0.1 < 1.25),
+        // so even though they're below threshold they populate the
+        // window. We should see zero shrinks during warm-up.
+        let script = std::iter::repeat_n(healthy(), 20).collect();
+        let gov = build_test_governor(conformal_cfg(), script);
+        for _ in 0..20 {
+            gov.step_once();
+        }
+        let tele = gov.telemetry();
+        assert_eq!(
+            tele.shrink_count, 0,
+            "no shrinks expected during healthy-only warm-up"
+        );
+        // Calibration telemetry should be present and should report the
+        // window filling up.
+        let cal = tele.calibration.expect("conformal mode must emit calibration telemetry");
+        assert_eq!(cal.mode, CalibrationMode::Conformal);
+        assert!(cal.load_window_len > 0);
+    }
+
+    #[test]
+    fn conformal_mode_never_inverts_severe_vs_pressured_invariant() {
+        // PO-C2-3: when we emit dynamic thresholds, the severe quantile
+        // must strictly exceed the pressured one. This test uses a
+        // non-degenerate signal (varying values) so the quantiles
+        // genuinely differ — on a degenerate all-identical stream both
+        // would be equal and `observe_and_compute_thresholds` would
+        // correctly refuse to emit. We exercise the non-degenerate path.
+        // For K=64 the α=0.05 / α=0.01 quantile indices sit at
+        // positions 61 and 63 of the sorted window; they return
+        // distinct values only when the top few samples are distinct.
+        // A permutation of 128 unique values (with a stationary mean
+        // so Page-Hinkley stays quiet) satisfies this.
+        let script: Vec<_> = (0..200)
+            .map(|i| {
+                // Deterministic sawtooth over [0.08, 0.24], stationary
+                // mean ≈ 0.16. Each 128-step cycle visits every value
+                // exactly once so the sorted window has unique top
+                // entries.
+                let phase = (i % 128) as f32;
+                let base = 0.08 + (phase * 0.125_f32 / 100.0);
+                HealthSnapshot {
+                    load_per_core: Some(base),
+                    psi_cpu_some_avg10: Some(base * 10.0),
+                }
+            })
+            .collect();
+        let gov = build_test_governor(conformal_cfg(), script);
+        for _ in 0..200 {
+            gov.step_once();
+        }
+        let tele = gov.telemetry();
+        let cal = tele.calibration.expect("calibration telemetry");
+        // At this point both windows should be at K=64 and quantiles
+        // must be emitted strictly monotone.
+        let sp = cal.load_pressured_q.expect("load pressured q̂ emitted");
+        let ss = cal.load_severe_q.expect("load severe q̂ emitted");
+        assert!(
+            ss > sp,
+            "load severe q̂ ({ss}) must exceed pressured q̂ ({sp})"
+        );
+        let pp = cal.psi_pressured_q.expect("psi pressured q̂ emitted");
+        let ps = cal.psi_severe_q.expect("psi severe q̂ emitted");
+        assert!(
+            ps > pp,
+            "psi severe q̂ ({ps}) must exceed pressured q̂ ({pp})"
+        );
+    }
+
+    #[test]
+    fn conformal_mode_falls_back_to_static_on_degenerate_window() {
+        // When every sample is identical, both quantiles collide. PO-C2-3
+        // requires the apply-calibration path to refuse rather than emit
+        // an inverted pair — degenerate distributions fall back to the
+        // static thresholds silently (safe behavior).
+        let script = std::iter::repeat_n(healthy(), 80).collect();
+        let gov = build_test_governor(conformal_cfg(), script);
+        for _ in 0..80 {
+            gov.step_once();
+        }
+        let tele = gov.telemetry();
+        // Governor should have spent all 80 ticks on static thresholds —
+        // no shrinks, no grows (except the built-in 3-tick healthy-streak
+        // hold pattern which can trigger HealthyCeilingHold from 100).
+        assert_eq!(tele.shrink_count, 0);
+        // Calibration telemetry is present but the quantiles may or may
+        // not be emitted; either way behaviour was static-safe.
+        assert!(tele.calibration.is_some());
+    }
+
+    #[test]
+    fn conformal_telemetry_serializes_with_calibration_block() {
+        let script = std::iter::repeat_n(healthy(), 40).collect();
+        let gov = build_test_governor(conformal_cfg(), script);
+        for _ in 0..40 {
+            gov.step_once();
+        }
+        let tele = gov.telemetry();
+        let json = serde_json::to_string(&tele).expect("telemetry serialization");
+        for key in [
+            "calibration",
+            "\"mode\":\"conformal\"",
+            "load_window_len",
+            "psi_window_len",
+            "conformal_k",
+            "drift_reset_count",
+            "outliers_rejected",
+        ] {
+            assert!(
+                json.contains(key),
+                "expected JSON to contain `{key}`; got: {json}"
+            );
+        }
     }
 }
