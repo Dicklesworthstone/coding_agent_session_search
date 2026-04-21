@@ -455,22 +455,31 @@ impl Governor {
                     | GovernorDecisionReason::PressuredFloorHold
             );
 
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.last_snapshot = Some(snapshot);
-            runtime.last_reason = Some(reason);
-            if record_this_tick {
-                if runtime.recent_decisions.len() >= TELEMETRY_DECISION_HISTORY {
-                    runtime.recent_decisions.pop_front();
-                }
-                runtime.recent_decisions.push_back(GovernorDecision {
-                    at_elapsed_ms: self.started_at.elapsed().as_millis() as u64,
-                    prev_capacity_pct: prev,
-                    next_capacity_pct: next,
-                    reason,
-                    snapshot,
-                });
+        // `unwrap_or_else(PoisonError::into_inner)` unconditionally yields the
+        // guard: a poisoned `Mutex` still holds a valid `GovernorRuntimeState`
+        // (its invariants are tick-local), so silently dropping telemetry
+        // forever after a single panic-while-locked is strictly worse than
+        // keeping it flowing. The `if let Ok` pattern we used before had
+        // exactly that failure mode.
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.last_snapshot = Some(snapshot);
+        runtime.last_reason = Some(reason);
+        if record_this_tick {
+            if runtime.recent_decisions.len() >= TELEMETRY_DECISION_HISTORY {
+                runtime.recent_decisions.pop_front();
             }
+            runtime.recent_decisions.push_back(GovernorDecision {
+                at_elapsed_ms: self.started_at.elapsed().as_millis() as u64,
+                prev_capacity_pct: prev,
+                next_capacity_pct: next,
+                reason,
+                snapshot,
+            });
         }
+        drop(runtime);
 
         if next != prev {
             tracing::info!(
@@ -485,17 +494,18 @@ impl Governor {
     }
 
     fn telemetry(&self) -> GovernorTelemetry {
-        let (recent, last_snapshot, last_reason) = match self.runtime.lock() {
-            Ok(runtime) => (
-                runtime.recent_decisions.iter().copied().collect::<Vec<_>>(),
-                runtime.last_snapshot,
-                runtime.last_reason,
-            ),
-            // Poison is unexpected but non-fatal for telemetry: surface an
-            // empty history rather than panicking. The poisoned runtime state
-            // will still be updated by the next sampler tick.
-            Err(_) => (Vec::new(), None, None),
-        };
+        // Same poison-safe acquisition pattern as `step_once`: the runtime
+        // state is tick-local, so reading the most-recent-committed history
+        // after a panic-while-locked is strictly more useful than returning
+        // an empty slice for the rest of the process lifetime.
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recent: Vec<_> = runtime.recent_decisions.iter().copied().collect();
+        let last_snapshot = runtime.last_snapshot;
+        let last_reason = runtime.last_reason;
+        drop(runtime);
         let disabled = env_bool_truthy("CASS_RESPONSIVENESS_DISABLE") || self.cfg.disabled;
         // When the governor is disabled via env or config, the effective
         // capacity that every caller of `effective_worker_count` /
@@ -880,6 +890,58 @@ mod tests {
             "healthy-hold ticks should not pollute the ring buffer"
         );
         assert_eq!(tele.current_capacity_pct, 100);
+    }
+
+    #[test]
+    fn telemetry_survives_mutex_poison() {
+        // Regression: an earlier version used `if let Ok(guard) = lock()` /
+        // `match Ok/Err` to access the runtime state, which silently dropped
+        // every telemetry update for the rest of the process if any thread
+        // panicked while holding the mutex. Switching to
+        // `unwrap_or_else(PoisonError::into_inner)` means a single panic
+        // cannot mute the governor forever.
+        let gov = Arc::new(build_test_governor(
+            cfg(),
+            std::iter::repeat_n(pressured(), 4).collect(),
+        ));
+        // Poison the runtime mutex deliberately by panicking inside a
+        // closure that holds the lock.
+        {
+            let poison_gov = Arc::clone(&gov);
+            let handle = std::thread::spawn(move || {
+                let _held = poison_gov
+                    .runtime
+                    .lock()
+                    .expect("fresh mutex should not be poisoned");
+                panic!("intentional poison for regression test");
+            });
+            let _ = handle.join();
+        }
+        assert!(
+            gov.runtime.is_poisoned(),
+            "mutex must be poisoned after the helper thread's panic"
+        );
+
+        // Now drive the sampler. If the old `if let Ok(...)` guard were
+        // still in place, none of these ticks would be recorded.
+        for _ in 0..4 {
+            gov.step_once();
+        }
+
+        let tele = gov.telemetry();
+        assert_eq!(
+            tele.ticks_total, 4,
+            "atomics update regardless of mutex state"
+        );
+        assert!(
+            !tele.recent_decisions.is_empty(),
+            "telemetry must continue to record after mutex poison, got: {tele:?}"
+        );
+        assert_eq!(
+            tele.recent_decisions.first().unwrap().reason,
+            GovernorDecisionReason::Pressured,
+            "first recorded decision after poison should still classify correctly"
+        );
     }
 
     #[test]
