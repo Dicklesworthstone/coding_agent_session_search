@@ -13675,7 +13675,7 @@ pub mod persist {
                 let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for (conv, internal_conv) in convs.iter().zip(internal_convs.into_iter()) {
+                for (conv, internal_conv) in convs.iter().zip(internal_convs) {
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
