@@ -84,8 +84,20 @@ pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelis
     available_parallelism.max(1).clamp(1, max_threads)
 }
 
+/// Governor-aware variant of `tantivy_writer_parallelism_hint_for_available`.
+/// Returns the same value on an idle host but scales down when the machine
+/// responsiveness governor has shrunk the global capacity. Call this from
+/// production code paths; the ungoverned `_for_available` variant is kept so
+/// formula-only unit tests stay deterministic.
+pub(crate) fn tantivy_writer_parallelism_hint_for_available_governed(
+    available_parallelism: usize,
+) -> usize {
+    let raw = tantivy_writer_parallelism_hint_for_available(available_parallelism);
+    crate::indexer::responsiveness::effective_worker_count(raw).max(1)
+}
+
 pub(crate) fn tantivy_writer_parallelism_hint() -> usize {
-    tantivy_writer_parallelism_hint_for_available(
+    tantivy_writer_parallelism_hint_for_available_governed(
         std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1),

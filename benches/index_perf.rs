@@ -40,6 +40,7 @@
 //! - Throughput: No more than 10% regression
 //! - Memory timeline: Streaming should show flat profile vs batch's spike
 
+use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use coding_agent_search::indexer::{IndexOptions, run_index};
 use coding_agent_search::search::tantivy::index_dir;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -223,10 +224,137 @@ fn bench_channel_overhead(c: &mut Criterion) {
     unsafe { std::env::remove_var("CASS_STREAMING_INDEX") };
 }
 
+/// Build a representative semantic-embedding input corpus. Mixes short,
+/// long, markdown, and code-block inputs so the canonicalizer is exercised
+/// across all of its branches.
+fn build_semantic_corpus(count: usize) -> Vec<EmbeddingInput> {
+    (0..count)
+        .map(|i| {
+            let content = match i % 7 {
+                0 => format!("Plain message number {i} with some ordinary words to embed."),
+                1 => format!("**Bold** and _italic_ markdown line {i}"),
+                2 => format!(
+                    "```rust\nfn example_{i}() {{\n    println!(\"code block {i}\");\n}}\n```\nfollow-up text"
+                ),
+                3 => format!("short line {i}"),
+                4 => format!("   whitespace   galore   {i}   "),
+                5 => format!(
+                    "Unicode \u{00E9}\u{0301} (combining accent) and emoji \u{1F600} line {i}"
+                ),
+                _ => format!(
+                    "Mixed line {i}: `inline_code`, [link](http://x), {{braces}}, \u{201C}curly quotes\u{201D}, \
+                     and a moderately long tail so the canonicalizer has something to truncate when it hits \
+                     its default cap of 2000 characters, well not really at this length but on longer inputs."
+                ),
+            };
+            EmbeddingInput::new(i as u64, content)
+        })
+        .collect()
+}
+
+/// Benchmark the semantic embedding prep + embed loop.
+///
+/// Sweeps `CASS_SEMANTIC_BATCH_SIZE` across 32/128/256 and
+/// `CASS_SEMANTIC_PREP_PARALLEL` on/off so we can measure the impact of the
+/// parallel canonicalize+hash prep (perf refactor introduced with the
+/// responsiveness governor work) against the legacy serial prep. Uses the
+/// hash embedder so the benchmark stays fast, deterministic, and dependency-
+/// free (no ONNX model download).
+fn bench_semantic_embedding(c: &mut Criterion) {
+    let mut group = c.benchmark_group("semantic_embedding");
+    group.sample_size(20);
+    let messages = build_semantic_corpus(2_000);
+
+    for &batch_size in &[32usize, 128, 256] {
+        for &serial_label in &["parallel", "serial"] {
+            let id = format!("batch{batch_size}_{serial_label}");
+            // SAFETY: Criterion runs benchmarks single-threaded per fn so
+            // env mutation is safe within this closure. We reset at the end.
+            unsafe {
+                std::env::set_var("CASS_SEMANTIC_BATCH_SIZE", batch_size.to_string());
+                std::env::set_var(
+                    "CASS_SEMANTIC_PREP_PARALLEL",
+                    if serial_label == "serial" { "0" } else { "1" },
+                );
+            }
+            // Build a fresh indexer per configuration so it picks up the env.
+            let indexer = SemanticIndexer::new("hash", None).unwrap();
+            group.bench_with_input(BenchmarkId::new("embed_messages", id), &(), |b, _| {
+                b.iter(|| {
+                    let out = indexer.embed_messages(&messages).unwrap();
+                    std::hint::black_box(out);
+                });
+            });
+        }
+    }
+
+    // Reset env so downstream benches are not polluted.
+    // SAFETY: single-threaded cleanup outside any iter loop.
+    unsafe {
+        std::env::remove_var("CASS_SEMANTIC_BATCH_SIZE");
+        std::env::remove_var("CASS_SEMANTIC_PREP_PARALLEL");
+    }
+    group.finish();
+}
+
+/// Benchmark the full ingest pipeline with and without the parallel
+/// pre-compute of `map_to_internal`. The `CASS_STREAMING_INDEX` toggle
+/// doesn't affect the hoist; both modes exercise it. We compare a
+/// governor-enabled run (default) against a governor-disabled run to expose
+/// whether the governor is silently costing throughput on an otherwise
+/// idle box.
+fn bench_ingest_with_responsiveness(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ingest_responsiveness");
+    group.sample_size(15);
+    let corpus_size = 200;
+
+    for &(label, disable_value) in &[("governor_on", "0"), ("governor_off", "1")] {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, db_path) = create_corpus(&tmp, corpus_size);
+        let _ = index_dir(&data_dir);
+
+        let opts = IndexOptions {
+            full: true,
+            force_rebuild: true,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        // SAFETY: Criterion benches run single-threaded.
+        unsafe {
+            std::env::set_var("CASS_RESPONSIVENESS_DISABLE", disable_value);
+        }
+
+        group.bench_with_input(BenchmarkId::new(label, corpus_size), &(), |b, _| {
+            b.iter(|| {
+                let opts = opts.clone();
+                let _ = fs::remove_file(&opts.db_path);
+                let _ = fs::remove_dir_all(opts.data_dir.join("index"));
+                run_index(opts, None)
+            });
+        });
+    }
+
+    // SAFETY: single-threaded cleanup outside any iter loop.
+    unsafe {
+        std::env::remove_var("CASS_RESPONSIVENESS_DISABLE");
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_index_full,
     bench_streaming_vs_batch,
-    bench_channel_overhead
+    bench_channel_overhead,
+    bench_semantic_embedding,
+    bench_ingest_with_responsiveness
 );
 criterion_main!(benches);
