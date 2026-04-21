@@ -9,12 +9,40 @@ use frankensearch::index::{
     VectorIndexWriter as FsVectorIndexWriter,
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rayon::prelude::*;
 
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::vector_index::{ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, vector_index_path};
+
+/// Default embedder batch size. 128 is a sweet spot for ONNX MiniLM models on
+/// modern CPUs: big enough to amortize dispatch overhead and keep the tensor
+/// kernels saturated, small enough that one batch fits comfortably in L2 and
+/// memory reservation stays bounded for large corpora.
+const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
+
+fn resolved_default_batch_size() -> usize {
+    dotenvy::var("CASS_SEMANTIC_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SEMANTIC_BATCH_SIZE)
+}
+
+/// Disable the parallel canonicalize+hash prep step (for before/after profiling
+/// or as an escape hatch). When set to a truthy value the indexer falls back to
+/// the original serial prep loop.
+fn parallel_prep_disabled() -> bool {
+    dotenvy::var("CASS_SEMANTIC_PREP_PARALLEL")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingInput {
@@ -62,6 +90,86 @@ fn hnsw_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
         .join(format!("hnsw-{embedder_id}.chsw"))
 }
 
+struct Prepared<'a> {
+    msg: &'a EmbeddingInput,
+    canonical: String,
+    hash: [u8; 32],
+}
+
+/// Canonicalize + hash a window of messages. When parallel prep is enabled
+/// (the default), each message's canonicalize + SHA256 runs on the rayon
+/// thread pool. Results preserve input order via `par_iter().collect()`.
+/// Messages whose canonical form is empty are filtered out so the embedder
+/// batch is never polluted with useless inputs.
+fn prepare_window<'a>(window: &'a [EmbeddingInput], serial: bool) -> Vec<Prepared<'a>> {
+    let prep = |msg: &'a EmbeddingInput| -> Option<Prepared<'a>> {
+        let canonical = canonicalize_for_embedding(&msg.content);
+        if canonical.is_empty() {
+            return None;
+        }
+        let hash = content_hash(&canonical);
+        Some(Prepared {
+            msg,
+            canonical,
+            hash,
+        })
+    };
+
+    if serial {
+        window.iter().filter_map(prep).collect()
+    } else {
+        window.par_iter().filter_map(prep).collect()
+    }
+}
+
+fn flush_prepared_batch(
+    batch: &[Prepared<'_>],
+    embeddings: &mut Vec<EmbeddedMessage>,
+    pb: &ProgressBar,
+    embedder: &dyn Embedder,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let texts: Vec<&str> = batch.iter().map(|p| p.canonical.as_str()).collect();
+    let vectors = embedder
+        .embed_batch_sync(&texts)
+        .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+
+    if vectors.len() != batch.len() {
+        bail!(
+            "embedder returned {} embeddings for {} inputs",
+            vectors.len(),
+            batch.len()
+        );
+    }
+
+    for (prepared, vector) in batch.iter().zip(vectors) {
+        if vector.len() != embedder.dimension() {
+            bail!(
+                "embedding dimension mismatch: expected {}, got {}",
+                embedder.dimension(),
+                vector.len()
+            );
+        }
+        embeddings.push(EmbeddedMessage {
+            message_id: prepared.msg.message_id,
+            created_at_ms: prepared.msg.created_at_ms,
+            agent_id: prepared.msg.agent_id,
+            workspace_id: prepared.msg.workspace_id,
+            source_id: prepared.msg.source_id,
+            role: prepared.msg.role,
+            chunk_idx: prepared.msg.chunk_idx,
+            content_hash: prepared.hash,
+            embedding: vector,
+        });
+    }
+
+    pb.inc(batch.len() as u64);
+    Ok(())
+}
+
 pub struct SemanticIndexer {
     embedder: Box<dyn Embedder>,
     batch_size: usize,
@@ -85,7 +193,7 @@ impl SemanticIndexer {
 
         Ok(Self {
             embedder,
-            batch_size: 32,
+            batch_size: resolved_default_batch_size(),
         })
     }
 
@@ -125,84 +233,24 @@ impl SemanticIndexer {
             pb.set_draw_target(ProgressDrawTarget::hidden());
         }
 
-        struct Prepared<'a> {
-            msg: &'a EmbeddingInput,
-            canonical: String,
-            hash: [u8; 32],
-        }
-
         let mut embeddings = Vec::with_capacity(messages.len());
-        let mut batch: Vec<Prepared> = Vec::with_capacity(self.batch_size);
 
-        let flush_batch = |batch: &mut Vec<Prepared>,
-                           embeddings: &mut Vec<EmbeddedMessage>,
-                           pb: &ProgressBar,
-                           embedder: &dyn Embedder|
-         -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
+        // Process the corpus in windows of ~4 batches. Within each window,
+        // rayon parallelizes the canonicalize + hash prep across cores; the
+        // ONNX embedder is then fed serially in `batch_size` chunks so its
+        // internal thread pool stays saturated without being starved by the
+        // single-threaded prep loop we had before.
+        let window = self.batch_size.saturating_mul(4).max(self.batch_size);
+        for window_slice in messages.chunks(window) {
+            let prepared_window = prepare_window(window_slice, parallel_prep_disabled());
+            let skipped_in_window = window_slice.len() - prepared_window.len();
+            if skipped_in_window > 0 {
+                pb.inc(skipped_in_window as u64);
             }
 
-            let texts: Vec<&str> = batch.iter().map(|p| p.canonical.as_str()).collect();
-            let vectors = embedder
-                .embed_batch_sync(&texts)
-                .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
-
-            if vectors.len() != batch.len() {
-                bail!(
-                    "embedder returned {} embeddings for {} inputs",
-                    vectors.len(),
-                    batch.len()
-                );
+            for batch in prepared_window.chunks(self.batch_size) {
+                flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
             }
-
-            for (prepared, vector) in batch.iter().zip(vectors) {
-                if vector.len() != embedder.dimension() {
-                    bail!(
-                        "embedding dimension mismatch: expected {}, got {}",
-                        embedder.dimension(),
-                        vector.len()
-                    );
-                }
-                embeddings.push(EmbeddedMessage {
-                    message_id: prepared.msg.message_id,
-                    created_at_ms: prepared.msg.created_at_ms,
-                    agent_id: prepared.msg.agent_id,
-                    workspace_id: prepared.msg.workspace_id,
-                    source_id: prepared.msg.source_id,
-                    role: prepared.msg.role,
-                    chunk_idx: prepared.msg.chunk_idx,
-                    content_hash: prepared.hash,
-                    embedding: vector,
-                });
-            }
-
-            pb.inc(batch.len() as u64);
-            batch.clear();
-            Ok(())
-        };
-
-        for msg in messages {
-            let canonical = canonicalize_for_embedding(&msg.content);
-            if canonical.is_empty() {
-                pb.inc(1);
-                continue;
-            }
-
-            let hash = content_hash(&canonical);
-            batch.push(Prepared {
-                msg,
-                canonical,
-                hash,
-            });
-
-            if batch.len() >= self.batch_size {
-                flush_batch(&mut batch, &mut embeddings, &pb, self.embedder.as_ref())?;
-            }
-        }
-
-        if !batch.is_empty() {
-            flush_batch(&mut batch, &mut embeddings, &pb, self.embedder.as_ref())?;
         }
 
         pb.finish_with_message("Embedding complete");
@@ -430,5 +478,92 @@ mod tests {
         assert_eq!(index.embedder_id(), indexer.embedder_id());
         assert_eq!(index.dimension(), indexer.embedder_dimension());
         assert_eq!(index.record_count(), 2);
+    }
+
+    #[test]
+    fn parallel_prep_matches_serial_prep_bitwise() {
+        // Mix of short, long, empty, markdown, code-block, and unicode inputs
+        // to make sure the canonicalizer is exercised across all of its paths.
+        let inputs: Vec<EmbeddingInput> = (0..500)
+            .map(|i| {
+                let text = match i % 7 {
+                    0 => format!("Plain message number {i} with some ordinary words."),
+                    1 => format!("**Bold** and _italic_ markdown line {i}"),
+                    2 => format!(
+                        "```rust\nfn example_{i}() {{\n    println!(\"code block {i}\");\n}}\n```\nfollow-up text"
+                    ),
+                    3 => String::new(), // empty — should be filtered
+                    4 => format!("   whitespace   galore   {i}   "),
+                    5 => format!("Unicode \u{00E9}\u{0301} (combining accent) and emoji \u{1F600} line {i}"),
+                    _ => format!(
+                        "Mixed line {i}: `inline_code`, [link](http://x), {{braces}}, and \u{201C}curly quotes\u{201D}."
+                    ),
+                };
+                EmbeddingInput::new(i as u64, text)
+            })
+            .collect();
+
+        let serial = prepare_window(&inputs, true);
+        let parallel = prepare_window(&inputs, false);
+
+        assert_eq!(
+            serial.len(),
+            parallel.len(),
+            "serial and parallel prep should skip the same number of empty canonicals"
+        );
+
+        for (s, p) in serial.iter().zip(parallel.iter()) {
+            assert_eq!(
+                s.msg.message_id, p.msg.message_id,
+                "ordering must be preserved between serial and parallel prep"
+            );
+            assert_eq!(
+                s.canonical, p.canonical,
+                "canonical form diverged between serial and parallel prep"
+            );
+            assert_eq!(
+                s.hash, p.hash,
+                "content hash diverged between serial and parallel prep"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_prep_filters_empty_canonicals() {
+        let inputs = vec![
+            EmbeddingInput::new(1, "valid content"),
+            EmbeddingInput::new(2, ""),
+            EmbeddingInput::new(3, "   \n\n   \t  "),
+            EmbeddingInput::new(4, "more valid content"),
+        ];
+
+        let prepared = prepare_window(&inputs, false);
+        let ids: Vec<u64> = prepared.iter().map(|p| p.msg.message_id).collect();
+
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&4));
+        // ids 2 and 3 should be dropped because their canonicals are empty.
+        assert!(!ids.contains(&2));
+        assert!(!ids.contains(&3));
+    }
+
+    #[test]
+    fn default_batch_size_uses_new_value() {
+        // The test setup must not leak a caller-provided CASS_SEMANTIC_BATCH_SIZE
+        // override, which would mask the constant bump we're asserting on.
+        let prior = std::env::var("CASS_SEMANTIC_BATCH_SIZE").ok();
+        // SAFETY: test-local env mutation.
+        unsafe {
+            std::env::remove_var("CASS_SEMANTIC_BATCH_SIZE");
+        }
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        assert_eq!(indexer.batch_size(), DEFAULT_SEMANTIC_BATCH_SIZE);
+        // Restore whatever was there before.
+        if let Some(v) = prior {
+            // SAFETY: test-local env mutation.
+            unsafe {
+                std::env::set_var("CASS_SEMANTIC_BATCH_SIZE", v);
+            }
+        }
     }
 }

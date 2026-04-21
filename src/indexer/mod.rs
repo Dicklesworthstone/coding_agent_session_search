@@ -1,5 +1,6 @@
 pub mod redact_secrets;
 pub mod refresh_ledger;
+pub(crate) mod responsiveness;
 pub mod semantic;
 
 use std::any::Any;
@@ -4194,7 +4195,7 @@ fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
 }
 
 fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
+    let desired = dotenvy::var("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -4208,7 +4209,12 @@ fn lexical_rebuild_page_prep_worker_parallelism() -> usize {
                 lexical_rebuild_worker_parallelism(),
             )
         })
-        .max(1)
+        .max(1);
+    // Let the machine-responsiveness governor scale this down when the host
+    // is under pressure. `effective_worker_count` returns the caller-requested
+    // value when the governor is idle or disabled, so behaviour on an idle
+    // box is unchanged.
+    responsiveness::effective_worker_count(desired).max(1)
 }
 
 fn lexical_rebuild_first_budget_promotion_wait() -> Duration {
@@ -9614,8 +9620,8 @@ fn finalize_staged_lexical_rebuild_publish_artifact(
             publish_path = %publish_path.display(),
             "reusing already-final staged lexical rebuild artifact without redundant final merge"
         );
-        let summary = crate::search::tantivy::searchable_index_summary(&publish_path)?
-            .ok_or_else(|| {
+        let summary =
+            crate::search::tantivy::searchable_index_summary(&publish_path)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "single-input staged lexical rebuild artifact is not searchable: {}",
                     publish_path.display()
@@ -13647,6 +13653,16 @@ pub mod persist {
             );
         }
 
+        // Hoist map_to_internal out of the writer transaction. It is a pure,
+        // allocator-heavy transformation (string clones, optional secret
+        // redaction, message + snippet remap) that does not depend on any
+        // writer-assigned id, so there is no reason to hold the SQLite writer
+        // lock while we burn CPU on it. Running it in parallel via rayon
+        // shortens the serial writer-hold window and exploits headroom on
+        // many-core hosts. This is the hot path for ingest batches.
+        use rayon::prelude::*;
+        let internal_convs: Vec<Conversation> = convs.par_iter().map(map_to_internal).collect();
+
         let outcomes = with_ephemeral_writer(
             storage,
             defer_checkpoints,
@@ -13659,7 +13675,7 @@ pub mod persist {
                 let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for conv in convs {
+                for (conv, internal_conv) in convs.iter().zip(internal_convs.into_iter()) {
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
@@ -13689,7 +13705,6 @@ pub mod persist {
                         &conv.metadata,
                         "serial batched indexing",
                     )?;
-                    let internal_conv = map_to_internal(conv);
                     prepared.push((agent_id, workspace_id, internal_conv));
                 }
 
@@ -14540,6 +14555,113 @@ pub mod persist {
                 })
                 .unwrap();
             assert_eq!(stored_indices, vec![0, 1, 2]);
+
+            t_index.commit().unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn persist_conversations_batched_parallel_pre_map_preserves_content_and_order() {
+            // Regression test for the perf refactor that hoists map_to_internal
+            // out of the writer transaction and runs it on rayon. This test
+            // asserts that the parallel pre-compute does NOT change the
+            // persisted content, message ordering, or redaction behaviour.
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            // Force redaction on so we exercise the heavier allocation path
+            // that is the real target of the parallel hoist.
+            let _redact_guard = set_env("CASS_REDACT_SECRETS", "1");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("parallel-pre-map.db");
+            let index_path = dir.path().join("tantivy");
+
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // Enough conversations that the parallel hoist will actually fan
+            // out across rayon workers on a multi-core host; small enough that
+            // the serial writer loop still completes quickly.
+            let convs: Vec<NormalizedConversation> = (0..32)
+                .map(|i| NormalizedConversation {
+                    agent_slug: format!("agent-{}", i % 4),
+                    external_id: Some(format!("session-{i}")),
+                    title: Some(format!("Title {i} with sk_live_FAKE_SECRET_{i:04}")),
+                    workspace: Some(std::path::PathBuf::from(format!("/ws/proj-{}", i % 3))),
+                    source_path: std::path::PathBuf::from(format!("/log/s{i}.jsonl")),
+                    started_at: Some(1_000 + i as i64),
+                    ended_at: Some(1_010 + i as i64),
+                    metadata: serde_json::json!({}),
+                    messages: vec![
+                        NormalizedMessage {
+                            idx: 0,
+                            role: "user".into(),
+                            author: Some("tester".into()),
+                            created_at: Some(1_000 + i as i64),
+                            content: format!("hello from conv {i}"),
+                            extra: serde_json::json!({}),
+                            snippets: vec![],
+                            invocations: Vec::new(),
+                        },
+                        NormalizedMessage {
+                            idx: 1,
+                            role: "assistant".into(),
+                            author: Some("tester".into()),
+                            created_at: Some(1_001 + i as i64),
+                            content: format!("reply {i}"),
+                            extra: serde_json::json!({}),
+                            snippets: vec![],
+                            invocations: Vec::new(),
+                        },
+                    ],
+                })
+                .collect();
+
+            persist_conversations_batched(
+                &storage,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("parallel pre-map serial batched path should persist all conversations");
+
+            let reader = FrankenStorage::open(&db_path).unwrap();
+            let conversation_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(conversation_count, convs.len() as i64);
+
+            let message_count: i64 = reader
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            assert_eq!(message_count, (convs.len() * 2) as i64);
+
+            // Titles must be persisted in their redacted form. If the hoist
+            // accidentally dropped the redaction branch, raw "sk_live_..."
+            // substrings would survive here.
+            let titles: Vec<String> = reader
+                .raw()
+                .query_map_collect(
+                    "SELECT title FROM conversations WHERE title IS NOT NULL ORDER BY id",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(titles.len(), convs.len());
+            for title in &titles {
+                assert!(
+                    !title.contains("sk_live_"),
+                    "title should have been redacted but contained a live secret marker: {title}"
+                );
+            }
 
             t_index.commit().unwrap();
         }
@@ -16358,8 +16480,7 @@ mod tests {
         .unwrap();
         assert_eq!(final_artifact.docs, 6);
         assert_eq!(
-            final_artifact.segments,
-            3,
+            final_artifact.segments, 3,
             "multi-input finalization should preserve the final shard frontier without remerging docs"
         );
         assert_eq!(
