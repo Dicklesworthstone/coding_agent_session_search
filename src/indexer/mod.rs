@@ -9650,6 +9650,10 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
 struct LexicalRebuildFinalMergeArtifact {
     publish_path: PathBuf,
     docs: usize,
+    // Kept for test assertions + future diagnostics; production code only
+    // consumes the path + doc count, but regression tests still read this to
+    // prove the segment frontier is not silently remerged.
+    #[allow(dead_code)]
     segments: usize,
 }
 

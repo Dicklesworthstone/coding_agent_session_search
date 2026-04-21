@@ -174,8 +174,14 @@ fn measure_foreground_latency(
 fn search_p95_stays_within_budget_while_indexing_in_background() {
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-    seed_baseline_corpus(&mut index, dir.path(), 100);
+    {
+        // Tantivy serializes the writer via a filesystem lockfile: only one
+        // `IndexWriter` may exist per directory at a time. We seed inside a
+        // scope so the writer is dropped (and the lock released) before the
+        // background indexer opens its own writer further down.
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        seed_baseline_corpus(&mut index, dir.path(), 100);
+    }
 
     // ---- Control: idle (no background indexer) ----
     let idle_report = measure_foreground_latency(&index_path, 50, Duration::from_millis(5));
@@ -259,8 +265,12 @@ fn governor_disabled_run_matches_idle_baseline() {
 
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-    seed_baseline_corpus(&mut index, dir.path(), 100);
+    {
+        // Same lockfile rationale as in the primary test: drop the writer
+        // before the background indexer opens its own.
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        seed_baseline_corpus(&mut index, dir.path(), 100);
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(2));

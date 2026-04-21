@@ -2852,10 +2852,10 @@ impl SearchClient {
             let _ = self.maybe_reload_reader(reader);
             let searcher = self.searcher_for_thread(reader);
             self.track_generation(searcher.generation().generation_id());
-        } else if let Some(readers) = self.federated_readers() {
-            if let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())? {
-                self.track_generation(signature);
-            }
+        } else if let Some(readers) = self.federated_readers()
+            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?
+        {
+            self.track_generation(signature);
         }
 
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
