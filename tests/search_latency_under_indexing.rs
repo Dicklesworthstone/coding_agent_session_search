@@ -251,17 +251,46 @@ fn search_p95_stays_within_budget_while_indexing_in_background() {
     }
 }
 
+/// Test-only RAII guard that sets an env var and restores (or removes) it on
+/// drop, even when the body panics. Prevents a failing test from leaking
+/// `CASS_RESPONSIVENESS_DISABLE=1` into other tests in the same binary.
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        // SAFETY: tests in this file are #[ignore] and run in their own
+        // process in practice, but we also restore on Drop below so even
+        // concurrent tests in the same binary stay isolated.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: single-threaded Drop restores what `set` captured.
+        unsafe {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "timing-sensitive; run with --ignored explicitly"]
 fn governor_disabled_run_matches_idle_baseline() {
     // Sanity check: with the governor pinned off, the pressured p95 should
     // still stay within the generous 750ms budget. If it blows past that,
     // something other than the governor is slowing foreground search.
-    // SAFETY: this test is #[ignore] and runs single-threaded via cargo
-    // test default + the --ignored filter.
-    unsafe {
-        std::env::set_var("CASS_RESPONSIVENESS_DISABLE", "1");
-    }
+    let _guard = EnvGuard::set("CASS_RESPONSIVENESS_DISABLE", "1");
 
     let dir = TempDir::new().unwrap();
     let index_path = dir.path().to_path_buf();
@@ -296,9 +325,5 @@ fn governor_disabled_run_matches_idle_baseline() {
         "governor-disabled p95 exceeded budget: {:?}",
         report.p95
     );
-
-    // SAFETY: single-threaded cleanup after workload.
-    unsafe {
-        std::env::remove_var("CASS_RESPONSIVENESS_DISABLE");
-    }
+    // `_guard` restores/removes CASS_RESPONSIVENESS_DISABLE on drop.
 }

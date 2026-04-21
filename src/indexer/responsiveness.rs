@@ -496,13 +496,26 @@ impl Governor {
             // will still be updated by the next sampler tick.
             Err(_) => (Vec::new(), None, None),
         };
+        let disabled = env_bool_truthy("CASS_RESPONSIVENESS_DISABLE") || self.cfg.disabled;
+        // When the governor is disabled via env or config, the effective
+        // capacity that every caller of `effective_worker_count` /
+        // `current_capacity_pct` observes is pinned at 100. Reporting the
+        // raw atomic (which may still hold a stale shrunken value from a
+        // pre-disable sampler tick) would leave robot consumers with two
+        // different "current" values for the same process. Align the
+        // telemetry with what the rest of the module reports.
+        let current = if disabled {
+            100
+        } else {
+            self.current_capacity.load(Ordering::Relaxed)
+        };
         GovernorTelemetry {
-            current_capacity_pct: self.current_capacity.load(Ordering::Relaxed),
+            current_capacity_pct: current,
             healthy_streak: self.healthy_streak.load(Ordering::Relaxed),
             shrink_count: self.shrink_count.load(Ordering::Relaxed),
             grow_count: self.grow_count.load(Ordering::Relaxed),
             ticks_total: self.ticks_total.load(Ordering::Relaxed),
-            disabled_via_env: env_bool_truthy("CASS_RESPONSIVENESS_DISABLE") || self.cfg.disabled,
+            disabled_via_env: disabled,
             last_snapshot,
             last_reason,
             recent_decisions: recent,
