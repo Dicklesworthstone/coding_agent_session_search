@@ -458,7 +458,9 @@ impl ExportEngine {
             PathMode::Hash => {
                 let mut hasher = Sha256::new();
                 hasher.update(path.as_bytes());
-                format!("{:x}", hasher.finalize())[..16].to_string()
+                // sha2 ≥ 0.11 dropped `LowerHex` on the digest output;
+                // `hex::encode` gives the same lowercase-hex string.
+                hex::encode(hasher.finalize())[..16].to_string()
             }
         }
     }

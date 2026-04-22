@@ -119,8 +119,13 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "frankensearch",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        expected_rev: "db7530e5",
-        expected_version: "0.1.0",
+        // Bumped from db7530e5 to pick up the ort 2.0.0-rc.12 API fix in
+        // 4ef8e090 ("feat(rerank+ops+fsfs): ... update ort API ...").
+        // The intervening 3dbab624 minor-version bump pushed `frankensearch`
+        // crate version 0.1.0 → 0.3.0; our `version = "*"` in Cargo.toml
+        // accepts it.
+        expected_rev: "3dbab624",
+        expected_version: "0.3.0",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",

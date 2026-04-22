@@ -1262,7 +1262,9 @@ fn compute_file_hash(path: &Path) -> Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    // sha2 ≥ 0.11 dropped `LowerHex` on the digest output;
+    // `hex::encode` produces the same lowercase-hex representation.
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Collect all files in a directory recursively

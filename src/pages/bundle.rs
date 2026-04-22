@@ -713,7 +713,10 @@ fn build_integrity_entry(path: &Path) -> Result<IntegrityEntry> {
     }
 
     Ok(IntegrityEntry {
-        sha256: format!("{:x}", hasher.finalize()),
+        // sha2 ≥ 0.11 dropped `LowerHex` for the `Output` GenericArray;
+        // route through `hex::encode` for the same lowercase-hex wire
+        // format.
+        sha256: hex::encode(hasher.finalize()),
         size,
     })
 }
@@ -730,8 +733,10 @@ pub(crate) fn compute_fingerprint(manifest: &IntegrityManifest) -> String {
 
     let hash = hasher.finalize();
 
-    // Return first 16 hex chars as fingerprint
-    format!("{:x}", hash)[..16].to_string()
+    // Return first 16 hex chars as fingerprint. `hex::encode` replaces the
+    // pre-sha2-0.11 `format!("{:x}", hash)` path (Output no longer
+    // implements `LowerHex`).
+    hex::encode(hash)[..16].to_string()
 }
 
 /// Write private artifacts that should never be deployed
