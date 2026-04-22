@@ -1,0 +1,169 @@
+{
+  "status": "not_initialized",
+  "healthy": false,
+  "initialized": false,
+  "explanation": "No cass database or search index exists in [TEST_HOME]/coding-agent-search yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+  "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+  "errors": [
+    "database not initialized yet",
+    "index not initialized yet"
+  ],
+  "latency_ms": "[LATENCY_MS]",
+  "db": {
+    "exists": false,
+    "opened": false,
+    "conversations": 0,
+    "messages": 0,
+    "open_error": null,
+    "counts_skipped": false
+  },
+  "responsiveness": {
+    "current_capacity_pct": 100,
+    "resource_policy": {
+      "available_parallelism": 128,
+      "reserved_cores": 8,
+      "max_workers": 120,
+      "effective_worker_ceiling": 120,
+      "max_inflight_bytes": 536870912,
+      "min_inflight_bytes": 1048576
+    },
+    "healthy_streak": 1,
+    "shrink_count": 0,
+    "grow_count": 0,
+    "ticks_total": 1,
+    "disabled_via_env": false,
+    "last_snapshot": {
+      "load_per_core": "[LIVE_METRIC]",
+      "psi_cpu_some_avg10": "[LIVE_METRIC]"
+    },
+    "last_reason": "healthy_hold",
+    "recent_decisions": [],
+    "calibration": {
+      "mode": "conformal",
+      "load_window_len": 1,
+      "psi_window_len": 1,
+      "conformal_k": 256,
+      "conformal_k_min": 32,
+      "conformal_alpha_pressured": 0.05000000074505806,
+      "conformal_alpha_severe": 0.009999999776482582,
+      "drift_reset_count": 0,
+      "outliers_rejected": 0,
+      "observations_total": 1,
+      "load_pressured_q": null,
+      "load_severe_q": null,
+      "psi_pressured_q": null,
+      "psi_severe_q": null
+    }
+  },
+  "parallel_wal_shadow": {
+    "recent_chunks": [],
+    "chunks_observed": 0,
+    "cumulative_wall_micros": 0,
+    "chunk_errors": 0,
+    "active": true
+  },
+  "state": {
+    "index": {
+      "exists": false,
+      "status": "missing",
+      "reason": "lexical Tantivy metadata missing",
+      "fresh": false,
+      "last_indexed_at": null,
+      "age_seconds": null,
+      "stale": false,
+      "stale_threshold_seconds": 300,
+      "rebuilding": false,
+      "activity_at": null,
+      "documents": null,
+      "empty_with_messages": false,
+      "fingerprint": {
+        "current_db_fingerprint": null,
+        "checkpoint_fingerprint": null,
+        "matches_current_db_fingerprint": null
+      },
+      "checkpoint": {
+        "present": false,
+        "completed": null,
+        "db_matches": null,
+        "schema_matches": null,
+        "page_size_matches": null,
+        "page_size_compatible": null
+      }
+    },
+    "database": {
+      "exists": false,
+      "opened": false,
+      "conversations": 0,
+      "messages": 0,
+      "open_error": null,
+      "open_retryable": false,
+      "counts_skipped": false
+    },
+    "pending": {
+      "sessions": 0,
+      "watch_active": false,
+      "orphaned": false
+    },
+    "rebuild": {
+      "active": false,
+      "orphaned": false,
+      "pid": null,
+      "mode": null,
+      "job_id": null,
+      "job_kind": null,
+      "phase": null,
+      "started_at": null,
+      "updated_at": null,
+      "processed_conversations": null,
+      "total_conversations": null,
+      "indexed_docs": null,
+      "pipeline": {
+        "workers": 64,
+        "available_parallelism": 128,
+        "reserved_cores": 8,
+        "tantivy_writer_threads": 26,
+        "staged_shard_builders": 8,
+        "staged_merge_workers": 4,
+        "controller_mode": "auto",
+        "controller_restore_clear_samples": 3,
+        "controller_restore_hold_ms": 5000,
+        "pipeline_max_message_bytes_in_flight": 402653184,
+        "page_prep_workers": 16,
+        "page_size": 1024,
+        "steady_batch_fetch_conversations": 1024,
+        "startup_batch_fetch_conversations": 32,
+        "steady_commit_every_conversations": 10000,
+        "startup_commit_every_conversations": 2048,
+        "steady_commit_every_messages": 800000,
+        "startup_commit_every_messages": 800000,
+        "steady_commit_every_message_bytes": 536870912,
+        "startup_commit_every_message_bytes": 134217728,
+        "pipeline_channel_size": 2,
+        "controller_loadavg_high_watermark_1m": 121.0,
+        "controller_loadavg_low_watermark_1m": 120.0,
+        "runtime": null
+      }
+    },
+    "semantic": {
+      "status": "not_initialized",
+      "availability": "not_initialized",
+      "summary": "semantic search is optional and has not been initialized yet",
+      "available": false,
+      "can_search": false,
+      "fallback_mode": "lexical",
+      "preferred_backend": "fastembed",
+      "embedder_id": null,
+      "vector_index_path": null,
+      "model_dir": null,
+      "hnsw_path": null,
+      "hnsw_ready": false,
+      "progressive_ready": false,
+      "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical."
+    },
+    "_meta": {
+      "timestamp": "[TIMESTAMP]",
+      "data_dir": "[TEST_HOME]/coding-agent-search",
+      "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db"
+    }
+  }
+}

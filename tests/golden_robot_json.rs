@@ -83,6 +83,20 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""latency_ms": "[LATENCY_MS]""#)
         .to_string();
 
+    // 6. Live-sampled kernel metrics in health --json (load average per
+    // core and PSI CPU pressure). These float values change between runs
+    // based on whatever else is happening on the box. Scrub to placeholders
+    // so the golden locks the shape without chasing host noise.
+    for key in ["load_per_core", "psi_cpu_some_avg10"] {
+        let re = regex::Regex::new(&format!(
+            r#""{key}"\s*:\s*(-?\d+(\.\d+)?([eE][+-]?\d+)?|null)"#
+        ))
+        .unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_METRIC]""#).as_str())
+            .to_string();
+    }
+
     out
 }
 
