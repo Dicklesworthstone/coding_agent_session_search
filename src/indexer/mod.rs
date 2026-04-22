@@ -10956,8 +10956,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
          -> Result<bool> {
             let mut force_progress_persist = false;
             while let Some(result) = pending_completed_shards.remove(next_shard_to_commit) {
-                let validated_artifact =
-                    validate_lexical_rebuild_shard_build_result(&result)?;
+                let validated_artifact = validate_lexical_rebuild_shard_build_result(&result)?;
                 *processed_conversations =
                     processed_conversations.saturating_add(result.shard.conversation_count);
                 *indexed_docs = indexed_docs.saturating_add(result.indexed_docs);
@@ -17838,6 +17837,149 @@ mod tests {
             merged_index.segment_count(),
             1,
             "merged shard indices should collapse into a single final segment"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_validates_built_shard_before_merge_frontier() {
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("validated-shard");
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
+            crate::storage::sqlite::LexicalRebuildConversationRow {
+                id: Some(7),
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some("validated-shard".into()),
+                title: Some("Validated shard".into()),
+                source_path: PathBuf::from("/tmp/validated-shard.jsonl"),
+                started_at: Some(1_700_000_935_000),
+                ended_at: Some(1_700_000_935_100),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+            vec![
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 0,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_935_010),
+                    content: "validated alpha".into(),
+                },
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 1,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_935_020),
+                    content: "validated beta".into(),
+                },
+            ]
+            .into_iter()
+            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
+            Some(70),
+            &HashMap::new(),
+        );
+        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
+        let shard = LexicalShardPlanShard {
+            shard_index: 0,
+            first_conversation_id: 7,
+            last_conversation_id: 7,
+            conversation_count: 1,
+            message_count: 2,
+            message_bytes: "validated alpha".len() + "validated beta".len(),
+            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[7]),
+            oversized_single_conversation: false,
+        };
+        let result = LexicalRebuildShardBuildResult {
+            shard: shard.clone(),
+            indexed_docs,
+            shard_index_path: shard_path.clone(),
+        };
+
+        let artifact = validate_lexical_rebuild_shard_build_result(&result).unwrap();
+
+        assert_eq!(artifact.first_shard_index, 0);
+        assert_eq!(artifact.last_shard_index, 0);
+        assert_eq!(artifact.index_path, shard_path);
+        validate_complete_lexical_rebuild_shard_artifacts(
+            &LexicalShardPlan {
+                planner_version: LEXICAL_SHARD_PLAN_VERSION,
+                plan_id: "validated-plan".into(),
+                budgets: LexicalShardPlannerBudgets {
+                    max_conversations_per_shard: 1,
+                    max_messages_per_shard: 2,
+                    max_message_bytes_per_shard: 10_000,
+                },
+                total_conversations: 1,
+                total_messages: 2,
+                total_message_bytes: "validated alpha".len() + "validated beta".len(),
+                oversized_conversation_ids: Vec::new(),
+                shards: vec![shard],
+            },
+            &[artifact],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lexical_rebuild_rejects_shard_doc_count_mismatch_before_merge_frontier() {
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("mismatched-shard");
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
+            crate::storage::sqlite::LexicalRebuildConversationRow {
+                id: Some(8),
+                agent_slug: "codex".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some("mismatched-shard".into()),
+                title: Some("Mismatched shard".into()),
+                source_path: PathBuf::from("/tmp/mismatched-shard.jsonl"),
+                started_at: Some(1_700_000_936_000),
+                ended_at: Some(1_700_000_936_100),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+            vec![
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 0,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_936_010),
+                    content: "mismatch alpha".into(),
+                },
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 1,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_936_020),
+                    content: "mismatch beta".into(),
+                },
+            ]
+            .into_iter()
+            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
+            Some(80),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap(),
+            2
+        );
+        let result = LexicalRebuildShardBuildResult {
+            shard: LexicalShardPlanShard {
+                shard_index: 0,
+                first_conversation_id: 8,
+                last_conversation_id: 8,
+                conversation_count: 1,
+                message_count: 2,
+                message_bytes: "mismatch alpha".len() + "mismatch beta".len(),
+                conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[8]),
+                oversized_single_conversation: false,
+            },
+            indexed_docs: 1,
+            shard_index_path: shard_path,
+        };
+
+        let err = validate_lexical_rebuild_shard_build_result(&result)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("reported 1 docs but a fresh Tantivy reader sees 2"),
+            "expected doc-count mismatch error, got {err}"
         );
     }
 
