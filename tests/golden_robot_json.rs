@@ -56,10 +56,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .to_string();
 
     // 2. ISO-8601 timestamps (match with optional fractional seconds / tz).
-    let ts_re = regex::Regex::new(
-        r#"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?"#,
-    )
-    .unwrap();
+    let ts_re =
+        regex::Regex::new(r#"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?"#)
+            .unwrap();
     out = ts_re.replace_all(&out, "[TIMESTAMP]").to_string();
 
     // 3. Absolute paths rooted at the isolated test HOME. Anything else is
@@ -71,10 +70,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     }
 
     // 4. UUIDs.
-    let uuid_re = regex::Regex::new(
-        r#"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#,
-    )
-    .unwrap();
+    let uuid_re =
+        regex::Regex::new(r#"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#)
+            .unwrap();
     out = uuid_re.replace_all(&out, "[UUID]").to_string();
 
     out
@@ -89,8 +87,7 @@ fn assert_golden(name: &str, actual: &str) {
         .join(name);
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
-        std::fs::create_dir_all(golden_path.parent().unwrap())
-            .expect("create golden parent dir");
+        std::fs::create_dir_all(golden_path.parent().unwrap()).expect("create golden parent dir");
         std::fs::write(&golden_path, actual).expect("write golden file");
         eprintln!("[GOLDEN] Updated: {}", golden_path.display());
         return;
