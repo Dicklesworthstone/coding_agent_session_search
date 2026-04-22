@@ -84,31 +84,39 @@ pub struct SemanticDocId {
 
 impl SemanticDocId {
     /// Encode this semantic vector record doc_id into the string form stored in FSVI.
+    ///
+    /// Hot-path encoder: runs once per embedded message during indexing and
+    /// for every search hit that goes through semantic lookup. Build the
+    /// output in a single pre-sized `String` with `itoa::Buffer` for the
+    /// integer fields instead of `format!`, which walks the formatter-trait
+    /// machinery per arg and grows its internal buffer on demand.
     #[must_use]
     pub fn to_doc_id_string(&self) -> String {
-        match self.content_hash {
-            Some(hash) => format!(
-                "m|{}|{}|{}|{}|{}|{}|{}|{}",
-                self.message_id,
-                self.chunk_idx,
-                self.agent_id,
-                self.workspace_id,
-                self.source_id,
-                self.role,
-                self.created_at_ms,
-                hex::encode(hash)
-            ),
-            None => format!(
-                "m|{}|{}|{}|{}|{}|{}|{}",
-                self.message_id,
-                self.chunk_idx,
-                self.agent_id,
-                self.workspace_id,
-                self.source_id,
-                self.role,
-                self.created_at_ms
-            ),
+        // Capacity estimate: "m|" (2) + seven integer fields up to 20 chars
+        // + six '|' separators + optional 64-hex hash + one '|' if present.
+        // Slight over-allocation is fine and avoids any realloc.
+        let capacity = 2 + (7 * 20) + 6 + if self.content_hash.is_some() { 65 } else { 0 };
+        let mut out = String::with_capacity(capacity);
+        let mut buf = itoa::Buffer::new();
+        out.push_str("m|");
+        out.push_str(buf.format(self.message_id));
+        out.push('|');
+        out.push_str(buf.format(self.chunk_idx));
+        out.push('|');
+        out.push_str(buf.format(self.agent_id));
+        out.push('|');
+        out.push_str(buf.format(self.workspace_id));
+        out.push('|');
+        out.push_str(buf.format(self.source_id));
+        out.push('|');
+        out.push_str(buf.format(self.role));
+        out.push('|');
+        out.push_str(buf.format(self.created_at_ms));
+        if let Some(hash) = self.content_hash {
+            out.push('|');
+            out.push_str(&hex::encode(hash));
         }
+        out
     }
 }
 
@@ -167,9 +175,7 @@ pub(crate) struct SemanticDocIdFilterView {
 /// ~5x cheaper than `parse_semantic_doc_id` when the content_hash is present,
 /// because it skips the 64-byte hex decode that dominates the full-parse cost.
 #[must_use]
-pub(crate) fn parse_semantic_doc_id_filter_view(
-    doc_id: &str,
-) -> Option<SemanticDocIdFilterView> {
+pub(crate) fn parse_semantic_doc_id_filter_view(doc_id: &str) -> Option<SemanticDocIdFilterView> {
     let rest = doc_id.strip_prefix("m|")?;
     let mut parts = rest.splitn(8, '|');
     // message_id + chunk_idx: we only need to advance the iterator past them.
