@@ -1135,6 +1135,57 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 }
 
 #[test]
+fn search_robot_meta_reports_explicit_hybrid_fail_open() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--mode",
+        "hybrid",
+        "--limit",
+        "1",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let meta = json
+        .get("_meta")
+        .and_then(Value::as_object)
+        .expect("_meta present when --robot-meta is used");
+
+    assert_eq!(
+        meta.get("requested_search_mode").and_then(Value::as_str),
+        Some("hybrid"),
+        "explicit hybrid intent should be preserved"
+    );
+    assert_eq!(
+        meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "hybrid should fail open to lexical when semantic assets are absent"
+    );
+    assert_eq!(
+        meta.get("mode_defaulted").and_then(Value::as_bool),
+        Some(false),
+        "explicit --mode hybrid should not be reported as defaulted"
+    );
+    assert_eq!(
+        meta.get("fallback_tier").and_then(Value::as_str),
+        Some("lexical"),
+        "metadata should name the fail-open tier"
+    );
+    assert_eq!(
+        meta.get("semantic_refinement").and_then(Value::as_bool),
+        Some(false),
+        "lexical fail-open should not claim semantic refinement"
+    );
+}
+
+#[test]
 fn search_robot_meta_reports_explicit_lexical_override() {
     let mut cmd = base_cmd();
     cmd.args([

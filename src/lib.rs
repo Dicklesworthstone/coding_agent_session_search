@@ -7228,13 +7228,11 @@ fn run_cli_search(
         );
     }
 
-    // Default user intent is hybrid-preferred. If the user did not explicitly
-    // request a semantic-bearing mode and semantic assets are unavailable, the
-    // command fails open to lexical while reporting the realized mode in robot
-    // metadata.
+    // Hybrid is a preference for semantic refinement, not a strict dependency.
+    // If semantic assets are unavailable, hybrid searches fail open to lexical
+    // while robot metadata reports the realized mode and fallback reason.
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
-    let default_hybrid_requested =
-        mode_meta.defaulted && matches!(mode_meta.requested, SearchMode::Hybrid);
+    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
 
     if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
         && !matches!(mode_meta.requested, SearchMode::Semantic)
@@ -7326,7 +7324,7 @@ fn run_cli_search(
                     "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
                         .to_string()
                 };
-                if default_hybrid_requested {
+                if hybrid_fail_open {
                     mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
                     let _ = client.clear_semantic_context();
                 } else {
@@ -7349,7 +7347,7 @@ fn run_cli_search(
                 "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
                     .to_string()
             };
-            if default_hybrid_requested {
+            if hybrid_fail_open {
                 mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
             } else {
                 return Err(CliError {
@@ -7609,7 +7607,7 @@ fn run_cli_search(
             Ok(result) => result,
             Err(e) => {
                 let err_str = e.to_string();
-                if default_hybrid_requested
+                if hybrid_fail_open
                     && (err_str.contains("unavailable") || err_str.contains("no embedder"))
                 {
                     mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
@@ -8420,6 +8418,10 @@ impl SearchModeMeta {
             self.realized,
             crate::search::query::SearchMode::Semantic | crate::search::query::SearchMode::Hybrid
         ) && self.fallback_tier.is_none()
+    }
+
+    fn fail_open_on_semantic_unavailable(&self) -> bool {
+        matches!(self.requested, crate::search::query::SearchMode::Hybrid)
     }
 
     fn fall_back_to_lexical(&mut self, reason: impl Into<String>) {
@@ -25953,6 +25955,18 @@ mod subcommand_robot_output_tests {
         assert_eq!(meta.realized, crate::search::query::SearchMode::Lexical);
         assert_eq!(meta.fallback_tier, Some("lexical"));
         assert!(!meta.semantic_refinement());
+    }
+
+    #[test]
+    fn hybrid_search_intent_is_fail_open_even_when_explicit() {
+        let default_hybrid = SearchModeMeta::new(crate::search::query::SearchMode::Hybrid, true);
+        let explicit_hybrid = SearchModeMeta::new(crate::search::query::SearchMode::Hybrid, false);
+        let explicit_semantic =
+            SearchModeMeta::new(crate::search::query::SearchMode::Semantic, false);
+
+        assert!(default_hybrid.fail_open_on_semantic_unavailable());
+        assert!(explicit_hybrid.fail_open_on_semantic_unavailable());
+        assert!(!explicit_semantic.fail_open_on_semantic_unavailable());
     }
 }
 
