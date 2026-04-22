@@ -6299,39 +6299,79 @@ fn persist_final_index_run_metadata(
     scan_start_ts: i64,
     now_ms: i64,
 ) -> Result<()> {
-    persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
-        persist::with_ephemeral_writer(
-            storage,
-            false,
-            "updating final index run metadata",
-            |writer| {
-                if performed_scan {
-                    writer.set_last_scan_ts(scan_start_ts)?;
-                }
-                writer.set_last_indexed_at(now_ms)
-            },
-        )
-    })
-    .with_context(|| {
-        format!(
-            "updating final index run metadata for {}",
-            db_path.display()
-        )
-    })?;
+    persist_final_index_run_metadata_with_writer(
+        db_path,
+        performed_scan,
+        scan_start_ts,
+        now_ms,
+        || {
+            persist::with_concurrent_retry(persist::begin_concurrent_retry_limit(), || {
+                persist::with_ephemeral_writer(
+                    storage,
+                    false,
+                    "updating final index run metadata",
+                    |writer| {
+                        if performed_scan {
+                            writer.set_last_scan_ts(scan_start_ts)?;
+                        }
+                        writer.set_last_indexed_at(now_ms)
+                    },
+                )
+            })
+        },
+    )
+}
 
-    if performed_scan {
-        tracing::info!(
-            scan_start_ts,
-            "updated last_scan_ts for incremental indexing"
-        );
-    } else {
-        tracing::info!(
-            db_path = %db_path.display(),
-            "preserving last_scan_ts because this run only resumed the lexical rebuild"
-        );
+/// Bead zz8ni: the expensive index + lexical rebuild work above this call
+/// has already been committed durably. The `last_indexed_at` /
+/// `last_scan_ts` markers are status-display metadata — losing the writer
+/// race to a peer `cass` process MUST NOT fail the whole run and discard a
+/// multi-minute rebuild. A subsequent incremental `cass index` will
+/// rewrite the markers once contention clears.
+///
+/// Split out with an injectable `writer_fn` so the log-and-swallow
+/// behavior can be exercised by unit tests without shelling out to a real
+/// locked database.
+fn persist_final_index_run_metadata_with_writer<F>(
+    db_path: &Path,
+    performed_scan: bool,
+    scan_start_ts: i64,
+    now_ms: i64,
+    writer_fn: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    match writer_fn() {
+        Ok(()) => {
+            if performed_scan {
+                tracing::info!(
+                    scan_start_ts,
+                    "updated last_scan_ts for incremental indexing"
+                );
+            } else {
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    "preserving last_scan_ts because this run only resumed the lexical rebuild"
+                );
+            }
+            tracing::info!(now_ms, "updated last_indexed_at for status display");
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                performed_scan,
+                scan_start_ts,
+                now_ms,
+                error = %format!("{err:#}"),
+                "deferred final index-run metadata update after retries exhausted; \
+                 index and lexical artifacts are committed, status markers will be \
+                 rewritten on the next incremental run once peer contention clears"
+            );
+            Ok(())
+        }
     }
-    tracing::info!(now_ms, "updated last_indexed_at for status display");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -26746,6 +26786,72 @@ mod tests {
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
+    }
+
+    #[test]
+    fn persist_final_index_run_metadata_logs_warning_and_returns_ok_when_retries_exhausted() {
+        // Bead zz8ni regression: a successful multi-minute rebuild must not
+        // be reported as failed just because the tail-end status-marker
+        // write lost the writer race to a peer cass process. The function
+        // log-swallows a retry-exhausted Err so the outer run reports
+        // success; a later incremental cass index rewrites the markers
+        // once contention clears.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+
+        let logs = capture_logs(|| {
+            let result =
+                persist_final_index_run_metadata_with_writer(&db_path, true, 999, 456, || {
+                    Err(anyhow::anyhow!(
+                        "ephemeral writer preflight write failed for updating final \
+                         last_indexed_at after index run at {}: database is busy",
+                        db_path.display()
+                    ))
+                });
+            assert!(
+                result.is_ok(),
+                "metadata-only contention must not fail a fully-committed rebuild; \
+                 got {result:?}"
+            );
+        });
+
+        assert!(
+            logs.contains("deferred final index-run metadata update after retries exhausted"),
+            "expected deferred-update warning in logs; got:\n{logs}"
+        );
+        assert!(
+            logs.contains("database is busy"),
+            "expected underlying writer error surfaced in warn log; got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("updated last_indexed_at for status display"),
+            "must not emit the success INFO log when the writer retry was swallowed; got:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn persist_final_index_run_metadata_with_writer_logs_success_info_when_writer_succeeds() {
+        // Companion probe: on the happy path both INFO markers fire and
+        // the deferred-update warning does NOT.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        let logs = capture_logs(|| {
+            let result =
+                persist_final_index_run_metadata_with_writer(&db_path, true, 111, 222, || Ok(()));
+            assert!(result.is_ok());
+        });
+        assert!(
+            logs.contains("updated last_scan_ts for incremental indexing"),
+            "expected scan_ts INFO log; got:\n{logs}"
+        );
+        assert!(
+            logs.contains("updated last_indexed_at for status display"),
+            "expected indexed_at INFO log; got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("deferred final index-run metadata update"),
+            "must not emit deferred-update warn on happy path; got:\n{logs}"
+        );
     }
 
     #[test]
