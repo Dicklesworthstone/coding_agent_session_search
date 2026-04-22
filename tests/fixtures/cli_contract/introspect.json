@@ -571,7 +571,7 @@
         },
         {
           "name": "mode",
-          "description": "Search mode: lexical (default), semantic, or hybrid",
+          "description": "Search mode: hybrid-preferred (default), lexical, or semantic",
           "arg_type": "option",
           "value_type": "enum",
           "required": false,

@@ -4,12 +4,30 @@
 //! added to the search command.
 
 use clap::Parser;
+use coding_agent_search::search::query::SearchMode;
 use coding_agent_search::{Cli, Commands};
+
+fn run_on_large_stack<T, F>(f: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("cli-search-semantic-flags".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack parser thread")
+        .join()
+        .expect("large-stack parser thread should not panic")
+}
+
+fn parse_cli<const N: usize>(args: [&'static str; N]) -> Cli {
+    run_on_large_stack(move || Cli::try_parse_from(args).expect("parse search flags"))
+}
 
 #[test]
 fn search_parses_model_flag() {
-    let cli = Cli::try_parse_from(["cass", "search", "query", "--model", "minilm"])
-        .expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--model", "minilm"]);
 
     match cli.command {
         Some(Commands::Search { model, .. }) => {
@@ -21,8 +39,7 @@ fn search_parses_model_flag() {
 
 #[test]
 fn search_parses_rerank_flag() {
-    let cli =
-        Cli::try_parse_from(["cass", "search", "query", "--rerank"]).expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--rerank"]);
 
     match cli.command {
         Some(Commands::Search { rerank, .. }) => {
@@ -34,8 +51,7 @@ fn search_parses_rerank_flag() {
 
 #[test]
 fn search_parses_reranker_flag() {
-    let cli = Cli::try_parse_from(["cass", "search", "query", "--rerank", "--reranker", "bge"])
-        .expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--rerank", "--reranker", "bge"]);
 
     match cli.command {
         Some(Commands::Search {
@@ -50,8 +66,7 @@ fn search_parses_reranker_flag() {
 
 #[test]
 fn search_parses_daemon_flag() {
-    let cli =
-        Cli::try_parse_from(["cass", "search", "query", "--daemon"]).expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--daemon"]);
 
     match cli.command {
         Some(Commands::Search { daemon, .. }) => {
@@ -63,8 +78,7 @@ fn search_parses_daemon_flag() {
 
 #[test]
 fn search_parses_no_daemon_flag() {
-    let cli = Cli::try_parse_from(["cass", "search", "query", "--no-daemon"])
-        .expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--no-daemon"]);
 
     match cli.command {
         Some(Commands::Search { no_daemon, .. }) => {
@@ -76,7 +90,7 @@ fn search_parses_no_daemon_flag() {
 
 #[test]
 fn search_default_flags_are_false() {
-    let cli = Cli::try_parse_from(["cass", "search", "query"]).expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query"]);
 
     match cli.command {
         Some(Commands::Search {
@@ -98,11 +112,50 @@ fn search_default_flags_are_false() {
 }
 
 #[test]
+fn search_without_mode_keeps_hybrid_preferred_default_intent() {
+    let cli = parse_cli(["cass", "search", "query"]);
+
+    assert!(
+        matches!(cli.command, Some(Commands::Search { .. })),
+        "expected search command"
+    );
+    let Some(Commands::Search { mode, .. }) = cli.command else {
+        return;
+    };
+
+    assert_eq!(mode, None, "absent --mode should stay distinguishable");
+    assert_eq!(SearchMode::default(), SearchMode::Hybrid);
+}
+
+#[test]
+fn search_explicit_lexical_and_semantic_modes_are_preserved() {
+    for (mode_arg, expected) in [
+        ("lexical", SearchMode::Lexical),
+        ("semantic", SearchMode::Semantic),
+    ] {
+        let cli = parse_cli(["cass", "search", "query", "--mode", mode_arg]);
+
+        assert!(
+            matches!(cli.command, Some(Commands::Search { .. })),
+            "expected search command for --mode {mode_arg}"
+        );
+        let Some(Commands::Search { mode, .. }) = cli.command else {
+            return;
+        };
+
+        assert_eq!(
+            mode,
+            Some(expected),
+            "explicit --mode {mode_arg} should be preserved"
+        );
+    }
+}
+
+#[test]
 fn search_combines_mode_and_model_flags() {
-    let cli = Cli::try_parse_from([
+    let cli = parse_cli([
         "cass", "search", "query", "--mode", "semantic", "--model", "minilm",
-    ])
-    .expect("parse search flags");
+    ]);
 
     match cli.command {
         Some(Commands::Search { mode, model, .. }) => {
@@ -115,7 +168,7 @@ fn search_combines_mode_and_model_flags() {
 
 #[test]
 fn search_combines_rerank_and_daemon_flags() {
-    let cli = Cli::try_parse_from([
+    let cli = parse_cli([
         "cass",
         "search",
         "query",
@@ -123,8 +176,7 @@ fn search_combines_rerank_and_daemon_flags() {
         "--reranker",
         "bge",
         "--daemon",
-    ])
-    .expect("parse search flags");
+    ]);
 
     match cli.command {
         Some(Commands::Search {
@@ -146,8 +198,7 @@ fn search_combines_rerank_and_daemon_flags() {
 
 #[test]
 fn search_parses_approximate_flag() {
-    let cli = Cli::try_parse_from(["cass", "search", "query", "--approximate"])
-        .expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query", "--approximate"]);
 
     match cli.command {
         Some(Commands::Search { approximate, .. }) => {
@@ -159,7 +210,7 @@ fn search_parses_approximate_flag() {
 
 #[test]
 fn search_approximate_default_is_false() {
-    let cli = Cli::try_parse_from(["cass", "search", "query"]).expect("parse search flags");
+    let cli = parse_cli(["cass", "search", "query"]);
 
     match cli.command {
         Some(Commands::Search { approximate, .. }) => {
@@ -171,15 +222,14 @@ fn search_approximate_default_is_false() {
 
 #[test]
 fn search_combines_mode_semantic_and_approximate() {
-    let cli = Cli::try_parse_from([
+    let cli = parse_cli([
         "cass",
         "search",
         "query",
         "--mode",
         "semantic",
         "--approximate",
-    ])
-    .expect("parse search flags");
+    ]);
 
     match cli.command {
         Some(Commands::Search {
@@ -194,15 +244,14 @@ fn search_combines_mode_semantic_and_approximate() {
 
 #[test]
 fn search_combines_mode_hybrid_and_approximate() {
-    let cli = Cli::try_parse_from([
+    let cli = parse_cli([
         "cass",
         "search",
         "query",
         "--mode",
         "hybrid",
         "--approximate",
-    ])
-    .expect("parse search flags");
+    ]);
 
     match cli.command {
         Some(Commands::Search {

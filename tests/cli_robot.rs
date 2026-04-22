@@ -1079,6 +1079,31 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
         meta.get("wildcard_fallback").is_some(),
         "_meta should include wildcard_fallback flag"
     );
+    assert_eq!(
+        meta.get("requested_search_mode").and_then(Value::as_str),
+        Some("hybrid"),
+        "default robot search intent should be hybrid-preferred"
+    );
+    assert_eq!(
+        meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "fixture without semantic assets should report realized lexical fallback"
+    );
+    assert_eq!(
+        meta.get("mode_defaulted").and_then(Value::as_bool),
+        Some(true),
+        "metadata should distinguish defaulted search intent"
+    );
+    assert_eq!(
+        meta.get("fallback_tier").and_then(Value::as_str),
+        Some("lexical"),
+        "metadata should name the realized fallback tier"
+    );
+    assert_eq!(
+        meta.get("semantic_refinement").and_then(Value::as_bool),
+        Some(false),
+        "lexical fallback should not claim semantic refinement"
+    );
 
     let cache = meta
         .get("cache_stats")
@@ -1089,6 +1114,69 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
             && cache.contains_key("misses")
             && cache.contains_key("shortfall"),
         "cache_stats should expose hits, misses, shortfall"
+    );
+}
+
+#[test]
+fn search_robot_meta_reports_explicit_lexical_override() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "hello",
+        "--json",
+        "--robot-meta",
+        "--mode",
+        "lexical",
+        "--limit",
+        "1",
+        "--data-dir",
+        "tests/fixtures/search_demo_data",
+    ]);
+
+    let assert = cmd.assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let parsed = serde_json::from_str::<Value>(stdout.trim());
+    assert!(
+        parsed.is_ok(),
+        "robot output should be valid JSON: {:?}",
+        parsed.as_ref().err()
+    );
+    let Ok(json) = parsed else {
+        return;
+    };
+    let meta = json.get("_meta").and_then(Value::as_object);
+    assert!(
+        meta.is_some(),
+        "_meta should be present when --robot-meta is used"
+    );
+    let Some(meta) = meta else {
+        return;
+    };
+
+    assert_eq!(
+        meta.get("requested_search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "explicit lexical intent should be preserved"
+    );
+    assert_eq!(
+        meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "explicit lexical mode should realize lexical search"
+    );
+    assert_eq!(
+        meta.get("mode_defaulted").and_then(Value::as_bool),
+        Some(false),
+        "explicit --mode should not be reported as defaulted"
+    );
+    assert_eq!(
+        meta.get("fallback_tier"),
+        Some(&Value::Null),
+        "explicit lexical mode should not report fallback"
+    );
+    assert_eq!(
+        meta.get("semantic_refinement").and_then(Value::as_bool),
+        Some(false),
+        "lexical-only override should not claim semantic refinement"
     );
 }
 
