@@ -107,3 +107,59 @@ fn concurrent_health_readings_agree_on_readiness_snapshot() {
         );
     }
 }
+
+#[test]
+fn cross_surface_version_agreement() {
+    // Row 2 of the matrix: cross-surface version-string invariant. The
+    // string that `cass --version` prints must match the `crate_version`
+    // field of `cass capabilities --json`. A drift here signals that one
+    // of the two surfaces picked up a stale build-time constant — the
+    // exact class of mysterious mismatch that agents and operators
+    // otherwise only discover in production.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    let version_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["--version"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass --version");
+    assert!(
+        version_out.status.success(),
+        "cass --version exited non-zero: {:?}",
+        version_out.status
+    );
+    let version_stdout = String::from_utf8(version_out.stdout).expect("utf8");
+    // `cass --version` emits `cass <semver>`; extract the token after the
+    // first whitespace and trim any trailing newline.
+    let version_flag_version = version_stdout
+        .split_whitespace()
+        .nth(1)
+        .expect("cass --version should be `cass X.Y.Z`")
+        .to_string();
+
+    let caps_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["capabilities", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass capabilities --json");
+    assert!(caps_out.status.success(), "cass capabilities exited non-zero");
+    let caps_stdout = String::from_utf8(caps_out.stdout).expect("utf8");
+    let caps_json: serde_json::Value = serde_json::from_str(&caps_stdout).expect("JSON");
+    let caps_version = caps_json
+        .get("crate_version")
+        .and_then(|v| v.as_str())
+        .expect("capabilities.crate_version is a string")
+        .to_string();
+
+    assert_eq!(
+        version_flag_version, caps_version,
+        "cass --version ({version_flag_version:?}) disagrees with capabilities.crate_version \
+         ({caps_version:?}) — one surface picked up a stale build-time constant"
+    );
+}
