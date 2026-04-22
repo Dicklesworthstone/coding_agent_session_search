@@ -482,6 +482,144 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
 
 #[test]
 #[serial]
+fn index_full_persists_lexical_rebuild_equivalence_ledger() {
+    // Bead ibuuh.29 E2E acceptance: the authoritative serial rebuild must
+    // persist an equivalence ledger (document count, manifest fingerprint,
+    // golden-query digest) as a preserved artifact so operators and external
+    // tooling can diff it across runs without replaying the corpus.
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    // Seed a small mixed corpus so the rebuild touches multiple distinct
+    // conversations and exercises the streaming accumulator beyond a trivial
+    // single-conversation path.
+    for (idx, content) in [
+        "equivalence-ledger-alpha",
+        "equivalence-ledger-bravo",
+        "equivalence-ledger-charlie",
+        "equivalence-ledger-delta",
+    ]
+    .iter()
+    .enumerate()
+    {
+        make_codex_session(
+            &codex_home,
+            "2026/04/22",
+            &format!("equivalence-ledger-{idx:02}.jsonl"),
+            content,
+        );
+    }
+
+    let mut cmd = base_cmd(home);
+    cmd.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = cmd.output().expect("run full index");
+    assert!(
+        output.status.success(),
+        "full index should succeed. stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    let reported_conversations = payload
+        .get("conversations")
+        .and_then(|value| value.as_i64())
+        .expect("conversation count in payload");
+    assert!(
+        reported_conversations >= 2,
+        "expected at least 2 seeded conversations, got {reported_conversations}"
+    );
+
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve tantivy index dir");
+    let ledger_path = index_path.join(".lexical-rebuild-equivalence.json");
+    assert!(
+        ledger_path.exists(),
+        "authoritative rebuild must persist the equivalence ledger artifact at {}",
+        ledger_path.display()
+    );
+    let raw = fs::read_to_string(&ledger_path).expect("read equivalence ledger artifact");
+    let ledger: serde_json::Value =
+        serde_json::from_str(&raw).expect("equivalence ledger must be valid JSON");
+    let document_count = ledger
+        .get("document_count")
+        .and_then(|value| value.as_u64())
+        .expect("ledger has integer document_count");
+    assert!(
+        document_count >= reported_conversations as u64,
+        "ledger document_count ({document_count}) should be at least the conversation count \
+         ({reported_conversations}); a single-message fixture still yields one indexed doc"
+    );
+    let manifest_fingerprint = ledger
+        .get("manifest_fingerprint")
+        .and_then(|value| value.as_str())
+        .expect("ledger has string manifest_fingerprint");
+    assert_eq!(
+        manifest_fingerprint.len(),
+        64,
+        "manifest_fingerprint must be a 32-byte blake3 hex digest, got {}",
+        manifest_fingerprint.len()
+    );
+    assert!(
+        manifest_fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+        "manifest_fingerprint must be hex, got {manifest_fingerprint}"
+    );
+    let golden_query_digest = ledger
+        .get("golden_query_digest")
+        .and_then(|value| value.as_str())
+        .expect("ledger has string golden_query_digest");
+    assert_eq!(
+        golden_query_digest.len(),
+        64,
+        "golden_query_digest must be a 32-byte blake3 hex digest"
+    );
+    let probes: Vec<&str> = ledger
+        .get("golden_query_hit_counts")
+        .and_then(|value| value.as_array())
+        .expect("ledger has golden_query_hit_counts array")
+        .iter()
+        .map(|entry| {
+            entry
+                .get("probe")
+                .and_then(|value| value.as_str())
+                .expect("hit entry has probe string")
+        })
+        .collect();
+    assert_eq!(
+        probes,
+        vec!["error", "TODO", "function", "import", "test"],
+        "ledger must record the default probe list in canonical order"
+    );
+
+    // Search readiness: a substring from the seeded content must be
+    // discoverable via `cass search` after the authoritative rebuild, so the
+    // evidence ledger is paired with a user-visible correctness signal.
+    let mut search_cmd = base_cmd(home);
+    search_cmd
+        .args(["search", "equivalence-ledger-alpha", "--data-dir"])
+        .arg(&data_dir);
+    let search_output = search_cmd.output().expect("run cass search");
+    assert!(
+        search_output.status.success(),
+        "search after authoritative rebuild should succeed. stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
+    let search_stdout = String::from_utf8_lossy(&search_output.stdout);
+    assert!(
+        search_stdout.contains("equivalence-ledger-alpha"),
+        "search should surface the seeded content; got stdout:\n{search_stdout}"
+    );
+}
+
+#[test]
+#[serial]
 fn index_json_reports_incremental_lexical_strategy() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
