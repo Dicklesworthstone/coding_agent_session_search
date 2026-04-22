@@ -1159,6 +1159,27 @@ pub enum ModelsCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// Run one bounded semantic backfill batch from the canonical DB
+    Backfill {
+        /// Semantic tier to backfill: fast or quality
+        #[arg(long, default_value = "fast")]
+        tier: String,
+        /// Embedder implementation: hash or fastembed
+        #[arg(long)]
+        embedder: Option<String>,
+        /// Maximum canonical conversations to process in this batch
+        #[arg(long, default_value_t = 64)]
+        batch_conversations: usize,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Override cass DB path
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Remove model files to free disk space
     Remove {
         /// Model to remove (default: all-minilm-l6-v2)
@@ -6136,6 +6157,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::Verify { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Models(ModelsCommand::Backfill { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
@@ -23949,6 +23973,24 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_models_verify(repair, data_dir, structured_format)
         }
+        ModelsCommand::Backfill {
+            tier,
+            embedder,
+            batch_conversations,
+            data_dir,
+            db,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_backfill(
+                &tier,
+                embedder.as_deref(),
+                batch_conversations,
+                data_dir,
+                db,
+                structured_format,
+            )
+        }
         ModelsCommand::Remove {
             model,
             yes,
@@ -24570,6 +24612,219 @@ fn run_models_verify(
                 println!("  cass models install -y");
             }
         }
+    }
+
+    Ok(())
+}
+
+fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_manifest::TierKind> {
+    use crate::search::semantic_manifest::TierKind;
+
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fast" => Ok(TierKind::Fast),
+        "quality" => Ok(TierKind::Quality),
+        other => Err(CliError {
+            code: 2,
+            kind: "usage",
+            message: format!("Unknown semantic tier '{other}'."),
+            hint: Some("Use --tier fast or --tier quality".into()),
+            retryable: false,
+        }),
+    }
+}
+
+fn run_models_backfill(
+    tier_raw: &str,
+    embedder_override: Option<&str>,
+    batch_conversations: usize,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
+    use crate::search::model_download::ModelManifest;
+    use crate::search::semantic_manifest::{SemanticManifest, TierKind};
+    use crate::storage::sqlite::FrankenStorage;
+    use colored::Colorize;
+
+    if batch_conversations == 0 {
+        return Err(CliError {
+            code: 2,
+            kind: "usage",
+            message: "--batch-conversations must be greater than zero".to_string(),
+            hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
+            retryable: false,
+        });
+    }
+
+    let tier = parse_models_backfill_tier(tier_raw)?;
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    if !db_path.is_file() {
+        return Err(CliError {
+            code: 3,
+            kind: "index_missing",
+            message: format!("cass database not found: {}", db_path.display()),
+            hint: Some("Run 'cass index --full' before semantic backfill".into()),
+            retryable: true,
+        });
+    }
+
+    let embedder_type = embedder_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match tier {
+            TierKind::Fast => "hash".to_string(),
+            TierKind::Quality => "fastembed".to_string(),
+        });
+    if !matches!(embedder_type.as_str(), "hash" | "fastembed") {
+        return Err(CliError {
+            code: 20,
+            kind: "model",
+            message: format!("Unknown embedder '{}'.", embedder_type),
+            hint: Some("Use --embedder hash or --embedder fastembed".into()),
+            retryable: false,
+        });
+    }
+
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+        code: 5,
+        kind: "storage",
+        message: format!("Failed to open cass database {}: {e}", db_path.display()),
+        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
+    })?;
+    let db_fingerprint =
+        crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
+            code: 5,
+            kind: "storage_fingerprint",
+            message: format!(
+                "Failed to fingerprint cass database {}: {e}",
+                db_path.display()
+            ),
+            hint: Some("Run 'cass index --full --force-rebuild' if the archive is corrupt".into()),
+            retryable: true,
+        })?;
+    let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
+        code: 5,
+        kind: "semantic_manifest",
+        message: format!("Failed to load semantic manifest: {e}"),
+        hint: Some("Check permissions under the cass data directory".into()),
+        retryable: true,
+    })?;
+    let model_manifest = ModelManifest::minilm_v2();
+    let model_revision = if embedder_type == "hash" {
+        "hash".to_string()
+    } else {
+        model_manifest.revision.clone()
+    };
+    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+        code: 20,
+        kind: "model",
+        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
+        hint: Some(if embedder_type == "fastembed" {
+            "Run 'cass models install -y' or retry with --embedder hash".into()
+        } else {
+            "Use --embedder hash or --embedder fastembed".into()
+        }),
+        retryable: embedder_type == "fastembed",
+    })?;
+
+    let outcome = indexer
+        .run_backfill_from_storage(
+            &storage,
+            &data_dir,
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier,
+                db_fingerprint,
+                model_revision,
+                max_conversations: batch_conversations,
+            },
+        )
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "semantic_backfill",
+            message: format!("Semantic backfill failed: {e}"),
+            hint: Some(
+                "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
+            ),
+            retryable: true,
+        })?;
+
+    let progress_pct = if outcome.total_conversations == 0 {
+        100.0
+    } else {
+        (outcome.conversations_processed as f64 / outcome.total_conversations as f64) * 100.0
+    };
+    let status = if outcome.published {
+        "published"
+    } else if outcome.embedded_docs == 0 {
+        "idle"
+    } else {
+        "checkpointed"
+    };
+    let next_step = if outcome.published {
+        "semantic tier is ready"
+    } else if outcome.embedded_docs == 0 {
+        "no pending canonical conversations for this tier"
+    } else {
+        "rerun the same command to continue the resumable backfill"
+    };
+    let backlog = serde_json::json!({
+        "total_conversations": manifest.backlog.total_conversations,
+        "fast_tier_processed": manifest.backlog.fast_tier_processed,
+        "quality_tier_processed": manifest.backlog.quality_tier_processed,
+        "computed_at_ms": manifest.backlog.computed_at_ms,
+    });
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(_fmt) = structured_format {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "next_step": next_step,
+                "tier": outcome.tier.as_str(),
+                "embedder_id": outcome.embedder_id,
+                "data_dir": data_dir.display().to_string(),
+                "db_path": db_path.display().to_string(),
+                "batch_conversations_limit": batch_conversations,
+                "embedded_docs": outcome.embedded_docs,
+                "conversations_processed": outcome.conversations_processed,
+                "total_conversations": outcome.total_conversations,
+                "progress_pct": progress_pct,
+                "last_offset": outcome.last_offset,
+                "checkpoint_saved": outcome.checkpoint_saved,
+                "published": outcome.published,
+                "index_path": outcome.index_path.display().to_string(),
+                "manifest_path": outcome.manifest_path.display().to_string(),
+                "backlog": backlog,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("{}", "Semantic backfill batch".bold());
+        println!("  Status: {}", status);
+        println!("  Tier: {}", outcome.tier.as_str());
+        println!("  Embedder: {}", outcome.embedder_id);
+        println!("  Embedded docs: {}", outcome.embedded_docs);
+        println!(
+            "  Conversations: {}/{} ({:.1}%)",
+            outcome.conversations_processed, outcome.total_conversations, progress_pct
+        );
+        println!("  Last offset: {}", outcome.last_offset);
+        println!("  Index: {}", outcome.index_path.display());
+        println!("  Manifest: {}", outcome.manifest_path.display());
+        println!();
+        println!("{}", next_step);
     }
 
     Ok(())
@@ -25698,18 +25953,20 @@ mod pages_cli_flag_tests {
         // --include-attachments is not yet implemented (config validation rejects it).
         // The flag is hidden from --help so users don't discover a non-functional feature.
         // It must still parse when explicitly passed for forward-compatible config files.
-        let cmd = Cli::command();
-        let pages_cmd = cmd
-            .find_subcommand("pages")
-            .expect("pages subcommand must exist");
-        let mut help_buf = Vec::new();
-        pages_cmd.clone().write_help(&mut help_buf).unwrap();
-        let help_text = String::from_utf8(help_buf).unwrap();
-        assert!(
-            !help_text.contains("include-attachments"),
-            "--include-attachments should be hidden from pages help until implemented.\nHelp text:\n{}",
-            help_text,
-        );
+        run_on_large_stack(|| {
+            let cmd = Cli::command();
+            let pages_cmd = cmd
+                .find_subcommand("pages")
+                .expect("pages subcommand must exist");
+            let mut help_buf = Vec::new();
+            pages_cmd.clone().write_help(&mut help_buf).unwrap();
+            let help_text = String::from_utf8(help_buf).unwrap();
+            assert!(
+                !help_text.contains("include-attachments"),
+                "--include-attachments should be hidden from pages help until implemented.\nHelp text:\n{}",
+                help_text,
+            );
+        });
     }
 
     #[test]

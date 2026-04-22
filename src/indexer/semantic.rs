@@ -10,6 +10,7 @@ use frankensearch::index::{
     Quantization as FsQuantization, VectorIndex as FsVectorIndex,
     VectorIndexWriter as FsVectorIndexWriter,
 };
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
@@ -21,7 +22,10 @@ use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
 use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, TierKind,
 };
-use crate::search::vector_index::{ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, vector_index_path};
+use crate::search::vector_index::{
+    ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, role_code_from_str, vector_index_path,
+};
+use crate::storage::sqlite::FrankenStorage;
 
 /// Default embedder batch size. 128 is a sweet spot for ONNX MiniLM models on
 /// modern CPUs: big enough to amortize dispatch overhead and keep the tensor
@@ -112,11 +116,21 @@ pub struct SemanticBackfillBatchPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct SemanticBackfillStoragePlan {
+    pub tier: TierKind,
+    pub db_fingerprint: String,
+    pub model_revision: String,
+    pub max_conversations: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct SemanticBackfillBatchOutcome {
     pub tier: TierKind,
+    pub embedder_id: String,
     pub embedded_docs: u64,
     pub conversations_processed: u64,
     pub total_conversations: u64,
+    pub last_offset: i64,
     pub checkpoint_saved: bool,
     pub published: bool,
     pub index_path: PathBuf,
@@ -185,6 +199,181 @@ fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
         content_hash: Some(embedded.content_hash),
     }
     .to_doc_id_string()
+}
+
+struct CanonicalEmbeddingRow {
+    conversation_id: i64,
+    message_id: i64,
+    created_at: Option<i64>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    source_id: Option<String>,
+    role: String,
+    content: String,
+}
+
+struct CanonicalEmbeddingBatch {
+    inputs: Vec<EmbeddingInput>,
+    conversations_in_batch: u64,
+    last_conversation_id: i64,
+    total_conversations: u64,
+}
+
+fn matching_semantic_checkpoint_offset(
+    manifest: &SemanticManifest,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> i64 {
+    manifest
+        .checkpoint
+        .as_ref()
+        .filter(|checkpoint| {
+            checkpoint.tier == tier
+                && checkpoint.embedder_id == embedder_id
+                && checkpoint.is_valid(db_fingerprint)
+        })
+        .map_or(0, |checkpoint| checkpoint.last_offset)
+}
+
+fn total_semantic_conversations(storage: &FrankenStorage) -> Result<u64> {
+    let count: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(DISTINCT m.conversation_id)
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| "counting canonical conversations with semantic messages")?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+}
+
+fn message_id_from_db(raw: i64) -> Option<u64> {
+    u64::try_from(raw).ok()
+}
+
+fn saturating_u32_from_i64(raw: i64) -> u32 {
+    match u32::try_from(raw) {
+        Ok(value) => value,
+        Err(_) if raw.is_negative() => 0,
+        Err(_) => u32::MAX,
+    }
+}
+
+fn embedding_input_from_row(row: CanonicalEmbeddingRow) -> Option<EmbeddingInput> {
+    let Some(message_id) = message_id_from_db(row.message_id) else {
+        tracing::warn!(
+            raw_message_id = row.message_id,
+            "skipping out-of-range id during semantic backfill"
+        );
+        return None;
+    };
+    let source_id = row.source_id.unwrap_or_else(|| "local".to_string());
+    Some(EmbeddingInput {
+        message_id,
+        created_at_ms: row.created_at.unwrap_or(0),
+        agent_id: saturating_u32_from_i64(row.agent_id),
+        workspace_id: saturating_u32_from_i64(row.workspace_id.unwrap_or(0)),
+        source_id: crc32fast::hash(source_id.as_bytes()),
+        role: role_code_from_str(&row.role).unwrap_or(ROLE_USER),
+        chunk_idx: 0,
+        content: row.content,
+    })
+}
+
+fn fetch_canonical_embedding_batch(
+    storage: &FrankenStorage,
+    after_conversation_id: i64,
+    max_conversations: usize,
+) -> Result<CanonicalEmbeddingBatch> {
+    let total_conversations = total_semantic_conversations(storage)?;
+    let max_conversations_i64 = i64::try_from(max_conversations.max(1)).unwrap_or(i64::MAX);
+    let conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT DISTINCT m.conversation_id
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.conversation_id > ?1
+             ORDER BY m.conversation_id ASC
+             LIMIT ?2",
+            &[
+                ParamValue::from(after_conversation_id),
+                ParamValue::from(max_conversations_i64),
+            ],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!("fetching semantic backfill conversation ids after {after_conversation_id}")
+        })?;
+
+    if conversation_ids.is_empty() {
+        return Ok(CanonicalEmbeddingBatch {
+            inputs: Vec::new(),
+            conversations_in_batch: 0,
+            last_conversation_id: after_conversation_id,
+            total_conversations,
+        });
+    }
+
+    let mut sql = String::from(
+        "SELECT c.id, m.id, m.created_at, COALESCE(c.agent_id, 0), c.workspace_id, c.source_id, m.role, m.content
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         WHERE c.id IN (",
+    );
+    let mut params = Vec::with_capacity(conversation_ids.len());
+    for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("?{}", idx + 1));
+        params.push(ParamValue::from(*conversation_id));
+    }
+    sql.push_str(") ORDER BY c.id ASC, m.idx ASC, m.id ASC");
+
+    let rows: Vec<CanonicalEmbeddingRow> = storage
+        .raw()
+        .query_map_collect(&sql, &params, |row| {
+            Ok(CanonicalEmbeddingRow {
+                conversation_id: row.get_typed(0)?,
+                message_id: row.get_typed(1)?,
+                created_at: row.get_typed(2)?,
+                agent_id: row.get_typed(3)?,
+                workspace_id: row.get_typed(4)?,
+                source_id: row.get_typed(5)?,
+                role: row.get_typed(6)?,
+                content: row.get_typed(7)?,
+            })
+        })
+        .with_context(|| {
+            format!(
+                "fetching semantic backfill messages for {} conversations",
+                conversation_ids.len()
+            )
+        })?;
+
+    let mut conversations_in_batch = 0_u64;
+    let mut last_seen_conversation_id = None;
+    let mut inputs = Vec::with_capacity(rows.len());
+    for row in rows {
+        if last_seen_conversation_id != Some(row.conversation_id) {
+            conversations_in_batch = conversations_in_batch.saturating_add(1);
+            last_seen_conversation_id = Some(row.conversation_id);
+        }
+        if let Some(input) = embedding_input_from_row(row) {
+            inputs.push(input);
+        }
+    }
+
+    Ok(CanonicalEmbeddingBatch {
+        inputs,
+        conversations_in_batch,
+        last_conversation_id: *conversation_ids.last().unwrap_or(&after_conversation_id),
+        total_conversations,
+    })
 }
 
 struct Prepared<'a> {
@@ -607,14 +796,49 @@ impl SemanticIndexer {
 
         Ok(SemanticBackfillBatchOutcome {
             tier: plan.tier,
+            embedder_id: self.embedder_id().to_string(),
             embedded_docs,
             conversations_processed,
             total_conversations: plan.total_conversations,
+            last_offset: plan.last_offset,
             checkpoint_saved: !complete,
             published: complete,
             index_path: if complete { final_path } else { staging_path },
             manifest_path,
         })
+    }
+
+    pub fn run_backfill_from_storage(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        let after_conversation_id = matching_semantic_checkpoint_offset(
+            manifest,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        );
+        let batch = fetch_canonical_embedding_batch(
+            storage,
+            after_conversation_id,
+            plan.max_conversations,
+        )?;
+        self.run_backfill_batch(
+            &batch.inputs,
+            data_dir,
+            manifest,
+            SemanticBackfillBatchPlan {
+                tier: plan.tier,
+                db_fingerprint: plan.db_fingerprint,
+                model_revision: plan.model_revision,
+                total_conversations: batch.total_conversations,
+                conversations_in_batch: batch.conversations_in_batch,
+                last_offset: batch.last_conversation_id,
+            },
+        )
     }
 
     /// Build and save an HNSW index for approximate nearest neighbor search.
@@ -671,7 +895,37 @@ impl SemanticIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::sqlite::FrankenStorage;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    fn test_conversation(external_id: &str, body: &str) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some(external_id.to_string()),
+            title: Some(format!("semantic {external_id}")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_001_000),
+            approx_tokens: None,
+            metadata_json: json!({}),
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000_500),
+                content: body.to_string(),
+                extra_json: json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: "local".to_string(),
+            origin_host: None,
+        }
+    }
 
     #[test]
     fn test_batch_embedding() {
@@ -944,6 +1198,73 @@ mod tests {
         let loaded = SemanticManifest::load(temp.path()).unwrap().unwrap();
         assert!(loaded.checkpoint.is_none());
         assert!(loaded.fast_tier.as_ref().is_some_and(|record| record.ready));
+    }
+
+    #[test]
+    fn backfill_from_storage_fetches_canonical_batches_and_resumes() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("first", "first canonical semantic message"),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("second", "second canonical semantic message"),
+        )?;
+
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None)?;
+
+        let first = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: "canonical-db-fp".to_string(),
+                model_revision: "hash".to_string(),
+                max_conversations: 1,
+            },
+        )?;
+        assert!(!first.published);
+        assert!(first.checkpoint_saved);
+        assert_eq!(first.conversations_processed, 1);
+        assert_eq!(first.total_conversations, 2);
+        assert_eq!(first.embedded_docs, 1);
+        assert!(first.last_offset > 0);
+
+        let second = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: "canonical-db-fp".to_string(),
+                model_revision: "hash".to_string(),
+                max_conversations: 1,
+            },
+        )?;
+        assert!(second.published);
+        assert!(!second.checkpoint_saved);
+        assert_eq!(second.conversations_processed, 2);
+        assert_eq!(second.embedded_docs, 1);
+        assert!(manifest.checkpoint.is_none());
+        assert_eq!(
+            manifest.fast_tier.as_ref().map(|record| record.doc_count),
+            Some(2)
+        );
+        Ok(())
     }
 
     #[test]
