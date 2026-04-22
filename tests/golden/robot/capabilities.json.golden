@@ -1,28 +1,7 @@
 {
-  "api_version": 1,
-  "connectors": [
-    "codex",
-    "claude_code",
-    "gemini",
-    "clawdbot",
-    "vibe",
-    "opencode",
-    "amp",
-    "cline",
-    "aider",
-    "cursor",
-    "chatgpt",
-    "pi_agent",
-    "factory",
-    "openclaw",
-    "kimi",
-    "copilot",
-    "copilot_cli",
-    "qwen",
-    "crush"
-  ],
-  "contract_version": "1",
   "crate_version": "[VERSION]",
+  "api_version": 1,
+  "contract_version": "1",
   "features": [
     "json_output",
     "jsonl_output",
@@ -47,10 +26,31 @@
     "timeline_command",
     "highlight_matches"
   ],
+  "connectors": [
+    "codex",
+    "claude_code",
+    "gemini",
+    "clawdbot",
+    "vibe",
+    "opencode",
+    "amp",
+    "cline",
+    "aider",
+    "cursor",
+    "chatgpt",
+    "pi_agent",
+    "factory",
+    "openclaw",
+    "kimi",
+    "copilot",
+    "copilot_cli",
+    "qwen",
+    "crush"
+  ],
   "limits": {
-    "max_agg_buckets": 10,
+    "max_limit": 0,
     "max_content_length": 0,
     "max_fields": 50,
-    "max_limit": 0
+    "max_agg_buckets": 10
   }
 }
