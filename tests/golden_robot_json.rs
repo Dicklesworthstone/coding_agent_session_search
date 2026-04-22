@@ -122,30 +122,45 @@ fn assert_golden(name: &str, actual: &str) {
     }
 }
 
+/// Capture stdout of `cass <args>` in the isolated test home and return
+/// the scrubbed canonical-JSON form (keys-sorted by serde_json's default
+/// `BTreeMap` insertion preservation, pretty-printed, dynamic values
+/// scrubbed). Returns the parsed-then-reserialized string so the golden
+/// survives whitespace drift.
+fn capture_robot_json(test_home: &std::path::Path, args: &[&str]) -> String {
+    let output = cass_cmd(test_home)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("run cass {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "cass {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("cass {args:?} stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    scrub_robot_json(&canonical, test_home)
+}
+
 #[test]
 fn capabilities_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let output = cass_cmd(test_home.path())
-        .args(["capabilities", "--json"])
-        .output()
-        .expect("run cass capabilities --json");
-
-    assert!(
-        output.status.success(),
-        "cass capabilities --json exited non-zero: status={:?}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
-    // Fail fast if the output is not valid JSON — a golden on invalid JSON
-    // would lock in the failure.
-    let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).expect("capabilities --json emits valid JSON");
-    // Re-serialize with stable ordering and 2-space indent so drift on
-    // whitespace / key order is not shape drift.
-    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
-    let scrubbed = scrub_robot_json(&canonical, test_home.path());
-
+    let scrubbed = capture_robot_json(test_home.path(), &["capabilities", "--json"]);
     assert_golden("robot/capabilities.json.golden", &scrubbed);
+}
+
+#[test]
+fn models_status_json_matches_golden() {
+    // `cass models status --json` reads XDG_DATA_HOME for the model cache
+    // directory. In our isolated test home the cache is always empty, so
+    // the output is deterministic: state=not_installed across every field.
+    // Absolute paths inside the payload (`model_dir`, `files[].actual_path`)
+    // get scrubbed by `scrub_robot_json` → `[TEST_HOME]` prefix.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(test_home.path(), &["models", "status", "--json"]);
+    assert_golden("robot/models_status.json.golden", &scrubbed);
 }

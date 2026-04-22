@@ -1,0 +1,80 @@
+{
+  "model_id": "all-minilm-l6-v2",
+  "model_dir": "[TEST_HOME]/coding-agent-search/models/all-MiniLM-L6-v2",
+  "installed": false,
+  "state": "not_acquired",
+  "state_detail": "model not acquired (user consent required); missing model.onnx, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+  "next_step": "Run `cass models install`, or keep using lexical search.",
+  "lexical_fail_open": true,
+  "revision": "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+  "license": "Apache-2.0",
+  "total_size_bytes": 90872535,
+  "installed_size_bytes": 0,
+  "observed_file_bytes": 0,
+  "policy_source": "semantic_policy",
+  "cache_lifecycle": {
+    "model_id": "all-minilm-l6-v2",
+    "model_dir": "[TEST_HOME]/coding-agent-search/models/all-MiniLM-L6-v2",
+    "state": {
+      "state": "not_acquired",
+      "missing_files": [
+        "model.onnx",
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json"
+      ],
+      "needs_consent": true
+    },
+    "required_size_bytes": 90872535,
+    "installed_size_bytes": 0,
+    "policy_source": "semantic_policy"
+  },
+  "files": [
+    {
+      "name": "onnx/model.onnx",
+      "local_name": "model.onnx",
+      "actual_path": null,
+      "expected_size": 90405214,
+      "actual_size": 0,
+      "exists": false,
+      "size_match": false
+    },
+    {
+      "name": "tokenizer.json",
+      "local_name": "tokenizer.json",
+      "actual_path": null,
+      "expected_size": 466247,
+      "actual_size": 0,
+      "exists": false,
+      "size_match": false
+    },
+    {
+      "name": "config.json",
+      "local_name": "config.json",
+      "actual_path": null,
+      "expected_size": 612,
+      "actual_size": 0,
+      "exists": false,
+      "size_match": false
+    },
+    {
+      "name": "special_tokens_map.json",
+      "local_name": "special_tokens_map.json",
+      "actual_path": null,
+      "expected_size": 112,
+      "actual_size": 0,
+      "exists": false,
+      "size_match": false
+    },
+    {
+      "name": "tokenizer_config.json",
+      "local_name": "tokenizer_config.json",
+      "actual_path": null,
+      "expected_size": 350,
+      "actual_size": 0,
+      "exists": false,
+      "size_match": false
+    }
+  ]
+}
