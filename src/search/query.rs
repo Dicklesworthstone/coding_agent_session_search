@@ -1454,19 +1454,42 @@ fn stable_hit_hash(
 
 fn search_hit_key_doc_id(key: &SearchHitKey) -> String {
     // Unit Separator (0x1F) is extremely unlikely in filesystem paths/ids.
-    let sep = '\u{1f}';
-    format!(
-        "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
-        key.source_id,
-        key.source_path,
-        key.conversation_id
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        key.title,
-        key.line_number.map(|v| v.to_string()).unwrap_or_default(),
-        key.created_at.map(|v| v.to_string()).unwrap_or_default(),
-        key.content_hash,
-    )
+    // Bead num7z: build the stable dedup key directly into a pre-sized
+    // String, branching on each Option instead of allocating throwaway
+    // per-field Strings via `.map(|v| v.to_string())`. Output must stay
+    // byte-identical to the prior `format!`-based implementation: empty
+    // string for `None` optional fields, the integer's `Display` rendering
+    // otherwise, all joined by 0x1F.
+    use std::fmt::Write as _;
+    const SEP: char = '\u{1f}';
+    // 20 bytes covers the decimal rendering of any i64/usize/u64.
+    let capacity = key.source_id.len()
+        + key.source_path.len()
+        + key.title.len()
+        + 6 // six separators
+        + 3 * 20 // three possibly-empty i64/usize fields
+        + 20; // content_hash u64
+    let mut out = String::with_capacity(capacity);
+    out.push_str(&key.source_id);
+    out.push(SEP);
+    out.push_str(&key.source_path);
+    out.push(SEP);
+    if let Some(v) = key.conversation_id {
+        let _ = write!(out, "{v}");
+    }
+    out.push(SEP);
+    out.push_str(&key.title);
+    out.push(SEP);
+    if let Some(v) = key.line_number {
+        let _ = write!(out, "{v}");
+    }
+    out.push(SEP);
+    if let Some(v) = key.created_at {
+        let _ = write!(out, "{v}");
+    }
+    out.push(SEP);
+    let _ = write!(out, "{}", key.content_hash);
+    out
 }
 
 fn search_hit_doc_id(hit: &SearchHit) -> String {
@@ -6819,6 +6842,89 @@ mod tests {
     use frankensqlite::compat::ParamValue;
     use serde_json::json;
     use tempfile::TempDir;
+
+    // Reference implementation of the stable dedup key prior to bead num7z.
+    // Kept in tests so the optimized `search_hit_key_doc_id` is pinned to
+    // byte-identical output; any drift trips this assertion.
+    fn search_hit_key_doc_id_reference_v0(key: &SearchHitKey) -> String {
+        let sep = '\u{1f}';
+        format!(
+            "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{}",
+            key.source_id,
+            key.source_path,
+            key.conversation_id
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            key.title,
+            key.line_number.map(|v| v.to_string()).unwrap_or_default(),
+            key.created_at.map(|v| v.to_string()).unwrap_or_default(),
+            key.content_hash,
+        )
+    }
+
+    #[test]
+    fn search_hit_key_doc_id_matches_reference_byte_for_byte() {
+        let fixtures = [
+            SearchHitKey {
+                source_id: "local".into(),
+                source_path: "/tmp/path.jsonl".into(),
+                conversation_id: Some(42),
+                title: "Demo chat".into(),
+                line_number: Some(7),
+                created_at: Some(1_700_000_000_000),
+                content_hash: 0xdead_beef_u64,
+            },
+            SearchHitKey {
+                source_id: "ssh:host".into(),
+                source_path: "/remote/path with spaces.jsonl".into(),
+                conversation_id: None,
+                title: String::new(),
+                line_number: None,
+                created_at: None,
+                content_hash: 0,
+            },
+            SearchHitKey {
+                source_id: String::new(),
+                source_path: String::new(),
+                conversation_id: Some(i64::MIN),
+                title: "unicode title — héllo".into(),
+                line_number: Some(usize::MAX),
+                created_at: Some(i64::MAX),
+                content_hash: u64::MAX,
+            },
+            SearchHitKey {
+                source_id: "a".into(),
+                source_path: "b".into(),
+                conversation_id: Some(0),
+                title: "c".into(),
+                line_number: Some(0),
+                created_at: Some(0),
+                content_hash: 0,
+            },
+            SearchHitKey {
+                source_id: "with\u{1f}separator".into(),
+                source_path: "with\u{1f}separator".into(),
+                conversation_id: Some(-1),
+                title: "with\u{1f}separator".into(),
+                line_number: None,
+                created_at: Some(-1),
+                content_hash: 1,
+            },
+        ];
+        for (idx, key) in fixtures.iter().enumerate() {
+            let optimized = search_hit_key_doc_id(key);
+            let reference = search_hit_key_doc_id_reference_v0(key);
+            assert_eq!(
+                optimized, reference,
+                "fixture {idx} produced divergent doc_id; byte-exact dedup key is a contract"
+            );
+            assert_eq!(
+                optimized.matches('\u{1f}').count(),
+                6,
+                "fixture {idx} must contain exactly six 0x1F separators; got {optimized:?}"
+            );
+        }
+    }
 
     #[derive(Debug)]
     struct FixedTestEmbedder {
