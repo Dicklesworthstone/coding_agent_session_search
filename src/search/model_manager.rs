@@ -16,7 +16,10 @@ use std::sync::Arc;
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::model_download::{ModelManifest, ModelState, check_version_mismatch};
+use crate::search::model_download::{
+    ModelAcquisitionPolicy, ModelCacheState, ModelManifest, classify_model_cache,
+};
+use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 use crate::search::vector_index::{
     ROLE_ASSISTANT, ROLE_USER, SemanticFilterMaps, VectorIndex, vector_index_path,
 };
@@ -359,35 +362,121 @@ fn load_semantic_context_inner(
     check_for_updates: bool,
 ) -> SemanticSetup {
     let model_dir = FastEmbedder::default_model_dir(data_dir);
-    let missing_files = FastEmbedder::required_model_files()
-        .iter()
-        .filter(|name| !model_dir.join(*name).is_file())
-        .map(|name| (*name).to_string())
-        .collect::<Vec<_>>();
+    let manifest = ModelManifest::minilm_v2();
+    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
+    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    if !missing_files.is_empty() {
-        return SemanticSetup {
-            availability: SemanticAvailability::ModelMissing {
-                model_dir,
-                missing_files,
-            },
-            context: None,
-        };
-    }
-
-    // Check for model version mismatch
-    if check_for_updates {
-        let manifest = ModelManifest::minilm_v2();
-        if let Some(ModelState::UpdateAvailable {
+    match &cache_report.state {
+        ModelCacheState::Acquired { .. }
+        | ModelCacheState::PreseededLocal { .. }
+        | ModelCacheState::MirrorSourced { .. } => {}
+        ModelCacheState::IncompatibleVersion {
             current_revision,
-            latest_revision,
-        }) = check_version_mismatch(&model_dir, &manifest)
-        {
+            expected_revision,
+        } if check_for_updates => {
             return SemanticSetup {
                 availability: SemanticAvailability::UpdateAvailable {
                     embedder_id: FastEmbedder::embedder_id_static().to_string(),
-                    current_revision,
-                    latest_revision,
+                    current_revision: current_revision.clone(),
+                    latest_revision: expected_revision.clone(),
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::IncompatibleVersion { .. } => {}
+        ModelCacheState::NotAcquired {
+            missing_files,
+            needs_consent,
+        } => {
+            let availability = if *needs_consent {
+                SemanticAvailability::NeedsConsent
+            } else {
+                SemanticAvailability::ModelMissing {
+                    model_dir: model_dir.clone(),
+                    missing_files: missing_files.clone(),
+                }
+            };
+            return SemanticSetup {
+                availability,
+                context: None,
+            };
+        }
+        ModelCacheState::Acquiring {
+            bytes_present,
+            total_bytes,
+            ..
+        } => {
+            let progress_pct = if *total_bytes == 0 {
+                0
+            } else {
+                ((*bytes_present as f64 / *total_bytes as f64) * 100.0).min(100.0) as u8
+            };
+            return SemanticSetup {
+                availability: SemanticAvailability::Downloading {
+                    progress_pct,
+                    bytes_downloaded: *bytes_present,
+                    total_bytes: *total_bytes,
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::ChecksumMismatch {
+            file,
+            expected,
+            actual,
+        } => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!(
+                        "model checksum mismatch for {file}: expected {expected}, got {actual}"
+                    ),
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::DisabledByPolicy { reason } => {
+            return SemanticSetup {
+                availability: SemanticAvailability::Disabled {
+                    reason: reason.clone(),
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::BudgetBlocked {
+            required_bytes,
+            max_bytes,
+        } => {
+            return SemanticSetup {
+                availability: SemanticAvailability::Disabled {
+                    reason: format!(
+                        "semantic model requires {required_bytes} bytes but policy allows {max_bytes}"
+                    ),
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::QuarantinedCorrupt {
+            marker_path,
+            reason,
+        } => {
+            return SemanticSetup {
+                availability: SemanticAvailability::LoadFailed {
+                    context: format!(
+                        "model cache quarantined at {}: {reason}",
+                        marker_path.display()
+                    ),
+                },
+                context: None,
+            };
+        }
+        ModelCacheState::OfflineBlocked { missing_files } => {
+            return SemanticSetup {
+                availability: SemanticAvailability::Disabled {
+                    reason: format!(
+                        "offline and semantic model is not acquired: missing {}",
+                        missing_files.join(", ")
+                    ),
                 },
                 context: None,
             };

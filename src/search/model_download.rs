@@ -29,8 +29,11 @@ use std::time::{Duration, Instant};
 
 use asupersync::bytes::Buf;
 use asupersync::http::Body;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+
+use crate::search::policy::{ModelDownloadPolicy, SemanticPolicy};
 
 /// Model state machine for download lifecycle.
 ///
@@ -116,6 +119,161 @@ impl ModelState {
             }
             ModelState::Cancelled => "cancelled".into(),
         }
+    }
+}
+
+/// Policy inputs that constrain semantic model acquisition.
+///
+/// This is intentionally local and explicit: callers can construct it from the
+/// resolved semantic policy, CLI flags, test fixtures, or future persisted
+/// config without hiding why acquisition is blocked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAcquisitionPolicy {
+    /// Whether semantic model acquisition is enabled at all.
+    pub downloads_enabled: bool,
+    /// Whether a missing model requires explicit user consent before fetching.
+    pub requires_consent: bool,
+    /// Whether network acquisition is unavailable because the host is offline.
+    pub offline: bool,
+    /// Whether the current network is metered.
+    pub metered: bool,
+    /// Whether acquisition may proceed on a metered network.
+    pub allow_metered: bool,
+    /// Maximum allowed size for this model download.
+    pub max_model_bytes: Option<u64>,
+    /// Optional mirror source selected for acquisition.
+    pub mirror_base_url: Option<String>,
+    /// Human-readable provenance for the active policy.
+    pub config_source: String,
+}
+
+impl Default for ModelAcquisitionPolicy {
+    fn default() -> Self {
+        Self {
+            downloads_enabled: true,
+            requires_consent: true,
+            offline: false,
+            metered: false,
+            allow_metered: false,
+            max_model_bytes: None,
+            mirror_base_url: None,
+            config_source: "compiled_default".to_string(),
+        }
+    }
+}
+
+impl ModelAcquisitionPolicy {
+    /// Build acquisition constraints from the resolved semantic policy.
+    pub fn from_semantic_policy(policy: &SemanticPolicy) -> Self {
+        const MIB: u64 = 1_048_576;
+
+        Self {
+            downloads_enabled: policy.mode.should_build_semantic(),
+            requires_consent: matches!(policy.download_policy, ModelDownloadPolicy::OptIn),
+            max_model_bytes: Some(policy.max_model_size_mb.saturating_mul(MIB)),
+            config_source: "semantic_policy".to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Precise on-disk semantic model cache state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ModelCacheState {
+    /// Required files are absent or incomplete.
+    NotAcquired {
+        /// Missing manifest files, expressed as local filenames.
+        missing_files: Vec<String>,
+        /// Whether the next acquisition step is consent rather than download.
+        needs_consent: bool,
+    },
+    /// A staged/resumable acquisition is present.
+    Acquiring {
+        staging_dir: PathBuf,
+        bytes_present: u64,
+        total_bytes: u64,
+    },
+    /// All files are installed, verified, and revision-compatible.
+    Acquired { model_dir: PathBuf },
+    /// At least one file exists but its checksum does not match the manifest.
+    ChecksumMismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
+    /// Files are complete, but the installed revision does not match the manifest.
+    IncompatibleVersion {
+        current_revision: String,
+        expected_revision: String,
+    },
+    /// Semantic model acquisition is disabled by user or policy.
+    DisabledByPolicy { reason: String },
+    /// The model exceeds the active byte budget.
+    BudgetBlocked { required_bytes: u64, max_bytes: u64 },
+    /// A previous corrupt cache has been quarantined.
+    QuarantinedCorrupt {
+        marker_path: PathBuf,
+        reason: String,
+    },
+    /// Files were preseeded locally and verified without a cass marker.
+    PreseededLocal { model_dir: PathBuf },
+    /// Files were acquired from a configured mirror and verified.
+    MirrorSourced {
+        model_dir: PathBuf,
+        mirror_base_url: String,
+    },
+    /// Acquisition is needed, but the host is offline.
+    OfflineBlocked { missing_files: Vec<String> },
+}
+
+impl ModelCacheState {
+    /// Stable machine-readable state code.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotAcquired { .. } => "not_acquired",
+            Self::Acquiring { .. } => "acquiring",
+            Self::Acquired { .. } => "acquired",
+            Self::ChecksumMismatch { .. } => "checksum_mismatch",
+            Self::IncompatibleVersion { .. } => "incompatible_version",
+            Self::DisabledByPolicy { .. } => "disabled_by_policy",
+            Self::BudgetBlocked { .. } => "budget_blocked",
+            Self::QuarantinedCorrupt { .. } => "quarantined_corrupt",
+            Self::PreseededLocal { .. } => "preseeded_local",
+            Self::MirrorSourced { .. } => "mirror_sourced",
+            Self::OfflineBlocked { .. } => "offline_blocked",
+        }
+    }
+
+    /// Whether the installed files can be used by the embedder immediately.
+    pub fn is_usable(&self) -> bool {
+        matches!(
+            self,
+            Self::Acquired { .. } | Self::PreseededLocal { .. } | Self::MirrorSourced { .. }
+        )
+    }
+}
+
+/// Machine-readable report for semantic model cache lifecycle decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCacheReport {
+    pub model_id: String,
+    pub model_dir: PathBuf,
+    pub state: ModelCacheState,
+    pub required_size_bytes: u64,
+    pub installed_size_bytes: u64,
+    pub policy_source: String,
+}
+
+impl ModelCacheReport {
+    /// Stable machine-readable state code.
+    pub fn state_code(&self) -> &'static str {
+        self.state.code()
+    }
+
+    /// Whether the model cache can be used by semantic search.
+    pub fn is_usable(&self) -> bool {
+        self.state.is_usable()
     }
 }
 
@@ -1009,7 +1167,7 @@ impl ModelDownloader {
         self.atomic_install()?;
 
         // Write verified marker
-        self.write_verified_marker(manifest)?;
+        self.write_verified_marker(manifest, mirror_base_url)?;
 
         Ok(())
     }
@@ -1283,12 +1441,20 @@ impl ModelDownloader {
     }
 
     /// Write .verified marker file.
-    fn write_verified_marker(&self, manifest: &ModelManifest) -> Result<(), DownloadError> {
+    fn write_verified_marker(
+        &self,
+        manifest: &ModelManifest,
+        mirror_base_url: Option<&str>,
+    ) -> Result<(), DownloadError> {
         let marker_path = self.target_dir.join(".verified");
+        let source = mirror_base_url
+            .map(|url| format!("mirror:{url}"))
+            .unwrap_or_else(|| "registry".to_string());
         let content = format!(
-            "revision={}\nverified_at={}\n",
+            "revision={}\nverified_at={}\nsource={}\n",
             manifest.revision,
-            chrono::Utc::now().to_rfc3339()
+            chrono::Utc::now().to_rfc3339(),
+            source
         );
         let temp_path = unique_model_temp_path(&marker_path);
         let mut file = File::create(&temp_path)?;
@@ -1338,6 +1504,155 @@ pub fn compute_sha256(path: &Path) -> Result<String, DownloadError> {
     Ok(hex::encode(hash))
 }
 
+/// Classify the local semantic model cache without performing network I/O.
+///
+/// This is the central fail-open lifecycle gate for semantic quality assets:
+/// it reports why quality semantic search is unavailable without changing the
+/// lexical search path.
+pub fn classify_model_cache(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    policy: &ModelAcquisitionPolicy,
+) -> ModelCacheReport {
+    let required_size_bytes = manifest.total_size();
+    let installed_size_bytes = installed_manifest_size(model_dir, manifest);
+    let missing_files = missing_manifest_files(model_dir, manifest);
+    let state = classify_model_cache_state(model_dir, manifest, policy, &missing_files);
+
+    ModelCacheReport {
+        model_id: manifest.id.clone(),
+        model_dir: model_dir.to_path_buf(),
+        state,
+        required_size_bytes,
+        installed_size_bytes,
+        policy_source: policy.config_source.clone(),
+    }
+}
+
+fn classify_model_cache_state(
+    model_dir: &Path,
+    manifest: &ModelManifest,
+    policy: &ModelAcquisitionPolicy,
+    missing_files: &[String],
+) -> ModelCacheState {
+    if !policy.downloads_enabled {
+        return ModelCacheState::DisabledByPolicy {
+            reason: "semantic model downloads disabled by policy".to_string(),
+        };
+    }
+
+    let quarantine_marker = model_dir.join(".quarantined");
+    if quarantine_marker.is_file() {
+        let reason = fs::read_to_string(&quarantine_marker)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "model cache quarantined after integrity failure".to_string());
+        return ModelCacheState::QuarantinedCorrupt {
+            marker_path: quarantine_marker,
+            reason,
+        };
+    }
+
+    let staging_dir = model_download_temp_dir(model_dir);
+    if staging_dir.is_dir() {
+        return ModelCacheState::Acquiring {
+            bytes_present: directory_size_bytes(&staging_dir),
+            staging_dir,
+            total_bytes: manifest.total_size(),
+        };
+    }
+
+    if !missing_files.is_empty() {
+        if policy.offline {
+            return ModelCacheState::OfflineBlocked {
+                missing_files: missing_files.to_vec(),
+            };
+        }
+
+        if policy.metered && !policy.allow_metered {
+            return ModelCacheState::DisabledByPolicy {
+                reason: "metered network disallows model acquisition".to_string(),
+            };
+        }
+
+        if let Some(max_bytes) = policy.max_model_bytes
+            && manifest.total_size() > max_bytes
+        {
+            return ModelCacheState::BudgetBlocked {
+                required_bytes: manifest.total_size(),
+                max_bytes,
+            };
+        }
+
+        return ModelCacheState::NotAcquired {
+            missing_files: missing_files.to_vec(),
+            needs_consent: policy.requires_consent,
+        };
+    }
+
+    for file in &manifest.files {
+        let Some(path) = manifest_file_path(model_dir, file) else {
+            continue;
+        };
+        match compute_sha256(&path) {
+            Ok(actual) if actual == file.sha256 => {}
+            Ok(actual) => {
+                return ModelCacheState::ChecksumMismatch {
+                    file: file.local_name().to_string(),
+                    expected: file.sha256.clone(),
+                    actual,
+                };
+            }
+            Err(err) => {
+                return ModelCacheState::QuarantinedCorrupt {
+                    marker_path: path,
+                    reason: format!("unable to hash model file {}: {err}", file.local_name()),
+                };
+            }
+        }
+    }
+
+    let verified_marker = model_dir.join(".verified");
+    if !verified_marker.is_file() {
+        return ModelCacheState::PreseededLocal {
+            model_dir: model_dir.to_path_buf(),
+        };
+    }
+
+    let marker = match fs::read_to_string(&verified_marker) {
+        Ok(marker) => marker,
+        Err(err) => {
+            return ModelCacheState::QuarantinedCorrupt {
+                marker_path: verified_marker,
+                reason: format!("unable to read verified marker: {err}"),
+            };
+        }
+    };
+
+    let current_revision =
+        marker_field(&marker, "revision").unwrap_or_else(|| "<unknown>".to_string());
+    if current_revision != manifest.revision {
+        return ModelCacheState::IncompatibleVersion {
+            current_revision,
+            expected_revision: manifest.revision.clone(),
+        };
+    }
+
+    match marker_field(&marker, "source") {
+        Some(source) if source == "preseeded_local" => ModelCacheState::PreseededLocal {
+            model_dir: model_dir.to_path_buf(),
+        },
+        Some(source) if source.starts_with("mirror:") => ModelCacheState::MirrorSourced {
+            model_dir: model_dir.to_path_buf(),
+            mirror_base_url: source.trim_start_matches("mirror:").to_string(),
+        },
+        _ => ModelCacheState::Acquired {
+            model_dir: model_dir.to_path_buf(),
+        },
+    }
+}
+
 /// Check if a model is installed and verified.
 pub fn check_model_installed(model_dir: &Path) -> ModelState {
     if !model_dir.is_dir() {
@@ -1349,16 +1664,12 @@ pub fn check_model_installed(model_dir: &Path) -> ModelState {
         return ModelState::NotInstalled;
     }
 
-    // Check if all required files exist
-    let required = [
-        "model.onnx",
-        "tokenizer.json",
-        "config.json",
-        "special_tokens_map.json",
-        "tokenizer_config.json",
-    ];
-    for file in required {
-        if !model_dir.join(file).is_file() {
+    // Check if all required files exist. Accept either the canonical repo path
+    // (for preseeded HuggingFace layouts) or the flat local name used by the
+    // downloader and air-gap installer.
+    let manifest = ModelManifest::minilm_v2();
+    for file in &manifest.files {
+        if manifest_file_path(model_dir, file).is_none() {
             return ModelState::NotInstalled;
         }
     }
@@ -1388,6 +1699,80 @@ pub fn check_version_mismatch(model_dir: &Path, manifest: &ModelManifest) -> Opt
     } else {
         None
     }
+}
+
+fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
+    if let Some(parent) = target_dir.parent() {
+        let dir_name = target_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model");
+        parent.join(format!("{dir_name}.downloading"))
+    } else {
+        target_dir.with_extension("downloading")
+    }
+}
+
+fn manifest_file_path(model_dir: &Path, file: &ModelFile) -> Option<PathBuf> {
+    let canonical = model_dir.join(&file.name);
+    if canonical.is_file() {
+        return Some(canonical);
+    }
+
+    let local = model_dir.join(file.local_name());
+    if local.is_file() {
+        return Some(local);
+    }
+
+    None
+}
+
+fn missing_manifest_files(model_dir: &Path, manifest: &ModelManifest) -> Vec<String> {
+    manifest
+        .files
+        .iter()
+        .filter(|file| manifest_file_path(model_dir, file).is_none())
+        .map(|file| file.local_name().to_string())
+        .collect()
+}
+
+fn installed_manifest_size(model_dir: &Path, manifest: &ModelManifest) -> u64 {
+    manifest
+        .files
+        .iter()
+        .filter_map(|file| manifest_file_path(model_dir, file))
+        .filter_map(|path| path.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(file_type) if file_type.is_file() => {
+                    entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                }
+                Ok(file_type) if file_type.is_dir() => directory_size_bytes(&path),
+                _ => 0,
+            }
+        })
+        .sum()
+}
+
+fn marker_field(content: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field}=");
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn unique_model_temp_path(path: &Path) -> PathBuf {
@@ -1928,6 +2313,166 @@ mod tests {
     }
 
     #[test]
+    fn classify_cache_policy_disabled_takes_precedence_over_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+        let policy = ModelAcquisitionPolicy {
+            downloads_enabled: false,
+            offline: true,
+            max_model_bytes: Some(1),
+            ..ModelAcquisitionPolicy::default()
+        };
+
+        let report = classify_model_cache(tmp.path(), &manifest, &policy);
+        assert_eq!(report.state_code(), "disabled_by_policy");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::DisabledByPolicy { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_cache_detects_resume_stage_before_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        let staging_dir = tmp.path().join("model.downloading");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("model.onnx"), b"partial").unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "acquiring");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::Acquiring {
+                bytes_present: 7,
+                total_bytes: 5,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_cache_distinguishes_offline_and_budget_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let offline = ModelAcquisitionPolicy {
+            offline: true,
+            ..ModelAcquisitionPolicy::default()
+        };
+        let report = classify_model_cache(tmp.path(), &manifest, &offline);
+        assert_eq!(report.state_code(), "offline_blocked");
+
+        let budget = ModelAcquisitionPolicy {
+            max_model_bytes: Some(1),
+            ..ModelAcquisitionPolicy::default()
+        };
+        let report = classify_model_cache(tmp.path(), &manifest, &budget);
+        assert_eq!(report.state_code(), "budget_blocked");
+    }
+
+    #[test]
+    fn classify_cache_accepts_preseeded_local_manifest_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(model_dir.join("onnx")).unwrap();
+        fs::write(model_dir.join("onnx/model.onnx"), b"model").unwrap();
+        fs::write(model_dir.join("tokenizer.json"), b"tok").unwrap();
+        let manifest = build_test_manifest(
+            "repo/model",
+            "rev1",
+            &[("onnx/model.onnx", b"model"), ("tokenizer.json", b"tok")],
+        );
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "preseeded_local");
+        assert!(report.is_usable());
+    }
+
+    #[test]
+    fn classify_cache_detects_checksum_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"wrong").unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "checksum_mismatch");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::ChecksumMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_cache_detects_incompatible_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"model").unwrap();
+        fs::write(model_dir.join(".verified"), "revision=old\n").unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "incompatible_version");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::IncompatibleVersion {
+                current_revision,
+                expected_revision
+            } if current_revision == "old" && expected_revision == "rev1"
+        ));
+    }
+
+    #[test]
+    fn classify_cache_reports_mirror_sourced_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.onnx"), b"model").unwrap();
+        fs::write(
+            model_dir.join(".verified"),
+            "revision=rev1\nsource=mirror:https://mirror.example/cache\n",
+        )
+        .unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "mirror_sourced");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::MirrorSourced {
+                mirror_base_url,
+                ..
+            } if mirror_base_url == "https://mirror.example/cache"
+        ));
+    }
+
+    #[test]
+    fn classify_cache_reports_quarantine_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join(".quarantined"), "bad checksum\n").unwrap();
+        let manifest = build_test_manifest("repo/model", "rev1", &[("model.onnx", b"model")]);
+
+        let report =
+            classify_model_cache(&model_dir, &manifest, &ModelAcquisitionPolicy::default());
+        assert_eq!(report.state_code(), "quarantined_corrupt");
+        assert!(matches!(
+            report.state,
+            ModelCacheState::QuarantinedCorrupt { reason, .. } if reason == "bad checksum"
+        ));
+    }
+
+    #[test]
     fn test_compute_sha256() {
         let tmp = tempfile::tempdir().unwrap();
         let file_path = tmp.path().join("test.txt");
@@ -2032,11 +2577,12 @@ mod tests {
 
         let downloader = ModelDownloader::new(target_dir.clone());
         let manifest = ModelManifest::minilm_v2();
-        downloader.write_verified_marker(&manifest).unwrap();
+        downloader.write_verified_marker(&manifest, None).unwrap();
 
         let marker = fs::read_to_string(target_dir.join(".verified")).unwrap();
         assert!(marker.contains(&format!("revision={}", manifest.revision)));
         assert!(marker.contains("verified_at="));
+        assert!(marker.contains("source=registry"));
     }
 
     #[test]
@@ -2310,6 +2856,10 @@ mod tests {
         assert!(
             marker.contains("revision=rev123"),
             "verified marker should preserve manifest identity after mirror install"
+        );
+        assert!(
+            marker.contains("source=mirror:"),
+            "verified marker should record mirror source"
         );
 
         let requests = server.requests();

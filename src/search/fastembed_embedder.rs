@@ -30,8 +30,8 @@ const MINILM_EMBEDDER_ID: &str = "minilm-384";
 const MINILM_DIMENSION: usize = 384;
 
 // Standard ONNX file names — prefer onnx/ subdir (modern layout), fall back to flat (legacy).
-const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
-const MODEL_ONNX_LEGACY: &str = "model.onnx";
+pub const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
+pub const MODEL_ONNX_LEGACY: &str = "model.onnx";
 const TOKENIZER_JSON: &str = "tokenizer.json";
 const CONFIG_JSON: &str = "config.json";
 const SPECIAL_TOKENS_JSON: &str = "special_tokens_map.json";
@@ -95,15 +95,18 @@ impl FastEmbedder {
         ]
     }
 
+    /// Candidate ONNX model locations, ordered from preferred to legacy.
+    pub fn model_file_candidates() -> &'static [&'static str] {
+        &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY]
+    }
+
     /// Select the ONNX model file, preferring `onnx/model.onnx` over `model.onnx`.
-    fn select_model_file(model_dir: &Path) -> Option<PathBuf> {
-        let modern = model_dir.join(MODEL_ONNX_SUBDIR);
-        if modern.is_file() {
-            return Some(modern);
-        }
-        let legacy = model_dir.join(MODEL_ONNX_LEGACY);
-        if legacy.is_file() {
-            return Some(legacy);
+    pub fn select_model_file(model_dir: &Path) -> Option<PathBuf> {
+        for candidate in Self::model_file_candidates() {
+            let path = model_dir.join(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
         }
         None
     }
