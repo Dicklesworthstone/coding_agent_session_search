@@ -1,0 +1,5 @@
+paths:
+  data dir default: [TEST_HOME]/coding-agent-search
+  db path default: [TEST_HOME]/coding-agent-search/agent_search.db
+  log path: <data-dir>/cass.log (daily rolling)
+  trace: user-provided path (JSONL).
