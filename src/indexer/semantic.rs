@@ -1215,7 +1215,10 @@ mod tests {
         let lexical_decision =
             semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &lexical_repair, 100);
         assert!(!lexical_decision.should_run());
-        assert_eq!(lexical_decision.state, SemanticBackfillSchedulerState::Paused);
+        assert_eq!(
+            lexical_decision.state,
+            SemanticBackfillSchedulerState::Paused
+        );
         assert_eq!(
             lexical_decision.reason,
             SemanticBackfillSchedulerReason::LexicalRepairActive

@@ -24759,7 +24759,10 @@ fn run_models_backfill(
             println!("  Tier: {}", tier.as_str());
             println!("  Embedder: {}", embedder_type);
             println!("  Capacity: {}%", decision.current_capacity_pct);
-            println!("  Next eligible after: {} ms", decision.next_eligible_after_ms);
+            println!(
+                "  Next eligible after: {} ms",
+                decision.next_eligible_after_ms
+            );
             println!();
             println!("{}", next_step);
         }

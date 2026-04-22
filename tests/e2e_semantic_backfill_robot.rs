@@ -97,6 +97,42 @@ fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
     Ok(serde_json::from_str(stdout.trim())?)
 }
 
+fn run_robot_scheduled_backfill_paused(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
+    let output = cargo_bin_cmd!("cass")
+        .args([
+            "models",
+            "backfill",
+            "--tier",
+            "fast",
+            "--embedder",
+            "hash",
+            "--batch-conversations",
+            "8",
+            "--scheduled",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .arg("--db")
+        .arg(db_path)
+        .arg("--json")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_SEMANTIC_BACKFILL_FOREGROUND_ACTIVE", "1")
+        .timeout(Duration::from_secs(20))
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "cass scheduled models backfill failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(serde_json::from_str(stdout.trim())?)
+}
+
 #[test]
 fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     let temp = tempfile::tempdir()?;
@@ -169,6 +205,39 @@ fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     );
     assert_eq!(manifest.backlog.total_conversations, 2);
     assert_eq!(manifest.backlog.fast_tier_processed, 2);
+
+    Ok(())
+}
+
+#[test]
+fn robot_models_backfill_scheduled_yields_to_foreground_pressure() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_canonical_db(&db_path)?;
+
+    let paused = run_robot_scheduled_backfill_paused(&data_dir, &db_path)?;
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(
+        paused["next_step"],
+        "foreground pressure is present; retry after the idle delay"
+    );
+    assert_eq!(paused["tier"], "fast");
+    assert_eq!(paused["embedder_id"], "hash");
+    assert_eq!(paused["batch_conversations_limit"], 8);
+    assert_eq!(paused["scheduler"]["state"], "paused");
+    assert_eq!(paused["scheduler"]["reason"], "foreground_pressure");
+    assert_eq!(paused["scheduler"]["foreground_pressure"], true);
+    assert_eq!(paused["scheduler"]["scheduled_batch_conversations"], 0);
+    assert!(
+        paused["scheduler"]["next_eligible_after_ms"]
+            .as_u64()
+            .is_some_and(|delay| delay > 0)
+    );
+    assert!(
+        !SemanticManifest::path(&data_dir).exists(),
+        "paused scheduled backfill should not touch semantic manifests"
+    );
 
     Ok(())
 }
