@@ -425,10 +425,9 @@ mod tests {
     #[test]
     fn fastembed_missing_files_returns_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = match FastEmbedder::load_from_dir(tmp.path()) {
-            Ok(_) => panic!("expected missing-model error"),
-            Err(err) => err,
-        };
+        let err = FastEmbedder::load_from_dir(tmp.path())
+            .err()
+            .expect("missing model should fail");
         assert!(
             matches!(err, EmbedderError::EmbedderUnavailable { .. }),
             "expected EmbedderUnavailable, got {err:?}"

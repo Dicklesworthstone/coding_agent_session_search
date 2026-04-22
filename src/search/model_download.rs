@@ -2277,7 +2277,7 @@ mod tests {
         let err = normalize_mirror_base_url("file:///tmp/mirror").unwrap_err();
         assert!(err.to_string().contains("unsupported URL scheme"));
 
-        let err = normalize_mirror_base_url("https://mirror.example/cache?token=abc").unwrap_err();
+        let err = normalize_mirror_base_url("https://mirror.example/cache?trace=abc").unwrap_err();
         assert!(
             err.to_string()
                 .contains("must not include query or fragment")
