@@ -1282,7 +1282,7 @@ fn tui_search_flow_with_logging() {
             .add_state("exit_code", serde_json::json!(output.status.code()))
             .add_state("trace_id", serde_json::json!(trace));
         tracker.fail(E2eError::with_type("index failed", "COMMAND_FAILED").with_context(ctx));
-        panic!("Index failed");
+        std::panic::panic_any("Index failed");
     }
 
     let index_ms = index_start.elapsed().as_millis() as u64;
@@ -1470,7 +1470,7 @@ fn tui_filter_flow_with_logging() {
             .with_command("cass index --full")
             .add_state("trace_id", serde_json::json!(trace));
         tracker.fail(E2eError::with_type("index failed", "COMMAND_FAILED").with_context(ctx));
-        panic!("Index failed");
+        std::panic::panic_any("Index failed");
     }
     tracker.end("index", Some("Index complete"), index_start);
 
@@ -1587,7 +1587,7 @@ fn tui_export_flow_with_logging() {
 
     if !output.status.success() {
         tracker.fail(E2eError::with_type("index failed", "COMMAND_FAILED"));
-        panic!("Index failed");
+        std::panic::panic_any("Index failed");
     }
     tracker.end("index", Some("Index complete"), index_start);
 
@@ -1850,7 +1850,7 @@ fn tui_unicode_flow_with_logging() {
 
     if !output.status.success() {
         tracker.fail(E2eError::with_type("index failed", "COMMAND_FAILED"));
-        panic!("Index failed");
+        std::panic::panic_any("Index failed");
     }
     tracker.end("index", Some("Index complete"), index_start);
 
