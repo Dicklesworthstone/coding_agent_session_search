@@ -33,6 +33,7 @@ pub mod model_download;
 pub mod model_manager;
 pub mod policy;
 pub mod query;
+pub(crate) mod readiness;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod semantic_manifest;
