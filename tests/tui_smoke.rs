@@ -71,6 +71,34 @@ fn make_multi_agent_fixtures(_data_dir: &Path, codex_home: &Path, claude_home: &
     make_claude_fixture(claude_home, "testproject");
 }
 
+fn assert_robot_search_hit(stdout: &[u8], query: &str, expected_agent: &str) {
+    let json: serde_json::Value =
+        serde_json::from_slice(stdout).expect("robot search should emit valid JSON");
+    let hits = json["hits"].as_array().expect("robot search hits array");
+    let rendered_hits = hits
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !hits.is_empty(),
+        "expected at least one hit for query '{query}', got: {json}"
+    );
+    assert!(
+        hits.iter().any(|hit| {
+            hit.get("agent").and_then(serde_json::Value::as_str) == Some(expected_agent)
+        }),
+        "expected query '{query}' to return a {expected_agent} hit, got: {rendered_hits}"
+    );
+    assert!(
+        rendered_hits
+            .to_ascii_lowercase()
+            .contains(&query.to_ascii_lowercase()),
+        "expected query '{query}' to appear in returned hit payloads, got: {rendered_hits}"
+    );
+}
+
 // =============================================================================
 // Basic TUI Launch Tests
 // =============================================================================
@@ -234,11 +262,7 @@ fn tui_headless_search_executes_successfully() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
-    assert!(
-        stdout.contains("hello") || stdout.contains("hits"),
-        "Search should return results containing 'hello' or hits array"
-    );
+    assert_robot_search_hit(&output.get_output().stdout, "hello", "codex");
 
     // Also run TUI headless to ensure search client initializes
     cargo_bin_cmd!("cass")
@@ -294,7 +318,7 @@ fn tui_headless_multi_agent_index_and_search() {
         .assert()
         .success();
 
-    let _codex_stdout = String::from_utf8_lossy(&codex_search.get_output().stdout);
+    assert_robot_search_hit(&codex_search.get_output().stdout, "hello", "codex");
 
     // Search for Claude content
     let claude_search = cargo_bin_cmd!("cass")
@@ -306,7 +330,11 @@ fn tui_headless_multi_agent_index_and_search() {
         .assert()
         .success();
 
-    let _claude_stdout = String::from_utf8_lossy(&claude_search.get_output().stdout);
+    assert_robot_search_hit(
+        &claude_search.get_output().stdout,
+        "authentication",
+        "claude_code",
+    );
 
     // TUI should work with multi-agent data
     cargo_bin_cmd!("cass")
