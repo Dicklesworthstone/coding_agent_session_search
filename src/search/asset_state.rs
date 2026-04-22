@@ -92,7 +92,7 @@ impl SearchMaintenanceJobKind {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SearchMaintenanceSnapshot {
     pub active: bool,
     pub pid: Option<u32>,
@@ -950,6 +950,224 @@ pub(crate) fn poll_maintenance_until_idle(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rich multi-actor event log, yield/pause signaling, unified view (ibuuh.22)
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(test), allow(dead_code))]
+const MAINTENANCE_EVENTS_FILE: &str = ".maintenance-events.jsonl";
+#[cfg_attr(not(test), allow(dead_code))]
+const YIELD_SIGNAL_FILE: &str = "maintenance-yield.signal";
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_EVENT_LOG_ENTRIES: usize = 500;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MaintenanceEvent {
+    pub timestamp_ms: i64,
+    pub job_id: String,
+    pub actor_pid: u32,
+    pub kind: MaintenanceEventKind,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MaintenanceEventKind {
+    Started {
+        job_kind: String,
+        phase: String,
+    },
+    PhaseChanged {
+        from: String,
+        to: String,
+    },
+    Progress {
+        processed: u64,
+        total: u64,
+    },
+    YieldRequested {
+        requester_pid: u32,
+        reason: String,
+    },
+    Paused {
+        reason: String,
+    },
+    Resumed,
+    Completed {
+        summary: String,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn append_maintenance_event(data_dir: &Path, event: &MaintenanceEvent) -> Result<()> {
+    let path = data_dir.join(MAINTENANCE_EVENTS_FILE);
+    let line =
+        serde_json::to_string(event).with_context(|| "serializing maintenance event")?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening maintenance event log at {}", path.display()))?;
+    use std::io::Write;
+    writeln!(file, "{line}")
+        .with_context(|| format!("appending to maintenance event log at {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn read_maintenance_events(
+    data_dir: &Path,
+    after_ms: Option<i64>,
+    limit: Option<usize>,
+) -> Vec<MaintenanceEvent> {
+    let path = data_dir.join(MAINTENANCE_EVENTS_FILE);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let threshold = after_ms.unwrap_or(0);
+    let cap = limit.unwrap_or(MAX_EVENT_LOG_ENTRIES);
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<MaintenanceEvent>(line).ok())
+        .filter(|e| e.timestamp_ms > threshold)
+        .rev()
+        .take(cap)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn truncate_maintenance_event_log(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(MAINTENANCE_EVENTS_FILE);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("reading event log for truncation at {}", path.display())
+            })
+        }
+    };
+    let lines: Vec<&str> = contents.lines().collect();
+    if lines.len() <= MAX_EVENT_LOG_ENTRIES {
+        return Ok(());
+    }
+    let keep = &lines[lines.len() - MAX_EVENT_LOG_ENTRIES..];
+    let mut output = keep.join("\n");
+    output.push('\n');
+    std::fs::write(&path, output)
+        .with_context(|| format!("truncating event log at {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Yield/pause signaling
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct YieldRequest {
+    pub requester_pid: u32,
+    pub requested_at_ms: i64,
+    pub reason: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn request_yield(data_dir: &Path, reason: &str) -> Result<()> {
+    let path = data_dir.join(YIELD_SIGNAL_FILE);
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    let req = YieldRequest {
+        requester_pid: std::process::id(),
+        requested_at_ms: now_ms,
+        reason: reason.to_string(),
+    };
+    let payload =
+        serde_json::to_string(&req).with_context(|| "serializing yield request")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("writing yield signal to {}", path.display()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn check_yield_requested(data_dir: &Path) -> Option<YieldRequest> {
+    let path = data_dir.join(YIELD_SIGNAL_FILE);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<YieldRequest>(&contents).ok()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn clear_yield_signal(data_dir: &Path) -> Result<()> {
+    let path = data_dir.join(YIELD_SIGNAL_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("clearing yield signal at {}", path.display()))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified maintenance view
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct UnifiedMaintenanceView {
+    pub coordination: MaintenanceCoordinationOutcome,
+    pub snapshot: SearchMaintenanceSnapshot,
+    pub yield_pending: Option<YieldRequest>,
+    pub recent_events: Vec<MaintenanceEvent>,
+    pub decision: MaintenanceDecision,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unified_maintenance_view(
+    data_dir: &Path,
+    lexical_available: bool,
+) -> UnifiedMaintenanceView {
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    let snapshot = read_search_maintenance_snapshot(data_dir);
+    let coordination = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+    let yield_pending = check_yield_requested(data_dir);
+    let recent_events = read_maintenance_events(data_dir, None, Some(20));
+    let decision = if lexical_available {
+        match &coordination {
+            MaintenanceCoordinationOutcome::Active {
+                job_id,
+                job_kind,
+                phase,
+                ..
+            } => MaintenanceDecision::FailOpen {
+                reason: format!(
+                    "maintenance job {} ({:?}) is active (phase: {}); lexical available, failing open",
+                    job_id,
+                    job_kind,
+                    phase.as_deref().unwrap_or("unknown")
+                ),
+            },
+            _ => decide_maintenance_action_from_snapshot(&snapshot, now_ms),
+        }
+    } else {
+        decide_maintenance_action_from_snapshot(&snapshot, now_ms)
+    };
+
+    UnifiedMaintenanceView {
+        coordination,
+        snapshot,
+        yield_pending,
+        recent_events,
+        decision,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,6 +1845,13 @@ mod tests {
     }
 
     #[test]
+    fn decision_launch_when_no_lock_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let decision = decide_maintenance_action(temp.path(), 1_733_000_000_000);
+        assert_eq!(decision, MaintenanceDecision::Launch);
+    }
+
+    #[test]
     fn decision_launch_when_stale_job() {
         let now_ms = 1_733_000_000_000i64;
         let snapshot = SearchMaintenanceSnapshot {
@@ -1668,6 +1893,11 @@ mod tests {
         assert!(
             matches!(result.outcome, MaintenanceCoordinationOutcome::Idle),
             "expected NoActiveJob"
+        );
+        assert!(
+            result.elapsed <= Duration::from_millis(500),
+            "immediate idle poll should finish before timeout, elapsed={:?}",
+            result.elapsed
         );
     }
 
@@ -1798,5 +2028,253 @@ mod tests {
         );
 
         let _ = FileExt::unlock(&owner);
+    }
+
+    // -----------------------------------------------------------------------
+    // ibuuh.22: Event log, yield signaling, unified view tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn event_log_append_and_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let event = MaintenanceEvent {
+            timestamp_ms: 1_733_000_000_000,
+            job_id: "test-job-1".to_string(),
+            actor_pid: 42,
+            kind: MaintenanceEventKind::Started {
+                job_kind: "lexical_refresh".to_string(),
+                phase: "scanning".to_string(),
+            },
+        };
+        append_maintenance_event(temp.path(), &event).expect("append");
+        let events = read_maintenance_events(temp.path(), None, None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].job_id, "test-job-1");
+        assert_eq!(events[0].actor_pid, 42);
+        assert!(matches!(
+            events[0].kind,
+            MaintenanceEventKind::Started { .. }
+        ));
+    }
+
+    #[test]
+    fn event_log_filters_by_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for i in 0..5 {
+            let event = MaintenanceEvent {
+                timestamp_ms: 1_000 + i,
+                job_id: format!("job-{i}"),
+                actor_pid: 1,
+                kind: MaintenanceEventKind::Progress {
+                    processed: i as u64,
+                    total: 5,
+                },
+            };
+            append_maintenance_event(temp.path(), &event).expect("append");
+        }
+        let events = read_maintenance_events(temp.path(), Some(1_002), None);
+        assert_eq!(events.len(), 2, "should only get events after ts 1002");
+        assert_eq!(events[0].timestamp_ms, 1_003);
+        assert_eq!(events[1].timestamp_ms, 1_004);
+    }
+
+    #[test]
+    fn event_log_respects_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for i in 0..10 {
+            let event = MaintenanceEvent {
+                timestamp_ms: 1_000 + i,
+                job_id: format!("job-{i}"),
+                actor_pid: 1,
+                kind: MaintenanceEventKind::Resumed,
+            };
+            append_maintenance_event(temp.path(), &event).expect("append");
+        }
+        let events = read_maintenance_events(temp.path(), None, Some(3));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].timestamp_ms, 1_007);
+        assert_eq!(events[2].timestamp_ms, 1_009);
+    }
+
+    #[test]
+    fn event_log_returns_empty_when_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let events = read_maintenance_events(temp.path(), None, None);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn event_log_truncation_retains_tail() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for i in 0..550 {
+            let event = MaintenanceEvent {
+                timestamp_ms: i,
+                job_id: format!("job-{i}"),
+                actor_pid: 1,
+                kind: MaintenanceEventKind::Resumed,
+            };
+            append_maintenance_event(temp.path(), &event).expect("append");
+        }
+        let before = read_maintenance_events(temp.path(), None, Some(600));
+        assert_eq!(before.len(), 550);
+        truncate_maintenance_event_log(temp.path()).expect("truncate");
+        let after = read_maintenance_events(temp.path(), None, Some(600));
+        assert_eq!(after.len(), MAX_EVENT_LOG_ENTRIES);
+        assert_eq!(after[0].timestamp_ms, 50);
+        assert_eq!(after[MAX_EVENT_LOG_ENTRIES - 1].timestamp_ms, 549);
+    }
+
+    #[test]
+    fn yield_signal_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            check_yield_requested(temp.path()).is_none(),
+            "no signal initially"
+        );
+        request_yield(temp.path(), "foreground search pressure").expect("request yield");
+        let req = check_yield_requested(temp.path()).expect("yield should be present");
+        assert_eq!(req.requester_pid, std::process::id());
+        assert_eq!(req.reason, "foreground search pressure");
+        assert!(req.requested_at_ms > 0);
+        clear_yield_signal(temp.path()).expect("clear");
+        assert!(
+            check_yield_requested(temp.path()).is_none(),
+            "signal cleared"
+        );
+    }
+
+    #[test]
+    fn clear_yield_signal_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        clear_yield_signal(temp.path()).expect("clear nonexistent");
+        clear_yield_signal(temp.path()).expect("clear again");
+    }
+
+    #[test]
+    fn unified_view_idle_no_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let view = unified_maintenance_view(temp.path(), true);
+        assert!(matches!(
+            view.coordination,
+            MaintenanceCoordinationOutcome::Idle
+        ));
+        assert!(view.yield_pending.is_none());
+        assert!(view.recent_events.is_empty());
+        assert_eq!(view.decision, MaintenanceDecision::Launch);
+    }
+
+    #[test]
+    fn unified_view_active_with_lexical_fails_open() {
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open");
+        owner.try_lock_exclusive().expect("lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/t.db\nmode=index\njob_id=uv-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                now_ms - 1_000,
+                now_ms,
+            ),
+        )
+        .expect("write metadata");
+
+        let event = MaintenanceEvent {
+            timestamp_ms: now_ms,
+            job_id: "uv-1".to_string(),
+            actor_pid: 99999,
+            kind: MaintenanceEventKind::Started {
+                job_kind: "lexical_refresh".to_string(),
+                phase: "indexing".to_string(),
+            },
+        };
+        append_maintenance_event(temp.path(), &event).expect("append");
+
+        let view = unified_maintenance_view(temp.path(), true);
+        assert!(matches!(
+            view.coordination,
+            MaintenanceCoordinationOutcome::Active { .. }
+        ));
+        assert!(matches!(view.decision, MaintenanceDecision::FailOpen { .. }));
+        assert_eq!(view.recent_events.len(), 1);
+
+        let _ = FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn unified_view_includes_yield_signal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        request_yield(temp.path(), "test yield").expect("yield");
+        let view = unified_maintenance_view(temp.path(), true);
+        assert!(view.yield_pending.is_some());
+        assert_eq!(
+            view.yield_pending.as_ref().unwrap().reason,
+            "test yield"
+        );
+        clear_yield_signal(temp.path()).expect("clear");
+    }
+
+    #[test]
+    fn event_kinds_serialize_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kinds = vec![
+            MaintenanceEventKind::Started {
+                job_kind: "lexical_refresh".to_string(),
+                phase: "init".to_string(),
+            },
+            MaintenanceEventKind::PhaseChanged {
+                from: "init".to_string(),
+                to: "scanning".to_string(),
+            },
+            MaintenanceEventKind::Progress {
+                processed: 50,
+                total: 100,
+            },
+            MaintenanceEventKind::YieldRequested {
+                requester_pid: 42,
+                reason: "foreground".to_string(),
+            },
+            MaintenanceEventKind::Paused {
+                reason: "yield".to_string(),
+            },
+            MaintenanceEventKind::Resumed,
+            MaintenanceEventKind::Completed {
+                summary: "done".to_string(),
+            },
+            MaintenanceEventKind::Failed {
+                error: "oops".to_string(),
+            },
+            MaintenanceEventKind::Cancelled {
+                reason: "user".to_string(),
+            },
+        ];
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let event = MaintenanceEvent {
+                timestamp_ms: i as i64,
+                job_id: "rt-test".to_string(),
+                actor_pid: 1,
+                kind,
+            };
+            append_maintenance_event(temp.path(), &event).expect("append");
+        }
+        let events = read_maintenance_events(temp.path(), None, None);
+        assert_eq!(events.len(), 9);
+        assert!(matches!(
+            events[0].kind,
+            MaintenanceEventKind::Started { .. }
+        ));
+        assert!(matches!(events[5].kind, MaintenanceEventKind::Resumed));
+        assert!(matches!(
+            events[8].kind,
+            MaintenanceEventKind::Cancelled { .. }
+        ));
     }
 }
