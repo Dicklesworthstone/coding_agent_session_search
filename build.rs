@@ -97,9 +97,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "asupersync",
         crate_package_name: "asupersync",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/asupersync",
-        expected_rev: "310ff61f",
-        expected_version: "0.2.9",
+        // crates.io-only pin after the 0.3.x migration unified every source
+        // (direct dep, frankensqlite transitive, frankensearch transitive)
+        // onto a single published release. Empty `expected_git` signals
+        // `validate_manifest_dependency_spec` to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.3.1",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -266,26 +270,56 @@ fn validate_manifest_dependency_spec(manifest: &Value, contract: &DependencyCont
         contract.dep_table,
     );
 
-    let actual_git = string_value(spec, "git", contract.dep_key);
-    if actual_git != contract.expected_git {
-        contract_error(
-            contract,
-            format!(
-                "dependency `{}` in [{}] must pin git = `{}`, found `{}`",
-                contract.dep_key, contract.dep_table, contract.expected_git, actual_git
-            ),
-        );
-    }
+    // When `expected_git` is empty the contract describes a pure crates.io
+    // dependency (e.g. asupersync after the 0.3.0 migration moved all
+    // sibling crates onto crates.io). Skip the git/rev shape checks and
+    // instead lock in the `version` field, which is the only pin that
+    // crates.io gives us.
+    if contract.expected_git.is_empty() {
+        let actual_version = string_value(spec, "version", contract.dep_key);
+        if actual_version != contract.expected_version {
+            contract_error(
+                contract,
+                format!(
+                    "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
+                    contract.dep_key,
+                    contract.dep_table,
+                    contract.expected_version,
+                    actual_version
+                ),
+            );
+        }
+        if spec.contains_key("git") || spec.contains_key("rev") {
+            contract_error(
+                contract,
+                format!(
+                    "dependency `{}` in [{}] is a crates.io dep in this contract; remove `git`/`rev`",
+                    contract.dep_key, contract.dep_table
+                ),
+            );
+        }
+    } else {
+        let actual_git = string_value(spec, "git", contract.dep_key);
+        if actual_git != contract.expected_git {
+            contract_error(
+                contract,
+                format!(
+                    "dependency `{}` in [{}] must pin git = `{}`, found `{}`",
+                    contract.dep_key, contract.dep_table, contract.expected_git, actual_git
+                ),
+            );
+        }
 
-    let actual_rev = string_value(spec, "rev", contract.dep_key);
-    if actual_rev != contract.expected_rev {
-        contract_error(
-            contract,
-            format!(
-                "dependency `{}` in [{}] must pin rev = `{}`, found `{}`",
-                contract.dep_key, contract.dep_table, contract.expected_rev, actual_rev
-            ),
-        );
+        let actual_rev = string_value(spec, "rev", contract.dep_key);
+        if actual_rev != contract.expected_rev {
+            contract_error(
+                contract,
+                format!(
+                    "dependency `{}` in [{}] must pin rev = `{}`, found `{}`",
+                    contract.dep_key, contract.dep_table, contract.expected_rev, actual_rev
+                ),
+            );
+        }
     }
 
     let actual_package = spec.get("package").and_then(Value::as_str);
@@ -489,6 +523,14 @@ fn validate_local_contract(
 }
 
 fn validate_strict_git_state(contract: &DependencyContract, repo_root: &Path, state: &GitState) {
+    // Crates.io-only contracts (empty `expected_rev`) intentionally
+    // have nothing to enforce at the sibling repo level — the actual
+    // pin lives in the crates.io version. A local sibling checkout
+    // may be on any branch and may be dirty; that's fine because
+    // we're not building against it. Skip both sub-checks.
+    if contract.expected_rev.is_empty() {
+        return;
+    }
     if !state.head.starts_with(contract.expected_rev) {
         contract_error(
             contract,
