@@ -135,18 +135,30 @@ fn assert_golden(name: &str, actual: &str) {
 /// `BTreeMap` insertion preservation, pretty-printed, dynamic values
 /// scrubbed). Returns the parsed-then-reserialized string so the golden
 /// survives whitespace drift.
-fn capture_robot_json(test_home: &std::path::Path, args: &[&str]) -> String {
+///
+/// `expect_status` selects the exit-code contract: `ExitOk` for commands
+/// that must succeed (capabilities, models status), `ExitAny` for
+/// commands that legitimately exit non-zero when reporting a problem
+/// (health, which exits 1 when the DB / index is not initialised — that
+/// non-zero status *is* part of the contract and we freeze its JSON).
+fn capture_robot_json(
+    test_home: &std::path::Path,
+    args: &[&str],
+    expect_status: ExpectStatus,
+) -> String {
     let output = cass_cmd(test_home)
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("run cass {args:?}: {err}"));
-    assert!(
-        output.status.success(),
-        "cass {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    if matches!(expect_status, ExpectStatus::ExitOk) {
+        assert!(
+            output.status.success(),
+            "cass {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("cass {args:?} stdout is not JSON: {err}\nstdout:\n{stdout}"));
@@ -154,10 +166,20 @@ fn capture_robot_json(test_home: &std::path::Path, args: &[&str]) -> String {
     scrub_robot_json(&canonical, test_home)
 }
 
+#[derive(Clone, Copy)]
+enum ExpectStatus {
+    ExitOk,
+    ExitAny,
+}
+
 #[test]
 fn capabilities_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(test_home.path(), &["capabilities", "--json"]);
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["capabilities", "--json"],
+        ExpectStatus::ExitOk,
+    );
     assert_golden("robot/capabilities.json.golden", &scrubbed);
 }
 
@@ -169,7 +191,11 @@ fn models_status_json_matches_golden() {
     // Absolute paths inside the payload (`model_dir`, `files[].actual_path`)
     // get scrubbed by `scrub_robot_json` → `[TEST_HOME]` prefix.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(test_home.path(), &["models", "status", "--json"]);
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["models", "status", "--json"],
+        ExpectStatus::ExitOk,
+    );
     assert_golden("robot/models_status.json.golden", &scrubbed);
 }
 
@@ -183,6 +209,14 @@ fn health_json_matches_golden() {
     // top-level status/healthy/initialized/errors/recommended_action
     // plus the per-subsystem state.* nested blocks.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(test_home.path(), &["health", "--json"]);
+    // `cass health` exits 1 when reporting an unhealthy / uninitialised
+    // state — that non-zero exit is part of the contract and the golden
+    // below freezes the JSON body that accompanies it. ExitAny lets the
+    // capture proceed regardless of status.
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["health", "--json"],
+        ExpectStatus::ExitAny,
+    );
     assert_golden("robot/health.json.golden", &scrubbed);
 }
