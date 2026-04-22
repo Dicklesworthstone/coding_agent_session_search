@@ -372,6 +372,14 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 Provides unified full-text and semantic search across all local coding agent session histories, with a rich TUI, robot-mode JSON API, multi-machine sync, HTML export with optional encryption, and analytics.
 
+### Search Asset Contract
+
+- **SQLite is the source of truth.** Search indexes are derived assets; do not treat a broken lexical or semantic artifact as lost user data.
+- **Lexical search is required and self-healing.** Missing, stale, schema-drifted, or corrupt lexical assets should rebuild from SQLite through scratch-build and atomic-publish semantics.
+- **Hybrid is the default search intent.** Semantic refinement joins when ready; default hybrid search must fail open to lexical with truthful robot metadata when semantic assets are unavailable.
+- **Semantic enrichment is opportunistic.** Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, missing model files, or vector catch-up.
+- **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
+
 ### Project Structure
 
 ```
@@ -440,10 +448,10 @@ coding_agent_session_search/
 ### Quick Start
 
 ```bash
-# Check if index is healthy (exit 0=ok, 1=run index first)
+# Check readiness and recommended action (fresh installs may need index --full)
 cass health
 
-# Search across all agent histories
+# Search across all agent histories (default: hybrid-preferred, lexical fail-open)
 cass search "authentication error" --robot --limit 5
 
 # View a specific result (from search output)
@@ -561,18 +569,18 @@ cass health --json
 
 Returns in <50ms:
 - **Exit 0:** Healthy — proceed with queries
-- **Exit 1:** Unhealthy — run `cass index --full` first
+- **Exit 1:** Not ready — inspect `status`, `rebuild`, `semantic`, and `recommended_action`. Fresh installs usually need `cass index --full`; active rebuilds usually need bounded waiting; semantic-only gaps usually mean lexical fallback is expected.
 
 ### Exit Codes
 
 | Code | Meaning | Retryable |
 |------|---------|-----------|
 | 0 | Success | N/A |
-| 1 | Health check failed | Yes — run `cass index --full` |
+| 1 | Health check failed | Yes — inspect `recommended_action` |
 | 2 | Usage/parsing error | No — fix syntax |
 | 3 | Index/DB missing | Yes — run `cass index --full` |
 | 4 | Network error | Yes — check connectivity |
-| 5 | Data corruption | Yes — run `cass index --full --force-rebuild` |
+| 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
 | 6 | Incompatible version | No — update cass |
 | 7 | Lock/busy | Yes — retry later |
 | 8 | Partial result | Yes — increase timeout |
@@ -1093,6 +1101,7 @@ cass robot-docs guide
 - Use `--fields minimal` for lean output
 - Filter by agent with `--agent`
 - Use `--days N` to limit to recent history
+- Use `--robot-meta` to see requested vs realized search mode, semantic refinement, and lexical fallback reasons
 
 stdout is data-only, stderr is diagnostics; exit code 0 means success.
 

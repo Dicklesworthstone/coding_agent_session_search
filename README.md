@@ -50,10 +50,12 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.
 
 ```bash
-# 1) Health check (exit 0 = OK, non-zero = rebuild index)
+# 1) First run builds the canonical archive. Later health checks report
+#    asset readiness, active refresh work, and recommended next actions.
 cass health --json || cass index --full
 
-# 2) Search across all agent history
+# 2) Search across all agent history. Default search is hybrid-preferred:
+#    lexical is the fast required path; semantic refinement joins when ready.
 cass search "authentication error" --robot --limit 5 --fields minimal
 
 # 3) Find the current or recent session for this workspace
@@ -78,6 +80,13 @@ cass sources agents include openclaw
 - stdout = data only
 - stderr = diagnostics
 - exit 0 = success
+
+**Search asset contract**
+- SQLite is the source of truth for indexed conversations and messages.
+- Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
+- Hybrid is the default search intent. Robot metadata reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
+- Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
+- `cass health --json` and `cass status --json` are the truth surface for readiness, active rebuilds, and recommended action. Prefer their `recommended_action` over hard-coded repair rituals.
 
 ## 📬 Agent Mail Fallback (When MCP Tools Are Not Exposed)
 
@@ -242,15 +251,15 @@ When ML model files are not installed, `cass` uses a deterministic hash-based em
 
 | Mode | Algorithm | Best For |
 |------|-----------|----------|
-| **Lexical** (default) | BM25 full-text | Exact term matching, code searches |
+| **Lexical** | BM25 full-text | Exact term matching, code searches |
 | **Semantic** | Vector similarity | Conceptual queries, "find similar" |
-| **Hybrid** | Reciprocal Rank Fusion | Balanced precision and recall |
+| **Hybrid** (default) | Reciprocal Rank Fusion with lexical fail-open | Balanced precision and recall |
 
-**Lexical Search**: Uses Tantivy's BM25 implementation with edge n-grams for prefix matching. Best when you know the exact terms you're looking for.
+**Lexical Search**: Uses Tantivy's BM25 implementation with edge n-grams for prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
 
 **Semantic Search**: Computes vector similarity between query and indexed message embeddings. Finds conceptually related content even without exact term overlap. Requires either the ML model (MiniLM) or falls back to hash embedder.
 
-**Hybrid Search**: Combines lexical and semantic results using Reciprocal Rank Fusion (RRF):
+**Hybrid Search**: The default. It combines lexical and semantic results using Reciprocal Rank Fusion (RRF) when semantic assets are ready, and it fails open to lexical when semantic enrichment is still catching up or disabled:
 ```
 RRF_score = Σ 1 / (K + rank_i)
 ```
@@ -1983,7 +1992,7 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
 
 ## 🛡️ Index Resilience & Recovery
 
-`cass` is designed to handle index corruption gracefully and recover automatically.
+`cass` treats search indexes as derived assets. The SQLite archive is authoritative; lexical and semantic search data can be rebuilt from it.
 
 ### Schema Version Tracking
 
@@ -1997,30 +2006,31 @@ Every Tantivy index stores a `schema_hash.json` file containing the schema versi
 
 | Scenario | Detection | Recovery |
 |----------|-----------|----------|
-| Missing index | No `meta.json` | Clean create |
-| Schema mismatch | Hash differs from current | Full rebuild |
-| Corrupted `schema_hash.json` | Invalid JSON or missing | Delete and recreate |
-| Missing `schema_hash.json` | File not found | Assume outdated, rebuild |
+| First run | No SQLite archive and no lexical index | `cass index --full` discovers sessions and creates both |
+| Missing lexical index | No readable lexical asset | Rebuild from SQLite into scratch space, then publish |
+| Schema mismatch | Hash differs from current | Rebuild derived lexical asset from SQLite |
+| Corrupted metadata | Invalid or missing lexical metadata | Ignore the broken derivative and rebuild from SQLite |
+| Semantic not ready | Model/vector assets absent or still backfilling | Continue lexical search and report semantic fallback/readiness |
 
 ### Manual Recovery
 
 ```bash
-# Force complete rebuild
-cass index --full --force-rebuild
-
-# Check index health
+# Check the current truth surface first
 cass health --json
+cass status --json
 
-# Diagnostic information
-cass diag --verbose
+# If recommended_action asks for it, refresh derived search data
+cass index --full
 ```
+
+Manual rebuild commands are for first setup, explicit operator refresh, or cases where `recommended_action` asks for them. A normal missing/stale lexical asset should be repaired as derived state from SQLite, not treated as lost user data.
 
 ### Design Principles
 
 1. **Never lose source data**: `cass` only reads agent files, never modifies them
-2. **Rebuild is always safe**: Worst case, re-index from source files
-3. **Atomic commits**: Index writes are transactional
-4. **Graceful degradation**: Search falls back to SQLite if Tantivy fails
+2. **SQLite is the source of truth**: Derived lexical and semantic assets can be rebuilt
+3. **Atomic publish**: Rebuilt assets are prepared in scratch space and published only when complete
+4. **Graceful degradation**: Hybrid search continues as lexical when semantic enrichment is unavailable
 
 ### Index Recovery & Self-Healing
 
@@ -2032,25 +2042,25 @@ Each Tantivy index stores a `schema_hash.json` file containing a hash of the cur
 2. If hash differs → schema changed, trigger rebuild
 3. If file missing/corrupted → assume stale, trigger rebuild
 
-This ensures that version upgrades with schema changes automatically rebuild the index without user intervention.
+This ensures that version upgrades with schema changes can rebuild the lexical derivative without user intervention.
 
 **Automatic Rebuild Triggers**:
 | Condition | Detection | Action |
 |-----------|-----------|--------|
 | Schema version change | Hash mismatch in `schema_hash.json` | Full rebuild |
-| Missing `meta.json` | Tantivy can't open index | Delete and recreate |
-| Corrupted index files | `Index::open_in_dir()` fails | Delete and recreate |
+| Missing `meta.json` | Tantivy can't open index | Rebuild and publish a fresh derivative |
+| Corrupted index files | `Index::open_in_dir()` fails | Rebuild and publish a fresh derivative |
 | Explicit request | `--force-rebuild` flag | Clean slate rebuild |
 
 **SQLite as Ground Truth**:
-The SQLite database serves as the authoritative data store. The `rebuild_tantivy_from_db()` function can reconstruct the entire Tantivy index from SQLite:
+The SQLite database serves as the authoritative data store. Lexical rebuilds reconstruct the Tantivy index from SQLite:
 ```rust
 // Iterate all conversations from SQLite
 // Re-index each message into fresh Tantivy index
 // Progress tracked via IndexingProgress for UI feedback
 ```
 
-This means users can always recover from Tantivy corruption by running `cass doctor --fix` or `cass index --full --force-rebuild`.
+This means corrupted lexical data is a repairable derivative-state problem. Operators should read `cass health --json` or `cass status --json` first, then follow `recommended_action`.
 
 ### Database Schema Migrations
 
@@ -2324,7 +2334,7 @@ cass completions bash > ~/.bash_completion.d/cass
 |---------|---------|
 | `cass` (default) | Start TUI + background watcher |
 | `cass tui --asciicast FILE` | Run TUI and save terminal output as asciicast v2 |
-| `index --full` | Complete rebuild of DB and search index |
+| `index --full` | Discover sessions and refresh the canonical DB plus derived search assets |
 | `index --watch` | Daemon mode: watch for file changes, reindex automatically |
 | `search --robot` | JSON output for automation pipelines |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
@@ -2373,11 +2383,11 @@ cass doctor --json
 
 # Auto-fix detected issues (safe - only rebuilds derived data)
 cass doctor --fix
-# → Removes stale locks, rebuilds corrupted index, repairs database
+# → Removes stale locks and rebuilds corrupted derived assets when needed
 
 # Force index rebuild even if healthy
 cass doctor --fix --force-rebuild
-# → Nuclear option: complete index rebuild from source sessions
+# → Explicit operator refresh from source sessions and SQLite truth
 ```
 
 ### The Doctor Command
