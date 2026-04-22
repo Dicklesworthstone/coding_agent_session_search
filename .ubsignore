@@ -14,6 +14,7 @@ temp_*.rs
 
 # Test fixtures (not production code)
 tests/fixtures/
+tests/golden/html_export/*.golden
 
 # Lock files (auto-generated)
 Cargo.lock

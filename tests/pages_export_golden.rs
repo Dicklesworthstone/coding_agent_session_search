@@ -16,7 +16,7 @@
 
 use assert_cmd::Command;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

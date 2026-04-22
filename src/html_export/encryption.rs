@@ -96,8 +96,8 @@ pub fn encrypt_content(
     params: &EncryptionParams,
 ) -> Result<EncryptedContent, EncryptionError> {
     use aes_gcm::{
-        aead::{Aead, KeyInit},
         Aes256Gcm, Nonce,
+        aead::{Aead, KeyInit},
     };
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
@@ -189,7 +189,7 @@ fn fill_encryption_random(label: &str, output: &mut [u8]) {
         return;
     }
 
-    use aes_gcm::aead::{rand_core::RngCore, OsRng};
+    use aes_gcm::aead::{OsRng, rand_core::RngCore};
     OsRng.fill_bytes(output);
 }
 
@@ -331,11 +331,11 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn test_encrypt_content_roundtrip() {
         use aes_gcm::{
-            aead::{Aead, KeyInit},
             Aes256Gcm, Nonce,
+            aead::{Aead, KeyInit},
         };
-        use base64::prelude::BASE64_STANDARD;
         use base64::Engine; // Required for decode() method
+        use base64::prelude::BASE64_STANDARD;
         use pbkdf2::pbkdf2_hmac;
         use sha2::Sha256;
 
