@@ -39,6 +39,7 @@ parking_lot = "*"
 fs2 = "*"
 lru = "0.16"
 rustc-hash = "*"  # Fast non-cryptographic hashing for cache keys (P1 Opt 1.3), replaces unmaintained fxhash
+xxhash-rust = { version = "*", features = ["xxh3"] }  # Fast content hashing for search-hit dedup (bead sdoxg)
 smallvec = "*"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "*"
 portable-pty = "*"
