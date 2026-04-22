@@ -119,3 +119,46 @@
 ### Build verification
 - Full `cargo check` blocked by **pre-existing** compilation errors in `frankentui` sibling repo (`ftui-widgets`: 27 errors — missing lifetime specifiers, missing variables, unstable features). These errors exist independently of this update.
 - Compatibility verified through code review of all 4 updated crates' changelogs and our usage patterns.
+
+---
+
+## 2026-04-22 /library-updater pass (exhaustive, swarm-coordinated)
+
+### Summary
+- **Updated git revs:** 2 repositories (5 Cargo.toml pins) — ftui family → `5f78cfa0`, frankensqlite family → `422969cf`
+- **Verified:** `asupersync = "0.3.1"` (crates.io, user-specified target — already correct at line 17)
+- **Wildcard crates.io deps:** 0 packages behind latest within current constraints (per `cargo update`)
+- **Held back / not actionable from cass alone:** `lru 0.16→0.17`, `generic-array 0.14.7→0.14.9`, `rusqlite 0.38→0.39`
+- **Coordinated with active swarm:** broadcast reservation on Cargo.toml/Cargo.lock for the ~15 minute upgrade window; resumed swarm afterward.
+- **Verification:** `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_libupdate cargo check --all-targets` → `Finished dev profile in 6m 35s`, 2 pre-existing warnings, no errors.
+
+### ftui (+ ftui-runtime, ftui-tty, ftui-extras): 2d25a03d → 5f78cfa0
+Commits pulled in:
+- `b3e5fc7a chore(deps): bump asupersync 0.2.9 → 0.3.0 (crates.io v0.3.0)`
+- `5f78cfa0 chore(deps): bump asupersync 0.3.0 → 0.3.1 (crates.io)`
+
+Breaking: none (internal dep bump only).
+
+### frankensqlite (+ fsqlite-types): 83c0d882 → 422969cf
+~30 commits pulled in, highlights:
+- perf: `cache autocommit publication binding` (29b062c7), `reuse record header template for upsert` (eb5a74e9), `identity-skip memmove in defrag` (4bb33114)
+- `a5813cfc chore(deps): bump asupersync 0.3.0 → 0.3.1 (crates.io)`
+- `253959cd chore(deps): bump asupersync 0.2.9 → 0.3.0 (crates.io v0.3.0)`
+- test hardening: conformance oracle 74b (e4826610), upsert record traps (92872a44)
+- bugfix: `fix(pager): align 3 tests with current bump-allocator + first-committer-wins` (b93c7cbd)
+
+Breaking: none (fsqlite::Connection, compat layer, params! macro unchanged).
+
+### Remaining transitive asupersync 0.2.9
+- Flows through `cass → FAD@88756ba9 → fsqlite@e3f57c9a → asupersync 0.2.9` (FAD's own fsqlite pin predates the asupersync 0.3.1 bump).
+- **Cannot be collapsed from cass alone** — requires coordinated cross-repo bump in FAD.
+- Filed follow-up bead: `coding_agent_session_search-0x5gm` — collapse after bead `3e3qg.14` (FAD rusqlite→frankensqlite migration) completes and FAD pushes a new HEAD.
+
+### Attempted but reverted
+- `lru 0.16 → 0.17`: blocked by `fsqlite-core` pinning `lru = "^0.16"`. Requires upstream fsqlite-core bump first. Cargo.toml reverted to `lru = "0.16"`.
+
+### Files modified
+- `Cargo.toml` (5 lines: 4 ftui revs + 1 frankensqlite rev + 1 fsqlite-types rev)
+- `Cargo.lock` (ftui family, fsqlite family, asupersync 0.3.0→0.3.1 for ftui/fsqlite subgraphs, added `simdutf8 0.1.5`)
+- `UPGRADE_LOG.md` (this entry)
+

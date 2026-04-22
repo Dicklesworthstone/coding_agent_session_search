@@ -47,7 +47,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "83c0d882",
+        expected_rev: "422969cf",
         expected_version: "0.1.2",
         expected_features: &["fts5"],
         expected_default_features: None,
@@ -64,7 +64,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "83c0d882",
+        expected_rev: "422969cf",
         expected_version: "0.1.2",
         expected_features: &[],
         expected_default_features: None,
@@ -141,7 +141,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "ftui",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "2d25a03d",
+        expected_rev: "5f78cfa0",
         expected_version: "0.3.1",
         expected_features: &[],
         expected_default_features: None,
@@ -158,7 +158,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "ftui-runtime",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "2d25a03d",
+        expected_rev: "5f78cfa0",
         expected_version: "0.3.1",
         expected_features: &["crossterm-compat", "native-backend"],
         expected_default_features: None,
@@ -175,7 +175,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "ftui-tty",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "2d25a03d",
+        expected_rev: "5f78cfa0",
         expected_version: "0.3.1",
         expected_features: &[],
         expected_default_features: None,
@@ -192,7 +192,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "ftui-extras",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/frankentui",
-        expected_rev: "2d25a03d",
+        expected_rev: "5f78cfa0",
         expected_version: "0.3.1",
         expected_features: &[
             "canvas",
@@ -287,10 +287,7 @@ fn validate_manifest_dependency_spec(manifest: &Value, contract: &DependencyCont
                 contract,
                 format!(
                     "dependency `{}` in [{}] must pin version = `{}`, found `{}`",
-                    contract.dep_key,
-                    contract.dep_table,
-                    contract.expected_version,
-                    actual_version
+                    contract.dep_key, contract.dep_table, contract.expected_version, actual_version
                 ),
             );
         }

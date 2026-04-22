@@ -32,7 +32,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "83c0d882", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "422969cf", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -44,10 +44,10 @@ regex = "*"
 portable-pty = "*"
 # FrankenTUI migration foundation (bead 2noh9.2.1).
 # Strategy: pin a Git revision for reproducible CI builds.
-ftui = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d" }
-ftui-runtime = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d", features = ["native-backend", "crossterm-compat"] }
-ftui-tty = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d" }
-ftui-extras = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "2d25a03d", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
+ftui = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
+ftui-runtime = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", features = ["native-backend", "crossterm-compat"] }
+ftui-tty = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0" }
+ftui-extras = { version = "*", git = "https://github.com/Dicklesworthstone/frankentui", rev = "5f78cfa0", default-features = false, features = ["markdown", "syntax", "charts", "canvas", "theme", "clipboard", "clipboard-fallback", "export", "visual-fx", "forms", "validation", "help"] }
 dirs = "*"
 walkdir = "*"
 glob = "*"
@@ -138,7 +138,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "83c0d882", package = "fsqlite-types" }
+fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "422969cf", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"

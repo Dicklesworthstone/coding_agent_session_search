@@ -990,7 +990,7 @@ pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsC
         })?;
 
     let inspection = (|| -> Result<(Option<i64>, i64, bool)> {
-        let schema_version = read_meta_schema_version(&conn)?;
+        let schema_version = read_meta_schema_version_rusqlite(&conn)?;
         let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
         let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
         Ok((schema_version, fts_schema_rows, fts_queryable))
@@ -1427,7 +1427,7 @@ impl HistoricalSalvageOutcome {
 
 #[derive(Debug)]
 struct HistoricalReadConnection {
-    conn: rusqlite::Connection,
+    conn: FrankenConnection,
     method: &'static str,
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -1758,19 +1758,21 @@ fn probe_historical_bundle(
     };
 
     let schema_version = read_meta_schema_version(&conn).ok().flatten();
-    let fts_schema_rows = conn
-        .query_row(
+    let fts_schema_rows: Option<i64> = conn
+        .query_row_map(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-            [],
-            |row| row.get(0),
+            fparams![],
+            |row| row.get_typed(0),
         )
         .ok();
     let fts_queryable =
         historical_bundle_fts_queryable_via_frankensqlite(root_path, fts_schema_rows);
-    let max_message_id = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
-            row.get(0)
-        })
+    let max_message_id: i64 = conn
+        .query_row_map(
+            "SELECT COALESCE(MAX(id), 0) FROM messages",
+            fparams![],
+            |row| row.get_typed(0),
+        )
         .unwrap_or(0);
 
     HistoricalBundleProbe {
@@ -1802,19 +1804,19 @@ fn historical_bundle_supports_direct_readonly(root_path: &Path) -> bool {
         .is_ok()
 }
 
-fn historical_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
+fn historical_table_exists(conn: &FrankenConnection, table: &str) -> Result<bool> {
     let found: Option<i64> = conn
-        .query_row(
+        .query_row_map(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-            [table],
-            |row| row.get(0),
+            fparams![table],
+            |row| row.get_typed(0),
         )
         .optional()
         .with_context(|| format!("checking for historical table {table}"))?;
     Ok(found.is_some())
 }
 
-fn probe_historical_table_reads(conn: &rusqlite::Connection, table: &str) -> Result<()> {
+fn probe_historical_table_reads(conn: &FrankenConnection, table: &str) -> Result<()> {
     if !historical_table_exists(conn, table)? {
         return Err(anyhow!(
             "historical database missing required table {table}"
@@ -1823,29 +1825,23 @@ fn probe_historical_table_reads(conn: &rusqlite::Connection, table: &str) -> Res
 
     let sql = format!("SELECT rowid FROM {table} LIMIT 1");
     let _: Option<i64> = conn
-        .query_row(&sql, [], |row| row.get(0))
+        .query_row_map(&sql, fparams![], |row| row.get_typed(0))
         .optional()
         .with_context(|| format!("probing rows from historical table {table}"))?;
     Ok(())
 }
 
-fn historical_bundle_has_queryable_core_tables(conn: &rusqlite::Connection) -> Result<()> {
+fn historical_bundle_has_queryable_core_tables(conn: &FrankenConnection) -> Result<()> {
     probe_historical_table_reads(conn, "conversations")?;
     probe_historical_table_reads(conn, "messages")?;
     Ok(())
 }
 
-fn open_historical_bundle_readonly(root_path: &Path) -> Result<rusqlite::Connection> {
-    let uri = format!("file:{}?immutable=1", root_path.to_string_lossy());
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
-    let conn = rusqlite::Connection::open_with_flags(uri, flags)
+fn open_historical_bundle_readonly(root_path: &Path) -> Result<FrankenConnection> {
+    let path_str = root_path.to_string_lossy();
+    let flags = FrankenOpenFlags::SQLITE_OPEN_READ_ONLY;
+    let conn = open_franken_with_flags(&path_str, flags)
         .with_context(|| format!("opening historical database {}", root_path.display()))?;
-    conn.pragma_update(None, "writable_schema", "ON")
-        .with_context(|| format!("enabling writable_schema for {}", root_path.display()))?;
-    conn.pragma_update(None, "query_only", "ON")
-        .with_context(|| format!("enabling query_only for {}", root_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(30))
-        .with_context(|| format!("configuring busy_timeout for {}", root_path.display()))?;
     Ok(conn)
 }
 
@@ -1872,7 +1868,7 @@ fn recover_historical_bundle_via_sqlite3(
 ) -> Result<HistoricalReadConnection> {
     let tempdir = tempfile::TempDir::new().context("creating temporary salvage directory")?;
     let recovered_db = tempdir.path().join("historical-recovered.db");
-    let temp_conn = rusqlite::Connection::open(&recovered_db)
+    let temp_conn = FrankenConnection::open(recovered_db.to_string_lossy().as_ref())
         .with_context(|| format!("creating recovered database {}", recovered_db.display()))?;
     temp_conn
         .execute_batch(HISTORICAL_RECOVERY_CORE_SCHEMA)
@@ -1990,28 +1986,31 @@ fn open_historical_bundle_for_salvage(
     recover_historical_bundle_via_sqlite3(bundle)
 }
 
-fn historical_bundle_counts(conn: &rusqlite::Connection) -> Result<(usize, usize)> {
+fn historical_bundle_counts(conn: &FrankenConnection) -> Result<(usize, usize)> {
     let conversations: i64 =
-        conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
-    let messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        conn.query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+            row.get_typed(0)
+        })?;
+    let messages: i64 = conn.query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+        row.get_typed(0)
+    })?;
     Ok((
         usize::try_from(conversations.max(0)).unwrap_or(usize::MAX),
         usize::try_from(messages.max(0)).unwrap_or(usize::MAX),
     ))
 }
 
-fn clear_seeded_runtime_meta_via_rusqlite(conn: &rusqlite::Connection) -> Result<()> {
+fn clear_seeded_runtime_meta(conn: &FrankenConnection) -> Result<()> {
     conn.execute(
         "DELETE FROM meta
          WHERE key LIKE 'historical_bundle_salvaged:%'
             OR key IN ('last_scan_ts', 'last_indexed_at', 'last_embedded_message_id')",
-        [],
     )?;
     Ok(())
 }
 
-fn record_historical_bundle_import_via_rusqlite(
-    conn: &rusqlite::Connection,
+fn record_historical_bundle_import(
+    conn: &FrankenConnection,
     bundle: &HistoricalDatabaseBundle,
     method: &str,
     conversations_imported: usize,
@@ -2029,9 +2028,9 @@ fn record_historical_bundle_import_via_rusqlite(
         "recorded_at_ms": FrankenStorage::now_millis(),
     });
     let value_str = serde_json::to_string(&value)?;
-    conn.execute(
+    conn.execute_compat(
         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-        rusqlite::params![key, value_str],
+        fparams![key, value_str],
     )?;
     Ok(())
 }
@@ -2050,22 +2049,21 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
             )
         })?;
 
-    let schema_version = {
-        let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
+    let path_str = canonical_db_path.to_string_lossy();
+    let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
+        format!(
+            "opening seeded canonical database for post-seed finalization: {}",
+            canonical_db_path.display()
+        )
+    })?;
+    conn.execute("PRAGMA busy_timeout = 30000;")
+        .with_context(|| {
             format!(
-                "opening seeded canonical database for post-seed finalization: {}",
+                "configuring busy timeout for seeded canonical database {}",
                 canonical_db_path.display()
             )
         })?;
-        conn.execute_batch("PRAGMA busy_timeout = 30000;")
-            .with_context(|| {
-                format!(
-                    "configuring busy timeout for seeded canonical database {}",
-                    canonical_db_path.display()
-                )
-            })?;
-        read_meta_schema_version(&conn)?
-    };
+    let schema_version = read_meta_schema_version(&conn)?;
 
     if let Some(version) = schema_version
         && version < CURRENT_SCHEMA_VERSION
@@ -2076,32 +2074,18 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
         );
     }
 
-    let conn = rusqlite::Connection::open(canonical_db_path).with_context(|| {
-        format!(
-            "reopening seeded canonical database for runtime-meta cleanup: {}",
-            canonical_db_path.display()
-        )
-    })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring post-seed busy timeout for {}",
-                canonical_db_path.display()
-            )
-        })?;
+    clear_seeded_runtime_meta(&conn)?;
 
-    clear_seeded_runtime_meta_via_rusqlite(&conn)?;
-
-    conn.execute(
+    conn.execute_compat(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?1)",
-        rusqlite::params![CURRENT_SCHEMA_VERSION.to_string()],
+        fparams![CURRENT_SCHEMA_VERSION.to_string()],
     )?;
 
-    conn.execute(
+    conn.execute_compat(
         "INSERT OR IGNORE INTO _schema_migrations(version, name) VALUES(?1, 'fts_contentless')",
-        rusqlite::params![CURRENT_SCHEMA_VERSION],
+        fparams![CURRENT_SCHEMA_VERSION],
     )?;
-    record_historical_bundle_import_via_rusqlite(
+    record_historical_bundle_import(
         &conn,
         bundle,
         "baseline-bulk-sql-copy",
@@ -2111,7 +2095,18 @@ fn finalize_seeded_canonical_bundle_via_rusqlite(
     Ok(())
 }
 
-fn read_meta_schema_version(conn: &rusqlite::Connection) -> Result<Option<i64>> {
+fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
+    let version: Option<String> = conn
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            fparams![],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    Ok(version.and_then(|raw| raw.parse::<i64>().ok()))
+}
+
+fn read_meta_schema_version_rusqlite(conn: &rusqlite::Connection) -> Result<Option<i64>> {
     let version = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",
@@ -2142,7 +2137,7 @@ pub(crate) fn probe_database_health_via_rusqlite(
             )
         })?;
 
-    let schema_version = read_meta_schema_version(&conn)?;
+    let schema_version = read_meta_schema_version_rusqlite(&conn)?;
     let quick_check_status: String = conn
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
@@ -5881,42 +5876,41 @@ impl FrankenStorage {
         }
     }
 
-    fn import_historical_sources(&self, source_conn: &rusqlite::Connection) -> Result<()> {
-        let mut stmt = match source_conn.prepare(
+    fn import_historical_sources(&self, source_conn: &FrankenConnection) -> Result<()> {
+        let sources: Vec<Source> = match source_conn.query_map_collect(
             "SELECT id, kind, host_label, machine_id, platform, config_json, created_at, updated_at
              FROM sources",
+            fparams![],
+            |row| {
+                let raw_source_id: String = row.get_typed(0)?;
+                let kind_str: String = row.get_typed(1)?;
+                let raw_host_label: Option<String> = row.get_typed(2)?;
+                let config_json_raw: Option<String> = row.get_typed(5)?;
+                let (source_id, source_kind, host_label) = normalized_storage_source_parts(
+                    Some(raw_source_id.as_str()),
+                    Some(kind_str.as_str()),
+                    raw_host_label.as_deref(),
+                );
+                Ok(Source {
+                    id: source_id,
+                    kind: source_kind,
+                    host_label,
+                    machine_id: row.get_typed(3)?,
+                    platform: row.get_typed(4)?,
+                    config_json: config_json_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+                    created_at: row.get_typed(6)?,
+                    updated_at: row.get_typed(7)?,
+                })
+            },
         ) {
-            Ok(stmt) => stmt,
+            Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, "historical sources table unavailable; skipping source import");
                 return Ok(());
             }
         };
 
-        let rows = stmt.query_map([], |row| {
-            let raw_source_id: String = row.get(0)?;
-            let kind_str: String = row.get(1)?;
-            let raw_host_label: Option<String> = row.get(2)?;
-            let config_json_raw: Option<String> = row.get(5)?;
-            let (source_id, source_kind, host_label) = normalized_storage_source_parts(
-                Some(raw_source_id.as_str()),
-                Some(kind_str.as_str()),
-                raw_host_label.as_deref(),
-            );
-            Ok(Source {
-                id: source_id,
-                kind: source_kind,
-                host_label,
-                machine_id: row.get(3)?,
-                platform: row.get(4)?,
-                config_json: config_json_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        })?;
-
-        for row in rows {
-            let source = row.context("reading historical source row")?;
+        for source in sources {
             self.upsert_source(&source)?;
         }
         Ok(())
@@ -5926,7 +5920,7 @@ impl FrankenStorage {
         &self,
         bundle: &HistoricalDatabaseBundle,
         salvage_method: &str,
-        source_conn: &rusqlite::Connection,
+        source_conn: &FrankenConnection,
     ) -> Result<(usize, usize)> {
         let batch_limits = historical_import_batch_limits();
         let cache_enabled = IndexingCache::is_enabled();
@@ -6006,19 +6000,51 @@ impl FrankenStorage {
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              ORDER BY c.id"
         };
-        let mut conv_stmt = source_conn.prepare(conv_sql)?;
-        let mut message_stmt = source_conn.prepare(
-            "SELECT idx, role, author, created_at, content, extra_json
+        let conv_params: &[ParamValue] =
+            if let Some(last_completed_source_row_id) = resume_after_row_id {
+                &[ParamValue::from(last_completed_source_row_id)]
+            } else {
+                &[]
+            };
+
+        #[allow(clippy::type_complexity)]
+        let conv_rows: Vec<(
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = source_conn
+            .query_map_collect(conv_sql, conv_params, |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<String>>(3)?,
+                    row.get_typed::<Option<String>>(4)?,
+                    row.get_typed::<String>(5)?,
+                    row.get_typed::<Option<i64>>(6)?,
+                    row.get_typed::<Option<i64>>(7)?,
+                    row.get_typed::<Option<i64>>(8)?,
+                    row.get_typed::<Option<String>>(9)?,
+                    row.get_typed::<Option<String>>(10)?,
+                    row.get_typed::<Option<String>>(11)?,
+                ))
+            })
+            .context("querying historical conversations")?;
+
+        let msg_sql = "SELECT idx, role, author, created_at, content, extra_json
              FROM messages
              WHERE conversation_id = ?1
-             ORDER BY idx",
-        )?;
+             ORDER BY idx";
 
-        let mut rows = if let Some(last_completed_source_row_id) = resume_after_row_id {
-            conv_stmt.query(rusqlite::params![last_completed_source_row_id])?
-        } else {
-            conv_stmt.query([])?
-        };
         let mut imported_conversations = resume_progress
             .as_ref()
             .map(|progress| progress.conversations_imported)
@@ -6136,13 +6162,21 @@ impl FrankenStorage {
             Ok(())
         };
 
-        while let Some(row) = rows.next()? {
-            let conversation_row_id: i64 = row.get(0)?;
-            let agent_slug: String = row.get(1)?;
-            let workspace_path: Option<String> = row.get(2)?;
-            let source_path: String = row.get(5)?;
-            let raw_source_id: Option<String> = row.get(10)?;
-            let raw_origin_host: Option<String> = row.get(11)?;
+        for (
+            conversation_row_id,
+            agent_slug,
+            workspace_path,
+            external_id,
+            title,
+            source_path,
+            started_at,
+            ended_at,
+            approx_tokens,
+            metadata_json_raw,
+            raw_source_id,
+            raw_origin_host,
+        ) in conv_rows
+        {
             let source_id = crate::search::tantivy::normalized_index_source_id(
                 raw_source_id.as_deref(),
                 None,
@@ -6151,12 +6185,12 @@ impl FrankenStorage {
             let origin_host =
                 crate::search::tantivy::normalized_index_origin_host(raw_origin_host.as_deref());
 
-            let messages = message_stmt
-                .query_map(rusqlite::params![conversation_row_id], |msg_row| {
-                    let role: String = msg_row.get(1)?;
+            let messages: Vec<Message> = source_conn
+                .query_map_collect(msg_sql, fparams![conversation_row_id], |msg_row| {
+                    let role: String = msg_row.get_typed(1)?;
                     Ok(Message {
                         id: None,
-                        idx: msg_row.get(0)?,
+                        idx: msg_row.get_typed(0)?,
                         role: match role.as_str() {
                             "user" => MessageRole::User,
                             "agent" | "assistant" => MessageRole::Agent,
@@ -6164,14 +6198,13 @@ impl FrankenStorage {
                             "system" => MessageRole::System,
                             other => MessageRole::Other(other.to_string()),
                         },
-                        author: msg_row.get(2)?,
-                        created_at: msg_row.get(3)?,
-                        content: msg_row.get(4)?,
-                        extra_json: parse_historical_json_column(msg_row.get(5)?),
+                        author: msg_row.get_typed(2)?,
+                        created_at: msg_row.get_typed(3)?,
+                        content: msg_row.get_typed(4)?,
+                        extra_json: parse_historical_json_column(msg_row.get_typed(5)?),
                         snippets: Vec::new(),
                     })
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()
+                })
                 .context("collecting historical message rows")?;
 
             if messages.is_empty() {
@@ -6188,13 +6221,13 @@ impl FrankenStorage {
                 id: None,
                 agent_slug: agent_slug.clone(),
                 workspace: workspace_path.map(PathBuf::from),
-                external_id: row.get(3)?,
-                title: row.get(4)?,
+                external_id,
+                title,
                 source_path: PathBuf::from(source_path),
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                approx_tokens: row.get(8)?,
-                metadata_json: parse_json_column(row.get(9)?),
+                started_at,
+                ended_at,
+                approx_tokens,
+                metadata_json: parse_json_column(metadata_json_raw),
                 messages,
                 source_id,
                 origin_host,
@@ -15393,23 +15426,29 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        let duplicated_source = open_historical_bundle_readonly(&source_db).unwrap();
-        let duplicated_source_fts_entries: i64 = duplicated_source
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            duplicated_source_fts_entries, 2,
-            "test fixture should reproduce the duplicate legacy fts_messages rows"
-        );
-        let duplicated_source_message_count: i64 = duplicated_source
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(duplicated_source_message_count, 1);
-        drop(duplicated_source);
+        // Verify fixture with rusqlite+writable_schema to see raw
+        // sqlite_master rows (frankensqlite deduplicates schema entries).
+        {
+            let verify = rusqlite::Connection::open(&source_db).unwrap();
+            verify
+                .execute_batch("PRAGMA writable_schema = ON;")
+                .unwrap();
+            let fts_entries: i64 = verify
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                fts_entries, 2,
+                "test fixture should reproduce the duplicate legacy fts_messages rows"
+            );
+            let msg_count: i64 = verify
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(msg_count, 1);
+        }
 
         let fresh = SqliteStorage::open(&canonical_db).unwrap();
         drop(fresh);
