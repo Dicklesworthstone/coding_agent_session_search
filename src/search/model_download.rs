@@ -245,6 +245,96 @@ impl ModelCacheState {
         }
     }
 
+    /// Human-readable state detail for CLI and robot diagnostics.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::NotAcquired {
+                missing_files,
+                needs_consent,
+            } => {
+                let action = if *needs_consent {
+                    "user consent required"
+                } else {
+                    "ready to acquire"
+                };
+                format!(
+                    "model not acquired ({action}); missing {}",
+                    missing_files.join(", ")
+                )
+            }
+            Self::Acquiring {
+                bytes_present,
+                total_bytes,
+                staging_dir,
+            } => format!(
+                "model acquisition in progress at {} ({bytes_present}/{total_bytes} bytes)",
+                staging_dir.display()
+            ),
+            Self::Acquired { .. } => "model cache acquired and verified".to_string(),
+            Self::ChecksumMismatch {
+                file,
+                expected,
+                actual,
+            } => format!("checksum mismatch for {file}: expected {expected}, got {actual}"),
+            Self::IncompatibleVersion {
+                current_revision,
+                expected_revision,
+            } => format!("model revision mismatch: {current_revision} != {expected_revision}"),
+            Self::DisabledByPolicy { reason } => format!("model acquisition disabled: {reason}"),
+            Self::BudgetBlocked {
+                required_bytes,
+                max_bytes,
+            } => {
+                format!("model requires {required_bytes} bytes but policy allows {max_bytes} bytes")
+            }
+            Self::QuarantinedCorrupt { reason, .. } => {
+                format!("model cache quarantined: {reason}")
+            }
+            Self::PreseededLocal { .. } => "preseeded local model cache verified".to_string(),
+            Self::MirrorSourced {
+                mirror_base_url, ..
+            } => {
+                format!("model cache verified from mirror {mirror_base_url}")
+            }
+            Self::OfflineBlocked { missing_files } => {
+                format!(
+                    "offline and model is not acquired; missing {}",
+                    missing_files.join(", ")
+                )
+            }
+        }
+    }
+
+    /// Suggested next operator action.
+    pub fn next_step(&self) -> Option<&'static str> {
+        match self {
+            Self::NotAcquired { .. } => {
+                Some("Run `cass models install`, or keep using lexical search.")
+            }
+            Self::Acquiring { .. } => {
+                Some("Wait for model acquisition to finish, or keep using lexical search.")
+            }
+            Self::Acquired { .. } | Self::PreseededLocal { .. } | Self::MirrorSourced { .. } => {
+                None
+            }
+            Self::ChecksumMismatch { .. } | Self::QuarantinedCorrupt { .. } => Some(
+                "Run `cass models verify --repair`, or reinstall with `cass models install -y`.",
+            ),
+            Self::IncompatibleVersion { .. } => {
+                Some("Run `cass models install -y` to refresh the model cache.")
+            }
+            Self::DisabledByPolicy { .. } => {
+                Some("Use lexical search or re-enable semantic model acquisition in policy.")
+            }
+            Self::BudgetBlocked { .. } => {
+                Some("Increase the semantic model budget or keep using lexical search.")
+            }
+            Self::OfflineBlocked { .. } => Some(
+                "Reconnect or install from local files with `cass models install --from-file`.",
+            ),
+        }
+    }
+
     /// Whether the installed files can be used by the embedder immediately.
     pub fn is_usable(&self) -> bool {
         matches!(
@@ -1592,7 +1682,7 @@ fn classify_model_cache_state(
     }
 
     for file in &manifest.files {
-        let Some(path) = manifest_file_path(model_dir, file) else {
+        let Some(path) = model_file_path(model_dir, file) else {
             continue;
         };
         match compute_sha256(&path) {
@@ -1669,7 +1759,7 @@ pub fn check_model_installed(model_dir: &Path) -> ModelState {
     // downloader and air-gap installer.
     let manifest = ModelManifest::minilm_v2();
     for file in &manifest.files {
-        if manifest_file_path(model_dir, file).is_none() {
+        if model_file_path(model_dir, file).is_none() {
             return ModelState::NotInstalled;
         }
     }
@@ -1713,7 +1803,11 @@ fn model_download_temp_dir(target_dir: &Path) -> PathBuf {
     }
 }
 
-fn manifest_file_path(model_dir: &Path, file: &ModelFile) -> Option<PathBuf> {
+/// Resolve a manifest file on disk.
+///
+/// The downloader stores HuggingFace paths by local basename, while preseeded
+/// directories can preserve the canonical repo layout.
+pub fn model_file_path(model_dir: &Path, file: &ModelFile) -> Option<PathBuf> {
     let canonical = model_dir.join(&file.name);
     if canonical.is_file() {
         return Some(canonical);
@@ -1731,7 +1825,7 @@ fn missing_manifest_files(model_dir: &Path, manifest: &ModelManifest) -> Vec<Str
     manifest
         .files
         .iter()
-        .filter(|file| manifest_file_path(model_dir, file).is_none())
+        .filter(|file| model_file_path(model_dir, file).is_none())
         .map(|file| file.local_name().to_string())
         .collect()
 }
@@ -1740,7 +1834,7 @@ fn installed_manifest_size(model_dir: &Path, manifest: &ModelManifest) -> u64 {
     manifest
         .files
         .iter()
-        .filter_map(|file| manifest_file_path(model_dir, file))
+        .filter_map(|file| model_file_path(model_dir, file))
         .filter_map(|path| path.metadata().ok())
         .map(|metadata| metadata.len())
         .sum()

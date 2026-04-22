@@ -23964,13 +23964,18 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
 /// Show semantic model installation status
 fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{ModelManifest, ModelState, check_model_installed};
+    use crate::search::model_download::{
+        ModelAcquisitionPolicy, ModelManifest, classify_model_cache, model_file_path,
+    };
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
 
     let data_dir = default_data_dir();
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
+    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    let state = check_model_installed(&model_dir);
     let total_size = manifest.total_size();
     let total_size_mb = total_size as f64 / 1_048_576.0;
 
@@ -23978,10 +23983,10 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     let mut installed_size: u64 = 0;
     let mut file_info: Vec<serde_json::Value> = Vec::new();
     for mfile in &manifest.files {
-        let file_path = model_dir.join(&mfile.name);
-        let exists = file_path.is_file();
-        let size = if exists {
-            file_path.metadata().map(|m| m.len()).unwrap_or(0)
+        let file_path = model_file_path(&model_dir, mfile);
+        let exists = file_path.is_some();
+        let size = if let Some(path) = file_path.as_ref() {
+            path.metadata().map(|m| m.len()).unwrap_or(0)
         } else {
             0
         };
@@ -23990,6 +23995,8 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         }
         file_info.push(serde_json::json!({
             "name": mfile.name,
+            "local_name": mfile.local_name(),
+            "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
             "expected_size": mfile.size,
             "actual_size": size,
             "exists": exists,
@@ -24009,22 +24016,18 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         let output = serde_json::json!({
             "model_id": manifest.id,
             "model_dir": model_dir.display().to_string(),
-            "state": match &state {
-                ModelState::Ready => "ready",
-                ModelState::NotInstalled => "not_installed",
-                ModelState::NeedsConsent => "needs_consent",
-                ModelState::Downloading { .. } => "downloading",
-                ModelState::Verifying => "verifying",
-                ModelState::Disabled { .. } => "disabled",
-                ModelState::VerificationFailed { .. } => "verification_failed",
-                ModelState::UpdateAvailable { .. } => "update_available",
-                ModelState::Cancelled => "cancelled",
-            },
-            "state_detail": state.summary(),
+            "installed": cache_report.is_usable(),
+            "state": cache_report.state_code(),
+            "state_detail": cache_report.state.summary(),
+            "next_step": cache_report.state.next_step(),
+            "lexical_fail_open": true,
             "revision": manifest.revision,
             "license": manifest.license,
             "total_size_bytes": total_size,
-            "installed_size_bytes": installed_size,
+            "installed_size_bytes": cache_report.installed_size_bytes,
+            "observed_file_bytes": installed_size,
+            "policy_source": cache_report.policy_source.as_str(),
+            "cache_lifecycle": &cache_report,
             "files": file_info,
         });
         println!(
@@ -24046,42 +24049,27 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         println!("Size:     {:.1} MB", total_size_mb);
         println!();
 
-        let status_str = match &state {
-            ModelState::Ready => "Ready".green().to_string(),
-            ModelState::NotInstalled => "Not Installed".yellow().to_string(),
-            ModelState::NeedsConsent => "Needs Consent".yellow().to_string(),
-            ModelState::Downloading { progress_pct, .. } => {
-                format!("Downloading ({}%)", progress_pct)
-                    .cyan()
-                    .to_string()
+        let status_str = match cache_report.state_code() {
+            "acquired" | "preseeded_local" | "mirror_sourced" => {
+                cache_report.state.summary().green().to_string()
             }
-            ModelState::Verifying => "Verifying".cyan().to_string(),
-            ModelState::Disabled { reason } => format!("Disabled: {}", reason).red().to_string(),
-            ModelState::VerificationFailed { reason } => {
-                format!("Verification Failed: {}", reason).red().to_string()
+            "acquiring" => cache_report.state.summary().cyan().to_string(),
+            "not_acquired" | "offline_blocked" | "budget_blocked" | "disabled_by_policy" => {
+                cache_report.state.summary().yellow().to_string()
             }
-            ModelState::UpdateAvailable {
-                current_revision,
-                latest_revision,
-            } => format!(
-                "Update Available ({} -> {})",
-                current_revision.get(..8).unwrap_or(current_revision),
-                latest_revision.get(..8).unwrap_or(latest_revision)
-            )
-            .yellow()
-            .to_string(),
-            ModelState::Cancelled => "Cancelled".yellow().to_string(),
+            _ => cache_report.state.summary().red().to_string(),
         };
         println!("Status: {}", status_str);
+        println!("Fail-open: lexical search remains available.");
         println!();
 
         // Show files
         println!("Files:");
         for mfile in &manifest.files {
-            let file_path = model_dir.join(&mfile.name);
-            let exists = file_path.is_file();
-            let size = if exists {
-                file_path.metadata().map(|m| m.len()).unwrap_or(0)
+            let file_path = model_file_path(&model_dir, mfile);
+            let exists = file_path.is_some();
+            let size = if let Some(path) = file_path.as_ref() {
+                path.metadata().map(|m| m.len()).unwrap_or(0)
             } else {
                 0
             };
@@ -24098,24 +24086,10 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         }
         println!();
 
-        // Suggestions based on state
-        match state {
-            ModelState::NotInstalled | ModelState::NeedsConsent => {
-                println!("To install the model, run:");
-                println!("  cass models install");
-            }
-            ModelState::VerificationFailed { .. } => {
-                println!("To repair the model, run:");
-                println!("  cass models verify --repair");
-            }
-            ModelState::UpdateAvailable { .. } => {
-                println!("To update the model, run:");
-                println!("  cass models install");
-            }
-            ModelState::Ready => {
-                println!("Model is ready for semantic search.");
-            }
-            _ => {}
+        if let Some(next_step) = cache_report.state.next_step() {
+            println!("{}", next_step);
+        } else {
+            println!("Model is ready for semantic search.");
         }
     }
 
@@ -24446,58 +24420,70 @@ fn run_models_verify(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{ModelManifest, compute_sha256};
+    use crate::search::model_download::{
+        ModelAcquisitionPolicy, ModelManifest, classify_model_cache, compute_sha256,
+        model_file_path,
+    };
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use colored::Colorize;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
+    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
 
     if !model_dir.is_dir() {
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-
         if let Some(_fmt) = structured_format {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "not_installed",
+                    "status": cache_report.state_code(),
+                    "state_detail": cache_report.state.summary(),
+                    "next_step": cache_report.state.next_step(),
+                    "lexical_fail_open": true,
                     "model_dir": model_dir.display().to_string(),
-                    "error": "Model directory does not exist",
+                    "all_valid": false,
+                    "cache_lifecycle": &cache_report,
+                    "error": "model directory does not exist",
                 }))
                 .unwrap_or_default()
             );
         } else {
-            println!("{} Model is not installed.", "✗".red());
+            println!("{} {}", "✗".red(), cache_report.state.summary());
             println!("  Expected location: {}", model_dir.display());
             println!();
-            println!("To install, run:");
-            println!("  cass models install");
+            if let Some(next_step) = cache_report.state.next_step() {
+                println!("{}", next_step);
+            }
         }
         return Ok(());
     }
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut all_valid = true;
-    let mut files_to_repair: Vec<&str> = Vec::new();
+    let mut files_to_repair: Vec<String> = Vec::new();
 
-    let is_robot = output_format.is_some();
+    let is_robot = structured_format.is_some();
     if !is_robot {
         println!("Verifying model files...");
         println!();
     }
 
     for mfile in &manifest.files {
-        let file_path = model_dir.join(&mfile.name);
-        let exists = file_path.is_file();
+        let file_path = model_file_path(&model_dir, mfile);
+        let exists = file_path.is_some();
 
-        let (valid, actual_hash, error) = if exists {
-            match compute_sha256(&file_path) {
+        let (valid, actual_hash, error) = if let Some(path) = file_path.as_ref() {
+            match compute_sha256(path) {
                 Ok(hash) => {
                     let matches = hash == mfile.sha256;
                     (matches, Some(hash), None)
@@ -24510,11 +24496,13 @@ fn run_models_verify(
 
         if !valid {
             all_valid = false;
-            files_to_repair.push(&mfile.name);
+            files_to_repair.push(mfile.local_name().to_string());
         }
 
         results.push(serde_json::json!({
             "file": mfile.name,
+            "local_name": mfile.local_name(),
+            "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
             "exists": exists,
             "valid": valid,
             "expected_sha256": mfile.sha256,
@@ -24543,20 +24531,17 @@ fn run_models_verify(
         }
     }
 
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
     if let Some(_fmt) = structured_format {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "model_dir": model_dir.display().to_string(),
+                "status": cache_report.state_code(),
+                "state_detail": cache_report.state.summary(),
+                "next_step": cache_report.state.next_step(),
+                "lexical_fail_open": true,
                 "all_valid": all_valid,
+                "cache_lifecycle": &cache_report,
                 "files": results,
             }))
             .unwrap_or_default()
