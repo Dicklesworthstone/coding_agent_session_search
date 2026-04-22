@@ -163,3 +163,54 @@ fn cross_surface_version_agreement() {
          ({caps_version:?}) — one surface picked up a stale build-time constant"
     );
 }
+
+#[test]
+fn capabilities_surface_is_home_independent() {
+    // Row 3 of the matrix: the capabilities surface is a compile-time
+    // contract (feature list, connector list, limits) and MUST NOT vary
+    // based on the resolved data-dir. Two independent isolated HOMEs
+    // must produce byte-identical capabilities JSON.
+    //
+    // If a future change accidentally reads a runtime config file from
+    // the data dir during capabilities resolution (e.g., "which features
+    // are enabled in this workspace"), this test starts failing — surfacing
+    // the leak before downstream agents see inconsistent capability views.
+    fn caps_json(home: &Path) -> String {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(["capabilities", "--json"])
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass capabilities --json");
+        assert!(
+            out.status.success(),
+            "cass capabilities --json exited non-zero under home {}",
+            home.display(),
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        // Re-serialize for canonical comparison. The capabilities output
+        // has no dynamic values outside crate_version, and crate_version
+        // is a compile-time constant that's identical across tempdirs —
+        // so no scrubbing is needed here.
+        serde_json::to_string_pretty(&parsed).expect("pretty")
+    }
+
+    let home_a = tempfile::tempdir().expect("tempdir a");
+    let home_b = tempfile::tempdir().expect("tempdir b");
+    assert_ne!(
+        home_a.path(),
+        home_b.path(),
+        "tempdir a and tempdir b must be distinct paths"
+    );
+
+    let caps_a = caps_json(home_a.path());
+    let caps_b = caps_json(home_b.path());
+
+    assert_eq!(
+        caps_a, caps_b,
+        "cass capabilities --json is HOME-dependent — this is a contract leak"
+    );
+}
