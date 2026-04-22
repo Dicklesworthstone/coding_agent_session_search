@@ -13,7 +13,6 @@ use frankensqlite::{
     },
     migrate::MigrationRunner,
 };
-use rusqlite::OptionalExtension as RusqliteOptionalExtension;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -823,276 +822,44 @@ const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
 pub const FTS5_DELETE_ALL_SQL: &str =
     "INSERT INTO fts_messages(fts_messages) VALUES('delete-all');";
 
-fn rusqlite_fts_schema_artifact_rows(conn: &rusqlite::Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE name = 'fts_messages' OR name LIKE 'fts_messages_%'",
-        [],
-        |row| row.get(0),
-    )
-    .context("counting sqlite_master rows for fts_messages artifacts")
-}
-
-fn scrub_fts_schema_via_writable_schema(conn: &rusqlite::Connection, db_path: &Path) -> Result<()> {
-    let schema_version: i64 = conn
-        .query_row("PRAGMA schema_version", [], |row| row.get(0))
-        .with_context(|| format!("reading schema_version for {}", db_path.display()))?;
-    conn.pragma_update(None, "writable_schema", "ON")
-        .with_context(|| format!("enabling writable_schema for {}", db_path.display()))?;
-    let delete_result = conn.execute(
-        "DELETE FROM sqlite_master
-         WHERE name = 'fts_messages'
-            OR name LIKE 'fts_messages_%'
-            OR tbl_name = 'fts_messages'",
-        [],
-    );
-    let disable_result = conn.pragma_update(None, "writable_schema", "OFF");
-
-    delete_result
-        .with_context(|| format!("scrubbing FTS sqlite_master rows in {}", db_path.display()))?;
-    disable_result
-        .with_context(|| format!("disabling writable_schema for {}", db_path.display()))?;
-    conn.pragma_update(None, "schema_version", schema_version + 1)
-        .with_context(|| {
-            format!(
-                "bumping schema_version after FTS scrub in {}",
-                db_path.display()
-            )
-        })?;
-    Ok(())
-}
-
-fn force_clear_fts_schema_via_rusqlite(conn: &rusqlite::Connection, db_path: &Path) -> Result<()> {
-    scrub_fts_schema_via_writable_schema(conn, db_path)?;
-    Ok(())
-}
-
-fn drop_fts_schema_via_rusqlite(conn: &rusqlite::Connection, db_path: &Path) -> Result<()> {
-    if let Err(err) = conn.execute_batch("DROP TABLE IF EXISTS fts_messages;") {
-        tracing::warn!(
-            db_path = %db_path.display(),
-            error = %err,
-            "drop table for fts_messages failed; forcing FTS schema scrub"
-        );
-        force_clear_fts_schema_via_rusqlite(conn, db_path)?;
-        return Ok(());
-    }
-
-    if rusqlite_fts_schema_artifact_rows(conn)? > 0 {
-        tracing::warn!(
-            db_path = %db_path.display(),
-            "fts_messages artifacts remained after DROP TABLE; forcing FTS schema scrub"
-        );
-        force_clear_fts_schema_via_rusqlite(conn, db_path)?;
-    }
-
-    Ok(())
-}
-
-fn open_rusqlite_with_busy_timeout(db_path: &Path, context: &str) -> Result<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+#[cfg(test)]
+pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
+    // Delegate to FrankenStorage: DROP TABLE IF EXISTS + CREATE VIRTUAL TABLE
+    // is fully supported by the frankensqlite FTS5 path at
+    // FrankenStorage::rebuild_fts_via_frankensqlite. We call rebuild which
+    // also populates rows, matching the historical semantics ("fresh FTS"
+    // means the schema exists and is consistent with message rows).
+    let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "reopening rusqlite db at {} for {context}",
+            "opening frankensqlite db at {} for FTS materialization",
             db_path.display()
         )
     })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring rusqlite busy timeout for {context} at {}",
-                db_path.display()
-            )
-        })?;
-    Ok(conn)
+    storage.rebuild_fts_via_frankensqlite().map(|_| ())
 }
 
 #[cfg(test)]
-pub(crate) fn materialize_fresh_fts_schema_via_rusqlite(db_path: &Path) -> Result<()> {
-    let conn = open_rusqlite_with_busy_timeout(db_path, "FTS materialization")?;
-    drop_fts_schema_via_rusqlite(&conn, db_path)?;
-    drop(conn);
-
-    let mut conn = open_rusqlite_with_busy_timeout(db_path, "FTS materialization post-drop")?;
-
-    let tx = conn.transaction().with_context(|| {
-        format!(
-            "starting rusqlite FTS materialization transaction for {}",
-            db_path.display()
-        )
-    })?;
-    tx.execute_batch(FTS5_REGISTER_SQL)
-        .with_context(|| format!("creating fresh FTS schema in {}", db_path.display()))?;
-    tx.commit()
-        .with_context(|| format!("committing fresh FTS schema in {}", db_path.display()))?;
-    Ok(())
-}
-
 pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
-    let conn = open_rusqlite_with_busy_timeout(db_path, "FTS rebuild")?;
-    drop_fts_schema_via_rusqlite(&conn, db_path)?;
-    drop(conn);
-
-    let mut conn = open_rusqlite_with_busy_timeout(db_path, "FTS rebuild post-drop")?;
-
-    let tx = conn.transaction().with_context(|| {
+    let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "starting rusqlite FTS rebuild transaction for {}",
+            "opening frankensqlite db at {} for FTS rebuild",
             db_path.display()
         )
     })?;
-    tx.execute_batch(FTS5_REGISTER_SQL)
-        .with_context(|| format!("creating fresh FTS schema in {}", db_path.display()))?;
-    let inserted = tx
-        .execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             SELECT m.id, m.content, c.title, COALESCE(a.slug, 'unknown'), w.path, c.source_path, m.created_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.rowid",
-            [],
-        )
-        .with_context(|| format!("populating rebuilt FTS rows in {}", db_path.display()))?;
-    tx.commit()
-        .with_context(|| format!("committing rebuilt FTS rows in {}", db_path.display()))?;
-    Ok(inserted)
-}
-
-fn rusqlite_fts_schema_rows(conn: &rusqlite::Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-        [],
-        |row| row.get(0),
-    )
-    .context("counting sqlite_master rows for fts_messages")
-}
-
-fn rusqlite_fts_limit_probe(conn: &rusqlite::Connection) -> bool {
-    conn.prepare("SELECT rowid FROM fts_messages LIMIT 1")
-        .and_then(|mut stmt| stmt.exists([]))
-        .is_ok()
+    storage.rebuild_fts_via_frankensqlite()
 }
 
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
-    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+    // Delegates to the FrankenStorage-native path. The function name retains
+    // the `_via_rusqlite` suffix only for backwards compatibility with the
+    // few test-site callers; all operations now run through frankensqlite.
+    let storage = FrankenStorage::open(db_path).with_context(|| {
         format!(
-            "opening rusqlite db at {} for FTS consistency check",
+            "opening frankensqlite db at {} for FTS consistency check",
             db_path.display()
         )
     })?;
-    conn.execute_batch("PRAGMA busy_timeout = 30000;")
-        .with_context(|| {
-            format!(
-                "configuring rusqlite busy timeout for FTS consistency check at {}",
-                db_path.display()
-            )
-        })?;
-
-    let inspection = (|| -> Result<(Option<i64>, i64, bool)> {
-        let schema_version = read_meta_schema_version_rusqlite(&conn)?;
-        let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
-        let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
-        Ok((schema_version, fts_schema_rows, fts_queryable))
-    })();
-    let (schema_version, _fts_schema_rows, fts_queryable) = match inspection {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "fts consistency probe failed; forcing authoritative rusqlite rebuild"
-            );
-            drop(conn);
-            let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
-            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-        }
-    };
-
-    if schema_version != Some(CURRENT_SCHEMA_VERSION) || !fts_queryable {
-        drop(conn);
-        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
-        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-    }
-
-    let total_messages: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .context("counting canonical messages for FTS consistency check")?;
-    let indexed_messages: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
-        .context("counting canonical FTS rows for FTS consistency check")?;
-
-    if indexed_messages == total_messages {
-        return Ok(FtsConsistencyRepair::AlreadyHealthy {
-            rows: usize::try_from(total_messages.max(0)).unwrap_or(usize::MAX),
-        });
-    }
-
-    if indexed_messages > total_messages {
-        drop(conn);
-        let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
-        return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
-    }
-
-    let mut conn = conn;
-    let tx = conn.transaction().with_context(|| {
-        format!(
-            "starting incremental FTS consistency repair for {}",
-            db_path.display()
-        )
-    })?;
-    let inserted_rows = tx
-        .execute(
-            "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             SELECT m.id, m.content, c.title, COALESCE(a.slug, 'unknown'), w.path, c.source_path, m.created_at
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
-             LEFT JOIN agents a ON c.agent_id = a.id
-             LEFT JOIN workspaces w ON c.workspace_id = w.id
-             WHERE NOT EXISTS (SELECT 1 FROM fts_messages f WHERE f.rowid = m.id)
-             ORDER BY m.rowid",
-            [],
-        )
-        .with_context(|| format!("incrementally repairing missing FTS rows in {}", db_path.display()))?;
-    tx.commit().with_context(|| {
-        format!(
-            "committing incremental FTS consistency repair in {}",
-            db_path.display()
-        )
-    })?;
-
-    let repaired_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fts_messages", [], |row| row.get(0))
-        .context("counting repaired canonical FTS rows")?;
-    if repaired_rows == total_messages {
-        return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-            inserted_rows,
-            total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-        });
-    }
-
-    // Same un-indexable-gap short-circuit as the frankensqlite path: if the
-    // incremental catch-up inserted zero rows yet the gap between
-    // total_messages and indexed_messages persists, the remaining messages
-    // are orphans (dangling conversation_id) and a full rebuild would just
-    // re-exclude them.  Accept the current state instead of looping.
-    if inserted_rows == 0 {
-        tracing::debug!(
-            db_path = %db_path.display(),
-            indexed_messages = repaired_rows,
-            total_messages,
-            un_indexable_gap = total_messages.saturating_sub(repaired_rows),
-            "FTS catch-up (rusqlite) inserted 0 rows; remaining gap is un-indexable (likely orphaned messages)"
-        );
-        return Ok(FtsConsistencyRepair::IncrementalCatchUp {
-            inserted_rows: 0,
-            total_rows: usize::try_from(repaired_rows.max(0)).unwrap_or(usize::MAX),
-        });
-    }
-
-    drop(conn);
-    let inserted_rows = rebuild_fts_via_rusqlite(db_path)?;
-    Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
+    storage.ensure_search_fallback_fts_consistency()
 }
 
 /// Create a uniquely named backup of the database file.
@@ -2106,44 +1873,48 @@ fn read_meta_schema_version(conn: &FrankenConnection) -> Result<Option<i64>> {
     Ok(version.and_then(|raw| raw.parse::<i64>().ok()))
 }
 
-fn read_meta_schema_version_rusqlite(conn: &rusqlite::Connection) -> Result<Option<i64>> {
-    let version = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .and_then(|raw| raw.parse::<i64>().ok());
-    Ok(version)
+#[cfg(test)]
+fn franken_fts_schema_rows(conn: &FrankenConnection) -> Result<i64> {
+    conn.query_row_map(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+        fparams![],
+        |row| row.get_typed(0),
+    )
+    .context("counting sqlite_master rows for fts_messages via frankensqlite")
+}
+
+#[cfg(test)]
+fn franken_fts_limit_probe(conn: &FrankenConnection) -> bool {
+    conn.query("SELECT rowid FROM fts_messages LIMIT 1").is_ok()
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn probe_database_health_via_rusqlite(
+pub(crate) fn probe_database_health_via_frankensqlite(
     db_path: &Path,
 ) -> Result<SqliteDatabaseHealthProbe> {
-    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+    let path_str = db_path.to_string_lossy();
+    let conn = FrankenConnection::open(path_str.as_ref()).with_context(|| {
         format!(
-            "opening rusqlite db at {} for database health probe",
+            "opening frankensqlite db at {} for database health probe",
             db_path.display()
         )
     })?;
     conn.execute_batch("PRAGMA busy_timeout = 30000;")
         .with_context(|| {
             format!(
-                "configuring rusqlite busy timeout for database health probe at {}",
+                "configuring busy timeout for database health probe at {}",
                 db_path.display()
             )
         })?;
 
-    let schema_version = read_meta_schema_version_rusqlite(&conn)?;
+    let schema_version = read_meta_schema_version(&conn)?;
     let quick_check_status: String = conn
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .query_row_map("PRAGMA quick_check(1)", fparams![], |row| row.get_typed(0))
         .with_context(|| format!("running PRAGMA quick_check(1) for {}", db_path.display()))?;
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
-    let fts_schema_rows = rusqlite_fts_schema_rows(&conn)?;
-    let fts_queryable = fts_schema_rows == 1 && rusqlite_fts_limit_probe(&conn);
+    let fts_schema_rows = franken_fts_schema_rows(&conn)?;
+    let fts_queryable = fts_schema_rows == 1 && franken_fts_limit_probe(&conn);
 
     if !quick_check_ok {
         return Ok(SqliteDatabaseHealthProbe {
@@ -2157,13 +1928,17 @@ pub(crate) fn probe_database_health_via_rusqlite(
     }
 
     let message_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .context("counting messages during rusqlite database health probe")?;
-    let max_message_id: i64 = conn
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |row| {
-            row.get(0)
+        .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+            row.get_typed(0)
         })
-        .context("reading max message id during rusqlite database health probe")?;
+        .context("counting messages during frankensqlite database health probe")?;
+    let max_message_id: i64 = conn
+        .query_row_map(
+            "SELECT COALESCE(MAX(id), 0) FROM messages",
+            fparams![],
+            |row| row.get_typed(0),
+        )
+        .context("reading max message id during frankensqlite database health probe")?;
 
     Ok(SqliteDatabaseHealthProbe {
         schema_version,
@@ -7045,7 +6820,7 @@ impl FrankenStorage {
         Ok(FtsConsistencyRepair::Rebuilt { inserted_rows })
     }
 
-    fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
+    pub(crate) fn rebuild_fts_via_frankensqlite(&self) -> Result<usize> {
         self.conn
             .execute("DROP TABLE IF EXISTS fts_messages;")
             .with_context(|| "dropping derived fts_messages before frankensqlite rebuild")?;
@@ -18633,8 +18408,10 @@ mod tests {
         // authoritative frankensqlite FTS rebuild generation yet.
         conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
 
-        assert_eq!(rusqlite_fts_schema_rows(&conn).unwrap(), 2);
         drop(conn);
+        let pre_repair = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(franken_fts_schema_rows(&pre_repair).unwrap(), 2);
+        drop(pre_repair);
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -18652,8 +18429,8 @@ mod tests {
             "canonical open should not eagerly rewrite FTS repair metadata"
         );
         reopened.ensure_search_fallback_fts_consistency().unwrap();
-        let repaired = rusqlite::Connection::open(&db_path).unwrap();
-        assert_eq!(rusqlite_fts_schema_rows(&repaired).unwrap(), 1);
+        let repaired = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(franken_fts_schema_rows(&repaired).unwrap(), 1);
 
         let total_messages: i64 = reopened
             .raw()
@@ -18683,19 +18460,16 @@ mod tests {
         // current contentless table is recreated lazily — see MIGRATION_V14).
         // Invoke the repair path to match normal cass startup, then assert
         // there is exactly one fts_messages entry in sqlite_schema (no
-        // duplicates). rusqlite is used for the schema count because
-        // frankensqlite's sqlite_master projection is authoritative only for
-        // the engine that wrote the page, and we want the canonical C-SQLite
-        // view for this invariant.
+        // duplicates).
         storage
             .ensure_search_fallback_fts_consistency()
             .expect("ensure FTS consistency after fresh open");
         drop(storage);
 
-        let c_reader = rusqlite::Connection::open(&db_path)
-            .expect("open DB via rusqlite for sqlite_master inspection");
+        let c_reader = FrankenConnection::open(db_path.to_string_lossy().into_owned())
+            .expect("open DB via frankensqlite for sqlite_master inspection");
         assert_eq!(
-            rusqlite_fts_schema_rows(&c_reader).unwrap(),
+            franken_fts_schema_rows(&c_reader).unwrap(),
             1,
             "exactly one fts_messages schema row should exist after ensure_search_fallback_fts_consistency"
         );
