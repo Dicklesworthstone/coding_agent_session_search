@@ -6560,7 +6560,11 @@ impl StreamingByteLimiter {
             let reservation = requested_bytes.min(max_bytes_in_flight);
             if state.bytes_in_flight.saturating_add(reservation) <= max_bytes_in_flight {
                 state.bytes_in_flight += reservation;
-                let wait_duration = waited.then(|| wait_started.elapsed()).unwrap_or_default();
+                let wait_duration = if waited {
+                    wait_started.elapsed()
+                } else {
+                    Duration::default()
+                };
                 return Ok((reservation, wait_duration, waited));
             }
 
