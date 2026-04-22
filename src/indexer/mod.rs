@@ -18630,6 +18630,104 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_producer_startup_delivers_first_batch_quickly() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("startup-timing.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        for i in 0..50 {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/workspace/bulk")),
+                        external_id: Some(format!("bulk-conv-{i}")),
+                        title: Some(format!("Bulk conversation {i}")),
+                        source_path: PathBuf::from(format!("/tmp/bulk-{i}.jsonl")),
+                        started_at: Some(1_700_000_100_000 + i * 1000),
+                        ended_at: Some(1_700_000_100_100 + i * 1000),
+                        approx_tokens: Some(32),
+                        metadata_json: serde_json::Value::Null,
+                        messages: vec![Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_100_010 + i * 1000),
+                            content: format!("bulk message {i}"),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        }],
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        }
+        drop(storage);
+
+        let started = Instant::now();
+        let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(4);
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(64 * 1024));
+        let handle = spawn_lexical_rebuild_packet_producer(
+            db_path,
+            None,
+            None,
+            LEXICAL_REBUILD_PAGE_SIZE,
+            4,
+            None,
+            Arc::new(LexicalRebuildPipelineBudgetController::new(
+                lexical_rebuild_runtime_pipeline_budget_snapshot(16, 128, 8192, 4),
+            )),
+            tx,
+            flow_limiter.clone(),
+            None,
+            Arc::new(LexicalRebuildProducerTelemetry::default()),
+        );
+
+        let first_batch = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(LexicalRebuildPipelineMessage::Batch(batch)) => batch,
+            Ok(other) => panic!("expected batch as first message, got {other:?}"),
+            Err(_) => panic!("timed out waiting for first batch from producer"),
+        };
+        let first_batch_ms = started.elapsed().as_millis();
+
+        assert!(
+            !first_batch.packets.is_empty(),
+            "first batch should contain at least one conversation packet"
+        );
+        assert!(
+            first_batch_ms < 5_000,
+            "producer should deliver first batch within 5s, took {first_batch_ms}ms"
+        );
+
+        while let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) {
+            match msg {
+                LexicalRebuildPipelineMessage::Done => break,
+                LexicalRebuildPipelineMessage::Batch(batch) => {
+                    for packet in &batch.packets {
+                        flow_limiter.release(packet.message_bytes);
+                    }
+                }
+                LexicalRebuildPipelineMessage::Error(err) => panic!("producer error: {err}"),
+            }
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn lexical_rebuild_packet_producer_releases_budget_when_consumer_disconnects() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("producer-disconnect.db");
