@@ -66,6 +66,17 @@ const DEFAULT_GROWTH_CONSECUTIVE_HEALTHY_TICKS: u32 = 3;
 /// more wasted wakeups on an idle box.
 const DEFAULT_TICK_SECS: u64 = 2;
 
+/// Default process-wide in-flight byte ceiling for responsiveness-governed
+/// maintenance work. The lexical rebuild pipeline's existing default is below
+/// this on ordinary settings, so the cap is mostly a guardrail for explicit
+/// high-throughput tuning.
+const DEFAULT_MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Lower bound applied only after scaling a non-zero in-flight byte budget.
+/// This prevents pressure shrinkage from producing tiny queue budgets that
+/// thrash, while still never increasing a caller-requested smaller budget.
+const DEFAULT_MIN_INFLIGHT_BYTES: usize = 1024 * 1024;
+
 /// Maximum number of decisions retained in the telemetry ring buffer.
 /// Sized so the structure stays under 16 KB and covers ~4 minutes of
 /// history at the default 2-second tick.
@@ -127,6 +138,11 @@ pub(crate) enum CalibrationMode {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GovernorConfig {
+    pub available_parallelism: usize,
+    pub reserved_cores: usize,
+    pub max_workers: usize,
+    pub max_inflight_bytes: usize,
+    pub min_inflight_bytes: usize,
     pub min_capacity_pct: u32,
     pub max_load_per_core: f32,
     pub severe_load_per_core: f32,
@@ -156,6 +172,24 @@ pub(crate) struct GovernorConfig {
 
 impl GovernorConfig {
     pub fn from_env() -> Self {
+        let available_parallelism = available_parallelism();
+        let reserved_cores = env_usize("CASS_RESPONSIVENESS_RESERVED_CORES")
+            .unwrap_or_else(|| default_reserved_cores_for_available(available_parallelism))
+            .min(available_parallelism.saturating_sub(1));
+        let worker_ceiling = worker_ceiling_for(available_parallelism, reserved_cores);
+        let max_workers = env_usize("CASS_RESPONSIVENESS_MAX_WORKERS")
+            .filter(|v| *v > 0)
+            .map(|v| v.min(worker_ceiling))
+            .unwrap_or(worker_ceiling)
+            .max(1);
+        let max_inflight_bytes = env_usize("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES")
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_BYTES);
+        let min_inflight_bytes = env_usize("CASS_RESPONSIVENESS_MIN_INFLIGHT_BYTES")
+            .filter(|v| *v > 0)
+            .map(|v| v.min(max_inflight_bytes))
+            .unwrap_or(DEFAULT_MIN_INFLIGHT_BYTES.min(max_inflight_bytes))
+            .max(1);
         let min_capacity_pct = env_u32("CASS_RESPONSIVENESS_MIN_CAPACITY_PCT")
             .map(|v| v.clamp(10, 100))
             .unwrap_or(DEFAULT_MIN_CAPACITY_PCT);
@@ -214,6 +248,11 @@ impl GovernorConfig {
             .unwrap_or(DEFAULT_DRIFT_LAMBDA);
 
         Self {
+            available_parallelism,
+            reserved_cores,
+            max_workers,
+            max_inflight_bytes,
+            min_inflight_bytes,
             min_capacity_pct,
             max_load_per_core,
             severe_load_per_core,
@@ -356,6 +395,55 @@ pub(crate) fn scale_worker_count(desired: usize, capacity_pct: u32) -> usize {
     scaled.max(1)
 }
 
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+pub(crate) fn default_reserved_cores_for_available(available_parallelism: usize) -> usize {
+    match available_parallelism {
+        0 | 1 => 0,
+        2..=4 => 1,
+        5..=16 => 2,
+        n => (n / 8).clamp(2, 8),
+    }
+}
+
+fn worker_ceiling_for(available_parallelism: usize, reserved_cores: usize) -> usize {
+    available_parallelism
+        .max(1)
+        .saturating_sub(reserved_cores)
+        .max(1)
+}
+
+pub(crate) fn scale_worker_count_with_policy(
+    desired: usize,
+    capacity_pct: u32,
+    cfg: &GovernorConfig,
+) -> usize {
+    if desired == 0 {
+        return 0;
+    }
+    let ceiling = worker_ceiling_for(cfg.available_parallelism, cfg.reserved_cores)
+        .min(cfg.max_workers.max(1));
+    scale_worker_count(desired.min(ceiling), capacity_pct)
+}
+
+pub(crate) fn scale_inflight_byte_limit(
+    desired_bytes: usize,
+    capacity_pct: u32,
+    cfg: &GovernorConfig,
+) -> usize {
+    if desired_bytes == 0 {
+        return 0;
+    }
+    let capped = desired_bytes.min(cfg.max_inflight_bytes.max(1));
+    let capacity = capacity_pct.clamp(1, 100) as usize;
+    let scaled = capped.saturating_mul(capacity) / 100;
+    scaled.max(cfg.min_inflight_bytes.min(capped)).max(1)
+}
+
 /// Reader abstraction for the health signals. Stubbed in tests so the
 /// hysteresis policy can be exercised without touching /proc.
 pub(crate) trait HealthReader: Send + Sync {
@@ -369,9 +457,7 @@ pub(crate) struct ProcHealthReader {
 impl ProcHealthReader {
     pub fn new() -> Self {
         Self {
-            ncpu: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            ncpu: available_parallelism(),
         }
     }
 }
@@ -445,6 +531,7 @@ pub(crate) struct GovernorDecision {
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct GovernorTelemetry {
     pub current_capacity_pct: u32,
+    pub resource_policy: ResourcePolicyTelemetry,
     pub healthy_streak: u32,
     pub shrink_count: u64,
     pub grow_count: u64,
@@ -459,6 +546,32 @@ pub(crate) struct GovernorTelemetry {
     /// and the quantiles the conformal policy is emitting for each
     /// signal × severity pairing.
     pub calibration: Option<CalibrationTelemetry>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct ResourcePolicyTelemetry {
+    pub available_parallelism: usize,
+    pub reserved_cores: usize,
+    pub max_workers: usize,
+    pub effective_worker_ceiling: usize,
+    pub max_inflight_bytes: usize,
+    pub min_inflight_bytes: usize,
+}
+
+impl ResourcePolicyTelemetry {
+    fn from_config(cfg: &GovernorConfig) -> Self {
+        let effective_worker_ceiling =
+            worker_ceiling_for(cfg.available_parallelism, cfg.reserved_cores)
+                .min(cfg.max_workers.max(1));
+        Self {
+            available_parallelism: cfg.available_parallelism,
+            reserved_cores: cfg.reserved_cores,
+            max_workers: cfg.max_workers,
+            effective_worker_ceiling,
+            max_inflight_bytes: cfg.max_inflight_bytes,
+            min_inflight_bytes: cfg.min_inflight_bytes,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,6 +1238,7 @@ impl Governor {
         };
         GovernorTelemetry {
             current_capacity_pct: current,
+            resource_policy: ResourcePolicyTelemetry::from_config(&self.cfg),
             healthy_streak: self.healthy_streak.load(Ordering::Relaxed),
             shrink_count: self.shrink_count.load(Ordering::Relaxed),
             grow_count: self.grow_count.load(Ordering::Relaxed),
@@ -1168,7 +1282,15 @@ pub(crate) fn current_capacity_pct() -> u32 {
 /// reserved cores); the governor returns a bounded count that respects the
 /// current machine responsiveness policy. Always returns at least 1.
 pub(crate) fn effective_worker_count(desired: usize) -> usize {
-    scale_worker_count(desired, current_capacity_pct())
+    let g = GOVERNOR.clone();
+    scale_worker_count_with_policy(desired, current_capacity_pct(), &g.cfg)
+}
+
+/// Apply the same live capacity factor and explicit byte ceilings to
+/// producer-side in-flight byte budgets.
+pub(crate) fn effective_inflight_byte_limit(desired_bytes: usize) -> usize {
+    let g = GOVERNOR.clone();
+    scale_inflight_byte_limit(desired_bytes, current_capacity_pct(), &g.cfg)
 }
 
 /// Return a full telemetry snapshot of the process-wide governor. Starts
@@ -1190,6 +1312,10 @@ fn env_f32(key: &str) -> Option<f32> {
     dotenvy::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
+fn env_usize(key: &str) -> Option<usize> {
+    dotenvy::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
 fn env_bool_truthy(key: &str) -> bool {
     match dotenvy::var(key) {
         Ok(v) => matches!(
@@ -1207,6 +1333,11 @@ mod tests {
 
     fn cfg() -> GovernorConfig {
         GovernorConfig {
+            available_parallelism: 16,
+            reserved_cores: 2,
+            max_workers: 14,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+            min_inflight_bytes: DEFAULT_MIN_INFLIGHT_BYTES,
             min_capacity_pct: DEFAULT_MIN_CAPACITY_PCT,
             max_load_per_core: DEFAULT_MAX_LOAD_PER_CORE,
             severe_load_per_core: DEFAULT_SEVERE_LOAD_PER_CORE,
@@ -1366,6 +1497,48 @@ mod tests {
         assert_eq!(scale_worker_count(16, 25), 4);
         assert_eq!(scale_worker_count(1, 1), 1);
         assert!(scale_worker_count(4, 100) <= 4);
+    }
+
+    #[test]
+    fn default_reserved_core_policy_preserves_interactive_headroom() {
+        assert_eq!(default_reserved_cores_for_available(1), 0);
+        assert_eq!(default_reserved_cores_for_available(2), 1);
+        assert_eq!(default_reserved_cores_for_available(8), 2);
+        assert_eq!(default_reserved_cores_for_available(64), 8);
+    }
+
+    #[test]
+    fn worker_policy_applies_reserved_cores_and_live_capacity() {
+        let mut c = cfg();
+        c.available_parallelism = 16;
+        c.reserved_cores = 4;
+        c.max_workers = 20;
+
+        assert_eq!(scale_worker_count_with_policy(64, 100, &c), 12);
+        assert_eq!(scale_worker_count_with_policy(64, 50, &c), 6);
+        assert_eq!(scale_worker_count_with_policy(2, 50, &c), 1);
+        assert_eq!(scale_worker_count_with_policy(0, 50, &c), 0);
+    }
+
+    #[test]
+    fn inflight_byte_policy_caps_and_scales_without_increasing_small_budgets() {
+        let mut c = cfg();
+        c.max_inflight_bytes = 128 * 1024 * 1024;
+        c.min_inflight_bytes = 8 * 1024 * 1024;
+
+        assert_eq!(
+            scale_inflight_byte_limit(512 * 1024 * 1024, 100, &c),
+            128 * 1024 * 1024
+        );
+        assert_eq!(
+            scale_inflight_byte_limit(512 * 1024 * 1024, 25, &c),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            scale_inflight_byte_limit(4 * 1024 * 1024, 25, &c),
+            4 * 1024 * 1024
+        );
+        assert_eq!(scale_inflight_byte_limit(0, 25, &c), 0);
     }
 
     #[test]
@@ -1568,6 +1741,9 @@ mod tests {
         let json = serde_json::to_string(&tele).expect("telemetry serializes");
         for key in [
             "current_capacity_pct",
+            "resource_policy",
+            "reserved_cores",
+            "max_inflight_bytes",
             "shrink_count",
             "grow_count",
             "ticks_total",
