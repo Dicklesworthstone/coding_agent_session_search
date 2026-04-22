@@ -331,7 +331,6 @@ Ingests history from 19 local agents, normalizing them into a unified `Conversat
 - **Clawdbot**: `~/.clawdbot/sessions` (Session JSONL)
 - **Vibe (Mistral)**: `~/.vibe/logs/session/*/messages.jsonl` (Session JSONL)
 - **OpenCode**: `.opencode` directories (SQLite)
-- **OpenClaw**: `~/.openclaw/sessions` (Session JSONL)
 - **Amp**: `~/.local/share/amp` & VS Code storage
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
@@ -344,11 +343,6 @@ Ingests history from 19 local agents, normalizing them into a unified `Conversat
 - **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
-- **Kimi**: Kimi Code CLI session files
-- **Copilot** (VS Code): GitHub Copilot chat history in VS Code global storage
-- **Copilot CLI**: `gh copilot` CLI session history
-- **Qwen**: Qwen Code session files
-- **Crush**: Charm Crush CLI session databases
 
 #### Connector Details
 
@@ -1815,6 +1809,8 @@ classDiagram
  Connector <|-- ClineConnector
  Connector <|-- ClaudeCodeConnector
  Connector <|-- GeminiConnector
+ Connector <|-- ClawdbotConnector
+ Connector <|-- VibeConnector
  Connector <|-- OpenCodeConnector
  Connector <|-- AmpConnector
  Connector <|-- CursorConnector
@@ -1822,11 +1818,19 @@ classDiagram
  Connector <|-- AiderConnector
  Connector <|-- PiAgentConnector
  Connector <|-- FactoryConnector
+ Connector <|-- CopilotConnector
+ Connector <|-- CopilotCliConnector
+ Connector <|-- OpenClawConnector
+ Connector <|-- CrushConnector
+ Connector <|-- KimiConnector
+ Connector <|-- QwenConnector
 
  CodexConnector ..> NormalizedConversation : emits
  ClineConnector ..> NormalizedConversation : emits
  ClaudeCodeConnector ..> NormalizedConversation : emits
  GeminiConnector ..> NormalizedConversation : emits
+ ClawdbotConnector ..> NormalizedConversation : emits
+ VibeConnector ..> NormalizedConversation : emits
  OpenCodeConnector ..> NormalizedConversation : emits
  AmpConnector ..> NormalizedConversation : emits
  CursorConnector ..> NormalizedConversation : emits
@@ -1834,6 +1838,12 @@ classDiagram
  AiderConnector ..> NormalizedConversation : emits
  PiAgentConnector ..> NormalizedConversation : emits
  FactoryConnector ..> NormalizedConversation : emits
+ CopilotConnector ..> NormalizedConversation : emits
+ CopilotCliConnector ..> NormalizedConversation : emits
+ OpenClawConnector ..> NormalizedConversation : emits
+ CrushConnector ..> NormalizedConversation : emits
+ KimiConnector ..> NormalizedConversation : emits
+ QwenConnector ..> NormalizedConversation : emits
 ```
 
 - **Polymorphic Scanning**: The indexer runs connector factories in parallel via rayon, creating fresh `Box<dyn Connector>` instances that are unaware of each other's underlying file formats (JSONL, SQLite, specialized JSON).
@@ -1843,10 +1853,10 @@ classDiagram
 
 ## 🧠 Architecture & Engineering
 
-`cass` employs a dual-storage strategy to balance data integrity with search performance, powered by a suite of integrated "franken" libraries.
+`cass` uses frankensqlite as the durable source of truth and frankensearch as a derived speed layer, powered by a suite of integrated "franken" libraries.
 
 ### The Pipeline
-1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 15+ coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, and more).
+1. **Discovery**: [franken_agent_detection](https://github.com/Dicklesworthstone/franken_agent_detection) auto-discovers sessions from 19 coding agents (Claude Code, Codex, Cursor, Gemini, Aider, Amp, Cline, OpenCode, ChatGPT, Pi Agent, Copilot, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi, Qwen, Factory).
 2. **Storage (frankensqlite)**: The **Source of Truth**. Data is persisted to a normalized SQLite schema (`messages`, `conversations`, `agents`) via [frankensqlite](https://github.com/Dicklesworthstone/frankensqlite) — a pure-Rust SQLite reimplementation with `BEGIN CONCURRENT` support for MVCC multi-writer transactions.
 3. **Search Index (frankensearch)**: The **Speed Layer**. New messages are incrementally pushed to a unified search index via [frankensearch](https://github.com/Dicklesworthstone/frankensearch) which provides BM25 lexical search, semantic embeddings, RRF fusion, and cross-encoder reranking in a single library.
  * **Fields**: `title`, `content`, `agent`, `workspace`, `created_at`.
@@ -1873,6 +1883,14 @@ flowchart LR
  A9[Aider]:::pastel
  A10[Pi-Agent]:::pastel
  A11[Factory]:::pastel
+ A12[Copilot Chat]:::pastel
+ A13[Copilot CLI]:::pastel
+ A14[OpenClaw]:::pastel
+ A15[Clawdbot]:::pastel
+ A16[Vibe]:::pastel
+ A17[Crush]:::pastel
+ A18[Kimi]:::pastel
+ A19[Qwen]:::pastel
  end
 
  subgraph Remote["Remote Sources"]
@@ -1885,7 +1903,7 @@ flowchart LR
  C1["franken_agent_detection\nAuto-Discover & Scan\nNormalize & Dedupe"]:::pastel2
  end
 
- subgraph "Dual Storage"
+ subgraph "Storage + Search"
  S1["frankensqlite (WAL)\nSource of Truth\nBEGIN CONCURRENT\nMigrations"]:::pastel3
  T1["frankensearch\nBM25 + Semantic\nRRF Fusion\nReranking"]:::pastel4
  end
@@ -1906,6 +1924,14 @@ flowchart LR
  A9 --> C1
  A10 --> C1
  A11 --> C1
+ A12 --> C1
+ A13 --> C1
+ A14 --> C1
+ A15 --> C1
+ A16 --> C1
+ A17 --> C1
+ A18 --> C1
+ A19 --> C1
  R1 --> R2
  R2 --> R3
  R3 --> C1
