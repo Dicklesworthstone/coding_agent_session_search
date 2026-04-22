@@ -1,0 +1,36 @@
+---
+source: tests/tui_flows.rs
+expression: "flow_snapshot(&app, \"keystroke_driven_command_palette\", \"<Ctrl-P> theme <Enter>\")"
+---
+flow: keystroke_driven_command_palette
+keys: <Ctrl-P> theme <Enter>
+state: query="" detail_open=false detail_tab=Messages find_query="<none>" palette_visible=false theme_dark=false status="Theme: Daylight"
+--- frame ---
+ ▐ Search ▌  · Analytics   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=
+╭ ██ cass · Daylight · Hybrid · Standard ─────────────────╭──────────────────────────────────────╮─╮
+│ ?? │ Search sessions, messages, code across all agents… │ i Theme: Daylight                    │ │
+│○ agent:✎any ○ ws:✎any ○ time:✎all ○ source:✎all         ╰──────────────────────────────────────╯ │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Results · 0 ───────────────────────────────────────────────────────│╭ Detail · Messages ↩ ───────╮
+│                                                                    ││  ▐Messages▌  │  Snippets  ││
+│                           ██  █  ███ ███                           ││                            │
+│                          █   █ █ █   █                             ││                            │
+│                          █   ███  ██  ██                           ││  ── CASS Preview Pane ──   │
+│                          █   █ █   █   █                           ││                            │
+│                           ██ █ █ ███ ███                           ││Search results will appear h│
+│                                                                    ││                            │
+│                    Coding Agent Session Search                     ││Messages, tool calls, code s│
+│                                                                    ││and conversation context — a│
+│                     ──── Ready to search ────                      ││                            │
+│                                                                    ││      ── Navigation ──      │
+│  ▶ Try: authentication  ·  "error handling"  ·  deploy AND staging ││                            │
+│                                                                    ││   ↑↓   → navigate results  │
+│                       ──── Quick Start ────                        ││ Enter  → expand detail moda│
+│                                                                    ││  Tab   → switch panel focus│
+│         Ctrl+P  → command palette     Tab   → switch panels        ││   F1    → help & shortcuts │
+│          F1      → help & shortcuts    F2    → cycle themes        ││                            │
+│        Alt+S   → search mode         F3    → filter by agent       ││                            │
+│              Alt+A   → analytics           F10   → quit            ││                            │
+╰────────────────────────────────────────────────────────────────────│╰────────────────────────────╯
+ status Theme: Daylight · hits 0 · view med-n/cozy · query HYB / STD · perf lat:— cache:cold
+  | Enter=open Alt+S=mode
