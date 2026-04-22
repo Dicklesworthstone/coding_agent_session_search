@@ -1203,6 +1203,7 @@ fn env_bool_truthy(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn cfg() -> GovernorConfig {
         GovernorConfig {
@@ -2064,6 +2065,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn conformal_vs_static_idle_dev_trace_is_not_materially_worse() {
         // Feed both governors the same 2 048-tick idle-dev trace and
         // compare shrink counts. An idle trace (load stays under the
@@ -2113,6 +2115,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn conformal_vs_static_under_sustained_pressure_shrinks_similarly() {
         // Both policies should shrink aggressively once a severe-class
         // signal arrives. This catches the opposite failure: conformal

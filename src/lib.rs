@@ -11105,6 +11105,7 @@ mod cli_read_db_tests {
     #[test]
     #[serial]
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
         let _reserved_cores = set_env("CASS_TANTIVY_REBUILD_RESERVED_CORES", "4");
         let _controller_mode = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_MODE", "steady");
