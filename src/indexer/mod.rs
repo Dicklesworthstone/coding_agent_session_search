@@ -1798,6 +1798,212 @@ impl LexicalRebuildConversationPacket {
     }
 }
 
+/// Streaming equivalence proof for the authoritative lexical rebuild path
+/// (bead ibuuh.29).
+///
+/// The test module shipped a sibling struct populated from a fully materialized
+/// packet vector so the legacy OFFSET replay and the new keyset-batched replay
+/// could be diffed for equivalence on a fixture. The production rebuild cannot
+/// buffer every packet, so this struct is the streaming-consumed form of the
+/// same proof: document count, a packet-and-doc manifest fingerprint hashed in
+/// commit order, and per-probe golden-query digests. Because both the test
+/// helper and the production consumer now funnel through
+/// [`LexicalRebuildEquivalenceAccumulator`], runtime evidence is diffable
+/// against the fixture-derived ledger without materializing the whole corpus.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LexicalRebuildEquivalenceEvidence {
+    pub document_count: u64,
+    pub manifest_fingerprint: String,
+    pub golden_query_digest: String,
+    pub golden_query_hit_counts: Vec<LexicalRebuildEquivalenceGoldenHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LexicalRebuildEquivalenceGoldenHit {
+    pub probe: String,
+    pub hit_count: u64,
+}
+
+const LEXICAL_REBUILD_EQUIVALENCE_DEFAULT_PROBES: &[&str] =
+    &["error", "TODO", "function", "import", "test"];
+
+struct LexicalRebuildEquivalenceAccumulator {
+    document_count: u64,
+    manifest_hasher: blake3::Hasher,
+    probes: Vec<String>,
+    probe_hashers: Vec<blake3::Hasher>,
+    probe_counts: Vec<u64>,
+}
+
+impl LexicalRebuildEquivalenceAccumulator {
+    fn new() -> Self {
+        Self::with_probes(
+            LEXICAL_REBUILD_EQUIVALENCE_DEFAULT_PROBES
+                .iter()
+                .map(|probe| (*probe).to_string()),
+        )
+    }
+
+    fn with_probes<I>(probes: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let probes: Vec<String> = probes.into_iter().collect();
+        let probe_hashers = probes.iter().map(|_| blake3::Hasher::new()).collect();
+        let probe_counts = vec![0_u64; probes.len()];
+        Self {
+            document_count: 0,
+            manifest_hasher: blake3::Hasher::new(),
+            probes,
+            probe_hashers,
+            probe_counts,
+        }
+    }
+
+    fn absorb_packet(&mut self, packet: &LexicalRebuildConversationPacket) {
+        let fingerprint = packet.fingerprint_input();
+        // Packet header: version, identity, provenance, counters. Length-prefixed
+        // length-prefixed strings avoid ambiguity across field boundaries.
+        self.manifest_hasher.update(b"pkt");
+        self.manifest_hasher
+            .update(&fingerprint.version.to_le_bytes());
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.agent),
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            fingerprint.external_id,
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            fingerprint.workspace,
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.source_path),
+        );
+        lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, fingerprint.title);
+        self.manifest_hasher
+            .update(&fingerprint.started_at.unwrap_or(i64::MIN).to_le_bytes());
+        self.manifest_hasher
+            .update(&fingerprint.ended_at.unwrap_or(i64::MIN).to_le_bytes());
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.source_id),
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.origin_kind),
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            fingerprint.origin_host,
+        );
+        self.manifest_hasher
+            .update(&(fingerprint.message_count as u64).to_le_bytes());
+        self.manifest_hasher
+            .update(&(fingerprint.message_bytes as u64).to_le_bytes());
+
+        let docs = packet.prebuilt_docs();
+        self.document_count = self.document_count.saturating_add(docs.len() as u64);
+        for doc in &docs {
+            self.manifest_hasher.update(b"doc");
+            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, Some(doc.agent));
+            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.workspace);
+            lexical_rebuild_equivalence_update_opt_str(
+                &mut self.manifest_hasher,
+                Some(doc.source_path),
+            );
+            self.manifest_hasher.update(&doc.msg_idx.to_le_bytes());
+            self.manifest_hasher
+                .update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.title);
+            self.manifest_hasher
+                .update(&(doc.content.len() as u64).to_le_bytes());
+            self.manifest_hasher.update(doc.content.as_bytes());
+            lexical_rebuild_equivalence_update_opt_str(
+                &mut self.manifest_hasher,
+                Some(doc.source_id),
+            );
+            lexical_rebuild_equivalence_update_opt_str(
+                &mut self.manifest_hasher,
+                Some(doc.origin_kind),
+            );
+            lexical_rebuild_equivalence_update_opt_str(&mut self.manifest_hasher, doc.origin_host);
+
+            for ((probe, hasher), count) in self
+                .probes
+                .iter()
+                .zip(self.probe_hashers.iter_mut())
+                .zip(self.probe_counts.iter_mut())
+            {
+                let probe_str = probe.as_str();
+                let hit = doc.content.contains(probe_str)
+                    || doc
+                        .title
+                        .map(|value| value.contains(probe_str))
+                        .unwrap_or(false)
+                    || doc
+                        .workspace
+                        .map(|value| value.contains(probe_str))
+                        .unwrap_or(false)
+                    || doc.source_path.contains(probe_str);
+                if hit {
+                    *count = count.saturating_add(1);
+                    hasher.update(b"hit");
+                    lexical_rebuild_equivalence_update_opt_str(hasher, Some(doc.source_path));
+                    hasher.update(&doc.msg_idx.to_le_bytes());
+                    hasher.update(&doc.created_at.unwrap_or(i64::MIN).to_le_bytes());
+                    hasher.update(&(doc.content.len() as u64).to_le_bytes());
+                    hasher.update(doc.content.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn finalize(self) -> LexicalRebuildEquivalenceEvidence {
+        let manifest_fingerprint = self.manifest_hasher.finalize().to_hex().to_string();
+        let mut combined = blake3::Hasher::new();
+        let mut golden_query_hit_counts = Vec::with_capacity(self.probes.len());
+        for ((probe, hasher), count) in self
+            .probes
+            .into_iter()
+            .zip(self.probe_hashers.into_iter())
+            .zip(self.probe_counts.into_iter())
+        {
+            combined.update(b"probe");
+            combined.update(&(probe.len() as u64).to_le_bytes());
+            combined.update(probe.as_bytes());
+            combined.update(&count.to_le_bytes());
+            combined.update(hasher.finalize().as_bytes());
+            golden_query_hit_counts.push(LexicalRebuildEquivalenceGoldenHit {
+                probe,
+                hit_count: count,
+            });
+        }
+        LexicalRebuildEquivalenceEvidence {
+            document_count: self.document_count,
+            manifest_fingerprint,
+            golden_query_digest: combined.finalize().to_hex().to_string(),
+            golden_query_hit_counts,
+        }
+    }
+}
+
+fn lexical_rebuild_equivalence_update_opt_str(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(s) => {
+            hasher.update(&[0x01_u8]);
+            hasher.update(&(s.len() as u64).to_le_bytes());
+            hasher.update(s.as_bytes());
+        }
+        None => {
+            hasher.update(&[0x00_u8]);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LexicalRebuildPacketPrepInput {
     conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
@@ -3284,6 +3490,31 @@ fn acquire_index_run_lock(
 
 fn lexical_rebuild_state_path(index_path: &Path) -> PathBuf {
     index_path.join(".lexical-rebuild-state.json")
+}
+
+fn lexical_rebuild_equivalence_evidence_path(index_path: &Path) -> PathBuf {
+    index_path.join(".lexical-rebuild-equivalence.json")
+}
+
+fn persist_lexical_rebuild_equivalence_evidence(
+    index_path: &Path,
+    evidence: &LexicalRebuildEquivalenceEvidence,
+) -> Result<()> {
+    let path = lexical_rebuild_equivalence_evidence_path(index_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating lexical rebuild equivalence evidence parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    write_json_pretty_atomically(&path, evidence).with_context(|| {
+        format!(
+            "persisting lexical rebuild equivalence evidence to {}",
+            path.display()
+        )
+    })
 }
 
 // Lexical-rebuild batching defaults are tuned for cold rebuilds over tens of
@@ -4825,11 +5056,15 @@ struct IncrementalCanonicalLexicalRepairContext {
     observed_tantivy_docs: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LexicalRebuildOutcome {
     pub indexed_docs: usize,
     pub observed_messages: Option<usize>,
     pub exact_checkpoint_persisted: bool,
+    /// Equivalence proof emitted by the authoritative streaming rebuild (ibuuh.29).
+    /// `None` for short-circuit paths that did not re-ingest packets (e.g., a
+    /// checkpoint that was already complete when the rebuild entered).
+    pub equivalence: Option<LexicalRebuildEquivalenceEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -10969,6 +11204,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         indexed_docs,
         observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
+        equivalence: None,
     })
 }
 
@@ -11089,6 +11325,7 @@ fn rebuild_tantivy_from_db_with_options(
                     .max(rebuild_state.indexed_docs),
             ),
             exact_checkpoint_persisted: false,
+            equivalence: None,
         });
     }
 
@@ -11402,6 +11639,7 @@ fn rebuild_tantivy_from_db_with_options(
     }
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
+    let mut equivalence_accumulator = LexicalRebuildEquivalenceAccumulator::new();
 
     {
         macro_rules! finish_conversation {
@@ -11667,6 +11905,7 @@ fn rebuild_tantivy_from_db_with_options(
                             {
                                 max_message_id = max_message_id.max(last_message_id);
                             }
+                            equivalence_accumulator.absorb_packet(&packet);
                             finish_conversation!(packet)?;
                         }
                         if flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
@@ -11838,10 +12077,37 @@ fn rebuild_tantivy_from_db_with_options(
         profile.log_summary();
     }
 
+    let equivalence_evidence = equivalence_accumulator.finalize();
+    tracing::info!(
+        document_count = equivalence_evidence.document_count,
+        manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
+        golden_query_digest = equivalence_evidence.golden_query_digest.as_str(),
+        golden_probe_count = equivalence_evidence.golden_query_hit_counts.len(),
+        golden_query_hit_total = equivalence_evidence
+            .golden_query_hit_counts
+            .iter()
+            .map(|hit| hit.hit_count)
+            .sum::<u64>(),
+        indexed_docs,
+        total_conversations,
+        processed_conversations,
+        "lexical rebuild authoritative equivalence evidence"
+    );
+    if let Err(err) =
+        persist_lexical_rebuild_equivalence_evidence(&index_path, &equivalence_evidence)
+    {
+        tracing::warn!(
+            error = %err,
+            index_path = %index_path.display(),
+            "failed to persist lexical rebuild equivalence evidence ledger"
+        );
+    }
+
     Ok(LexicalRebuildOutcome {
         indexed_docs,
         observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
+        equivalence: Some(equivalence_evidence),
     })
 }
 
@@ -21651,6 +21917,168 @@ mod tests {
 {logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_emits_equivalence_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            assert_eq!(rebuild.indexed_docs, 4);
+            let evidence = rebuild
+                .equivalence
+                .as_ref()
+                .expect("authoritative rebuild must emit equivalence evidence");
+            assert_eq!(evidence.document_count, 4);
+            assert_eq!(
+                evidence.manifest_fingerprint.len(),
+                64,
+                "manifest fingerprint should be a 32-byte blake3 hex digest"
+            );
+            assert_eq!(evidence.golden_query_digest.len(), 64);
+            let default_probes = LEXICAL_REBUILD_EQUIVALENCE_DEFAULT_PROBES.iter().copied();
+            let recorded_probes = evidence
+                .golden_query_hit_counts
+                .iter()
+                .map(|hit| hit.probe.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recorded_probes,
+                default_probes.collect::<Vec<_>>(),
+                "evidence should record the default probe list verbatim"
+            );
+
+            let index_path = index_dir(&data_dir).unwrap();
+            let artifact_path = lexical_rebuild_equivalence_evidence_path(&index_path);
+            let persisted = std::fs::read_to_string(&artifact_path)
+                .expect("equivalence evidence artifact should be persisted on disk");
+            // `super::` skips the test-local shadowed struct so we can round-trip
+            // into the production type emitted by the rebuild.
+            let parsed: super::LexicalRebuildEquivalenceEvidence =
+                serde_json::from_str(&persisted).expect("persisted evidence is valid JSON");
+            assert_eq!(&parsed, evidence);
+        });
+
+        assert!(
+            logs.contains("lexical rebuild authoritative equivalence evidence"),
+            "expected authoritative equivalence evidence log, got:
+{logs}"
+        );
+        assert!(
+            logs.contains("manifest_fingerprint="),
+            "expected manifest_fingerprint field in evidence log, got:
+{logs}"
+        );
+        assert!(
+            logs.contains("golden_query_digest="),
+            "expected golden_query_digest field in evidence log, got:
+{logs}"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_accumulator_matches_legacy_and_keyset_replays() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("lexical-equivalence-accumulator.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let legacy_packets = legacy_offset_lexical_rebuild_packets(&storage, 1).unwrap();
+        let keyset_packets = keyset_batched_lexical_rebuild_packets(&storage, 2, 2).unwrap();
+
+        let accumulate = |packets: &[LexicalRebuildConversationPacket]| {
+            let mut acc = LexicalRebuildEquivalenceAccumulator::new();
+            for packet in packets {
+                acc.absorb_packet(packet);
+            }
+            acc.finalize()
+        };
+        let legacy_evidence = accumulate(&legacy_packets);
+        let keyset_evidence = accumulate(&keyset_packets);
+
+        assert_eq!(
+            legacy_evidence, keyset_evidence,
+            "streaming accumulator must agree across legacy OFFSET and keyset replays"
+        );
+        assert_eq!(legacy_evidence.document_count, 4);
+        assert_eq!(legacy_evidence.manifest_fingerprint.len(), 64);
+        assert_eq!(legacy_evidence.golden_query_digest.len(), 64);
+    }
+
+    #[test]
+    fn lexical_rebuild_equivalence_accumulator_counts_probe_hits_and_hashes_are_stable() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("lexical-equivalence-probes.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let packets = keyset_batched_lexical_rebuild_packets(&storage, 10, 10).unwrap();
+
+        let probe_evidence = |probes: &[&str]| {
+            let mut acc = LexicalRebuildEquivalenceAccumulator::with_probes(
+                probes.iter().map(|probe| (*probe).to_string()),
+            );
+            for packet in &packets {
+                acc.absorb_packet(packet);
+            }
+            acc.finalize()
+        };
+
+        // Fixture content contains two "lexical-fixture-*" strings so only two
+        // probes should register hits; "missing-golden-query" should be zero.
+        let targeted = probe_evidence(&[
+            "lexical-fixture-1",
+            "lexical-fixture-2-second",
+            "missing-golden-query",
+        ]);
+        let hits: Vec<_> = targeted
+            .golden_query_hit_counts
+            .iter()
+            .map(|hit| (hit.probe.as_str(), hit.hit_count))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![
+                ("lexical-fixture-1", 2),
+                ("lexical-fixture-2-second", 1),
+                ("missing-golden-query", 0),
+            ],
+            "fixture should produce deterministic per-probe hit counts"
+        );
+
+        // Running the accumulator a second time on the same inputs must produce
+        // byte-identical evidence, otherwise the hash is not a legitimate proof.
+        let repeat = probe_evidence(&[
+            "lexical-fixture-1",
+            "lexical-fixture-2-second",
+            "missing-golden-query",
+        ]);
+        assert_eq!(
+            targeted, repeat,
+            "equivalence evidence must be deterministic across invocations"
+        );
+
+        // Any change to the probe list must change the digest.
+        let shuffled = probe_evidence(&[
+            "lexical-fixture-2-second",
+            "lexical-fixture-1",
+            "missing-golden-query",
+        ]);
+        assert_ne!(
+            targeted.golden_query_digest, shuffled.golden_query_digest,
+            "probe order must be part of the digest"
+        );
     }
 
     #[test]
