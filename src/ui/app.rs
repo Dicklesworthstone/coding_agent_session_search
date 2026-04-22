@@ -15507,12 +15507,19 @@ impl super::ftui_adapter::Model for CassApp {
             } else {
                 // Find bar is NOT active — handle detail-level navigation
                 match &msg {
-                    // Slash or Ctrl+F opens find
+                    // Slash or Ctrl+F starts a fresh local find, even if the
+                    // modal was opened with seeded search-highlight terms.
                     CassMsg::PaneFilterOpened | CassMsg::WildcardFallbackToggled => {
-                        return self.update(CassMsg::DetailFindToggled);
+                        self.detail_find = Some(DetailFindState::default());
+                        self.detail_find_matches_cache.borrow_mut().clear();
+                        self.input_mode = InputMode::DetailFind;
+                        return ftui::Cmd::none();
                     }
                     CassMsg::QueryChanged(text) if text == "/" => {
-                        return self.update(CassMsg::DetailFindToggled);
+                        self.detail_find = Some(DetailFindState::default());
+                        self.detail_find_matches_cache.borrow_mut().clear();
+                        self.input_mode = InputMode::DetailFind;
+                        return ftui::Cmd::none();
                     }
                     // Enter moves to the next contextual search hit while modal is open.
                     CassMsg::QuerySubmitted | CassMsg::DetailOpened => {
