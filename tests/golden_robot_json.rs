@@ -246,7 +246,23 @@ fn diag_json_matches_golden() {
     // Freezing this makes drift on any connector-detection or path-layout
     // field fail in CI instead of silently misreporting to operators.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed =
-        capture_robot_json(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
+    let scrubbed = capture_robot_json(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
     assert_golden("robot/diag.json.golden", &scrubbed);
+}
+
+#[test]
+fn api_version_json_matches_golden() {
+    // `cass api-version --json` is the smallest LLM contract surface —
+    // three fields (crate_version, api_version, contract_version) that
+    // together tell an agent "am I talking to a compatible cass build".
+    // A silent bump of api_version or contract_version without a
+    // coordinated client update breaks every downstream agent. Freezing
+    // here catches the drift at commit time.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["api-version", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    assert_golden("robot/api_version.json.golden", &scrubbed);
 }
