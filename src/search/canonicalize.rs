@@ -36,12 +36,104 @@ thread_local! {
     static CANONICALIZER: DefaultCanonicalizer = DefaultCanonicalizer::default();
 }
 
+/// Low-signal content tokens. Must stay in sync with frankensearch's
+/// `LOW_SIGNAL_CONTENT` constant; the slow path falls through to the shared
+/// canonicalizer so any drift is caught by `canonicalize_for_embedding_fast_path_matches_slow_path`.
+const LOW_SIGNAL_CONTENT: &[&str] = &[
+    "ok",
+    "done",
+    "done.",
+    "got it",
+    "got it.",
+    "understood",
+    "understood.",
+    "sure",
+    "sure.",
+    "yes",
+    "no",
+    "thanks",
+    "thanks.",
+    "thank you",
+    "thank you.",
+];
+
+/// Return `Some(canonical)` when `text` can be processed by the cheap
+/// whitespace-only fast path, `None` otherwise. The fast path matches the
+/// output of the full `DefaultCanonicalizer` pipeline exactly when the input
+/// is pure ASCII and contains no markdown discriminators.
+///
+/// For the dominant tool-output message shape (short plain-ASCII strings
+/// without backticks, asterisks, underscores, headers, or link brackets),
+/// this skips NFC normalization, markdown line-by-line stripping, and
+/// code-block collapse — the expensive parts of the slow path — and just
+/// does whitespace collapse + low-signal filter + truncation.
+fn canonicalize_fast_path(text: &str) -> Option<String> {
+    // Pure-ASCII check implies NFC is a no-op; any non-ASCII byte must
+    // flow through the full pipeline because NFC may re-encode composed
+    // characters.
+    if !text.is_ascii() {
+        return None;
+    }
+    // Any markdown discriminator byte forces the slow path. `]` is excluded
+    // because on its own it's harmless; `[` is the real link start token, so
+    // looking for `[` alone suffices.
+    if text
+        .bytes()
+        .any(|b| matches!(b, b'`' | b'*' | b'_' | b'#' | b'['))
+    {
+        return None;
+    }
+
+    // Whitespace-collapsed string: split_whitespace + join(' ') produces the
+    // same output as the slow path's char-by-char collapse + trim.
+    // Pre-size the buffer from the input length — collapsed output is always
+    // <= input length for ASCII.
+    let mut collapsed = String::with_capacity(text.len());
+    let mut first = true;
+    for token in text.split_whitespace() {
+        if !first {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(token);
+        first = false;
+    }
+
+    // Low-signal filter: lowercase ASCII match against the shared pattern
+    // list. Pure-ASCII so `make_ascii_lowercase` suffices without allocating
+    // in the case-match case.
+    if !collapsed.is_empty() {
+        let lower = collapsed.to_ascii_lowercase();
+        for pattern in LOW_SIGNAL_CONTENT {
+            if lower == *pattern {
+                return Some(String::new());
+            }
+        }
+    }
+
+    // Truncate to MAX_EMBED_CHARS. Pure-ASCII inputs let us slice by byte
+    // index == char index.
+    if collapsed.len() > MAX_EMBED_CHARS {
+        collapsed.truncate(MAX_EMBED_CHARS);
+    }
+
+    Some(collapsed)
+}
+
 /// Canonicalize text for embedding.
 ///
 /// Applies the full preprocessing pipeline to produce clean, consistent text
 /// suitable for embedding. The output is deterministic: the same visual input
 /// always produces the same output.
+///
+/// Hot-path: when the input is pure ASCII and contains no markdown
+/// discriminator bytes, a cheap whitespace-only fast path is used and the
+/// full `DefaultCanonicalizer` pipeline is skipped. The fast path is a
+/// superset-preserving refinement — for any input where it fires, its output
+/// is byte-identical to the slow path.
 pub fn canonicalize_for_embedding(text: &str) -> String {
+    if let Some(fast) = canonicalize_fast_path(text) {
+        return fast;
+    }
     CANONICALIZER.with(|c| c.canonicalize(text))
 }
 
@@ -199,6 +291,63 @@ pub fn is_search_noise_text(text: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonicalize_fast_path_matches_slow_path_for_pure_ascii_inputs() {
+        // Every input in this table must either (a) hit the fast path and
+        // match the slow path byte-for-byte, or (b) correctly fall through
+        // to the slow path because it contains a markdown discriminator or
+        // non-ASCII bytes. If the fast path ever diverges, this test catches
+        // it before it reaches production.
+        let cases = &[
+            // Pure-ASCII, no markdown — fast path eligible
+            "hello world",
+            "  hello   world  ",
+            "hello\n\n\nworld\n",
+            "line one\nline two\nline three",
+            "Thanks!",
+            "plain text with punctuation: comma, period. question?",
+            "simple-hyphen and plus+signs",
+            "parens (like this) are fine",
+            // Low-signal acks — fast path must return ""
+            "OK",
+            "ok",
+            "  Done.  ",
+            "got it",
+            "Thanks",
+            "thank you.",
+            // Markdown discriminators — fall through to slow path
+            "**bold** text",
+            "has `inline code`",
+            "# A Header",
+            "list [link](url)",
+            "_italic_ too",
+            // Non-ASCII — fall through (NFC must run)
+            "café au lait",
+            "caf\u{0065}\u{0301}",
+            "emoji 👋 mix",
+            // Empty / whitespace-only
+            "",
+            "   ",
+            "\n\n\n",
+        ];
+
+        for input in cases {
+            let slow = CANONICALIZER.with(|c| c.canonicalize(input));
+            let combined = canonicalize_for_embedding(input);
+            assert_eq!(
+                combined, slow,
+                "canonicalize_for_embedding({input:?}) diverged from slow path"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_fast_path_truncates_to_max_embed_chars() {
+        let long_ascii: String = "a ".repeat(MAX_EMBED_CHARS);
+        let out = canonicalize_for_embedding(&long_ascii);
+        assert!(out.chars().count() <= MAX_EMBED_CHARS);
+    }
 
     #[test]
     fn test_unicode_nfc_normalization() {
