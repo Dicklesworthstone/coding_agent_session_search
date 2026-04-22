@@ -1,7 +1,9 @@
+use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use frankensearch::index::{
     HNSW_DEFAULT_EF_CONSTRUCTION as FS_HNSW_DEFAULT_EF_CONSTRUCTION,
     HNSW_DEFAULT_M as FS_HNSW_DEFAULT_M, HnswConfig as FsHnswConfig, HnswIndex as FsHnswIndex,
@@ -15,6 +17,10 @@ use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
+use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
+use crate::search::semantic_manifest::{
+    ArtifactRecord, BuildCheckpoint, SemanticManifest, TierKind,
+};
 use crate::search::vector_index::{ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, vector_index_path};
 
 /// Default embedder batch size. 128 is a sweet spot for ONNX MiniLM models on
@@ -95,10 +101,90 @@ pub struct EmbeddedMessage {
     pub embedding: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SemanticBackfillBatchPlan {
+    pub tier: TierKind,
+    pub db_fingerprint: String,
+    pub model_revision: String,
+    pub total_conversations: u64,
+    pub conversations_in_batch: u64,
+    pub last_offset: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticBackfillBatchOutcome {
+    pub tier: TierKind,
+    pub embedded_docs: u64,
+    pub conversations_processed: u64,
+    pub total_conversations: u64,
+    pub checkpoint_saved: bool,
+    pub published: bool,
+    pub index_path: PathBuf,
+    pub manifest_path: PathBuf,
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn hnsw_index_path(data_dir: &Path, embedder_id: &str) -> PathBuf {
     data_dir
         .join(VECTOR_INDEX_DIR)
         .join(format!("hnsw-{embedder_id}.chsw"))
+}
+
+fn safe_path_component(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn semantic_staging_index_path(
+    data_dir: &Path,
+    tier: TierKind,
+    embedder_id: &str,
+    db_fingerprint: &str,
+) -> PathBuf {
+    let fingerprint_hash = crc32fast::hash(db_fingerprint.as_bytes());
+    data_dir.join(VECTOR_INDEX_DIR).join(format!(
+        ".staging-{}-{}-{fingerprint_hash:08x}.fsvi",
+        tier.as_str(),
+        safe_path_component(embedder_id)
+    ))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = fs::File::open(parent)
+        .with_context(|| format!("opening parent directory {}", parent.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("syncing parent directory {}", parent.display()))
+}
+
+fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
+    SemanticDocId {
+        message_id: embedded.message_id,
+        chunk_idx: embedded.chunk_idx,
+        agent_id: embedded.agent_id,
+        workspace_id: embedded.workspace_id,
+        source_id: embedded.source_id,
+        role: embedded.role,
+        created_at_ms: embedded.created_at_ms,
+        content_hash: Some(embedded.content_hash),
+    }
+    .to_doc_id_string()
 }
 
 struct Prepared<'a> {
@@ -280,6 +366,17 @@ impl SemanticIndexer {
         I: IntoIterator<Item = EmbeddedMessage>,
     {
         let index_path = vector_index_path(data_dir, self.embedder_id());
+        self.build_and_save_index_at_path(embedded_messages, &index_path)
+    }
+
+    fn build_and_save_index_at_path<I>(
+        &self,
+        embedded_messages: I,
+        index_path: &Path,
+    ) -> Result<FsVectorIndex>
+    where
+        I: IntoIterator<Item = EmbeddedMessage>,
+    {
         if let Some(parent) = index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -303,17 +400,7 @@ impl SemanticIndexer {
                         embedded.embedding.len()
                     );
                 }
-                let doc_id = SemanticDocId {
-                    message_id: embedded.message_id,
-                    chunk_idx: embedded.chunk_idx,
-                    agent_id: embedded.agent_id,
-                    workspace_id: embedded.workspace_id,
-                    source_id: embedded.source_id,
-                    role: embedded.role,
-                    created_at_ms: embedded.created_at_ms,
-                    content_hash: Some(embedded.content_hash),
-                }
-                .to_doc_id_string();
+                let doc_id = semantic_doc_id_for_embedded(&embedded);
                 writer
                     .write_record(&doc_id, &embedded.embedding)
                     .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
@@ -354,23 +441,21 @@ impl SemanticIndexer {
         data_dir: &Path,
     ) -> Result<usize> {
         let index_path = vector_index_path(data_dir, self.embedder_id());
+        self.append_to_index_path(embedded_messages, &index_path)
+    }
+
+    fn append_to_index_path(
+        &self,
+        embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
+        index_path: &Path,
+    ) -> Result<usize> {
         let mut index = FsVectorIndex::open(&index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
 
         let entries: Vec<(String, Vec<f32>)> = embedded_messages
             .into_iter()
             .map(|em| {
-                let doc_id = SemanticDocId {
-                    message_id: em.message_id,
-                    chunk_idx: em.chunk_idx,
-                    agent_id: em.agent_id,
-                    workspace_id: em.workspace_id,
-                    source_id: em.source_id,
-                    role: em.role,
-                    created_at_ms: em.created_at_ms,
-                    content_hash: Some(em.content_hash),
-                }
-                .to_doc_id_string();
+                let doc_id = semantic_doc_id_for_embedded(&em);
                 (doc_id, em.embedding)
             })
             .collect();
@@ -391,6 +476,145 @@ impl SemanticIndexer {
         }
 
         Ok(count)
+    }
+
+    fn write_backfill_staging_index(
+        &self,
+        embedded_messages: Vec<EmbeddedMessage>,
+        staging_path: &Path,
+        resume_existing: bool,
+    ) -> Result<FsVectorIndex> {
+        if resume_existing && staging_path.exists() {
+            self.append_to_index_path(embedded_messages, staging_path)?;
+            FsVectorIndex::open(staging_path)
+                .map_err(|err| anyhow::anyhow!("open staged semantic index failed: {err}"))
+        } else {
+            self.build_and_save_index_at_path(embedded_messages, staging_path)
+        }
+    }
+
+    pub fn run_backfill_batch(
+        &self,
+        messages: &[EmbeddingInput],
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        if plan.db_fingerprint.trim().is_empty() {
+            bail!("semantic backfill requires a non-empty DB fingerprint");
+        }
+        if plan.total_conversations == 0 && plan.conversations_in_batch > 0 {
+            bail!("semantic backfill batch cannot process conversations when total is zero");
+        }
+
+        let manifest_path = SemanticManifest::path(data_dir);
+        let staging_path = semantic_staging_index_path(
+            data_dir,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        );
+        let final_path = vector_index_path(data_dir, self.embedder_id());
+
+        let prior_checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .filter(|checkpoint| {
+                checkpoint.tier == plan.tier
+                    && checkpoint.embedder_id == self.embedder_id()
+                    && checkpoint.is_valid(&plan.db_fingerprint)
+            })
+            .cloned();
+        let prior_conversations = prior_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.conversations_processed);
+        let prior_docs = prior_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.docs_embedded);
+
+        let embeddings = self.embed_messages(messages)?;
+        let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
+        let staged_index = self.write_backfill_staging_index(
+            embeddings,
+            &staging_path,
+            prior_checkpoint.is_some(),
+        )?;
+        let docs_embedded = u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
+        let conversations_processed = prior_conversations
+            .saturating_add(plan.conversations_in_batch)
+            .min(plan.total_conversations);
+        let checkpoint_docs = prior_docs.saturating_add(embedded_docs).max(docs_embedded);
+        let complete = conversations_processed >= plan.total_conversations;
+
+        manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
+
+        if complete {
+            let db_fingerprint = plan.db_fingerprint.clone();
+            drop(staged_index);
+            fs::rename(&staging_path, &final_path).with_context(|| {
+                format!(
+                    "publishing staged semantic index {} to {}",
+                    staging_path.display(),
+                    final_path.display()
+                )
+            })?;
+            sync_parent_directory(&final_path)?;
+            let published_index = FsVectorIndex::open(&final_path)
+                .map_err(|err| anyhow::anyhow!("open published semantic index failed: {err}"))?;
+            let size_bytes = fs::metadata(&final_path)
+                .with_context(|| format!("stat published semantic index {}", final_path.display()))?
+                .len();
+            let relative_index_path = final_path
+                .strip_prefix(data_dir)
+                .unwrap_or(final_path.as_path())
+                .to_string_lossy()
+                .to_string();
+            manifest.publish_artifact(ArtifactRecord {
+                tier: plan.tier,
+                embedder_id: self.embedder_id().to_string(),
+                model_revision: plan.model_revision,
+                schema_version: SEMANTIC_SCHEMA_VERSION,
+                chunking_version: CHUNKING_STRATEGY_VERSION,
+                dimension: self.embedder_dimension(),
+                doc_count: u64::try_from(published_index.record_count()).unwrap_or(u64::MAX),
+                conversation_count: conversations_processed,
+                db_fingerprint: plan.db_fingerprint,
+                index_path: relative_index_path,
+                size_bytes,
+                started_at_ms: prior_checkpoint
+                    .as_ref()
+                    .map_or_else(now_ms, |checkpoint| checkpoint.saved_at_ms),
+                completed_at_ms: now_ms(),
+                ready: true,
+            });
+            manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
+            manifest.save(data_dir)?;
+        } else {
+            manifest.save_checkpoint(BuildCheckpoint {
+                tier: plan.tier,
+                embedder_id: self.embedder_id().to_string(),
+                last_offset: plan.last_offset,
+                docs_embedded: checkpoint_docs,
+                conversations_processed,
+                total_conversations: plan.total_conversations,
+                db_fingerprint: plan.db_fingerprint,
+                schema_version: SEMANTIC_SCHEMA_VERSION,
+                chunking_version: CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: now_ms(),
+            });
+            manifest.save(data_dir)?;
+        }
+
+        Ok(SemanticBackfillBatchOutcome {
+            tier: plan.tier,
+            embedded_docs,
+            conversations_processed,
+            total_conversations: plan.total_conversations,
+            checkpoint_saved: !complete,
+            published: complete,
+            index_path: if complete { final_path } else { staging_path },
+            manifest_path,
+        })
     }
 
     /// Build and save an HNSW index for approximate nearest neighbor search.
@@ -615,6 +839,111 @@ mod tests {
         // ids 2 and 3 should be dropped because their canonicals are empty.
         assert!(!ids.contains(&2));
         assert!(!ids.contains(&3));
+    }
+
+    #[test]
+    fn backfill_batch_saves_checkpoint_and_staged_index_until_complete() {
+        let temp = tempdir().unwrap();
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let messages = vec![
+            EmbeddingInput::new(10, "first staged semantic message"),
+            EmbeddingInput::new(11, "second staged semantic message"),
+        ];
+
+        let outcome = indexer
+            .run_backfill_batch(
+                &messages,
+                temp.path(),
+                &mut manifest,
+                SemanticBackfillBatchPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: "db-fp-backfill-partial".to_string(),
+                    model_revision: "hash".to_string(),
+                    total_conversations: 2,
+                    conversations_in_batch: 1,
+                    last_offset: 1,
+                },
+            )
+            .unwrap();
+
+        assert!(!outcome.published);
+        assert!(outcome.checkpoint_saved);
+        assert!(outcome.index_path.exists());
+        assert!(!vector_index_path(temp.path(), indexer.embedder_id()).exists());
+        let checkpoint = manifest.checkpoint.as_ref().expect("checkpoint");
+        assert_eq!(checkpoint.tier, TierKind::Fast);
+        assert_eq!(checkpoint.conversations_processed, 1);
+        assert_eq!(checkpoint.docs_embedded, 2);
+        assert_eq!(manifest.backlog.total_conversations, 2);
+        assert!(SemanticManifest::path(temp.path()).exists());
+    }
+
+    #[test]
+    fn backfill_batch_resumes_staged_index_and_publishes_manifest_atomically() {
+        let temp = tempdir().unwrap();
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let db_fingerprint = "db-fp-backfill-complete";
+        let staging_path = semantic_staging_index_path(
+            temp.path(),
+            TierKind::Fast,
+            indexer.embedder_id(),
+            db_fingerprint,
+        );
+
+        let first = vec![EmbeddingInput::new(20, "first resume batch")];
+        let first_outcome = indexer
+            .run_backfill_batch(
+                &first,
+                temp.path(),
+                &mut manifest,
+                SemanticBackfillBatchPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.to_string(),
+                    model_revision: "hash".to_string(),
+                    total_conversations: 2,
+                    conversations_in_batch: 1,
+                    last_offset: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(first_outcome.index_path, staging_path);
+        assert!(staging_path.exists());
+
+        let second = vec![EmbeddingInput::new(21, "second resume batch")];
+        let second_outcome = indexer
+            .run_backfill_batch(
+                &second,
+                temp.path(),
+                &mut manifest,
+                SemanticBackfillBatchPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.to_string(),
+                    model_revision: "hash".to_string(),
+                    total_conversations: 2,
+                    conversations_in_batch: 1,
+                    last_offset: 2,
+                },
+            )
+            .unwrap();
+
+        assert!(second_outcome.published);
+        assert!(!second_outcome.checkpoint_saved);
+        assert!(!staging_path.exists());
+        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
+        assert_eq!(second_outcome.index_path, final_path);
+        assert!(final_path.exists());
+        assert!(manifest.checkpoint.is_none());
+        let artifact = manifest.fast_tier.as_ref().expect("published fast tier");
+        assert!(artifact.ready);
+        assert_eq!(artifact.conversation_count, 2);
+        assert_eq!(artifact.doc_count, 2);
+        assert_eq!(manifest.backlog.fast_tier_processed, 2);
+
+        let loaded = SemanticManifest::load(temp.path()).unwrap().unwrap();
+        assert!(loaded.checkpoint.is_none());
+        assert!(loaded.fast_tier.as_ref().is_some_and(|record| record.ready));
     }
 
     #[test]
