@@ -1170,6 +1170,9 @@ pub enum ModelsCommand {
         /// Maximum canonical conversations to process in this batch
         #[arg(long, default_value_t = 64)]
         batch_conversations: usize,
+        /// Apply idle/load scheduler gates before running this batch
+        #[arg(long, visible_alias = "background")]
+        scheduled: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -23992,6 +23995,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             tier,
             embedder,
             batch_conversations,
+            scheduled,
             data_dir,
             db,
             json,
@@ -24001,6 +24005,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 &tier,
                 embedder.as_deref(),
                 batch_conversations,
+                scheduled,
                 data_dir,
                 db.or_else(|| cli.db.clone()),
                 structured_format,
@@ -24652,12 +24657,17 @@ fn run_models_backfill(
     tier_raw: &str,
     embedder_override: Option<&str>,
     batch_conversations: usize,
+    scheduled: bool,
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::indexer::semantic::{SemanticBackfillStoragePlan, SemanticIndexer};
+    use crate::indexer::semantic::{
+        SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
+        semantic_backfill_scheduler_decision,
+    };
     use crate::search::model_download::ModelManifest;
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use crate::search::semantic_manifest::{SemanticManifest, TierKind};
     use crate::storage::sqlite::FrankenStorage;
     use colored::Colorize;
@@ -24702,6 +24712,66 @@ fn run_models_backfill(
             retryable: false,
         });
     }
+
+    let scheduler_decision = if scheduled {
+        let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+        let signals = SemanticBackfillSchedulerSignals::from_env();
+        Some(semantic_backfill_scheduler_decision(
+            &policy,
+            batch_conversations,
+            &signals,
+        ))
+    } else {
+        None
+    };
+
+    if let Some(decision) = scheduler_decision.as_ref()
+        && !decision.should_run()
+    {
+        let status = decision.state.as_str();
+        let next_step = decision.reason.next_step();
+        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+            if matches!(fmt, RobotFormat::Sessions) {
+                RobotFormat::Compact
+            } else {
+                fmt
+            }
+        });
+
+        if let Some(_fmt) = structured_format {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": status,
+                    "next_step": next_step,
+                    "tier": tier.as_str(),
+                    "embedder_id": embedder_type,
+                    "data_dir": data_dir.display().to_string(),
+                    "db_path": db_path.display().to_string(),
+                    "batch_conversations_limit": batch_conversations,
+                    "scheduler": decision,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            println!("{}", "Semantic backfill scheduler".bold());
+            println!("  Status: {}", status);
+            println!("  Tier: {}", tier.as_str());
+            println!("  Embedder: {}", embedder_type);
+            println!("  Capacity: {}%", decision.current_capacity_pct);
+            println!("  Next eligible after: {} ms", decision.next_eligible_after_ms);
+            println!();
+            println!("{}", next_step);
+        }
+
+        return Ok(());
+    }
+
+    let effective_batch_conversations = scheduler_decision
+        .as_ref()
+        .map_or(batch_conversations, |decision| {
+            decision.scheduled_batch_conversations
+        });
 
     let db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
@@ -24755,7 +24825,7 @@ fn run_models_backfill(
                 tier,
                 db_fingerprint,
                 model_revision,
-                max_conversations: batch_conversations,
+                max_conversations: effective_batch_conversations,
             },
         )
         .map_err(|e| CliError {
@@ -24811,7 +24881,9 @@ fn run_models_backfill(
                 "embedder_id": outcome.embedder_id,
                 "data_dir": data_dir.display().to_string(),
                 "db_path": db_path.display().to_string(),
-                "batch_conversations_limit": batch_conversations,
+                "batch_conversations_limit": effective_batch_conversations,
+                "requested_batch_conversations_limit": batch_conversations,
+                "scheduler": scheduler_decision,
                 "embedded_docs": outcome.embedded_docs,
                 "conversations_processed": outcome.conversations_processed,
                 "total_conversations": outcome.total_conversations,
