@@ -1,3 +1,4 @@
+pub(crate) mod parallel_wal_shadow;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub(crate) mod responsiveness;
@@ -1408,9 +1409,18 @@ impl IndexRunLockHeartbeat {
     fn start(data_dir: PathBuf, interval: Duration, metadata_write_lock: Arc<Mutex<()>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        // Use `park_timeout` instead of `thread::sleep` so `Drop` below can
+        // wake the worker immediately via `unpark`. With `sleep`, every
+        // `run_index` call paid up to `interval` (default 1 s) at shutdown
+        // while the main thread blocked on `join()` — which quantised
+        // bench wall-clock to 1 s bins regardless of the actual indexing
+        // cost. `park_timeout` preserves the periodic-heartbeat semantics
+        // (it returns on token, on deadline, or spuriously; the outer
+        // `while` loop re-checks `stop` each iteration) but makes the
+        // shutdown path O(drain), not O(interval).
         let join = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
-                thread::sleep(interval);
+                thread::park_timeout(interval);
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1437,6 +1447,10 @@ impl Drop for IndexRunLockHeartbeat {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
+            // Wake the worker if it's currently parked on `park_timeout`.
+            // Ordered after the `stop.store` above so the worker always
+            // sees `stop = true` on its next stop-flag read.
+            join.thread().unpark();
             let _ = join.join();
         }
     }
@@ -4929,7 +4943,8 @@ enum DailyStatsRepairOutcome {
 }
 
 fn repair_fallback_fts_after_full_index_run(
-    storage: &FrankenStorage,
+    _storage: &FrankenStorage,
+    db_path: &Path,
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
     known_archive_fingerprint: Option<&str>,
@@ -4938,8 +4953,39 @@ fn repair_fallback_fts_after_full_index_run(
         return Ok(None);
     }
 
+    // Use a short-lived, freshly-opened FrankenStorage for *every* step
+    // of the repair — the fingerprint probe, the consistency check, and
+    // the marker write.  The long-running indexer connection accumulates
+    // per-thread cursor cancellation state across the rayon worker pool
+    // (see `observe_cursor_cancellation` in fsqlite-btree), which can
+    // surface on the FIRST subsequent query as `SQLITE_ABORT`
+    // ("callback requested query abort").  That failure was making
+    // every full-rebuild `run_index` call in the bench harness return
+    // an Err after ~1 s of abort bookkeeping, swamping the actual
+    // indexing wall-clock and quantizing measurements to 1 s bins.
+    //
+    // The repair work is bounded (at most one `COUNT(*)` probe, an
+    // optional batched rebuild, and a single meta write) and strictly
+    // idempotent on the disk state, so a fresh connection is both
+    // sufficient and correct.  The caller's `_storage` is intentionally
+    // *not* consulted: an earlier version of this function did the
+    // fingerprint probe on it and was still vulnerable to the exact
+    // abort this fix is supposed to prevent.  The `_storage` parameter
+    // is kept for API stability (callers pass the same long-running
+    // connection they already have) but is not touched.
+    let fresh_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+        db_path,
+        std::time::Duration::from_secs(10),
+    )
+    .with_context(|| {
+        format!(
+            "opening fresh frankensqlite connection for fallback FTS repair at {}",
+            db_path.display()
+        )
+    })?;
+
     if let Some(archive_fingerprint) = known_archive_fingerprint
-        && storage.fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
+        && fresh_storage.fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
     {
         return Ok(Some(
             FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
@@ -4948,9 +4994,9 @@ fn repair_fallback_fts_after_full_index_run(
         ));
     }
 
-    let repair = storage.ensure_search_fallback_fts_consistency()?;
+    let repair = fresh_storage.ensure_search_fallback_fts_consistency()?;
     if let Some(archive_fingerprint) = known_archive_fingerprint {
-        storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
+        fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
     }
     Ok(Some(FallbackFtsRepairOutcome::Repaired(repair)))
 }
@@ -6474,6 +6520,55 @@ fn streaming_consumer_commit_interval() -> Duration {
     Duration::from_secs(scaled.max(1))
 }
 
+/// Flat-combining drain in the streaming consumer (Card 3 / `§14.2 Flat
+/// Combining` in the alien graveyard). When enabled, the consumer drains
+/// up to `streaming_combine_max_messages` pending `Batch` messages in one
+/// sweep and folds them into a single `ingest_batch` call. Reduces
+/// consumer-thread CPU under multi-connector producers; single-producer
+/// scans bypass the drain entirely (the `active_producers > 1` gate).
+///
+/// **Default: ON.** Set `CASS_STREAMING_CONSUMER_COMBINE=0` to revert.
+fn streaming_combine_enabled() -> bool {
+    match dotenvy::var("CASS_STREAMING_CONSUMER_COMBINE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        // Explicit opt-out keywords.
+        Some("0" | "false" | "no" | "off") => false,
+        // Anything else (unset, `1`, `true`, garbage value) = enabled.
+        _ => true,
+    }
+}
+
+/// Max pending channel messages folded into a single combined drain.
+/// Oversizing hurts first-visibility latency without increasing
+/// throughput (we still commit at the same cadence); undersizing wastes
+/// the consumer's CPU. Default 64 matches `ALIEN-ARTIFACT-CARD3-SPEC.md`
+/// §2.B derivation from Little's Law. Clamped to [1, 1024].
+fn streaming_combine_max_messages() -> usize {
+    dotenvy::var("CASS_STREAMING_COMBINE_MAX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|v| v.clamp(1, 1024))
+        .unwrap_or(64)
+}
+
+/// Max combined-drain byte budget. Half the streaming in-flight cap by
+/// default so combining cannot push a single drain over the global
+/// producer-backpressure limit. Override with
+/// `CASS_STREAMING_COMBINE_MAX_BYTES` (clamped to
+/// `[1 MiB, STREAMING_MAX_BYTES_IN_FLIGHT]`).
+fn streaming_combine_max_bytes() -> usize {
+    dotenvy::var("CASS_STREAMING_COMBINE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|v| v.clamp(1024 * 1024, STREAMING_MAX_BYTES_IN_FLIGHT))
+        .unwrap_or(STREAMING_MAX_BYTES_IN_FLIGHT / 2)
+}
+
 /// Run the streaming indexing consumer.
 ///
 /// Receives batches from producer threads and ingests them into storage.
@@ -6504,8 +6599,35 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
 
+    // Card 3 (flat combining, §14.2): when enabled and at least one
+    // additional producer is live, we opportunistically drain pending
+    // `Batch` messages from the channel after receiving the first one,
+    // fold them into a single `ingest_batch` call, and commit once.
+    // This amortises the per-message overhead of persist + Tantivy add.
+    // Disabled by default; opt in via `CASS_STREAMING_CONSUMER_COMBINE=1`.
+    //
+    // Correctness is preserved by:
+    //  * concat order: combined.conversations = first.conversations ++ next1 ++ next2 ...,
+    //  * per-message byte_reservation release tracked exactly once,
+    //  * non-`Batch` messages (Done/ScanError) seen mid-drain are deferred
+    //    into `deferred_non_batch` and processed in-order *after* the
+    //    combined ingest, so producer-Done accounting stays accurate.
+    let combine_enabled = streaming_combine_enabled();
+    let max_combine_messages = streaming_combine_max_messages();
+    let max_combine_bytes = streaming_combine_max_bytes();
+    let mut deferred_non_batch: VecDeque<IndexMessage> = VecDeque::new();
+
     loop {
-        match rx.recv() {
+        // Drain any deferred messages from a prior combine-drain first, in
+        // the exact order they arrived on the channel. This preserves the
+        // invariant that every message is handled exactly once, in order,
+        // regardless of whether combining was active.
+        let next_message = if let Some(m) = deferred_non_batch.pop_front() {
+            Ok(m)
+        } else {
+            rx.recv()
+        };
+        match next_message {
             Ok(IndexMessage::Batch {
                 connector_name,
                 conversations,
@@ -6513,19 +6635,28 @@ fn run_streaming_consumer(
                 message_count,
                 byte_reservation,
             }) => {
-                let batch_size = conversations.len();
-                total_conversations += batch_size;
-                total_messages += message_count;
+                // Accumulators start with the first-received batch.
+                let mut combined_conversations: Vec<NormalizedConversation> = conversations;
+                let mut combined_message_count = message_count;
+                let mut combined_byte_reservation = byte_reservation;
+                let mut combined_batch_size = combined_conversations.len();
+                total_conversations += combined_batch_size;
+                total_messages += combined_message_count;
 
-                // Update per-connector stats
-                let stats = connector_stats
-                    .entry(connector_name.to_string())
-                    .or_insert_with(|| ConnectorStats {
-                        name: connector_name.to_string(),
-                        ..Default::default()
-                    });
-                stats.conversations += batch_size;
-                stats.messages += message_count;
+                // Update per-connector stats for the FIRST batch. Extra
+                // batches coalesced during drain get their own stats
+                // updates in the inner loop below so per-connector
+                // accounting stays identical to the per-message path.
+                {
+                    let stats = connector_stats
+                        .entry(connector_name.to_string())
+                        .or_insert_with(|| ConnectorStats {
+                            name: connector_name.to_string(),
+                            ..Default::default()
+                        });
+                    stats.conversations += combined_batch_size;
+                    stats.messages += message_count;
+                }
 
                 // Switch to indexing phase on first batch (reset total/current for accurate progress)
                 if !switched_to_indexing {
@@ -6539,7 +6670,7 @@ fn run_streaming_consumer(
 
                 // Update progress total (we learn about sizes as batches arrive)
                 if let Some(p) = progress {
-                    p.total.fetch_add(batch_size, Ordering::Relaxed);
+                    p.total.fetch_add(combined_batch_size, Ordering::Relaxed);
                 }
 
                 // Track discovered agent names
@@ -6547,17 +6678,78 @@ fn run_streaming_consumer(
                     remember_discovered_connector(&mut discovered_names, connector_name);
                 }
 
-                // Ingest the batch
+                // Combine drain: pull additional pending Batch messages up
+                // to the configured caps. Stop on:
+                //   - channel empty (try_recv returns Err),
+                //   - non-Batch message (defer it for the next loop iteration),
+                //   - MAX messages or MAX bytes cap reached.
+                if combine_enabled && active_producers > 1 {
+                    let mut combined_messages_so_far = 1usize;
+                    while combined_messages_so_far < max_combine_messages
+                        && combined_byte_reservation < max_combine_bytes
+                    {
+                        match rx.try_recv() {
+                            Ok(IndexMessage::Batch {
+                                connector_name: cname2,
+                                conversations: extra_convs,
+                                is_discovered: extra_discovered,
+                                message_count: extra_msg_count,
+                                byte_reservation: extra_byte_reservation,
+                            }) => {
+                                let extra_size = extra_convs.len();
+                                // Per-connector stats for the extra batch.
+                                let stats = connector_stats
+                                    .entry(cname2.to_string())
+                                    .or_insert_with(|| ConnectorStats {
+                                        name: cname2.to_string(),
+                                        ..Default::default()
+                                    });
+                                stats.conversations += extra_size;
+                                stats.messages += extra_msg_count;
+                                if extra_discovered {
+                                    remember_discovered_connector(&mut discovered_names, cname2);
+                                }
+                                if let Some(p) = progress {
+                                    p.total.fetch_add(extra_size, Ordering::Relaxed);
+                                }
+                                combined_conversations.extend(extra_convs);
+                                combined_message_count += extra_msg_count;
+                                combined_byte_reservation += extra_byte_reservation;
+                                combined_batch_size += extra_size;
+                                total_conversations += extra_size;
+                                total_messages += extra_msg_count;
+                                combined_messages_so_far += 1;
+                            }
+                            Ok(other) => {
+                                // Non-Batch message: defer and stop draining.
+                                // Ordering is preserved because we'll process
+                                // `other` as the very next message on the
+                                // main loop.
+                                deferred_non_batch.push_back(other);
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Ingest the combined batch (== original single batch when
+                // combine_enabled = false or no extras were drained).
                 let ingest_result = ingest_batch(
                     storage,
                     t_index.as_deref_mut(),
-                    &conversations,
+                    &combined_conversations,
                     progress,
                     lexical_strategy,
                     true,
                 );
-                flow_limiter.release(byte_reservation);
+                flow_limiter.release(combined_byte_reservation);
                 canonical_mutations = canonical_mutations.accumulate(ingest_result?);
+
+                // For tracing parity with the per-message path, use the
+                // first batch's connector_name + the combined totals.
+                let message_count = combined_message_count;
+                let batch_size = combined_batch_size;
 
                 // Periodic commit to make results visible incrementally.
                 // The base interval is 5s (tunable via
@@ -8053,6 +8245,7 @@ pub fn run_index(
         .flatten();
     if let Some(repair) = repair_fallback_fts_after_full_index_run(
         &storage,
+        &opts.db_path,
         opts.full,
         canonical_only_full_rebuild,
         fallback_fts_archive_fingerprint,
@@ -13368,6 +13561,17 @@ pub mod persist {
             .map(|(chunk_idx, chunk)| {
                 let base_idx = chunk_idx * chunk_size;
                 let internal_chunk = &internal_convs[base_idx..base_idx + chunk.len()];
+                // Card 1 / Silo shadow observer — observes only, NO commit
+                // semantics change. When CASS_INDEXER_PARALLEL_WAL=shadow is
+                // set, this records per-chunk wall-clock so future sessions
+                // can compare what a parallel-WAL coordinator would have
+                // decided. In `off` mode (default), this returns None and
+                // costs one env lookup + one Option construction.
+                let shadow_guard = crate::indexer::parallel_wal_shadow::start_chunk(
+                    chunk_idx,
+                    base_idx,
+                    chunk.len(),
+                );
                 let franken = FrankenStorage::open_writer(db_path).with_context(|| {
                     format!(
                         "opening frankensqlite writer for begin-concurrent mode: {}",
@@ -13399,6 +13603,9 @@ pub mod persist {
                 match result {
                     Ok(outcomes) => {
                         close_result?;
+                        if let Some(g) = shadow_guard {
+                            g.finish_ok();
+                        }
                         Ok(outcomes)
                     }
                     Err(err) => {
@@ -13408,6 +13615,9 @@ pub mod persist {
                                 db_path = %db_path.display(),
                                 "failed to close begin-concurrent writer cleanly after index error"
                             );
+                        }
+                        if let Some(g) = shadow_guard {
+                            g.finish_err();
                         }
                         Err(err)
                     }
@@ -14836,6 +15046,155 @@ pub mod persist {
             }
 
             t_index.commit().unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn parallel_wal_shadow_observer_does_not_change_persisted_state() {
+            // C1.3 per `ALIEN-ARTIFACT-CARD1-SPEC.md`:
+            // Toggling the shadow observer must NOT change what gets
+            // committed. Run the same 16-conv workload through the
+            // begin-concurrent path with CASS_INDEXER_PARALLEL_WAL unset
+            // and with =shadow, diff the resulting DB state by
+            // (external_id, started_at) tuples.
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+
+            fn run_once(parallel_wal: Option<&str>) -> Vec<(String, i64)> {
+                let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+                let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "4");
+                let _wal_guard = parallel_wal.map(|v| set_env("CASS_INDEXER_PARALLEL_WAL", v));
+                let _ = _wal_guard;
+
+                let dir = tempfile::TempDir::new().unwrap();
+                let db_path = dir.path().join("shadow-parity.db");
+                let index_path = dir.path().join("tantivy");
+                let storage = create_franken_db(&db_path);
+                let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+                let convs: Vec<NormalizedConversation> = (0..16)
+                    .map(|i| NormalizedConversation {
+                        agent_slug: format!("agent-{}", i % 3),
+                        external_id: Some(format!("shadow-parity-{i}")),
+                        title: Some(format!("Title {i}")),
+                        workspace: Some(std::path::PathBuf::from(format!("/ws/{}", i % 2))),
+                        source_path: std::path::PathBuf::from(format!("/log/{i}.jsonl")),
+                        started_at: Some(1_000 + i as i64),
+                        ended_at: Some(1_010 + i as i64),
+                        metadata: serde_json::json!({}),
+                        messages: vec![NormalizedMessage {
+                            idx: 0,
+                            role: "user".into(),
+                            author: Some("tester".into()),
+                            created_at: Some(1_000 + i as i64),
+                            content: format!("body {i}"),
+                            extra: serde_json::json!({}),
+                            snippets: vec![],
+                            invocations: Vec::new(),
+                        }],
+                    })
+                    .collect();
+
+                persist_conversations_batched(
+                    &storage,
+                    Some(&mut t_index),
+                    &convs,
+                    LexicalPopulationStrategy::IncrementalInline,
+                    false,
+                )
+                .expect("begin-concurrent path should persist all conversations");
+
+                let reader = FrankenStorage::open(&db_path).unwrap();
+                reader
+                    .raw()
+                    .query_map_collect(
+                        "SELECT external_id, started_at FROM conversations ORDER BY id",
+                        &[],
+                        |row| {
+                            let ext: Option<String> = row.get_typed(0)?;
+                            let started: Option<i64> = row.get_typed(1)?;
+                            Ok((ext.unwrap_or_default(), started.unwrap_or(0)))
+                        },
+                    )
+                    .unwrap()
+            }
+
+            // BEGIN CONCURRENT commits chunks in nondeterministic order
+            // (par_chunks scheduling), so the committed-row order is NOT
+            // identical run-to-run. The invariant we care about is "the
+            // SET of persisted (external_id, started_at) tuples is
+            // identical." Compare as sorted vectors to normalize.
+            let mut off = run_once(None);
+            let mut shadow = run_once(Some("shadow"));
+            off.sort();
+            shadow.sort();
+            assert_eq!(off.len(), 16);
+            assert_eq!(shadow.len(), 16);
+            assert_eq!(
+                off, shadow,
+                "shadow-mode observer must NOT change the SET of persisted rows"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn parallel_wal_shadow_observer_emits_chunk_telemetry() {
+            // Positive control: with shadow mode ON, running a real
+            // begin-concurrent batch should populate the shadow observer
+            // ring buffer with at least one record.
+            use crate::connectors::NormalizedConversation;
+            use crate::search::tantivy::TantivyIndex;
+
+            let _begin_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
+            let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "4");
+            let _wal_guard = set_env("CASS_INDEXER_PARALLEL_WAL", "shadow");
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("shadow-tele.db");
+            let index_path = dir.path().join("tantivy");
+            let storage = create_franken_db(&db_path);
+            let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            let convs: Vec<NormalizedConversation> = (0..8)
+                .map(|i| NormalizedConversation {
+                    agent_slug: "codex".into(),
+                    external_id: Some(format!("shadow-tele-{i}")),
+                    title: Some(format!("Title {i}")),
+                    workspace: None,
+                    source_path: std::path::PathBuf::from(format!("/log/{i}.jsonl")),
+                    started_at: Some(1_000 + i as i64),
+                    ended_at: Some(1_010 + i as i64),
+                    metadata: serde_json::json!({}),
+                    messages: vec![NormalizedMessage {
+                        idx: 0,
+                        role: "user".into(),
+                        author: Some("tester".into()),
+                        created_at: Some(1_000 + i as i64),
+                        content: format!("body {i}"),
+                        extra: serde_json::json!({}),
+                        snippets: vec![],
+                        invocations: Vec::new(),
+                    }],
+                })
+                .collect();
+
+            let baseline = crate::indexer::parallel_wal_shadow::telemetry_snapshot();
+            persist_conversations_batched(
+                &storage,
+                Some(&mut t_index),
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            )
+            .expect("shadow-mode begin-concurrent should persist");
+            let after = crate::indexer::parallel_wal_shadow::telemetry_snapshot();
+
+            assert!(after.active, "active must be true under shadow");
+            assert!(
+                after.chunks_observed > baseline.chunks_observed,
+                "shadow observer must record ≥1 chunk when begin-concurrent path runs"
+            );
         }
 
         #[test]
@@ -19277,6 +19636,392 @@ mod tests {
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
     }
 
+    // -----------------------------------------------------------------
+    // Card 3 (flat combining): tests that the combine drain preserves
+    // ordering, caps, backpressure, and Done-flushes-pending semantics.
+    // The existing streaming_consumer_* tests above verify the disabled
+    // (default) path byte-identically against the per-message code.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn flat_combine_preserves_order_and_counts() {
+        let _guard = set_env("CASS_STREAMING_CONSUMER_COMBINE", "1");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("combine.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+
+        // Pre-queue 3 batches from 2 producers so the drain path sees
+        // enough extras to combine. num_producers=2 makes the combine
+        // decision rule (num_producers >= 2) fire.
+        send_conversation_batches(
+            &tx,
+            "codex",
+            vec![norm_conv(
+                Some("combine-a"),
+                vec![norm_msg(0, 1_700_000_000_000)],
+            )],
+            true,
+        );
+        send_conversation_batches(
+            &tx,
+            "claude",
+            vec![norm_conv(
+                Some("combine-b"),
+                vec![norm_msg(0, 1_700_000_000_100)],
+            )],
+            true,
+        );
+        send_conversation_batches(
+            &tx,
+            "codex",
+            vec![norm_conv(
+                Some("combine-c"),
+                vec![norm_msg(0, 1_700_000_000_200)],
+            )],
+            false,
+        );
+        send_done(&tx, "codex", true);
+        send_done(&tx, "claude", true);
+        drop(tx);
+
+        let (_discovered, mutations) = run_streaming_consumer(
+            rx,
+            2, // num_producers: enables combine-decision
+            &storage,
+            Some(&mut index),
+            flow_limiter,
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )
+        .unwrap();
+
+        // All three conversations must end up persisted regardless of
+        // how many drains coalesced them.
+        assert_eq!(mutations.inserted_conversations, 3);
+
+        let conversation_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_count, 3);
+
+        // Ordering: external_ids must appear in the DB in the order they
+        // were sent on the channel. The combine path concatenates, so
+        // this is only true if the drain preserves FIFO semantics.
+        use frankensqlite::compat::{ConnectionExt, RowExt};
+        let external_ids: Vec<String> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT external_id FROM conversations WHERE external_id IS NOT NULL ORDER BY id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            external_ids,
+            vec![
+                "combine-a".to_string(),
+                "combine-b".to_string(),
+                "combine-c".to_string(),
+            ],
+        );
+
+        // Per-connector stats: both connectors must be credited with
+        // their correct conversation counts even though they were
+        // coalesced into one ingest call.
+        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        let codex_convs = stats
+            .connectors
+            .iter()
+            .find(|c| c.name == "codex")
+            .map(|c| c.conversations)
+            .unwrap_or(0);
+        let claude_convs = stats
+            .connectors
+            .iter()
+            .find(|c| c.name == "claude")
+            .map(|c| c.conversations)
+            .unwrap_or(0);
+        assert_eq!(codex_convs, 2);
+        assert_eq!(claude_convs, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn flat_combine_disabled_produces_identical_db_state_as_combine_enabled() {
+        // PO-C3-1 ordering equivalence: for any interleaving, the final
+        // DB state with combine=ON equals the DB state with combine=OFF.
+        // We don't compare bit-for-bit at the SQLite level because
+        // timestamps / autoincrement ids can differ; instead we compare
+        // external_ids in-order, message counts, and message idx values.
+
+        fn run_once(combine: &str) -> (i64, i64, Vec<(String, i64)>) {
+            let _guard = set_env("CASS_STREAMING_CONSUMER_COMBINE", combine);
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            let db_path = data_dir.join("parity.db");
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            ensure_fts_schema(&storage);
+            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+            let progress = Arc::new(IndexingProgress::default());
+            let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+            let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+            // A scripted 6-batch mix from 2 connectors.
+            for i in 0..6 {
+                let conn = if i % 2 == 0 { "codex" } else { "claude" };
+                send_conversation_batches(
+                    &tx,
+                    conn,
+                    vec![norm_conv(
+                        Some(&format!("parity-{i}")),
+                        vec![norm_msg(0, 1_700_000_000_000 + i as i64)],
+                    )],
+                    i < 2,
+                );
+            }
+            send_done(&tx, "codex", true);
+            send_done(&tx, "claude", true);
+            drop(tx);
+
+            run_streaming_consumer(
+                rx,
+                2,
+                &storage,
+                Some(&mut index),
+                flow_limiter,
+                &Some(progress),
+                LexicalPopulationStrategy::IncrementalInline,
+                None,
+            )
+            .unwrap();
+
+            use frankensqlite::compat::{ConnectionExt, RowExt};
+            let conv_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            let msg_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+                .unwrap();
+            let rows: Vec<(String, i64)> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT external_id, started_at FROM conversations ORDER BY id",
+                    &[],
+                    |row| {
+                        let ext: Option<String> = row.get_typed(0)?;
+                        let started: Option<i64> = row.get_typed(1)?;
+                        Ok((ext.unwrap_or_default(), started.unwrap_or(0)))
+                    },
+                )
+                .unwrap();
+            (conv_count, msg_count, rows)
+        }
+
+        let off = run_once("0");
+        let on = run_once("1");
+        assert_eq!(off.0, on.0, "conversation count must match");
+        assert_eq!(off.1, on.1, "message count must match");
+        assert_eq!(
+            off.2, on.2,
+            "per-conversation external_id + started_at must appear in the same order"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn flat_combine_disabled_leaves_per_message_path_untouched() {
+        // PO-C3-6: when env=0, the drain loop is never taken, so the
+        // code path is byte-identical to the pre-Card-3 version. This
+        // test just confirms the existing (pre-combine) semantics still
+        // work when combine is explicitly disabled.
+        let _guard = set_env("CASS_STREAMING_CONSUMER_COMBINE", "0");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("disabled.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        send_conversation_batches(
+            &tx,
+            "codex",
+            vec![norm_conv(
+                Some("single"),
+                vec![norm_msg(0, 1_700_000_000_000)],
+            )],
+            true,
+        );
+        send_done(&tx, "codex", true);
+        drop(tx);
+        let (discovered, mutations) = run_streaming_consumer(
+            rx,
+            1,
+            &storage,
+            Some(&mut index),
+            flow_limiter,
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )
+        .unwrap();
+        assert_eq!(discovered, vec!["codex".to_string()]);
+        assert_eq!(mutations.inserted_conversations, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn flat_combine_single_producer_skips_drain() {
+        // The combine-decision rule requires num_producers >= 2. With
+        // exactly one producer we must behave like the per-message
+        // path even when env=1 is set.
+        let _guard = set_env("CASS_STREAMING_CONSUMER_COMBINE", "1");
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("single-prod.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+        let progress = Arc::new(IndexingProgress::default());
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        for i in 0..3 {
+            send_conversation_batches(
+                &tx,
+                "codex",
+                vec![norm_conv(
+                    Some(&format!("solo-{i}")),
+                    vec![norm_msg(0, 1_700_000_000_000 + i)],
+                )],
+                i == 0,
+            );
+        }
+        send_done(&tx, "codex", true);
+        drop(tx);
+        let (_discovered, mutations) = run_streaming_consumer(
+            rx,
+            1, // single producer → drain loop body is bypassed
+            &storage,
+            Some(&mut index),
+            flow_limiter,
+            &Some(progress.clone()),
+            LexicalPopulationStrategy::IncrementalInline,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mutations.inserted_conversations, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn streaming_combine_env_respects_truthy_parsing() {
+        // Post-flip semantics: default is ON. Only explicit opt-out
+        // keywords disable it. Anything else (unset, garbage, "1", …) is
+        // treated as enabled. Operators who want the legacy per-message
+        // path set CASS_STREAMING_CONSUMER_COMBINE=0.
+        let prior = std::env::var("CASS_STREAMING_CONSUMER_COMBINE").ok();
+        // SAFETY: test-local env mutation; one-shot and restored below.
+        unsafe {
+            std::env::remove_var("CASS_STREAMING_CONSUMER_COMBINE");
+        }
+        assert!(
+            streaming_combine_enabled(),
+            "unset env must default to enabled"
+        );
+        for truthy in ["1", "true", "yes", "on", "TRUE", "Yes"] {
+            unsafe {
+                std::env::set_var("CASS_STREAMING_CONSUMER_COMBINE", truthy);
+            }
+            assert!(
+                streaming_combine_enabled(),
+                "expected `{truthy}` to enable combine"
+            );
+        }
+        for falsy in ["0", "false", "no", "off", "OFF"] {
+            unsafe {
+                std::env::set_var("CASS_STREAMING_CONSUMER_COMBINE", falsy);
+            }
+            assert!(
+                !streaming_combine_enabled(),
+                "expected `{falsy}` to disable combine"
+            );
+        }
+        // Garbage / empty falls through to default-enabled.
+        for pass_through in ["", "maybe", "idk"] {
+            unsafe {
+                std::env::set_var("CASS_STREAMING_CONSUMER_COMBINE", pass_through);
+            }
+            assert!(
+                streaming_combine_enabled(),
+                "non-off values fall through to default-enabled; `{pass_through}` did not"
+            );
+        }
+        unsafe {
+            std::env::remove_var("CASS_STREAMING_CONSUMER_COMBINE");
+        }
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("CASS_STREAMING_CONSUMER_COMBINE", v);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn streaming_combine_max_messages_clamps_to_valid_range() {
+        let prior = std::env::var("CASS_STREAMING_COMBINE_MAX").ok();
+        // SAFETY: test-local env mutation.
+        unsafe {
+            std::env::set_var("CASS_STREAMING_COMBINE_MAX", "0");
+        }
+        assert_eq!(
+            streaming_combine_max_messages(),
+            64,
+            "zero must not be honored; default"
+        );
+        unsafe {
+            std::env::set_var("CASS_STREAMING_COMBINE_MAX", "1000000");
+        }
+        assert_eq!(
+            streaming_combine_max_messages(),
+            1024,
+            "upper clamp is 1024"
+        );
+        unsafe {
+            std::env::set_var("CASS_STREAMING_COMBINE_MAX", "16");
+        }
+        assert_eq!(streaming_combine_max_messages(), 16);
+        unsafe {
+            std::env::remove_var("CASS_STREAMING_COMBINE_MAX");
+        }
+        assert_eq!(streaming_combine_max_messages(), 64);
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("CASS_STREAMING_COMBINE_MAX", v);
+            }
+        }
+    }
+
     #[test]
     fn streaming_producer_records_remote_scan_errors_in_connector_stats() {
         let tmp = TempDir::new().unwrap();
@@ -19977,7 +20722,9 @@ mod tests {
         ensure_fts_schema(&storage);
         seed_lexical_rebuild_fixture(&storage);
 
-        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false, None).unwrap();
+        let repair =
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+                .unwrap();
         assert_eq!(
             repair,
             Some(FallbackFtsRepairOutcome::Repaired(
@@ -19993,7 +20740,9 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         seed_lexical_rebuild_fixture(&storage);
 
-        let repair = repair_fallback_fts_after_full_index_run(&storage, true, false, None).unwrap();
+        let repair =
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+                .unwrap();
         assert_eq!(
             repair,
             Some(FallbackFtsRepairOutcome::Repaired(
@@ -20018,6 +20767,7 @@ mod tests {
 
         let repair = repair_fallback_fts_after_full_index_run(
             &storage,
+            &db_path,
             true,
             false,
             Some(&archive_fingerprint),

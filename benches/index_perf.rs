@@ -349,12 +349,88 @@ fn bench_ingest_with_responsiveness(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measured A/B of the post-flip defaults (Cards 1/2/3 all enabled) vs
+/// the pre-flip "legacy" configuration (static governor, per-message
+/// consumer, shadow observer off). The goal is to answer the user's
+/// question: does flipping all three defaults on actually help or hurt
+/// end-to-end wall-clock on a realistic-sized ingest?
+///
+/// We also run the two middle corners so per-card attribution is
+/// possible: toggle combine in isolation and toggle the governor in
+/// isolation against the legacy baseline.
+///
+/// Each configuration uses `--force-rebuild` so the measured wall-clock
+/// includes the full scan + persist + Tantivy index path. Corpus size
+/// 200 matches the existing `ingest_responsiveness` bench so the
+/// criterion baseline comparator can attribute the delta.
+fn bench_card_defaults_ab(c: &mut Criterion) {
+    let mut group = c.benchmark_group("card_defaults_ab");
+    group.sample_size(10);
+    let corpus_size = 200;
+
+    // Four cells. Each is (label, (governor, combine, shadow)) tuple.
+    // `governor`: "static" (legacy) vs "conformal" (new default)
+    // `combine`:  "0" (legacy) vs "1" (new default)
+    // `shadow`:   "off" (legacy) vs "shadow" (new default)
+    let cells: [(&str, &str, &str, &str); 4] = [
+        ("legacy_all_off", "static", "0", "off"),
+        ("new_all_on", "conformal", "1", "shadow"),
+        ("only_combine_on", "static", "1", "off"),
+        ("only_governor_on", "conformal", "0", "off"),
+    ];
+
+    for &(label, governor, combine, shadow) in &cells {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, db_path) = create_corpus(&tmp, corpus_size);
+        let _ = index_dir(&data_dir);
+
+        let opts = IndexOptions {
+            full: true,
+            force_rebuild: true,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        // SAFETY: criterion benches are single-threaded per-fn.
+        unsafe {
+            std::env::set_var("CASS_RESPONSIVENESS_CALIBRATION", governor);
+            std::env::set_var("CASS_STREAMING_CONSUMER_COMBINE", combine);
+            std::env::set_var("CASS_INDEXER_PARALLEL_WAL", shadow);
+        }
+
+        group.bench_with_input(BenchmarkId::new(label, corpus_size), &(), |b, _| {
+            b.iter(|| {
+                let opts = opts.clone();
+                let _ = fs::remove_file(&opts.db_path);
+                let _ = fs::remove_dir_all(opts.data_dir.join("index"));
+                run_index(opts, None)
+            });
+        });
+    }
+
+    // SAFETY: single-threaded cleanup outside any iter loop.
+    unsafe {
+        std::env::remove_var("CASS_RESPONSIVENESS_CALIBRATION");
+        std::env::remove_var("CASS_STREAMING_CONSUMER_COMBINE");
+        std::env::remove_var("CASS_INDEXER_PARALLEL_WAL");
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_index_full,
     bench_streaming_vs_batch,
     bench_channel_overhead,
     bench_semantic_embedding,
-    bench_ingest_with_responsiveness
+    bench_ingest_with_responsiveness,
+    bench_card_defaults_ab,
 );
 criterion_main!(benches);
