@@ -12113,6 +12113,61 @@ fn rebuild_tantivy_from_db_with_options(
         );
     }
 
+    // Bead ibuuh.30 slice: write a generation manifest alongside the
+    // equivalence ledger. This slice builds in place rather than a scratch
+    // directory, so the final state is directly Validated+Published; a
+    // future slice introduces scratch directories and atomic promotion.
+    let manifest_now_ms = lexical_generation::now_ms();
+    let generation_fingerprint_head = rebuild_state
+        .db
+        .storage_fingerprint
+        .get(..16)
+        .unwrap_or(rebuild_state.db.storage_fingerprint.as_str());
+    let generation_id = format!(
+        "gen-{manifest_now_ms:016x}-{generation_fingerprint_head}"
+    );
+    let attempt_id = format!("attempt-{manifest_now_ms:016x}");
+    let mut generation_manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
+        generation_id.clone(),
+        attempt_id.clone(),
+        rebuild_state.db.storage_fingerprint.clone(),
+        manifest_now_ms,
+    );
+    generation_manifest.conversation_count = total_conversations as u64;
+    generation_manifest.message_count = final_observed_messages as u64;
+    generation_manifest.indexed_doc_count = indexed_docs as u64;
+    generation_manifest.equivalence_manifest_fingerprint =
+        Some(equivalence_evidence.manifest_fingerprint.clone());
+    generation_manifest
+        .transition_build(lexical_generation::LexicalGenerationBuildState::Built, manifest_now_ms);
+    generation_manifest.transition_build(
+        lexical_generation::LexicalGenerationBuildState::Validated,
+        manifest_now_ms,
+    );
+    generation_manifest.transition_publish(
+        lexical_generation::LexicalGenerationPublishState::Published,
+        manifest_now_ms,
+    );
+    if let Err(err) = lexical_generation::store_manifest(&index_path, &generation_manifest) {
+        tracing::warn!(
+            error = %err,
+            index_path = %index_path.display(),
+            generation_id = generation_id.as_str(),
+            "failed to persist lexical generation manifest; rebuild succeeded but publish record is missing"
+        );
+    } else {
+        tracing::info!(
+            generation_id = generation_id.as_str(),
+            attempt_id = attempt_id.as_str(),
+            conversation_count = generation_manifest.conversation_count,
+            message_count = generation_manifest.message_count,
+            indexed_doc_count = generation_manifest.indexed_doc_count,
+            source_db_fingerprint = generation_manifest.source_db_fingerprint.as_str(),
+            equivalence_manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
+            "lexical generation manifest published"
+        );
+    }
+
     Ok(LexicalRebuildOutcome {
         indexed_docs,
         observed_messages: Some(final_observed_messages),
