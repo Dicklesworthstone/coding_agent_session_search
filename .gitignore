@@ -184,3 +184,8 @@ storage.sqlite3-wal.corrupt-*
 # NTM per-repo state (rate-limit tracking, session metadata) — regenerated on demand
 .ntm/
 .claude/settings.local.json
+
+# Golden-file actual-dump outputs — written by tests/golden_robot_json.rs and
+# tests/pages_export_golden.rs when a golden diverges from expected, strictly
+# for local diffing ahead of UPDATE_GOLDENS=1 regeneration. Never committed.
+tests/golden/**/*.actual
