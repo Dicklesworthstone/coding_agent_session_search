@@ -98,13 +98,13 @@ fn canonicalize_fast_path(text: &str) -> Option<String> {
         first = false;
     }
 
-    // Low-signal filter: lowercase ASCII match against the shared pattern
-    // list. Pure-ASCII so `make_ascii_lowercase` suffices without allocating
-    // in the case-match case.
+    // Low-signal filter: case-insensitive ASCII match against the shared
+    // pattern list. `str::eq_ignore_ascii_case` walks both operands byte-by-
+    // byte and does the case-fold inline, so we avoid the `to_ascii_lowercase`
+    // allocation that the previous version paid on every ack-length input.
     if !collapsed.is_empty() {
-        let lower = collapsed.to_ascii_lowercase();
         for pattern in LOW_SIGNAL_CONTENT {
-            if lower == *pattern {
+            if collapsed.eq_ignore_ascii_case(pattern) {
                 return Some(String::new());
             }
         }
