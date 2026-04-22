@@ -23987,7 +23987,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 embedder.as_deref(),
                 batch_conversations,
                 data_dir,
-                db,
+                db.or_else(|| cli.db.clone()),
                 structured_format,
             )
         }
@@ -24688,13 +24688,6 @@ fn run_models_backfill(
         });
     }
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
-        code: 5,
-        kind: "storage",
-        message: format!("Failed to open cass database {}: {e}", db_path.display()),
-        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
-        retryable: true,
-    })?;
     let db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
             code: 5,
@@ -24706,6 +24699,13 @@ fn run_models_backfill(
             hint: Some("Run 'cass index --full --force-rebuild' if the archive is corrupt".into()),
             retryable: true,
         })?;
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+        code: 5,
+        kind: "storage",
+        message: format!("Failed to open cass database {}: {e}", db_path.display()),
+        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
+    })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
         kind: "semantic_manifest",
