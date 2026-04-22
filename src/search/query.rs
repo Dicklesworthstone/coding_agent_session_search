@@ -1381,6 +1381,37 @@ impl PartialOrd for SearchHitKey {
     }
 }
 
+const FEDERATED_RRF_K: f32 = 60.0;
+
+#[derive(Debug)]
+struct FederatedRankedHit {
+    hit: SearchHit,
+    shard_index: usize,
+    shard_rank: usize,
+    fused_score: f32,
+}
+
+fn federated_rrf_score(shard_rank: usize) -> f32 {
+    1.0 / (FEDERATED_RRF_K + shard_rank as f32 + 1.0)
+}
+
+fn merge_federated_ranked_hits(mut ranked_hits: Vec<FederatedRankedHit>) -> Vec<SearchHit> {
+    ranked_hits.sort_by(|a, b| {
+        b.fused_score
+            .total_cmp(&a.fused_score)
+            .then_with(|| a.shard_rank.cmp(&b.shard_rank))
+            .then_with(|| SearchHitKey::from_hit(&a.hit).cmp(&SearchHitKey::from_hit(&b.hit)))
+            .then_with(|| a.shard_index.cmp(&b.shard_index))
+    });
+    ranked_hits
+        .into_iter()
+        .map(|mut ranked| {
+            ranked.hit.score = ranked.fused_score;
+            ranked.hit
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
@@ -5628,13 +5659,11 @@ impl SearchClient {
         limit: usize,
         field_mask: FieldMask,
     ) -> Result<(Vec<SearchHit>, usize)> {
-        const FEDERATED_RRF_K: f32 = 60.0;
-
-        let mut combined_hits = Vec::new();
+        let mut ranked_hits = Vec::new();
         let mut total_count = 0usize;
 
-        for shard in readers {
-            let (mut shard_hits, shard_total_count) = self.search_tantivy(
+        for (shard_index, shard) in readers.iter().enumerate() {
+            let (shard_hits, shard_total_count) = self.search_tantivy(
                 &shard.reader,
                 &shard.fields,
                 raw_query,
@@ -5645,18 +5674,29 @@ impl SearchClient {
                 field_mask,
             )?;
             total_count = total_count.saturating_add(shard_total_count);
-            for (rank, hit) in shard_hits.iter_mut().enumerate() {
-                let shard_rank = rank as f32 + 1.0;
-                hit.score = 1.0 / (FEDERATED_RRF_K + shard_rank);
+            for (shard_rank, hit) in shard_hits.into_iter().enumerate() {
+                ranked_hits.push(FederatedRankedHit {
+                    hit,
+                    shard_index,
+                    shard_rank,
+                    fused_score: federated_rrf_score(shard_rank),
+                });
             }
-            combined_hits.extend(shard_hits);
         }
 
-        combined_hits.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| SearchHitKey::from_hit(a).cmp(&SearchHitKey::from_hit(b)))
-        });
+        let raw_hit_count = ranked_hits.len();
+        let generation_signature = self.federated_generation_signature(readers);
+        self.track_generation(generation_signature);
+        let combined_hits = merge_federated_ranked_hits(ranked_hits);
+        tracing::debug!(
+            generation_signature,
+            shard_count = readers.len(),
+            total_count,
+            raw_hit_count,
+            returned_hit_count = combined_hits.len(),
+            merge_policy = "rrf_rank_then_stable_hit_key",
+            "federated lexical search merged shard results"
+        );
 
         Ok((combined_hits, total_count))
     }
@@ -8094,6 +8134,97 @@ mod tests {
                 conversation_id: None,
             },
         }
+    }
+
+    fn make_federated_merge_hit(id: &str, agent: &str) -> SearchHit {
+        SearchHit {
+            title: id.into(),
+            snippet: String::new(),
+            content: id.into(),
+            content_hash: stable_content_hash(id),
+            score: 0.0,
+            source_path: format!("{id}.jsonl"),
+            agent: agent.into(),
+            workspace: "workspace".into(),
+            workspace_original: None,
+            created_at: Some(1_700_000_000_000),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            conversation_id: None,
+        }
+    }
+
+    fn make_federated_ranked_hit(
+        shard_index: usize,
+        shard_rank: usize,
+        id: &str,
+    ) -> FederatedRankedHit {
+        FederatedRankedHit {
+            hit: make_federated_merge_hit(id, &format!("shard-{shard_index}")),
+            shard_index,
+            shard_rank,
+            fused_score: federated_rrf_score(shard_rank),
+        }
+    }
+
+    #[test]
+    fn federated_merge_orders_equal_rank_hits_by_stable_hit_key() {
+        let merged = merge_federated_ranked_hits(vec![
+            make_federated_ranked_hit(2, 0, "zeta"),
+            make_federated_ranked_hit(0, 0, "bravo"),
+            make_federated_ranked_hit(1, 0, "alpha"),
+        ]);
+
+        let paths = merged
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["alpha.jsonl", "bravo.jsonl", "zeta.jsonl"]);
+        assert!(
+            merged
+                .iter()
+                .all(|hit| (hit.score - federated_rrf_score(0)).abs() < f32::EPSILON),
+            "equal per-shard rank should produce equal RRF scores"
+        );
+    }
+
+    #[test]
+    fn federated_merge_keeps_rrf_rank_ahead_of_stable_key() {
+        let merged = merge_federated_ranked_hits(vec![
+            make_federated_ranked_hit(0, 1, "alpha"),
+            make_federated_ranked_hit(1, 0, "zeta"),
+        ]);
+
+        let paths = merged
+            .iter()
+            .map(|hit| hit.source_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["zeta.jsonl", "alpha.jsonl"]);
+        assert!(merged[0].score > merged[1].score);
+    }
+
+    #[test]
+    fn federated_merge_uses_shard_index_as_duplicate_final_tiebreak() {
+        let merged = merge_federated_ranked_hits(vec![
+            FederatedRankedHit {
+                hit: make_federated_merge_hit("same", "shard-2"),
+                shard_index: 2,
+                shard_rank: 0,
+                fused_score: federated_rrf_score(0),
+            },
+            FederatedRankedHit {
+                hit: make_federated_merge_hit("same", "shard-0"),
+                shard_index: 0,
+                shard_rank: 0,
+                fused_score: federated_rrf_score(0),
+            },
+        ]);
+
+        assert_eq!(merged[0].agent, "shard-0");
+        assert_eq!(merged[1].agent, "shard-2");
     }
 
     #[test]
