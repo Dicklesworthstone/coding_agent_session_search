@@ -153,10 +153,7 @@ pub(crate) struct ReadinessSnapshot {
 }
 
 impl ReadinessSnapshot {
-    pub(crate) fn new(
-        lexical: LexicalReadinessState,
-        semantic: SemanticReadinessState,
-    ) -> Self {
+    pub(crate) fn new(lexical: LexicalReadinessState, semantic: SemanticReadinessState) -> Self {
         Self {
             lexical,
             semantic,
@@ -164,10 +161,7 @@ impl ReadinessSnapshot {
         }
     }
 
-    pub(crate) fn with_last_search_refinement(
-        mut self,
-        level: SearchRefinementLevel,
-    ) -> Self {
+    pub(crate) fn with_last_search_refinement(mut self, level: SearchRefinementLevel) -> Self {
         self.last_search_refinement = Some(level);
         self
     }
@@ -192,8 +186,9 @@ impl ReadinessSnapshot {
                     SemanticReadinessState::PolicyDisabled => {
                         RecommendedAction::SemanticDisabledByPolicy
                     }
-                    SemanticReadinessState::FastTierReady
-                    | SemanticReadinessState::HybridReady => RecommendedAction::NothingRequired,
+                    SemanticReadinessState::FastTierReady | SemanticReadinessState::HybridReady => {
+                        RecommendedAction::NothingRequired
+                    }
                 }
             }
             LexicalReadinessState::StaleButSearchable => RecommendedAction::RefreshLexicalSoon,
@@ -228,9 +223,15 @@ mod tests {
         let pairs: &[(LexicalReadinessState, &str)] = &[
             (LexicalReadinessState::Missing, "missing"),
             (LexicalReadinessState::Repairing, "repairing"),
-            (LexicalReadinessState::StaleButSearchable, "stale_but_searchable"),
+            (
+                LexicalReadinessState::StaleButSearchable,
+                "stale_but_searchable",
+            ),
             (LexicalReadinessState::Ready, "ready"),
-            (LexicalReadinessState::CorruptQuarantined, "corrupt_quarantined"),
+            (
+                LexicalReadinessState::CorruptQuarantined,
+                "corrupt_quarantined",
+            ),
         ];
         for (state, expected) in pairs {
             assert_eq!(
@@ -262,7 +263,10 @@ mod tests {
         let pairs: &[(SearchRefinementLevel, &str)] = &[
             (SearchRefinementLevel::LexicalOnly, "lexical_only"),
             (SearchRefinementLevel::FastTierRefined, "fast_tier_refined"),
-            (SearchRefinementLevel::FullyHybridRefined, "fully_hybrid_refined"),
+            (
+                SearchRefinementLevel::FullyHybridRefined,
+                "fully_hybrid_refined",
+            ),
         ];
         for (level, expected) in pairs {
             assert_eq!(
@@ -300,7 +304,10 @@ mod tests {
             SemanticReadinessState::PolicyDisabled,
         ] {
             let snap = ReadinessSnapshot::new(LexicalReadinessState::Missing, sem);
-            assert_eq!(snap.recommended_action(), RecommendedAction::RepairLexicalNow);
+            assert_eq!(
+                snap.recommended_action(),
+                RecommendedAction::RepairLexicalNow
+            );
         }
     }
 
@@ -310,7 +317,10 @@ mod tests {
             LexicalReadinessState::CorruptQuarantined,
             SemanticReadinessState::HybridReady,
         );
-        assert_eq!(snap.recommended_action(), RecommendedAction::RepairLexicalNow);
+        assert_eq!(
+            snap.recommended_action(),
+            RecommendedAction::RepairLexicalNow
+        );
     }
 
     #[test]
@@ -333,7 +343,10 @@ mod tests {
             LexicalReadinessState::Ready,
             SemanticReadinessState::HybridReady,
         );
-        assert_eq!(snap.recommended_action(), RecommendedAction::NothingRequired);
+        assert_eq!(
+            snap.recommended_action(),
+            RecommendedAction::NothingRequired
+        );
     }
 
     #[test]
