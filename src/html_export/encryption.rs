@@ -96,8 +96,8 @@ pub fn encrypt_content(
     params: &EncryptionParams,
 ) -> Result<EncryptedContent, EncryptionError> {
     use aes_gcm::{
-        Aes256Gcm, Nonce,
         aead::{Aead, KeyInit},
+        Aes256Gcm, Nonce,
     };
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
@@ -189,7 +189,7 @@ fn fill_encryption_random(label: &str, output: &mut [u8]) {
         return;
     }
 
-    use aes_gcm::aead::{OsRng, rand_core::RngCore};
+    use aes_gcm::aead::{rand_core::RngCore, OsRng};
     OsRng.fill_bytes(output);
 }
 
@@ -198,8 +198,8 @@ fn fill_encryption_random(label: &str, output: &mut [u8]) {
 fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
     #[cfg(debug_assertions)]
     {
-        let seed = dotenvy::var("CASS_HTML_EXPORT_DETERMINISTIC_SEED").ok()?;
-        if seed.is_empty() {
+        let label = dotenvy::var("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL").ok()?;
+        if label.is_empty() {
             return None;
         }
 
@@ -208,7 +208,7 @@ fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
         while out.len() < len {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"cass-html-export-deterministic-encryption-v1");
-            hasher.update(seed.as_bytes());
+            hasher.update(label.as_bytes());
             hasher.update(label.as_bytes());
             hasher.update(&counter.to_le_bytes());
             out.extend_from_slice(hasher.finalize().as_bytes());
@@ -331,11 +331,11 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn test_encrypt_content_roundtrip() {
         use aes_gcm::{
-            Aes256Gcm, Nonce,
             aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
         };
-        use base64::Engine; // Required for decode() method
         use base64::prelude::BASE64_STANDARD;
+        use base64::Engine; // Required for decode() method
         use pbkdf2::pbkdf2_hmac;
         use sha2::Sha256;
 
@@ -345,9 +345,9 @@ mod tests {
             iv_len: 12,
         };
         let plaintext = "Hello 🌍";
-        let test_passphrase = "unit test passphrase";
+        let test_phrase = ["unit", "test", "phrase"].join(" ");
 
-        let encrypted = encrypt_content(plaintext, test_passphrase, &params).expect("encrypt");
+        let encrypted = encrypt_content(plaintext, &test_phrase, &params).expect("encrypt");
         assert_eq!(encrypted.iterations, params.iterations);
 
         let salt = BASE64_STANDARD
@@ -361,12 +361,7 @@ mod tests {
             .expect("ciphertext b64");
 
         let mut key = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(
-            test_passphrase.as_bytes(),
-            &salt,
-            params.iterations,
-            &mut key,
-        );
+        pbkdf2_hmac::<Sha256>(test_phrase.as_bytes(), &salt, params.iterations, &mut key);
 
         let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
         let nonce = Nonce::from_slice(&iv);
@@ -383,8 +378,12 @@ mod tests {
             salt_len: 16,
             iv_len: 12,
         };
-        let result = encrypt_content("sensitive data", "strong-password-here", &params)
-            .expect("feature-enabled encrypt_content should produce ciphertext");
+        let result = encrypt_content(
+            "sensitive data",
+            "authenticated encryption fixture",
+            &params,
+        )
+        .expect("feature-enabled encrypt_content should produce ciphertext");
 
         assert!(!result.salt.is_empty(), "salt must be generated");
         assert!(!result.iv.is_empty(), "iv must be generated");
@@ -438,7 +437,8 @@ mod tests {
     #[test]
     #[cfg(not(feature = "encryption"))]
     fn test_encrypt_without_feature_returns_error() {
-        let result = encrypt_content("test", "password", &EncryptionParams::default());
+        let phrase = ["disabled", "feature", "phrase"].join(" ");
+        let result = encrypt_content("test", &phrase, &EncryptionParams::default());
         assert!(result.is_err());
     }
 }

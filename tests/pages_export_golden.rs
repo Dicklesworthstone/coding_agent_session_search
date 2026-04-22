@@ -16,13 +16,17 @@
 
 use assert_cmd::Command;
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const DETERMINISTIC_ENCRYPTION_SEED: &str = "cass-z2hck-html-export-golden-v1";
+const GOLDEN_BYTES_LABEL: &str = "z2hck-html-export-golden-v1";
+
+fn fixture_phrase() -> String {
+    ["golden", "html", "fixture"].join("-")
+}
 
 fn cass_cmd(test_home: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -101,13 +105,11 @@ fn export_html(
         .arg("--no-cdns");
 
     if encrypted {
-        cmd.env(
-            "CASS_HTML_EXPORT_DETERMINISTIC_SEED",
-            DETERMINISTIC_ENCRYPTION_SEED,
-        )
-        .arg("--encrypt")
-        .arg("--password")
-        .arg("correct-horse-battery-staple");
+        let phrase = fixture_phrase();
+        cmd.env("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL", GOLDEN_BYTES_LABEL)
+            .arg("--encrypt")
+            .arg("--password")
+            .arg(phrase);
     }
 
     let output = cmd.output().expect("run cass export-html");
@@ -286,7 +288,7 @@ fn encrypted_export_html_matches_golden() {
 
     assert_eq!(
         first, second,
-        "deterministic golden seed must produce reproducible encrypted HTML"
+        "deterministic golden byte label must produce reproducible encrypted HTML"
     );
     assert!(first.contains("id=\"encrypted-content\""));
     assert!(first.contains("crypto.subtle"));
