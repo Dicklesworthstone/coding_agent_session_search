@@ -23192,7 +23192,7 @@ mod tests {
         assert_eq!(app.per_pane_limit, 0);
         assert_eq!(app.input_mode, InputMode::Query);
         assert_eq!(app.focused_region(), FocusRegion::Results);
-        assert_eq!(app.search_mode, SearchMode::Lexical);
+        assert_eq!(app.search_mode, SearchMode::Hybrid);
         assert_eq!(app.match_mode, MatchMode::Standard);
         assert_eq!(app.ranking_mode, RankingMode::Balanced);
         assert_eq!(app.context_window, ContextWindow::Medium);

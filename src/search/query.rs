@@ -281,11 +281,11 @@ pub struct SearchFilters {
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Lexical (BM25) search - keyword matching
-    #[default]
     Lexical,
     /// Semantic search - embedding similarity
     Semantic,
-    /// Hybrid search - RRF fusion of lexical and semantic
+    /// Hybrid-preferred search - RRF fusion of lexical and semantic when available
+    #[default]
     Hybrid,
 }
 
@@ -15123,11 +15123,7 @@ mod tests {
         // reintroduced the unbounded-result failure mode. Driven via
         // the pure `*_from` helper so we can't race with other
         // concurrent tests that read the real env.
-        let cap = compute_no_limit_result_cap_from(
-            Some("999999999999".to_string()),
-            None,
-            None,
-        );
+        let cap = compute_no_limit_result_cap_from(Some("999999999999".to_string()), None, None);
         assert!(
             cap <= NO_LIMIT_RESULT_MAX,
             "explicit override must still clamp to ceiling; got {cap} > {NO_LIMIT_RESULT_MAX}"
@@ -15147,11 +15143,7 @@ mod tests {
         // 128 GiB available → 128 / 16 = 8 GiB budget (under the 16 GiB
         // ceiling, above the 256 MiB floor) → 8 GiB / 80 KiB ≈ 104k
         // hits. That lands inside [MIN, MAX] and above floor.
-        let cap = compute_no_limit_result_cap_from(
-            None,
-            None,
-            Some(128u64 * 1024 * 1024 * 1024),
-        );
+        let cap = compute_no_limit_result_cap_from(None, None, Some(128u64 * 1024 * 1024 * 1024));
         assert!(cap >= NO_LIMIT_RESULT_MIN, "cap {cap} below floor");
         assert!(cap <= NO_LIMIT_RESULT_MAX, "cap {cap} above ceiling");
         // Sanity: 128 GiB / 16 / 80 KiB is nowhere near 1k.
@@ -15180,8 +15172,7 @@ mod tests {
             Some(four_gib),
             Some(1024u64 * 1024 * 1024 * 1024), // 1 TiB (would ceiling otherwise)
         );
-        let expected_hits =
-            ((4u64 * 1024 * 1024 * 1024) / AVG_HIT_BYTES) as usize;
+        let expected_hits = ((4u64 * 1024 * 1024 * 1024) / AVG_HIT_BYTES) as usize;
         let expected = expected_hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX);
         assert_eq!(cap, expected, "bytes env must win over meminfo");
     }
@@ -17221,6 +17212,11 @@ mod tests {
     fn query_explanation_empty_query() {
         let explanation = QueryExplanation::analyze("", &SearchFilters::default());
         assert_eq!(explanation.query_type, QueryType::Empty);
+    }
+
+    #[test]
+    fn search_mode_default_is_hybrid_preferred() {
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
     }
 
     #[test]

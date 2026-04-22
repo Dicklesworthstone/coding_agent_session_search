@@ -366,7 +366,7 @@ pub enum Commands {
         /// Enables chained searches: `cass search "query1" --robot-format sessions | cass search "query2" --sessions-from -`
         #[arg(long)]
         sessions_from: Option<String>,
-        /// Search mode: lexical (default), semantic, or hybrid
+        /// Search mode: hybrid-preferred (default), lexical, or semantic
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
 
@@ -7200,23 +7200,24 @@ fn run_cli_search(
         );
     }
 
-    // Determine effective search mode (default to Lexical)
-    let effective_mode = mode.unwrap_or(SearchMode::Lexical);
-    let approximate = if semantic_opts.approximate && matches!(effective_mode, SearchMode::Lexical)
-    {
-        eprintln!("Warning: --approximate has no effect in lexical mode.");
-        false
-    } else {
-        semantic_opts.approximate
-    };
+    // Default user intent is hybrid-preferred. If the user did not explicitly
+    // request a semantic-bearing mode and semantic assets are unavailable, the
+    // command fails open to lexical while reporting the realized mode in robot
+    // metadata.
+    let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
+    let default_hybrid_requested =
+        mode_meta.defaulted && matches!(mode_meta.requested, SearchMode::Hybrid);
 
     if semantic_opts.tier_mode != crate::search::query::SemanticTierMode::Single
-        && !matches!(effective_mode, SearchMode::Semantic)
+        && !matches!(mode_meta.requested, SearchMode::Semantic)
     {
         eprintln!("Warning: tier flags currently only affect --mode semantic.");
     }
 
-    if matches!(effective_mode, SearchMode::Semantic | SearchMode::Hybrid) {
+    if matches!(
+        mode_meta.requested,
+        SearchMode::Semantic | SearchMode::Hybrid
+    ) {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
         // Use embedder registry for model selection (bd-2mbe)
@@ -7297,13 +7298,18 @@ fn run_cli_search(
                     "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
                         .to_string()
                 };
-                return Err(CliError {
-                    code: 15,
-                    kind: "semantic-unavailable",
-                    message: format!("Semantic search not available: {err}"),
-                    hint: Some(hint),
-                    retryable: false,
-                });
+                if default_hybrid_requested {
+                    mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
+                    let _ = client.clear_semantic_context();
+                } else {
+                    return Err(CliError {
+                        code: 15,
+                        kind: "semantic-unavailable",
+                        message: format!("Semantic search not available: {err}"),
+                        hint: Some(hint),
+                        retryable: false,
+                    });
+                }
             }
         } else {
             let _ = client.clear_semantic_context();
@@ -7315,15 +7321,27 @@ fn run_cli_search(
                 "Run 'cass models install' and then 'cass index --semantic', or use --mode lexical"
                     .to_string()
             };
-            return Err(CliError {
-                code: 15,
-                kind: "semantic-unavailable",
-                message: format!("Semantic search not available: {summary}"),
-                hint: Some(hint),
-                retryable: false,
-            });
+            if default_hybrid_requested {
+                mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
+            } else {
+                return Err(CliError {
+                    code: 15,
+                    kind: "semantic-unavailable",
+                    message: format!("Semantic search not available: {summary}"),
+                    hint: Some(hint),
+                    retryable: false,
+                });
+            }
         }
     }
+
+    let approximate =
+        if semantic_opts.approximate && matches!(mode_meta.realized, SearchMode::Lexical) {
+            eprintln!("Warning: --approximate has no effect in lexical mode.");
+            false
+        } else {
+            semantic_opts.approximate
+        };
 
     let mut filters = SearchFilters::default();
     if !agents.is_empty() {
@@ -7479,7 +7497,7 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let result = match effective_mode {
+    let result = match mode_meta.realized {
         SearchMode::Lexical => client
             .search_with_fallback(
                 query,
@@ -7550,21 +7568,43 @@ fn run_cli_search(
                 total_count: None,
             }
         }
-        SearchMode::Hybrid => client
-            .search_hybrid(
-                query,
-                query,
-                filters.clone(),
-                search_limit,
-                search_offset,
-                sparse_threshold,
-                field_mask,
-                approximate,
-            )
-            .map_err(|e| {
+        SearchMode::Hybrid => match client.search_hybrid(
+            query,
+            query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            sparse_threshold,
+            field_mask,
+            approximate,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                    CliError {
+                if default_hybrid_requested
+                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
+                {
+                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
+                    client
+                        .search_with_fallback(
+                            query,
+                            filters.clone(),
+                            search_limit,
+                            search_offset,
+                            sparse_threshold,
+                            field_mask,
+                        )
+                        .map_err(|fallback_err| CliError {
+                            code: 9,
+                            kind: "search",
+                            message: format!(
+                                "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                            ),
+                            hint: None,
+                            retryable: true,
+                        })?
+                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
+                    return Err(CliError {
                         code: 15,
                         kind: "semantic-unavailable",
                         message: "Hybrid search not available (requires semantic search)".to_string(),
@@ -7573,17 +7613,18 @@ fn run_cli_search(
                                 .to_string(),
                         ),
                         retryable: false,
-                    }
+                    });
                 } else {
-                    CliError {
+                    return Err(CliError {
                         code: 9,
                         kind: "search",
                         message: format!("hybrid search failed: {e}"),
                         hint: Some("Try --mode lexical as fallback".to_string()),
                         retryable: true,
-                    }
+                    });
                 }
-            })?,
+            }
+        },
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 
@@ -7904,7 +7945,7 @@ fn run_cli_search(
             explanation.as_ref(),
             timed_out,
             timeout_ms,
-            effective_mode,
+            mode_meta,
             search_ms,
             rerank_ms,
         )?;
@@ -8326,6 +8367,40 @@ fn robot_format_from_env() -> Option<RobotFormat> {
         })
 }
 
+#[derive(Debug, Clone)]
+struct SearchModeMeta {
+    requested: crate::search::query::SearchMode,
+    realized: crate::search::query::SearchMode,
+    defaulted: bool,
+    fallback_tier: Option<&'static str>,
+    fallback_reason: Option<String>,
+}
+
+impl SearchModeMeta {
+    fn new(requested: crate::search::query::SearchMode, defaulted: bool) -> Self {
+        Self {
+            requested,
+            realized: requested,
+            defaulted,
+            fallback_tier: None,
+            fallback_reason: None,
+        }
+    }
+
+    fn semantic_refinement(&self) -> bool {
+        matches!(
+            self.realized,
+            crate::search::query::SearchMode::Semantic | crate::search::query::SearchMode::Hybrid
+        ) && self.fallback_tier.is_none()
+    }
+
+    fn fall_back_to_lexical(&mut self, reason: impl Into<String>) {
+        self.realized = crate::search::query::SearchMode::Lexical;
+        self.fallback_tier = Some("lexical");
+        self.fallback_reason = Some(reason.into());
+    }
+}
+
 fn toon_encode_options_from_env() -> toon::EncodeOptions {
     let indent = match dotenvy::var("TOON_INDENT") {
         Ok(v) if !v.trim().is_empty() => match v.parse::<usize>() {
@@ -8402,7 +8477,7 @@ fn output_robot_results(
     explanation: Option<&crate::search::query::QueryExplanation>,
     timed_out: bool,
     timeout_ms: Option<u64>,
-    search_mode: crate::search::query::SearchMode,
+    search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
 ) -> CliResult<()> {
@@ -8799,7 +8874,12 @@ fn output_robot_results(
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
                 let mut meta = serde_json::json!({
                     "elapsed_ms": elapsed_ms,
-                    "search_mode": search_mode,
+                    "search_mode": search_mode_meta.realized,
+                    "requested_search_mode": search_mode_meta.requested,
+                    "mode_defaulted": search_mode_meta.defaulted,
+                    "fallback_tier": search_mode_meta.fallback_tier,
+                    "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                    "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "cache_stats": {
                         "hits": result.cache_stats.cache_hits,
@@ -8912,7 +8992,12 @@ fn output_robot_results(
                         "count": filtered_hits.len(),
                         "total_matches": total_matches,
                         "elapsed_ms": elapsed_ms,
-                        "search_mode": search_mode,
+                        "search_mode": search_mode_meta.realized,
+                        "requested_search_mode": search_mode_meta.requested,
+                        "mode_defaulted": search_mode_meta.defaulted,
+                        "fallback_tier": search_mode_meta.fallback_tier,
+                        "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                        "semantic_refinement": search_mode_meta.semantic_refinement(),
                         "wildcard_fallback": result.wildcard_fallback,
                         "cache_stats": {
                             "hits": result.cache_stats.cache_hits,
@@ -9070,7 +9155,12 @@ fn output_robot_results(
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
                 let mut meta = serde_json::json!({
                     "elapsed_ms": elapsed_ms,
-                    "search_mode": search_mode,
+                    "search_mode": search_mode_meta.realized,
+                    "requested_search_mode": search_mode_meta.requested,
+                    "mode_defaulted": search_mode_meta.defaulted,
+                    "fallback_tier": search_mode_meta.fallback_tier,
+                    "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                    "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -9180,7 +9270,12 @@ fn output_robot_results(
             if include_meta && let serde_json::Value::Object(ref mut map) = payload {
                 let mut meta = serde_json::json!({
                     "elapsed_ms": elapsed_ms,
-                    "search_mode": search_mode,
+                    "search_mode": search_mode_meta.realized,
+                    "requested_search_mode": search_mode_meta.requested,
+                    "mode_defaulted": search_mode_meta.defaulted,
+                    "fallback_tier": search_mode_meta.fallback_tier,
+                    "fallback_reason": search_mode_meta.fallback_reason.clone(),
+                    "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -25572,6 +25667,44 @@ mod subcommand_robot_output_tests {
                 Some(RobotFormat::Jsonl)
             );
         });
+    }
+
+    #[test]
+    fn search_without_mode_uses_hybrid_preferred_default_intent() {
+        run_on_large_stack(|| {
+            let cli = match Cli::try_parse_from(["cass", "search", "needle", "--json"]) {
+                Ok(cli) => cli,
+                Err(err) => {
+                    assert!(false, "parse search command: {err}");
+                    return;
+                }
+            };
+            let Some(command) = cli.command.as_ref() else {
+                assert!(false, "parsed search command should include command");
+                return;
+            };
+            let Some(Commands::Search { mode, .. }) = cli.command.as_ref() else {
+                assert!(matches!(command, Commands::Search { .. }));
+                return;
+            };
+
+            assert!(mode.is_none(), "absent --mode should remain inspectable");
+            assert_eq!(
+                crate::search::query::SearchMode::default(),
+                crate::search::query::SearchMode::Hybrid
+            );
+        });
+    }
+
+    #[test]
+    fn default_hybrid_fallback_meta_reports_lexical_realization() {
+        let mut meta = SearchModeMeta::new(crate::search::query::SearchMode::Hybrid, true);
+        meta.fall_back_to_lexical("semantic assets unavailable");
+
+        assert_eq!(meta.requested, crate::search::query::SearchMode::Hybrid);
+        assert_eq!(meta.realized, crate::search::query::SearchMode::Lexical);
+        assert_eq!(meta.fallback_tier, Some("lexical"));
+        assert!(!meta.semantic_refinement());
     }
 }
 
