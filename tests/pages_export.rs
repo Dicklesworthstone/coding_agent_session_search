@@ -1,9 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use anyhow::{Result, anyhow};
     use coding_agent_search::pages::export::{
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
+    use frankensqlite::compat::{ConnectionExt, RowExt};
+    use frankensqlite::{Connection as FrankenConnection, Row as FrankenRow, params as fparams};
     use rusqlite::Connection;
     use std::path::Path;
     use tempfile::TempDir;
@@ -94,6 +96,106 @@ mod tests {
         Ok(())
     }
 
+    fn open_franken_db(path: &Path) -> Result<FrankenConnection> {
+        let path_str = path.to_string_lossy();
+        Ok(FrankenConnection::open(path_str.as_ref())?)
+    }
+
+    fn setup_franken_source_db(path: &Path) -> Result<()> {
+        let conn = open_franken_db(path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL
+            );
+
+            CREATE TABLE workspaces (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL
+            );
+
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                message_count INTEGER,
+                metadata_json TEXT
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT,
+                attachment_refs TEXT
+            );
+            "#,
+        )?;
+
+        conn.execute_compat(
+            "INSERT INTO agents (id, slug) VALUES (?1, ?2)",
+            fparams![1_i64, "codex"],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (?1, ?2)",
+            fparams![1_i64, "/home/user/franken"],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            fparams![
+                1_i64,
+                1_i64,
+                1_i64,
+                "Frankensqlite Export",
+                "/home/user/franken/.codex/session.jsonl",
+                1_700_000_000_000_i64,
+                2_i64
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            fparams![
+                10_i64,
+                1_i64,
+                0_i64,
+                "user",
+                "please verify frankensqlite pages export",
+                1_700_000_000_000_i64,
+                1_700_000_000_100_i64,
+                "gpt-5",
+                "[\"artifact-a\"]"
+            ],
+        )?;
+        conn.execute_compat(
+            "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, updated_at, model, attachment_refs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            fparams![
+                11_i64,
+                1_i64,
+                1_i64,
+                "assistant",
+                "frankensqlite export payload is queryable",
+                1_700_000_000_500_i64,
+                1_700_000_000_600_i64,
+                "gpt-5",
+                "[\"artifact-b\"]"
+            ],
+        )?;
+
+        Ok(())
+    }
+
     #[test]
     fn test_export_engine_basic() -> Result<()> {
         let temp_dir = TempDir::new()?;
@@ -164,6 +266,56 @@ mod tests {
         let conn = Connection::open(&output_path)?;
         let agent: String = conn.query_row("SELECT agent FROM conversations", [], |r| r.get(0))?;
         assert_eq!(agent, "claude");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_export_engine_frankensqlite_source_and_output_are_queryable() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source-franken.db");
+        let output_path = temp_dir.path().join("export-franken.db");
+
+        setup_franken_source_db(&source_path)?;
+
+        let filter = ExportFilter {
+            agents: Some(vec!["codex".to_string()]),
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Relative,
+        };
+
+        let engine = ExportEngine::new(&source_path, &output_path, filter);
+        let stats = engine.execute(|_, _| {}, None)?;
+
+        assert_eq!(stats.conversations_processed, 1);
+        assert_eq!(stats.messages_processed, 2);
+
+        let output_conn = open_franken_db(&output_path)?;
+        let exported_messages: i64 = output_conn.query_row_map(
+            "SELECT COUNT(*) FROM messages",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        assert_eq!(exported_messages, 2);
+
+        let assistant_content: String = output_conn.query_row_map(
+            "SELECT content FROM messages WHERE role = 'assistant'",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        assert_eq!(
+            assistant_content,
+            "frankensqlite export payload is queryable"
+        );
+
+        let fts_hits: i64 = output_conn.query_row_map(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'frankensqlite'",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        assert_eq!(fts_hits, 2);
 
         Ok(())
     }
@@ -243,7 +395,11 @@ mod tests {
         let filter = ExportFilter {
             agents: None,
             workspaces: None,
-            since: Some(Utc.timestamp_millis_opt(1650000000000).unwrap()), // ~Apr 2022
+            since: Some(
+                Utc.timestamp_millis_opt(1_650_000_000_000)
+                    .single()
+                    .ok_or_else(|| anyhow!("invalid fixed pages export timestamp"))?,
+            ), // ~Apr 2022
             until: None,
             path_mode: PathMode::Relative,
         };
