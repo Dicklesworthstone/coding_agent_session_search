@@ -239,11 +239,13 @@ fn tui_headless_search_executes_successfully() {
     let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
+    let codex_home = tmp.path().join("codex_home");
     fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
 
     // Set up fixtures
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
-    make_codex_fixture(&data_dir);
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    make_codex_fixture(&codex_home);
 
     // Build index
     cargo_bin_cmd!("cass")
@@ -257,7 +259,7 @@ fn tui_headless_search_executes_successfully() {
     // Run a search via CLI (robot mode) to verify search works
     let output = cargo_bin_cmd!("cass")
         .arg("search")
-        .arg("hello")
+        .arg(CODEX_SMOKE_QUERY)
         .arg("--robot")
         .arg("--data-dir")
         .arg(&data_dir)
