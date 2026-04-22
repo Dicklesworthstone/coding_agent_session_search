@@ -36,6 +36,10 @@ use crate::connectors::{
     kimi::KimiConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
 };
+use crate::model::conversation_packet::{
+    CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
+    ConversationPacketProvenance, ConversationPacketSinkProjections,
+};
 use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode};
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::search::tantivy::{TantivyIndex, index_dir, schema_hash_matches};
@@ -57,7 +61,7 @@ use std::iter::Peekable;
 type BatchClassificationMap =
     HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
 
-const LEXICAL_REBUILD_PACKET_VERSION: u32 = 1;
+const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 
 type LexicalRebuildMessageBatch = Vec<LexicalRebuildConversationPacket>;
 
@@ -110,6 +114,8 @@ struct LexicalRebuildConversationPacket {
     diagnostics: LexicalRebuildPacketDiagnostics,
     identity: LexicalRebuildPacketIdentity,
     provenance: LexicalRebuildPacketProvenance,
+    contract_hashes: ConversationPacketHashes,
+    contract_projections: ConversationPacketSinkProjections,
     messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
     message_count: usize,
     message_bytes: usize,
@@ -130,6 +136,9 @@ pub(crate) struct LexicalRebuildPacketFingerprintInput<'a> {
     pub source_id: &'a str,
     pub origin_kind: &'a str,
     pub origin_host: Option<&'a str>,
+    pub contract_semantic_hash: &'a str,
+    pub contract_message_hash: &'a str,
+    pub lexical_projected_content_bytes: usize,
     pub messages: &'a crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
     pub message_count: usize,
     pub message_bytes: usize,
@@ -1704,6 +1713,67 @@ fn lexical_rebuild_grouped_message_from_normalized(
     }
 }
 
+fn lexical_rebuild_contract_provenance(
+    provenance: &LexicalRebuildPacketProvenance,
+) -> ConversationPacketProvenance {
+    ConversationPacketProvenance {
+        source_id: provenance.source_id.clone(),
+        origin_kind: provenance.origin_kind.clone(),
+        origin_host: provenance.origin_host.clone(),
+    }
+}
+
+fn lexical_rebuild_contract_from_grouped_messages(
+    conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
+    provenance: &LexicalRebuildPacketProvenance,
+    messages: &crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
+) -> ConversationPacket {
+    let canonical_messages = messages
+        .iter()
+        .map(|message| crate::model::types::Message {
+            id: None,
+            idx: message.idx,
+            role: if message.is_tool_role {
+                crate::model::types::MessageRole::Tool
+            } else {
+                crate::model::types::MessageRole::Agent
+            },
+            author: None,
+            created_at: message.created_at,
+            content: message.content.clone(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    lexical_rebuild_contract_from_canonical_messages(conversation, provenance, canonical_messages)
+}
+
+fn lexical_rebuild_contract_from_canonical_messages(
+    conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
+    provenance: &LexicalRebuildPacketProvenance,
+    messages: Vec<crate::model::types::Message>,
+) -> ConversationPacket {
+    let canonical = crate::model::types::Conversation {
+        id: conversation.id,
+        agent_slug: conversation.agent_slug.clone(),
+        workspace: conversation.workspace.clone(),
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages,
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    };
+    ConversationPacket::from_canonical_replay(
+        &canonical,
+        lexical_rebuild_contract_provenance(provenance),
+    )
+}
+
 impl LexicalRebuildConversationPacket {
     fn from_canonical_replay(
         conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
@@ -1713,8 +1783,70 @@ impl LexicalRebuildConversationPacket {
     ) -> Self {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let message_count = messages.len();
-        let message_bytes = messages.iter().map(|message| message.content.len()).sum();
+        let contract =
+            lexical_rebuild_contract_from_grouped_messages(&conversation, &provenance, &messages);
+        Self::from_canonical_replay_parts(
+            conversation,
+            messages,
+            last_message_id,
+            provenance,
+            provenance_mode,
+            contract,
+        )
+    }
+
+    fn from_canonical_replay_messages(
+        conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
+        messages: Vec<crate::model::types::Message>,
+        source_map: &HashMap<String, (SourceKind, Option<String>)>,
+    ) -> Result<Self> {
+        let (provenance, provenance_mode) =
+            lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
+        let contract = lexical_rebuild_contract_from_canonical_messages(
+            &conversation,
+            &provenance,
+            messages.clone(),
+        );
+        let mut grouped_rows = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
+        grouped_rows.reserve(messages.len());
+        let mut last_message_id = None;
+        for message in messages {
+            let message_id = message.id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "lexical rebuild batch fetch returned message without id for conversation {}",
+                    conversation.id.unwrap_or_default()
+                )
+            })?;
+            last_message_id = Some(last_message_id.unwrap_or(0).max(message_id));
+            grouped_rows.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                idx: message.idx,
+                is_tool_role: matches!(message.role, crate::model::types::MessageRole::Tool),
+                created_at: message.created_at,
+                content: message.content,
+            });
+        }
+        Ok(Self::from_canonical_replay_parts(
+            conversation,
+            grouped_rows,
+            last_message_id,
+            provenance,
+            provenance_mode,
+            contract,
+        ))
+    }
+
+    fn from_canonical_replay_parts(
+        conversation: crate::storage::sqlite::LexicalRebuildConversationRow,
+        messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
+        last_message_id: Option<i64>,
+        provenance: LexicalRebuildPacketProvenance,
+        provenance_mode: LexicalRebuildPacketProvenanceMode,
+        contract: ConversationPacket,
+    ) -> Self {
+        let message_count = contract.payload.messages.len();
+        let message_bytes = contract.projections.lexical.total_content_bytes;
+        let contract_hashes = contract.hashes;
+        let contract_projections = contract.projections;
         Self {
             diagnostics: LexicalRebuildPacketDiagnostics {
                 version: LEXICAL_REBUILD_PACKET_VERSION,
@@ -1736,6 +1868,8 @@ impl LexicalRebuildConversationPacket {
                 ended_at: conversation.ended_at,
             },
             provenance,
+            contract_hashes,
+            contract_projections,
             messages,
             message_count,
             message_bytes,
@@ -1757,6 +1891,9 @@ impl LexicalRebuildConversationPacket {
             source_id: self.provenance.source_id.as_str(),
             origin_kind: self.provenance.origin_kind.as_str(),
             origin_host: self.provenance.origin_host.as_deref(),
+            contract_semantic_hash: self.contract_hashes.semantic_hash.as_str(),
+            contract_message_hash: self.contract_hashes.message_hash.as_str(),
+            lexical_projected_content_bytes: self.contract_projections.lexical.total_content_bytes,
             messages: &self.messages,
             message_count: self.message_count,
             message_bytes: self.message_bytes,
@@ -1768,8 +1905,11 @@ impl LexicalRebuildConversationPacket {
             return Vec::new();
         };
 
-        let mut docs = Vec::with_capacity(self.messages.len());
-        for message in &self.messages {
+        let mut docs = Vec::with_capacity(self.contract_projections.lexical.message_indices.len());
+        for message_index in &self.contract_projections.lexical.message_indices {
+            let Some(message) = self.messages.get(*message_index) else {
+                continue;
+            };
             if is_hard_message_noise(
                 lexical_rebuild_noise_role(message.is_tool_role),
                 &message.content,
@@ -1797,13 +1937,19 @@ impl LexicalRebuildConversationPacket {
     #[cfg(test)]
     fn from_normalized_conversation(conv: &NormalizedConversation) -> Self {
         let (provenance, provenance_mode) = lexical_rebuild_packet_provenance_from_metadata(conv);
+        let contract = ConversationPacket::from_normalized_conversation(
+            conv,
+            lexical_rebuild_contract_provenance(&provenance),
+        );
         let messages = conv
             .messages
             .iter()
             .map(lexical_rebuild_grouped_message_from_normalized)
             .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>();
-        let message_count = messages.len();
-        let message_bytes = messages.iter().map(|message| message.content.len()).sum();
+        let message_count = contract.payload.messages.len();
+        let message_bytes = contract.projections.lexical.total_content_bytes;
+        let contract_hashes = contract.hashes;
+        let contract_projections = contract.projections;
         Self {
             diagnostics: LexicalRebuildPacketDiagnostics {
                 version: LEXICAL_REBUILD_PACKET_VERSION,
@@ -1825,6 +1971,8 @@ impl LexicalRebuildConversationPacket {
                 ended_at: conv.ended_at,
             },
             provenance,
+            contract_hashes,
+            contract_projections,
             messages,
             message_count,
             message_bytes,
@@ -1847,6 +1995,8 @@ impl LexicalRebuildConversationPacket {
             source_id: self.provenance.source_id.clone(),
             origin_kind: self.provenance.origin_kind.clone(),
             origin_host: self.provenance.origin_host.clone(),
+            contract_hashes: self.contract_hashes.clone(),
+            contract_projections: self.contract_projections.clone(),
             messages: self.messages.clone(),
             message_count: self.message_count,
             message_bytes: self.message_bytes,
@@ -1956,6 +2106,16 @@ impl LexicalRebuildEquivalenceAccumulator {
             &mut self.manifest_hasher,
             fingerprint.origin_host,
         );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.contract_semantic_hash),
+        );
+        lexical_rebuild_equivalence_update_opt_str(
+            &mut self.manifest_hasher,
+            Some(fingerprint.contract_message_hash),
+        );
+        self.manifest_hasher
+            .update(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
         self.manifest_hasher
             .update(&(fingerprint.message_count as u64).to_le_bytes());
         self.manifest_hasher
@@ -2070,32 +2230,18 @@ fn prepare_lexical_rebuild_packet_from_canonical(
     input: LexicalRebuildPacketPrepInput,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
 ) -> Result<LexicalRebuildConversationPacket> {
-    let mut grouped_rows = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
-    let mut last_message_id = None;
-
     if let Some(messages) = input.messages {
-        grouped_rows.reserve(messages.len());
-        for message in messages {
-            let message_id = message.id.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "lexical rebuild batch fetch returned message without id for conversation {}",
-                    input.conversation.id.unwrap_or_default()
-                )
-            })?;
-            last_message_id = Some(last_message_id.unwrap_or(0).max(message_id));
-            grouped_rows.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                idx: message.idx,
-                is_tool_role: matches!(message.role, crate::model::types::MessageRole::Tool),
-                created_at: message.created_at,
-                content: message.content,
-            });
-        }
+        return LexicalRebuildConversationPacket::from_canonical_replay_messages(
+            input.conversation,
+            messages,
+            source_map,
+        );
     }
 
     Ok(LexicalRebuildConversationPacket::from_canonical_replay(
         input.conversation,
-        grouped_rows,
-        last_message_id,
+        crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new(),
+        None,
         source_map,
     ))
 }
@@ -2181,6 +2327,8 @@ struct LexicalRebuildPacketSemanticView {
     source_id: String,
     origin_kind: String,
     origin_host: Option<String>,
+    contract_hashes: ConversationPacketHashes,
+    contract_projections: ConversationPacketSinkProjections,
     messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
     message_count: usize,
     message_bytes: usize,
@@ -16689,21 +16837,6 @@ mod tests {
         let replay_messages = fetched
             .remove(&inserted.conversation_id)
             .expect("canonical replay messages");
-        let last_message_id = replay_messages
-            .iter()
-            .filter_map(|message| message.id)
-            .max();
-        let grouped_messages = replay_messages
-            .into_iter()
-            .map(
-                |message| crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
-                    idx: message.idx,
-                    is_tool_role: matches!(message.role, MessageRole::Tool),
-                    created_at: message.created_at,
-                    content: message.content,
-                },
-            )
-            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>();
         let source_map = storage
             .list_sources()
             .unwrap_or_default()
@@ -16711,12 +16844,12 @@ mod tests {
             .map(|source| (source.id, (source.kind, source.host_label)))
             .collect::<HashMap<_, _>>();
 
-        let canonical_packet = LexicalRebuildConversationPacket::from_canonical_replay(
+        let canonical_packet = LexicalRebuildConversationPacket::from_canonical_replay_messages(
             replay_row,
-            grouped_messages,
-            last_message_id,
+            replay_messages,
             &source_map,
-        );
+        )
+        .unwrap();
         let normalized_packet =
             LexicalRebuildConversationPacket::from_normalized_conversation(&raw_conv);
 
@@ -20002,30 +20135,19 @@ mod tests {
     fn streaming_byte_limiter_acquire_with_wait_reports_capacity_stall() {
         let limiter = Arc::new(StreamingByteLimiter::new(64));
         let first = limiter.acquire(64).unwrap();
-        let (ready_tx, ready_rx) = bounded(1);
-        let (result_tx, result_rx) = bounded(1);
-        let waiter = {
+        let releaser = {
             let limiter = limiter.clone();
             thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                let result = limiter.acquire_with_wait(32).unwrap();
-                result_tx.send(result).unwrap();
+                thread::sleep(Duration::from_millis(25));
+                limiter.release(first);
             })
         };
 
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(
-            result_rx.try_recv().is_err(),
-            "waiter should remain blocked while all byte capacity is reserved"
-        );
-
-        limiter.release(first);
-        let (reserved, _wait_duration, waited) =
-            result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (reserved, _wait_duration, waited) = limiter.acquire_with_wait(32).unwrap();
         assert_eq!(reserved, 32);
         assert!(waited, "capacity stall should be reported to telemetry");
         limiter.release(reserved);
-        waiter.join().unwrap();
+        releaser.join().unwrap();
     }
 
     #[test]

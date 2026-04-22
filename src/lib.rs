@@ -5573,6 +5573,10 @@ fn state_meta_json(
                     "active_page_prep_jobs": runtime.active_page_prep_jobs,
                     "ordered_buffered_pages": runtime.ordered_buffered_pages,
                     "budget_generation": runtime.budget_generation,
+                    "producer_budget_wait_count": runtime.producer_budget_wait_count,
+                    "producer_budget_wait_ms": runtime.producer_budget_wait_ms,
+                    "producer_handoff_wait_count": runtime.producer_handoff_wait_count,
+                    "producer_handoff_wait_ms": runtime.producer_handoff_wait_ms,
                     "host_loadavg_1m": runtime.host_loadavg_1m_milli.map(|value| f64::from(value) / 1000.0),
                     "controller_mode": if runtime.controller_mode.is_empty() {
                         serde_json::Value::Null
@@ -11269,6 +11273,10 @@ mod cli_read_db_tests {
                     "active_page_prep_jobs": 2,
                     "ordered_buffered_pages": 4,
                     "budget_generation": 1,
+                    "producer_budget_wait_count": 2,
+                    "producer_budget_wait_ms": 17,
+                    "producer_handoff_wait_count": 1,
+                    "producer_handoff_wait_ms": 9,
                     "host_loadavg_1m_milli": 7_250,
                     "controller_mode": "pressure_limited",
                     "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
@@ -11323,6 +11331,10 @@ mod cli_read_db_tests {
         assert_eq!(runtime["active_page_prep_jobs"].as_u64(), Some(2));
         assert_eq!(runtime["ordered_buffered_pages"].as_u64(), Some(4));
         assert_eq!(runtime["budget_generation"].as_u64(), Some(1));
+        assert_eq!(runtime["producer_budget_wait_count"].as_u64(), Some(2));
+        assert_eq!(runtime["producer_budget_wait_ms"].as_u64(), Some(17));
+        assert_eq!(runtime["producer_handoff_wait_count"].as_u64(), Some(1));
+        assert_eq!(runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
         assert_eq!(runtime["host_loadavg_1m"].as_f64(), Some(7.25));
         assert_eq!(
             runtime["controller_mode"].as_str(),
