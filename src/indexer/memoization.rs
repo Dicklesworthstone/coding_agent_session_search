@@ -187,11 +187,12 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             };
         }
         let mut evicted = false;
-        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
-            if let Some(victim) = self.lru.pop_front() {
-                self.entries.remove(&victim);
-                evicted = true;
-            }
+        if !self.entries.contains_key(&key)
+            && self.entries.len() >= self.max_entries
+            && let Some(victim) = self.lru.pop_front()
+        {
+            self.entries.remove(&victim);
+            evicted = true;
         }
         // Re-insert OR fresh-insert both retain position at tail.
         self.lru.retain(|existing| existing != &key);
