@@ -53,6 +53,21 @@ contract surface: `api_version`, `contract_version`, `features` list,
 an isolated TempDir and `CASS_IGNORE_SOURCES_CONFIG=1` so no ambient
 sources leak into the output.
 
+### `robot/models_status.json.golden`
+
+Frozen output of `cass models status --json` against an isolated empty
+model cache (XDG_DATA_HOME pinned to a TempDir). Captures the full
+not-installed state: `state="not_acquired"`, `state_detail` missing-file
+listing, `next_step` user-facing hint, `files[]` per-manifest-file sizes,
+and the `cache_lifecycle` sub-structure (state machine + per-file
+`last_check_at_ms`). Paths to `model_dir` and per-file locations are
+scrubbed to `[TEST_HOME]/...`.
+
+**Command:** `cass models status --json` with `XDG_DATA_HOME`, `HOME`,
+and `CASS_IGNORE_SOURCES_CONFIG=1` all pinned to an isolated TempDir so
+the model cache is guaranteed empty. Shape includes every field
+`run_models_status` emits in the JSON branch of the structured output.
+
 ### `html_export/basic_export.html.golden`
 
 Frozen full document from `cass export-html --json --no-cdns`
