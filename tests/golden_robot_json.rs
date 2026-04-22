@@ -75,6 +75,14 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .unwrap();
     out = uuid_re.replace_all(&out, "[UUID]").to_string();
 
+    // 5. latency_ms (health --json) — wall-clock duration that varies run to
+    // run and by host. Keep the field in the golden to prove the shape but
+    // scrub the value so drift on it doesn't fail the contract test.
+    let latency_re = regex::Regex::new(r#""latency_ms"\s*:\s*\d+"#).unwrap();
+    out = latency_re
+        .replace_all(&out, r#""latency_ms": "[LATENCY_MS]""#)
+        .to_string();
+
     out
 }
 
@@ -163,4 +171,18 @@ fn models_status_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let scrubbed = capture_robot_json(test_home.path(), &["models", "status", "--json"]);
     assert_golden("robot/models_status.json.golden", &scrubbed);
+}
+
+#[test]
+fn health_json_matches_golden() {
+    // `cass health --json` reports readiness for an isolated empty HOME:
+    // status=not_initialized, healthy=false, db.exists=false,
+    // state.index.status=missing, state.semantic.availability=...
+    // All paths scrub to [TEST_HOME], latency_ms scrubs to [LATENCY_MS].
+    // The golden freezes the full readiness contract (ibuuh.9 scope):
+    // top-level status/healthy/initialized/errors/recommended_action
+    // plus the per-subsystem state.* nested blocks.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(test_home.path(), &["health", "--json"]);
+    assert_golden("robot/health.json.golden", &scrubbed);
 }
