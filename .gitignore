@@ -183,3 +183,4 @@ storage.sqlite3-wal.corrupt-*
 
 # NTM per-repo state (rate-limit tracking, session metadata) — regenerated on demand
 .ntm/
+.claude/settings.local.json
