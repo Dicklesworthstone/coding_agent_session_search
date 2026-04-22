@@ -1341,7 +1341,24 @@ fn models_status_json_outputs_structure() {
 
     // Should output valid JSON
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid models status json");
-    // Should have installed or available field
+    assert_eq!(
+        json["lexical_fail_open"].as_bool(),
+        Some(true),
+        "models status should report lexical fail-open behavior"
+    );
+    assert!(
+        json.get("cache_lifecycle").is_some(),
+        "models status JSON should include cache lifecycle details: {json}"
+    );
+    assert!(
+        json.get("next_step").is_some(),
+        "models status JSON should include next-step guidance: {json}"
+    );
+    assert!(
+        json["state"].as_str().is_some(),
+        "models status JSON should include a machine-readable state: {json}"
+    );
+    // Keep the older loose structure check for compatibility with callers.
     assert!(
         json.get("installed").is_some()
             || json.get("models").is_some()

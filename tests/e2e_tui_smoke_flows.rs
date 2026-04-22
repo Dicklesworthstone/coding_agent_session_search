@@ -131,6 +131,10 @@ fn rendered_contains_detail_messages_marker(rendered: &str) -> bool {
         || (rendered.contains("Detail") && rendered.contains("Messages"))
 }
 
+fn rendered_contains_hello_fixture_detail(rendered: &str) -> bool {
+    rendered.to_ascii_lowercase().contains("hi there, how can")
+}
+
 /// Save output as artifact
 fn save_artifact(name: &str, trace: &str, content: &[u8]) -> PathBuf {
     let dir = artifact_dir();
@@ -235,11 +239,12 @@ fn prepare_ftui_pty_env(trace: &str, tracker: &PhaseTracker) -> FtuiPtyEnv {
             "PTY index failed context: {}",
             serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string())
         );
-        panic!(
-            "Failed to build index for PTY test: {}",
-            truncate_output(&output.stderr, 500)
-        );
     }
+    assert!(
+        output.status.success(),
+        "Failed to build index for PTY test: {}",
+        truncate_output(&output.stderr, 500)
+    );
 
     FtuiPtyEnv {
         _tmp: tmp,
@@ -287,20 +292,22 @@ fn spawn_reader(reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, thread::J
 fn wait_for_child_exit(
     child: &mut (dyn portable_pty::Child + Send + Sync),
     timeout: Duration,
-) -> portable_pty::ExitStatus {
+) -> Result<portable_pty::ExitStatus, String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status,
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let status = child.wait().expect("wait after kill");
-                    panic!("PTY child timed out after {:?} (status: {status})", timeout);
+                    return Err(format!(
+                        "PTY child timed out after {timeout:?} (status: {status})"
+                    ));
                 }
                 thread::sleep(PTY_POLL);
             }
-            Err(err) => panic!("Failed polling PTY child status: {err}"),
+            Err(err) => return Err(format!("Failed polling PTY child status: {err}")),
         }
     }
 }
@@ -347,7 +354,11 @@ fn quit_tui_with_escape(
             return (status, press);
         }
     }
-    (wait_for_child_exit(child, PTY_EXIT_TIMEOUT), max_presses)
+    (
+        wait_for_child_exit(child, PTY_EXIT_TIMEOUT)
+            .expect("PTY child should exit after escape presses"),
+        max_presses,
+    )
 }
 
 fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
@@ -458,7 +469,8 @@ fn tui_pty_launch_quit_and_terminal_cleanup() {
         .slave
         .spawn_command(stty_cmd)
         .expect("spawn stty check");
-    let stty_status = wait_for_child_exit(&mut *stty_child, Duration::from_secs(8));
+    let stty_status =
+        wait_for_child_exit(&mut *stty_child, Duration::from_secs(8)).expect("stty should exit");
     assert!(
         stty_status.success(),
         "stty exited unsuccessfully: {stty_status}"
@@ -556,7 +568,7 @@ fn tui_pty_help_overlay_open_close_flow() {
 
     send_key_sequence(&mut *writer, b"\x1b"); // quit app
 
-    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT);
+    let status = wait_for_child_exit(&mut *child, PTY_EXIT_TIMEOUT).expect("TUI should exit");
     assert!(
         status.success(),
         "ftui process exited unsuccessfully: {status}"
@@ -760,6 +772,7 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
     let raw = captured.lock().expect("capture lock").clone();
     let rendered = strip_terminal_control_sequences(&raw);
     let saw_messages_detail = rendered_contains_detail_messages_marker(&rendered);
+    let saw_fixture_detail_content = rendered_contains_hello_fixture_detail(&rendered);
     save_artifact("pty_enter_detail_output.raw", &trace, &raw);
     let summary = serde_json::json!({
         "trace_id": trace,
@@ -768,6 +781,7 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
         "first_esc_exited": first_esc_exited,
         "total_esc_presses_to_exit": 1 + additional_esc_presses,
         "saw_messages_detail": saw_messages_detail,
+        "saw_fixture_detail_content": saw_fixture_detail_content,
         "captured_bytes": raw.len(),
     });
     save_artifact(
@@ -780,6 +794,10 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
     assert!(
         saw_messages_detail,
         "Expected PTY capture to include Detail [Messages] marker after Enter drill-in"
+    );
+    assert!(
+        saw_fixture_detail_content,
+        "Expected PTY detail capture to include selected fixture conversation content"
     );
     assert!(
         !raw.is_empty(),
@@ -2091,7 +2109,8 @@ fn tui_pty_inline_mode_no_altscreen() {
         .slave
         .spawn_command(stty_cmd)
         .expect("spawn stty check");
-    let stty_status = wait_for_child_exit(&mut *stty_child, Duration::from_secs(8));
+    let stty_status =
+        wait_for_child_exit(&mut *stty_child, Duration::from_secs(8)).expect("stty should exit");
     assert!(
         stty_status.success(),
         "stty exited unsuccessfully: {stty_status}"

@@ -20,6 +20,7 @@ use util::EnvGuard;
 /// Running them in parallel makes them flaky and can accidentally index the developer's real
 /// archives, causing multi-minute hangs.
 static TUI_SMOKE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const CODEX_SMOKE_QUERY: &str = "codexsentinel";
 
 fn tui_smoke_guard() -> std::sync::MutexGuard<'static, ()> {
     match TUI_SMOKE_LOCK.get_or_init(|| Mutex::new(())).lock() {
@@ -42,8 +43,9 @@ fn make_codex_fixture(root: &Path) {
     let sessions = root.join("sessions/2025/11/21");
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join("rollout-1.jsonl");
-    let sample = r#"{"role":"user","timestamp":1700000000000,"content":"hello world test"}
-{"role":"assistant","timestamp":1700000001000,"content":"hi there"}
+    let sample = r#"{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"tui-smoke-codex","cwd":"/test/tui-smoke","cli_version":"0.42.0"}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"codexsentinel world test"}]}}
+{"timestamp":"2025-09-30T15:42:43.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"hi there"}]}}
 "#;
     fs::write(file, sample).unwrap();
 }
@@ -262,7 +264,7 @@ fn tui_headless_search_executes_successfully() {
         .assert()
         .success();
 
-    assert_robot_search_hit(&output.get_output().stdout, "hello", "codex");
+    assert_robot_search_hit(&output.get_output().stdout, CODEX_SMOKE_QUERY, "codex");
 
     // Also run TUI headless to ensure search client initializes
     cargo_bin_cmd!("cass")
@@ -311,14 +313,18 @@ fn tui_headless_multi_agent_index_and_search() {
     // Search for Codex content
     let codex_search = cargo_bin_cmd!("cass")
         .arg("search")
-        .arg("hello")
+        .arg(CODEX_SMOKE_QUERY)
         .arg("--robot")
         .arg("--data-dir")
         .arg(&data_dir)
         .assert()
         .success();
 
-    assert_robot_search_hit(&codex_search.get_output().stdout, "hello", "codex");
+    assert_robot_search_hit(
+        &codex_search.get_output().stdout,
+        CODEX_SMOKE_QUERY,
+        "codex",
+    );
 
     // Search for Claude content
     let claude_search = cargo_bin_cmd!("cass")
