@@ -1,3 +1,4 @@
+pub(crate) mod lexical_generation;
 pub(crate) mod parallel_wal_shadow;
 pub mod redact_secrets;
 pub mod refresh_ledger;
