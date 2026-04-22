@@ -1441,11 +1441,13 @@ fn stable_hit_hash(
     hasher.update(source_path.as_bytes());
     hasher.update(b"|");
     if let Some(line) = line_number {
-        hasher.update(line.to_string().as_bytes());
+        let mut buf = itoa::Buffer::new();
+        hasher.update(buf.format(line).as_bytes());
     }
     hasher.update(b"|");
     if let Some(ts) = created_at {
-        hasher.update(ts.to_string().as_bytes());
+        let mut buf = itoa::Buffer::new();
+        hasher.update(buf.format(ts).as_bytes());
     }
     hasher.digest()
 }
@@ -6858,6 +6860,67 @@ mod tests {
             key.created_at.map(|v| v.to_string()).unwrap_or_default(),
             key.content_hash,
         )
+    }
+
+    fn stable_hit_hash_reference_v0(
+        content: &str,
+        source_path: &str,
+        line_number: Option<usize>,
+        created_at: Option<i64>,
+    ) -> u64 {
+        use xxhash_rust::xxh3::Xxh3;
+
+        let mut hasher = Xxh3::new();
+        if !content.is_empty() {
+            hasher.update(&stable_content_hash(content).to_le_bytes());
+        }
+        hasher.update(b"|");
+        hasher.update(source_path.as_bytes());
+        hasher.update(b"|");
+        if let Some(line) = line_number {
+            hasher.update(line.to_string().as_bytes());
+        }
+        hasher.update(b"|");
+        if let Some(ts) = created_at {
+            hasher.update(ts.to_string().as_bytes());
+        }
+        hasher.digest()
+    }
+
+    #[test]
+    fn stable_hit_hash_matches_reference_and_is_deterministic() {
+        let fixtures = [
+            ("", "", None, None),
+            ("same   content\nnormalized", "/tmp/session.jsonl", Some(1), Some(0)),
+            (
+                "tool output with repeated whitespace",
+                "/tmp/path with spaces.jsonl",
+                Some(42),
+                Some(1_700_000_000_000),
+            ),
+            (
+                "unicode stays in the content hash path: café",
+                "/remote/host/session.jsonl",
+                Some(usize::MAX),
+                Some(i64::MIN),
+            ),
+            (
+                "negative timestamp fixture",
+                "/tmp/negative.jsonl",
+                None,
+                Some(-123_456),
+            ),
+        ];
+
+        for (content, source_path, line_number, created_at) in fixtures {
+            let optimized = stable_hit_hash(content, source_path, line_number, created_at);
+            let repeated = stable_hit_hash(content, source_path, line_number, created_at);
+            let reference =
+                stable_hit_hash_reference_v0(content, source_path, line_number, created_at);
+
+            assert_eq!(optimized, repeated);
+            assert_eq!(optimized, reference);
+        }
     }
 
     #[test]
