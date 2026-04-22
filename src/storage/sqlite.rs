@@ -16985,8 +16985,7 @@ mod tests {
         materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
         let conn = rusqlite_test_fixture_conn(&db_path);
-        conn.execute_batch("PRAGMA writable_schema = ON;")
-            .unwrap();
+        conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
         conn.execute(
             "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
              VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
@@ -17014,11 +17013,9 @@ mod tests {
             "DROP TABLE should leave one clean FTS schema"
         );
         let match_count: i64 = conn
-            .query_row_map(
-                "SELECT COUNT(*) FROM fts_messages",
-                fparams![],
-                |row| row.get_typed(0),
-            )
+            .query_row_map("SELECT COUNT(*) FROM fts_messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(match_count, 1);
     }

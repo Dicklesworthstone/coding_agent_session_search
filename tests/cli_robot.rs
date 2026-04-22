@@ -4292,8 +4292,8 @@ fn introspect_index_embedder_default() {
 #[test]
 fn parse_index_semantic_embedder_flags() {
     run_on_large_stack(|| {
-        let cli =
-            Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"]).unwrap();
+        let cli = Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"])
+            .unwrap();
         let command = cli.command.as_ref();
         assert!(
             matches!(command, Some(Commands::Index { .. })),
