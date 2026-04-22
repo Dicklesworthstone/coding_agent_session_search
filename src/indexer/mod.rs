@@ -17,7 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, bounded, never, select};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
@@ -495,6 +495,14 @@ pub struct IndexingProgress {
     pub rebuild_pipeline_ordered_buffered_pages: AtomicUsize,
     /// Runtime budget generation observed by the rebuild pipeline.
     pub rebuild_pipeline_budget_generation: AtomicUsize,
+    /// Producer-side waits on the in-flight byte budget.
+    pub rebuild_pipeline_producer_budget_wait_count: AtomicUsize,
+    /// Producer-side milliseconds spent waiting on the in-flight byte budget.
+    pub rebuild_pipeline_producer_budget_wait_ms: AtomicUsize,
+    /// Producer-side waits on bounded sink handoff.
+    pub rebuild_pipeline_producer_handoff_wait_count: AtomicUsize,
+    /// Producer-side milliseconds spent waiting on bounded sink handoff.
+    pub rebuild_pipeline_producer_handoff_wait_ms: AtomicUsize,
     /// Sampled host 1-minute load average while the rebuild is active, in milli-loadavg units.
     pub rebuild_pipeline_host_loadavg_1m_milli: Mutex<Option<u32>>,
     /// Human-readable runtime controller mode for the active rebuild.
@@ -577,6 +585,18 @@ impl IndexingProgress {
             .load(Ordering::Relaxed);
         let rebuild_pipeline_budget_generation = self
             .rebuild_pipeline_budget_generation
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_producer_budget_wait_count = self
+            .rebuild_pipeline_producer_budget_wait_count
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_producer_budget_wait_ms = self
+            .rebuild_pipeline_producer_budget_wait_ms
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_producer_handoff_wait_count = self
+            .rebuild_pipeline_producer_handoff_wait_count
+            .load(Ordering::Relaxed);
+        let rebuild_pipeline_producer_handoff_wait_ms = self
+            .rebuild_pipeline_producer_handoff_wait_ms
             .load(Ordering::Relaxed);
         let rebuild_pipeline_host_loadavg_1m_milli = self
             .rebuild_pipeline_host_loadavg_1m_milli
@@ -668,6 +688,10 @@ impl IndexingProgress {
                 "active_page_prep_jobs": rebuild_pipeline_active_page_prep_jobs,
                 "ordered_buffered_pages": rebuild_pipeline_ordered_buffered_pages,
                 "budget_generation": rebuild_pipeline_budget_generation,
+                "producer_budget_wait_count": rebuild_pipeline_producer_budget_wait_count,
+                "producer_budget_wait_ms": rebuild_pipeline_producer_budget_wait_ms,
+                "producer_handoff_wait_count": rebuild_pipeline_producer_handoff_wait_count,
+                "producer_handoff_wait_ms": rebuild_pipeline_producer_handoff_wait_ms,
                 "host_loadavg_1m": rebuild_pipeline_host_loadavg_1m_milli.map(|value| {
                     f64::from(value) / 1000.0
                 }),
@@ -847,6 +871,18 @@ fn reset_progress_to_idle(progress: Option<&Arc<IndexingProgress>>) {
         .rebuild_pipeline_budget_generation
         .store(0, Ordering::Relaxed);
     progress
+        .rebuild_pipeline_producer_budget_wait_count
+        .store(0, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_producer_budget_wait_ms
+        .store(0, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_producer_handoff_wait_count
+        .store(0, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_producer_handoff_wait_ms
+        .store(0, Ordering::Relaxed);
+    progress
         .rebuild_pipeline_staged_merge_workers_max
         .store(0, Ordering::Relaxed);
     progress
@@ -944,6 +980,10 @@ fn capture_lexical_rebuild_pipeline_runtime(
         active_page_prep_jobs: producer_snapshot.active_page_prep_jobs,
         ordered_buffered_pages: producer_snapshot.ordered_buffered_pages,
         budget_generation,
+        producer_budget_wait_count: producer_snapshot.budget_wait_count,
+        producer_budget_wait_ms: producer_snapshot.budget_wait_ms,
+        producer_handoff_wait_count: producer_snapshot.handoff_wait_count,
+        producer_handoff_wait_ms: producer_snapshot.handoff_wait_ms,
         host_loadavg_1m_milli: lexical_rebuild_host_loadavg_1m_milli(),
         controller_mode,
         controller_reason,
@@ -1007,6 +1047,19 @@ fn refresh_lexical_rebuild_pipeline_runtime(
     progress
         .rebuild_pipeline_budget_generation
         .store(latest_runtime.budget_generation, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_producer_budget_wait_count
+        .store(latest_runtime.producer_budget_wait_count, Ordering::Relaxed);
+    progress
+        .rebuild_pipeline_producer_budget_wait_ms
+        .store(latest_runtime.producer_budget_wait_ms, Ordering::Relaxed);
+    progress.rebuild_pipeline_producer_handoff_wait_count.store(
+        latest_runtime.producer_handoff_wait_count,
+        Ordering::Relaxed,
+    );
+    progress
+        .rebuild_pipeline_producer_handoff_wait_ms
+        .store(latest_runtime.producer_handoff_wait_ms, Ordering::Relaxed);
     if let Ok(mut host_loadavg) = progress.rebuild_pipeline_host_loadavg_1m_milli.lock() {
         *host_loadavg = latest_runtime.host_loadavg_1m_milli;
     }
@@ -1481,11 +1534,13 @@ fn heartbeat_index_run_lock_with_lock(
 
     let mut wrote_updated_at = false;
     let now_ms = FrankenStorage::now_millis();
+    let mut itoa_buf = itoa::Buffer::new();
+    let now_ms_str = itoa_buf.format(now_ms);
     let mut refreshed = String::with_capacity(existing.len() + 32);
     for line in existing.lines() {
         if line.strip_prefix("updated_at_ms=").is_some() {
             refreshed.push_str("updated_at_ms=");
-            refreshed.push_str(&now_ms.to_string());
+            refreshed.push_str(now_ms_str);
             wrote_updated_at = true;
         } else {
             refreshed.push_str(line);
@@ -1494,7 +1549,7 @@ fn heartbeat_index_run_lock_with_lock(
     }
     if !wrote_updated_at {
         refreshed.push_str("updated_at_ms=");
-        refreshed.push_str(&now_ms.to_string());
+        refreshed.push_str(now_ms_str);
         refreshed.push('\n');
     }
 
@@ -3237,6 +3292,10 @@ pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub active_page_prep_jobs: usize,
     pub ordered_buffered_pages: usize,
     pub budget_generation: usize,
+    pub producer_budget_wait_count: usize,
+    pub producer_budget_wait_ms: usize,
+    pub producer_handoff_wait_count: usize,
+    pub producer_handoff_wait_ms: usize,
     pub host_loadavg_1m_milli: Option<u32>,
     pub controller_mode: String,
     pub controller_reason: String,
@@ -3265,6 +3324,10 @@ impl LexicalRebuildPipelineRuntimeSnapshot {
             || self.active_page_prep_jobs > 0
             || self.ordered_buffered_pages > 0
             || self.budget_generation > 0
+            || self.producer_budget_wait_count > 0
+            || self.producer_budget_wait_ms > 0
+            || self.producer_handoff_wait_count > 0
+            || self.producer_handoff_wait_ms > 0
             || self.host_loadavg_1m_milli.is_some()
             || !self.controller_mode.is_empty()
             || !self.controller_reason.is_empty()
@@ -4383,6 +4446,10 @@ struct LexicalRebuildProducerTelemetrySnapshot {
     page_prep_workers: usize,
     active_page_prep_jobs: usize,
     ordered_buffered_pages: usize,
+    budget_wait_count: usize,
+    budget_wait_ms: usize,
+    handoff_wait_count: usize,
+    handoff_wait_ms: usize,
 }
 
 #[derive(Debug, Default)]
@@ -4390,14 +4457,32 @@ struct LexicalRebuildProducerTelemetry {
     page_prep_workers: AtomicUsize,
     active_page_prep_jobs: AtomicUsize,
     ordered_buffered_pages: AtomicUsize,
+    budget_wait_count: AtomicUsize,
+    budget_wait_ms: AtomicUsize,
+    handoff_wait_count: AtomicUsize,
+    handoff_wait_ms: AtomicUsize,
 }
 
 impl LexicalRebuildProducerTelemetry {
+    fn saturating_add(counter: &AtomicUsize, value: usize) {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        });
+    }
+
+    fn duration_millis(duration: Duration) -> usize {
+        usize::try_from(duration.as_millis()).unwrap_or(usize::MAX)
+    }
+
     fn snapshot(&self) -> LexicalRebuildProducerTelemetrySnapshot {
         LexicalRebuildProducerTelemetrySnapshot {
             page_prep_workers: self.page_prep_workers.load(Ordering::Relaxed),
             active_page_prep_jobs: self.active_page_prep_jobs.load(Ordering::Relaxed),
             ordered_buffered_pages: self.ordered_buffered_pages.load(Ordering::Relaxed),
+            budget_wait_count: self.budget_wait_count.load(Ordering::Relaxed),
+            budget_wait_ms: self.budget_wait_ms.load(Ordering::Relaxed),
+            handoff_wait_count: self.handoff_wait_count.load(Ordering::Relaxed),
+            handoff_wait_ms: self.handoff_wait_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -4413,6 +4498,16 @@ impl LexicalRebuildProducerTelemetry {
             .store(active_page_prep_jobs, Ordering::Relaxed);
         self.ordered_buffered_pages
             .store(ordered_buffered_pages, Ordering::Relaxed);
+    }
+
+    fn record_budget_wait(&self, duration: Duration) {
+        Self::saturating_add(&self.budget_wait_count, 1);
+        Self::saturating_add(&self.budget_wait_ms, Self::duration_millis(duration));
+    }
+
+    fn record_handoff_wait(&self, duration: Duration) {
+        Self::saturating_add(&self.handoff_wait_count, 1);
+        Self::saturating_add(&self.handoff_wait_ms, Self::duration_millis(duration));
     }
 }
 
@@ -6294,11 +6389,18 @@ impl StreamingByteLimiter {
     }
 
     fn acquire(&self, requested_bytes: usize) -> Result<usize> {
+        self.acquire_with_wait(requested_bytes)
+            .map(|(reservation, _, _)| reservation)
+    }
+
+    fn acquire_with_wait(&self, requested_bytes: usize) -> Result<(usize, Duration, bool)> {
         if requested_bytes == 0 {
-            return Ok(0);
+            return Ok((0, Duration::ZERO, false));
         }
 
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited = false;
+        let wait_started = Instant::now();
         loop {
             if state.closed {
                 return Err(anyhow::anyhow!(
@@ -6310,9 +6412,11 @@ impl StreamingByteLimiter {
             let reservation = requested_bytes.min(max_bytes_in_flight);
             if state.bytes_in_flight.saturating_add(reservation) <= max_bytes_in_flight {
                 state.bytes_in_flight += reservation;
-                return Ok(reservation);
+                let wait_duration = waited.then(|| wait_started.elapsed()).unwrap_or_default();
+                return Ok((reservation, wait_duration, waited));
             }
 
+            waited = true;
             state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -9328,6 +9432,7 @@ fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
     flow_limiter: &StreamingByteLimiter,
+    producer_telemetry: &LexicalRebuildProducerTelemetry,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
@@ -9400,12 +9505,17 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .map(|packet| packet.message_count)
         .sum::<usize>();
-    let reserved_bytes = flow_limiter.acquire(page_message_bytes).with_context(|| {
-        format!(
-            "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
-            sequence
-        )
-    })?;
+    let (reserved_bytes, budget_wait_duration, waited_for_budget) = flow_limiter
+        .acquire_with_wait(page_message_bytes)
+        .with_context(|| {
+            format!(
+                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
+                sequence
+            )
+        })?;
+    if waited_for_budget {
+        producer_telemetry.record_budget_wait(budget_wait_duration);
+    }
     assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
     let configured_page_size = usize::try_from(work.configured_page_size.max(1))
         .unwrap_or(usize::MAX)
@@ -9427,6 +9537,8 @@ fn prepare_lexical_rebuild_page_work(
         page_messages = page_message_count,
         page_message_bytes,
         reserved_bytes,
+        budget_wait_ms = budget_wait_duration.as_millis() as u64,
+        waited_for_budget,
         batch_fetch_message_limit = work.pipeline_budget.batch_fetch_message_limit,
         batch_fetch_message_bytes_limit = work.pipeline_budget.batch_fetch_message_bytes_limit,
         max_message_bytes_in_flight = work.pipeline_budget.max_message_bytes_in_flight,
@@ -9458,8 +9570,9 @@ fn spawn_lexical_rebuild_page_prep_workers(
     work_rx: Receiver<LexicalRebuildPagePrepWork>,
     result_tx: Sender<LexicalRebuildPagePrepResult>,
     flow_limiter: Arc<StreamingByteLimiter>,
+    producer_telemetry: Arc<LexicalRebuildProducerTelemetry>,
     lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
-) -> Vec<JoinHandle<()>> {
+) -> Result<Vec<JoinHandle<()>>> {
     let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
     (0..worker_count.max(1))
         .map(|worker_idx| {
@@ -9468,6 +9581,7 @@ fn spawn_lexical_rebuild_page_prep_workers(
             let worker_rx = work_rx.clone();
             let worker_result_tx = result_tx.clone();
             let worker_flow_limiter = Arc::clone(&flow_limiter);
+            let worker_producer_telemetry = Arc::clone(&producer_telemetry);
             let worker_pool = lexical_rebuild_worker_pool.clone();
             let worker_dispatch = tracing_dispatch.clone();
             thread::Builder::new()
@@ -9498,6 +9612,7 @@ fn spawn_lexical_rebuild_page_prep_workers(
                                 &mut storage,
                                 worker_source_map.as_ref(),
                                 worker_flow_limiter.as_ref(),
+                                worker_producer_telemetry.as_ref(),
                                 worker_pool.as_deref(),
                                 work,
                             ) {
@@ -9525,8 +9640,8 @@ fn spawn_lexical_rebuild_page_prep_workers(
                         storage.close_best_effort_in_place();
                     });
                 })
-                .unwrap_or_else(|err| {
-                    panic!("failed to spawn lexical rebuild page-prep worker {worker_idx}: {err}")
+                .with_context(|| {
+                    format!("spawning lexical rebuild page-prep worker {worker_idx}")
                 })
         })
         .collect()
@@ -9661,15 +9776,24 @@ fn spawn_lexical_rebuild_packet_producer(
             let (result_tx, result_rx) =
                 bounded::<LexicalRebuildPagePrepResult>(page_prep_worker_count);
             let source_map = Arc::new(source_map);
-            let worker_handles = spawn_lexical_rebuild_page_prep_workers(
+            let worker_handles = match spawn_lexical_rebuild_page_prep_workers(
                 page_prep_worker_count,
                 db_path.clone(),
                 Arc::clone(&source_map),
                 work_rx,
                 result_tx,
                 Arc::clone(&flow_limiter),
+                Arc::clone(&producer_telemetry),
                 lexical_rebuild_worker_pool.clone(),
-            );
+            ) {
+                Ok(handles) => handles,
+                Err(err) => {
+                    send_error(err);
+                    producer_telemetry.record(page_prep_worker_count, 0, 0);
+                    storage.close_best_effort_in_place();
+                    return;
+                }
+            };
             producer_telemetry.record(page_prep_worker_count, 0, 0);
             tracing::info!(
                 page_prep_workers = page_prep_worker_count,
@@ -9889,18 +10013,33 @@ fn spawn_lexical_rebuild_packet_producer(
                             .sum::<usize>();
                         let page_planned_shard_index = prepared_page.planned_shard_index;
                         let page_finishes_planned_shard = prepared_page.finishes_planned_shard;
-                        if tx
-                            .send(LexicalRebuildPipelineMessage::Batch(prepared_page))
-                            .is_err()
-                        {
-                            flow_limiter.release(reserved_bytes);
-                            release_completed_lexical_rebuild_pages(
-                                &mut completed_pages,
-                                flow_limiter.as_ref(),
-                            );
-                            return Err(anyhow::anyhow!(
-                                "lexical rebuild consumer disconnected before ordered page handoff"
-                            ));
+                        match tx.try_send(LexicalRebuildPipelineMessage::Batch(prepared_page)) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(message)) => {
+                                let handoff_wait_started = Instant::now();
+                                if tx.send(message).is_err() {
+                                    flow_limiter.release(reserved_bytes);
+                                    release_completed_lexical_rebuild_pages(
+                                        &mut completed_pages,
+                                        flow_limiter.as_ref(),
+                                    );
+                                    return Err(anyhow::anyhow!(
+                                        "lexical rebuild consumer disconnected before ordered page handoff"
+                                    ));
+                                }
+                                producer_telemetry
+                                    .record_handoff_wait(handoff_wait_started.elapsed());
+                            }
+                            Err(TrySendError::Disconnected(_message)) => {
+                                flow_limiter.release(reserved_bytes);
+                                release_completed_lexical_rebuild_pages(
+                                    &mut completed_pages,
+                                    flow_limiter.as_ref(),
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "lexical rebuild consumer disconnected before ordered page handoff"
+                                ));
+                            }
                         }
                         handoff_conversations_since_budget = handoff_conversations_since_budget
                             .saturating_add(page_handoff_conversations);
@@ -18017,6 +18156,7 @@ mod tests {
             page_prep_workers: 6,
             active_page_prep_jobs: 6,
             ordered_buffered_pages: 1,
+            producer_handoff_wait_count: 1,
             ..LexicalRebuildPipelineRuntimeSnapshot::default()
         };
 
@@ -19859,6 +19999,52 @@ mod tests {
     }
 
     #[test]
+    fn streaming_byte_limiter_acquire_with_wait_reports_capacity_stall() {
+        let limiter = Arc::new(StreamingByteLimiter::new(64));
+        let first = limiter.acquire(64).unwrap();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (result_tx, result_rx) = bounded(1);
+        let waiter = {
+            let limiter = limiter.clone();
+            thread::spawn(move || {
+                ready_tx.send(()).unwrap();
+                let result = limiter.acquire_with_wait(32).unwrap();
+                result_tx.send(result).unwrap();
+            })
+        };
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            result_rx.try_recv().is_err(),
+            "waiter should remain blocked while all byte capacity is reserved"
+        );
+
+        limiter.release(first);
+        let (reserved, _wait_duration, waited) =
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(reserved, 32);
+        assert!(waited, "capacity stall should be reported to telemetry");
+        limiter.release(reserved);
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn lexical_rebuild_pipeline_runtime_snapshot_observes_stall_only_telemetry() {
+        let runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 7,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 3,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+
+        assert!(
+            runtime.is_observed(),
+            "stall counters alone should keep attach/status runtime visible"
+        );
+    }
+
+    #[test]
     fn send_conversation_batches_marks_only_first_batch_as_discovered() {
         let (tx, rx) = bounded(4);
         let convs = vec![
@@ -19950,6 +20136,18 @@ mod tests {
         progress
             .rebuild_pipeline_budget_generation
             .store(1, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_producer_budget_wait_count
+            .store(2, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_producer_budget_wait_ms
+            .store(17, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_producer_handoff_wait_count
+            .store(1, Ordering::Relaxed);
+        progress
+            .rebuild_pipeline_producer_handoff_wait_ms
+            .store(9, Ordering::Relaxed);
         *progress
             .rebuild_pipeline_host_loadavg_1m_milli
             .lock()
@@ -20033,6 +20231,22 @@ mod tests {
         assert_eq!(
             snapshot["rebuild_pipeline"]["budget_generation"],
             serde_json::json!(1)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["producer_budget_wait_count"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["producer_budget_wait_ms"],
+            serde_json::json!(17)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["producer_handoff_wait_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            snapshot["rebuild_pipeline"]["producer_handoff_wait_ms"],
+            serde_json::json!(9)
         );
         assert_eq!(
             snapshot["rebuild_pipeline"]["host_loadavg_1m"],
@@ -24574,6 +24788,10 @@ mod tests {
             active_page_prep_jobs: 2,
             ordered_buffered_pages: 4,
             budget_generation: 1,
+            producer_budget_wait_count: 2,
+            producer_budget_wait_ms: 15,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 7,
             host_loadavg_1m_milli: None,
             controller_mode: "pressure_limited".to_string(),
             controller_reason: "queue_depth_3_reached_pipeline_capacity_3".to_string(),
@@ -24646,6 +24864,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 3,
             budget_generation: 2,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 11,
+            producer_handoff_wait_count: 2,
+            producer_handoff_wait_ms: 22,
             host_loadavg_1m_milli: None,
             controller_mode: "steady".to_string(),
             controller_reason: "first_durable_commit_promoted_steady_budget".to_string(),
@@ -24953,6 +25175,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 3,
             budget_generation: 2,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 11,
+            producer_handoff_wait_count: 2,
+            producer_handoff_wait_ms: 22,
             host_loadavg_1m_milli: None,
             controller_mode: "steady".to_string(),
             controller_reason: "first_durable_commit_promoted_steady_budget".to_string(),
@@ -25041,6 +25267,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 3,
             budget_generation: 2,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 11,
+            producer_handoff_wait_count: 2,
+            producer_handoff_wait_ms: 22,
             host_loadavg_1m_milli: None,
             controller_mode: "steady".to_string(),
             controller_reason: "first_durable_commit_promoted_steady_budget".to_string(),
@@ -25116,6 +25346,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 0,
             budget_generation: 1,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 3,
+            producer_handoff_wait_count: 0,
+            producer_handoff_wait_ms: 0,
             host_loadavg_1m_milli: None,
             controller_mode: "startup".to_string(),
             controller_reason: "seeded-runtime".to_string(),
@@ -25143,6 +25377,10 @@ mod tests {
             active_page_prep_jobs: 2,
             ordered_buffered_pages: 1,
             budget_generation: 2,
+            producer_budget_wait_count: 2,
+            producer_budget_wait_ms: 9,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 5,
             host_loadavg_1m_milli: Some(7_250),
             controller_mode: "pressure_limited".to_string(),
             controller_reason: "queue_depth_3_reached_pipeline_capacity_3".to_string(),
@@ -25202,6 +25440,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 0,
             budget_generation: 1,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 2,
+            producer_handoff_wait_count: 0,
+            producer_handoff_wait_ms: 0,
             host_loadavg_1m_milli: None,
             controller_mode: "startup".to_string(),
             controller_reason: "cached-live-meta".to_string(),
@@ -25289,6 +25531,10 @@ mod tests {
             active_page_prep_jobs: 0,
             ordered_buffered_pages: 0,
             budget_generation: 1,
+            producer_budget_wait_count: 0,
+            producer_budget_wait_ms: 0,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 4,
             host_loadavg_1m_milli: None,
             controller_mode: "steady".to_string(),
             controller_reason: "final-commit".to_string(),
@@ -25373,6 +25619,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 0,
             budget_generation: 1,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 3,
+            producer_handoff_wait_count: 0,
+            producer_handoff_wait_ms: 0,
             host_loadavg_1m_milli: None,
             controller_mode: "startup".to_string(),
             controller_reason: "staged-heartbeat".to_string(),
@@ -25446,6 +25696,10 @@ mod tests {
             active_page_prep_jobs: 1,
             ordered_buffered_pages: 0,
             budget_generation: 1,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 3,
+            producer_handoff_wait_count: 0,
+            producer_handoff_wait_ms: 0,
             host_loadavg_1m_milli: None,
             controller_mode: "startup".to_string(),
             controller_reason: "seeded-runtime".to_string(),
@@ -25473,6 +25727,10 @@ mod tests {
             active_page_prep_jobs: 0,
             ordered_buffered_pages: 0,
             budget_generation: 2,
+            producer_budget_wait_count: 1,
+            producer_budget_wait_ms: 3,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 5,
             host_loadavg_1m_milli: Some(4_250),
             controller_mode: "merge_tail".to_string(),
             controller_reason: "draining_eager_merges".to_string(),

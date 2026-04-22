@@ -979,6 +979,7 @@ dependencies = [
  "indicatif",
  "insta",
  "itertools 0.14.0",
+ "itoa",
  "lru 0.16.4",
  "memmap2",
  "mime_guess",
