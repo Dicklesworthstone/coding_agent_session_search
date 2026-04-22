@@ -14737,12 +14737,12 @@ mod tests {
             .into_iter()
             .find(|bundle| bundle.root_path == backup_db)
             .unwrap();
-        let first_row_id: i64 = rusqlite::Connection::open(&backup_db)
+        let first_row_id: i64 = FrankenConnection::open(backup_db.to_string_lossy().into_owned())
             .unwrap()
-            .query_row(
+            .query_row_map(
                 "SELECT id FROM conversations WHERE source_path = ?1",
-                ["/tmp/one.jsonl"],
-                |row| row.get(0),
+                fparams!["/tmp/one.jsonl"],
+                |row| row.get_typed(0),
             )
             .unwrap();
         storage
@@ -15442,13 +15442,15 @@ mod tests {
         assert_eq!(outcome.conversations_imported, 1);
         assert_eq!(outcome.messages_imported, 1);
 
-        let readonly = rusqlite::Connection::open_with_flags(
-            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        let readonly = open_franken_with_flags(
+            &canonical_db.to_string_lossy(),
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
         let readonly_message_count: i64 = readonly
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(readonly_message_count, 1);
 
@@ -15491,16 +15493,16 @@ mod tests {
             .unwrap();
         assert_eq!(salvage_keys.len(), 1);
 
-        let reopened_readonly = rusqlite::Connection::open_with_flags(
-            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        let reopened_readonly = open_franken_with_flags(
+            &canonical_db.to_string_lossy(),
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
         let reopened_fts_entries: i64 = reopened_readonly
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
-                [],
-                |row| row.get(0),
+                fparams![],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(
@@ -15508,7 +15510,9 @@ mod tests {
             "seeded canonical db should keep a single stock-SQLite fts_messages schema row"
         );
         let reopened_message_count: i64 = reopened_readonly
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(reopened_message_count, 1);
 
@@ -15604,12 +15608,9 @@ mod tests {
             .unwrap();
         drop(source);
 
-        let legacy = rusqlite::Connection::open(&source_db).unwrap();
+        let legacy = FrankenConnection::open(source_db.to_string_lossy().into_owned()).unwrap();
         legacy
-            .execute(
-                "UPDATE meta SET value = '12' WHERE key = 'schema_version'",
-                [],
-            )
+            .execute("UPDATE meta SET value = '12' WHERE key = 'schema_version'")
             .unwrap();
         drop(legacy);
 
@@ -15640,13 +15641,15 @@ mod tests {
             .unwrap();
         assert_eq!(conversation_count, 0);
 
-        let readonly = rusqlite::Connection::open_with_flags(
-            format!("file:{}?mode=ro&immutable=1", canonical_db.display()),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        let readonly = open_franken_with_flags(
+            &canonical_db.to_string_lossy(),
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
         let readonly_conversation_count: i64 = readonly
-            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+            .query_row_map("SELECT COUNT(*) FROM conversations", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
         assert_eq!(readonly_conversation_count, 0);
     }
@@ -16616,7 +16619,7 @@ mod tests {
         let backups_dir = dir.path().join("backups");
         fs::create_dir_all(&backups_dir).unwrap();
         let smaller_healthy = backups_dir.join("agent_search.db.20260322T020200.bak");
-        let conn = rusqlite::Connection::open(&smaller_healthy).unwrap();
+        let conn = FrankenConnection::open(smaller_healthy.to_string_lossy().into_owned()).unwrap();
         conn.execute_batch(
             "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT);
              CREATE TABLE messages (
@@ -16865,14 +16868,16 @@ mod tests {
 
         rebuild_fts_via_rusqlite(&db_path).unwrap();
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let conversation_id: i64 = conn
-            .query_row("SELECT id FROM conversations LIMIT 1", [], |row| row.get(0))
+            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
             .unwrap();
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
              VALUES(2, ?1, 1, 'assistant', 'assistant', 1700000000060, 'authentication catchup', NULL, NULL)",
-            rusqlite::params![conversation_id],
+            fparams![conversation_id],
         )
         .unwrap();
         drop(conn);
@@ -16886,12 +16891,12 @@ mod tests {
             }
         );
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let auth_hits: i64 = conn
-            .query_row(
+            .query_row_map(
                 "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'authentication'",
-                [],
-                |row| row.get(0),
+                fparams![],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(auth_hits, 1);
@@ -18250,7 +18255,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_transition_with_fts.db");
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES('schema_version', '13');
@@ -18284,7 +18289,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test_open_legacy_v13_with_fts.db");
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute_batch(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES('schema_version', '13');
