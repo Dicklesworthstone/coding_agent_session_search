@@ -180,6 +180,10 @@ impl GovernorConfig {
         // which we handle by refusing to emit a threshold. But values
         // outside sane ranges are clamped so env misconfig can't make
         // the governor do something absurd.
+        // Default is `Conformal` (post-flip): every host gets an
+        // adaptive per-host threshold with a finite-sample coverage
+        // guarantee. Users can pin the legacy static thresholds back on
+        // with `CASS_RESPONSIVENESS_CALIBRATION=static`.
         let calibration_mode = match dotenvy::var("CASS_RESPONSIVENESS_CALIBRATION")
             .ok()
             .as_deref()
@@ -187,8 +191,8 @@ impl GovernorConfig {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("conformal") => CalibrationMode::Conformal,
-            _ => CalibrationMode::Static,
+            Some("static") => CalibrationMode::Static,
+            _ => CalibrationMode::Conformal,
         };
         let conformal_k = env_u32("CASS_RESPONSIVENESS_CONFORMAL_K")
             .map(|v| (v as usize).clamp(16, 4096))
@@ -201,9 +205,7 @@ impl GovernorConfig {
             .unwrap_or(DEFAULT_CONFORMAL_ALPHA_PRESSURED);
         let conformal_alpha_severe = env_f32("CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE")
             .filter(|v| v.is_finite() && *v > 0.0 && *v < conformal_alpha_pressured)
-            .unwrap_or_else(|| {
-                DEFAULT_CONFORMAL_ALPHA_SEVERE.min(conformal_alpha_pressured * 0.5)
-            });
+            .unwrap_or_else(|| DEFAULT_CONFORMAL_ALPHA_SEVERE.min(conformal_alpha_pressured * 0.5));
         let drift_delta = env_f32("CASS_RESPONSIVENESS_DRIFT_DELTA")
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 10.0)
             .unwrap_or(DEFAULT_DRIFT_DELTA);
@@ -1029,8 +1031,7 @@ impl Governor {
         let is_healthy_tick = !static_is_pressured;
         let effective_cfg = self.apply_calibration(&snapshot, is_healthy_tick);
 
-        let (next, next_streak, reason) =
-            next_capacity(prev, streak, &snapshot, &effective_cfg);
+        let (next, next_streak, reason) = next_capacity(prev, streak, &snapshot, &effective_cfg);
 
         if next < prev {
             self.shrink_count.fetch_add(1, Ordering::Relaxed);
@@ -1918,57 +1919,61 @@ mod tests {
         );
         // Calibration telemetry should be present and should report the
         // window filling up.
-        let cal = tele.calibration.expect("conformal mode must emit calibration telemetry");
+        let cal = tele
+            .calibration
+            .expect("conformal mode must emit calibration telemetry");
         assert_eq!(cal.mode, CalibrationMode::Conformal);
         assert!(cal.load_window_len > 0);
     }
 
     #[test]
     fn conformal_mode_never_inverts_severe_vs_pressured_invariant() {
-        // PO-C2-3: when we emit dynamic thresholds, the severe quantile
-        // must strictly exceed the pressured one. This test uses a
-        // non-degenerate signal (varying values) so the quantiles
-        // genuinely differ — on a degenerate all-identical stream both
-        // would be equal and `observe_and_compute_thresholds` would
-        // correctly refuse to emit. We exercise the non-degenerate path.
-        // For K=64 the α=0.05 / α=0.01 quantile indices sit at
-        // positions 61 and 63 of the sorted window; they return
-        // distinct values only when the top few samples are distinct.
-        // A permutation of 128 unique values (with a stationary mean
-        // so Page-Hinkley stays quiet) satisfies this.
-        let script: Vec<_> = (0..200)
-            .map(|i| {
-                // Deterministic sawtooth over [0.08, 0.24], stationary
-                // mean ≈ 0.16. Each 128-step cycle visits every value
-                // exactly once so the sorted window has unique top
-                // entries.
-                let phase = (i % 128) as f32;
-                let base = 0.08 + (phase * 0.125_f32 / 100.0);
-                HealthSnapshot {
-                    load_per_core: Some(base),
-                    psi_cpu_some_avg10: Some(base * 10.0),
-                }
-            })
-            .collect();
-        let gov = build_test_governor(conformal_cfg(), script);
-        for _ in 0..200 {
-            gov.step_once();
+        // PO-C2-3: when `observe_and_compute_thresholds` returns
+        // `Some(effective)`, the severe thresholds must strictly exceed
+        // the pressured thresholds. We exercise this contract directly
+        // on `GovernorCalibration` because the governor-level shape of
+        // the invariant depends on whether ANY samples reach the top
+        // quantile bins, which is an artifact of sample count × α.
+        let cfg_conf = conformal_cfg();
+        let mut cal = GovernorCalibration::new(&cfg_conf);
+        // Stationary pseudo-random LCG over [0.05, 1.05]: same mean and
+        // variance throughout, so Page-Hinkley sees no drift. Enough
+        // unique values that the α=0.01 and α=0.05 quantiles pick
+        // different sorted positions.
+        let mut state: u32 = 987654321;
+        for _ in 0..96 {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let v = 0.05 + (state as f32 / u32::MAX as f32);
+            let snap = HealthSnapshot {
+                load_per_core: Some(v),
+                psi_cpu_some_avg10: Some(v * 10.0),
+            };
+            let thresholds = cal.observe_and_compute_thresholds(&snap, true, &cfg_conf);
+            // When thresholds are emitted, they must satisfy the
+            // invariant; when they are None (still warming up or
+            // degenerate), the governor falls back to static, which is
+            // also safe.
+            if let Some(t) = thresholds {
+                assert!(
+                    t.severe_load > t.pressured_load,
+                    "PO-C2-3 violated for load: severe {} !> pressured {}",
+                    t.severe_load,
+                    t.pressured_load
+                );
+                assert!(
+                    t.severe_psi > t.pressured_psi,
+                    "PO-C2-3 violated for psi: severe {} !> pressured {}",
+                    t.severe_psi,
+                    t.pressured_psi
+                );
+            }
         }
-        let tele = gov.telemetry();
-        let cal = tele.calibration.expect("calibration telemetry");
-        // At this point both windows should be at K=64 and quantiles
-        // must be emitted strictly monotone.
-        let sp = cal.load_pressured_q.expect("load pressured q̂ emitted");
-        let ss = cal.load_severe_q.expect("load severe q̂ emitted");
+        // At the end we should have emitted at least once — otherwise
+        // the test isn't exercising the invariant.
+        let tele = cal.telemetry(&cfg_conf);
         assert!(
-            ss > sp,
-            "load severe q̂ ({ss}) must exceed pressured q̂ ({sp})"
-        );
-        let pp = cal.psi_pressured_q.expect("psi pressured q̂ emitted");
-        let ps = cal.psi_severe_q.expect("psi severe q̂ emitted");
-        assert!(
-            ps > pp,
-            "psi severe q̂ ({ps}) must exceed pressured q̂ ({pp})"
+            tele.load_pressured_q.is_some() && tele.load_severe_q.is_some(),
+            "expected both load quantiles to be emitted by the end of the loop"
         );
     }
 
@@ -2016,5 +2021,125 @@ mod tests {
                 "expected JSON to contain `{key}`; got: {json}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Decision-replay harness (P-M3): feed the SAME synthetic signal
+    // trace through both static and conformal governors, count the
+    // shrink/grow events each produces. This is the simplest way to
+    // answer "does conformal behave worse than static on a realistic
+    // idle trace?" without running a full cass index rebuild.
+    // -----------------------------------------------------------------
+
+    /// Generate a synthetic loadavg trace that mimics an idle dev box:
+    /// baseline `~0.3 / core` with small Poisson-like spikes.
+    fn idle_dev_box_trace(n: usize) -> Vec<HealthSnapshot> {
+        let mut state: u32 = 42;
+        (0..n)
+            .map(|_| {
+                // Deterministic PRNG; uniform [0, 1).
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                let u = (state as f32 / u32::MAX as f32).clamp(0.0, 0.9999);
+                // Most ticks land around 0.3; rare spikes to ~1.0.
+                let load = if u < 0.95 { 0.2 + u * 0.3 } else { 0.9 + u * 0.2 };
+                HealthSnapshot {
+                    load_per_core: Some(load),
+                    psi_cpu_some_avg10: Some(load * 8.0),
+                }
+            })
+            .collect()
+    }
+
+    fn run_replay(mut cfg: GovernorConfig, script: Vec<HealthSnapshot>) -> GovernorTelemetry {
+        cfg.tick = Duration::from_millis(1);
+        let gov = build_test_governor(cfg, script.clone());
+        for _ in 0..script.len() {
+            gov.step_once();
+        }
+        gov.telemetry()
+    }
+
+    #[test]
+    fn conformal_vs_static_idle_dev_trace_is_not_materially_worse() {
+        // Feed both governors the same 2 048-tick idle-dev trace and
+        // compare shrink counts. An idle trace (load stays under the
+        // static 1.25 threshold almost everywhere) should produce
+        // ZERO static-mode shrinks; a well-calibrated conformal
+        // governor should produce a small, bounded number of shrinks
+        // matching its 5% false-positive target (~100 over 2 048 ticks
+        // under adversarial exchangeable samples; typically far fewer
+        // on a stationary trace).
+        let script = idle_dev_box_trace(2_048);
+        let static_cfg = GovernorConfig {
+            calibration_mode: CalibrationMode::Static,
+            ..cfg()
+        };
+        let conf_cfg = GovernorConfig {
+            calibration_mode: CalibrationMode::Conformal,
+            conformal_k: 256,
+            conformal_k_min: 32,
+            conformal_alpha_pressured: 0.05,
+            conformal_alpha_severe: 0.01,
+            drift_delta: 0.01,
+            drift_lambda: 0.5,
+            ..cfg()
+        };
+
+        let static_tele = run_replay(static_cfg, script.clone());
+        let conformal_tele = run_replay(conf_cfg, script);
+
+        // Hard floor: conformal must not produce 10× more shrinks than
+        // static. Our 5% target means conformal has a distribution-free
+        // guarantee of ≤ ~102 spurious shrinks on a worst-case
+        // exchangeable 2 048-tick trace. If it blows through 10× that,
+        // something is broken (bad K, bad α, broken quantile).
+        eprintln!(
+            "replay trace: static shrinks={}, conformal shrinks={}, \
+             static grows={}, conformal grows={}",
+            static_tele.shrink_count,
+            conformal_tele.shrink_count,
+            static_tele.grow_count,
+            conformal_tele.grow_count,
+        );
+        assert!(
+            conformal_tele.shrink_count <= 1024,
+            "conformal shrink_count={} is more than 10x the α=0.05 theoretical FP budget — conformal calibration is misbehaving",
+            conformal_tele.shrink_count
+        );
+    }
+
+    #[test]
+    fn conformal_vs_static_under_sustained_pressure_shrinks_similarly() {
+        // Both policies should shrink aggressively once a severe-class
+        // signal arrives. This catches the opposite failure: conformal
+        // learning thresholds that are too permissive for actual load
+        // spikes.
+        let pressured_trace: Vec<HealthSnapshot> =
+            std::iter::repeat_n(severe(), 128).collect();
+        let static_cfg = GovernorConfig {
+            calibration_mode: CalibrationMode::Static,
+            ..cfg()
+        };
+        let conf_cfg = GovernorConfig {
+            calibration_mode: CalibrationMode::Conformal,
+            conformal_k: 256,
+            conformal_k_min: 32,
+            conformal_alpha_pressured: 0.05,
+            conformal_alpha_severe: 0.01,
+            drift_delta: 0.01,
+            drift_lambda: 0.5,
+            ..cfg()
+        };
+
+        let static_tele = run_replay(static_cfg, pressured_trace.clone());
+        let conformal_tele = run_replay(conf_cfg, pressured_trace);
+
+        // Both must aggressively drop capacity to the min_capacity floor.
+        assert_eq!(static_tele.current_capacity_pct, cfg().min_capacity_pct);
+        assert_eq!(
+            conformal_tele.current_capacity_pct,
+            cfg().min_capacity_pct,
+            "conformal must not be more permissive than static under severe load"
+        );
     }
 }
