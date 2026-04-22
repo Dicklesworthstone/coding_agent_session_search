@@ -4985,7 +4985,8 @@ fn repair_fallback_fts_after_full_index_run(
     })?;
 
     if let Some(archive_fingerprint) = known_archive_fingerprint
-        && fresh_storage.fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
+        && fresh_storage
+            .fallback_fts_is_known_healthy_for_archive_fingerprint(archive_fingerprint)?
     {
         return Ok(Some(
             FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {

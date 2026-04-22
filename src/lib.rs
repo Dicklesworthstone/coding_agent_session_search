@@ -25674,18 +25674,13 @@ mod subcommand_robot_output_tests {
         run_on_large_stack(|| {
             let cli = match Cli::try_parse_from(["cass", "search", "needle", "--json"]) {
                 Ok(cli) => cli,
-                Err(err) => {
-                    assert!(false, "parse search command: {err}");
-                    return;
-                }
+                Err(err) => panic!("parse search command: {err}"),
             };
             let Some(command) = cli.command.as_ref() else {
-                assert!(false, "parsed search command should include command");
-                return;
+                panic!("parsed search command should include command");
             };
-            let Some(Commands::Search { mode, .. }) = cli.command.as_ref() else {
-                assert!(matches!(command, Commands::Search { .. }));
-                return;
+            let Commands::Search { mode, .. } = command else {
+                panic!("expected search command, got {command:?}");
             };
 
             assert!(mode.is_none(), "absent --mode should remain inspectable");

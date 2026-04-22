@@ -2041,7 +2041,11 @@ mod tests {
                 state = state.wrapping_mul(1103515245).wrapping_add(12345);
                 let u = (state as f32 / u32::MAX as f32).clamp(0.0, 0.9999);
                 // Most ticks land around 0.3; rare spikes to ~1.0.
-                let load = if u < 0.95 { 0.2 + u * 0.3 } else { 0.9 + u * 0.2 };
+                let load = if u < 0.95 {
+                    0.2 + u * 0.3
+                } else {
+                    0.9 + u * 0.2
+                };
                 HealthSnapshot {
                     load_per_core: Some(load),
                     psi_cpu_some_avg10: Some(load * 8.0),
@@ -2114,8 +2118,7 @@ mod tests {
         // signal arrives. This catches the opposite failure: conformal
         // learning thresholds that are too permissive for actual load
         // spikes.
-        let pressured_trace: Vec<HealthSnapshot> =
-            std::iter::repeat_n(severe(), 128).collect();
+        let pressured_trace: Vec<HealthSnapshot> = std::iter::repeat_n(severe(), 128).collect();
         let static_cfg = GovernorConfig {
             calibration_mode: CalibrationMode::Static,
             ..cfg()
