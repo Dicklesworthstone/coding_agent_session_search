@@ -28,13 +28,21 @@ pub const CODE_HEAD_LINES: usize = 20;
 /// Maximum lines to keep from the end of a code block.
 pub const CODE_TAIL_LINES: usize = 10;
 
+thread_local! {
+    /// Per-thread cached canonicalizer. DefaultCanonicalizer is a stateless
+    /// POD (three `usize` fields), so the cost of `Default::default()` per
+    /// call was pure overhead; caching it also gives a clean injection point
+    /// for future input-length short-circuiting.
+    static CANONICALIZER: DefaultCanonicalizer = DefaultCanonicalizer::default();
+}
+
 /// Canonicalize text for embedding.
 ///
 /// Applies the full preprocessing pipeline to produce clean, consistent text
 /// suitable for embedding. The output is deterministic: the same visual input
 /// always produces the same output.
 pub fn canonicalize_for_embedding(text: &str) -> String {
-    DefaultCanonicalizer::default().canonicalize(text)
+    CANONICALIZER.with(|c| c.canonicalize(text))
 }
 
 /// Compute SHA256 content hash of text.
