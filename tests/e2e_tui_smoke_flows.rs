@@ -135,6 +135,12 @@ fn rendered_contains_hello_fixture_detail(rendered: &str) -> bool {
     rendered.to_ascii_lowercase().contains("hi there, how can")
 }
 
+fn rendered_contains_auth_fixture_result(rendered: &str) -> bool {
+    rendered
+        .to_ascii_lowercase()
+        .contains("i found several authentication issues")
+}
+
 /// Save output as artifact
 fn save_artifact(name: &str, trace: &str, content: &[u8]) -> PathBuf {
     let dir = artifact_dir();
@@ -668,12 +674,17 @@ fn tui_pty_search_detail_and_quit_flow() {
     drop(pair);
     let _ = reader_handle.join();
     let raw = captured.lock().expect("capture lock").clone();
+    let rendered = strip_terminal_control_sequences(&raw);
+    let saw_messages_detail = rendered_contains_detail_messages_marker(&rendered);
+    let saw_fixture_result_content = rendered_contains_auth_fixture_result(&rendered);
     save_artifact("pty_search_detail_output.raw", &trace, &raw);
     let summary = serde_json::json!({
         "trace_id": trace,
         "test": "tui_pty_search_detail_and_quit_flow",
         "saw_detail_growth": saw_detail,
         "esc_presses_to_exit": esc_presses,
+        "saw_messages_detail": saw_messages_detail,
+        "saw_fixture_result_content": saw_fixture_result_content,
         "captured_bytes": raw.len(),
     });
     save_artifact(
@@ -682,6 +693,14 @@ fn tui_pty_search_detail_and_quit_flow() {
         serde_json::to_string_pretty(&summary)
             .expect("serialize search-detail summary")
             .as_bytes(),
+    );
+    assert!(
+        saw_messages_detail,
+        "Expected PTY capture to include Detail [Messages] marker after v drill-in"
+    );
+    assert!(
+        saw_fixture_result_content,
+        "Expected PTY capture to include rendered fixture hit content"
     );
     assert!(
         !raw.is_empty(),
