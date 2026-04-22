@@ -6916,12 +6916,27 @@ mod tests {
                 optimized, reference,
                 "fixture {idx} produced divergent doc_id; byte-exact dedup key is a contract"
             );
-            assert_eq!(
-                optimized.matches('\u{1f}').count(),
-                6,
-                "fixture {idx} must contain exactly six 0x1F separators; got {optimized:?}"
-            );
         }
+
+        // Separate structural probe: on a fixture that does NOT embed 0x1F
+        // inside any field, the separator count must be exactly six. This
+        // catches accidental sep drops while tolerating the "embedded
+        // separator" fixture above (which inflates the count legitimately).
+        let structural_key = SearchHitKey {
+            source_id: "clean".into(),
+            source_path: "/no/separators/here.jsonl".into(),
+            conversation_id: Some(1),
+            title: "plain title".into(),
+            line_number: Some(2),
+            created_at: Some(3),
+            content_hash: 4,
+        };
+        let encoded = search_hit_key_doc_id(&structural_key);
+        assert_eq!(
+            encoded.matches('\u{1f}').count(),
+            6,
+            "structural fixture must contain exactly six 0x1F separators; got {encoded:?}"
+        );
     }
 
     #[derive(Debug)]
