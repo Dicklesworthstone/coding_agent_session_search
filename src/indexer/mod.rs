@@ -1142,6 +1142,7 @@ fn refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
     responsiveness_controller: &mut LexicalRebuildResponsivenessController,
     pipeline_budget_controller: &LexicalRebuildPipelineBudgetController,
     current_batch_conversation_limit: &mut usize,
+    active_commit_intervals: Option<(&mut usize, &mut usize, &mut usize)>,
     sink_runtime: LexicalRebuildPipelineSinkRuntimeSnapshot,
 ) {
     refresh_lexical_rebuild_pipeline_runtime(
@@ -1160,6 +1161,7 @@ fn refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
             flow_limiter,
             pipeline_budget_controller,
             current_batch_conversation_limit,
+            active_commit_intervals,
         );
         refresh_lexical_rebuild_pipeline_runtime(
             latest_runtime,
@@ -4470,20 +4472,30 @@ struct LexicalRebuildPipelineBudgetSnapshot {
     batch_fetch_message_limit: usize,
     batch_fetch_message_bytes_limit: usize,
     max_message_bytes_in_flight: usize,
+    commit_interval_conversations: usize,
+    commit_interval_messages: usize,
+    commit_interval_message_bytes: usize,
 }
 
 impl LexicalRebuildPipelineBudgetSnapshot {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         page_conversation_limit: usize,
         batch_fetch_message_limit: usize,
         batch_fetch_message_bytes_limit: usize,
         max_message_bytes_in_flight: usize,
+        commit_interval_conversations: usize,
+        commit_interval_messages: usize,
+        commit_interval_message_bytes: usize,
     ) -> Self {
         Self {
             page_conversation_limit: page_conversation_limit.max(1),
             batch_fetch_message_limit: batch_fetch_message_limit.max(1),
             batch_fetch_message_bytes_limit: batch_fetch_message_bytes_limit.max(1),
             max_message_bytes_in_flight: max_message_bytes_in_flight.max(1),
+            commit_interval_conversations: commit_interval_conversations.max(1),
+            commit_interval_messages: commit_interval_messages.max(1),
+            commit_interval_message_bytes: commit_interval_message_bytes.max(1),
         }
     }
 }
@@ -4494,6 +4506,9 @@ struct LexicalRebuildPipelineBudgetController {
     batch_fetch_message_limit: AtomicUsize,
     batch_fetch_message_bytes_limit: AtomicUsize,
     max_message_bytes_in_flight: AtomicUsize,
+    commit_interval_conversations: AtomicUsize,
+    commit_interval_messages: AtomicUsize,
+    commit_interval_message_bytes: AtomicUsize,
     generation: AtomicUsize,
     generation_lock: Mutex<usize>,
     generation_cv: Condvar,
@@ -4508,6 +4523,9 @@ impl LexicalRebuildPipelineBudgetController {
                 snapshot.batch_fetch_message_bytes_limit,
             ),
             max_message_bytes_in_flight: AtomicUsize::new(snapshot.max_message_bytes_in_flight),
+            commit_interval_conversations: AtomicUsize::new(snapshot.commit_interval_conversations),
+            commit_interval_messages: AtomicUsize::new(snapshot.commit_interval_messages),
+            commit_interval_message_bytes: AtomicUsize::new(snapshot.commit_interval_message_bytes),
             generation: AtomicUsize::new(0),
             generation_lock: Mutex::new(0),
             generation_cv: Condvar::new(),
@@ -4522,6 +4540,13 @@ impl LexicalRebuildPipelineBudgetController {
                 .batch_fetch_message_bytes_limit
                 .load(Ordering::Relaxed),
             max_message_bytes_in_flight: self.max_message_bytes_in_flight.load(Ordering::Relaxed),
+            commit_interval_conversations: self
+                .commit_interval_conversations
+                .load(Ordering::Relaxed),
+            commit_interval_messages: self.commit_interval_messages.load(Ordering::Relaxed),
+            commit_interval_message_bytes: self
+                .commit_interval_message_bytes
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -4538,6 +4563,12 @@ impl LexicalRebuildPipelineBudgetController {
             .store(snapshot.batch_fetch_message_bytes_limit, Ordering::Relaxed);
         self.max_message_bytes_in_flight
             .store(snapshot.max_message_bytes_in_flight, Ordering::Relaxed);
+        self.commit_interval_conversations
+            .store(snapshot.commit_interval_conversations, Ordering::Relaxed);
+        self.commit_interval_messages
+            .store(snapshot.commit_interval_messages, Ordering::Relaxed);
+        self.commit_interval_message_bytes
+            .store(snapshot.commit_interval_message_bytes, Ordering::Relaxed);
         let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let mut guard = self
             .generation_lock
@@ -4651,6 +4682,9 @@ fn lexical_rebuild_runtime_pipeline_budget_snapshot(
     batch_fetch_message_limit: usize,
     batch_fetch_message_bytes_limit: usize,
     pipeline_channel_size: usize,
+    commit_interval_conversations: usize,
+    commit_interval_messages: usize,
+    commit_interval_message_bytes: usize,
 ) -> LexicalRebuildPipelineBudgetSnapshot {
     let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
     LexicalRebuildPipelineBudgetSnapshot::new(
@@ -4661,6 +4695,9 @@ fn lexical_rebuild_runtime_pipeline_budget_snapshot(
             batch_fetch_message_bytes_limit,
             pipeline_channel_size,
         ),
+        commit_interval_conversations,
+        commit_interval_messages,
+        commit_interval_message_bytes,
     )
 }
 
@@ -4758,10 +4795,21 @@ fn apply_lexical_rebuild_budget_transition(
     flow_limiter: &StreamingByteLimiter,
     pipeline_budget_controller: &LexicalRebuildPipelineBudgetController,
     current_batch_conversation_limit: &mut usize,
+    active_commit_intervals: Option<(&mut usize, &mut usize, &mut usize)>,
 ) {
     flow_limiter.update_max_bytes_in_flight(transition.new_budget.max_message_bytes_in_flight);
     pipeline_budget_controller.update(transition.new_budget);
     *current_batch_conversation_limit = transition.new_budget.page_conversation_limit;
+    if let Some((
+        commit_interval_conversations,
+        commit_interval_messages,
+        commit_interval_message_bytes,
+    )) = active_commit_intervals
+    {
+        *commit_interval_conversations = transition.new_budget.commit_interval_conversations;
+        *commit_interval_messages = transition.new_budget.commit_interval_messages;
+        *commit_interval_message_bytes = transition.new_budget.commit_interval_message_bytes;
+    }
     tracing::info!(
         controller_mode = transition.mode,
         controller_reason = %transition.reason,
@@ -4773,6 +4821,16 @@ fn apply_lexical_rebuild_budget_transition(
         new_batch_fetch_message_bytes_limit = transition.new_budget.batch_fetch_message_bytes_limit,
         old_max_message_bytes_in_flight = transition.old_budget.max_message_bytes_in_flight,
         new_max_message_bytes_in_flight = transition.new_budget.max_message_bytes_in_flight,
+        old_commit_interval_conversations =
+            transition.old_budget.commit_interval_conversations,
+        new_commit_interval_conversations =
+            transition.new_budget.commit_interval_conversations,
+        old_commit_interval_messages = transition.old_budget.commit_interval_messages,
+        new_commit_interval_messages = transition.new_budget.commit_interval_messages,
+        old_commit_interval_message_bytes =
+            transition.old_budget.commit_interval_message_bytes,
+        new_commit_interval_message_bytes =
+            transition.new_budget.commit_interval_message_bytes,
         "updated lexical rebuild pipeline budgets"
     );
 }
@@ -10145,6 +10203,11 @@ fn spawn_lexical_rebuild_packet_producer(
                                     pipeline_budget.batch_fetch_message_bytes_limit,
                                 max_message_bytes_in_flight =
                                     pipeline_budget.max_message_bytes_in_flight,
+                                commit_interval_conversations =
+                                    pipeline_budget.commit_interval_conversations,
+                                commit_interval_messages = pipeline_budget.commit_interval_messages,
+                                commit_interval_message_bytes =
+                                    pipeline_budget.commit_interval_message_bytes,
                                 "lexical rebuild producer adopted pipeline budgets"
                             );
                             last_logged_budget = Some(pipeline_budget);
@@ -10849,6 +10912,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 responsiveness_controller,
                 pipeline_budget_controller.as_ref(),
                 current_batch_conversation_limit,
+                None,
                 LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                     pipeline_rx.len(),
                     pending_batch_conversations,
@@ -10974,6 +11038,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                         lexical_rebuild_flow_limiter.as_ref(),
                         pipeline_budget_controller.as_ref(),
                         current_batch_conversation_limit,
+                        None,
                     );
                     force_progress_persist = true;
                 }
@@ -11544,6 +11609,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &mut responsiveness_controller,
         pipeline_budget_controller.as_ref(),
         &mut current_batch_conversation_limit,
+        None,
         LexicalRebuildPipelineSinkRuntimeSnapshot::new(0, 0, 0),
     );
     maybe_persist_staged_lexical_rebuild_progress(
@@ -11821,19 +11887,34 @@ fn rebuild_tantivy_from_db_with_options(
     let rebuild_profile_started = perf_profile.as_ref().map(|_| Instant::now());
 
     let pipeline_channel_size = lexical_rebuild_pipeline_channel_size();
+    let startup_commit_interval_conversations =
+        lexical_rebuild_initial_commit_interval_conversations()
+            .min(lexical_rebuild_commit_interval_conversations());
+    let startup_commit_interval_messages = lexical_rebuild_initial_commit_interval_messages()
+        .min(lexical_rebuild_commit_interval_messages());
+    let startup_commit_interval_message_bytes =
+        lexical_rebuild_initial_commit_interval_message_bytes()
+            .min(lexical_rebuild_commit_interval_message_bytes());
+    let steady_commit_interval_conversations = lexical_rebuild_commit_interval_conversations();
+    let steady_commit_interval_messages = lexical_rebuild_commit_interval_messages();
+    let steady_commit_interval_message_bytes = lexical_rebuild_commit_interval_message_bytes();
     let startup_pipeline_budget = lexical_rebuild_runtime_pipeline_budget_snapshot(
         initial_batch_conversation_limit,
-        lexical_rebuild_initial_commit_interval_messages()
-            .min(lexical_rebuild_commit_interval_messages()),
-        lexical_rebuild_initial_commit_interval_message_bytes()
-            .min(lexical_rebuild_commit_interval_message_bytes()),
+        startup_commit_interval_messages,
+        startup_commit_interval_message_bytes,
         pipeline_channel_size,
+        startup_commit_interval_conversations,
+        startup_commit_interval_messages,
+        startup_commit_interval_message_bytes,
     );
     let steady_pipeline_budget = lexical_rebuild_runtime_pipeline_budget_snapshot(
         batch_conversation_limit,
-        lexical_rebuild_commit_interval_messages(),
-        lexical_rebuild_commit_interval_message_bytes(),
+        steady_commit_interval_messages,
+        steady_commit_interval_message_bytes,
         pipeline_channel_size,
+        steady_commit_interval_conversations,
+        steady_commit_interval_messages,
+        steady_commit_interval_message_bytes,
     );
     let controller_policy = lexical_rebuild_responsiveness_policy();
     let available_parallelism = pipeline_settings.available_parallelism;
@@ -11864,6 +11945,10 @@ fn rebuild_tantivy_from_db_with_options(
     let mut current_batch_conversation_limit = responsiveness_controller
         .current_budget()
         .page_conversation_limit;
+    let current_budget = responsiveness_controller.current_budget();
+    commit_interval_conversations = current_budget.commit_interval_conversations;
+    commit_interval_messages = current_budget.commit_interval_messages;
+    commit_interval_message_bytes = current_budget.commit_interval_message_bytes;
     let first_budget_promotion_commit_thresholds = responsiveness_controller
         .waits_for_first_durable_commit()
         .then_some((
@@ -11888,6 +11973,11 @@ fn rebuild_tantivy_from_db_with_options(
         &mut responsiveness_controller,
         pipeline_budget_controller.as_ref(),
         &mut current_batch_conversation_limit,
+        Some((
+            &mut commit_interval_conversations,
+            &mut commit_interval_messages,
+            &mut commit_interval_message_bytes,
+        )),
         LexicalRebuildPipelineSinkRuntimeSnapshot::new(0, 0, 0),
     );
     let lexical_rebuild_worker_pool = lexical_rebuild_worker_pool.map(Arc::new);
@@ -12105,6 +12195,11 @@ fn rebuild_tantivy_from_db_with_options(
                     &mut responsiveness_controller,
                     pipeline_budget_controller.as_ref(),
                     &mut current_batch_conversation_limit,
+                    Some((
+                        &mut commit_interval_conversations,
+                        &mut commit_interval_messages,
+                        &mut commit_interval_message_bytes,
+                    )),
                     LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                         pipeline_rx.len(),
                         pending_batch.len(),
@@ -12136,6 +12231,11 @@ fn rebuild_tantivy_from_db_with_options(
                         &mut responsiveness_controller,
                         pipeline_budget_controller.as_ref(),
                         &mut current_batch_conversation_limit,
+                        Some((
+                            &mut commit_interval_conversations,
+                            &mut commit_interval_messages,
+                            &mut commit_interval_message_bytes,
+                        )),
                         LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                             pipeline_rx.len(),
                             pending_batch.len(),
@@ -12175,6 +12275,11 @@ fn rebuild_tantivy_from_db_with_options(
                         &mut responsiveness_controller,
                         pipeline_budget_controller.as_ref(),
                         &mut current_batch_conversation_limit,
+                        Some((
+                            &mut commit_interval_conversations,
+                            &mut commit_interval_messages,
+                            &mut commit_interval_message_bytes,
+                        )),
                         LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                             pipeline_rx.len(),
                             pending_batch.len(),
@@ -12210,6 +12315,11 @@ fn rebuild_tantivy_from_db_with_options(
                             lexical_rebuild_flow_limiter.as_ref(),
                             pipeline_budget_controller.as_ref(),
                             &mut current_batch_conversation_limit,
+                            Some((
+                                &mut commit_interval_conversations,
+                                &mut commit_interval_messages,
+                                &mut commit_interval_message_bytes,
+                            )),
                         );
                         refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
                             &mut latest_pipeline_runtime,
@@ -12219,6 +12329,11 @@ fn rebuild_tantivy_from_db_with_options(
                             &mut responsiveness_controller,
                             pipeline_budget_controller.as_ref(),
                             &mut current_batch_conversation_limit,
+                            Some((
+                                &mut commit_interval_conversations,
+                                &mut commit_interval_messages,
+                                &mut commit_interval_message_bytes,
+                            )),
                             LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                                 pipeline_rx.len(),
                                 pending_batch.len(),
@@ -12241,6 +12356,11 @@ fn rebuild_tantivy_from_db_with_options(
                         &mut responsiveness_controller,
                         pipeline_budget_controller.as_ref(),
                         &mut current_batch_conversation_limit,
+                        Some((
+                            &mut commit_interval_conversations,
+                            &mut commit_interval_messages,
+                            &mut commit_interval_message_bytes,
+                        )),
                         LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                             pipeline_rx.len(),
                             pending_batch.len(),
@@ -12362,6 +12482,11 @@ fn rebuild_tantivy_from_db_with_options(
                                 &mut responsiveness_controller,
                                 pipeline_budget_controller.as_ref(),
                                 &mut current_batch_conversation_limit,
+                                Some((
+                                    &mut commit_interval_conversations,
+                                    &mut commit_interval_messages,
+                                    &mut commit_interval_message_bytes,
+                                )),
                                 LexicalRebuildPipelineSinkRuntimeSnapshot::new(
                                     pipeline_rx.len(),
                                     pending_batch.len(),
@@ -12429,6 +12554,11 @@ fn rebuild_tantivy_from_db_with_options(
         &mut responsiveness_controller,
         pipeline_budget_controller.as_ref(),
         &mut current_batch_conversation_limit,
+        Some((
+            &mut commit_interval_conversations,
+            &mut commit_interval_messages,
+            &mut commit_interval_message_bytes,
+        )),
         LexicalRebuildPipelineSinkRuntimeSnapshot::new(
             0,
             pending_batch.len(),
@@ -19341,8 +19471,10 @@ mod tests {
     fn lexical_rebuild_responsiveness_controller_demotes_and_restores_with_hysteresis() {
         let _clear_samples = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_CLEAR_SAMPLES", "2");
         let _hold_ms = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_HOLD_MS", "1");
-        let startup_budget = LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048);
-        let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192);
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
         let mut controller = LexicalRebuildResponsivenessController::new(
             LexicalRebuildResponsivenessPolicy::Auto,
             startup_budget,
@@ -19366,6 +19498,9 @@ mod tests {
         assert_eq!(transition.old_budget, steady_budget);
         assert_eq!(transition.new_budget, startup_budget);
         assert_eq!(transition.mode, "pressure_limited");
+        assert_eq!(transition.new_budget.commit_interval_conversations, 16);
+        assert_eq!(transition.new_budget.commit_interval_messages, 128);
+        assert_eq!(transition.new_budget.commit_interval_message_bytes, 4_096);
         assert_eq!(controller.current_budget(), startup_budget);
 
         controller.last_transition_at = Instant::now() - controller.restore_hold;
@@ -19378,13 +19513,18 @@ mod tests {
         assert_eq!(restore.old_budget, startup_budget);
         assert_eq!(restore.new_budget, steady_budget);
         assert_eq!(restore.mode, "steady");
+        assert_eq!(restore.new_budget.commit_interval_conversations, 1_024);
+        assert_eq!(restore.new_budget.commit_interval_messages, 8_192);
+        assert_eq!(restore.new_budget.commit_interval_message_bytes, 65_536);
         assert_eq!(controller.current_budget(), steady_budget);
     }
 
     #[test]
     fn lexical_rebuild_responsiveness_controller_honors_pinned_conservative_mode() {
-        let startup_budget = LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048);
-        let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192);
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
         let mut controller = LexicalRebuildResponsivenessController::new(
             LexicalRebuildResponsivenessPolicy::Conservative,
             startup_budget,
@@ -19408,6 +19548,63 @@ mod tests {
     }
 
     #[test]
+    fn lexical_rebuild_budget_transition_updates_active_commit_cadence() {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let flow_limiter = StreamingByteLimiter::new(steady_budget.max_message_bytes_in_flight);
+        let pipeline_budget_controller = LexicalRebuildPipelineBudgetController::new(steady_budget);
+        let mut current_batch_conversation_limit = steady_budget.page_conversation_limit;
+        let mut commit_interval_conversations = steady_budget.commit_interval_conversations;
+        let mut commit_interval_messages = steady_budget.commit_interval_messages;
+        let mut commit_interval_message_bytes = steady_budget.commit_interval_message_bytes;
+
+        apply_lexical_rebuild_budget_transition(
+            LexicalRebuildBudgetTransition {
+                old_budget: steady_budget,
+                new_budget: startup_budget,
+                mode: "pressure_limited",
+                reason: "test_pressure".into(),
+            },
+            &flow_limiter,
+            &pipeline_budget_controller,
+            &mut current_batch_conversation_limit,
+            Some((
+                &mut commit_interval_conversations,
+                &mut commit_interval_messages,
+                &mut commit_interval_message_bytes,
+            )),
+        );
+
+        assert_eq!(
+            current_batch_conversation_limit,
+            startup_budget.page_conversation_limit
+        );
+        assert_eq!(
+            flow_limiter.max_bytes_in_flight(),
+            startup_budget.max_message_bytes_in_flight
+        );
+        assert_eq!(
+            pipeline_budget_controller.snapshot(),
+            startup_budget,
+            "producer-side budget snapshots should include the demoted commit cadence"
+        );
+        assert_eq!(
+            (
+                commit_interval_conversations,
+                commit_interval_messages,
+                commit_interval_message_bytes,
+            ),
+            (
+                startup_budget.commit_interval_conversations,
+                startup_budget.commit_interval_messages,
+                startup_budget.commit_interval_message_bytes,
+            )
+        );
+    }
+
+    #[test]
     fn parse_lexical_rebuild_loadavg_1m_milli_reads_first_field() {
         assert_eq!(
             parse_lexical_rebuild_loadavg_1m_milli("1.50 1.21 0.80 2/199 1234\n"),
@@ -19420,8 +19617,10 @@ mod tests {
     fn lexical_rebuild_responsiveness_controller_demotes_and_restores_on_host_loadavg_pressure() {
         let _clear_samples = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_CLEAR_SAMPLES", "1");
         let _hold_ms = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_HOLD_MS", "1");
-        let startup_budget = LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048);
-        let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192);
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
         let mut controller = LexicalRebuildResponsivenessController::new(
             LexicalRebuildResponsivenessPolicy::Auto,
             startup_budget,

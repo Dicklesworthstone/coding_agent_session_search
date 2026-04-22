@@ -1,4 +1,4 @@
-//! Lifecycle validation matrix — first concrete row.
+//! Lifecycle validation matrix — concrete early rows.
 //!
 //! Bead `ibuuh.23` scopes out a dedicated validation matrix for long-running
 //! maintenance lifecycle behavior (scheduler, cleanup, quarantine, retention,
@@ -6,22 +6,24 @@
 //! / quarantine subsystems that are multi-day scope downstream of in-flight
 //! ibuuh.30 / ibuuh.32 work.
 //!
-//! What ships today is the FIRST ROW of that matrix — the cheapest
-//! meaningful multi-actor assertion: three concurrent `cass health --json`
-//! invocations against the same isolated data dir must all return
-//! byte-identical readiness JSON (modulo the already-scrubbed live kernel
-//! metrics). This proves the readiness snapshot is idempotent under
-//! process-level concurrency — a prerequisite invariant the rest of the
-//! lifecycle tail will build on.
+//! The early rows pin prerequisites the rest of the lifecycle tail needs:
+//! idempotent readiness reads under process-level concurrency, cross-surface
+//! robot contract agreement, and deterministic scheduler trace artifacts.
 //!
-//! Future rows will need their own fixtures and cannot ship until the
+//! Later rows will need their own fixtures and cannot ship until the
 //! upstream features they validate exist; see bead ibuuh.23 comments for
 //! the remainder of the matrix plan.
 
+mod util;
+
 use assert_cmd::Command;
+use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use util::search_asset_simulation::{
+    ContentionPlan, LoadSample, LoadScript, SearchAssetSimulationHarness, SimulationActor,
+};
 
 /// Invoke `cass health --json` against an isolated data dir and return
 /// scrubbed canonical JSON (identical rules to tests/golden_robot_json.rs
@@ -216,4 +218,132 @@ fn capabilities_surface_is_home_independent() {
         caps_a, caps_b,
         "cass capabilities --json is HOME-dependent — this is a contract leak"
     );
+}
+
+#[test]
+fn scheduler_pause_resume_trace_is_artifact_backed() {
+    // Row 4 of the matrix: deterministic lifecycle traces must preserve
+    // pause/resume ordering, the pressure reason, and artifact-backed robot
+    // evidence. This is intentionally a harness-level row until the full
+    // scheduler/cleanup/quarantine subsystems are complete.
+    let mut harness = SearchAssetSimulationHarness::new(
+        "lifecycle_matrix_pause_resume_trace",
+        LoadScript::new(vec![
+            LoadSample::idle("scheduler_start_idle"),
+            LoadSample::busy("foreground_pressure"),
+            LoadSample::idle("pressure_cleared"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::BackgroundSemantic, "start_backfill")
+        .turn(SimulationActor::ForegroundSearch, "foreground_pressure")
+        .turn(SimulationActor::BackgroundSemantic, "resume_backfill");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::BackgroundSemantic, "start_backfill") => {
+                sim.phase("scheduler", "background backfill starts under idle budget");
+                sim.snapshot_json(
+                    "scheduler_start",
+                    &json!({
+                        "scheduler_state": "running",
+                        "reason": "idle_budget_available",
+                        "work": "semantic_backfill",
+                        "generation_state": "current"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "foreground_pressure") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground pressure requests scheduler yield",
+                );
+                sim.snapshot_json(
+                    "scheduler_pause",
+                    &json!({
+                        "scheduler_state": "paused",
+                        "reason": "foreground_pressure",
+                        "yielded": true,
+                        "foreground_searches": 2
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::BackgroundSemantic, "resume_backfill") => {
+                sim.phase(
+                    "scheduler",
+                    "background backfill resumes after pressure clears",
+                );
+                sim.snapshot_json(
+                    "scheduler_resume",
+                    &json!({
+                        "scheduler_state": "running",
+                        "reason": "pressure_cleared",
+                        "yielded": false,
+                        "work": "semantic_backfill"
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic lifecycle turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "pause/resume trace should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 3);
+    assert_eq!(
+        summary.actor_traces[0].actor,
+        SimulationActor::BackgroundSemantic
+    );
+    assert_eq!(summary.actor_traces[0].load.label, "scheduler_start_idle");
+    assert_eq!(
+        summary.actor_traces[1].actor,
+        SimulationActor::ForegroundSearch
+    );
+    assert_eq!(summary.actor_traces[1].load.label, "foreground_pressure");
+    assert!(summary.actor_traces[1].load.user_active);
+    assert_eq!(
+        summary.actor_traces[2].actor,
+        SimulationActor::BackgroundSemantic
+    );
+    assert_eq!(summary.actor_traces[2].load.label, "pressure_cleared");
+    assert!(!summary.actor_traces[2].load.user_active);
+
+    for expected in [
+        "001-scheduler_start.json",
+        "002-scheduler_pause.json",
+        "003-scheduler_resume.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing lifecycle snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write lifecycle artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = std::fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("foreground pressure requests scheduler yield"),
+        "phase log should preserve the pause reason"
+    );
+    let pause_snapshot = artifacts.snapshot_dir.join("002-scheduler_pause.json");
+    let pause_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&pause_snapshot).expect("read pause snapshot"),
+    )
+    .expect("pause snapshot JSON");
+    assert_eq!(pause_json["scheduler_state"], "paused");
+    assert_eq!(pause_json["reason"], "foreground_pressure");
+    assert_eq!(pause_json["yielded"], true);
 }
