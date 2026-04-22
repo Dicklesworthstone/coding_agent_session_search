@@ -3,10 +3,16 @@
 //! This module centralizes coarse-grained asset truth so callers stop inferring
 //! lexical freshness, active maintenance, and semantic readiness from ad hoc
 //! file checks spread across the CLI.
+//!
+//! The maintenance coordination layer (`evaluate_maintenance_coordination`,
+//! `decide_maintenance_action`, `poll_maintenance_until_idle`) provides
+//! single-flight semantics: foreground cass actors share one coherent truth
+//! for repair/acquisition work and never duplicate basic maintenance jobs.
 
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -741,6 +747,209 @@ fn semantic_hint(
     Some(hint.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Maintenance coordination: single-flight, attach-to-progress, fail-open
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(test), allow(dead_code))]
+const HEARTBEAT_STALE_THRESHOLD_MS: i64 = 30_000;
+#[cfg_attr(not(test), allow(dead_code))]
+const BOUNDED_WAIT_DEFAULT: Duration = Duration::from_secs(5);
+#[cfg_attr(not(test), allow(dead_code))]
+const POLL_INTERVAL_DEFAULT: Duration = Duration::from_millis(250);
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum MaintenanceCoordinationOutcome {
+    Idle,
+    Active {
+        job_id: String,
+        job_kind: SearchMaintenanceJobKind,
+        phase: Option<String>,
+        started_at_ms: i64,
+        updated_at_ms: i64,
+    },
+    Stale {
+        job_id: String,
+        reason: String,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum MaintenanceDecision {
+    Launch,
+    AttachOrWait {
+        job_id: String,
+        job_kind: SearchMaintenanceJobKind,
+        phase: Option<String>,
+        elapsed_ms: u64,
+    },
+    FailOpen {
+        reason: String,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn evaluate_maintenance_coordination(
+    data_dir: &Path,
+    now_ms: i64,
+) -> MaintenanceCoordinationOutcome {
+    evaluate_maintenance_coordination_from_snapshot(
+        &read_search_maintenance_snapshot(data_dir),
+        now_ms,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn evaluate_maintenance_coordination_from_snapshot(
+    snapshot: &SearchMaintenanceSnapshot,
+    now_ms: i64,
+) -> MaintenanceCoordinationOutcome {
+    if !snapshot.active {
+        return MaintenanceCoordinationOutcome::Idle;
+    }
+    let job_id = match snapshot.job_id {
+        Some(ref id) if !id.is_empty() => id.clone(),
+        _ => return MaintenanceCoordinationOutcome::Idle,
+    };
+    let heartbeat_age_ms = snapshot
+        .updated_at_ms
+        .map(|ts| now_ms.saturating_sub(ts))
+        .unwrap_or(i64::MAX);
+    if heartbeat_age_ms > HEARTBEAT_STALE_THRESHOLD_MS {
+        return MaintenanceCoordinationOutcome::Stale {
+            job_id,
+            reason: format!(
+                "heartbeat is {heartbeat_age_ms}ms old (threshold {HEARTBEAT_STALE_THRESHOLD_MS}ms)"
+            ),
+        };
+    }
+    MaintenanceCoordinationOutcome::Active {
+        job_id,
+        job_kind: snapshot
+            .job_kind
+            .unwrap_or(SearchMaintenanceJobKind::LexicalRefresh),
+        phase: snapshot.phase.clone(),
+        started_at_ms: snapshot.started_at_ms.unwrap_or(0),
+        updated_at_ms: snapshot.updated_at_ms.unwrap_or(now_ms),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decide_maintenance_action(data_dir: &Path, now_ms: i64) -> MaintenanceDecision {
+    decide_maintenance_action_from_snapshot(&read_search_maintenance_snapshot(data_dir), now_ms)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decide_maintenance_action_from_snapshot(
+    snapshot: &SearchMaintenanceSnapshot,
+    now_ms: i64,
+) -> MaintenanceDecision {
+    match evaluate_maintenance_coordination_from_snapshot(snapshot, now_ms) {
+        MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
+            MaintenanceDecision::Launch
+        }
+        MaintenanceCoordinationOutcome::Active {
+            job_id,
+            job_kind,
+            phase,
+            started_at_ms,
+            ..
+        } => MaintenanceDecision::AttachOrWait {
+            job_id,
+            job_kind,
+            phase,
+            elapsed_ms: (now_ms.saturating_sub(started_at_ms)) as u64,
+        },
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decide_search_failopen(
+    data_dir: &Path,
+    now_ms: i64,
+    lexical_available: bool,
+) -> MaintenanceDecision {
+    let snapshot = read_search_maintenance_snapshot(data_dir);
+    match evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms) {
+        MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
+            MaintenanceDecision::Launch
+        }
+        MaintenanceCoordinationOutcome::Active {
+            job_id,
+            job_kind,
+            phase,
+            started_at_ms,
+            ..
+        } => {
+            if lexical_available {
+                MaintenanceDecision::FailOpen {
+                    reason: format!(
+                        "maintenance job {job_id} is active; lexical index is available, failing open"
+                    ),
+                }
+            } else {
+                MaintenanceDecision::AttachOrWait {
+                    job_id,
+                    job_kind,
+                    phase,
+                    elapsed_ms: (now_ms.saturating_sub(started_at_ms)) as u64,
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PollResult {
+    pub outcome: MaintenanceCoordinationOutcome,
+    pub polls: u32,
+    pub elapsed: Duration,
+    pub timed_out: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn poll_maintenance_until_idle(
+    data_dir: &Path,
+    timeout: Option<Duration>,
+    poll_interval: Option<Duration>,
+) -> PollResult {
+    let timeout = timeout.unwrap_or(BOUNDED_WAIT_DEFAULT);
+    let interval = poll_interval.unwrap_or(POLL_INTERVAL_DEFAULT);
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut polls = 0u32;
+    loop {
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let outcome = evaluate_maintenance_coordination(data_dir, now_ms);
+        polls += 1;
+        match outcome {
+            MaintenanceCoordinationOutcome::Idle | MaintenanceCoordinationOutcome::Stale { .. } => {
+                return PollResult {
+                    outcome,
+                    polls,
+                    elapsed: start.elapsed(),
+                    timed_out: false,
+                };
+            }
+            MaintenanceCoordinationOutcome::Active { .. } => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return PollResult {
+                        outcome,
+                        polls,
+                        elapsed: start.elapsed(),
+                        timed_out: true,
+                    };
+                }
+                let remaining = deadline - now;
+                std::thread::sleep(interval.min(remaining));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1320,5 +1529,274 @@ mod tests {
             state.embedder_id.as_deref(),
             Some(FastEmbedder::embedder_id_static())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Maintenance coordination tests
+    // -----------------------------------------------------------------------
+
+    fn make_active_snapshot(now_ms: i64) -> SearchMaintenanceSnapshot {
+        SearchMaintenanceSnapshot {
+            active: true,
+            pid: Some(12345),
+            started_at_ms: Some(now_ms - 5_000),
+            db_path: Some(PathBuf::from("/tmp/cass/agent_search.db")),
+            mode: Some(SearchMaintenanceMode::Index),
+            job_id: Some("lexical_refresh-1000-12345".to_string()),
+            job_kind: Some(SearchMaintenanceJobKind::LexicalRefresh),
+            phase: Some("scanning".to_string()),
+            updated_at_ms: Some(now_ms - 500),
+            orphaned: false,
+        }
+    }
+
+    #[test]
+    fn coordination_no_active_job_when_snapshot_inactive() {
+        let snapshot = SearchMaintenanceSnapshot::default();
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, 1_733_000_000_000);
+        assert_eq!(outcome, MaintenanceCoordinationOutcome::Idle);
+    }
+
+    #[test]
+    fn coordination_no_active_job_when_no_job_id() {
+        let snapshot = SearchMaintenanceSnapshot {
+            active: true,
+            pid: Some(12345),
+            job_id: None,
+            ..Default::default()
+        };
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, 1_733_000_000_000);
+        assert_eq!(outcome, MaintenanceCoordinationOutcome::Idle);
+    }
+
+    #[test]
+    fn coordination_active_job_with_fresh_heartbeat() {
+        let now_ms = 1_733_000_000_000i64;
+        let snapshot = make_active_snapshot(now_ms);
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+        match outcome {
+            MaintenanceCoordinationOutcome::Active {
+                ref job_id, phase, ..
+            } => {
+                assert_eq!(job_id, "lexical_refresh-1000-12345");
+                assert_eq!(phase.as_deref(), Some("scanning"));
+            }
+            other => panic!("expected ActiveJob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordination_stale_job_with_old_heartbeat() {
+        let now_ms = 1_733_000_000_000i64;
+        let snapshot = SearchMaintenanceSnapshot {
+            updated_at_ms: Some(now_ms - 60_000),
+            ..make_active_snapshot(now_ms)
+        };
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+        match outcome {
+            MaintenanceCoordinationOutcome::Stale {
+                ref job_id,
+                ref reason,
+            } => {
+                assert_eq!(job_id, "lexical_refresh-1000-12345");
+                assert!(reason.contains("60000ms"), "reason={reason}");
+            }
+            other => panic!("expected StaleJob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coordination_stale_job_when_no_heartbeat_timestamp() {
+        let now_ms = 1_733_000_000_000i64;
+        let snapshot = SearchMaintenanceSnapshot {
+            updated_at_ms: None,
+            ..make_active_snapshot(now_ms)
+        };
+        let outcome = evaluate_maintenance_coordination_from_snapshot(&snapshot, now_ms);
+        assert!(
+            matches!(outcome, MaintenanceCoordinationOutcome::Stale { .. }),
+            "missing heartbeat must be treated as stale"
+        );
+    }
+
+    #[test]
+    fn decision_launch_when_no_job() {
+        let snapshot = SearchMaintenanceSnapshot::default();
+        let decision = decide_maintenance_action_from_snapshot(&snapshot, 1_733_000_000_000);
+        assert_eq!(decision, MaintenanceDecision::Launch);
+    }
+
+    #[test]
+    fn decision_launch_when_stale_job() {
+        let now_ms = 1_733_000_000_000i64;
+        let snapshot = SearchMaintenanceSnapshot {
+            updated_at_ms: Some(now_ms - 60_000),
+            ..make_active_snapshot(now_ms)
+        };
+        let decision = decide_maintenance_action_from_snapshot(&snapshot, now_ms);
+        assert_eq!(decision, MaintenanceDecision::Launch);
+    }
+
+    #[test]
+    fn decision_attach_when_active_fresh_job() {
+        let now_ms = 1_733_000_000_000i64;
+        let snapshot = make_active_snapshot(now_ms);
+        let decision = decide_maintenance_action_from_snapshot(&snapshot, now_ms);
+        match decision {
+            MaintenanceDecision::AttachOrWait {
+                ref job_id,
+                elapsed_ms,
+                ..
+            } => {
+                assert_eq!(job_id, "lexical_refresh-1000-12345");
+                assert_eq!(elapsed_ms, 5_000);
+            }
+            other => panic!("expected AttachOrWait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_returns_immediately_when_no_active_job() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = poll_maintenance_until_idle(
+            temp.path(),
+            Some(Duration::from_millis(500)),
+            Some(Duration::from_millis(50)),
+        );
+        assert!(!result.timed_out);
+        assert_eq!(result.polls, 1);
+        assert!(
+            matches!(result.outcome, MaintenanceCoordinationOutcome::Idle),
+            "expected NoActiveJob"
+        );
+    }
+
+    #[test]
+    fn poll_returns_active_on_timeout_when_lock_held() {
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner.try_lock_exclusive().expect("acquire lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-1\njob_kind=lexical_refresh\nphase=scanning\n",
+                now_ms - 1_000,
+                now_ms,
+            ),
+        )
+        .expect("write lock metadata");
+
+        let result = poll_maintenance_until_idle(
+            temp.path(),
+            Some(Duration::from_millis(300)),
+            Some(Duration::from_millis(50)),
+        );
+        assert!(result.timed_out, "should time out when lock is held");
+        assert!(result.polls >= 2, "should have polled multiple times");
+        assert!(
+            matches!(
+                result.outcome,
+                MaintenanceCoordinationOutcome::Active { .. }
+            ),
+            "expected ActiveJob on timeout"
+        );
+
+        let _ = FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn poll_detects_release_mid_wait() {
+        use fs2::FileExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner.try_lock_exclusive().expect("acquire lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=test-job-2\njob_kind=lexical_refresh\nphase=committing\n",
+                now_ms - 1_000,
+                now_ms,
+            ),
+        )
+        .expect("write lock metadata");
+
+        let temp_path = temp.path().to_path_buf();
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = owner.set_len(0);
+            let _ = FileExt::unlock(&owner);
+            drop(owner);
+        });
+
+        let result = poll_maintenance_until_idle(
+            &temp_path,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(50)),
+        );
+        assert!(!result.timed_out, "should detect release before timeout");
+        release_thread.join().expect("release thread");
+    }
+
+    #[test]
+    fn failopen_returns_failopen_when_lexical_available_and_job_active() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("index-run.lock");
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+
+        use fs2::FileExt;
+        let owner = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)
+            .expect("open owner handle");
+        owner.try_lock_exclusive().expect("acquire lock");
+        std::fs::write(
+            &lock_path,
+            format!(
+                "pid=99999\nstarted_at_ms={}\nupdated_at_ms={}\ndb_path=/tmp/test.db\nmode=index\njob_id=fo-job-1\njob_kind=lexical_refresh\nphase=indexing\n",
+                now_ms - 1_000,
+                now_ms,
+            ),
+        )
+        .expect("write lock metadata");
+
+        let decision = decide_search_failopen(temp.path(), now_ms, true);
+        match decision {
+            MaintenanceDecision::FailOpen { ref reason } => {
+                assert!(reason.contains("fo-job-1"), "reason={reason}");
+                assert!(reason.contains("failing open"), "reason={reason}");
+            }
+            other => panic!("expected FailOpen, got {other:?}"),
+        }
+
+        let decision_no_lexical = decide_search_failopen(temp.path(), now_ms, false);
+        assert!(
+            matches!(
+                decision_no_lexical,
+                MaintenanceDecision::AttachOrWait { .. }
+            ),
+            "without lexical must attach, got {decision_no_lexical:?}"
+        );
+
+        let _ = FileExt::unlock(&owner);
     }
 }
