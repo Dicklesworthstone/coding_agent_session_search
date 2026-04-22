@@ -11,7 +11,7 @@
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
 
 **Unified, high-performance TUI to index and search your local coding agent history.**
-Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, and Factory (Droid) into a single, searchable timeline.
+Aggregates sessions from Codex, Claude Code, Gemini CLI, Cline, OpenCode, Amp, Cursor, ChatGPT, Aider, Pi-Agent, GitHub Copilot Chat, Copilot CLI, OpenClaw, Clawdbot, Vibe, Crush, Kimi Code, Qwen Code, and Factory (Droid) into a single, searchable timeline.
 
 <div align="center">
 
@@ -323,7 +323,7 @@ cass export-html session.jsonl --json
 ```
 
 ### 🔗 Universal Connectors
-Ingests history from all major local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
+Ingests history from 19 local agents, normalizing them into a unified `Conversation -> Message -> Snippet` model:
 - **Codex**: `~/.codex/sessions` (Rollout JSONL)
 - **Cline**: VS Code global storage (Task directories)
 - **Gemini CLI**: `~/.gemini/tmp` (Chat JSON)
@@ -331,12 +331,24 @@ Ingests history from all major local agents, normalizing them into a unified `Co
 - **Clawdbot**: `~/.clawdbot/sessions` (Session JSONL)
 - **Vibe (Mistral)**: `~/.vibe/logs/session/*/messages.jsonl` (Session JSONL)
 - **OpenCode**: `.opencode` directories (SQLite)
+- **OpenClaw**: `~/.openclaw/sessions` (Session JSONL)
 - **Amp**: `~/.local/share/amp` & VS Code storage
 - **Cursor**: `~/Library/Application Support/Cursor/User/` global + workspace storage (SQLite `state.vscdb`)
 - **ChatGPT**: `~/Library/Application Support/com.openai.chat` (v1 unencrypted JSON; v2/v3 encrypted—see Environment)
 - **Aider**: `~/.aider.chat.history.md` and per-project `.aider.chat.history.md` files (Markdown)
 - **Pi-Agent**: `~/.pi/agent/sessions` (Session JSONL with thinking content)
+- **GitHub Copilot Chat**: VS Code global storage under `github.copilot-chat` (JSON)
+- **Copilot CLI**: `~/.copilot/session-state`, legacy `~/.copilot/history-session-state`, and `gh copilot` config paths (JSONL/JSON)
+- **OpenClaw**: `~/.openclaw/agents/*/sessions` (Session JSONL)
+- **Crush**: `~/.crush/crush.db` and per-project `.crush/crush.db` (SQLite)
+- **Kimi Code**: `~/.kimi/sessions/*/*/wire.jsonl` (Session JSONL)
+- **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
+- **Kimi**: Kimi Code CLI session files
+- **Copilot** (VS Code): GitHub Copilot chat history in VS Code global storage
+- **Copilot CLI**: `gh copilot` CLI session history
+- **Qwen**: Qwen Code session files
+- **Crush**: Charm Crush CLI session databases
 
 #### Connector Details
 
@@ -1477,7 +1489,7 @@ The same conversation content can appear multiple times due to:
 
 `cass` uses a multi-layer deduplication strategy:
 
-1. **Message Hash**: SHA-256 of `(role + content + timestamp)`
+1. **Message Hash**: BLAKE3 of `(role + content + timestamp)`
    - Identical messages in different files are stored once
 
 2. **Conversation Fingerprint**: Hash of first N message hashes
@@ -1638,16 +1650,29 @@ The pane automatically adjusts how many results fit based on terminal height and
 
 ### Theme Presets
 
-Cycle through 6 built-in theme presets with `F2`:
+Cycle through 19 built-in theme presets with `F2`:
 
 | Theme | Description | Best For |
 |-------|-------------|----------|
-| **Dark** (default) | Tokyo Night-inspired deep blues | Low-light environments, extended sessions |
-| **Light** | High-contrast light background | Bright environments, presentations |
-| **Catppuccin** | Warm pastels, reduced eye strain | All-day coding, aesthetic preference |
+| **Tokyo Night** (default) | Deep blues with restrained contrast | Low-light environments, extended sessions |
+| **Daylight** | High-contrast light background | Bright environments, presentations |
+| **Catppuccin Mocha** | Warm pastels, reduced eye strain | All-day coding, aesthetic preference |
 | **Dracula** | Purple-accented dark theme | Popular among developers, familiar feel |
 | **Nord** | Arctic-inspired cool tones | Calm, focused work sessions |
+| **Solarized Dark** | Precisely tuned low-contrast palette | Long editing sessions, monitor-agnostic |
+| **Solarized Light** | Solarized on a cream background | Paper-style readability in bright rooms |
+| **Monokai** | Classic warm dark palette | Familiar Sublime/TextMate feel |
+| **Gruvbox Dark** | Retro earth tones on dark | Warmer alternative to Tokyo Night |
+| **One Dark** | Atom's signature balanced dark | Moderate contrast, friendly defaults |
+| **Rosé Pine** | Soho-inspired muted roses | Gentle contrast, boutique look |
+| **Everforest** | Forest-inspired green-brown palette | Calm, nature-adjacent mood |
+| **Kanagawa** | Japanese ink-and-paper theme | Artistic, quietly distinctive |
+| **Ayu Mirage** | Ayu's balanced muted dark | Blue-teal accents, relaxed contrast |
+| **Nightfox** | Fox-inspired warm dark | Deep violets with orange highlights |
+| **Cyberpunk Aurora** | Neon aurora on obsidian | Showy, high-saturation dark |
+| **Synthwave '84** | Retro neon magenta/cyan | 80s aesthetic, fun demos |
 | **High Contrast** | Maximum readability | Accessibility needs, bright monitors |
+| **Colorblind** | Deuteranopia/protanopia-safe palette | Color-vision-deficient users |
 
 ### WCAG Accessibility
 
