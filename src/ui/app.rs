@@ -23132,6 +23132,8 @@ mod tests {
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
 
+    static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Clone)]
     struct TraceBufferWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -23152,6 +23154,9 @@ mod tests {
     where
         F: FnOnce(),
     {
+        let _trace_capture_guard = TRACE_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sink = Arc::new(Mutex::new(Vec::new()));
         let writer = TraceBufferWriter(sink.clone());
         let subscriber = tracing_subscriber::fmt()
@@ -23163,7 +23168,11 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
 
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
+        tracing::callsite::rebuild_interest_cache();
         String::from_utf8(sink.lock().map(|b| b.clone()).unwrap_or_default()).unwrap_or_default()
     }
 
