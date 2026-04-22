@@ -5,15 +5,46 @@
 
 use chrono::{TimeZone, Utc};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
-use rusqlite::{Connection, params};
-use std::path::PathBuf;
+use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
 
+type TestResult<T> = anyhow::Result<T>;
+
+fn open_db(path: &Path) -> TestResult<Connection> {
+    let path_str = path.to_string_lossy();
+    Ok(Connection::open(path_str.as_ref())?)
+}
+
+fn query_i64(conn: &Connection, sql: &str) -> TestResult<i64> {
+    Ok(conn.query_row_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+}
+
+fn query_string(conn: &Connection, sql: &str) -> TestResult<String> {
+    Ok(conn.query_row_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+}
+
+fn query_strings(conn: &Connection, sql: &str) -> TestResult<Vec<String>> {
+    Ok(conn.query_map_collect(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+}
+
+fn query_table_columns(conn: &Connection, table_name: &str) -> TestResult<Vec<String>> {
+    let sql = format!("PRAGMA table_info({table_name})");
+    Ok(conn.query_map_collect(&sql, &[], |row: &FrankenRow| row.get_typed(1))?)
+}
+
+fn query_message_pairs(conn: &Connection, sql: &str) -> TestResult<Vec<(i64, String)>> {
+    Ok(conn.query_map_collect(sql, &[], |row: &FrankenRow| {
+        Ok((row.get_typed(0)?, row.get_typed(1)?))
+    })?)
+}
+
 /// Create a source database with the schema expected by the indexer.
-fn create_source_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
+fn create_source_db(conn: &Connection) -> TestResult<()> {
+    Ok(conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS agents (
             id INTEGER PRIMARY KEY,
@@ -53,67 +84,56 @@ fn create_source_db(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY (conversation_id) REFERENCES conversations(id)
         );
         "#,
-    )
+    )?)
 }
 
 /// Insert test data into the source database.
-fn insert_test_data(conn: &Connection) -> rusqlite::Result<()> {
+fn insert_test_data(conn: &Connection) -> TestResult<()> {
     // Insert agents
-    conn.execute(
-        "INSERT INTO agents (id, slug, name, kind) VALUES (1, 'claude', 'Claude', 'ai')",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO agents (id, slug, name, kind) VALUES (2, 'codex', 'Codex', 'ai')",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO agents (id, slug, name, kind) VALUES (3, 'gemini', 'Gemini', 'ai')",
-        [],
-    )?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (1, 'claude', 'Claude', 'ai')")?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (2, 'codex', 'Codex', 'ai')")?;
+    conn.execute("INSERT INTO agents (id, slug, name, kind) VALUES (3, 'gemini', 'Gemini', 'ai')")?;
 
     // Insert workspaces
     conn.execute(
-        "INSERT INTO workspaces (id, path, display_name) VALUES (1, '/home/user/project-a', 'Project A')",
-        [],
+        "INSERT INTO workspaces (id, path, display_name) VALUES (1, '/home/user/project-a', 'Project A')"
     )?;
     conn.execute(
-        "INSERT INTO workspaces (id, path, display_name) VALUES (2, '/home/user/project-b', 'Project B')",
-        [],
+        "INSERT INTO workspaces (id, path, display_name) VALUES (2, '/home/user/project-b', 'Project B')"
     )?;
 
     // Insert conversations with different agents, workspaces, and timestamps
     let base_ts = Utc.with_ymd_and_hms(2024, 6, 15, 10, 0, 0).unwrap();
 
     // Conversation 1: claude, project-a, June 15
-    conn.execute(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
-         VALUES (1, 1, 1, 'Auth debugging', '/home/user/project-a/sessions/auth.jsonl', ?, ?, 3)",
-        params![base_ts.timestamp_millis(), (base_ts + chrono::Duration::hours(1)).timestamp_millis()],
+         VALUES (1, 1, 1, 'Auth debugging', '/home/user/project-a/sessions/auth.jsonl', ?1, ?2, 3)",
+        fparams![base_ts.timestamp_millis(), (base_ts + chrono::Duration::hours(1)).timestamp_millis()],
     )?;
 
     // Conversation 2: codex, project-a, June 16
     let ts2 = base_ts + chrono::Duration::days(1);
-    conn.execute(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
-         VALUES (2, 2, 1, 'API refactoring', '/home/user/project-a/sessions/api.jsonl', ?, ?, 2)",
-        params![ts2.timestamp_millis(), (ts2 + chrono::Duration::hours(2)).timestamp_millis()],
+         VALUES (2, 2, 1, 'API refactoring', '/home/user/project-a/sessions/api.jsonl', ?1, ?2, 2)",
+        fparams![ts2.timestamp_millis(), (ts2 + chrono::Duration::hours(2)).timestamp_millis()],
     )?;
 
     // Conversation 3: claude, project-b, June 17
     let ts3 = base_ts + chrono::Duration::days(2);
-    conn.execute(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
-         VALUES (3, 1, 2, 'UI design', '/home/user/project-b/sessions/ui.jsonl', ?, ?, 4)",
-        params![ts3.timestamp_millis(), (ts3 + chrono::Duration::hours(3)).timestamp_millis()],
+         VALUES (3, 1, 2, 'UI design', '/home/user/project-b/sessions/ui.jsonl', ?1, ?2, 4)",
+        fparams![ts3.timestamp_millis(), (ts3 + chrono::Duration::hours(3)).timestamp_millis()],
     )?;
 
     // Conversation 4: gemini, project-b, June 18
     let ts4 = base_ts + chrono::Duration::days(3);
-    conn.execute(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, ended_at, message_count)
-         VALUES (4, 3, 2, 'Database optimization', '/home/user/project-b/sessions/db.jsonl', ?, ?, 5)",
-        params![ts4.timestamp_millis(), (ts4 + chrono::Duration::hours(1)).timestamp_millis()],
+         VALUES (4, 3, 2, 'Database optimization', '/home/user/project-b/sessions/db.jsonl', ?1, ?2, 5)",
+        fparams![ts4.timestamp_millis(), (ts4 + chrono::Duration::hours(1)).timestamp_millis()],
     )?;
 
     // Insert messages for each conversation
@@ -144,9 +164,15 @@ fn insert_test_data(conn: &Connection) -> rusqlite::Result<()> {
     ];
 
     for (conv_id, idx, role, content) in messages {
-        conn.execute(
-            "INSERT INTO messages (conversation_id, idx, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-            params![conv_id, idx, role, content, base_ts.timestamp_millis() + (idx as i64 * 60000)],
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            fparams![
+                conv_id as i64,
+                idx as i64,
+                role,
+                content,
+                base_ts.timestamp_millis() + (idx as i64 * 60000)
+            ],
         )?;
     }
 
@@ -154,39 +180,33 @@ fn insert_test_data(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Verify exported database has correct schema.
-fn verify_export_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn verify_export_schema(conn: &Connection) -> TestResult<()> {
     // Check conversations table exists and has expected columns
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
+    let _: i64 = query_i64(conn, "SELECT COUNT(*) FROM conversations")?;
 
     // Check messages table
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+    let _: i64 = query_i64(conn, "SELECT COUNT(*) FROM messages")?;
 
     // Check FTS tables are present in schema
-    let fts_exists: i64 = conn.query_row(
+    let fts_exists = query_i64(
+        conn,
         "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'",
-        [],
-        |row| row.get(0),
     )?;
-    let code_fts_exists: i64 = conn.query_row(
+    let code_fts_exists = query_i64(
+        conn,
         "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_code_fts'",
-        [],
-        |row| row.get(0),
     )?;
     assert_eq!(fts_exists, 1);
     assert_eq!(code_fts_exists, 1);
 
     // Check export_meta
-    let schema_version: String = conn.query_row(
+    let schema_version = query_string(
+        conn,
         "SELECT value FROM export_meta WHERE key = 'schema_version'",
-        [],
-        |row| row.get(0),
     )?;
     assert_eq!(schema_version, "1");
 
-    let message_columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(messages)")?
-        .query_map([], |row| row.get(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let message_columns = query_table_columns(conn, "messages")?;
     assert!(message_columns.contains(&"updated_at".to_string()));
     assert!(message_columns.contains(&"model".to_string()));
     assert!(message_columns.contains(&"attachment_refs".to_string()));
@@ -205,7 +225,7 @@ fn export_engine_exports_all_conversations_with_no_filter() {
     let output_path = tmp.path().join("export.db");
 
     // Create and populate source DB
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -227,17 +247,13 @@ fn export_engine_exports_all_conversations_with_no_filter() {
     assert_eq!(stats.messages_processed, 14);
 
     // Verify exported database
-    let out_conn = Connection::open(&output_path).unwrap();
+    let out_conn = open_db(&output_path).unwrap();
     verify_export_schema(&out_conn).unwrap();
 
-    let conv_count: i64 = out_conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
-        .unwrap();
+    let conv_count = query_i64(&out_conn, "SELECT COUNT(*) FROM conversations").unwrap();
     assert_eq!(conv_count, 4);
 
-    let msg_count: i64 = out_conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .unwrap();
+    let msg_count = query_i64(&out_conn, "SELECT COUNT(*) FROM messages").unwrap();
     assert_eq!(msg_count, 14);
 }
 
@@ -247,7 +263,7 @@ fn export_engine_filters_by_single_agent() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -268,14 +284,8 @@ fn export_engine_filters_by_single_agent() {
     assert_eq!(stats.conversations_processed, 2);
     assert_eq!(stats.messages_processed, 7);
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let agents: Vec<String> = out_conn
-        .prepare("SELECT DISTINCT agent FROM conversations")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let out_conn = open_db(&output_path).unwrap();
+    let agents = query_strings(&out_conn, "SELECT DISTINCT agent FROM conversations").unwrap();
     assert_eq!(agents, vec!["claude"]);
 }
 
@@ -285,7 +295,7 @@ fn export_engine_filters_by_multiple_agents() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -313,7 +323,7 @@ fn export_engine_filters_by_workspace() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -334,14 +344,9 @@ fn export_engine_filters_by_workspace() {
     assert_eq!(stats.conversations_processed, 2);
     assert_eq!(stats.messages_processed, 5);
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let workspaces: Vec<String> = out_conn
-        .prepare("SELECT DISTINCT workspace FROM conversations")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let out_conn = open_db(&output_path).unwrap();
+    let workspaces =
+        query_strings(&out_conn, "SELECT DISTINCT workspace FROM conversations").unwrap();
     assert_eq!(workspaces, vec!["/home/user/project-a"]);
 }
 
@@ -351,7 +356,7 @@ fn export_engine_filters_by_time_range() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -382,7 +387,7 @@ fn export_engine_combined_filters() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -414,7 +419,7 @@ fn export_engine_transforms_paths_with_full_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -430,12 +435,8 @@ fn export_engine_transforms_paths_with_full_mode() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let path: String = out_conn
-        .query_row("SELECT source_path FROM conversations LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let out_conn = open_db(&output_path).unwrap();
+    let path = query_string(&out_conn, "SELECT source_path FROM conversations LIMIT 1").unwrap();
 
     // Full mode preserves the complete path
     assert_eq!(path, "/home/user/project-a/sessions/auth.jsonl");
@@ -447,7 +448,7 @@ fn export_engine_transforms_paths_with_basename_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -463,12 +464,8 @@ fn export_engine_transforms_paths_with_basename_mode() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let path: String = out_conn
-        .query_row("SELECT source_path FROM conversations LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let out_conn = open_db(&output_path).unwrap();
+    let path = query_string(&out_conn, "SELECT source_path FROM conversations LIMIT 1").unwrap();
 
     // Basename mode extracts just the filename
     assert_eq!(path, "auth.jsonl");
@@ -480,7 +477,7 @@ fn export_engine_transforms_paths_with_relative_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -496,12 +493,8 @@ fn export_engine_transforms_paths_with_relative_mode() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let path: String = out_conn
-        .query_row("SELECT source_path FROM conversations LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let out_conn = open_db(&output_path).unwrap();
+    let path = query_string(&out_conn, "SELECT source_path FROM conversations LIMIT 1").unwrap();
 
     // Relative mode strips workspace prefix
     assert_eq!(path, "sessions/auth.jsonl");
@@ -513,7 +506,7 @@ fn export_engine_transforms_paths_with_hash_mode() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -529,12 +522,8 @@ fn export_engine_transforms_paths_with_hash_mode() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
-    let path: String = out_conn
-        .query_row("SELECT source_path FROM conversations LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let out_conn = open_db(&output_path).unwrap();
+    let path = query_string(&out_conn, "SELECT source_path FROM conversations LIMIT 1").unwrap();
 
     // Hash mode produces 16 hex characters
     assert_eq!(path.len(), 16);
@@ -551,7 +540,7 @@ fn export_engine_handles_empty_filter_results() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -572,7 +561,7 @@ fn export_engine_handles_empty_filter_results() {
     assert_eq!(stats.messages_processed, 0);
 
     // Output DB should still be valid
-    let out_conn = Connection::open(&output_path).unwrap();
+    let out_conn = open_db(&output_path).unwrap();
     verify_export_schema(&out_conn).unwrap();
 }
 
@@ -582,7 +571,7 @@ fn export_engine_handles_empty_agents_list() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -609,7 +598,7 @@ fn export_engine_cancellation_via_running_flag() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -639,7 +628,7 @@ fn export_engine_rejects_same_source_and_output() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("source.db");
 
-    let src_conn = Connection::open(&db_path).unwrap();
+    let src_conn = open_db(&db_path).unwrap();
     create_source_db(&src_conn).unwrap();
     drop(src_conn);
 
@@ -665,7 +654,7 @@ fn export_engine_rejects_output_directory() {
     let tmp = TempDir::new().unwrap();
     let source_path = tmp.path().join("source.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     drop(src_conn);
 
@@ -692,7 +681,7 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -718,10 +707,7 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let rerun = ExportEngine::new(&source_path, &output_path, filter);
-    let err = match rerun.execute(|_, _| {}, Some(cancelled)) {
-        Ok(_) => panic!("rerun should stop before replacing the existing export"),
-        Err(err) => err,
-    };
+    let err = rerun.execute(|_, _| {}, Some(cancelled)).err().unwrap();
     assert!(
         err.to_string().contains("cancelled"),
         "expected cancellation error, got: {err}"
@@ -733,21 +719,15 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
         "cancelled rerun should preserve the previous export file"
     );
 
-    let preserved_conn = Connection::open(&output_path).unwrap();
-    let schema_version: String = preserved_conn
-        .query_row(
-            "SELECT value FROM export_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let preserved_conn = open_db(&output_path).unwrap();
+    let schema_version = query_string(
+        &preserved_conn,
+        "SELECT value FROM export_meta WHERE key = 'schema_version'",
+    )
+    .unwrap();
     assert_eq!(schema_version, "1");
-    let conv_count: i64 = preserved_conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
-        .unwrap();
-    let msg_count: i64 = preserved_conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .unwrap();
+    let conv_count = query_i64(&preserved_conn, "SELECT COUNT(*) FROM conversations").unwrap();
+    let msg_count = query_i64(&preserved_conn, "SELECT COUNT(*) FROM messages").unwrap();
     assert_eq!(conv_count, 4);
     assert_eq!(msg_count, 14);
 }
@@ -762,7 +742,7 @@ fn export_engine_populates_fts_indexes() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -778,37 +758,29 @@ fn export_engine_populates_fts_indexes() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
+    let out_conn = open_db(&output_path).unwrap();
 
-    let messages_count: i64 = out_conn
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .unwrap();
+    let messages_count = query_i64(&out_conn, "SELECT COUNT(*) FROM messages").unwrap();
     assert!(messages_count > 0, "Export should contain indexed messages");
 
-    let fts_exists: i64 = out_conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let code_fts_exists: i64 = out_conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_code_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let fts_exists = query_i64(
+        &out_conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+    )
+    .unwrap();
+    let code_fts_exists = query_i64(
+        &out_conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_code_fts'",
+    )
+    .unwrap();
     assert_eq!(fts_exists, 1, "Export should create prose FTS index");
     assert_eq!(code_fts_exists, 1, "Export should create code FTS index");
 
-    let fts_sql: String = out_conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let fts_sql = query_string(
+        &out_conn,
+        "SELECT sql FROM sqlite_master WHERE name = 'messages_fts'",
+    )
+    .unwrap();
     assert!(
         fts_sql.contains("fts5"),
         "messages_fts should be an FTS5 virtual table"
@@ -821,7 +793,7 @@ fn export_engine_preserves_message_order() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
@@ -837,16 +809,14 @@ fn export_engine_preserves_message_order() {
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     engine.execute(|_, _| {}, None).unwrap();
 
-    let out_conn = Connection::open(&output_path).unwrap();
+    let out_conn = open_db(&output_path).unwrap();
 
     // Get messages in idx order
-    let messages: Vec<(i64, String)> = out_conn
-        .prepare("SELECT idx, content FROM messages WHERE conversation_id = 1 ORDER BY idx")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let messages = query_message_pairs(
+        &out_conn,
+        "SELECT idx, content FROM messages WHERE conversation_id = 1 ORDER BY idx",
+    )
+    .unwrap();
 
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0].0, 0);
@@ -865,7 +835,7 @@ fn export_engine_calls_progress_callback() {
     let source_path = tmp.path().join("source.db");
     let output_path = tmp.path().join("export.db");
 
-    let src_conn = Connection::open(&source_path).unwrap();
+    let src_conn = open_db(&source_path).unwrap();
     create_source_db(&src_conn).unwrap();
     insert_test_data(&src_conn).unwrap();
     drop(src_conn);
