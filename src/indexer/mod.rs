@@ -4728,7 +4728,7 @@ fn lexical_rebuild_pipeline_max_message_bytes_in_flight(
     batch_fetch_message_bytes_limit: usize,
     pipeline_channel_size: usize,
 ) -> usize {
-    dotenvy::var("CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT")
+    let desired = dotenvy::var("CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -4736,7 +4736,8 @@ fn lexical_rebuild_pipeline_max_message_bytes_in_flight(
             batch_fetch_message_bytes_limit
                 .max(1)
                 .saturating_mul(pipeline_channel_size.saturating_add(1).max(1))
-        })
+        });
+    responsiveness::effective_inflight_byte_limit(desired).max(1)
 }
 
 fn should_commit_lexical_rebuild(
@@ -5629,6 +5630,7 @@ pub(crate) struct LexicalShardPlanShard {
     pub conversation_count: usize,
     pub message_count: usize,
     pub message_bytes: usize,
+    pub conversation_id_fingerprint: String,
     pub oversized_single_conversation: bool,
 }
 
@@ -5672,6 +5674,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
     let mut conversation_count = 0usize;
     let mut message_count = 0usize;
     let mut message_bytes = 0usize;
+    let mut conversation_ids = Vec::new();
 
     let flush_current_shard = |shards: &mut Vec<LexicalShardPlanShard>,
                                first_conversation_id: &mut Option<i64>,
@@ -5679,10 +5682,12 @@ pub(crate) fn plan_lexical_rebuild_shards(
                                conversation_count: &mut usize,
                                message_count: &mut usize,
                                message_bytes: &mut usize,
+                               conversation_ids: &mut Vec<i64>,
                                oversized_single_conversation: bool| {
         if *conversation_count == 0 {
             return;
         }
+        debug_assert_eq!(*conversation_count, conversation_ids.len());
         shards.push(LexicalShardPlanShard {
             shard_index: shards.len(),
             first_conversation_id: (*first_conversation_id)
@@ -5692,6 +5697,9 @@ pub(crate) fn plan_lexical_rebuild_shards(
             conversation_count: *conversation_count,
             message_count: *message_count,
             message_bytes: *message_bytes,
+            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(
+                conversation_ids,
+            ),
             oversized_single_conversation,
         });
         *first_conversation_id = None;
@@ -5699,6 +5707,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
         *conversation_count = 0;
         *message_count = 0;
         *message_bytes = 0;
+        conversation_ids.clear();
     };
 
     for conversation in ordered {
@@ -5719,6 +5728,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
                 &mut conversation_count,
                 &mut message_count,
                 &mut message_bytes,
+                &mut conversation_ids,
                 false,
             );
         }
@@ -5732,6 +5742,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
                 &mut conversation_count,
                 &mut message_count,
                 &mut message_bytes,
+                &mut conversation_ids,
                 false,
             );
             first_conversation_id = Some(conversation.conversation_id);
@@ -5739,6 +5750,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
             conversation_count = 1;
             message_count = conversation.message_count;
             message_bytes = conversation.message_bytes;
+            conversation_ids.push(conversation.conversation_id);
             flush_current_shard(
                 &mut shards,
                 &mut first_conversation_id,
@@ -5746,6 +5758,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
                 &mut conversation_count,
                 &mut message_count,
                 &mut message_bytes,
+                &mut conversation_ids,
                 true,
             );
             continue;
@@ -5758,6 +5771,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
         conversation_count = conversation_count.saturating_add(1);
         message_count = message_count.saturating_add(conversation.message_count);
         message_bytes = message_bytes.saturating_add(conversation.message_bytes);
+        conversation_ids.push(conversation.conversation_id);
     }
 
     flush_current_shard(
@@ -5767,6 +5781,7 @@ pub(crate) fn plan_lexical_rebuild_shards(
         &mut conversation_count,
         &mut message_count,
         &mut message_bytes,
+        &mut conversation_ids,
         false,
     );
 
@@ -5789,6 +5804,14 @@ pub(crate) fn plan_lexical_rebuild_shards(
         oversized_conversation_ids,
         shards,
     }
+}
+
+fn lexical_shard_conversation_ids_fingerprint(conversation_ids: &[i64]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for conversation_id in conversation_ids {
+        hasher.update(&conversation_id.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn lexical_shard_plan_id(
@@ -5814,6 +5837,7 @@ fn lexical_shard_plan_id(
         hasher.update(&shard.conversation_count.to_le_bytes());
         hasher.update(&shard.message_count.to_le_bytes());
         hasher.update(&shard.message_bytes.to_le_bytes());
+        hasher.update(shard.conversation_id_fingerprint.as_bytes());
         hasher.update(&[u8::from(shard.oversized_single_conversation)]);
     }
     for conversation_id in oversized_conversation_ids {
@@ -10016,6 +10040,8 @@ fn spawn_lexical_rebuild_packet_producer(
                                     conversation_count = shard.conversation_count,
                                     message_count = shard.message_count,
                                     message_bytes = shard.message_bytes,
+                                    conversation_id_fingerprint =
+                                        %shard.conversation_id_fingerprint,
                                     oversized_single_conversation =
                                         shard.oversized_single_conversation,
                                     "lexical rebuild producer opened planned shard boundary"
@@ -18748,6 +18774,73 @@ mod tests {
         assert_eq!(ordered_plan.shards[0].last_conversation_id, 20);
         assert_eq!(ordered_plan.shards[1].first_conversation_id, 30);
         assert_eq!(ordered_plan.shards[1].last_conversation_id, 30);
+    }
+
+    #[test]
+    fn lexical_shard_plan_id_changes_when_sparse_assignments_change() {
+        let budgets = LexicalShardPlannerBudgets {
+            max_conversations_per_shard: 3,
+            max_messages_per_shard: 20,
+            max_message_bytes_per_shard: 2_000,
+        };
+        let plan_a = plan_lexical_rebuild_shards(
+            &[
+                LexicalShardPlannerConversation {
+                    conversation_id: 1,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+                LexicalShardPlannerConversation {
+                    conversation_id: 2,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+                LexicalShardPlannerConversation {
+                    conversation_id: 4,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+            ],
+            budgets,
+        );
+        let plan_b = plan_lexical_rebuild_shards(
+            &[
+                LexicalShardPlannerConversation {
+                    conversation_id: 1,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+                LexicalShardPlannerConversation {
+                    conversation_id: 3,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+                LexicalShardPlannerConversation {
+                    conversation_id: 4,
+                    message_count: 2,
+                    message_bytes: 200,
+                },
+            ],
+            budgets,
+        );
+
+        assert_eq!(plan_a.shards.len(), 1);
+        assert_eq!(plan_b.shards.len(), 1);
+        assert_eq!(plan_a.shards[0].first_conversation_id, 1);
+        assert_eq!(plan_b.shards[0].first_conversation_id, 1);
+        assert_eq!(plan_a.shards[0].last_conversation_id, 4);
+        assert_eq!(plan_b.shards[0].last_conversation_id, 4);
+        assert_eq!(plan_a.shards[0].conversation_count, 3);
+        assert_eq!(plan_b.shards[0].conversation_count, 3);
+        assert_ne!(
+            plan_a.shards[0].conversation_id_fingerprint,
+            plan_b.shards[0].conversation_id_fingerprint,
+            "sparse shard assignments with the same range and totals need distinct shard evidence"
+        );
+        assert_ne!(
+            plan_a.plan_id, plan_b.plan_id,
+            "plan identity must include interior conversation IDs, not only shard ranges"
+        );
     }
 
     #[test]
