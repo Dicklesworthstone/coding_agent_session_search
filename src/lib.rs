@@ -288,7 +288,10 @@ pub enum Commands {
         /// Filter by workspace path (can be specified multiple times)
         #[arg(long)]
         workspace: Vec<String>,
-        /// Max results (0 = no limit)
+        /// Max results. 0 = "no limit" but is auto-capped to a RAM-proportional ceiling
+        /// (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single
+        /// query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits>
+        /// or CASS_SEARCH_NO_LIMIT_BYTES=<bytes>.
         #[arg(long, default_value_t = 0)]
         limit: usize,
         /// Offset for pagination (start at Nth result)
@@ -6456,9 +6459,20 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_RESPONSIVENESS_SEVERE_PSI_AVG10=<F>  PSI severe threshold (default 40.0)".to_string(),
             "  CASS_RESPONSIVENESS_GROWTH_TICKS=<N>     healthy ticks needed before each 25pp grow step (default 3)".to_string(),
             "  CASS_RESPONSIVENESS_TICK_SECS=<N>        sampler interval in seconds (default 2)".to_string(),
+            "  CASS_RESPONSIVENESS_CALIBRATION=static|conformal  threshold policy (DEFAULT: conformal). Set to `static` to revert to legacy hand-tuned 1.25/20.0 thresholds.".to_string(),
+            "  CASS_RESPONSIVENESS_CONFORMAL_K=<N>      calibration window size (clamped 16..4096, default 256)".to_string(),
+            "  CASS_RESPONSIVENESS_CONFORMAL_K_MIN=<N>  min samples before quantile emits (clamped 4..K, default 32)".to_string(),
+            "  CASS_RESPONSIVENESS_CONFORMAL_ALPHA_PRESSURED=<F>  FP rate for pressured quantile (0<α<0.5, default 0.05)".to_string(),
+            "  CASS_RESPONSIVENESS_CONFORMAL_ALPHA_SEVERE=<F>  FP rate for severe quantile (0<α<pressured, default 0.01)".to_string(),
+            "  CASS_RESPONSIVENESS_DRIFT_DELTA=<F>      Page-Hinkley drift tolerance δ (default 0.01)".to_string(),
+            "  CASS_RESPONSIVENESS_DRIFT_LAMBDA=<F>     Page-Hinkley trigger λ for calibration reset (default 0.5)".to_string(),
             "  CASS_STREAMING_CONSUMER_COMMIT_SECS=<N>  base streaming-consumer Tantivy commit cadence (default 5)".to_string(),
             "  CASS_SEMANTIC_BATCH_SIZE=<N>             embedder batch size (default 128)".to_string(),
             "  CASS_SEMANTIC_PREP_PARALLEL=1            opt in to rayon-parallel canonicalize+hash prep (default off: serial is measurably faster on the common cheap-embedder path)".to_string(),
+            "  CASS_STREAMING_CONSUMER_COMBINE=0        DISABLE flat-combining drain in run_streaming_consumer (Card 3; DEFAULT: on). Any non-off value (unset, 1, true, yes, on) leaves combining enabled.".to_string(),
+            "  CASS_STREAMING_COMBINE_MAX=<N>           max messages per combined drain (clamped 1..1024, default 64)".to_string(),
+            "  CASS_STREAMING_COMBINE_MAX_BYTES=<N>     byte cap per combined drain (clamped 1MiB..STREAMING_MAX, default half)".to_string(),
+            "  CASS_INDEXER_PARALLEL_WAL=off            DISABLE Card 1 parallel-WAL shadow observer (DEFAULT: shadow). Observer records per-chunk wall-clock; does NOT change commit semantics. `on`/`commit` are reserved for a future revision.".to_string(),
         ],
         RobotTopic::Paths => {
             let mut lines: Vec<String> = vec!["paths:".to_string()];
@@ -10319,6 +10333,14 @@ fn run_health(
         let responsiveness =
             serde_json::to_value(crate::indexer::responsiveness::telemetry_snapshot())
                 .unwrap_or(serde_json::Value::Null);
+        // Parallel-WAL shadow observer (Card 1, shadow-only phase). Present
+        // in every health response; `active=false` when the env isn't set.
+        // Operators comparing rebuild workloads can read
+        // `.parallel_wal_shadow.recent_chunks` to see what the observer
+        // saw during the most recent begin-concurrent run.
+        let parallel_wal_shadow =
+            serde_json::to_value(crate::indexer::parallel_wal_shadow::telemetry_snapshot())
+                .unwrap_or(serde_json::Value::Null);
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -10340,6 +10362,7 @@ fn run_health(
                     .unwrap_or(serde_json::Value::Bool(false))
             },
             "responsiveness": responsiveness,
+            "parallel_wal_shadow": parallel_wal_shadow,
             "state": state
         });
         output_structured_value(payload, fmt)?;
@@ -15080,6 +15103,30 @@ fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Val
                                             "psi_cpu_some_avg10": { "type": ["number", "null"] }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                },
+                "parallel_wal_shadow": {
+                    "type": "object",
+                    "description": "Parallel-WAL shadow observer (Card 1, shadow-only phase). Activates under CASS_INDEXER_PARALLEL_WAL=shadow. Records per-chunk wall-clock on begin-concurrent writes so operators can assess what an epoch-ordered group-commit coordinator would have decided. NEVER changes commit semantics.",
+                    "properties": {
+                        "active": { "type": "boolean", "description": "True when shadow mode is enabled." },
+                        "chunks_observed": { "type": "integer", "description": "Cumulative shadow-observed chunks since startup." },
+                        "cumulative_wall_micros": { "type": "integer", "description": "Total wall-clock across observed chunks (µs)." },
+                        "chunk_errors": { "type": "integer", "description": "Count of observed chunks that returned an error." },
+                        "recent_chunks": {
+                            "type": "array",
+                            "description": "Bounded ring buffer of the most-recent chunk records, oldest → newest.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "chunk_idx": { "type": "integer" },
+                                    "base_conv_idx": { "type": "integer" },
+                                    "convs_in_chunk": { "type": "integer" },
+                                    "wall_micros": { "type": "integer" },
+                                    "succeeded": { "type": "boolean" }
                                 }
                             }
                         }

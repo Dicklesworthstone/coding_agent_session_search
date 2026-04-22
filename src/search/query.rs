@@ -341,6 +341,109 @@ const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
 const HYBRID_NO_LIMIT_SEMANTIC_CAP: usize = 2048;
 
+/// Upper bound on how many documents a `limit == 0` ("no limit") search is
+/// allowed to materialize. Each `SearchHit` carries the full message
+/// `content` string (roughly 80 KB p99 in real corpora), so an unlimited
+/// search on a ~500k-row user history can easily allocate tens of
+/// gigabytes of heap AND drive sustained multi-GB/s reads off the Tantivy
+/// `.store` file and SQLite rows, crushing the whole machine.
+///
+/// The cap is computed dynamically from `/proc/meminfo` `MemAvailable`
+/// (Linux) so a dev box with 512 GB of RAM is allowed to return ~200k
+/// rows while a 2 GB laptop stops at the floor. The cap translates
+/// directly into an upper bound on disk-I/O per query because the
+/// per-hit hydration loop in `fs_load_doc()` / `hydrate_tantivy_hit_contents`
+/// does ~11 `.store` field reads per hit plus up to one SQLite row
+/// fetch — bounding hits bounds bytes read.
+///
+/// Override with `CASS_SEARCH_NO_LIMIT_CAP=<hits>` or
+/// `CASS_SEARCH_NO_LIMIT_BYTES=<bytes>`. Both overrides are still
+/// clamped to `[NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX]` on the way
+/// out — an unclamped override would re-open the same "crush the
+/// machine" hole this cap exists to close.
+pub const NO_LIMIT_RESULT_MIN: usize = 1_000;
+pub const NO_LIMIT_RESULT_MAX: usize = 1_000_000;
+
+/// Approximate on-heap size per `SearchHit` used to translate a
+/// memory budget into a hit-count cap. Kept conservatively high
+/// (p99-ish message content + metadata strings) so real workloads
+/// stay well under the computed bytes budget.
+const AVG_HIT_BYTES: u64 = 80 * 1024;
+
+/// Absolute ceiling on the memory budget for a single "no limit"
+/// search, regardless of how much RAM is free. 16 GiB keeps sustained
+/// disk reads on a single query bounded to <10 s on a 2 GB/s NVMe —
+/// long enough for a power user to wait, short enough not to block
+/// other workloads on a shared box.
+const NO_LIMIT_BYTES_CEILING: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Floor on the memory budget. On a 2 GB laptop we still let a
+/// single "no limit" query use ~256 MiB — small enough to survive,
+/// large enough to be useful.
+const NO_LIMIT_BYTES_FLOOR: u64 = 256 * 1024 * 1024;
+
+/// Fraction of `MemAvailable` we're willing to spend on a single
+/// "no limit" search response. 1/16 leaves 93% of RAM for everything
+/// else on the box.
+const NO_LIMIT_RAM_DIVISOR: u64 = 16;
+
+fn available_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn no_limit_result_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        compute_no_limit_result_cap_from(
+            std::env::var("CASS_SEARCH_NO_LIMIT_CAP").ok(),
+            std::env::var("CASS_SEARCH_NO_LIMIT_BYTES").ok(),
+            available_memory_bytes(),
+        )
+    })
+}
+
+/// Pure version of the cap-computation, with env + `/proc/meminfo`
+/// passed in as arguments. Kept pure so unit tests can drive it
+/// deterministically without mutating the process-global env (which
+/// would race with every other parallel test that reads env, including
+/// the search-query pipeline tests that transitively hit
+/// `no_limit_result_cap()`).
+fn compute_no_limit_result_cap_from(
+    cap_env: Option<String>,
+    bytes_env: Option<String>,
+    available_bytes: Option<u64>,
+) -> usize {
+    // Explicit hit-count override takes priority, but is still clamped
+    // to `[MIN, MAX]` so a typo like `CASS_SEARCH_NO_LIMIT_CAP=10000000000`
+    // can't reopen the unbounded-result bug this cap closes.
+    if let Some(hits) = cap_env
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX);
+    }
+    let budget_bytes = bytes_env
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            available_bytes
+                .map(|avail| {
+                    (avail / NO_LIMIT_RAM_DIVISOR)
+                        .clamp(NO_LIMIT_BYTES_FLOOR, NO_LIMIT_BYTES_CEILING)
+                })
+                .unwrap_or(NO_LIMIT_BYTES_FLOOR)
+        });
+    let hits = (budget_bytes / AVG_HIT_BYTES) as usize;
+    hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX)
+}
+
 static FRANKENSEARCH_TWO_TIER_CONFIG: Lazy<FsTwoTierConfig> =
     Lazy::new(|| FsTwoTierConfig::optimized().with_env_overrides());
 
@@ -390,12 +493,25 @@ fn hybrid_candidate_budget(
     // but bound semantic fanout so hybrid doesn't try to score the entire corpus.
     if requested_limit == 0 {
         let planning_window = HYBRID_NO_LIMIT_PLANNING_WINDOW.max(offset.saturating_add(1));
+        // Cap the lexical fanout — without a ceiling a "no limit" hybrid
+        // query on a ~500k-row corpus asks Tantivy to materialize a
+        // `Vec<SearchHit>` the size of the entire index, which is the
+        // unboundedness fixed by `no_limit_result_cap()`.
+        let lexical = effective_limit.min(total_docs).min(no_limit_result_cap());
+        // Semantic fan-out can be wide in principle, but must never
+        // exceed the lexical cap — the pipeline fuses lexical+semantic
+        // candidates and returning more semantic candidates than
+        // lexical is both wasteful (semantic is the expensive tier)
+        // and breaks the pre-cap invariant that `semantic ≤ lexical`.
+        // On tiny boxes where `no_limit_result_cap()` hits the floor,
+        // this pulls semantic down with it.
         let semantic = fs_candidate_count(planning_window, 0, sem_mult)
             .max(planning_window)
             .min(HYBRID_NO_LIMIT_SEMANTIC_CAP.max(offset.saturating_add(planning_window)))
-            .min(total_docs);
+            .min(total_docs)
+            .min(lexical);
         return HybridCandidateBudget {
-            lexical_candidates: effective_limit.min(total_docs),
+            lexical_candidates: lexical,
             semantic_candidates: semantic,
         };
     }
@@ -2829,7 +2945,7 @@ impl SearchClient {
         let sanitized = nfc_sanitize_query(query);
         let field_mask = effective_field_mask(field_mask);
         let limit = if limit == 0 {
-            self.total_docs().max(1)
+            self.total_docs().min(no_limit_result_cap()).max(1)
         } else {
             limit
         };
@@ -4542,7 +4658,7 @@ impl SearchClient {
             return Ok((Vec::new(), None));
         }
         let limit = if limit == 0 {
-            self.total_docs().max(1)
+            self.total_docs().min(no_limit_result_cap()).max(1)
         } else {
             limit
         };
@@ -4853,7 +4969,7 @@ impl SearchClient {
         let requested_limit = limit;
         let total_docs = self.total_docs().max(1);
         let limit = if requested_limit == 0 {
-            total_docs
+            total_docs.min(no_limit_result_cap()).max(1)
         } else {
             requested_limit
         };
@@ -14963,13 +15079,125 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_budget_no_limit_caps_semantic_without_capping_lexical() {
-        let total_docs = 30_000;
+    fn hybrid_budget_no_limit_caps_both_lexical_and_semantic() {
+        // Regression: a "no limit" hybrid search on a large corpus used to
+        // set `lexical_candidates = total_docs`, which let a single
+        // `cass search` request grow to tens of GB of RAM on a ~500k-row
+        // user history and saturate disk IO. Both lexical and semantic
+        // fanout are now bounded, lexical against the RAM-proportional
+        // `no_limit_result_cap()` ceiling and semantic against the narrower
+        // `HYBRID_NO_LIMIT_SEMANTIC_CAP` ceiling.
+        let total_docs = 2_000_000;
         let budget =
             hybrid_candidate_budget("authentication middleware", 0, total_docs, 0, total_docs);
-        assert_eq!(budget.lexical_candidates, total_docs);
+        let cap = no_limit_result_cap();
+        assert!(
+            budget.lexical_candidates <= cap,
+            "lexical fanout must respect no_limit_result_cap() = {cap}; got {}",
+            budget.lexical_candidates
+        );
+        assert!(
+            budget.lexical_candidates <= NO_LIMIT_RESULT_MAX,
+            "lexical fanout must respect the absolute NO_LIMIT_RESULT_MAX; got {}",
+            budget.lexical_candidates
+        );
         assert!(budget.semantic_candidates <= HYBRID_NO_LIMIT_SEMANTIC_CAP);
-        assert!(budget.semantic_candidates < budget.lexical_candidates);
+        // Invariant preserved by the `.min(lexical)` clamp inside
+        // hybrid_candidate_budget: semantic fanout never exceeds
+        // lexical fanout. On typical hosts lexical >> semantic, but
+        // the cheaper `<=` assertion also holds on edge-case tiny
+        // boxes where the overall cap pulls lexical down to the
+        // planning window.
+        assert!(
+            budget.semantic_candidates <= budget.lexical_candidates,
+            "semantic ({}) must not exceed lexical ({}) fanout",
+            budget.semantic_candidates,
+            budget.lexical_candidates
+        );
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_clamps_explicit_over_ceiling_env_override() {
+        // A naively large explicit override must still be clamped. The
+        // old implementation returned the env value unclamped, which
+        // reintroduced the unbounded-result failure mode. Driven via
+        // the pure `*_from` helper so we can't race with other
+        // concurrent tests that read the real env.
+        let cap = compute_no_limit_result_cap_from(
+            Some("999999999999".to_string()),
+            None,
+            None,
+        );
+        assert!(
+            cap <= NO_LIMIT_RESULT_MAX,
+            "explicit override must still clamp to ceiling; got {cap} > {NO_LIMIT_RESULT_MAX}"
+        );
+        assert!(cap >= NO_LIMIT_RESULT_MIN);
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_clamps_tiny_explicit_override_up_to_floor() {
+        // Mirror case: an explicit override under the floor is lifted.
+        let cap = compute_no_limit_result_cap_from(Some("1".to_string()), None, None);
+        assert_eq!(cap, NO_LIMIT_RESULT_MIN);
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_uses_meminfo_when_no_env_override() {
+        // 128 GiB available → 128 / 16 = 8 GiB budget (under the 16 GiB
+        // ceiling, above the 256 MiB floor) → 8 GiB / 80 KiB ≈ 104k
+        // hits. That lands inside [MIN, MAX] and above floor.
+        let cap = compute_no_limit_result_cap_from(
+            None,
+            None,
+            Some(128u64 * 1024 * 1024 * 1024),
+        );
+        assert!(cap >= NO_LIMIT_RESULT_MIN, "cap {cap} below floor");
+        assert!(cap <= NO_LIMIT_RESULT_MAX, "cap {cap} above ceiling");
+        // Sanity: 128 GiB / 16 / 80 KiB is nowhere near 1k.
+        assert!(cap > NO_LIMIT_RESULT_MIN * 10);
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_falls_back_to_floor_when_meminfo_unavailable() {
+        // Simulates non-Linux (no /proc/meminfo): must still produce a
+        // finite, in-envelope cap. The floor budget (256 MiB) / 80 KiB
+        // ≈ 3276 hits — above MIN, below MAX.
+        let cap = compute_no_limit_result_cap_from(None, None, None);
+        assert!(cap >= NO_LIMIT_RESULT_MIN);
+        assert!(cap <= NO_LIMIT_RESULT_MAX);
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_bytes_env_takes_priority_over_meminfo() {
+        // Explicit bytes override wins over MemAvailable. 4 GiB bytes
+        // / 80 KiB ≈ 52k hits, distinct from what a large MemAvailable
+        // hint would otherwise produce (which would hit the 16 GiB
+        // ceiling → ~209k hits).
+        let four_gib = (4u64 * 1024 * 1024 * 1024).to_string();
+        let cap = compute_no_limit_result_cap_from(
+            None,
+            Some(four_gib),
+            Some(1024u64 * 1024 * 1024 * 1024), // 1 TiB (would ceiling otherwise)
+        );
+        let expected_hits =
+            ((4u64 * 1024 * 1024 * 1024) / AVG_HIT_BYTES) as usize;
+        let expected = expected_hits.clamp(NO_LIMIT_RESULT_MIN, NO_LIMIT_RESULT_MAX);
+        assert_eq!(cap, expected, "bytes env must win over meminfo");
+    }
+
+    #[test]
+    fn compute_no_limit_result_cap_ignores_malformed_env() {
+        // Garbage or zero values fall back to meminfo / floor, not crash.
+        for bad in ["", "abc", "0", "-1"] {
+            let cap = compute_no_limit_result_cap_from(
+                Some(bad.to_string()),
+                Some(bad.to_string()),
+                None,
+            );
+            assert!(cap >= NO_LIMIT_RESULT_MIN, "bad={bad:?} cap={cap}");
+            assert!(cap <= NO_LIMIT_RESULT_MAX, "bad={bad:?} cap={cap}");
+        }
     }
 
     // =============================================================================
