@@ -92,7 +92,10 @@ fn capture_docs(topic: &str) -> String {
 
 #[test]
 fn robot_docs_exit_codes_matches_golden() {
-    assert_golden("robot_docs/exit-codes.txt.golden", &capture_docs("exit-codes"));
+    assert_golden(
+        "robot_docs/exit-codes.txt.golden",
+        &capture_docs("exit-codes"),
+    );
 }
 
 #[test]

@@ -4897,6 +4897,83 @@ fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
     }
 }
 
+fn validate_lexical_rebuild_shard_build_result(
+    result: &LexicalRebuildShardBuildResult,
+) -> Result<LexicalRebuildShardMergeArtifact> {
+    let observed_docs = live_tantivy_doc_count(&result.shard_index_path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "built lexical rebuild shard {} at {} is not searchable",
+            result.shard.shard_index,
+            result.shard_index_path.display()
+        )
+    })?;
+    if observed_docs != result.indexed_docs {
+        return Err(anyhow::anyhow!(
+            "built lexical rebuild shard {} reported {} docs but a fresh Tantivy reader sees {}",
+            result.shard.shard_index,
+            result.indexed_docs,
+            observed_docs
+        ));
+    }
+    if observed_docs != result.shard.message_count {
+        return Err(anyhow::anyhow!(
+            "built lexical rebuild shard {} indexed {} docs but its shard plan expected {} messages",
+            result.shard.shard_index,
+            observed_docs,
+            result.shard.message_count
+        ));
+    }
+
+    Ok(LexicalRebuildShardMergeArtifact {
+        first_shard_index: result.shard.shard_index,
+        last_shard_index: result.shard.shard_index,
+        index_path: result.shard_index_path.clone(),
+    })
+}
+
+fn validate_complete_lexical_rebuild_shard_artifacts(
+    shard_plan: &LexicalShardPlan,
+    artifacts: &[LexicalRebuildShardMergeArtifact],
+) -> Result<()> {
+    if artifacts.len() != shard_plan.shards.len() {
+        return Err(anyhow::anyhow!(
+            "staged lexical rebuild validated {} shard artifacts but planned {} shards",
+            artifacts.len(),
+            shard_plan.shards.len()
+        ));
+    }
+
+    for (expected, artifact) in shard_plan.shards.iter().zip(artifacts.iter()) {
+        if artifact.first_shard_index != expected.shard_index
+            || artifact.last_shard_index != expected.shard_index
+        {
+            return Err(anyhow::anyhow!(
+                "staged lexical rebuild shard artifact order mismatch: expected shard {} but got range {}..={}",
+                expected.shard_index,
+                artifact.first_shard_index,
+                artifact.last_shard_index
+            ));
+        }
+        let observed_docs = live_tantivy_doc_count(&artifact.index_path)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "validated lexical rebuild shard {} at {} is no longer searchable before publish",
+                expected.shard_index,
+                artifact.index_path.display()
+            )
+        })?;
+        if observed_docs != expected.message_count {
+            return Err(anyhow::anyhow!(
+                "validated lexical rebuild shard {} has {} docs but its shard plan expected {} messages",
+                expected.shard_index,
+                observed_docs,
+                expected.message_count
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn pending_commit_landed(
     base_meta_fingerprint: Option<&str>,
     current_meta_fingerprint: Option<&str>,
@@ -10879,16 +10956,14 @@ fn rebuild_tantivy_from_db_via_staged_shards(
          -> Result<bool> {
             let mut force_progress_persist = false;
             while let Some(result) = pending_completed_shards.remove(next_shard_to_commit) {
+                let validated_artifact =
+                    validate_lexical_rebuild_shard_build_result(&result)?;
                 *processed_conversations =
                     processed_conversations.saturating_add(result.shard.conversation_count);
                 *indexed_docs = indexed_docs.saturating_add(result.indexed_docs);
                 *observed_messages = observed_messages.saturating_add(result.shard.message_count);
                 *last_processed_conversation_id = Some(result.shard.last_conversation_id);
-                completed_shard_artifacts.push(LexicalRebuildShardMergeArtifact {
-                    first_shard_index: result.shard.shard_index,
-                    last_shard_index: result.shard.shard_index,
-                    index_path: result.shard_index_path,
-                });
+                completed_shard_artifacts.push(validated_artifact);
                 *conversations_since_progress_persist = conversations_since_progress_persist
                     .saturating_add(result.shard.conversation_count);
                 if let Some(p) = &progress {
@@ -11390,6 +11465,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 shard_plan.shards.len()
             ));
         }
+        validate_complete_lexical_rebuild_shard_artifacts(&shard_plan, &completed_shard_artifacts)?;
         let mut reduced_final_merge_artifacts = merge_coordinator.final_merge_input_artifacts();
         if reduced_final_merge_artifacts.len()
             > LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN
