@@ -136,8 +136,6 @@ pub(crate) struct LexicalRebuildPacketFingerprintInput<'a> {
     pub source_id: &'a str,
     pub origin_kind: &'a str,
     pub origin_host: Option<&'a str>,
-    pub contract_semantic_hash: &'a str,
-    pub contract_message_hash: &'a str,
     pub lexical_projected_content_bytes: usize,
     pub messages: &'a crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
     pub message_count: usize,
@@ -1891,8 +1889,6 @@ impl LexicalRebuildConversationPacket {
             source_id: self.provenance.source_id.as_str(),
             origin_kind: self.provenance.origin_kind.as_str(),
             origin_host: self.provenance.origin_host.as_deref(),
-            contract_semantic_hash: self.contract_hashes.semantic_hash.as_str(),
-            contract_message_hash: self.contract_hashes.message_hash.as_str(),
             lexical_projected_content_bytes: self.contract_projections.lexical.total_content_bytes,
             messages: &self.messages,
             message_count: self.message_count,
@@ -1995,7 +1991,6 @@ impl LexicalRebuildConversationPacket {
             source_id: self.provenance.source_id.clone(),
             origin_kind: self.provenance.origin_kind.clone(),
             origin_host: self.provenance.origin_host.clone(),
-            contract_hashes: self.contract_hashes.clone(),
             contract_projections: self.contract_projections.clone(),
             messages: self.messages.clone(),
             message_count: self.message_count,
@@ -2105,14 +2100,6 @@ impl LexicalRebuildEquivalenceAccumulator {
         lexical_rebuild_equivalence_update_opt_str(
             &mut self.manifest_hasher,
             fingerprint.origin_host,
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.contract_semantic_hash),
-        );
-        lexical_rebuild_equivalence_update_opt_str(
-            &mut self.manifest_hasher,
-            Some(fingerprint.contract_message_hash),
         );
         self.manifest_hasher
             .update(&(fingerprint.lexical_projected_content_bytes as u64).to_le_bytes());
@@ -2327,7 +2314,6 @@ struct LexicalRebuildPacketSemanticView {
     source_id: String,
     origin_kind: String,
     origin_host: Option<String>,
-    contract_hashes: ConversationPacketHashes,
     contract_projections: ConversationPacketSinkProjections,
     messages: crate::storage::sqlite::LexicalRebuildGroupedMessageRows,
     message_count: usize,
