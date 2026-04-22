@@ -18432,7 +18432,7 @@ mod tests {
         materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
 
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let conn = rusqlite_test_fixture_conn(&db_path);
         conn.execute_batch("PRAGMA writable_schema = ON;").unwrap();
         conn.execute(
             "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
