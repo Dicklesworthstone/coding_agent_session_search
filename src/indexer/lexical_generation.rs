@@ -35,6 +35,7 @@
 //!   answers both "is this generation safe to serve?" and "does it
 //!   correspond to the expected DB?".
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current manifest format version. Bump whenever the struct layout changes
 /// in a way that older or newer readers cannot ignore.
-pub(crate) const LEXICAL_GENERATION_MANIFEST_VERSION: u32 = 1;
+pub(crate) const LEXICAL_GENERATION_MANIFEST_VERSION: u32 = 2;
 
 /// File name used inside a generation directory for the manifest artifact.
 pub(crate) const LEXICAL_GENERATION_MANIFEST_FILE: &str = "lexical-generation-manifest.json";
@@ -86,6 +87,119 @@ pub(crate) enum LexicalGenerationPublishState {
     /// Generation is quarantined: keep the artifacts on disk for inspection
     /// but never serve them. Used for debugging failed rebuilds.
     Quarantined,
+}
+
+/// Per-shard lifecycle state. This is intentionally richer than the
+/// generation-level state so recovery can reason from durable facts instead
+/// of directory names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalShardLifecycleState {
+    /// Shard is planned but no output exists yet.
+    Planned,
+    /// Builder is actively writing the shard.
+    Building,
+    /// Output exists in a staged directory but has not been validated.
+    Staged,
+    /// Validation succeeded; the shard can be included in publish.
+    Validated,
+    /// Shard is part of a published generation.
+    Published,
+    /// Shard has staged output that recovery can safely continue.
+    Resumable,
+    /// Shard must be retained for inspection and excluded from serving.
+    Quarantined,
+    /// Shard is invalid or intentionally abandoned; rebuild from source.
+    Abandoned,
+}
+
+/// Shard-plan identity for a generation. All shard manifests in a generation
+/// must agree with this plan id before publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalGenerationShardPlan {
+    pub plan_id: String,
+    pub planner_version: u32,
+    pub shard_count: u32,
+    pub packet_contract_version: u32,
+    pub source_db_fingerprint: String,
+}
+
+/// Effective build budget and controller context that shaped a generation.
+/// This keeps postmortems explainable without dragging runtime-only planner
+/// structs into the durable manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalGenerationBuildBudget {
+    pub policy_id: String,
+    pub effective_settings_fingerprint: String,
+    pub max_inflight_message_bytes: u64,
+    pub producer_queue_pages: u64,
+    pub batch_conversation_limit: u64,
+    pub worker_threads: u64,
+    pub controller_reason: Option<String>,
+    #[serde(default)]
+    pub extra_limits: BTreeMap<String, u64>,
+}
+
+/// Durable footprint and retention metadata for one shard artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalShardManifest {
+    pub shard_id: String,
+    pub shard_ordinal: u32,
+    pub state: LexicalShardLifecycleState,
+    pub updated_at_ms: i64,
+    pub indexed_doc_count: u64,
+    pub message_count: u64,
+    pub artifact_bytes: u64,
+    pub stable_hash: Option<String>,
+    pub reclaimable: bool,
+    pub pinned: bool,
+    pub recovery_reason: Option<String>,
+    pub quarantine_reason: Option<String>,
+}
+
+impl LexicalShardManifest {
+    pub(crate) fn planned(shard_id: impl Into<String>, shard_ordinal: u32, now_ms: i64) -> Self {
+        Self {
+            shard_id: shard_id.into(),
+            shard_ordinal,
+            state: LexicalShardLifecycleState::Planned,
+            updated_at_ms: now_ms,
+            indexed_doc_count: 0,
+            message_count: 0,
+            artifact_bytes: 0,
+            stable_hash: None,
+            reclaimable: true,
+            pinned: false,
+            recovery_reason: None,
+            quarantine_reason: None,
+        }
+    }
+
+    pub(crate) fn transition(&mut self, state: LexicalShardLifecycleState, now_ms: i64) {
+        self.state = state;
+        self.updated_at_ms = now_ms;
+    }
+}
+
+/// Crash-startup decision derived only from manifest state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalGenerationRecoveryAction {
+    AttachPublished,
+    PublishValidated,
+    ResumeStaged,
+    KeepQuarantined,
+    DiscardAndRebuild,
+    IgnoreSuperseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalGenerationRecoveryDecision {
+    pub action: LexicalGenerationRecoveryAction,
+    pub reason: String,
+    pub resumable_shards: Vec<String>,
+    pub quarantined_shards: Vec<String>,
+    pub abandoned_shards: Vec<String>,
 }
 
 /// Single entry in a generation's append-only failure log.
@@ -139,6 +253,15 @@ pub(crate) struct LexicalGenerationManifest {
     /// ibuuh.29) so generation acceptance can cross-check the streaming
     /// accumulator digest.
     pub equivalence_manifest_fingerprint: Option<String>,
+    /// Shard-plan identity, present for shard-farm generations.
+    #[serde(default)]
+    pub shard_plan: Option<LexicalGenerationShardPlan>,
+    /// Build-budget and effective-settings context that governed this run.
+    #[serde(default)]
+    pub build_budget: Option<LexicalGenerationBuildBudget>,
+    /// Durable per-shard state. Empty for legacy single-generation builds.
+    #[serde(default)]
+    pub shards: Vec<LexicalShardManifest>,
     pub build_state: LexicalGenerationBuildState,
     pub publish_state: LexicalGenerationPublishState,
     /// Append-only history of attempts that failed under this
@@ -167,10 +290,72 @@ impl LexicalGenerationManifest {
             message_count: 0,
             indexed_doc_count: 0,
             equivalence_manifest_fingerprint: None,
+            shard_plan: None,
+            build_budget: None,
+            shards: Vec::new(),
             build_state: LexicalGenerationBuildState::Scratch,
             publish_state: LexicalGenerationPublishState::Staged,
             failure_history: Vec::new(),
         }
+    }
+
+    /// Attach shard-plan and budget context. The manifest records this once
+    /// near generation creation so later recovery can explain which plan and
+    /// controller limits produced the staged outputs.
+    pub(crate) fn set_shard_plan_and_budget(
+        &mut self,
+        shard_plan: LexicalGenerationShardPlan,
+        build_budget: LexicalGenerationBuildBudget,
+        now_ms: i64,
+    ) {
+        self.shard_plan = Some(shard_plan);
+        self.build_budget = Some(build_budget);
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Replace the durable shard list. Callers should provide one entry per
+    /// planned shard in ordinal order.
+    pub(crate) fn set_shards(&mut self, shards: Vec<LexicalShardManifest>, now_ms: i64) {
+        self.shards = shards;
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Transition a known shard by id. Returns true when the shard existed.
+    pub(crate) fn transition_shard(
+        &mut self,
+        shard_id: &str,
+        state: LexicalShardLifecycleState,
+        now_ms: i64,
+        reason: Option<String>,
+    ) -> bool {
+        let Some(shard) = self
+            .shards
+            .iter_mut()
+            .find(|candidate| candidate.shard_id == shard_id)
+        else {
+            return false;
+        };
+        shard.transition(state, now_ms);
+        match state {
+            LexicalShardLifecycleState::Quarantined => {
+                shard.quarantine_reason = reason;
+                shard.reclaimable = false;
+            }
+            LexicalShardLifecycleState::Resumable => {
+                shard.recovery_reason = reason;
+            }
+            LexicalShardLifecycleState::Published => {
+                shard.pinned = true;
+                shard.reclaimable = false;
+            }
+            LexicalShardLifecycleState::Abandoned => {
+                shard.recovery_reason = reason;
+                shard.reclaimable = true;
+            }
+            _ => {}
+        }
+        self.updated_at_ms = now_ms;
+        true
     }
 
     /// Record a build-state transition, bumping `updated_at_ms`.
@@ -208,6 +393,127 @@ impl LexicalGenerationManifest {
     pub(crate) fn is_serveable(&self) -> bool {
         matches!(self.build_state, LexicalGenerationBuildState::Validated)
             && matches!(self.publish_state, LexicalGenerationPublishState::Published)
+    }
+
+    /// Derive the crash-startup action from durable manifest state. This is
+    /// intentionally conservative: any quarantined or abandoned shard prevents
+    /// partial shard sets from becoming visible to search.
+    pub(crate) fn recovery_decision(&self) -> LexicalGenerationRecoveryDecision {
+        let resumable_shards = self.shards_with_state(&[
+            LexicalShardLifecycleState::Building,
+            LexicalShardLifecycleState::Staged,
+            LexicalShardLifecycleState::Resumable,
+        ]);
+        let quarantined_shards = self.shards_with_state(&[LexicalShardLifecycleState::Quarantined]);
+        let abandoned_shards = self.shards_with_state(&[LexicalShardLifecycleState::Abandoned]);
+
+        let (action, reason) = if matches!(
+            self.publish_state,
+            LexicalGenerationPublishState::Superseded
+        ) {
+            (
+                LexicalGenerationRecoveryAction::IgnoreSuperseded,
+                format!(
+                    "generation {} was superseded by a newer publish",
+                    self.generation_id
+                ),
+            )
+        } else if !quarantined_shards.is_empty()
+            || matches!(
+                self.publish_state,
+                LexicalGenerationPublishState::Quarantined
+            )
+        {
+            (
+                LexicalGenerationRecoveryAction::KeepQuarantined,
+                format!(
+                    "generation {} has quarantined shard state and must stay out of search",
+                    self.generation_id
+                ),
+            )
+        } else if !abandoned_shards.is_empty()
+            || matches!(self.build_state, LexicalGenerationBuildState::Failed)
+        {
+            (
+                LexicalGenerationRecoveryAction::DiscardAndRebuild,
+                format!(
+                    "generation {} has abandoned or failed state and must rebuild from source",
+                    self.generation_id
+                ),
+            )
+        } else if self.is_serveable() {
+            (
+                LexicalGenerationRecoveryAction::AttachPublished,
+                format!(
+                    "generation {} is validated and published",
+                    self.generation_id
+                ),
+            )
+        } else if matches!(self.build_state, LexicalGenerationBuildState::Validated)
+            && self.all_shards_publish_ready()
+        {
+            (
+                LexicalGenerationRecoveryAction::PublishValidated,
+                format!(
+                    "generation {} is validated with a complete publish-ready shard set",
+                    self.generation_id
+                ),
+            )
+        } else if !resumable_shards.is_empty()
+            || matches!(
+                self.build_state,
+                LexicalGenerationBuildState::Scratch
+                    | LexicalGenerationBuildState::Building
+                    | LexicalGenerationBuildState::Built
+                    | LexicalGenerationBuildState::Validating
+            )
+        {
+            (
+                LexicalGenerationRecoveryAction::ResumeStaged,
+                format!(
+                    "generation {} has staged or in-progress work that can be resumed",
+                    self.generation_id
+                ),
+            )
+        } else {
+            (
+                LexicalGenerationRecoveryAction::DiscardAndRebuild,
+                format!(
+                    "generation {} does not contain a safe publish or resume state",
+                    self.generation_id
+                ),
+            )
+        };
+
+        LexicalGenerationRecoveryDecision {
+            action,
+            reason,
+            resumable_shards,
+            quarantined_shards,
+            abandoned_shards,
+        }
+    }
+
+    fn shards_with_state(&self, states: &[LexicalShardLifecycleState]) -> Vec<String> {
+        self.shards
+            .iter()
+            .filter(|shard| states.contains(&shard.state))
+            .map(|shard| shard.shard_id.clone())
+            .collect()
+    }
+
+    fn all_shards_publish_ready(&self) -> bool {
+        !self.shards.is_empty()
+            && self.shards.iter().all(|shard| {
+                matches!(
+                    shard.state,
+                    LexicalShardLifecycleState::Validated | LexicalShardLifecycleState::Published
+                )
+            })
+            && match self.shard_plan.as_ref() {
+                Some(plan) => usize::try_from(plan.shard_count) == Ok(self.shards.len()),
+                None => true,
+            }
     }
 }
 
@@ -300,6 +606,43 @@ mod tests {
             "fp-deadbeef",
             1_700_000_000_000,
         );
+        manifest.set_shard_plan_and_budget(
+            LexicalGenerationShardPlan {
+                plan_id: "plan-fp-deadbeef-2".into(),
+                planner_version: 1,
+                shard_count: 2,
+                packet_contract_version: 1,
+                source_db_fingerprint: "fp-deadbeef".into(),
+            },
+            LexicalGenerationBuildBudget {
+                policy_id: "responsive-default".into(),
+                effective_settings_fingerprint: "settings-fp-1".into(),
+                max_inflight_message_bytes: 8 * 1024 * 1024,
+                producer_queue_pages: 4,
+                batch_conversation_limit: 64,
+                worker_threads: 6,
+                controller_reason: Some("reserved_2_cores_for_interactive_use".into()),
+                extra_limits: BTreeMap::from([("staged_merge_jobs".into(), 2)]),
+            },
+            1_700_000_000_250,
+        );
+        let mut shard_a = LexicalShardManifest::planned("shard-0000", 0, 1_700_000_000_250);
+        shard_a.indexed_doc_count = 20;
+        shard_a.message_count = 20;
+        shard_a.artifact_bytes = 4096;
+        shard_a.stable_hash = Some("shard-hash-a".into());
+        shard_a.transition(LexicalShardLifecycleState::Published, 1_700_000_000_900);
+        shard_a.pinned = true;
+        shard_a.reclaimable = false;
+        let mut shard_b = LexicalShardManifest::planned("shard-0001", 1, 1_700_000_000_250);
+        shard_b.indexed_doc_count = 14;
+        shard_b.message_count = 14;
+        shard_b.artifact_bytes = 2048;
+        shard_b.stable_hash = Some("shard-hash-b".into());
+        shard_b.transition(LexicalShardLifecycleState::Published, 1_700_000_000_900);
+        shard_b.pinned = true;
+        shard_b.reclaimable = false;
+        manifest.set_shards(vec![shard_a, shard_b], 1_700_000_000_900);
         manifest.conversation_count = 12;
         manifest.message_count = 34;
         manifest.indexed_doc_count = 34;
@@ -310,6 +653,19 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: LexicalGenerationManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, manifest);
+        assert_eq!(
+            parsed.shard_plan.as_ref().unwrap().plan_id,
+            "plan-fp-deadbeef-2"
+        );
+        assert_eq!(
+            parsed
+                .build_budget
+                .as_ref()
+                .unwrap()
+                .effective_settings_fingerprint,
+            "settings-fp-1"
+        );
+        assert_eq!(parsed.shards.len(), 2);
         assert!(parsed.is_serveable());
     }
 
@@ -334,6 +690,20 @@ mod tests {
             (LexicalGenerationPublishState::Quarantined, "quarantined"),
         ];
         for (state, expected) in publish_states {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+        }
+        let shard_states: Vec<(LexicalShardLifecycleState, &str)> = vec![
+            (LexicalShardLifecycleState::Planned, "planned"),
+            (LexicalShardLifecycleState::Building, "building"),
+            (LexicalShardLifecycleState::Staged, "staged"),
+            (LexicalShardLifecycleState::Validated, "validated"),
+            (LexicalShardLifecycleState::Published, "published"),
+            (LexicalShardLifecycleState::Resumable, "resumable"),
+            (LexicalShardLifecycleState::Quarantined, "quarantined"),
+            (LexicalShardLifecycleState::Abandoned, "abandoned"),
+        ];
+        for (state, expected) in shard_states {
             let json = serde_json::to_string(&state).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
         }
@@ -440,5 +810,205 @@ mod tests {
         assert!(manifest.is_serveable());
         manifest.transition_publish(LexicalGenerationPublishState::Superseded, 4);
         assert!(!manifest.is_serveable(), "superseded must not serve");
+    }
+
+    #[test]
+    fn recovery_decision_attaches_published_generation() {
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-published",
+            "attempt-1",
+            "fp-published",
+            10,
+        );
+        manifest.set_shard_plan_and_budget(test_shard_plan("fp-published", 2), test_budget(), 11);
+        let mut shard_a = LexicalShardManifest::planned("shard-a", 0, 11);
+        shard_a.transition(LexicalShardLifecycleState::Published, 20);
+        let mut shard_b = LexicalShardManifest::planned("shard-b", 1, 11);
+        shard_b.transition(LexicalShardLifecycleState::Published, 20);
+        manifest.set_shards(vec![shard_a, shard_b], 20);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 30);
+        manifest.transition_publish(LexicalGenerationPublishState::Published, 31);
+
+        let decision = manifest.recovery_decision();
+        assert_eq!(
+            decision.action,
+            LexicalGenerationRecoveryAction::AttachPublished
+        );
+        assert!(decision.resumable_shards.is_empty());
+        assert!(decision.quarantined_shards.is_empty());
+    }
+
+    #[test]
+    fn recovery_decision_publishes_complete_validated_shard_set() {
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-validated",
+            "attempt-1",
+            "fp-validated",
+            10,
+        );
+        manifest.set_shard_plan_and_budget(test_shard_plan("fp-validated", 2), test_budget(), 11);
+        let mut shard_a = LexicalShardManifest::planned("shard-a", 0, 11);
+        shard_a.transition(LexicalShardLifecycleState::Validated, 20);
+        let mut shard_b = LexicalShardManifest::planned("shard-b", 1, 11);
+        shard_b.transition(LexicalShardLifecycleState::Validated, 20);
+        manifest.set_shards(vec![shard_a, shard_b], 20);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 30);
+
+        let decision = manifest.recovery_decision();
+        assert_eq!(
+            decision.action,
+            LexicalGenerationRecoveryAction::PublishValidated
+        );
+        assert!(decision.reason.contains("complete publish-ready shard set"));
+    }
+
+    #[test]
+    fn recovery_decision_resumes_resumable_staged_shards() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-resume", "attempt-1", "fp-resume", 10);
+        manifest.set_shard_plan_and_budget(test_shard_plan("fp-resume", 2), test_budget(), 11);
+        manifest.set_shards(
+            vec![
+                LexicalShardManifest::planned("shard-a", 0, 11),
+                LexicalShardManifest::planned("shard-b", 1, 11),
+            ],
+            12,
+        );
+        assert!(manifest.transition_shard(
+            "shard-a",
+            LexicalShardLifecycleState::Resumable,
+            20,
+            Some("builder checkpoint reached after doc flush".into()),
+        ));
+        assert!(manifest.transition_shard("shard-b", LexicalShardLifecycleState::Staged, 21, None));
+        manifest.transition_build(LexicalGenerationBuildState::Building, 30);
+
+        let decision = manifest.recovery_decision();
+        assert_eq!(
+            decision.action,
+            LexicalGenerationRecoveryAction::ResumeStaged
+        );
+        assert_eq!(
+            decision.resumable_shards,
+            vec!["shard-a".to_string(), "shard-b".to_string()]
+        );
+        assert!(decision.quarantined_shards.is_empty());
+    }
+
+    #[test]
+    fn recovery_decision_keeps_quarantined_shards_out_of_search() {
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-quarantine",
+            "attempt-1",
+            "fp-quarantine",
+            10,
+        );
+        manifest.set_shard_plan_and_budget(test_shard_plan("fp-quarantine", 2), test_budget(), 11);
+        manifest.set_shards(
+            vec![
+                LexicalShardManifest::planned("shard-a", 0, 11),
+                LexicalShardManifest::planned("shard-b", 1, 11),
+            ],
+            12,
+        );
+        assert!(manifest.transition_shard(
+            "shard-b",
+            LexicalShardLifecycleState::Quarantined,
+            20,
+            Some("tantivy open probe failed".into()),
+        ));
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 30);
+
+        let decision = manifest.recovery_decision();
+        assert_eq!(
+            decision.action,
+            LexicalGenerationRecoveryAction::KeepQuarantined
+        );
+        assert_eq!(decision.quarantined_shards, vec!["shard-b".to_string()]);
+        assert!(decision.reason.contains("must stay out of search"));
+    }
+
+    #[test]
+    fn recovery_decision_discards_abandoned_or_failed_generation() {
+        let mut manifest = LexicalGenerationManifest::new_scratch(
+            "gen-abandoned",
+            "attempt-1",
+            "fp-abandoned",
+            10,
+        );
+        manifest.set_shard_plan_and_budget(test_shard_plan("fp-abandoned", 1), test_budget(), 11);
+        manifest.set_shards(vec![LexicalShardManifest::planned("shard-a", 0, 11)], 12);
+        assert!(manifest.transition_shard(
+            "shard-a",
+            LexicalShardLifecycleState::Abandoned,
+            20,
+            Some("source fingerprint changed mid-build".into()),
+        ));
+        manifest.transition_build(LexicalGenerationBuildState::Failed, 30);
+
+        let decision = manifest.recovery_decision();
+        assert_eq!(
+            decision.action,
+            LexicalGenerationRecoveryAction::DiscardAndRebuild
+        );
+        assert_eq!(decision.abandoned_shards, vec!["shard-a".to_string()]);
+        assert!(decision.reason.contains("must rebuild from source"));
+    }
+
+    #[test]
+    fn shard_transition_records_retention_and_recovery_reasons() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-retention", "attempt-1", "fp", 1);
+        manifest.set_shards(vec![LexicalShardManifest::planned("shard-a", 0, 1)], 2);
+
+        assert!(manifest.transition_shard(
+            "shard-a",
+            LexicalShardLifecycleState::Quarantined,
+            3,
+            Some("checksum mismatch".into()),
+        ));
+        let shard = &manifest.shards[0];
+        assert!(!shard.reclaimable);
+        assert!(!shard.pinned);
+        assert_eq!(
+            shard.quarantine_reason.as_deref(),
+            Some("checksum mismatch")
+        );
+
+        assert!(manifest.transition_shard(
+            "shard-a",
+            LexicalShardLifecycleState::Published,
+            4,
+            None,
+        ));
+        let shard = &manifest.shards[0];
+        assert!(shard.pinned);
+        assert!(!shard.reclaimable);
+    }
+
+    fn test_shard_plan(
+        source_db_fingerprint: &str,
+        shard_count: u32,
+    ) -> LexicalGenerationShardPlan {
+        LexicalGenerationShardPlan {
+            plan_id: format!("plan-{source_db_fingerprint}-{shard_count}"),
+            planner_version: 1,
+            shard_count,
+            packet_contract_version: 1,
+            source_db_fingerprint: source_db_fingerprint.into(),
+        }
+    }
+
+    fn test_budget() -> LexicalGenerationBuildBudget {
+        LexicalGenerationBuildBudget {
+            policy_id: "test-policy".into(),
+            effective_settings_fingerprint: "settings-fp-test".into(),
+            max_inflight_message_bytes: 4 * 1024 * 1024,
+            producer_queue_pages: 2,
+            batch_conversation_limit: 16,
+            worker_threads: 2,
+            controller_reason: Some("test budget".into()),
+            extra_limits: BTreeMap::from([("staged_merge_jobs".into(), 1)]),
+        }
     }
 }
