@@ -5,13 +5,12 @@ mod tests {
         ExportEngine, ExportFilter, PathMode, run_pages_export,
     };
     use frankensqlite::compat::{ConnectionExt, RowExt};
-    use frankensqlite::{Connection as FrankenConnection, Row as FrankenRow, params as fparams};
-    use rusqlite::Connection;
+    use frankensqlite::{Connection, Row as FrankenRow, params as fparams};
     use std::path::Path;
     use tempfile::TempDir;
 
     fn setup_source_db(path: &Path) -> Result<()> {
-        let conn = Connection::open(path)?;
+        let conn = open_franken_db(path)?;
 
         conn.execute_batch(
             r#"
@@ -54,51 +53,48 @@ mod tests {
         )?;
 
         // Agents + workspaces
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", [])?;
-        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'codex')", [])?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (2, '/home/user/proj2')",
-            [],
-        )?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (2, 'codex')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (2, '/home/user/proj2')")?;
 
         // Insert test data
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (1, 1, 1, 'Test Conv 1', '/home/user/proj1/.claude/1.json', 1600000000000, 2)",
-            [],
+             VALUES (1, 1, 1, 'Test Conv 1', '/home/user/proj1/.claude/1.json', 1600000000000, 2)"
         )?;
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
              VALUES (1, 0, 'user', 'hello', 1600000000000)",
-            [],
         )?;
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
              VALUES (1, 1, 'assistant', 'world', 1600000005000)",
-            [],
         )?;
 
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (2, 2, 2, 'Test Conv 2', '/home/user/proj2/.codex/session.json', 1700000000000, 1)",
-            [],
+             VALUES (2, 2, 2, 'Test Conv 2', '/home/user/proj2/.codex/session.json', 1700000000000, 1)"
         )?;
         conn.execute(
             "INSERT INTO messages (conversation_id, idx, role, content, created_at)
              VALUES (2, 0, 'user', 'rust code', 1700000000000)",
-            [],
         )?;
 
         Ok(())
     }
 
-    fn open_franken_db(path: &Path) -> Result<FrankenConnection> {
+    fn open_franken_db(path: &Path) -> Result<Connection> {
         let path_str = path.to_string_lossy();
-        Ok(FrankenConnection::open(path_str.as_ref())?)
+        Ok(Connection::open(path_str.as_ref())?)
+    }
+
+    fn query_i64(conn: &Connection, sql: &str) -> Result<i64> {
+        Ok(conn.query_row_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
+    }
+
+    fn query_string(conn: &Connection, sql: &str) -> Result<String> {
+        Ok(conn.query_row_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
     }
 
     fn setup_franken_source_db(path: &Path) -> Result<()> {
@@ -219,24 +215,19 @@ mod tests {
         assert_eq!(stats.messages_processed, 3);
 
         // Verify output DB
-        let conn = Connection::open(&output_path)?;
+        let conn = open_franken_db(&output_path)?;
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations")?;
         assert_eq!(count, 2);
 
-        let fts_exists: i64 = conn.query_row(
+        let fts_exists = query_i64(
+            &conn,
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'",
-            [],
-            |r| r.get(0),
         )?;
         assert_eq!(fts_exists, 1);
 
         // Verify Path Transformation (Relative)
-        let path: String = conn.query_row(
-            "SELECT source_path FROM conversations WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let path = query_string(&conn, "SELECT source_path FROM conversations WHERE id=1")?;
         assert_eq!(path, ".claude/1.json"); // Stripped workspace prefix
 
         Ok(())
@@ -263,8 +254,8 @@ mod tests {
 
         assert_eq!(stats.conversations_processed, 1);
 
-        let conn = Connection::open(&output_path)?;
-        let agent: String = conn.query_row("SELECT agent FROM conversations", [], |r| r.get(0))?;
+        let conn = open_franken_db(&output_path)?;
+        let agent = query_string(&conn, "SELECT agent FROM conversations")?;
         assert_eq!(agent, "claude");
 
         Ok(())
@@ -339,12 +330,8 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let conn = Connection::open(&output_path)?;
-        let path: String = conn.query_row(
-            "SELECT source_path FROM conversations WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let conn = open_franken_db(&output_path)?;
+        let path = query_string(&conn, "SELECT source_path FROM conversations WHERE id=1")?;
 
         assert_eq!(path.len(), 16); // 16 chars hex
         assert_ne!(path, "/home/user/proj1/.claude/1.json");
@@ -410,8 +397,8 @@ mod tests {
         // Should only get conv 2 (codex)
         assert_eq!(stats.conversations_processed, 1);
 
-        let conn = Connection::open(&output_path)?;
-        let agent: String = conn.query_row("SELECT agent FROM conversations", [], |r| r.get(0))?;
+        let conn = open_franken_db(&output_path)?;
+        let agent = query_string(&conn, "SELECT agent FROM conversations")?;
         assert_eq!(agent, "codex");
 
         Ok(())
@@ -425,17 +412,17 @@ mod tests {
 
         setup_source_db(&source_path)?;
 
-        let source_conn = Connection::open(&source_path)?;
-        source_conn.execute("ALTER TABLE messages ADD COLUMN attachment_refs TEXT", [])?;
+        let source_conn = open_franken_db(&source_path)?;
+        source_conn.execute("ALTER TABLE messages ADD COLUMN attachment_refs TEXT")?;
 
-        let source_message_id: i64 = source_conn.query_row(
+        let source_message_id: i64 = source_conn.query_row_map(
             "SELECT id FROM messages WHERE conversation_id = 1 AND idx = 0",
-            [],
-            |row| row.get(0),
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
         )?;
-        source_conn.execute(
-            "UPDATE messages SET updated_at = ?, model = ?, attachment_refs = ? WHERE id = ?",
-            rusqlite::params![
+        source_conn.execute_compat(
+            "UPDATE messages SET updated_at = ?1, model = ?2, attachment_refs = ?3 WHERE id = ?4",
+            fparams![
                 1_600_000_123_000_i64,
                 "claude-opus-4-6",
                 "[\"blob-a\",\"blob-b\"]",
@@ -455,16 +442,16 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let output_conn = Connection::open(&output_path)?;
-        let exported = output_conn.query_row(
+        let output_conn = open_franken_db(&output_path)?;
+        let exported = output_conn.query_row_map(
             "SELECT id, updated_at, model, attachment_refs FROM messages WHERE conversation_id = 1 AND idx = 0",
-            [],
-            |row| {
+            &[],
+            |row: &FrankenRow| {
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<i64>>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<String>>(3)?,
                 ))
             },
         )?;
@@ -483,7 +470,7 @@ mod tests {
         let source_path = temp_dir.path().join("source.db");
         let output_path = temp_dir.path().join("export.db");
 
-        let conn = Connection::open(&source_path)?;
+        let conn = open_franken_db(&source_path)?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
@@ -510,22 +497,16 @@ mod tests {
             );
             "#,
         )?;
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", [])?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')",
-            [],
-        )?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/proj1')")?;
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (1, 1, 1, 'Extra JSON model', '/home/user/proj1/.claude/extra.jsonl', 1600000000000, 1)",
-            [],
+             VALUES (1, 1, 1, 'Extra JSON model', '/home/user/proj1/.claude/extra.jsonl', 1600000000000, 1)"
         )?;
-        conn.execute(
+        conn.execute_compat(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at, extra_json)
              VALUES (101, 1, 0, 'assistant', 'hello', 1600000000000, ?1)",
-            rusqlite::params![
-                r#"{"message":{"model":"claude-sonnet-4"},"attachments":["blob-z"]}"#
-            ],
+            fparams![r#"{"message":{"model":"claude-sonnet-4"},"attachments":["blob-z"]}"#],
         )?;
         drop(conn);
 
@@ -540,15 +521,15 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let output_conn = Connection::open(&output_path)?;
-        let exported = output_conn.query_row(
+        let output_conn = open_franken_db(&output_path)?;
+        let exported = output_conn.query_row_map(
             "SELECT id, model, attachment_refs FROM messages WHERE conversation_id = 1 AND idx = 0",
-            [],
-            |row| {
+            &[],
+            |row: &FrankenRow| {
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<Option<String>>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
                 ))
             },
         )?;
@@ -582,8 +563,8 @@ mod tests {
         // Should only get conv 1 (claude in proj1)
         assert_eq!(stats.conversations_processed, 1);
 
-        let conn = Connection::open(&output_path)?;
-        let agent: String = conn.query_row("SELECT agent FROM conversations", [], |r| r.get(0))?;
+        let conn = open_franken_db(&output_path)?;
+        let agent = query_string(&conn, "SELECT agent FROM conversations")?;
         assert_eq!(agent, "claude");
 
         Ok(())
@@ -614,15 +595,14 @@ mod tests {
         assert_eq!(stats.messages_processed, 0);
 
         // Output DB should still exist with schema
-        let conn = Connection::open(&output_path)?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        let conn = open_franken_db(&output_path)?;
+        let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations")?;
         assert_eq!(count, 0);
 
         // Schema should exist (FTS table)
-        let fts_exists: i64 = conn.query_row(
+        let fts_exists = query_i64(
+            &conn,
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'messages_fts'",
-            [],
-            |r| r.get(0),
         )?;
         assert_eq!(fts_exists, 1);
 
@@ -648,12 +628,8 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let conn = Connection::open(&output_path)?;
-        let path: String = conn.query_row(
-            "SELECT source_path FROM conversations WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let conn = open_franken_db(&output_path)?;
+        let path = query_string(&conn, "SELECT source_path FROM conversations WHERE id=1")?;
 
         // Should be just the filename
         assert_eq!(path, "1.json");
@@ -680,12 +656,8 @@ mod tests {
         let engine = ExportEngine::new(&source_path, &output_path, filter);
         engine.execute(|_, _| {}, None)?;
 
-        let conn = Connection::open(&output_path)?;
-        let path: String = conn.query_row(
-            "SELECT source_path FROM conversations WHERE id=1",
-            [],
-            |r| r.get(0),
-        )?;
+        let conn = open_franken_db(&output_path)?;
+        let path = query_string(&conn, "SELECT source_path FROM conversations WHERE id=1")?;
 
         // Should be full path unchanged
         assert_eq!(path, "/home/user/proj1/.claude/1.json");
@@ -752,8 +724,8 @@ mod tests {
         assert_eq!(stats.conversations_processed, 2);
         assert!(output_path.exists(), "export db should be created");
 
-        let conn = Connection::open(&output_path)?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        let conn = open_franken_db(&output_path)?;
+        let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations")?;
         assert_eq!(count, 2);
 
         Ok(())
