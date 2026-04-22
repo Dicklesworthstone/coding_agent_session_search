@@ -11823,7 +11823,7 @@ impl CassApp {
             "Modes",
             &[
                 format!(
-                    "{} search mode: Lexical → Semantic → Hybrid",
+                    "{} search mode: Hybrid → Lexical → Semantic",
                     shortcuts::SEARCH_MODE
                 ),
                 format!(
@@ -13246,7 +13246,7 @@ pub enum CassMsg {
     SourceFilterCycled,
 
     // -- Mode cycling -----------------------------------------------------
-    /// Cycle search mode (Lexical -> Semantic -> Hybrid).
+    /// Cycle search mode (Hybrid -> Lexical -> Semantic).
     SearchModeCycled,
     /// Cycle match mode (Standard <-> Prefix).
     MatchModeCycled,
@@ -34696,7 +34696,7 @@ not jsonl",
         let hints = app.build_contextual_footer_hints(120);
         assert!(
             hints.contains("Alt+S=mode"),
-            "results footer should advertise lexical/semantic/hybrid mode cycling"
+            "results footer should advertise hybrid/lexical/semantic mode cycling"
         );
     }
 
