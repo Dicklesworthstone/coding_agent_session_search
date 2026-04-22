@@ -11858,11 +11858,9 @@ fn rebuild_tantivy_from_db_with_options(
     let initial_batch_conversation_limit =
         lexical_rebuild_initial_batch_fetch_conversation_limit(batch_conversation_limit);
     let lexical_rebuild_worker_pool = build_lexical_rebuild_worker_pool()?;
-    let (
-        mut commit_interval_conversations,
-        mut commit_interval_messages,
-        mut commit_interval_message_bytes,
-    ) = lexical_rebuild_commit_intervals_for_state(&rebuild_state);
+    let mut commit_interval_conversations;
+    let mut commit_interval_messages;
+    let mut commit_interval_message_bytes;
     let progress_heartbeat_interval_conversations =
         lexical_rebuild_progress_heartbeat_interval_conversations();
     let progress_heartbeat_interval = lexical_rebuild_progress_heartbeat_interval();
@@ -19731,7 +19729,7 @@ mod tests {
             4,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(3, 32, 1024, 4),
+                lexical_rebuild_runtime_pipeline_budget_snapshot(3, 32, 1024, 4, 3, 32, 1024),
             )),
             tx,
             flow_limiter.clone(),
@@ -19838,7 +19836,7 @@ mod tests {
             4,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(16, 128, 8192, 4),
+                lexical_rebuild_runtime_pipeline_budget_snapshot(16, 128, 8192, 4, 16, 128, 8192),
             )),
             tx,
             flow_limiter.clone(),
@@ -19895,7 +19893,7 @@ mod tests {
             1,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(2, 32, 1024, 4),
+                lexical_rebuild_runtime_pipeline_budget_snapshot(2, 32, 1024, 4, 2, 32, 1024),
             )),
             tx,
             flow_limiter.clone(),
@@ -20017,7 +20015,15 @@ mod tests {
             2,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(64, 256, 256 * 1024, 2),
+                lexical_rebuild_runtime_pipeline_budget_snapshot(
+                    64,
+                    256,
+                    256 * 1024,
+                    2,
+                    64,
+                    256,
+                    256 * 1024,
+                ),
             )),
             tx,
             flow_limiter.clone(),
@@ -20159,7 +20165,15 @@ mod tests {
             2,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(1, 32, 64 * 1024, 2),
+                lexical_rebuild_runtime_pipeline_budget_snapshot(
+                    1,
+                    32,
+                    64 * 1024,
+                    2,
+                    1,
+                    32,
+                    64 * 1024,
+                ),
             )),
             tx,
             flow_limiter.clone(),

@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current manifest format version. Bump whenever the struct layout changes
 /// in a way that older or newer readers cannot ignore.
-pub(crate) const LEXICAL_GENERATION_MANIFEST_VERSION: u32 = 2;
+pub(crate) const LEXICAL_GENERATION_MANIFEST_VERSION: u32 = 3;
 
 /// File name used inside a generation directory for the manifest artifact.
 pub(crate) const LEXICAL_GENERATION_MANIFEST_FILE: &str = "lexical-generation-manifest.json";
@@ -138,6 +138,80 @@ pub(crate) struct LexicalGenerationBuildBudget {
     pub controller_reason: Option<String>,
     #[serde(default)]
     pub extra_limits: BTreeMap<String, u64>,
+}
+
+/// Deferred merge/compaction lifecycle for a published shard generation.
+///
+/// Search-ready and fully consolidated are intentionally separate states: a
+/// published generation can be safe to query while still carrying background
+/// merge debt that cleanup/compaction workers may handle later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalGenerationMergeDebtState {
+    /// No deferred consolidation work is known for this generation.
+    None,
+    /// Consolidation is required but intentionally kept off the publish path.
+    Pending,
+    /// A background worker is currently consolidating this generation.
+    Running,
+    /// Work yielded to foreground pressure and can resume later.
+    Paused,
+    /// Work is blocked by policy, locks, or another explicit operator reason.
+    Blocked,
+    /// Deferred consolidation completed; generation is fully settled.
+    Complete,
+    /// Work was cancelled without invalidating the published generation.
+    Cancelled,
+}
+
+impl Default for LexicalGenerationMergeDebtState {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Durable merge-debt accounting surfaced through the generation manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalGenerationMergeDebt {
+    pub state: LexicalGenerationMergeDebtState,
+    pub updated_at_ms: Option<i64>,
+    pub pending_shard_count: u64,
+    pub pending_artifact_bytes: u64,
+    pub reason: Option<String>,
+    pub controller_reason: Option<String>,
+}
+
+impl Default for LexicalGenerationMergeDebt {
+    fn default() -> Self {
+        Self {
+            state: LexicalGenerationMergeDebtState::None,
+            updated_at_ms: None,
+            pending_shard_count: 0,
+            pending_artifact_bytes: 0,
+            reason: None,
+            controller_reason: None,
+        }
+    }
+}
+
+impl LexicalGenerationMergeDebt {
+    pub(crate) fn has_pending_work(&self) -> bool {
+        matches!(
+            self.state,
+            LexicalGenerationMergeDebtState::Pending
+                | LexicalGenerationMergeDebtState::Running
+                | LexicalGenerationMergeDebtState::Paused
+                | LexicalGenerationMergeDebtState::Blocked
+                | LexicalGenerationMergeDebtState::Cancelled
+        )
+    }
+
+    pub(crate) fn is_fully_settled(&self) -> bool {
+        matches!(
+            self.state,
+            LexicalGenerationMergeDebtState::None | LexicalGenerationMergeDebtState::Complete
+        )
+    }
 }
 
 /// Durable footprint and retention metadata for one shard artifact.
@@ -262,6 +336,9 @@ pub(crate) struct LexicalGenerationManifest {
     /// Durable per-shard state. Empty for legacy single-generation builds.
     #[serde(default)]
     pub shards: Vec<LexicalShardManifest>,
+    /// Deferred merge/compaction debt that may be handled after publish.
+    #[serde(default)]
+    pub merge_debt: LexicalGenerationMergeDebt,
     pub build_state: LexicalGenerationBuildState,
     pub publish_state: LexicalGenerationPublishState,
     /// Append-only history of attempts that failed under this
@@ -293,6 +370,7 @@ impl LexicalGenerationManifest {
             shard_plan: None,
             build_budget: None,
             shards: Vec::new(),
+            merge_debt: LexicalGenerationMergeDebt::default(),
             build_state: LexicalGenerationBuildState::Scratch,
             publish_state: LexicalGenerationPublishState::Staged,
             failure_history: Vec::new(),
@@ -370,6 +448,48 @@ impl LexicalGenerationManifest {
         self.updated_at_ms = now_ms;
     }
 
+    /// Record or update deferred merge debt without changing serveability.
+    pub(crate) fn record_merge_debt(
+        &mut self,
+        pending_shard_count: u64,
+        pending_artifact_bytes: u64,
+        reason: impl Into<String>,
+        now_ms: i64,
+    ) {
+        self.merge_debt = LexicalGenerationMergeDebt {
+            state: if pending_shard_count == 0 && pending_artifact_bytes == 0 {
+                LexicalGenerationMergeDebtState::Complete
+            } else {
+                LexicalGenerationMergeDebtState::Pending
+            },
+            updated_at_ms: Some(now_ms),
+            pending_shard_count,
+            pending_artifact_bytes,
+            reason: Some(reason.into()),
+            controller_reason: None,
+        };
+        self.updated_at_ms = now_ms;
+    }
+
+    /// Move deferred merge work between background lifecycle states.
+    pub(crate) fn transition_merge_debt(
+        &mut self,
+        state: LexicalGenerationMergeDebtState,
+        now_ms: i64,
+        reason: Option<String>,
+        controller_reason: Option<String>,
+    ) {
+        self.merge_debt.state = state;
+        self.merge_debt.updated_at_ms = Some(now_ms);
+        self.merge_debt.reason = reason;
+        self.merge_debt.controller_reason = controller_reason;
+        if self.merge_debt.is_fully_settled() {
+            self.merge_debt.pending_shard_count = 0;
+            self.merge_debt.pending_artifact_bytes = 0;
+        }
+        self.updated_at_ms = now_ms;
+    }
+
     /// Append a failure record and bump `updated_at_ms`. Callers should set
     /// `build_state` to [`LexicalGenerationBuildState::Failed`] separately
     /// when the failure is terminal for the attempt.
@@ -393,6 +513,11 @@ impl LexicalGenerationManifest {
     pub(crate) fn is_serveable(&self) -> bool {
         matches!(self.build_state, LexicalGenerationBuildState::Validated)
             && matches!(self.publish_state, LexicalGenerationPublishState::Published)
+    }
+
+    /// Whether published artifacts have no known deferred merge debt.
+    pub(crate) fn is_fully_consolidated(&self) -> bool {
+        self.is_serveable() && self.merge_debt.is_fully_settled()
     }
 
     /// Derive the crash-startup action from durable manifest state. This is
@@ -649,6 +774,12 @@ mod tests {
         manifest.equivalence_manifest_fingerprint = Some("eq-fp-123".into());
         manifest.transition_build(LexicalGenerationBuildState::Validated, 1_700_000_000_500);
         manifest.transition_publish(LexicalGenerationPublishState::Published, 1_700_000_001_000);
+        manifest.record_merge_debt(
+            2,
+            6144,
+            "shard segments are queryable before background consolidation",
+            1_700_000_001_100,
+        );
 
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: LexicalGenerationManifest = serde_json::from_slice(&bytes).unwrap();
@@ -667,6 +798,8 @@ mod tests {
         );
         assert_eq!(parsed.shards.len(), 2);
         assert!(parsed.is_serveable());
+        assert!(parsed.merge_debt.has_pending_work());
+        assert!(!parsed.is_fully_consolidated());
     }
 
     #[test]
@@ -690,6 +823,19 @@ mod tests {
             (LexicalGenerationPublishState::Quarantined, "quarantined"),
         ];
         for (state, expected) in publish_states {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+        }
+        let merge_debt_states: Vec<(LexicalGenerationMergeDebtState, &str)> = vec![
+            (LexicalGenerationMergeDebtState::None, "none"),
+            (LexicalGenerationMergeDebtState::Pending, "pending"),
+            (LexicalGenerationMergeDebtState::Running, "running"),
+            (LexicalGenerationMergeDebtState::Paused, "paused"),
+            (LexicalGenerationMergeDebtState::Blocked, "blocked"),
+            (LexicalGenerationMergeDebtState::Complete, "complete"),
+            (LexicalGenerationMergeDebtState::Cancelled, "cancelled"),
+        ];
+        for (state, expected) in merge_debt_states {
             let json = serde_json::to_string(&state).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
         }
@@ -810,6 +956,92 @@ mod tests {
         assert!(manifest.is_serveable());
         manifest.transition_publish(LexicalGenerationPublishState::Superseded, 4);
         assert!(!manifest.is_serveable(), "superseded must not serve");
+    }
+
+    #[test]
+    fn published_generation_can_serve_before_deferred_merge_debt_settles() {
+        let mut manifest = LexicalGenerationManifest::new_scratch("gen-debt", "attempt-1", "fp", 1);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 2);
+        manifest.transition_publish(LexicalGenerationPublishState::Published, 3);
+
+        manifest.record_merge_debt(
+            3,
+            12_288,
+            "segment consolidation is safe to defer after atomic publish",
+            4,
+        );
+
+        assert!(
+            manifest.is_serveable(),
+            "merge debt must not drag safe published assets off the query path"
+        );
+        assert!(
+            !manifest.is_fully_consolidated(),
+            "pending debt should keep fully-settled status false"
+        );
+        assert_eq!(
+            manifest.merge_debt.state,
+            LexicalGenerationMergeDebtState::Pending
+        );
+        assert_eq!(manifest.merge_debt.pending_shard_count, 3);
+        assert_eq!(manifest.merge_debt.pending_artifact_bytes, 12_288);
+        assert!(manifest.merge_debt.has_pending_work());
+    }
+
+    #[test]
+    fn merge_debt_tracks_background_pause_block_and_completion_reasons() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-debt-flow", "attempt-1", "fp", 1);
+        manifest.record_merge_debt(2, 2048, "two shard fragments need compaction", 2);
+
+        manifest.transition_merge_debt(
+            LexicalGenerationMergeDebtState::Running,
+            3,
+            Some("background worker acquired consolidation lease".into()),
+            Some("controller admitted one low-priority merge job".into()),
+        );
+        assert_eq!(
+            manifest.merge_debt.state,
+            LexicalGenerationMergeDebtState::Running
+        );
+        assert_eq!(
+            manifest.merge_debt.controller_reason.as_deref(),
+            Some("controller admitted one low-priority merge job")
+        );
+
+        manifest.transition_merge_debt(
+            LexicalGenerationMergeDebtState::Paused,
+            4,
+            Some("foreground search pressure exceeded reserve budget".into()),
+            Some("controller yielded to interactive workload".into()),
+        );
+        assert_eq!(
+            manifest.merge_debt.state,
+            LexicalGenerationMergeDebtState::Paused
+        );
+        assert!(manifest.merge_debt.has_pending_work());
+
+        manifest.transition_merge_debt(
+            LexicalGenerationMergeDebtState::Blocked,
+            5,
+            Some("publish lock held by another generation".into()),
+            Some("single-flight lock prevented duplicate compaction".into()),
+        );
+        assert_eq!(
+            manifest.merge_debt.state,
+            LexicalGenerationMergeDebtState::Blocked
+        );
+
+        manifest.transition_merge_debt(
+            LexicalGenerationMergeDebtState::Complete,
+            6,
+            Some("background consolidation finished".into()),
+            Some("controller budget remained below pressure threshold".into()),
+        );
+        assert!(manifest.merge_debt.is_fully_settled());
+        assert_eq!(manifest.merge_debt.pending_shard_count, 0);
+        assert_eq!(manifest.merge_debt.pending_artifact_bytes, 0);
+        assert_eq!(manifest.updated_at_ms, 6);
     }
 
     #[test]
