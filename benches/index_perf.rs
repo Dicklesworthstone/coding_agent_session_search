@@ -40,6 +40,7 @@
 //! - Throughput: No more than 10% regression
 //! - Memory timeline: Streaming should show flat profile vs batch's spike
 
+use coding_agent_search::indexer::redact_secrets::redact_text;
 use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use coding_agent_search::indexer::{IndexOptions, run_index};
 use coding_agent_search::search::tantivy::index_dir;
@@ -107,6 +108,29 @@ fn bench_index_full(c: &mut Criterion) {
     c.bench_function("index_full_empty", |b| {
         b.iter(|| run_index(opts.clone(), None))
     });
+}
+
+/// Benchmark ingestion-time secret redaction. The harmless case is the hot path
+/// for normal message content and should stay at one RegexSet scan with no
+/// owned output allocation.
+fn bench_redact_text(c: &mut Criterion) {
+    let mut group = c.benchmark_group("redact_text");
+    let harmless = "ordinary tool output with code review notes and no credentials";
+    let secret = "api_key=abcdefgh12345678 and token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+
+    group.bench_function("harmless", |b| {
+        b.iter(|| {
+            let output = redact_text(std::hint::black_box(harmless));
+            std::hint::black_box(output);
+        });
+    });
+    group.bench_function("with_secrets", |b| {
+        b.iter(|| {
+            let output = redact_text(std::hint::black_box(secret));
+            std::hint::black_box(output);
+        });
+    });
+    group.finish();
 }
 
 /// Benchmark streaming vs batch indexing throughput.
@@ -427,6 +451,7 @@ fn bench_card_defaults_ab(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_index_full,
+    bench_redact_text,
     bench_streaming_vs_batch,
     bench_channel_overhead,
     bench_semantic_embedding,

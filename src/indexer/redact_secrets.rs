@@ -10,14 +10,17 @@
 //!
 //! See also: `pages::secret_scan` (post-hoc scanning of existing data).
 
+use std::borrow::Cow;
+
 use once_cell::sync::Lazy;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
 
 /// A compiled secret-detection pattern.
 struct SecretPattern {
+    pattern: &'static str,
     regex: Regex,
 }
 
@@ -26,10 +29,12 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
     vec![
         // AWS Access Key ID (always starts with AKIA)
         SecretPattern {
+            pattern: r"\bAKIA[0-9A-Z]{16}\b",
             regex: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").expect("aws access key regex"),
         },
         // AWS Secret Key in assignment context
         SecretPattern {
+            pattern: r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
             regex: Regex::new(
                 r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
             )
@@ -37,32 +42,39 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         },
         // GitHub PAT (ghp_, gho_, ghu_, ghs_, ghr_)
         SecretPattern {
+            pattern: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
             regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").expect("github pat regex"),
         },
         // OpenAI API key (sk-...)
         SecretPattern {
+            pattern: r"\bsk-[A-Za-z0-9]{20,}\b",
             regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
         },
         // Anthropic API key (sk-ant-...)
         SecretPattern {
+            pattern: r"\bsk-ant-[A-Za-z0-9]{20,}\b",
             regex: Regex::new(r"\bsk-ant-[A-Za-z0-9]{20,}\b").expect("anthropic key regex"),
         },
         // Bearer tokens in authorization headers
         SecretPattern {
+            pattern: r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}",
             regex: Regex::new(r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}").expect("bearer token regex"),
         },
         // JWT tokens (eyJ...)
         SecretPattern {
+            pattern: r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
             regex: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
                 .expect("jwt regex"),
         },
         // PEM private keys
         SecretPattern {
+            pattern: r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----",
             regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
                 .expect("private key regex"),
         },
         // Database connection URLs with credentials
         SecretPattern {
+            pattern: r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
             regex: Regex::new(
                 r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
             )
@@ -70,6 +82,7 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         },
         // Generic key/token/secret/password assignments
         SecretPattern {
+            pattern: r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
             regex: Regex::new(
                 r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
             )
@@ -77,22 +90,40 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         },
         // Slack tokens (xoxb-, xoxp-, xoxs-, xoxa-, xoxo-, xoxr-)
         SecretPattern {
+            pattern: r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}",
             regex: Regex::new(r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}").expect("slack token regex"),
         },
         // Stripe keys (sk_live_, pk_live_, rk_live_)
         SecretPattern {
+            pattern: r"\b[spr]k_live_[A-Za-z0-9]{20,}",
             regex: Regex::new(r"\b[spr]k_live_[A-Za-z0-9]{20,}").expect("stripe key regex"),
         },
     ]
 });
 
+/// Fast pre-check for the common no-secret path. Keeps pattern ordering aligned
+/// with `SECRET_PATTERNS` so matched set indices can select replacement regexes.
+static SECRET_REGEX_SET: Lazy<RegexSet> = Lazy::new(|| {
+    RegexSet::new(SECRET_PATTERNS.iter().map(|pattern| pattern.pattern)).expect("secret regex set")
+});
+
 /// Redact secrets from a plain-text string.
 ///
 /// Returns the input unchanged if no secrets are detected.
-pub fn redact_text(input: &str) -> String {
-    let mut output = input.to_string();
-    for pat in SECRET_PATTERNS.iter() {
-        output = pat.regex.replace_all(&output, REDACTED).into_owned();
+pub fn redact_text(input: &str) -> Cow<'_, str> {
+    let matches = SECRET_REGEX_SET.matches(input);
+    if !matches.matched_any() {
+        return Cow::Borrowed(input);
+    }
+
+    let mut output = Cow::Borrowed(input);
+    for idx in matches.iter() {
+        let replaced = SECRET_PATTERNS[idx]
+            .regex
+            .replace_all(output.as_ref(), REDACTED);
+        if let Cow::Owned(redacted) = replaced {
+            output = Cow::Owned(redacted);
+        }
     }
     output
 }
@@ -105,7 +136,7 @@ pub fn redact_text(input: &str) -> String {
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(s) => {
-            let redacted = redact_text(s);
+            let redacted = redact_text(s).into_owned();
             serde_json::Value::String(redacted)
         }
         serde_json::Value::Array(arr) => {
@@ -114,7 +145,7 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(obj) => {
             let mut new_obj = serde_json::Map::new();
             for (k, v) in obj {
-                let redacted_key = redact_text(k);
+                let redacted_key = redact_text(k).into_owned();
                 new_obj.insert(redacted_key, redact_json(v));
             }
             serde_json::Value::Object(new_obj)
@@ -216,6 +247,10 @@ mod tests {
         let input = "Hello, this is a normal message about code review.";
         let output = redact_text(input);
         assert_eq!(output, input);
+        assert!(
+            matches!(output, Cow::Borrowed(_)),
+            "no-secret path should not allocate"
+        );
     }
 
     #[test]
@@ -282,5 +317,9 @@ mod tests {
         assert!(!output.contains("sk-ABCDE"));
         assert!(!output.contains("ghp_ABCDE"));
         assert_eq!(output.matches("[REDACTED]").count(), 2);
+        assert!(
+            matches!(output, Cow::Owned(_)),
+            "matched secret path should return owned redacted text"
+        );
     }
 }

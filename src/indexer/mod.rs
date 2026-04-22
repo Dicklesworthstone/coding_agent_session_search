@@ -14142,7 +14142,7 @@ pub mod persist {
             title: if should_redact {
                 conv.title
                     .as_ref()
-                    .map(|t| super::redact_secrets::redact_text(t))
+                    .map(|t| super::redact_secrets::redact_text(t).into_owned())
             } else {
                 conv.title.clone()
             },
@@ -14152,7 +14152,7 @@ pub mod persist {
             approx_tokens: None,
             metadata_json: if should_redact {
                 let s = serde_json::to_string(&conv.metadata).unwrap_or_default();
-                let redacted = super::redact_secrets::redact_text(&s);
+                let redacted = super::redact_secrets::redact_text(&s).into_owned();
                 serde_json::from_str(&redacted).unwrap_or_else(|_| conv.metadata.clone())
             } else {
                 conv.metadata.clone()
@@ -14162,7 +14162,7 @@ pub mod persist {
                 .iter()
                 .map(|m| {
                     let content = if should_redact {
-                        super::redact_secrets::redact_text(&m.content)
+                        super::redact_secrets::redact_text(&m.content).into_owned()
                     } else {
                         m.content.clone()
                     };
@@ -14191,6 +14191,7 @@ pub mod persist {
                                 snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
                                     if should_redact {
                                         super::redact_secrets::redact_text(snippet_text)
+                                            .into_owned()
                                     } else {
                                         snippet_text.clone()
                                     }
