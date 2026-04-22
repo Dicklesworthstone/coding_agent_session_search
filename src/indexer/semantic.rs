@@ -1155,6 +1155,105 @@ mod tests {
         }
     }
 
+    fn default_scheduler_signals() -> SemanticBackfillSchedulerSignals {
+        SemanticBackfillSchedulerSignals {
+            foreground_pressure: false,
+            lexical_repair_active: false,
+            force: false,
+            operator_disabled: false,
+        }
+    }
+
+    #[test]
+    fn semantic_backfill_scheduler_runs_and_scales_batch_under_idle_budget() {
+        let policy = SemanticPolicy::compiled_defaults();
+        let decision = semantic_backfill_scheduler_decision_for_capacity(
+            &policy,
+            64,
+            &default_scheduler_signals(),
+            80,
+        );
+
+        assert!(decision.should_run());
+        assert_eq!(decision.state, SemanticBackfillSchedulerState::Running);
+        assert_eq!(
+            decision.reason,
+            SemanticBackfillSchedulerReason::IdleBudgetAvailable
+        );
+        assert_eq!(decision.scheduled_batch_conversations, 51);
+        assert_eq!(decision.current_capacity_pct, 80);
+        assert_eq!(decision.next_eligible_after_ms, 0);
+    }
+
+    #[test]
+    fn semantic_backfill_scheduler_yields_to_foreground_and_lexical_pressure() {
+        let policy = SemanticPolicy::compiled_defaults();
+        let foreground = SemanticBackfillSchedulerSignals {
+            foreground_pressure: true,
+            ..default_scheduler_signals()
+        };
+        let foreground_decision =
+            semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &foreground, 100);
+        assert!(!foreground_decision.should_run());
+        assert_eq!(
+            foreground_decision.state,
+            SemanticBackfillSchedulerState::Paused
+        );
+        assert_eq!(
+            foreground_decision.reason,
+            SemanticBackfillSchedulerReason::ForegroundPressure
+        );
+        assert_eq!(
+            foreground_decision.next_eligible_after_ms,
+            policy.idle_delay_seconds * 1000
+        );
+
+        let lexical_repair = SemanticBackfillSchedulerSignals {
+            lexical_repair_active: true,
+            ..default_scheduler_signals()
+        };
+        let lexical_decision =
+            semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &lexical_repair, 100);
+        assert!(!lexical_decision.should_run());
+        assert_eq!(lexical_decision.state, SemanticBackfillSchedulerState::Paused);
+        assert_eq!(
+            lexical_decision.reason,
+            SemanticBackfillSchedulerReason::LexicalRepairActive
+        );
+    }
+
+    #[test]
+    fn semantic_backfill_scheduler_honors_policy_disable_and_force_override() {
+        let mut policy = SemanticPolicy::compiled_defaults();
+        policy.mode = crate::search::policy::SemanticMode::LexicalOnly;
+
+        let disabled = semantic_backfill_scheduler_decision_for_capacity(
+            &policy,
+            64,
+            &default_scheduler_signals(),
+            100,
+        );
+        assert!(!disabled.should_run());
+        assert_eq!(disabled.state, SemanticBackfillSchedulerState::Disabled);
+        assert_eq!(
+            disabled.reason,
+            SemanticBackfillSchedulerReason::PolicyDisabled
+        );
+
+        let forced = SemanticBackfillSchedulerSignals {
+            force: true,
+            ..default_scheduler_signals()
+        };
+        let forced_decision =
+            semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &forced, 100);
+        assert!(forced_decision.should_run());
+        assert_eq!(
+            forced_decision.reason,
+            SemanticBackfillSchedulerReason::IdleBudgetAvailable
+        );
+        assert!(forced_decision.forced);
+    }
+
     #[test]
     fn test_batch_embedding() {
         let indexer = SemanticIndexer::new("hash", None).unwrap();
