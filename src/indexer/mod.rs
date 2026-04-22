@@ -2858,7 +2858,6 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
 fn commit_lexical_rebuild_progress(
     index_path: &Path,
     rebuild_state: &mut LexicalRebuildState,
-    next_offset: i64,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
     indexed_docs: usize,
@@ -2871,7 +2870,6 @@ fn commit_lexical_rebuild_progress(
     persist_pending_lexical_rebuild_progress(
         index_path,
         rebuild_state,
-        next_offset,
         next_conversation_id,
         processed_conversations,
         indexed_docs,
@@ -3155,14 +3153,13 @@ impl LexicalRebuildState {
 
     fn record_pending_commit(
         &mut self,
-        next_offset: i64,
         next_conversation_id: Option<i64>,
         processed_conversations: usize,
         indexed_docs: usize,
         base_meta_fingerprint: Option<String>,
     ) {
         self.pending = Some(PendingLexicalCommit {
-            next_offset,
+            next_offset: i64::try_from(processed_conversations).unwrap_or(i64::MAX),
             next_conversation_id,
             processed_conversations,
             indexed_docs,
@@ -3174,7 +3171,8 @@ impl LexicalRebuildState {
 
     fn finalize_commit(&mut self, committed_meta_fingerprint: Option<String>) {
         if let Some(pending) = self.pending.take() {
-            self.committed_offset = pending.next_offset;
+            self.committed_offset =
+                i64::try_from(pending.processed_conversations).unwrap_or(i64::MAX);
             self.committed_conversation_id = pending.next_conversation_id;
             self.processed_conversations = pending.processed_conversations;
             self.indexed_docs = pending.indexed_docs;
@@ -4514,7 +4512,7 @@ fn resolve_legacy_lexical_rebuild_conversation_id_from_offset(
     }
 
     let rows = storage
-        .list_conversations_for_lexical_rebuild(
+        .list_conversations_for_lexical_rebuild_by_offset(
             1,
             committed_offset.saturating_sub(1),
             &HashMap::new(),
@@ -4606,7 +4604,6 @@ fn upgrade_lexical_rebuild_state_resume_cursor_if_needed(
 fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     index_path: &Path,
     state: &mut LexicalRebuildState,
-    next_offset: i64,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
     indexed_docs: usize,
@@ -4618,8 +4615,7 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         None => index_meta_fingerprint(index_path)?,
     };
     let already_recorded = state.pending.as_ref().is_some_and(|pending| {
-        pending.next_offset == next_offset
-            && pending.next_conversation_id == next_conversation_id
+        pending.next_conversation_id == next_conversation_id
             && pending.processed_conversations == processed_conversations
             && pending.indexed_docs == indexed_docs
             && pending.base_meta_fingerprint == base_meta_fingerprint
@@ -4630,7 +4626,6 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
     }
 
     state.record_pending_commit(
-        next_offset,
         next_conversation_id,
         processed_conversations,
         indexed_docs,
@@ -4643,7 +4638,6 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
 fn persist_pending_lexical_rebuild_progress(
     index_path: &Path,
     state: &mut LexicalRebuildState,
-    next_offset: i64,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
     indexed_docs: usize,
@@ -4652,7 +4646,6 @@ fn persist_pending_lexical_rebuild_progress(
     persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         index_path,
         state,
-        next_offset,
         next_conversation_id,
         processed_conversations,
         indexed_docs,
@@ -4665,7 +4658,6 @@ fn persist_pending_lexical_rebuild_progress(
 fn maybe_persist_staged_lexical_rebuild_progress(
     index_path: &Path,
     state: &mut LexicalRebuildState,
-    next_offset: i64,
     next_conversation_id: Option<i64>,
     processed_conversations: usize,
     indexed_docs: usize,
@@ -4696,7 +4688,6 @@ fn maybe_persist_staged_lexical_rebuild_progress(
     persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         index_path,
         state,
-        next_offset,
         next_conversation_id,
         processed_conversations,
         indexed_docs,
@@ -10379,7 +10370,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     maybe_persist_staged_lexical_rebuild_progress(
                         index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -10436,7 +10426,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     maybe_persist_staged_lexical_rebuild_progress(
                         index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -10554,7 +10543,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                             maybe_persist_staged_lexical_rebuild_progress(
                                 index_path,
                                 &mut rebuild_state,
-                                i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                                 last_processed_conversation_id,
                                 processed_conversations,
                                 indexed_docs,
@@ -10591,7 +10579,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                             maybe_persist_staged_lexical_rebuild_progress(
                                 index_path,
                                 &mut rebuild_state,
-                                i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                                 last_processed_conversation_id,
                                 processed_conversations,
                                 indexed_docs,
@@ -10693,7 +10680,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     maybe_persist_staged_lexical_rebuild_progress(
                         index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -10750,7 +10736,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     maybe_persist_staged_lexical_rebuild_progress(
                         index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -10857,7 +10842,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     maybe_persist_staged_lexical_rebuild_progress(
         index_path,
         &mut rebuild_state,
-        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
         last_processed_conversation_id,
         processed_conversations,
         indexed_docs,
@@ -11487,7 +11471,6 @@ fn rebuild_tantivy_from_db_with_options(
                     commit_lexical_rebuild_progress(
                         &index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -11554,7 +11537,6 @@ fn rebuild_tantivy_from_db_with_options(
                     persist_pending_lexical_rebuild_progress(
                         &index_path,
                         &mut rebuild_state,
-                        i64::try_from(processed_conversations).unwrap_or(i64::MAX),
                         last_processed_conversation_id,
                         processed_conversations,
                         indexed_docs,
@@ -11752,7 +11734,6 @@ fn rebuild_tantivy_from_db_with_options(
         commit_lexical_rebuild_progress(
             &index_path,
             &mut rebuild_state,
-            i64::try_from(processed_conversations).unwrap_or(i64::MAX),
             last_processed_conversation_id,
             processed_conversations,
             indexed_docs,
@@ -23578,7 +23559,6 @@ mod tests {
             updated_at_ms: 1_733_000_124_000_i64,
         });
         state.record_pending_commit(
-            200,
             Some(200),
             200,
             600,
@@ -23651,7 +23631,6 @@ mod tests {
             updated_at_ms: 1_733_000_224_000_i64,
         });
         state.record_pending_commit(
-            200,
             Some(200),
             200,
             600,
@@ -23803,7 +23782,7 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
 
         let rows = storage
-            .list_conversations_for_lexical_rebuild(2, 0, &HashMap::new(), &HashMap::new())
+            .list_conversations_for_lexical_rebuild_after_id(2, 0, &HashMap::new(), &HashMap::new())
             .unwrap();
         let first_conversation_id = rows[0].id.expect("first conversation id");
         let second_conversation_id = rows[1].id.expect("second conversation id");
@@ -24095,13 +24074,7 @@ mod tests {
         state.committed_conversation_id = Some(4);
         state.processed_conversations = 4;
         state.indexed_docs = 8;
-        state.record_pending_commit(
-            6,
-            Some(6),
-            6,
-            12,
-            index_meta_fingerprint(&index_path).unwrap(),
-        );
+        state.record_pending_commit(Some(6), 6, 12, index_meta_fingerprint(&index_path).unwrap());
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 1,
             inflight_message_bytes: 1_024,
@@ -24158,7 +24131,6 @@ mod tests {
         persist_pending_lexical_rebuild_progress(
             &index_path,
             &mut state,
-            6,
             Some(6),
             6,
             12,
@@ -24227,7 +24199,6 @@ mod tests {
         persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
             &index_path,
             &mut state,
-            5,
             Some(5),
             5,
             10,
@@ -24306,7 +24277,6 @@ mod tests {
         commit_lexical_rebuild_progress(
             &index_path,
             &mut state,
-            1,
             Some(1),
             1,
             1,
@@ -24394,7 +24364,6 @@ mod tests {
         let persisted = maybe_persist_staged_lexical_rebuild_progress(
             &index_path,
             &mut state,
-            1,
             Some(1),
             1,
             2,
@@ -24435,7 +24404,7 @@ mod tests {
             LEXICAL_REBUILD_PAGE_SIZE,
         );
         let base_meta_fingerprint = index_meta_fingerprint(&index_path).unwrap();
-        state.record_pending_commit(6, Some(6), 6, 12, base_meta_fingerprint.clone());
+        state.record_pending_commit(Some(6), 6, 12, base_meta_fingerprint.clone());
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 1,
             inflight_message_bytes: 1_024,
@@ -24494,7 +24463,6 @@ mod tests {
         let persisted = maybe_persist_staged_lexical_rebuild_progress(
             &index_path,
             &mut state,
-            6,
             Some(6),
             6,
             12,
@@ -24545,13 +24513,7 @@ mod tests {
         state.committed_conversation_id = Some(4);
         state.processed_conversations = 4;
         state.indexed_docs = 20;
-        state.record_pending_commit(
-            7,
-            Some(7),
-            7,
-            35,
-            index_meta_fingerprint(&index_path).unwrap(),
-        );
+        state.record_pending_commit(Some(7), 7, 35, index_meta_fingerprint(&index_path).unwrap());
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
         let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
@@ -25825,5 +25787,130 @@ mod tests {
             "repeated quarantines should not collide on backup path"
         );
         assert_eq!(std::fs::read(&second_backup).unwrap(), b"db-two");
+    }
+
+    #[test]
+    fn record_pending_commit_derives_next_offset_from_processed_conversations() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 100,
+            total_messages: 200,
+            storage_fingerprint: "seed:100".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.record_pending_commit(Some(42), 17, 34, None);
+
+        let pending = state.pending.as_ref().unwrap();
+        assert_eq!(pending.next_offset, 17);
+        assert_eq!(pending.next_conversation_id, Some(42));
+        assert_eq!(pending.processed_conversations, 17);
+    }
+
+    #[test]
+    fn finalize_commit_derives_committed_offset_from_processed_conversations() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 100,
+            total_messages: 200,
+            storage_fingerprint: "seed:100".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.record_pending_commit(Some(42), 17, 34, None);
+        state.finalize_commit(Some("fp-abc".to_string()));
+
+        assert_eq!(state.committed_offset, 17);
+        assert_eq!(state.committed_conversation_id, Some(42));
+        assert_eq!(state.processed_conversations, 17);
+        assert_eq!(state.indexed_docs, 34);
+    }
+
+    #[test]
+    fn keyset_checkpoint_round_trips_through_serialization() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 500,
+            total_messages: 1000,
+            storage_fingerprint: "content-v1:500:999:5000".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.record_pending_commit(Some(999), 250, 500, None);
+        state.finalize_commit(None);
+        state.record_pending_commit(Some(1500), 300, 600, None);
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: LexicalRebuildState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.committed_offset, 250);
+        assert_eq!(restored.committed_conversation_id, Some(999));
+        assert_eq!(restored.processed_conversations, 250);
+
+        let pending = restored.pending.as_ref().unwrap();
+        assert_eq!(pending.next_offset, 300);
+        assert_eq!(pending.next_conversation_id, Some(1500));
+        assert_eq!(pending.processed_conversations, 300);
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_conversation_id_deserializes() {
+        let legacy_json = r#"{
+            "version": 3,
+            "schema_hash": "test-hash",
+            "db": {
+                "db_path": "/tmp/agent_search.db",
+                "total_conversations": 100,
+                "total_messages": 200,
+                "storage_fingerprint": "seed:100"
+            },
+            "page_size": 64,
+            "committed_offset": 50,
+            "processed_conversations": 50,
+            "indexed_docs": 100,
+            "committed_meta_fingerprint": null,
+            "pending": {
+                "next_offset": 60,
+                "processed_conversations": 60,
+                "indexed_docs": 120,
+                "base_meta_fingerprint": null
+            },
+            "completed": false,
+            "updated_at_ms": 1700000000000
+        }"#;
+
+        let state: LexicalRebuildState = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(state.committed_offset, 50);
+        assert_eq!(state.committed_conversation_id, None);
+        assert_eq!(state.processed_conversations, 50);
+
+        let pending = state.pending.as_ref().unwrap();
+        assert_eq!(pending.next_offset, 60);
+        assert_eq!(pending.next_conversation_id, None);
+        assert_eq!(pending.processed_conversations, 60);
+    }
+
+    #[test]
+    fn checkpoint_progress_is_monotone_across_commits() {
+        let db_state = LexicalRebuildDbState {
+            db_path: "/tmp/agent_search.db".to_string(),
+            total_conversations: 1000,
+            total_messages: 5000,
+            storage_fingerprint: "seed:1000".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(db_state, LEXICAL_REBUILD_PAGE_SIZE);
+
+        let conversation_ids = [10, 25, 100, 500, 999];
+        for (i, &cid) in conversation_ids.iter().enumerate() {
+            let processed = i + 1;
+            let docs = processed * 5;
+            state.record_pending_commit(Some(cid), processed, docs, None);
+            state.finalize_commit(None);
+            assert_eq!(state.committed_conversation_id, Some(cid));
+            assert_eq!(state.processed_conversations, processed);
+            assert_eq!(state.indexed_docs, docs);
+            assert_eq!(state.committed_offset, processed as i64);
+        }
+
+        assert_eq!(state.committed_conversation_id, Some(999));
+        assert_eq!(state.processed_conversations, 5);
+        assert_eq!(state.committed_offset, 5);
     }
 }

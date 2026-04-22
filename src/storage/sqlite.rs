@@ -4924,12 +4924,11 @@ impl FrankenStorage {
         Ok(footprints)
     }
 
-    /// List conversations in primary-key order for full lexical rebuilds.
+    /// Legacy OFFSET-based traversal for one-time checkpoint migration only.
     ///
-    /// This avoids the user-facing recency sort, which forces SQLite to build a
-    /// temp B-tree on every page. Rebuilds only need a stable traversal order,
-    /// not reverse-chronological presentation.
-    pub fn list_conversations_for_lexical_rebuild(
+    /// New code must use `list_conversations_for_lexical_rebuild_after_id`
+    /// for keyset pagination.
+    pub fn list_conversations_for_lexical_rebuild_by_offset(
         &self,
         limit: i64,
         offset: i64,
@@ -15074,7 +15073,7 @@ mod tests {
 
         let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
         let rebuild_order: Vec<PathBuf> = storage
-            .list_conversations_for_lexical_rebuild(10, 0, &agent_slugs, &workspace_paths)
+            .list_conversations_for_lexical_rebuild_after_id(10, 0, &agent_slugs, &workspace_paths)
             .unwrap()
             .into_iter()
             .map(|conv| conv.source_path)
@@ -15137,6 +15136,214 @@ mod tests {
             bounded_paths,
             vec![PathBuf::from("/tmp/a.jsonl"), PathBuf::from("/tmp/b.jsonl")]
         );
+    }
+
+    #[test]
+    fn keyset_traversal_handles_sparse_holey_conversation_ids() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |label: &str, ts: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(label.to_string()),
+            title: Some(label.to_string()),
+            source_path: PathBuf::from(format!("/tmp/{label}.jsonl")),
+            started_at: Some(ts),
+            ended_at: Some(ts + 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(ts),
+                content: format!("msg for {label}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        for i in 0..6 {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &make_conv(&format!("conv-{i}"), 1000 + i),
+                )
+                .unwrap();
+        }
+
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .conn
+            .execute_compat("DELETE FROM conversations WHERE id IN (2, 4)", fparams![])
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id IN (2, 4)",
+                fparams![],
+            )
+            .unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
+
+        let page1 = storage
+            .list_conversations_for_lexical_rebuild_after_id(2, 0, &agent_slugs, &workspace_paths)
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let page1_ids: Vec<i64> = page1.iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(page1_ids, vec![1, 3]);
+
+        let page2 = storage
+            .list_conversations_for_lexical_rebuild_after_id(
+                2,
+                *page1_ids.last().unwrap(),
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        let page2_ids: Vec<i64> = page2.iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(page2_ids, vec![5, 6]);
+
+        let page3 = storage
+            .list_conversations_for_lexical_rebuild_after_id(
+                2,
+                *page2_ids.last().unwrap(),
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        assert!(page3.is_empty());
+
+        let all_ids: Vec<i64> = page1_ids.iter().chain(page2_ids.iter()).copied().collect();
+        assert_eq!(all_ids, vec![1, 3, 5, 6]);
+    }
+
+    #[test]
+    fn keyset_traversal_through_id_with_sparse_ranges() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let make_conv = |label: &str, ts: i64| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some(label.to_string()),
+            title: Some(label.to_string()),
+            source_path: PathBuf::from(format!("/tmp/{label}.jsonl")),
+            started_at: Some(ts),
+            ended_at: Some(ts + 1),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(ts),
+                content: format!("msg for {label}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        for i in 0..10 {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &make_conv(&format!("conv-{i}"), 1000 + i),
+                )
+                .unwrap();
+        }
+
+        storage.conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "DELETE FROM conversations WHERE id IN (3, 5, 7, 8)",
+                fparams![],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_compat(
+                "DELETE FROM messages WHERE conversation_id IN (3, 5, 7, 8)",
+                fparams![],
+            )
+            .unwrap();
+        storage.conn.execute("PRAGMA foreign_keys = ON").unwrap();
+
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups().unwrap();
+
+        let through_5 = storage
+            .list_conversations_for_lexical_rebuild_after_id_through_id(
+                100,
+                0,
+                5,
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        let through_5_ids: Vec<i64> = through_5.iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(through_5_ids, vec![1, 2, 4]);
+
+        let after_4_through_10 = storage
+            .list_conversations_for_lexical_rebuild_after_id_through_id(
+                100,
+                4,
+                10,
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        let ids: Vec<i64> = after_4_through_10.iter().map(|c| c.id.unwrap()).collect();
+        assert_eq!(ids, vec![6, 9, 10]);
+
+        let after_10 = storage
+            .list_conversations_for_lexical_rebuild_after_id_through_id(
+                100,
+                10,
+                20,
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .unwrap();
+        assert!(after_10.is_empty());
     }
 
     #[test]
