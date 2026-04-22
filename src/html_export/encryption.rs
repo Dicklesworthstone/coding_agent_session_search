@@ -20,8 +20,8 @@ pub enum EncryptionError {
     KeyDerivation(String),
     /// Encryption operation failed
     EncryptionFailed(String),
-    /// Invalid password
-    InvalidPassword,
+    /// Invalid passphrase
+    InvalidPassphrase,
 }
 
 impl fmt::Display for EncryptionError {
@@ -29,7 +29,7 @@ impl fmt::Display for EncryptionError {
         match self {
             EncryptionError::KeyDerivation(msg) => write!(f, "key derivation failed: {}", msg),
             EncryptionError::EncryptionFailed(msg) => write!(f, "encryption failed: {}", msg),
-            EncryptionError::InvalidPassword => write!(f, "invalid password"),
+            EncryptionError::InvalidPassphrase => write!(f, "invalid passphrase"),
         }
     }
 }
@@ -96,8 +96,8 @@ pub fn encrypt_content(
     params: &EncryptionParams,
 ) -> Result<EncryptedContent, EncryptionError> {
     use aes_gcm::{
-        Aes256Gcm, Nonce,
         aead::{Aead, KeyInit},
+        Aes256Gcm, Nonce,
     };
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
@@ -108,7 +108,7 @@ pub fn encrypt_content(
             operation = "validate_password",
             "Rejected empty password"
         );
-        return Err(EncryptionError::InvalidPassword);
+        return Err(EncryptionError::InvalidPassphrase);
     }
     if params.iterations == 0 {
         return Err(EncryptionError::KeyDerivation(
@@ -189,17 +189,17 @@ fn fill_encryption_random(label: &str, output: &mut [u8]) {
         return;
     }
 
-    use aes_gcm::aead::{OsRng, rand_core::RngCore};
+    use aes_gcm::aead::{rand_core::RngCore, OsRng};
     OsRng.fill_bytes(output);
 }
 
 /// Deterministic bytes for debug/test golden generation only.
 #[cfg(feature = "encryption")]
-fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
+fn deterministic_test_bytes(entropy_label: &str, len: usize) -> Option<Vec<u8>> {
     #[cfg(debug_assertions)]
     {
-        let label = dotenvy::var("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL").ok()?;
-        if label.is_empty() {
+        let golden_label = dotenvy::var("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL").ok()?;
+        if golden_label.is_empty() {
             return None;
         }
 
@@ -208,8 +208,8 @@ fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
         while out.len() < len {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"cass-html-export-deterministic-encryption-v1");
-            hasher.update(label.as_bytes());
-            hasher.update(label.as_bytes());
+            hasher.update(golden_label.as_bytes());
+            hasher.update(entropy_label.as_bytes());
             hasher.update(&counter.to_le_bytes());
             out.extend_from_slice(hasher.finalize().as_bytes());
             counter += 1;
@@ -220,7 +220,7 @@ fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
 
     #[cfg(not(debug_assertions))]
     {
-        let _ = (label, len);
+        let _ = (entropy_label, len);
         None
     }
 }
@@ -331,11 +331,11 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn test_encrypt_content_roundtrip() {
         use aes_gcm::{
-            Aes256Gcm, Nonce,
             aead::{Aead, KeyInit},
+            Aes256Gcm, Nonce,
         };
-        use base64::Engine; // Required for decode() method
         use base64::prelude::BASE64_STANDARD;
+        use base64::Engine; // Required for decode() method
         use pbkdf2::pbkdf2_hmac;
         use sha2::Sha256;
 
@@ -407,7 +407,7 @@ mod tests {
             iv_len: 12,
         };
         let result = encrypt_content("hello", "", &params);
-        assert!(matches!(result, Err(EncryptionError::InvalidPassword)));
+        assert!(matches!(result, Err(EncryptionError::InvalidPassphrase)));
     }
 
     #[test]
