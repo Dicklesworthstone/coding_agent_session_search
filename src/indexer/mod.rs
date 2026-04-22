@@ -2352,6 +2352,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
     worker_count: usize,
     rx: Receiver<LexicalRebuildShardBuildWork>,
     tx: Sender<LexicalRebuildShardBuildMessage>,
+    flow_limiter: Arc<StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
 ) -> Vec<JoinHandle<()>> {
     let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
@@ -2359,17 +2360,24 @@ fn spawn_lexical_rebuild_shard_builder_workers(
         .map(|worker_idx| {
             let rx = rx.clone();
             let tx = tx.clone();
+            let flow_limiter = Arc::clone(&flow_limiter);
             let lexical_rebuild_worker_pool = lexical_rebuild_worker_pool.clone();
             let tracing_dispatch = tracing_dispatch.clone();
             thread::spawn(move || {
                 tracing::dispatcher::with_default(&tracing_dispatch, || {
                     while let Ok(work) = rx.recv() {
+                        let flow_reservation_bytes = work
+                            .packets
+                            .iter()
+                            .map(|packet| packet.flow_reservation_bytes)
+                            .sum::<usize>();
                         let result = build_lexical_rebuild_shard_index_with_writer_parallelism(
                             &work.shard_index_path,
                             &work.packets,
                             lexical_rebuild_worker_pool.as_deref(),
                             Some(work.writer_parallelism),
                         );
+                        flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(indexed_docs) => {
                                 tracing::info!(
@@ -10362,6 +10370,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_builder_settings.max_builders,
         shard_work_rx,
         shard_result_tx,
+        Arc::clone(&lexical_rebuild_flow_limiter),
         lexical_rebuild_worker_pool.clone(),
     );
     let shard_work_dispatch_tx = shard_work_tx.clone();
@@ -14471,6 +14480,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn wal_autocheckpoint_defaults_follow_bulk_import_mode() {
             let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
             assert_eq!(index_writer_wal_autocheckpoint_pages(true), 0);
@@ -18088,6 +18098,7 @@ mod tests {
     #[test]
     #[serial]
     fn lexical_rebuild_pipeline_settings_snapshot_honors_env_overrides() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "7");
         let _reserved_cores = set_env("CASS_TANTIVY_REBUILD_RESERVED_CORES", "4");
         let _controller_mode = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_MODE", "steady");
@@ -18590,6 +18601,7 @@ mod tests {
     #[test]
     #[serial]
     fn lexical_rebuild_pipeline_settings_snapshot_defaults_page_prep_workers_from_worker_budget() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "12");
         let _pipeline_channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "2");
         let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "8");
@@ -19203,6 +19215,7 @@ mod tests {
     #[test]
     #[serial]
     fn lexical_rebuild_packet_producer_preserves_order_across_parallel_page_prep_workers() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("producer-ordered-workers.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
@@ -20131,7 +20144,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn streaming_consumer_handles_mixed_startup_batches_with_watch_checkpoint_policy() {
+        let _wal_guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -22084,6 +22099,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_promotes_pipeline_budgets_after_first_commit() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -26425,7 +26441,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn initial_batch_fetch_limit_defaults_to_bounded_warmup_chunk() {
+        let _initial_conversation_limit = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "0",
+        );
         // The first durable rebuild chunk should stay small enough to land an
         // early restartable checkpoint without exploding RSS. Once that commit
         // lands, the rebuild immediately ramps back to the steady-state chunk
