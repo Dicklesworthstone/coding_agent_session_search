@@ -266,3 +266,20 @@ fn api_version_json_matches_golden() {
     );
     assert_golden("robot/api_version.json.golden", &scrubbed);
 }
+
+#[test]
+fn introspect_json_matches_golden() {
+    // `cass introspect --json` is the full API schema surface — every
+    // subcommand, its flags, positional args, and response-schema
+    // references. Agents that bind to cass programmatically read this to
+    // generate typed clients; silent drift here breaks every downstream
+    // client. Under an isolated empty HOME the output is deterministic
+    // (no runtime data affects the schema listing).
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["introspect", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    assert_golden("robot/introspect.json.golden", &scrubbed);
+}
