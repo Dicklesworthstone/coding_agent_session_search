@@ -114,7 +114,14 @@ impl SemanticDocId {
         out.push_str(buf.format(self.created_at_ms));
         if let Some(hash) = self.content_hash {
             out.push('|');
-            out.push_str(&hex::encode(hash));
+            // Stack-buffered hex encode: avoids the 64-byte heap alloc that
+            // `hex::encode(hash)` performs internally. Hex output is pure
+            // ASCII so str::from_utf8 can't fail on the filled slice.
+            let mut hex_buf = [0u8; 64];
+            hex::encode_to_slice(hash, &mut hex_buf).expect("32 bytes encode to exactly 64 hex chars");
+            out.push_str(
+                std::str::from_utf8(&hex_buf).expect("hex output is always valid ASCII"),
+            );
         }
         out
     }
