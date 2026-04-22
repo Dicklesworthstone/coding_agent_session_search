@@ -973,42 +973,21 @@ pub(crate) struct MaintenanceEvent {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum MaintenanceEventKind {
-    Started {
-        job_kind: String,
-        phase: String,
-    },
-    PhaseChanged {
-        from: String,
-        to: String,
-    },
-    Progress {
-        processed: u64,
-        total: u64,
-    },
-    YieldRequested {
-        requester_pid: u32,
-        reason: String,
-    },
-    Paused {
-        reason: String,
-    },
+    Started { job_kind: String, phase: String },
+    PhaseChanged { from: String, to: String },
+    Progress { processed: u64, total: u64 },
+    YieldRequested { requester_pid: u32, reason: String },
+    Paused { reason: String },
     Resumed,
-    Completed {
-        summary: String,
-    },
-    Failed {
-        error: String,
-    },
-    Cancelled {
-        reason: String,
-    },
+    Completed { summary: String },
+    Failed { error: String },
+    Cancelled { reason: String },
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn append_maintenance_event(data_dir: &Path, event: &MaintenanceEvent) -> Result<()> {
     let path = data_dir.join(MAINTENANCE_EVENTS_FILE);
-    let line =
-        serde_json::to_string(event).with_context(|| "serializing maintenance event")?;
+    let line = serde_json::to_string(event).with_context(|| "serializing maintenance event")?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1031,12 +1010,11 @@ pub(crate) fn read_maintenance_events(
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    let threshold = after_ms.unwrap_or(0);
     let cap = limit.unwrap_or(MAX_EVENT_LOG_ENTRIES);
     contents
         .lines()
         .filter_map(|line| serde_json::from_str::<MaintenanceEvent>(line).ok())
-        .filter(|e| e.timestamp_ms > threshold)
+        .filter(|e| after_ms.is_none_or(|threshold| e.timestamp_ms > threshold))
         .rev()
         .take(cap)
         .collect::<Vec<_>>()
@@ -1054,7 +1032,7 @@ pub(crate) fn truncate_maintenance_event_log(data_dir: &Path) -> Result<()> {
         Err(e) => {
             return Err(e).with_context(|| {
                 format!("reading event log for truncation at {}", path.display())
-            })
+            });
         }
     };
     let lines: Vec<&str> = contents.lines().collect();
@@ -1089,8 +1067,7 @@ pub(crate) fn request_yield(data_dir: &Path, reason: &str) -> Result<()> {
         requested_at_ms: now_ms,
         reason: reason.to_string(),
     };
-    let payload =
-        serde_json::to_string(&req).with_context(|| "serializing yield request")?;
+    let payload = serde_json::to_string(&req).with_context(|| "serializing yield request")?;
     std::fs::write(&path, payload)
         .with_context(|| format!("writing yield signal to {}", path.display()))
 }
@@ -1108,9 +1085,7 @@ pub(crate) fn clear_yield_signal(data_dir: &Path) -> Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => {
-            Err(e).with_context(|| format!("clearing yield signal at {}", path.display()))
-        }
+        Err(e) => Err(e).with_context(|| format!("clearing yield signal at {}", path.display())),
     }
 }
 
@@ -2203,7 +2178,10 @@ mod tests {
             view.coordination,
             MaintenanceCoordinationOutcome::Active { .. }
         ));
-        assert!(matches!(view.decision, MaintenanceDecision::FailOpen { .. }));
+        assert!(matches!(
+            view.decision,
+            MaintenanceDecision::FailOpen { .. }
+        ));
         assert_eq!(view.recent_events.len(), 1);
 
         let _ = FileExt::unlock(&owner);
@@ -2215,10 +2193,7 @@ mod tests {
         request_yield(temp.path(), "test yield").expect("yield");
         let view = unified_maintenance_view(temp.path(), true);
         assert!(view.yield_pending.is_some());
-        assert_eq!(
-            view.yield_pending.as_ref().unwrap().reason,
-            "test yield"
-        );
+        assert_eq!(view.yield_pending.as_ref().unwrap().reason, "test yield");
         clear_yield_signal(temp.path()).expect("clear");
     }
 
