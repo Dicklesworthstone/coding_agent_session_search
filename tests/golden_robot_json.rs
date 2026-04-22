@@ -234,3 +234,19 @@ fn health_json_matches_golden() {
     );
     assert_golden("robot/health.json.golden", &scrubbed);
 }
+
+#[test]
+fn diag_json_matches_golden() {
+    // `cass diag --json` is the artifact-inventory surface that
+    // ibuuh.36's verification matrix wants frozen alongside manifest
+    // snapshots and golden-query digests: version, platform, paths,
+    // database counts, index presence, and per-connector detection. Under
+    // an isolated empty HOME every field is deterministic (no connectors
+    // detected, database/index absent, paths scrub to [TEST_HOME]).
+    // Freezing this makes drift on any connector-detection or path-layout
+    // field fail in CI instead of silently misreporting to operators.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed =
+        capture_robot_json(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
+    assert_golden("robot/diag.json.golden", &scrubbed);
+}

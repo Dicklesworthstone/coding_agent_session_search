@@ -1,0 +1,119 @@
+{
+  "version": "0.3.6",
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "paths": {
+    "data_dir": "[TEST_HOME]/coding-agent-search",
+    "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db",
+    "index_path": "[TEST_HOME]/coding-agent-search/index/v7"
+  },
+  "database": {
+    "exists": false,
+    "size_bytes": 0,
+    "conversations": 0,
+    "messages": 0
+  },
+  "index": {
+    "exists": false,
+    "size_bytes": 0
+  },
+  "connectors": [
+    {
+      "name": "codex",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "claude_code",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "gemini",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "clawdbot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "vibe",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "opencode",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "amp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "cline",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "aider",
+      "path": "/data/projects/coding_agent_session_search/.aider.chat.history.md",
+      "found": true
+    },
+    {
+      "name": "cursor",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "chatgpt",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "pi_agent",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "factory",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "openclaw",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "kimi",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "copilot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "copilot_cli",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "qwen",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "crush",
+      "path": "(not detected)",
+      "found": false
+    }
+  ]
+}
