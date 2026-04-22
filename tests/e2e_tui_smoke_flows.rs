@@ -141,6 +141,12 @@ fn rendered_contains_auth_fixture_result(rendered: &str) -> bool {
         .contains("i found several authentication issues")
 }
 
+fn exported_html_contains_codex_fixture(rendered: &str) -> bool {
+    let lower = rendered.to_ascii_lowercase();
+    lower.contains("hi there, how can i help?")
+        && lower.contains("i found several authentication issues")
+}
+
 /// Save output as artifact
 fn save_artifact(name: &str, trace: &str, content: &[u8]) -> PathBuf {
     let dir = artifact_dir();
@@ -384,7 +390,7 @@ fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
 // =============================================================================
 
 /// Create a Codex fixture with searchable content
-fn make_codex_fixture(root: &Path) {
+fn make_codex_fixture(root: &Path) -> PathBuf {
     let sessions = root.join("sessions/2025/11/21");
     fs::create_dir_all(&sessions).unwrap();
     let file = sessions.join("rollout-1.jsonl");
@@ -399,7 +405,8 @@ fn make_codex_fixture(root: &Path) {
 {"type":"event_msg","timestamp":1700000000700,"payload":{"type":"user_message","message":"show markdown sentinel sample"}}
 {"type":"response_item","timestamp":1700000000800,"payload":{"role":"assistant","content":"## Markdown Sentinel Alpha\n- list item bravo\n\n```rust\nlet sentinel = 42;\n```"}}
 "###;
-    fs::write(file, sample).unwrap();
+    fs::write(&file, sample).unwrap();
+    file
 }
 
 /// Create a Claude Code fixture
@@ -1590,7 +1597,7 @@ fn tui_export_flow_with_logging() {
     fs::create_dir_all(&data_dir).unwrap();
 
     let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
-    make_codex_fixture(&data_dir);
+    let export_session_path = make_codex_fixture(&data_dir);
     tracker.end("setup", Some("Fixtures created"), setup_start);
 
     // Index
@@ -1619,7 +1626,7 @@ fn tui_export_flow_with_logging() {
         .arg("search")
         .arg("hello")
         .arg("--robot")
-        .arg("--format")
+        .arg("--robot-format")
         .arg("sessions")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -1628,6 +1635,18 @@ fn tui_export_flow_with_logging() {
         .expect("failed to spawn cass search");
 
     save_artifact("search_sessions_stdout.json", &trace, &search_output.stdout);
+    save_artifact("search_sessions_stderr.txt", &trace, &search_output.stderr);
+    assert!(
+        search_output.status.success(),
+        "search for export failed: stdout={} stderr={}",
+        truncate_output(&search_output.stdout, 1200),
+        truncate_output(&search_output.stderr, 1200)
+    );
+    assert!(
+        export_session_path.exists(),
+        "fixture session path should exist for export: {}",
+        export_session_path.display()
+    );
 
     let search_ms = search_start.elapsed().as_millis() as u64;
     tracker.end("search_for_export", Some("Search complete"), search_start);
@@ -1643,9 +1662,53 @@ fn tui_export_flow_with_logging() {
     let export_dir = tmp.path().join("exports");
     fs::create_dir_all(&export_dir).unwrap();
 
-    // Note: Full HTML export requires a session source path, which we simulate
-    // In a real TUI flow, user would select a session and export it
-    // Here we verify the export command infrastructure works
+    let export_start = tracker.start(
+        "export_html",
+        Some("Exporting selected session content to HTML"),
+    );
+    let export_output = cargo_bin_cmd!("cass")
+        .arg("export-html")
+        .arg(&export_session_path)
+        .arg("--output-dir")
+        .arg(&export_dir)
+        .arg("--filename")
+        .arg("tui-export-flow")
+        .arg("--json")
+        .current_dir(&home)
+        .output()
+        .expect("failed to spawn cass export-html");
+
+    save_artifact("export_html_stdout.json", &trace, &export_output.stdout);
+    save_artifact("export_html_stderr.txt", &trace, &export_output.stderr);
+    assert!(
+        export_output.status.success(),
+        "export-html failed: stdout={} stderr={}",
+        truncate_output(&export_output.stdout, 1200),
+        truncate_output(&export_output.stderr, 1200)
+    );
+    let export_json: serde_json::Value =
+        serde_json::from_slice(&export_output.stdout).expect("export-html should emit JSON");
+    let output_path = export_json
+        .get("exported")
+        .and_then(|exported| exported.get("output_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .expect("export-html JSON should include exported.output_path");
+    let rendered_html = fs::read_to_string(&output_path).expect("read exported HTML");
+    save_artifact("exported_session.html", &trace, rendered_html.as_bytes());
+    let saw_exported_fixture_content = exported_html_contains_codex_fixture(&rendered_html);
+    assert!(
+        saw_exported_fixture_content,
+        "Expected exported HTML to contain rendered Codex fixture conversation content"
+    );
+    let export_ms = export_start.elapsed().as_millis() as u64;
+    tracker.end("export_html", Some("Export HTML complete"), export_start);
+    tracker.metrics(
+        "export_html_duration",
+        &E2ePerformanceMetrics::new()
+            .with_duration(export_ms)
+            .with_custom("trace_id", trace.clone()),
+    );
 
     // TUI launch to verify export UI would work
     let tui_start = tracker.start(
@@ -1683,8 +1746,12 @@ fn tui_export_flow_with_logging() {
         "test": "tui_export_flow_with_logging",
         "phases": {
             "search_sessions_ms": search_ms,
+            "export_html_ms": export_ms,
             "tui_headless_ms": tui_ms,
         },
+        "export_session_path": export_session_path,
+        "export_output_path": output_path,
+        "saw_exported_fixture_content": saw_exported_fixture_content,
     });
     save_artifact(
         "summary.json",
