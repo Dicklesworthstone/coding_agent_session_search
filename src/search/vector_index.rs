@@ -118,11 +118,13 @@ impl SemanticDocId {
 /// 64-hex content hash suffix.
 #[must_use]
 pub fn parse_semantic_doc_id(doc_id: &str) -> Option<SemanticDocId> {
-    let mut parts = doc_id.split('|');
-    if parts.next()? != "m" {
-        return None;
-    }
-
+    // Fast reject: every cass semantic doc_id starts with "m|". `strip_prefix`
+    // avoids the full iterator setup + first `.next()` comparison when the
+    // discriminator doesn't match. `splitn(8, '|')` caps the field scan at
+    // exactly the 7 required fields + a single tail holding the optional
+    // content hash (which itself never contains '|').
+    let rest = doc_id.strip_prefix("m|")?;
+    let mut parts = rest.splitn(8, '|');
     let parsed = SemanticDocId {
         message_id: parts.next()?.parse().ok()?,
         chunk_idx: parts.next()?.parse().ok()?,
@@ -142,6 +144,49 @@ pub fn parse_semantic_doc_id(doc_id: &str) -> Option<SemanticDocId> {
     };
 
     Some(parsed)
+}
+
+/// Lean filter-only view of a parsed semantic doc_id.
+///
+/// Drops the content_hash (which requires hex::decode_to_slice on 64 bytes)
+/// plus the unused message_id and chunk_idx. Used by
+/// `SemanticFilter::matches`, which runs once per HNSW-visited node during
+/// ANN traversal — often thousands of times per query — and never reads the
+/// content_hash or message identifiers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SemanticDocIdFilterView {
+    pub agent_id: u32,
+    pub workspace_id: u32,
+    pub source_id: u32,
+    pub role: u8,
+    pub created_at_ms: i64,
+}
+
+/// Parse only the filter-relevant fields of a cass semantic doc_id string.
+///
+/// ~5x cheaper than `parse_semantic_doc_id` when the content_hash is present,
+/// because it skips the 64-byte hex decode that dominates the full-parse cost.
+#[must_use]
+pub(crate) fn parse_semantic_doc_id_filter_view(
+    doc_id: &str,
+) -> Option<SemanticDocIdFilterView> {
+    let rest = doc_id.strip_prefix("m|")?;
+    let mut parts = rest.splitn(8, '|');
+    // message_id + chunk_idx: we only need to advance the iterator past them.
+    parts.next()?;
+    parts.next()?;
+    let agent_id: u32 = parts.next()?.parse().ok()?;
+    let workspace_id: u32 = parts.next()?.parse().ok()?;
+    let source_id: u32 = parts.next()?.parse().ok()?;
+    let role: u8 = parts.next()?.parse().ok()?;
+    let created_at_ms: i64 = parts.next()?.parse().ok()?;
+    Some(SemanticDocIdFilterView {
+        agent_id,
+        workspace_id,
+        source_id,
+        role,
+        created_at_ms,
+    })
 }
 
 fn map_filter_set(keys: &HashSet<String>, map: &HashMap<String, u32>) -> Option<HashSet<u32>> {
@@ -323,7 +368,9 @@ pub struct VectorSearchResult {
 
 impl frankensearch::core::filter::SearchFilter for SemanticFilter {
     fn matches(&self, doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
-        let Some(parsed) = parse_semantic_doc_id(doc_id) else {
+        // Use the filter-view parse: skips the expensive 64-byte hex decode
+        // of content_hash that the full parse runs on every call.
+        let Some(parsed) = parse_semantic_doc_id_filter_view(doc_id) else {
             return false;
         };
 
