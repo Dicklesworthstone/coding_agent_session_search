@@ -3524,7 +3524,8 @@ impl SearchClient {
                     "semantic two-tier search executed"
                 );
 
-                let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+                let mut best_by_message: HashMap<u64, VectorSearchResult> =
+                    HashMap::with_capacity(tier_hits.len());
                 for hit in tier_hits.iter() {
                     let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
                         continue;
@@ -3562,7 +3563,8 @@ impl SearchClient {
                 .search_top_k(embedding, request.fetch_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
 
-            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+            let mut best_by_message: HashMap<u64, VectorSearchResult> =
+                HashMap::with_capacity(fs_hits.len());
             for hit in fs_hits.iter() {
                 let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
                     continue;
@@ -3621,7 +3623,8 @@ impl SearchClient {
 
             let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
 
-            let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+            let mut best_by_message: HashMap<u64, VectorSearchResult> =
+                HashMap::with_capacity(ann_results.len());
             for hit in ann_results.iter() {
                 if let Some(filter) = fs_filter
                     && !filter.matches(&hit.doc_id, None)
@@ -3659,7 +3662,8 @@ impl SearchClient {
             .search_top_k(embedding, request.fetch_limit, fs_filter)
             .map_err(|err| anyhow!("frankensearch semantic search failed: {err}"))?;
 
-        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        let mut best_by_message: HashMap<u64, VectorSearchResult> =
+            HashMap::with_capacity(fs_hits.len());
         for hit in fs_hits.iter() {
             let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
                 continue;
@@ -4161,7 +4165,8 @@ impl SearchClient {
         fetch_limit: usize,
     ) -> Vec<VectorSearchResult> {
         let fetch = fetch_limit.max(1);
-        let mut best_by_message: HashMap<u64, VectorSearchResult> = HashMap::new();
+        let mut best_by_message: HashMap<u64, VectorSearchResult> =
+            HashMap::with_capacity(results.len());
         for hit in results {
             let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
                 continue;
