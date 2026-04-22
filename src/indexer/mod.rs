@@ -22057,6 +22057,113 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_persists_serveable_generation_manifest() {
+        // Bead ibuuh.30 slice: the authoritative rebuild must write a
+        // lexical generation manifest alongside the equivalence ledger, and
+        // that manifest must declare the generation serveable (Validated +
+        // Published) with counts that line up with the rebuild outcome and
+        // the equivalence fingerprint that ibuuh.29 computed.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            let evidence = rebuild
+                .equivalence
+                .as_ref()
+                .expect("authoritative rebuild must emit equivalence evidence");
+            assert_eq!(rebuild.indexed_docs, 4);
+
+            let index_path = index_dir(&data_dir).unwrap();
+            let loaded = lexical_generation::load_manifest(&index_path)
+                .expect("loading the generation manifest must not error")
+                .expect(
+                    "authoritative rebuild must persist a generation manifest \
+                     alongside the equivalence ledger",
+                );
+
+            // Publish-readiness contract: only a manifest in Validated build state
+            // AND Published publish state may be served by ordinary search.
+            assert!(
+                loaded.is_serveable(),
+                "freshly committed generation must be Validated+Published; got \
+                 build_state={:?} publish_state={:?}",
+                loaded.build_state,
+                loaded.publish_state
+            );
+            assert_eq!(
+                loaded.build_state,
+                lexical_generation::LexicalGenerationBuildState::Validated
+            );
+            assert_eq!(
+                loaded.publish_state,
+                lexical_generation::LexicalGenerationPublishState::Published
+            );
+
+            // Counts must line up with the rebuild outcome so operators can
+            // sanity-check the manifest against progress logs without
+            // replaying the rebuild.
+            assert_eq!(
+                loaded.indexed_doc_count, evidence.document_count,
+                "manifest indexed_doc_count must match equivalence accumulator"
+            );
+            assert_eq!(
+                loaded.indexed_doc_count, rebuild.indexed_docs as u64,
+                "manifest indexed_doc_count must match outcome.indexed_docs"
+            );
+
+            // The equivalence fingerprint bridges ibuuh.29 and ibuuh.30:
+            // the manifest must point at the streaming accumulator digest
+            // the rebuild just emitted, so validation tooling can diff
+            // them without re-reading the ledger artifact.
+            assert_eq!(
+                loaded.equivalence_manifest_fingerprint.as_deref(),
+                Some(evidence.manifest_fingerprint.as_str()),
+                "generation manifest must link to the equivalence accumulator fingerprint"
+            );
+
+            assert!(
+                !loaded.generation_id.is_empty(),
+                "generation_id must be non-empty"
+            );
+            assert!(
+                !loaded.attempt_id.is_empty(),
+                "attempt_id must be non-empty"
+            );
+            assert!(
+                !loaded.source_db_fingerprint.is_empty(),
+                "source_db_fingerprint must be propagated from rebuild_state"
+            );
+            assert!(
+                loaded.failure_history.is_empty(),
+                "successful rebuild should have an empty failure history"
+            );
+            assert!(
+                loaded.updated_at_ms >= loaded.created_at_ms,
+                "updated_at_ms must be non-decreasing relative to created_at_ms"
+            );
+        });
+
+        assert!(
+            logs.contains("lexical generation manifest published"),
+            "expected generation manifest publish log, got:
+{logs}"
+        );
+        assert!(
+            logs.contains("generation_id=") && logs.contains("attempt_id="),
+            "expected generation_id + attempt_id fields in publish log, got:
+{logs}"
+        );
+    }
+
+    #[test]
     fn lexical_rebuild_equivalence_accumulator_matches_legacy_and_keyset_replays() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("lexical-equivalence-accumulator.db");
