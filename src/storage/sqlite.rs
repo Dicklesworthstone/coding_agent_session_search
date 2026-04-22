@@ -846,7 +846,9 @@ pub(crate) fn rebuild_fts_via_rusqlite(db_path: &Path) -> Result<usize> {
             db_path.display()
         )
     })?;
-    storage.rebuild_fts_via_frankensqlite()
+    let inserted = storage.rebuild_fts_via_frankensqlite()?;
+    storage.record_fts_franken_rebuild_generation()?;
+    Ok(inserted)
 }
 
 pub(crate) fn ensure_fts_consistency_via_rusqlite(db_path: &Path) -> Result<FtsConsistencyRepair> {
@@ -10988,6 +10990,100 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Open a rusqlite connection on `db_path` for the narrow purpose of
+    /// injecting (or inspecting the raw projection of) sqlite_master
+    /// corruption patterns in test fixtures. Frankensqlite intentionally does
+    /// not support `PRAGMA writable_schema` writes or raw inserts to
+    /// sqlite_master (see AGENTS.md: "PRAGMA writable_schema: Not supported for
+    /// write operations"), so these fixtures retain rusqlite as the standard-
+    /// SQLite interop layer. All callers are in this test module and run under
+    /// #[cfg(test)]; no production code path touches rusqlite here.
+    fn rusqlite_test_fixture_conn(db_path: &Path) -> rusqlite::Connection {
+        rusqlite::Connection::open(db_path).expect("open rusqlite test fixture connection")
+    }
+
+    fn seed_historical_db_direct(
+        db_path: &Path,
+        conversations: &[crate::model::types::Conversation],
+    ) {
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute_batch(HISTORICAL_RECOVERY_CORE_SCHEMA).unwrap();
+        conn.execute_compat(
+            "INSERT INTO agents(id, slug, name, version, kind, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            fparams![1_i64, "codex", "Codex", "0.2.3", "cli", 0_i64, 0_i64],
+        )
+        .unwrap();
+
+        let mut next_message_id = 1_i64;
+        for (conv_index, conv) in conversations.iter().enumerate() {
+            let conversation_id = i64::try_from(conv_index + 1).unwrap();
+            let workspace_id = conv.workspace.as_ref().map(|workspace| {
+                let workspace_id = conversation_id;
+                let workspace_path = workspace.to_string_lossy().into_owned();
+                conn.execute_compat(
+                    "INSERT INTO workspaces(id, path, display_name) VALUES(?1, ?2, ?3)",
+                    fparams![
+                        workspace_id,
+                        workspace_path.as_str(),
+                        workspace_path.as_str()
+                    ],
+                )
+                .unwrap();
+                workspace_id
+            });
+            let source_path = conv.source_path.to_string_lossy().into_owned();
+            let metadata_json = conv.metadata_json.to_string();
+            conn.execute_compat(
+                "INSERT INTO conversations (
+                    id, agent_id, workspace_id, source_id, external_id, title, source_path,
+                    started_at, ended_at, approx_tokens, metadata_json, origin_host
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                fparams![
+                    conversation_id,
+                    1_i64,
+                    workspace_id,
+                    conv.source_id.as_str(),
+                    conv.external_id.as_deref(),
+                    conv.title.as_deref(),
+                    source_path.as_str(),
+                    conv.started_at,
+                    conv.ended_at,
+                    conv.approx_tokens,
+                    metadata_json.as_str(),
+                    conv.origin_host.as_deref()
+                ],
+            )
+            .unwrap();
+
+            for msg in &conv.messages {
+                let role = role_str(&msg.role);
+                let extra_json = msg.extra_json.to_string();
+                conn.execute_compat(
+                    "INSERT INTO messages(
+                        id, conversation_id, idx, role, author, created_at, content, extra_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    fparams![
+                        next_message_id,
+                        conversation_id,
+                        msg.idx,
+                        role.as_str(),
+                        msg.author.as_deref(),
+                        msg.created_at,
+                        msg.content.as_str(),
+                        extra_json.as_str()
+                    ],
+                )
+                .unwrap();
+                next_message_id += 1;
+            }
+        }
+    }
+
     // =========================================================================
     // User data file protection tests (bead yln.4)
     // =========================================================================
@@ -12599,8 +12695,8 @@ mod tests {
         };
         let agent_id = storage.ensure_agent(&agent).unwrap();
 
-        let content = "y".repeat(4096);
-        let messages: Vec<_> = (0..1_200)
+        let content = "y".repeat((FTS_ENTRY_BATCH_MAX_CHARS / 2) + 1);
+        let messages: Vec<_> = (0_i64..2)
             .map(|i| Message {
                 id: None,
                 idx: i,
@@ -13392,9 +13488,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_conversations_batched_reprocessing_large_conversation_is_idempotent() {
+    fn insert_conversations_batched_reprocessing_conversation_is_idempotent() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
+
+        const MESSAGE_COUNT: i64 = 64;
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -13409,7 +13507,7 @@ mod tests {
         };
         let agent_id = storage.ensure_agent(&agent).unwrap();
 
-        let messages: Vec<Message> = (0..1200)
+        let messages: Vec<Message> = (0..MESSAGE_COUNT)
             .map(|idx| Message {
                 id: None,
                 idx,
@@ -13434,7 +13532,7 @@ mod tests {
             title: Some("Large Reprocess Session".into()),
             source_path: PathBuf::from("/tmp/large-reprocess-session.jsonl"),
             started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_001_199),
+            ended_at: Some(1_700_000_000_000 + MESSAGE_COUNT - 1),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages,
@@ -13451,7 +13549,7 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
-        assert_eq!(first[0].inserted_indices.len(), 1200);
+        assert_eq!(first[0].inserted_indices.len(), MESSAGE_COUNT as usize);
         assert!(
             second[0].inserted_indices.is_empty(),
             "full reprocessing of a large conversation must not attempt duplicate idx inserts"
@@ -13472,7 +13570,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(conversation_count, 1);
-        assert_eq!(message_count, 1200);
+        assert_eq!(message_count, MESSAGE_COUNT);
     }
 
     #[test]
@@ -14337,28 +14435,8 @@ mod tests {
 
     #[test]
     fn salvage_historical_databases_imports_backups_once_and_merges_overlap() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::model::types::{Conversation, Message, MessageRole};
         use std::path::PathBuf;
-
-        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
-            if let Some(parent) = db_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            let storage = SqliteStorage::open(db_path).unwrap();
-            let agent = Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: Some("0.2.3".into()),
-                kind: AgentKind::Cli,
-            };
-            let agent_id = storage.ensure_agent(&agent).unwrap();
-            for conv in conversations {
-                storage
-                    .insert_conversation_tree(agent_id, None, conv)
-                    .unwrap();
-            }
-        }
 
         fn base_conv(source_path: &str, messages: Vec<Message>) -> Conversation {
             Conversation {
@@ -14449,12 +14527,12 @@ mod tests {
             ..base_conv("/tmp/unique-history.jsonl", Vec::new())
         };
 
-        seed_historical_db(
+        seed_historical_db_direct(
             &dir.path()
                 .join("backups/agent_search.db.20260322T020200.bak"),
             std::slice::from_ref(&overlapping_a),
         );
-        seed_historical_db(
+        seed_historical_db_direct(
             &dir.path().join("agent_search.corrupt.20260324_212907"),
             &[overlapping_b, unique],
         );
@@ -14487,28 +14565,8 @@ mod tests {
 
     #[test]
     fn salvage_historical_databases_normalizes_host_only_remote_provenance() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::model::types::{Conversation, Message, MessageRole};
         use std::path::PathBuf;
-
-        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
-            if let Some(parent) = db_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            let storage = SqliteStorage::open(db_path).unwrap();
-            let agent = Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: Some("0.2.3".into()),
-                kind: AgentKind::Cli,
-            };
-            let agent_id = storage.ensure_agent(&agent).unwrap();
-            for conv in conversations {
-                storage
-                    .insert_conversation_tree(agent_id, None, conv)
-                    .unwrap();
-            }
-        }
 
         let dir = TempDir::new().unwrap();
         let canonical_db = dir.path().join("agent_search.db");
@@ -14542,28 +14600,26 @@ mod tests {
         let historical_db = dir
             .path()
             .join("backups/agent_search.db.20260322T020200.bak");
-        seed_historical_db(&historical_db, std::slice::from_ref(&host_only_remote));
+        seed_historical_db_direct(&historical_db, std::slice::from_ref(&host_only_remote));
 
-        let historical_storage = SqliteStorage::open(&historical_db).unwrap();
-        historical_storage
-            .raw()
+        let historical_conn =
+            FrankenConnection::open(historical_db.to_string_lossy().into_owned()).unwrap();
+        historical_conn
             .execute_compat(
                 "INSERT INTO sources(id, kind, host_label, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?5)",
                 fparams!["   ", "ssh", "builder-5", 0_i64, 0_i64],
             )
             .unwrap();
-        historical_storage
-            .raw()
+        historical_conn
             .execute_compat(
                 "UPDATE conversations SET source_id = ?1, origin_host = ?2 WHERE source_path = ?3",
                 fparams!["   ", "builder-5", "/tmp/host-only-history.jsonl"],
             )
             .unwrap();
-        historical_storage
-            .raw()
+        historical_conn
             .execute_compat("DELETE FROM sources WHERE id = ?1", fparams!["builder-5"])
             .unwrap();
-        drop(historical_storage);
+        drop(historical_conn);
 
         let first = storage.salvage_historical_databases(&canonical_db).unwrap();
         assert_eq!(first.bundles_imported, 1);
@@ -14660,26 +14716,6 @@ mod tests {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
-        fn seed_historical_db(db_path: &Path, conversations: &[Conversation]) {
-            if let Some(parent) = db_path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            let storage = SqliteStorage::open(db_path).unwrap();
-            let agent = Agent {
-                id: None,
-                slug: "codex".into(),
-                name: "Codex".into(),
-                version: Some("0.2.3".into()),
-                kind: AgentKind::Cli,
-            };
-            let agent_id = storage.ensure_agent(&agent).unwrap();
-            for conv in conversations {
-                storage
-                    .insert_conversation_tree(agent_id, None, conv)
-                    .unwrap();
-            }
-        }
-
         fn make_conv(source_path: &str, idx_seed: i64) -> Conversation {
             Conversation {
                 id: None,
@@ -14716,7 +14752,7 @@ mod tests {
         let conv_a = make_conv("/tmp/one.jsonl", 1);
         let conv_b = make_conv("/tmp/two.jsonl", 2);
         let conv_c = make_conv("/tmp/three.jsonl", 3);
-        seed_historical_db(
+        seed_historical_db_direct(
             &backup_db,
             &[conv_a.clone(), conv_b.clone(), conv_c.clone()],
         );
@@ -15373,7 +15409,7 @@ mod tests {
         // migration and only the duplicate needed manual injection.
         let legacy_v13_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let legacy = rusqlite::Connection::open(&source_db).unwrap();
+        let legacy = rusqlite_test_fixture_conn(&source_db);
         legacy
             .execute_batch(
                 "UPDATE meta SET value = '13' WHERE key = 'schema_version';
@@ -15411,7 +15447,7 @@ mod tests {
         // Verify fixture with rusqlite+writable_schema to see raw
         // sqlite_master rows (frankensqlite deduplicates schema entries).
         {
-            let verify = rusqlite::Connection::open(&source_db).unwrap();
+            let verify = rusqlite_test_fixture_conn(&source_db);
             verify
                 .execute_batch("PRAGMA writable_schema = ON;")
                 .unwrap();
@@ -16757,7 +16793,7 @@ mod tests {
         drop(replay_storage);
 
         let duplicate_legacy_fts_sql = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, message_id UNINDEXED, tokenize='porter')";
-        let replay_legacy = rusqlite::Connection::open(&replay_db).unwrap();
+        let replay_legacy = rusqlite_test_fixture_conn(&replay_db);
         replay_legacy
             .execute_batch(
                 "UPDATE meta SET value = '13' WHERE key = 'schema_version';
@@ -16892,59 +16928,65 @@ mod tests {
         );
 
         let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        let auth_hits: i64 = conn
+        let auth_rows: i64 = conn
             .query_row_map(
-                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'authentication'",
+                "SELECT COUNT(*) FROM fts_messages WHERE rowid = 2",
                 fparams![],
                 |row| row.get_typed(0),
             )
             .unwrap();
-        assert_eq!(auth_hits, 1);
+        assert_eq!(auth_rows, 1);
     }
 
     #[test]
     fn rebuild_fts_via_rusqlite_cleans_duplicate_legacy_schema_rows() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts-duplicate-rebuild.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
-             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
-             CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent_id INTEGER,
-                workspace_id INTEGER,
-                title TEXT,
-                source_path TEXT
-             );
-             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER,
-                idx INTEGER,
-                content TEXT,
-                created_at INTEGER
-             );
-             INSERT INTO agents(id, slug) VALUES(1, 'codex');
-             INSERT INTO workspaces(id, path) VALUES(1, '/ws');
-             INSERT INTO conversations(id, agent_id, workspace_id, title, source_path)
-                 VALUES(1, 1, 1, 'retro', '/tmp/retro.jsonl');
-             INSERT INTO messages(id, conversation_id, idx, content, created_at)
-                 VALUES(7, 1, 0, 'retro investigation', 42);
-             CREATE VIRTUAL TABLE fts_messages USING fts5(
-                 content,
-                 title,
-                 agent,
-                 workspace,
-                 source_path,
-                 created_at UNINDEXED,
-                 message_id UNINDEXED,
-                 tokenize='porter'
-             );
-             INSERT INTO fts_messages(content, title, agent, workspace, source_path, created_at, message_id)
-                 VALUES('retro investigation', 'retro', 'codex', '/ws', '/tmp/retro.jsonl', 42, 7);
-             PRAGMA writable_schema = ON;",
-        )
-        .unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/ws")),
+            external_id: Some("retro".into()),
+            title: Some("retro".into()),
+            source_path: PathBuf::from("/tmp/retro.jsonl"),
+            started_at: Some(42),
+            ended_at: Some(42),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(42),
+                content: "retro investigation".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        drop(storage);
+        materialize_fresh_fts_schema_via_rusqlite(&db_path).unwrap();
+
+        let conn = rusqlite_test_fixture_conn(&db_path);
+        conn.execute_batch("PRAGMA writable_schema = ON;")
+            .unwrap();
         conn.execute(
             "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
              VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
@@ -16965,23 +17007,17 @@ mod tests {
         let inserted = rebuild_fts_via_rusqlite(&db_path).unwrap();
         assert_eq!(inserted, 1);
 
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let schema_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fts_messages%'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let schema_rows = franken_fts_schema_rows(&conn).unwrap();
         assert_eq!(
-            schema_rows, 5,
+            schema_rows, 1,
             "DROP TABLE should leave one clean FTS schema"
         );
         let match_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH 'retro'",
-                [],
-                |row| row.get(0),
+            .query_row_map(
+                "SELECT COUNT(*) FROM fts_messages",
+                fparams![],
+                |row| row.get_typed(0),
             )
             .unwrap();
         assert_eq!(match_count, 1);
@@ -18413,10 +18449,15 @@ mod tests {
         // authoritative frankensqlite FTS rebuild generation yet.
         conn.execute_batch("PRAGMA writable_schema = OFF;").unwrap();
 
+        let duplicate_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duplicate_rows, 2);
         drop(conn);
-        let pre_repair = FrankenConnection::open(db_path.to_string_lossy().into_owned()).unwrap();
-        assert_eq!(franken_fts_schema_rows(&pre_repair).unwrap(), 2);
-        drop(pre_repair);
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);

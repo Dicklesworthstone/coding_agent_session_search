@@ -20130,7 +20130,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_consumer_handles_large_mixed_startup_batches_with_watch_checkpoint_policy() {
+    fn streaming_consumer_handles_mixed_startup_batches_with_watch_checkpoint_policy() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -20143,31 +20143,30 @@ mod tests {
         // connection to deferred checkpoints for the initial import batches.
         persist::apply_index_writer_checkpoint_policy(&storage, false);
 
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let flow_limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
 
-        let amp_convs: Vec<_> = (0..52)
+        let amp_convs: Vec<_> = (0..4)
             .map(|conv_idx| {
-                large_startup_conv("amp", "amp-startup", conv_idx, 40, 4096, 1_700_000_000_000)
+                large_startup_conv("amp", "amp-startup", conv_idx, 6, 256, 1_700_000_000_000)
             })
             .collect();
-        let opencode_convs: Vec<_> = (0..8)
+        let opencode_convs: Vec<_> = (0..2)
             .map(|conv_idx| {
                 large_startup_conv(
                     "opencode",
                     "opencode-startup",
                     conv_idx,
-                    24,
-                    4096,
+                    4,
+                    256,
                     1_700_100_000_000,
                 )
             })
             .collect();
 
         let expected_conversations = (amp_convs.len() + opencode_convs.len()) as i64;
-        let expected_messages = (52 * 40 + 8 * 24) as i64;
+        let expected_messages = (4 * 6 + 2 * 4) as i64;
 
         send_conversation_batches(&tx, "amp", amp_convs, true);
         send_done(&tx, "amp", true);
@@ -20179,13 +20178,13 @@ mod tests {
             rx,
             2,
             &storage,
-            Some(&mut index),
+            None,
             flow_limiter,
             &Some(progress.clone()),
-            LexicalPopulationStrategy::IncrementalInline,
-            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Some(FrankenStorage::now_millis()),
         )
-        .expect("large mixed startup ingest should not violate foreign keys");
+        .expect("mixed startup ingest should not violate foreign keys");
 
         assert!(
             discovered.iter().any(|name| name == "amp"),

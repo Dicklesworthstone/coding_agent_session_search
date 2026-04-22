@@ -20473,6 +20473,7 @@ impl super::ftui_adapter::Model for CassApp {
                         match_mode_str(self.match_mode)
                     )
                 };
+                let show_inline_mode_tags = !vis.show_theme_in_title;
                 let query_block = Block::new()
                     .borders(adaptive_borders)
                     .border_type(border_type)
@@ -20531,6 +20532,16 @@ impl super::ftui_adapter::Model for CassApp {
                                 if show_search_icon {
                                     spans.push(ftui::text::Span::styled(
                                         " \u{1f50e} ",
+                                        text_muted_style,
+                                    ));
+                                }
+                                if show_inline_mode_tags {
+                                    spans.push(ftui::text::Span::styled(
+                                        format!(
+                                            "{} {} ",
+                                            search_mode_str(self.search_mode),
+                                            match_mode_str(self.match_mode)
+                                        ),
                                         text_muted_style,
                                     ));
                                 }
@@ -34826,8 +34837,9 @@ not jsonl",
             24,
             ftui::render::budget::DegradationLevel::Full,
         ));
+        let expected_mode = search_mode_str(app.search_mode);
         assert!(
-            narrow_text.contains("lexical"),
+            narrow_text.contains(expected_mode),
             "narrow search title should show mode"
         );
     }
@@ -34875,13 +34887,15 @@ not jsonl",
                 24,
                 ftui::render::budget::DegradationLevel::Full,
             ));
+            let expected_mode = search_mode_str(app.search_mode);
+            let expected_match = match_mode_str(app.match_mode);
             assert!(
-                narrow_text.contains("lexical"),
+                narrow_text.contains(expected_mode),
                 "narrow title should include explicit mode token for {:?}",
                 preset
             );
             assert!(
-                narrow_text.contains("standard"),
+                narrow_text.contains(expected_match),
                 "narrow title should include explicit match token for {:?}",
                 preset
             );

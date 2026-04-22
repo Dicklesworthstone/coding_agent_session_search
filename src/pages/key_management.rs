@@ -39,9 +39,18 @@ use std::path::Path;
 use tracing::info;
 
 /// Argon2id default parameters
+#[cfg(not(test))]
 const ARGON2_MEMORY_KB: u32 = 65536; // 64 MB
+#[cfg(test)]
+const ARGON2_MEMORY_KB: u32 = 64;
+#[cfg(not(test))]
 const ARGON2_ITERATIONS: u32 = 3;
+#[cfg(test)]
+const ARGON2_ITERATIONS: u32 = 1;
+#[cfg(not(test))]
 const ARGON2_PARALLELISM: u32 = 4;
+#[cfg(test)]
+const ARGON2_PARALLELISM: u32 = 1;
 
 /// Schema version for encryption
 const SCHEMA_VERSION: u8 = 2;

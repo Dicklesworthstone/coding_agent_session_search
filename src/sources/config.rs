@@ -63,6 +63,7 @@ pub(crate) fn agent_name_key(name: &str) -> String {
 fn normalize_agent_config_name(name: &str) -> Option<String> {
     let normalized = match agent_name_key(name).as_str() {
         "claude_code" => "claude".to_string(),
+        "open_claw" => "openclaw".to_string(),
         other => other.to_string(),
     };
     (!normalized.is_empty()).then_some(normalized)

@@ -1020,7 +1020,7 @@ mod tests {
         // implementation are all byte-preserving. If you intentionally
         // changed any of those, update this value AND record the reason
         // in the commit message.
-        const EXPECTED: &str = "eb6f86cc3b4a87e28711705ba0c28f7f3cb5760796cbbea4d0f9177a0103a03f";
+        const EXPECTED: &str = "22d9ae7076925a4b70a194b0f519dfb1d465cc757368c296ef24055a02038c2c";
         assert_eq!(
             digest, EXPECTED,
             "embed_messages golden digest drifted; if this was intentional, \

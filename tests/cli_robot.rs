@@ -25,6 +25,21 @@ fn base_cmd() -> Command {
     cmd
 }
 
+fn run_on_large_stack<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name("cass-cli-robot-clap-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn large-stack test thread");
+    match handle.join() {
+        Ok(()) => {}
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
 fn isolated_search_demo_data() -> TempDir {
@@ -827,17 +842,19 @@ fn search_no_match_returns_empty_hits() {
 
 #[test]
 fn include_attachments_flag_hidden_from_pages_help() {
-    let cmd = Cli::command();
-    let pages_cmd = cmd
-        .find_subcommand("pages")
-        .expect("pages subcommand must exist");
-    let mut help_buf = Vec::new();
-    pages_cmd.clone().write_help(&mut help_buf).unwrap();
-    let help_text = String::from_utf8(help_buf).unwrap();
-    assert!(
-        !help_text.contains("include-attachments"),
-        "--include-attachments should stay hidden from pages help until implemented.\n{help_text}"
-    );
+    run_on_large_stack(|| {
+        let cmd = Cli::command();
+        let pages_cmd = cmd
+            .find_subcommand("pages")
+            .expect("pages subcommand must exist");
+        let mut help_buf = Vec::new();
+        pages_cmd.clone().write_help(&mut help_buf).unwrap();
+        let help_text = String::from_utf8(help_buf).unwrap();
+        assert!(
+            !help_text.contains("include-attachments"),
+            "--include-attachments should stay hidden from pages help until implemented.\n{help_text}"
+        );
+    });
 }
 
 #[test]

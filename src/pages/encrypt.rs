@@ -34,9 +34,18 @@ pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 pub const MAX_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Argon2id parameters (from Phase 2 spec)
+#[cfg(not(test))]
 const ARGON2_MEMORY_KB: u32 = 65536; // 64 MB
+#[cfg(test)]
+const ARGON2_MEMORY_KB: u32 = 64;
+#[cfg(not(test))]
 const ARGON2_ITERATIONS: u32 = 3;
+#[cfg(test)]
+const ARGON2_ITERATIONS: u32 = 1;
+#[cfg(not(test))]
 const ARGON2_PARALLELISM: u32 = 4;
+#[cfg(test)]
+const ARGON2_PARALLELISM: u32 = 1;
 
 /// Encryption schema version
 const SCHEMA_VERSION: u8 = 2;
