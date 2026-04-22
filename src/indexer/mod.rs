@@ -1970,8 +1970,8 @@ impl LexicalRebuildEquivalenceAccumulator {
         for ((probe, hasher), count) in self
             .probes
             .into_iter()
-            .zip(self.probe_hashers.into_iter())
-            .zip(self.probe_counts.into_iter())
+            .zip(self.probe_hashers)
+            .zip(self.probe_counts)
         {
             combined.update(b"probe");
             combined.update(&(probe.len() as u64).to_le_bytes());
@@ -12123,9 +12123,7 @@ fn rebuild_tantivy_from_db_with_options(
         .storage_fingerprint
         .get(..16)
         .unwrap_or(rebuild_state.db.storage_fingerprint.as_str());
-    let generation_id = format!(
-        "gen-{manifest_now_ms:016x}-{generation_fingerprint_head}"
-    );
+    let generation_id = format!("gen-{manifest_now_ms:016x}-{generation_fingerprint_head}");
     let attempt_id = format!("attempt-{manifest_now_ms:016x}");
     let mut generation_manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
         generation_id.clone(),
@@ -12138,8 +12136,10 @@ fn rebuild_tantivy_from_db_with_options(
     generation_manifest.indexed_doc_count = indexed_docs as u64;
     generation_manifest.equivalence_manifest_fingerprint =
         Some(equivalence_evidence.manifest_fingerprint.clone());
-    generation_manifest
-        .transition_build(lexical_generation::LexicalGenerationBuildState::Built, manifest_now_ms);
+    generation_manifest.transition_build(
+        lexical_generation::LexicalGenerationBuildState::Built,
+        manifest_now_ms,
+    );
     generation_manifest.transition_build(
         lexical_generation::LexicalGenerationBuildState::Validated,
         manifest_now_ms,

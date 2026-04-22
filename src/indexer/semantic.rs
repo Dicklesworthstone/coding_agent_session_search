@@ -572,7 +572,7 @@ impl SemanticIndexer {
 
         // Store as f16 by default (smaller, faster I/O). Embeddings are validated by the writer.
         let mut writer: FsVectorIndexWriter = FsVectorIndex::create_with_revision(
-            &index_path,
+            index_path,
             self.embedder_id(),
             "1.0",
             self.embedder_dimension(),
@@ -600,7 +600,7 @@ impl SemanticIndexer {
         if let Err(e) = &write_result {
             // Clean up partial index file to prevent corruption
             tracing::warn!("removing partial vector index after write failure: {e}");
-            if let Err(rm_err) = std::fs::remove_file(&index_path) {
+            if let Err(rm_err) = std::fs::remove_file(index_path) {
                 tracing::error!(
                     "failed to remove partial index file {}: {rm_err}",
                     index_path.display()
@@ -613,7 +613,7 @@ impl SemanticIndexer {
             .finish()
             .map_err(|err| anyhow::anyhow!("finish fsvi index failed: {err}"))?;
 
-        FsVectorIndex::open(&index_path)
+        FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
     }
 
@@ -638,7 +638,7 @@ impl SemanticIndexer {
         embedded_messages: impl IntoIterator<Item = EmbeddedMessage>,
         index_path: &Path,
     ) -> Result<usize> {
-        let mut index = FsVectorIndex::open(&index_path)
+        let mut index = FsVectorIndex::open(index_path)
             .map_err(|err| anyhow::anyhow!("open fsvi index for append: {err}"))?;
 
         let entries: Vec<(String, Vec<f32>)> = embedded_messages
