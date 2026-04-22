@@ -9029,10 +9029,12 @@ struct LexicalRebuildPagePrepWork {
     sequence: u64,
     conversation_page: Vec<crate::storage::sqlite::LexicalRebuildConversationRow>,
     page_last_conversation_id: i64,
+    configured_page_size: i64,
     planned_shard_index: Option<usize>,
     finishes_planned_shard: bool,
     conversation_list_duration: Duration,
     pipeline_budget: LexicalRebuildPipelineBudgetSnapshot,
+    budget_generation: usize,
 }
 
 #[derive(Debug)]
@@ -9150,6 +9152,10 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .map(|packet| packet.message_bytes)
         .sum::<usize>();
+    let page_message_count = prepared_packets
+        .iter()
+        .map(|packet| packet.message_count)
+        .sum::<usize>();
     let reserved_bytes = flow_limiter.acquire(page_message_bytes).with_context(|| {
         format!(
             "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
@@ -9157,6 +9163,34 @@ fn prepare_lexical_rebuild_page_work(
         )
     })?;
     assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
+    let configured_page_size = usize::try_from(work.configured_page_size.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let budget_shrink_decision =
+        if work.pipeline_budget.page_conversation_limit < configured_page_size {
+            "bounded_below_configured_page"
+        } else {
+            "using_configured_page"
+        };
+    tracing::info!(
+        sequence,
+        configured_page_size = work.configured_page_size,
+        page_conversation_limit = work.pipeline_budget.page_conversation_limit,
+        budget_generation = work.budget_generation,
+        budget_shrink_decision,
+        page_conversations = prepared_packets.len(),
+        page_last_conversation_id = work.page_last_conversation_id,
+        page_messages = page_message_count,
+        page_message_bytes,
+        reserved_bytes,
+        batch_fetch_message_limit = work.pipeline_budget.batch_fetch_message_limit,
+        batch_fetch_message_bytes_limit = work.pipeline_budget.batch_fetch_message_bytes_limit,
+        max_message_bytes_in_flight = work.pipeline_budget.max_message_bytes_in_flight,
+        conversation_list_ms = work.conversation_list_duration.as_millis() as u64,
+        message_fetch_ms = message_fetch_duration.as_millis() as u64,
+        packet_prepare_ms = packet_prepare_duration.as_millis() as u64,
+        "lexical rebuild prepared bounded page"
+    );
 
     Ok(LexicalRebuildSequencedPreparedPage {
         sequence,
@@ -9537,12 +9571,14 @@ fn spawn_lexical_rebuild_packet_producer(
                             sequence: next_sequence_to_enqueue,
                             conversation_page,
                             page_last_conversation_id,
+                            configured_page_size: page_size,
                             planned_shard_index: current_planned_shard
                                 .as_ref()
                                 .map(|shard| shard.shard_index),
                             finishes_planned_shard,
                             conversation_list_duration,
                             pipeline_budget,
+                            budget_generation: pipeline_budget_controller.generation(),
                         };
                         work_tx.send(work).map_err(|_| {
                             anyhow::anyhow!(
@@ -9630,6 +9666,13 @@ fn spawn_lexical_rebuild_packet_producer(
                             .saturating_add(page_handoff_message_bytes);
                         if !logged_first_batch_handoff {
                             log_prep_step("first_batch_handoff", &mut prep_step_started);
+                            let total_startup_ms = prep_started.elapsed().as_millis() as u64;
+                            tracing::info!(
+                                component = "producer",
+                                total_startup_ms,
+                                conversations_in_first_batch = page_handoff_conversations,
+                                "lexical rebuild producer delivered first batch — serial startup complete"
+                            );
                             logged_first_batch_handoff = true;
                         }
                         tracing::debug!(
@@ -11339,19 +11382,22 @@ fn rebuild_tantivy_from_db_with_options(
         .take()
         .expect("lexical rebuild packet producer handle missing before consume loop");
 
-    if prep_profile {
+    {
         let step_ms = prep_step_started.elapsed().as_millis() as u64;
         let total_ms = prep_started.elapsed().as_millis() as u64;
-        eprintln!(
-            "CASS_PREP_PROFILE step=ready_to_index step_ms={} total_ms={}",
-            step_ms, total_ms
-        );
+        if prep_profile {
+            eprintln!(
+                "CASS_PREP_PROFILE step=ready_to_index step_ms={} total_ms={}",
+                step_ms, total_ms
+            );
+        }
         tracing::info!(
             component = "main",
             step = "ready_to_index",
-            step_ms,
-            total_ms,
-            "lexical rebuild prep profile"
+            total_prep_ms = total_ms,
+            total_conversations,
+            restart_from_zero,
+            "lexical rebuild startup complete, entering consumer loop"
         );
     }
     let mut max_conversation_id = 0i64;
@@ -16451,6 +16497,275 @@ mod tests {
         assert_eq!(parallel_packets[2].provenance.origin_kind, "local");
     }
 
+    fn lexical_rebuild_test_source_map(
+        storage: &FrankenStorage,
+    ) -> HashMap<String, (SourceKind, Option<String>)> {
+        storage
+            .list_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|source| (source.id, (source.kind, source.host_label)))
+            .collect()
+    }
+
+    fn legacy_offset_lexical_rebuild_packets(
+        storage: &FrankenStorage,
+        page_size: i64,
+    ) -> Result<Vec<LexicalRebuildConversationPacket>> {
+        let source_map = lexical_rebuild_test_source_map(storage);
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
+        let mut packets = Vec::new();
+        let mut offset = 0_i64;
+
+        loop {
+            let conversation_page = storage.list_conversations_for_lexical_rebuild_by_offset(
+                page_size,
+                offset,
+                &agent_slugs,
+                &workspace_paths,
+            )?;
+            if conversation_page.is_empty() {
+                break;
+            }
+
+            offset = offset.saturating_add(i64::try_from(conversation_page.len()).unwrap_or(0));
+            for conversation in conversation_page {
+                let conversation_id = conversation.id.ok_or_else(|| {
+                    anyhow::anyhow!("legacy lexical rebuild row missing conversation id")
+                })?;
+                let grouped_messages = HashMap::from([(
+                    conversation_id,
+                    storage.fetch_messages_for_lexical_rebuild(conversation_id)?,
+                )]);
+                let mut prepared = prepare_lexical_rebuild_packet_batch(
+                    vec![conversation],
+                    grouped_messages,
+                    &source_map,
+                    None,
+                )?;
+                packets.push(
+                    prepared
+                        .pop()
+                        .expect("single-conversation legacy packet should be prepared"),
+                );
+            }
+        }
+
+        Ok(packets)
+    }
+
+    fn keyset_batched_lexical_rebuild_packets(
+        storage: &FrankenStorage,
+        page_size: i64,
+        batch_limit: usize,
+    ) -> Result<Vec<LexicalRebuildConversationPacket>> {
+        let source_map = lexical_rebuild_test_source_map(storage);
+        let (agent_slugs, workspace_paths) = storage.build_lexical_rebuild_lookups()?;
+        let mut packets = Vec::new();
+        let mut after_conversation_id = 0_i64;
+        let batch_limit = batch_limit.max(1);
+
+        loop {
+            let conversation_page = storage.list_conversations_for_lexical_rebuild_after_id(
+                page_size,
+                after_conversation_id,
+                &agent_slugs,
+                &workspace_paths,
+            )?;
+            if conversation_page.is_empty() {
+                break;
+            }
+            after_conversation_id = conversation_page
+                .last()
+                .and_then(|conversation| conversation.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("keyset lexical rebuild page missing terminal id")
+                })?;
+
+            for chunk in conversation_page.chunks(batch_limit) {
+                let conversation_chunk = chunk.to_vec();
+                let conversation_ids = conversation_chunk
+                    .iter()
+                    .filter_map(|conversation| conversation.id)
+                    .collect::<Vec<_>>();
+                let grouped_messages = storage.fetch_messages_for_lexical_rebuild_batch(
+                    &conversation_ids,
+                    None,
+                    None,
+                )?;
+                let mut prepared = prepare_lexical_rebuild_packet_batch(
+                    conversation_chunk,
+                    grouped_messages,
+                    &source_map,
+                    None,
+                )?;
+                packets.append(&mut prepared);
+            }
+        }
+
+        Ok(packets)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LexicalRebuildEquivalenceEvidence {
+        document_count: usize,
+        manifest_fingerprint: String,
+        golden_query_digest: String,
+    }
+
+    fn lexical_rebuild_packet_artifact(
+        packets: &[LexicalRebuildConversationPacket],
+    ) -> serde_json::Value {
+        let packet_rows = packets
+            .iter()
+            .map(|packet| {
+                serde_json::json!({
+                    "conversation_id": packet.identity.conversation_id,
+                    "external_id": packet.identity.external_id.as_deref(),
+                    "agent": &packet.identity.agent,
+                    "workspace": packet.identity.workspace.as_deref(),
+                    "source_path": &packet.identity.source_path,
+                    "source_id": &packet.provenance.source_id,
+                    "origin_kind": &packet.provenance.origin_kind,
+                    "origin_host": packet.provenance.origin_host.as_deref(),
+                    "message_count": packet.message_count,
+                    "message_bytes": packet.message_bytes,
+                    "last_message_id": packet.last_message_id,
+                    "messages": packet.messages.iter().map(|message| {
+                        serde_json::json!({
+                            "idx": message.idx,
+                            "is_tool_role": message.is_tool_role,
+                            "created_at": message.created_at,
+                            "content": &message.content,
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let document_rows = packets
+            .iter()
+            .flat_map(|packet| {
+                packet.prebuilt_docs().into_iter().map(|doc| {
+                    serde_json::json!({
+                        "conversation_id": doc.conversation_id,
+                        "agent": doc.agent,
+                        "workspace": doc.workspace,
+                        "source_path": doc.source_path,
+                        "msg_idx": doc.msg_idx,
+                        "created_at": doc.created_at,
+                        "title": doc.title,
+                        "content": doc.content,
+                        "source_id": doc.source_id,
+                        "origin_kind": doc.origin_kind,
+                        "origin_host": doc.origin_host,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        serde_json::json!({
+            "packets": packet_rows,
+            "documents": document_rows,
+        })
+    }
+
+    fn stable_json_digest(value: &serde_json::Value) -> String {
+        let bytes = serde_json::to_vec(value).expect("equivalence artifact should serialize");
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    fn lexical_rebuild_golden_query_digest(packets: &[LexicalRebuildConversationPacket]) -> String {
+        let queries = [
+            "lexical-fixture-1",
+            "lexical-fixture-2-second",
+            "missing-golden-query",
+        ];
+        let hits = queries
+            .iter()
+            .flat_map(|query| {
+                packets.iter().flat_map(move |packet| {
+                    packet.prebuilt_docs().into_iter().filter_map(move |doc| {
+                        let title = doc.title.unwrap_or("");
+                        let workspace = doc.workspace.unwrap_or("");
+                        if doc.content.contains(query)
+                            || title.contains(query)
+                            || workspace.contains(query)
+                            || doc.source_path.contains(query)
+                        {
+                            Some(serde_json::json!({
+                                "query": query,
+                                "conversation_id": doc.conversation_id,
+                                "agent": doc.agent,
+                                "source_path": doc.source_path,
+                                "msg_idx": doc.msg_idx,
+                                "created_at": doc.created_at,
+                                "content": doc.content,
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        stable_json_digest(&serde_json::json!({
+            "queries": queries,
+            "hits": hits,
+        }))
+    }
+
+    fn lexical_rebuild_equivalence_evidence(
+        packets: &[LexicalRebuildConversationPacket],
+    ) -> LexicalRebuildEquivalenceEvidence {
+        let artifact = lexical_rebuild_packet_artifact(packets);
+        LexicalRebuildEquivalenceEvidence {
+            document_count: packets
+                .iter()
+                .map(|packet| packet.prebuilt_docs().len())
+                .sum(),
+            manifest_fingerprint: stable_json_digest(&artifact),
+            golden_query_digest: lexical_rebuild_golden_query_digest(packets),
+        }
+    }
+
+    #[test]
+    fn keyset_batched_lexical_rebuild_matches_legacy_offset_replay_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("lexical-equivalence.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let legacy_packets = legacy_offset_lexical_rebuild_packets(&storage, 1).unwrap();
+        let keyset_packets = keyset_batched_lexical_rebuild_packets(&storage, 2, 2).unwrap();
+        let legacy_evidence = lexical_rebuild_equivalence_evidence(&legacy_packets);
+        let keyset_evidence = lexical_rebuild_equivalence_evidence(&keyset_packets);
+        let legacy_artifact =
+            serde_json::to_string_pretty(&lexical_rebuild_packet_artifact(&legacy_packets))
+                .unwrap();
+        let keyset_artifact =
+            serde_json::to_string_pretty(&lexical_rebuild_packet_artifact(&keyset_packets))
+                .unwrap();
+
+        assert_eq!(
+            legacy_packets
+                .iter()
+                .map(LexicalRebuildConversationPacket::semantic_view)
+                .collect::<Vec<_>>(),
+            keyset_packets
+                .iter()
+                .map(LexicalRebuildConversationPacket::semantic_view)
+                .collect::<Vec<_>>(),
+            "legacy offset replay and keyset batched replay diverged\nlegacy_artifact={legacy_artifact}\nkeyset_artifact={keyset_artifact}"
+        );
+        assert_eq!(
+            legacy_evidence, keyset_evidence,
+            "equivalence evidence diverged\nlegacy_artifact={legacy_artifact}\nkeyset_artifact={keyset_artifact}"
+        );
+        assert_eq!(keyset_evidence.document_count, 4);
+    }
+
     #[test]
     fn assign_lexical_rebuild_flow_reservation_bytes_preserves_exact_total() {
         let make_packet = |conversation_id: i64, content: &str| {
@@ -21203,6 +21518,18 @@ mod tests {
         assert!(
             logs.contains("lexical rebuild flushed a streamed conversation batch"),
             "expected streamed batch log, got:
+{logs}"
+        );
+        assert!(
+            logs.contains("lexical rebuild prepared bounded page"),
+            "expected page-level bounded-prep diagnostics, got:
+{logs}"
+        );
+        assert!(
+            logs.contains("budget_shrink_decision=")
+                && logs.contains("batch_fetch_message_bytes_limit=")
+                && logs.contains("max_message_bytes_in_flight="),
+            "expected bounded page budget diagnostics, got:
 {logs}"
         );
         assert!(
