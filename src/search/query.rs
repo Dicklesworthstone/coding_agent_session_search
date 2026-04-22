@@ -6891,7 +6891,12 @@ mod tests {
     fn stable_hit_hash_matches_reference_and_is_deterministic() {
         let fixtures = [
             ("", "", None, None),
-            ("same   content\nnormalized", "/tmp/session.jsonl", Some(1), Some(0)),
+            (
+                "same   content\nnormalized",
+                "/tmp/session.jsonl",
+                Some(1),
+                Some(0),
+            ),
             (
                 "tool output with repeated whitespace",
                 "/tmp/path with spaces.jsonl",

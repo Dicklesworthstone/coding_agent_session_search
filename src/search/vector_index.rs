@@ -118,10 +118,9 @@ impl SemanticDocId {
             // `hex::encode(hash)` performs internally. Hex output is pure
             // ASCII so str::from_utf8 can't fail on the filled slice.
             let mut hex_buf = [0u8; 64];
-            hex::encode_to_slice(hash, &mut hex_buf).expect("32 bytes encode to exactly 64 hex chars");
-            out.push_str(
-                std::str::from_utf8(&hex_buf).expect("hex output is always valid ASCII"),
-            );
+            hex::encode_to_slice(hash, &mut hex_buf)
+                .expect("32 bytes encode to exactly 64 hex chars");
+            out.push_str(std::str::from_utf8(&hex_buf).expect("hex output is always valid ASCII"));
         }
         out
     }
