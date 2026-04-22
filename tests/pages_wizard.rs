@@ -7,7 +7,7 @@ mod util;
 
 use coding_agent_search::pages::summary::ExclusionSet;
 use coding_agent_search::pages::wizard::{DeployTarget, WizardState};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use util::e2e_log::PhaseTracker;
 
@@ -363,7 +363,26 @@ use coding_agent_search::pages::config_input::PagesConfig;
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, RowExt};
-use rusqlite::Connection;
+
+fn open_franken_connection(path: &Path) -> FrankenConnection {
+    FrankenConnection::open(path.to_string_lossy().into_owned())
+        .expect("should open database with frankensqlite")
+}
+
+fn query_i64(conn: &FrankenConnection, sql: &str) -> i64 {
+    conn.query_row_map(sql, &[], |row| row.get_typed(0))
+        .expect("integer query should succeed")
+}
+
+fn query_strings(conn: &FrankenConnection, sql: &str) -> Vec<String> {
+    conn.query_map_collect(sql, &[], |row| row.get_typed(0))
+        .expect("string query should succeed")
+}
+
+fn query_i64s(conn: &FrankenConnection, sql: &str) -> Vec<i64> {
+    conn.query_map_collect(sql, &[], |row| row.get_typed(0))
+        .expect("integer list query should succeed")
+}
 
 /// Returns the path to the fixture database
 fn fixture_db_path() -> PathBuf {
@@ -392,15 +411,10 @@ fn test_wizard_with_real_fixture_database() {
     };
 
     // Verify we can open and query the database
-    let conn = Connection::open(&db_path).expect("Should open fixture database");
+    let conn = open_franken_connection(&db_path);
 
     // Query agents
-    let mut stmt = conn.prepare("SELECT slug FROM agents").unwrap();
-    let agents: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let agents = query_strings(&conn, "SELECT slug FROM agents");
 
     assert!(!agents.is_empty(), "Should have agents in fixture");
     assert!(
@@ -409,9 +423,7 @@ fn test_wizard_with_real_fixture_database() {
     );
 
     // Query conversations
-    let conv_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-        .unwrap();
+    let conv_count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
     assert!(conv_count > 0, "Should have conversations in fixture");
 }
 
@@ -445,18 +457,14 @@ fn test_export_with_real_fixture_all_agents() {
     assert!(stats.messages_processed > 0, "Should export messages");
 
     // Verify output database structure
-    let conn = Connection::open(&output_path).unwrap();
+    let conn = open_franken_connection(&output_path);
 
-    let conv_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-        .unwrap();
+    let conv_count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
     assert_eq!(conv_count as usize, stats.conversations_processed);
 
     // Verify FTS table was created
-    let fts_conn = FrankenConnection::open(output_path.to_string_lossy().into_owned()).unwrap();
-    let fts_count: i64 = fts_conn
-        .query_row_map("SELECT COUNT(*) FROM messages_fts", &[], |r| r.get_typed(0))
-        .unwrap();
+    let fts_conn = open_franken_connection(&output_path);
+    let fts_count = query_i64(&fts_conn, "SELECT COUNT(*) FROM messages_fts");
     assert!(fts_count > 0, "Should have FTS entries");
 }
 
@@ -483,17 +491,10 @@ fn test_export_with_real_fixture_agent_filter() {
         .expect("Export should succeed");
 
     // Verify filtered export
-    let conn = Connection::open(&output_path).unwrap();
+    let conn = open_franken_connection(&output_path);
 
     // All exported conversations should be from claude_code
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT agent FROM conversations")
-        .unwrap();
-    let agents: Vec<String> = stmt
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let agents = query_strings(&conn, "SELECT DISTINCT agent FROM conversations");
 
     // If there are claude_code conversations, verify only those were exported
     if stats.conversations_processed > 0 {
@@ -531,10 +532,8 @@ fn test_export_with_real_fixture_nonexistent_agent() {
     assert_eq!(stats.messages_processed, 0);
 
     // Output database should still be valid with schema
-    let conn = Connection::open(&output_path).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-        .unwrap();
+    let conn = open_franken_connection(&output_path);
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
     assert_eq!(count, 0);
 }
 
@@ -562,10 +561,8 @@ fn test_export_with_real_fixture_explicit_empty_workspace_filter() {
     assert_eq!(stats.conversations_processed, 0);
     assert_eq!(stats.messages_processed, 0);
 
-    let conn = Connection::open(&output_path).unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-        .unwrap();
+    let conn = open_franken_connection(&output_path);
+    let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
     assert_eq!(count, 0);
 }
 
@@ -601,10 +598,8 @@ fn test_export_with_real_fixture_path_modes() {
             path_mode
         );
 
-        let conn = Connection::open(&output_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap();
+        let conn = open_franken_connection(&output_path);
+        let count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
         assert!(count >= 0, "Should have valid conversation count");
     }
 }
@@ -704,19 +699,15 @@ fn test_wizard_state_with_fixture_export_flow() {
 
     // Verify export results
     if stats.conversations_processed > 0 {
-        let conn = Connection::open(&output_db).unwrap();
+        let conn = open_franken_connection(&output_db);
 
         // Verify exported data
-        let conv_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
-            .unwrap();
+        let conv_count = query_i64(&conn, "SELECT COUNT(*) FROM conversations");
         assert_eq!(conv_count as usize, stats.conversations_processed);
 
         // Verify messages were exported
-        let fts_conn = FrankenConnection::open(output_db.to_string_lossy().into_owned()).unwrap();
-        let msg_count: i64 = fts_conn
-            .query_row_map("SELECT COUNT(*) FROM messages_fts", &[], |r| r.get_typed(0))
-            .unwrap();
+        let fts_conn = open_franken_connection(&output_db);
+        let msg_count = query_i64(&fts_conn, "SELECT COUNT(*) FROM messages_fts");
         assert!(msg_count >= 0);
     }
 }
@@ -728,15 +719,8 @@ fn test_exclusion_set_with_real_conversation_ids() {
     let db_path = fixture_db_path();
 
     // Get real conversation IDs from fixture
-    let conn = Connection::open(&db_path).expect("Should open fixture database");
-    let mut stmt = conn
-        .prepare("SELECT id FROM conversations LIMIT 5")
-        .unwrap();
-    let conv_ids: Vec<i64> = stmt
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let conn = open_franken_connection(&db_path);
+    let conv_ids = query_i64s(&conn, "SELECT id FROM conversations LIMIT 5");
 
     if conv_ids.is_empty() {
         return; // Skip if no conversations
