@@ -1,6 +1,7 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
-use rusqlite::Connection;
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::ConnectionExt;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -11,33 +12,27 @@ use tempfile::TempDir;
 // ============================================================================
 
 /// Create a test SQLite database with the cursorDiskKV and ItemTable tables.
-fn create_test_db(path: &Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)",
-        [],
-    )
-    .unwrap();
+fn create_test_db(path: &Path) -> FrankenConnection {
+    let conn = FrankenConnection::open(path.to_string_lossy().into_owned()).unwrap();
+    conn.execute("CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
     conn
 }
 
-fn insert_kv(conn: &Connection, key: &str, value: &str) {
-    conn.execute(
+fn insert_kv(conn: &FrankenConnection, key: &str, value: &str) {
+    conn.execute_compat(
         "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-        [key, value],
+        frankensqlite::params![key, value],
     )
     .unwrap();
 }
 
-fn insert_item(conn: &Connection, key: &str, value: &str) {
-    conn.execute(
+fn insert_item(conn: &FrankenConnection, key: &str, value: &str) {
+    conn.execute_compat(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
-        [key, value],
+        frankensqlite::params![key, value],
     )
     .unwrap();
 }
