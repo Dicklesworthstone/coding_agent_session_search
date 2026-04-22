@@ -4291,40 +4291,44 @@ fn introspect_index_embedder_default() {
 /// Index command parsing should accept semantic + embedder flags.
 #[test]
 fn parse_index_semantic_embedder_flags() {
-    let cli =
-        Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"]).unwrap();
-    let command = cli.command.as_ref();
-    assert!(
-        matches!(command, Some(Commands::Index { .. })),
-        "expected index command, got {:?}",
-        cli.command
-    );
-    if let Some(Commands::Index {
-        semantic, embedder, ..
-    }) = command
-    {
-        assert!(*semantic, "semantic flag should be set");
-        assert_eq!(embedder.as_str(), "fastembed");
-    }
+    run_on_large_stack(|| {
+        let cli =
+            Cli::try_parse_from(["cass", "index", "--semantic", "--embedder", "fastembed"]).unwrap();
+        let command = cli.command.as_ref();
+        assert!(
+            matches!(command, Some(Commands::Index { .. })),
+            "expected index command, got {:?}",
+            cli.command
+        );
+        if let Some(Commands::Index {
+            semantic, embedder, ..
+        }) = command
+        {
+            assert!(*semantic, "semantic flag should be set");
+            assert_eq!(embedder.as_str(), "fastembed");
+        }
+    });
 }
 
 /// Index command parsing should default embedder to fastembed.
 #[test]
 fn parse_index_embedder_default() {
-    let cli = Cli::try_parse_from(["cass", "index", "--semantic"]).unwrap();
-    let command = cli.command.as_ref();
-    assert!(
-        matches!(command, Some(Commands::Index { .. })),
-        "expected index command, got {:?}",
-        cli.command
-    );
-    if let Some(Commands::Index {
-        semantic, embedder, ..
-    }) = command
-    {
-        assert!(*semantic, "semantic flag should be set");
-        assert_eq!(embedder.as_str(), "fastembed");
-    }
+    run_on_large_stack(|| {
+        let cli = Cli::try_parse_from(["cass", "index", "--semantic"]).unwrap();
+        let command = cli.command.as_ref();
+        assert!(
+            matches!(command, Some(Commands::Index { .. })),
+            "expected index command, got {:?}",
+            cli.command
+        );
+        if let Some(Commands::Index {
+            semantic, embedder, ..
+        }) = command
+        {
+            assert!(*semantic, "semantic flag should be set");
+            assert_eq!(embedder.as_str(), "fastembed");
+        }
+    });
 }
 
 /// Search command aggregate parameter should be repeatable
