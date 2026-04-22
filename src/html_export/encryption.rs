@@ -95,10 +95,9 @@ pub fn encrypt_content(
     password: &str,
     params: &EncryptionParams,
 ) -> Result<EncryptedContent, EncryptionError> {
-    use aes_gcm::aead::rand_core::RngCore;
     use aes_gcm::{
         Aes256Gcm, Nonce,
-        aead::{Aead, KeyInit, OsRng},
+        aead::{Aead, KeyInit},
     };
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
@@ -141,8 +140,8 @@ pub fn encrypt_content(
     // Generate random salt and IV
     let mut salt = vec![0u8; params.salt_len];
     let mut iv = vec![0u8; params.iv_len];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut iv);
+    fill_encryption_random("salt", &mut salt);
+    fill_encryption_random("iv", &mut iv);
 
     let derive_started = Instant::now();
     // Derive key using PBKDF2-SHA256
@@ -180,6 +179,50 @@ pub fn encrypt_content(
     );
 
     Ok(encrypted)
+}
+
+/// Fill encryption entropy for salt/IV generation.
+#[cfg(feature = "encryption")]
+fn fill_encryption_random(label: &str, output: &mut [u8]) {
+    if let Some(bytes) = deterministic_test_bytes(label, output.len()) {
+        output.copy_from_slice(&bytes);
+        return;
+    }
+
+    use aes_gcm::aead::{OsRng, rand_core::RngCore};
+    OsRng.fill_bytes(output);
+}
+
+/// Deterministic bytes for debug/test golden generation only.
+#[cfg(feature = "encryption")]
+fn deterministic_test_bytes(label: &str, len: usize) -> Option<Vec<u8>> {
+    #[cfg(debug_assertions)]
+    {
+        let seed = dotenvy::var("CASS_HTML_EXPORT_DETERMINISTIC_SEED").ok()?;
+        if seed.is_empty() {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(len);
+        let mut counter = 0u64;
+        while out.len() < len {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"cass-html-export-deterministic-encryption-v1");
+            hasher.update(seed.as_bytes());
+            hasher.update(label.as_bytes());
+            hasher.update(&counter.to_le_bytes());
+            out.extend_from_slice(hasher.finalize().as_bytes());
+            counter += 1;
+        }
+        out.truncate(len);
+        Some(out)
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (label, len);
+        None
+    }
 }
 
 /// Placeholder encrypt function when encryption feature is disabled.
@@ -302,9 +345,9 @@ mod tests {
             iv_len: 12,
         };
         let plaintext = "Hello 🌍";
-        let password = "p@ssw0rd";
+        let test_passphrase = "unit test passphrase";
 
-        let encrypted = encrypt_content(plaintext, password, &params).expect("encrypt");
+        let encrypted = encrypt_content(plaintext, test_passphrase, &params).expect("encrypt");
         assert_eq!(encrypted.iterations, params.iterations);
 
         let salt = BASE64_STANDARD
@@ -318,7 +361,12 @@ mod tests {
             .expect("ciphertext b64");
 
         let mut key = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut key);
+        pbkdf2_hmac::<Sha256>(
+            test_passphrase.as_bytes(),
+            &salt,
+            params.iterations,
+            &mut key,
+        );
 
         let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
         let nonce = Nonce::from_slice(&iv);
