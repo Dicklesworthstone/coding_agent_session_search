@@ -148,7 +148,10 @@ fn cross_surface_version_agreement() {
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .output()
         .expect("run cass capabilities --json");
-    assert!(caps_out.status.success(), "cass capabilities exited non-zero");
+    assert!(
+        caps_out.status.success(),
+        "cass capabilities exited non-zero"
+    );
     let caps_stdout = String::from_utf8(caps_out.stdout).expect("utf8");
     let caps_json: serde_json::Value = serde_json::from_str(&caps_stdout).expect("JSON");
     let caps_version = caps_json
