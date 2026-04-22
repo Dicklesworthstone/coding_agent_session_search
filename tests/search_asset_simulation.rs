@@ -61,7 +61,11 @@ fn run_robot_style_demo() -> (
                     &json!({
                         "visible_generation": "old_good",
                         "semantic_state": "not_ready",
-                        "mode": "lexical_fail_open"
+                        "requested_search_mode": "hybrid",
+                        "realized_search_mode": "lexical",
+                        "semantic_refinement": false,
+                        "fallback_tier": "lexical",
+                        "fallback_reason": "semantic assets not ready; lexical fail-open served old-good generation"
                     }),
                 );
                 Ok(())
@@ -273,6 +277,35 @@ fn robot_style_demo_is_deterministic_and_persists_artifacts() {
         assert!(
             summary_json.contains("robot_style_publish_and_acquisition_demo"),
             "summary should include scenario name"
+        );
+
+        let fail_open_snapshot_path = artifacts.snapshot_dir.join("001-foreground_status_initial.json");
+        let fail_open_snapshot: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&fail_open_snapshot_path)
+                .expect("read initial fail-open snapshot"),
+        )
+        .expect("fail-open snapshot should be valid JSON");
+        assert_eq!(
+            fail_open_snapshot["requested_search_mode"], "hybrid",
+            "artifact should preserve requested hybrid intent"
+        );
+        assert_eq!(
+            fail_open_snapshot["realized_search_mode"], "lexical",
+            "artifact should preserve realized lexical fail-open mode"
+        );
+        assert_eq!(
+            fail_open_snapshot["semantic_refinement"], false,
+            "artifact should prove fail-open did not claim semantic refinement"
+        );
+        assert_eq!(
+            fail_open_snapshot["fallback_tier"], "lexical",
+            "artifact should name the fallback tier"
+        );
+        assert!(
+            fail_open_snapshot["fallback_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("semantic assets not ready")),
+            "artifact should retain a diagnosable fallback reason"
         );
 
         let snapshot_entries = fs::read_dir(&artifacts.snapshot_dir)

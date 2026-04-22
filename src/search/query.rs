@@ -15185,12 +15185,48 @@ mod tests {
             FieldMask::FULL,
         )?;
         assert_eq!(hits.len(), 4);
+        let observed_order = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.content.clone(),
+                    hit.score.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>();
         let hit_paths = hits
             .iter()
             .map(|hit| hit.source_path.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert!(hit_paths.contains("/tmp/fed-query-a.jsonl"));
         assert!(hit_paths.contains("/tmp/fed-query-b.jsonl"));
+
+        for attempt in 0..3 {
+            let repeated = client.search(
+                "shared federated needle",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )?;
+            let repeated_order = repeated
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.source_path.clone(),
+                        hit.line_number,
+                        hit.content.clone(),
+                        hit.score.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                repeated_order, observed_order,
+                "federated lexical query order drifted on repeated attempt {attempt}"
+            );
+        }
 
         Ok(())
     }
