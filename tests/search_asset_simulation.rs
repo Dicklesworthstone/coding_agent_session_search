@@ -279,10 +279,11 @@ fn robot_style_demo_is_deterministic_and_persists_artifacts() {
             "summary should include scenario name"
         );
 
-        let fail_open_snapshot_path = artifacts.snapshot_dir.join("001-foreground_status_initial.json");
+        let fail_open_snapshot_path = artifacts
+            .snapshot_dir
+            .join("001-foreground_status_initial.json");
         let fail_open_snapshot: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(&fail_open_snapshot_path)
-                .expect("read initial fail-open snapshot"),
+            &fs::read_to_string(&fail_open_snapshot_path).expect("read initial fail-open snapshot"),
         )
         .expect("fail-open snapshot should be valid JSON");
         assert_eq!(
