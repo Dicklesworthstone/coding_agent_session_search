@@ -112,3 +112,32 @@ fn robot_docs_paths_matches_golden() {
 fn robot_docs_schemas_matches_golden() {
     assert_golden("robot_docs/schemas.txt.golden", &capture_docs("schemas"));
 }
+
+/// Capture plain-text `--robot-help` output in an isolated home. The
+/// robot-help string is the top-level "start here" contract surface
+/// agents read on first contact; keeping it stable is load-bearing.
+fn capture_robot_help() -> String {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = cass_cmd(test_home.path())
+        .args(["--robot-help"])
+        .output()
+        .unwrap_or_else(|err| panic!("run cass --robot-help: {err}"));
+    assert!(
+        out.status.success(),
+        "cass --robot-help exited non-zero: {:?}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    scrub_robot_docs(&stdout, test_home.path())
+}
+
+#[test]
+fn robot_help_matches_golden() {
+    // ibuuh.36 verification-matrix row: --robot-help is the top-level
+    // LLM onboarding surface. Topics, subcommand list, exit codes, and
+    // example invocations are all printed here as a bounded static
+    // block. Silent removal of any line breaks agent workflows — freeze
+    // the contract so drift fails CI loudly.
+    assert_golden("robot_docs/robot_help.txt.golden", &capture_robot_help());
+}

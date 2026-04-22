@@ -1,0 +1,31 @@
+cass --robot-help (contract v1)
+===============================
+
+QUICKSTART (for AI agents):
+  cass search "your query" --robot     # Search with JSON output
+  cass search "bug fix" --today        # Search today's sessions only
+  cass search "api" --week --agent codex  # Last 7 days, codex only
+  cass stats --json                    # Get index statistics
+  cass sessions --current --json       # Find current workspace session
+  cass view /path/file.jsonl -n 42    # View file at line 42
+  cass robot-docs commands            # Machine-readable command list
+  cass --robot-docs=commands          # Also accepted (auto-normalized)
+
+TIME FILTERS:
+  --today | --yesterday | --week | --days N
+  --since YYYY-MM-DD | --until YYYY-MM-DD
+
+WORKFLOW:
+  1. cass index --full          # First-time setup (index all sessions)
+  2. cass search "query" --robot  # Search with JSON output
+  3. cass view <source_path> -n <line>  # Follow up on search result
+
+OUTPUT:
+  --robot | --json   Machine-readable JSON output (auto-quiet enabled)
+  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)
+  Use -v/--verbose with --json to enable INFO logs if needed
+
+Subcommands: search | sessions | stats | view | index | tui | robot-docs <topic>
+Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources
+Exit codes: 0 ok; 2 usage; 3 missing index/db; 9 unknown
+More: cass robot-docs examples | cass robot-docs commands
