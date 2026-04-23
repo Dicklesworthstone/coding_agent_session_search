@@ -2226,12 +2226,7 @@ fn absent_index_collapses_timestamp_and_document_fields_to_null() {
     );
 
     // Nullable fields that must be null when index is absent.
-    for key in [
-        "last_indexed_at",
-        "age_seconds",
-        "activity_at",
-        "documents",
-    ] {
+    for key in ["last_indexed_at", "age_seconds", "activity_at", "documents"] {
         let v = &idx[key];
         assert!(
             v.is_null(),
@@ -2266,5 +2261,150 @@ fn absent_index_collapses_timestamp_and_document_fields_to_null() {
     assert!(
         threshold > 0,
         "stale_threshold_seconds={threshold} but must be positive — zero/negative collapses freshness policy"
+    );
+}
+
+#[test]
+fn models_status_aggregates_equal_component_sums_and_files_cohere_on_absence() {
+    // ibuuh.19 model-cache retention row (derived-value consistency).
+    // Retention budget accounting reads three aggregates and a per-
+    // file breakdown from `cass models status --json`:
+    //
+    //   total_size_bytes                      (top level)
+    //   installed_size_bytes                  (top level)
+    //   cache_lifecycle.required_size_bytes   (lifecycle block)
+    //   files[].{expected_size, actual_size,
+    //            exists, size_match, actual_path}
+    //
+    // The aggregate-vs-component invariants the retention layer
+    // depends on:
+    //
+    //   A. sum(files[].expected_size) == total_size_bytes
+    //      A silent file-list refactor that adds/drops a file without
+    //      updating the aggregate would produce a wrong reclaim-vs-
+    //      keep budget.
+    //
+    //   B. cache_lifecycle.required_size_bytes == total_size_bytes
+    //      These are two surfaces that acquisition and retention both
+    //      consult; silent drift means one layer under-reserves and
+    //      the other over-reserves.
+    //
+    //   C. installed=false ⇒ every files[i] in a coherently-absent
+    //      state: exists=false, actual_size=0, size_match=false,
+    //      actual_path=null. A per-file stale signal would fool the
+    //      retention layer into treating the file as partially
+    //      cached (partial reclaim risk) or fully cached (phantom
+    //      reclaimable bytes).
+    //
+    // The earlier row models_status_model_dir_nests_under_data_dir_...
+    // covers top-level aggregates and `model_dir`; this one extends
+    // coverage to derived-aggregate consistency and per-file coherence.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(
+        out.status.success(),
+        "cass models status --json exited non-zero"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let total = status["total_size_bytes"]
+        .as_u64()
+        .expect("total_size_bytes must be u64");
+    let installed_size = status["installed_size_bytes"]
+        .as_u64()
+        .expect("installed_size_bytes must be u64");
+    let cl_required = status["cache_lifecycle"]["required_size_bytes"]
+        .as_u64()
+        .expect("cache_lifecycle.required_size_bytes must be u64");
+    let files = status["files"].as_array().expect("files must be an array");
+    assert!(
+        !files.is_empty(),
+        "files array is empty — retention cannot enumerate the cache"
+    );
+
+    // Invariant A: aggregate = sum of per-file expected sizes.
+    let sum_expected: u64 = files
+        .iter()
+        .map(|f| {
+            f["expected_size"]
+                .as_u64()
+                .expect("files[].expected_size must be u64")
+        })
+        .sum();
+    assert_eq!(
+        sum_expected, total,
+        "sum(files[].expected_size)={sum_expected} != total_size_bytes={total} — retention budget diverged from the file-list it should reflect"
+    );
+
+    // Invariant B: cache_lifecycle aggregate agrees with top-level.
+    assert_eq!(
+        cl_required, total,
+        "cache_lifecycle.required_size_bytes={cl_required} != total_size_bytes={total} — acquisition and retention would plan against different sizes"
+    );
+
+    // Precondition for invariant C: isolated HOME means not installed.
+    let installed = status["installed"]
+        .as_bool()
+        .expect("installed must be a bool");
+    assert!(!installed, "isolated HOME unexpectedly installed=true");
+    assert_eq!(
+        installed_size, 0,
+        "installed=false but installed_size_bytes={installed_size}"
+    );
+
+    // Invariant C: per-file absence coherence.
+    let sum_actual: u64 = files
+        .iter()
+        .map(|f| {
+            f["actual_size"]
+                .as_u64()
+                .expect("files[].actual_size must be u64")
+        })
+        .sum();
+    assert_eq!(
+        sum_actual, 0,
+        "installed=false but sum(files[].actual_size)={sum_actual} — phantom cached bytes at file level"
+    );
+    for (i, f) in files.iter().enumerate() {
+        let name = f["name"].as_str().unwrap_or("<unnamed>");
+        let exists = f["exists"]
+            .as_bool()
+            .expect("files[].exists must be a bool");
+        let size_match = f["size_match"]
+            .as_bool()
+            .expect("files[].size_match must be a bool");
+        let actual_path = &f["actual_path"];
+        assert!(
+            !exists,
+            "installed=false but files[{i}] ({name}) reports exists=true — stale per-file presence signal"
+        );
+        assert!(
+            !size_match,
+            "installed=false but files[{i}] ({name}) reports size_match=true — stale per-file size-match signal"
+        );
+        assert!(
+            actual_path.is_null(),
+            "installed=false but files[{i}] ({name}) has actual_path={actual_path:?} — a non-null path cannot exist when installed=false"
+        );
+    }
+
+    // Also: observed_file_bytes must equal sum(actual_size) — the
+    // observed aggregate cannot diverge from the per-file breakdown
+    // it was (presumably) derived from. In the installed=false case
+    // both are 0, but the equality is the structural invariant.
+    let observed = status["observed_file_bytes"]
+        .as_u64()
+        .expect("observed_file_bytes must be u64");
+    assert_eq!(
+        observed, sum_actual,
+        "observed_file_bytes={observed} != sum(files[].actual_size)={sum_actual} — aggregate drifted from component breakdown"
     );
 }
