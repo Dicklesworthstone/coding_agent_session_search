@@ -1,0 +1,85 @@
+{
+  "events": [
+    {
+      "audit": "MemoCacheAuditRecord { operation: Lookup, key: MemoKey { content_hash: MemoContentHash([149, 41, 224, 150, 236, 41, 116, 173, 62, 201, 116, 227, 231, 31, 248, 236, 178, 72, 244, 42, 252, 85, 55, 137, 146, 153, 82, 8, 228, 162, 90, 58]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Miss, changed: false, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 0, misses: 1, inserts: 0, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 0 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Insert, key: MemoKey { content_hash: MemoContentHash([149, 41, 224, 150, 236, 41, 116, 173, 62, 201, 116, 227, 231, 31, 248, 236, 178, 72, 244, 42, 252, 85, 55, 137, 146, 153, 82, 8, 228, 162, 90, 58]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Insert, changed: true, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 0, misses: 1, inserts: 1, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 1 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Lookup, key: MemoKey { content_hash: MemoContentHash([149, 41, 224, 150, 236, 41, 116, 173, 62, 201, 116, 227, 231, 31, 248, 236, 178, 72, 244, 42, 252, 85, 55, 137, 146, 153, 82, 8, 228, 162, 90, 58]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Hit, changed: false, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 1, misses: 1, inserts: 1, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 1 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Lookup, key: MemoKey { content_hash: MemoContentHash([227, 176, 196, 66, 152, 252, 28, 20, 154, 251, 244, 200, 153, 111, 185, 36, 39, 174, 65, 228, 100, 155, 147, 76, 164, 149, 153, 27, 120, 82, 184, 85]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Miss, changed: false, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 1, misses: 2, inserts: 1, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 1 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Lookup, key: MemoKey { content_hash: MemoContentHash([251, 22, 61, 193, 92, 163, 30, 106, 212, 0, 185, 168, 175, 198, 129, 185, 37, 182, 84, 42, 203, 185, 45, 8, 66, 154, 152, 7, 184, 182, 66, 70]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Miss, changed: false, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 1, misses: 3, inserts: 1, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 1 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Insert, key: MemoKey { content_hash: MemoContentHash([251, 22, 61, 193, 92, 163, 30, 106, 212, 0, 185, 168, 175, 198, 129, 185, 37, 182, 84, 42, 203, 185, 45, 8, 66, 154, 152, 7, 184, 182, 66, 70]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Insert, changed: true, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 1, misses: 3, inserts: 2, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 2 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "algorithm": "semantic_prepare_window",
+      "algorithm_version": "canonicalize_for_embedding:v2:stable-content-hash",
+      "entry_capacity": 4,
+      "evictions_capacity_delta": 0,
+      "hit_delta": 1,
+      "insert_delta": 2,
+      "level": "TRACE",
+      "live_entries": 2,
+      "message": "semantic prep memo cache window",
+      "miss_delta": 3,
+      "prepared_messages": 3,
+      "quarantined_delta": 0,
+      "skipped_messages": 1,
+      "window_index": 0,
+      "window_len": 4
+    },
+    {
+      "audit": "MemoCacheAuditRecord { operation: Lookup, key: MemoKey { content_hash: MemoContentHash([149, 41, 224, 150, 236, 41, 116, 173, 62, 201, 116, 227, 231, 31, 248, 236, 178, 72, 244, 42, 252, 85, 55, 137, 146, 153, 82, 8, 228, 162, 90, 58]), algorithm: \"semantic_prepare_window\", algorithm_version: \"canonicalize_for_embedding:v2:stable-content-hash\" }, event: Hit, changed: false, entry_capacity: 4, quarantined_entries: 0, stats: MemoCacheStats { hits: 2, misses: 3, inserts: 2, evictions_capacity: 0, invalidations: 0, quarantined: 0, live_entries: 2 } }",
+      "level": "TRACE",
+      "message": "semantic prep memo cache audit"
+    },
+    {
+      "algorithm": "semantic_prepare_window",
+      "algorithm_version": "canonicalize_for_embedding:v2:stable-content-hash",
+      "entry_capacity": 4,
+      "evictions_capacity_delta": 0,
+      "hit_delta": 1,
+      "insert_delta": 0,
+      "level": "TRACE",
+      "live_entries": 2,
+      "message": "semantic prep memo cache window",
+      "miss_delta": 0,
+      "prepared_messages": 1,
+      "quarantined_delta": 0,
+      "skipped_messages": 0,
+      "window_index": 1,
+      "window_len": 1
+    },
+    {
+      "algorithm": "semantic_prepare_window",
+      "algorithm_version": "canonicalize_for_embedding:v2:stable-content-hash",
+      "entry_capacity": 4,
+      "hits": 2,
+      "inserts": 2,
+      "level": "DEBUG",
+      "live_entries": 2,
+      "message": "semantic prep memo cache summary",
+      "misses": 3,
+      "quarantined": 0
+    }
+  ]
+}
