@@ -403,6 +403,8 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub dry_run: bool,
     pub explicit_operator_approval: bool,
     pub approval_fingerprint: String,
+    pub provided_approval_fingerprint: Option<String>,
+    pub approval_fingerprint_matches: bool,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
     #[serde(default)]
@@ -451,6 +453,14 @@ impl LexicalCleanupDryRunPlan {
     }
 
     pub(crate) fn apply_gate(&self, explicit_operator_approval: bool) -> LexicalCleanupApplyGate {
+        self.apply_gate_with_fingerprint(explicit_operator_approval, None)
+    }
+
+    pub(crate) fn apply_gate_with_fingerprint(
+        &self,
+        explicit_operator_approval: bool,
+        provided_approval_fingerprint: Option<&str>,
+    ) -> LexicalCleanupApplyGate {
         let mut blocked_reasons = Vec::new();
         if self.reclaim_candidates.is_empty() {
             blocked_reasons.push("no reclaimable cleanup candidates".to_string());
@@ -459,6 +469,19 @@ impl LexicalCleanupDryRunPlan {
             blocked_reasons.push(
                 "destructive cleanup requires explicit operator approval after dry-run".to_string(),
             );
+        }
+        let approval_fingerprint_matches =
+            provided_approval_fingerprint == Some(self.approval_fingerprint.as_str());
+        if explicit_operator_approval && !approval_fingerprint_matches {
+            match provided_approval_fingerprint {
+                Some(_) => blocked_reasons.push(
+                    "provided cleanup approval fingerprint does not match dry-run plan".to_string(),
+                ),
+                None => blocked_reasons.push(format!(
+                    "cleanup apply requires confirming approval fingerprint {}",
+                    self.approval_fingerprint
+                )),
+            }
         }
         if !self.active_generation_ids.is_empty() {
             blocked_reasons.push(format!(
@@ -472,6 +495,8 @@ impl LexicalCleanupDryRunPlan {
             dry_run: self.dry_run,
             explicit_operator_approval,
             approval_fingerprint: self.approval_fingerprint.clone(),
+            provided_approval_fingerprint: provided_approval_fingerprint.map(str::to_owned),
+            approval_fingerprint_matches,
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
             candidate_previews: self.reclaim_candidates.clone(),
@@ -2332,16 +2357,41 @@ mod tests {
         let active_still_blocks = plan.apply_gate(true);
         assert!(!active_still_blocks.apply_allowed);
         assert!(active_still_blocks.explicit_operator_approval);
-        assert_eq!(active_still_blocks.blocked_reasons.len(), 1);
+        assert!(!active_still_blocks.approval_fingerprint_matches);
+        assert!(
+            active_still_blocks
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("approval fingerprint")),
+            "missing fingerprint blocker: {:?}",
+            active_still_blocks.blocked_reasons
+        );
+
+        let active_fingerprint_still_blocks =
+            plan.apply_gate_with_fingerprint(true, Some(&plan.approval_fingerprint));
+        assert!(!active_fingerprint_still_blocks.apply_allowed);
+        assert!(active_fingerprint_still_blocks.approval_fingerprint_matches);
+        assert_eq!(active_fingerprint_still_blocks.blocked_reasons.len(), 1);
 
         let safe_plan = LexicalCleanupDryRunPlan::from_manifests([&superseded]);
-        let allowed = safe_plan.apply_gate(true);
+        let allowed =
+            safe_plan.apply_gate_with_fingerprint(true, Some(&safe_plan.approval_fingerprint));
         assert!(allowed.apply_allowed);
         assert!(allowed.blocked_reasons.is_empty());
+        assert!(allowed.approval_fingerprint_matches);
+        assert_eq!(
+            allowed.provided_approval_fingerprint.as_deref(),
+            Some(safe_plan.approval_fingerprint.as_str())
+        );
         assert_eq!(allowed.candidate_count, 1);
         assert_eq!(allowed.reclaimable_bytes, 4096);
         let allowed_json =
             serde_json::to_value(&allowed).expect("serialize cleanup apply gate preview");
+        assert_eq!(
+            allowed_json["provided_approval_fingerprint"],
+            safe_plan.approval_fingerprint
+        );
+        assert_eq!(allowed_json["approval_fingerprint_matches"], true);
         assert_eq!(
             allowed_json["candidate_previews"][0]["generation_id"],
             "gen-old"
@@ -2353,6 +2403,19 @@ mod tests {
         assert_eq!(
             allowed_json["candidate_previews"][0]["reclaimable_bytes"],
             4096
+        );
+
+        let stale_fingerprint =
+            safe_plan.apply_gate_with_fingerprint(true, Some("cleanup-v1-stale"));
+        assert!(!stale_fingerprint.apply_allowed);
+        assert!(!stale_fingerprint.approval_fingerprint_matches);
+        assert!(
+            stale_fingerprint
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("does not match")),
+            "missing stale fingerprint blocker: {:?}",
+            stale_fingerprint.blocked_reasons
         );
     }
 
@@ -2406,12 +2469,21 @@ mod tests {
             "approval fingerprint must change when reclaimable candidate bytes change"
         );
 
-        let gate = plan.apply_gate(true);
+        let gate = plan.apply_gate_with_fingerprint(true, Some(&plan.approval_fingerprint));
         assert_eq!(gate.approval_fingerprint, plan.approval_fingerprint);
+        assert_eq!(
+            gate.provided_approval_fingerprint.as_deref(),
+            Some(plan.approval_fingerprint.as_str())
+        );
+        assert!(gate.approval_fingerprint_matches);
         let plan_json = serde_json::to_value(&plan)?;
         let gate_json = serde_json::to_value(&gate)?;
         assert_eq!(plan_json["approval_fingerprint"], plan.approval_fingerprint);
         assert_eq!(gate_json["approval_fingerprint"], plan.approval_fingerprint);
+        assert_eq!(
+            gate_json["provided_approval_fingerprint"],
+            plan.approval_fingerprint
+        );
         Ok(())
     }
 
