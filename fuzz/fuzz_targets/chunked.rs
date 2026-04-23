@@ -9,7 +9,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use tempfile::TempDir;
 
-use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
+use coding_agent_search::pages::encrypt::{load_config, DecryptionEngine, EncryptionEngine};
 
 /// Fuzzer input for chunked encryption.
 #[derive(Arbitrary, Debug)]
@@ -53,7 +53,7 @@ fuzz_target!(|input: ChunkedInput| {
     let decrypt_path = temp_dir.path().join("decrypted.bin");
 
     // Write input file
-    if let Err(_) = std::fs::write(&input_path, plaintext) {
+    if std::fs::write(&input_path, plaintext).is_err() {
         return;
     }
 
@@ -85,13 +85,12 @@ fuzz_target!(|input: ChunkedInput| {
     };
 
     // Decrypt
-    if decryptor
-        .decrypt_to_file(&encrypt_dir, &decrypt_path, |_, _| {})
-        .is_err()
-    {
-        // Decryption failure after successful encryption is a bug
-        panic!("Decryption failed after successful encryption");
-    }
+    assert!(
+        decryptor
+            .decrypt_to_file(&encrypt_dir, &decrypt_path, |_, _| {})
+            .is_ok(),
+        "Decryption failed after successful encryption"
+    );
 
     // Verify roundtrip
     let decrypted = match std::fs::read(&decrypt_path) {
@@ -99,13 +98,13 @@ fuzz_target!(|input: ChunkedInput| {
         Err(_) => return,
     };
 
-    if decrypted != plaintext {
-        panic!(
-            "Roundtrip mismatch! Original len: {}, Decrypted len: {}",
-            plaintext.len(),
-            decrypted.len()
-        );
-    }
+    assert_eq!(
+        decrypted,
+        plaintext,
+        "Roundtrip mismatch! Original len: {}, Decrypted len: {}",
+        plaintext.len(),
+        decrypted.len()
+    );
 
     // If recovery slot was added, test recovery decryption too
     if input.add_recovery && !input.recovery_secret.is_empty() {
@@ -123,9 +122,10 @@ fuzz_target!(|input: ChunkedInput| {
                 .is_ok()
             {
                 let recovery_decrypted = std::fs::read(&recovery_decrypt_path).unwrap_or_default();
-                if recovery_decrypted != plaintext {
-                    panic!("Recovery roundtrip mismatch!");
-                }
+                assert_eq!(
+                    recovery_decrypted, plaintext,
+                    "Recovery roundtrip mismatch!"
+                );
             }
         }
     }

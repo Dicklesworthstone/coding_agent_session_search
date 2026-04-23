@@ -56,3 +56,17 @@ path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_query_parser"
+path = "fuzz_targets/fuzz_query_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_connectors"
+path = "fuzz_targets/fuzz_connectors.rs"
+test = false
+doc = false
+bench = false
