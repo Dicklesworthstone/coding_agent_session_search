@@ -11178,6 +11178,11 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
+        let quarantine_summary = collect_diag_quarantine_report(
+            &data_dir,
+            &crate::search::tantivy::expected_index_dir(&data_dir),
+        )
+        .summary;
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -11197,6 +11202,9 @@ fn run_status(
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
+            "quarantine": {
+                "summary": quarantine_summary,
+            },
             "recommended_action": recommended_action,
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });

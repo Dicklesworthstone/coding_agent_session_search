@@ -5,6 +5,55 @@ use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
+
+fn write_quarantined_manifest(generation_dir: &Path) {
+    fs::create_dir_all(generation_dir).expect("create generation dir");
+    fs::write(
+        generation_dir.join("lexical-generation-manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 1,
+            "generation_id": "gen-quarantined",
+            "attempt_id": "attempt-1",
+            "created_at_ms": 1_733_000_000_000_i64,
+            "updated_at_ms": 1_733_000_000_321_i64,
+            "source_db_fingerprint": "fp-test",
+            "conversation_count": 3,
+            "message_count": 9,
+            "indexed_doc_count": 9,
+            "equivalence_manifest_fingerprint": null,
+            "shard_plan": null,
+            "build_budget": null,
+            "shards": [{
+                "shard_id": "shard-a",
+                "shard_ordinal": 0,
+                "state": "quarantined",
+                "updated_at_ms": 1_733_000_000_222_i64,
+                "indexed_doc_count": 9,
+                "message_count": 9,
+                "artifact_bytes": 512,
+                "stable_hash": "stable-hash-a",
+                "reclaimable": false,
+                "pinned": false,
+                "recovery_reason": null,
+                "quarantine_reason": "validation_failed"
+            }],
+            "merge_debt": {
+                "state": "none",
+                "updated_at_ms": null,
+                "pending_shard_count": 0,
+                "pending_artifact_bytes": 0,
+                "reason": null,
+                "controller_reason": null
+            },
+            "build_state": "failed",
+            "publish_state": "quarantined",
+            "failure_history": []
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("write manifest");
+}
 
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     let db_path = data_dir.join("agent_search.db");
@@ -128,5 +177,95 @@ fn status_json_surfaces_runtime_queue_and_byte_budget_headroom() {
     assert_eq!(
         runtime["inflight_message_bytes_headroom"].as_u64(),
         Some(65_536)
+    );
+}
+
+#[test]
+fn status_json_surfaces_quarantine_gc_summary() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let backups_dir = data_dir.join("backups");
+    fs::create_dir_all(&backups_dir).expect("create backups dir");
+
+    let failed_seed_root =
+        backups_dir.join("agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak");
+    fs::write(&failed_seed_root, b"seed-backup").expect("write failed seed bundle");
+    fs::write(
+        failed_seed_root.with_file_name(format!(
+            "{}-wal",
+            failed_seed_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("file name")
+        )),
+        b"seed-wal",
+    )
+    .expect("write failed seed wal");
+
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained publish backup");
+
+    let generation_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_manifest(&generation_dir);
+    fs::write(
+        generation_dir.join("segment-a"),
+        b"quarantined-generation-bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("XDG_CONFIG_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        out.status.success(),
+        "cass status --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let summary = &payload["quarantine"]["summary"];
+
+    assert_eq!(summary["gc_eligible_asset_count"].as_u64(), Some(1));
+    assert!(
+        summary["gc_eligible_bytes"].as_u64().unwrap_or(0) > 0,
+        "one retained publish backup should fall outside the retention cap"
+    );
+    assert_eq!(summary["inspection_required_asset_count"].as_u64(), Some(3));
+    assert!(
+        summary["inspection_required_bytes"].as_u64().unwrap_or(0) > 0,
+        "failed seed bundles and quarantined lexical generation should remain inspection-only"
+    );
+    assert_eq!(
+        summary["retained_publish_backup_retention_limit"].as_u64(),
+        Some(1)
     );
 }
