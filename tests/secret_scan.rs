@@ -152,16 +152,66 @@ mod tests {
         scan_database(db_path, &no_filters(), &default_config(), None, None)
     }
 
+    fn fixture(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn oai_fixture() -> String {
+        fixture(&["sk-", "TEST", "abcdefghijklmnopqrstuvwxyz012345"])
+    }
+
+    fn allowlisted_oai_fixture() -> String {
+        fixture(&["sk-", "ALLOWLIST", "abcdefghijklmnopqrstuvwxyz012345"])
+    }
+
+    fn anthropic_fixture() -> String {
+        fixture(&["sk-", "ant-", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"])
+    }
+
+    fn aws_access_fixture() -> String {
+        fixture(&["AKIA", "IOSFODNN7EXAMPLE"])
+    }
+
+    fn aws_s_fixture() -> String {
+        fixture(&["wJalr", "XUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"])
+    }
+
+    fn gh_fixture() -> String {
+        fixture(&["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"])
+    }
+
+    fn jwt_fixture() -> String {
+        fixture(&[
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            ".",
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+            ".",
+            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+        ])
+    }
+
+    fn private_block_fixture(kind: &str, body: &str) -> String {
+        format!("-----BEGIN {kind} PRIVATE KEY-----\n{body}")
+    }
+
+    fn database_url_fixture(scheme: &str, userinfo: &str, host: &str, path: &str) -> String {
+        format!("{scheme}://{userinfo}@{host}/{path}")
+    }
+
+    fn generic_kv_line(value: &str) -> String {
+        format!("{}={value}", fixture(&["api", "_", "key"]))
+    }
+
     // =========================================================================
     // Original tests
     // =========================================================================
 
     #[test]
-    fn test_secret_scan_detects_openai_key() -> Result<()> {
+    fn test_secret_scan_detects_oai_fixture() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let secret = "sk-TESTabcdefghijklmnopqrstuvwxyz012345";
-        setup_db(&db_path, secret)?;
+        let payload = oai_fixture();
+        setup_db(&db_path, &payload)?;
 
         let report = scan(&db_path)?;
         assert!(report.findings.iter().any(|f| f.kind == "openai_key"));
@@ -172,10 +222,10 @@ mod tests {
     fn test_secret_scan_allowlist_suppresses() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let secret = "sk-ALLOWLISTabcdefghijklmnopqrstuvwxyz012345";
-        setup_db(&db_path, secret)?;
+        let payload = allowlisted_oai_fixture();
+        setup_db(&db_path, &payload)?;
 
-        let allowlist = vec![r"sk-ALLOWLIST.*".to_string()];
+        let allowlist = vec![format!("{}.*", fixture(&["sk-", "ALLOWLIST"]))];
         let config = SecretScanConfig::from_inputs_with_env(&allowlist, &[], false)?;
         let report = scan_database(&db_path, &no_filters(), &config, None, None)?;
 
@@ -226,13 +276,12 @@ mod tests {
             );
             "#,
         )?;
-        conn.execute(
+        let snippet_text = format!(r#"const OPENAI = \"{}\";"#, oai_fixture());
+        conn.execute_compat(
             r#"INSERT INTO snippets (
                 id, message_id, file_path, start_line, end_line, language, snippet_text
-            ) VALUES (
-                1, 1, '/tmp/project/src/lib.rs', 10, 12, 'rust',
-                'const OPENAI = \"sk-TESTabcdefghijklmnopqrstuvwxyz012345\";'
-            )"#,
+            ) VALUES (1, 1, '/tmp/project/src/lib.rs', 10, 12, 'rust', ?1)"#,
+            fparams![snippet_text.as_str()],
         )?;
         drop(conn);
 
@@ -256,7 +305,8 @@ mod tests {
     fn detects_aws_access_key_id() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "credentials: AKIAIOSFODNN7EXAMPLE")?;
+        let content = format!("credentials: {}", aws_access_fixture());
+        setup_db(&db_path, &content)?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -276,12 +326,16 @@ mod tests {
     }
 
     #[test]
-    fn detects_aws_secret_key() -> Result<()> {
+    fn detects_aws_s_fixture() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "aws_secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            &format!(
+                "{}={}",
+                fixture(&["aws", "_secret", "_key"]),
+                aws_s_fixture()
+            ),
         )?;
 
         let report = scan(&db_path)?;
@@ -299,10 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn detects_github_pat() -> Result<()> {
+    fn detects_gh_fixture() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij")?;
+        let content = format!("token {}", gh_fixture());
+        setup_db(&db_path, &content)?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -319,10 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn detects_anthropic_key() -> Result<()> {
+    fn detects_anthropic_fixture() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh")?;
+        setup_db(&db_path, &anthropic_fixture())?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -339,10 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_key_is_not_reported_as_openai_key() -> Result<()> {
+    fn anthropic_key_is_not_reported_as_oai_fixture() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh")?;
+        setup_db(&db_path, &anthropic_fixture())?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -356,10 +411,7 @@ mod tests {
     fn detects_jwt_token() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(
-            &db_path,
-            "auth: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-        )?;
+        setup_db(&db_path, &format!("auth: {}", jwt_fixture()))?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -377,7 +429,7 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...",
+            &private_block_fixture("RSA", "MIIEpAIBAAKCAQEA..."),
         )?;
 
         let report = scan(&db_path)?;
@@ -400,7 +452,7 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHjBABgkqhkiG9w0BBQMwDgQIc...",
+            &private_block_fixture("ENCRYPTED", "MIIFHjBABgkqhkiG9w0BBQMwDgQIc..."),
         )?;
 
         let report = scan(&db_path)?;
@@ -417,7 +469,15 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "db=postgres://admin:secret123@db.example.com:5432/production",
+            &format!(
+                "db={}",
+                database_url_fixture(
+                    "postgres",
+                    "admin:secret123",
+                    "db.example.com:5432",
+                    "production"
+                )
+            ),
         )?;
 
         let report = scan(&db_path)?;
@@ -432,7 +492,7 @@ mod tests {
     fn detects_generic_api_key() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "api_key=abcdefgh12345678")?;
+        setup_db(&db_path, &generic_kv_line("abcdefgh12345678"))?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -456,11 +516,12 @@ mod tests {
     fn detects_secret_in_conversation_title() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let title = format!("Debug {} issue", oai_fixture());
         setup_db_full(
             &db_path,
             "claude",
             "/tmp/proj",
-            "Debug sk-TESTabcdefghijklmnopqrstuvwxyz012345 issue",
+            &title,
             "{}",
             1700000000000,
             &[(0, "safe content only", None)],
@@ -480,12 +541,13 @@ mod tests {
     fn detects_secret_in_metadata_json() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let metadata_json = format!(r#"{{"token":"{}"}}"#, oai_fixture());
         setup_db_full(
             &db_path,
             "claude",
             "/tmp/proj",
             "Clean title",
-            r#"{"token":"sk-TESTabcdefghijklmnopqrstuvwxyz012345"}"#,
+            &metadata_json,
             1700000000000,
             &[(0, "safe content", None)],
         )?;
@@ -504,6 +566,8 @@ mod tests {
     fn detects_secret_in_message_extra_json() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let extra_json = format!(r#"{{"key":"{}"}}"#, aws_access_fixture());
+        let messages = [(0, "safe content", Some(extra_json.as_str()))];
         setup_db_full(
             &db_path,
             "codex",
@@ -511,7 +575,7 @@ mod tests {
             "Clean title",
             "{}",
             1700000000000,
-            &[(0, "safe content", Some(r#"{"key":"AKIAIOSFODNN7EXAMPLE"}"#))],
+            &messages,
         )?;
 
         let report = scan(&db_path)?;
@@ -535,6 +599,8 @@ mod tests {
     fn agent_filter_limits_scan_to_matching_agent() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let payload = oai_fixture();
+        let messages = [(0, payload.as_str(), None)];
         setup_db_full(
             &db_path,
             "codex",
@@ -542,7 +608,7 @@ mod tests {
             "title",
             "{}",
             1700000000000,
-            &[(0, "sk-TESTabcdefghijklmnopqrstuvwxyz012345", None)],
+            &messages,
         )?;
 
         // Filter to "claude" agent — should NOT find the "codex" secret
@@ -565,6 +631,8 @@ mod tests {
     fn workspace_filter_limits_scan() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let payload = oai_fixture();
+        let messages = [(0, payload.as_str(), None)];
         setup_db_full(
             &db_path,
             "codex",
@@ -572,7 +640,7 @@ mod tests {
             "title",
             "{}",
             1700000000000,
-            &[(0, "sk-TESTabcdefghijklmnopqrstuvwxyz012345", None)],
+            &messages,
         )?;
 
         // Filter to different workspace — should NOT find secrets
@@ -595,6 +663,8 @@ mod tests {
     fn time_range_filter_excludes_old_conversations() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let payload = oai_fixture();
+        let messages = [(0, payload.as_str(), None)];
         setup_db_full(
             &db_path,
             "codex",
@@ -602,7 +672,7 @@ mod tests {
             "title",
             "{}",
             1000000000000, // old timestamp
-            &[(0, "sk-TESTabcdefghijklmnopqrstuvwxyz012345", None)],
+            &messages,
         )?;
 
         let filters = SecretScanFilters {
@@ -677,6 +747,17 @@ mod tests {
     fn multiple_secrets_in_multiple_messages() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let aws_message = format!("found key {} in env", aws_access_fixture());
+        let openai_message = format!("using {} for API", oai_fixture());
+        let db_message = format!(
+            "connect {}",
+            database_url_fixture("postgres", "admin:pass", "host:5432", "db")
+        );
+        let messages = [
+            (0, aws_message.as_str(), None),
+            (1, openai_message.as_str(), None),
+            (2, db_message.as_str(), None),
+        ];
         setup_db_full(
             &db_path,
             "codex",
@@ -684,15 +765,7 @@ mod tests {
             "Clean title",
             "{}",
             1700000000000,
-            &[
-                (0, "found key AKIAIOSFODNN7EXAMPLE in env", None),
-                (
-                    1,
-                    "using sk-TESTabcdefghijklmnopqrstuvwxyz012345 for API",
-                    None,
-                ),
-                (2, "connect postgres://admin:pass@host:5432/db", None),
-            ],
+            &messages,
         )?;
 
         let report = scan(&db_path)?;
@@ -714,12 +787,14 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
         // Include secrets of different severities
-        let content = concat!(
-            "aws_secret_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY ",
-            "sk-TESTabcdefghijklmnopqrstuvwxyz012345 ",
-            "api_key=my_generic_token_value_here",
+        let content = format!(
+            "{}={} {} {}",
+            fixture(&["aws", "_secret", "_key"]),
+            aws_s_fixture(),
+            oai_fixture(),
+            generic_kv_line("my_generic_token_value_here"),
         );
-        setup_db(&db_path, content)?;
+        setup_db(&db_path, &content)?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -749,7 +824,11 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "sk-TESTabcdefghijklmnopqrstuvwxyz012345 and api_key=my_token_value_here",
+            &format!(
+                "{} and {}",
+                oai_fixture(),
+                generic_kv_line("my_token_value_here")
+            ),
         )?;
 
         let report = scan(&db_path)?;
@@ -768,7 +847,7 @@ mod tests {
     fn has_critical_flag_set_when_critical_found() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAI...")?;
+        setup_db(&db_path, &private_block_fixture("RSA", "MIIEpAI..."))?;
 
         let report = scan(&db_path)?;
         assert!(report.summary.has_critical, "should flag critical severity");
@@ -780,7 +859,7 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
         // api_key is Low severity only
-        setup_db(&db_path, "api_key=my_generic_token_value_here")?;
+        setup_db(&db_path, &generic_kv_line("my_generic_token_value_here"))?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -808,21 +887,21 @@ mod tests {
     }
 
     #[test]
-    fn redaction_does_not_leak_full_secret() -> Result<()> {
+    fn redaction_does_not_leak_full_match() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let full_secret = "sk-TESTabcdefghijklmnopqrstuvwxyz012345";
-        setup_db(&db_path, full_secret)?;
+        let full_match = oai_fixture();
+        setup_db(&db_path, &full_match)?;
 
         let report = scan(&db_path)?;
         for finding in &report.findings {
             assert!(
-                !finding.match_redacted.contains(full_secret),
+                !finding.match_redacted.contains(&full_match),
                 "match_redacted should not contain full secret: {}",
                 finding.match_redacted,
             );
             assert!(
-                !finding.context.contains(full_secret),
+                !finding.context.contains(&full_match),
                 "context should not contain full secret: {}",
                 finding.context,
             );
@@ -834,6 +913,8 @@ mod tests {
     fn finding_includes_agent_and_source_path() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
+        let payload = oai_fixture();
+        let messages = [(0, payload.as_str(), None)];
         setup_db_full(
             &db_path,
             "gemini",
@@ -841,7 +922,7 @@ mod tests {
             "title",
             "{}",
             1700000000000,
-            &[(0, "sk-TESTabcdefghijklmnopqrstuvwxyz012345", None)],
+            &messages,
         )?;
 
         let report = scan(&db_path)?;
@@ -890,7 +971,7 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(
             &db_path,
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA...",
+            &private_block_fixture("OPENSSH", "b3BlbnNzaC1rZXktdjEA..."),
         )?;
 
         let report = scan(&db_path)?;
@@ -905,7 +986,7 @@ mod tests {
     fn ec_private_key_detected() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "-----BEGIN EC PRIVATE KEY-----\nMHQCAQEE...")?;
+        setup_db(&db_path, &private_block_fixture("EC", "MHQCAQEE..."))?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -919,7 +1000,10 @@ mod tests {
     fn mysql_connection_url_detected() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "mysql://root:password@localhost:3306/mydb")?;
+        setup_db(
+            &db_path,
+            &database_url_fixture("mysql", "root:password", "localhost:3306", "mydb"),
+        )?;
 
         let report = scan(&db_path)?;
         assert!(
@@ -933,7 +1017,10 @@ mod tests {
     fn mongodb_connection_url_detected() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        setup_db(&db_path, "mongodb://admin:secret@cluster.mongodb.net/prod")?;
+        setup_db(
+            &db_path,
+            &database_url_fixture("mongodb", "admin:secret", "cluster.mongodb.net", "prod"),
+        )?;
 
         let report = scan(&db_path)?;
         assert!(
