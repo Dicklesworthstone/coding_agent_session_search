@@ -23648,7 +23648,6 @@ mod tests {
             "1",
         );
 
-        let mut rebuild_equivalence = None;
         let logs = capture_logs(|| {
             let rebuild = rebuild_tantivy_from_db_with_options(
                 &db_path,
@@ -24006,6 +24005,7 @@ mod tests {
             "1",
         );
 
+        let mut rebuild_equivalence: Option<super::LexicalRebuildEquivalenceEvidence> = None;
         let logs = capture_logs(|| {
             let rebuild = rebuild_tantivy_from_db_with_options(
                 &db_path,
@@ -24053,7 +24053,7 @@ mod tests {
             "completed staged rebuild state should retain the live published meta fingerprint"
         );
         let evidence_path = lexical_rebuild_equivalence_evidence_path(&index_path);
-        let persisted_evidence: LexicalRebuildEquivalenceEvidence =
+        let persisted_evidence: super::LexicalRebuildEquivalenceEvidence =
             serde_json::from_slice(&std::fs::read(&evidence_path).unwrap()).unwrap();
         assert_eq!(
             persisted_evidence, evidence,
