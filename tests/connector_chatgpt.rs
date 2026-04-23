@@ -82,8 +82,25 @@ fn scan_parses_mapping_format() {
     assert_eq!(convs[0].messages[0].role, "user");
     assert!(convs[0].messages[0].content.contains("sort"));
     assert_eq!(convs[0].messages[1].role, "assistant");
-    assert!(convs[0].started_at.is_some());
-    assert!(convs[0].ended_at.is_some());
+    // Bead 7k7pl: pin the EXACT started/ended timestamps — the
+    // mapping fixture seeds create_time = 1700000000.0 and
+    // 1700000001.0 (unix seconds), which the connector must convert
+    // to ms. A regression that lost precision, swapped order, or
+    // dropped the conversion would slip past `.is_some()`.
+    let started = convs[0].started_at.expect("started_at from create_time");
+    let ended = convs[0].ended_at.expect("ended_at from create_time");
+    assert_eq!(
+        started, 1_700_000_000_000,
+        "started_at must be seeded create_time in ms; got {started}"
+    );
+    assert_eq!(
+        ended, 1_700_000_001_000,
+        "ended_at must be seeded create_time in ms; got {ended}"
+    );
+    assert!(
+        started <= ended,
+        "started_at must be <= ended_at; got started={started}, ended={ended}"
+    );
 }
 
 #[test]

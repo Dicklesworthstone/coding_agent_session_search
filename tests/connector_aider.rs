@@ -193,10 +193,21 @@ fn aider_timestamps_from_mtime() {
     let convs = conn.scan(&ctx).expect("scan");
 
     assert_eq!(convs.len(), 1);
-    // Both timestamps should be set and equal (using file mtime)
-    assert!(convs[0].started_at.is_some());
-    assert!(convs[0].ended_at.is_some());
-    assert_eq!(convs[0].started_at, convs[0].ended_at);
+    // Bead 7k7pl: pin that BOTH timestamps are the same plausible
+    // ms-epoch value (file mtime), not just "present". Aider uses
+    // the file's mtime for both started/ended; a regression that
+    // emitted 0 / MIN / time::now() would slip past `.is_some()`.
+    let started = convs[0].started_at.expect("started_at must be set from mtime");
+    let ended = convs[0].ended_at.expect("ended_at must be set from mtime");
+    // ms-epoch sanity floor: 2001-09-09 (1_000_000_000_000 ms).
+    assert!(
+        started >= 1_000_000_000_000,
+        "started_at must be a plausible ms-epoch value; got {started}"
+    );
+    assert_eq!(
+        started, ended,
+        "aider sets started/ended from the same mtime; got started={started}, ended={ended}"
+    );
 }
 
 /// Test `since_ts` filtering excludes old files

@@ -43,9 +43,23 @@ fn codex_connector_reads_modern_envelope_jsonl() {
     assert!(c.title.as_ref().unwrap().contains("write a hello program"));
     // Verify workspace was extracted from session_meta
     assert_eq!(c.workspace, Some(PathBuf::from("/test/workspace")));
-    // Verify timestamps were parsed from ISO-8601
-    assert!(c.started_at.is_some());
-    assert!(c.ended_at.is_some());
+    // Bead 7k7pl: pin timestamps parsed from the 2025-09-30 ISO-8601
+    // fixture — both must be plausible ms-epoch values (>= 2020) and
+    // started must be strictly before ended. A regression that
+    // dropped ISO parsing (emitting 0 / default) would slip past
+    // `.is_some()`.
+    let started = c.started_at.expect("started_at must be parsed from ISO-8601");
+    let ended = c.ended_at.expect("ended_at must be parsed from ISO-8601");
+    // ms-epoch floor: 2020-01-01 (1_577_836_800_000 ms). Fixture is
+    // 2025 so this is well below the real value but catches 0/MIN.
+    assert!(
+        started >= 1_577_836_800_000,
+        "started_at must be parsed from the 2025 fixture (>= 2020); got {started}"
+    );
+    assert!(
+        started < ended,
+        "started_at must be strictly before ended_at; got started={started}, ended={ended}"
+    );
 }
 
 #[test]
@@ -983,8 +997,22 @@ fn codex_connector_truncates_long_title() {
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
-    assert!(c.title.is_some());
-    assert_eq!(c.title.as_ref().unwrap().len(), 100);
+    // Bead 7k7pl: collapse `.is_some()` + `.unwrap().len() == 100`
+    // into a single pin on the title's length (truncation contract)
+    // plus a content pin — the truncated title must still be 100 x
+    // 'A' (no bytes lost to multi-byte boundary confusion).
+    assert_eq!(
+        c.title.as_ref().map(|t| t.len()),
+        Some(100),
+        "title must be truncated to exactly 100 chars; got {:?}",
+        c.title
+    );
+    assert_eq!(
+        c.title.as_deref(),
+        Some("A".repeat(100).as_str()),
+        "title must be 100 'A's from the truncation of 200; got {:?}",
+        c.title
+    );
 }
 
 /// Test `source_path` matches actual file path

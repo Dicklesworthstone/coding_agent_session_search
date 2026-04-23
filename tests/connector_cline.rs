@@ -681,8 +681,16 @@ fn cline_truncates_long_title() {
     };
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
-    assert!(convs[0].title.is_some());
-    assert_eq!(convs[0].title.as_ref().unwrap().len(), 100);
+    // Bead 7k7pl: collapse `.is_some()` + `.unwrap().len() == 100`
+    // into one `assert_eq!` that captures both preconditions — a
+    // regression producing None or the wrong truncation length both
+    // fail with a single actionable message.
+    assert_eq!(
+        convs[0].title.as_ref().map(|t| t.len()),
+        Some(100),
+        "title must be truncated to exactly 100 chars; got {:?}",
+        convs[0].title
+    );
 }
 
 /// Test metadata source is "cline"
