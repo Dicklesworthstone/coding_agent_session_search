@@ -14061,28 +14061,79 @@ pub mod persist {
             .unwrap_or(false)
     }
 
+    // Caps on the begin-concurrent knobs below. Each is chosen to be
+    // generous (covers every realistic workload) while bounding the
+    // blast radius of a typo / pathological env value:
+    //
+    // - Retries cap: worst-case wall time = max_retries × (256 ms backoff
+    //   + 256 ms jitter) ≈ ~16 s at 32 retries. Beyond that the outer
+    //   RetryableFallback path should kick in; spinning longer just burns
+    //   CPU.
+    // - Chunk size cap: rayon parallelism is proportional; 512 convos per
+    //   chunk × 32-core hosts is already deep in oversubscription land.
+    // - Writer cache KiB cap: applied per parallel chunk writer. With the
+    //   default chunk count this is ~32 × 64 MiB ≈ 2 GiB peak, below
+    //   anything a CI host or dev laptop would OOM on.
+    const BEGIN_CONCURRENT_RETRY_MAX: usize = 32;
+    const BEGIN_CONCURRENT_CHUNK_SIZE_MAX: usize = 512;
+    const BEGIN_CONCURRENT_WRITER_CACHE_KIB_MAX: i64 = 65_536;
+
+    fn env_usize_bounded(var: &str, default: usize, max: usize) -> usize {
+        match dotenvy::var(var).ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => default,
+            Some(v) if v > max => {
+                tracing::warn!(
+                    env_var = var,
+                    requested = v,
+                    cap = max,
+                    "env var exceeds safe cap; clamping"
+                );
+                max
+            }
+            Some(v) => v,
+            None => default,
+        }
+    }
+
+    fn env_i64_bounded(var: &str, default: i64, max: i64) -> i64 {
+        match dotenvy::var(var).ok().and_then(|v| v.parse::<i64>().ok()) {
+            Some(v) if v <= 0 => default,
+            Some(v) if v > max => {
+                tracing::warn!(
+                    env_var = var,
+                    requested = v,
+                    cap = max,
+                    "env var exceeds safe cap; clamping"
+                );
+                max
+            }
+            Some(v) => v,
+            None => default,
+        }
+    }
+
     pub(super) fn begin_concurrent_retry_limit() -> usize {
-        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(6)
+        env_usize_bounded(
+            "CASS_INDEXER_BEGIN_CONCURRENT_RETRIES",
+            6,
+            BEGIN_CONCURRENT_RETRY_MAX,
+        )
     }
 
     fn begin_concurrent_chunk_size() -> usize {
-        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(32)
+        env_usize_bounded(
+            "CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE",
+            32,
+            BEGIN_CONCURRENT_CHUNK_SIZE_MAX,
+        )
     }
 
     fn begin_concurrent_writer_cache_kib() -> i64 {
-        dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(4096)
+        env_i64_bounded(
+            "CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB",
+            4096,
+            BEGIN_CONCURRENT_WRITER_CACHE_KIB_MAX,
+        )
     }
 
     fn serial_batch_chunk_size() -> usize {
@@ -15118,6 +15169,50 @@ pub mod persist {
         fn begin_concurrent_writer_cache_invalid_defaults() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "0");
             assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
+        }
+
+        #[test]
+        fn begin_concurrent_knobs_are_clamped_to_safe_caps() {
+            // Pathological values (typos, overflow-adjacent integers) must be
+            // clamped, not honored verbatim. Each knob here is exercised at the
+            // upper edge the user could type; the expected post-clamp value is
+            // the constant cap.
+            {
+                let _guard = set_env(
+                    "CASS_INDEXER_BEGIN_CONCURRENT_RETRIES",
+                    "1000000000",
+                );
+                assert_eq!(begin_concurrent_retry_limit(), BEGIN_CONCURRENT_RETRY_MAX);
+            }
+            {
+                let _guard = set_env(
+                    "CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE",
+                    "1000000000",
+                );
+                assert_eq!(
+                    begin_concurrent_chunk_size(),
+                    BEGIN_CONCURRENT_CHUNK_SIZE_MAX
+                );
+            }
+            {
+                let _guard = set_env(
+                    "CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB",
+                    "9999999999",
+                );
+                assert_eq!(
+                    begin_concurrent_writer_cache_kib(),
+                    BEGIN_CONCURRENT_WRITER_CACHE_KIB_MAX
+                );
+            }
+            // Negative or zero inputs still fall through to the existing
+            // default path (not clamp-to-max).
+            {
+                let _guard = set_env(
+                    "CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB",
+                    "-42",
+                );
+                assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
+            }
         }
 
         #[test]
