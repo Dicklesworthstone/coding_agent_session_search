@@ -1294,16 +1294,13 @@ fn capabilities_features_and_connectors_contain_no_duplicates() {
     let stdout = String::from_utf8(out.stdout).expect("utf8");
     let caps: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
 
-    for (field, label) in [("features", "feature"), ("connectors", "connector")] {
+    for field in ["features", "connectors"] {
         let arr = caps[field]
             .as_array()
-            .unwrap_or_else(|| panic!("capabilities.{field} must be an array"));
+            .expect("capabilities field must be an array");
         let names: Vec<&str> = arr
             .iter()
-            .map(|v| {
-                v.as_str()
-                    .unwrap_or_else(|| panic!("{label} entries must be strings"))
-            })
+            .map(|v| v.as_str().expect("capability entries must be strings"))
             .collect();
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(
@@ -1328,7 +1325,7 @@ fn capabilities_features_and_connectors_contain_no_duplicates() {
     ] {
         let n = limits[key]
             .as_i64()
-            .unwrap_or_else(|| panic!("limits.{key} must be an integer"));
+            .expect("limits field must be an integer");
         assert!(n >= 0, "limits.{key} must be non-negative; got {n}");
     }
 }
