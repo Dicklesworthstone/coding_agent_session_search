@@ -731,6 +731,25 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
+fn stats_json_missing_db_error_envelope_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args([
+            "stats",
+            "--json",
+            "--data-dir",
+            test_home.path().to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass stats --json");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stderr).expect("stats error envelope is JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden("robot/stats_missing_db_shape.json.golden", &canonical);
+}
+
+#[test]
 fn introspect_json_matches_golden() {
     // `cass introspect --json` is the full API schema surface — every
     // subcommand, its flags, positional args, and response-schema
