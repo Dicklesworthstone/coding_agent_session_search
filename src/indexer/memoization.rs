@@ -288,6 +288,25 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             })
     }
 
+    /// Preview which quarantine tombstones would be collected for an
+    /// algorithm without mutating the cache.
+    pub(crate) fn preview_garbage_collect_quarantined_algorithm(
+        &self,
+        algorithm: &str,
+    ) -> Vec<MemoQuarantineInspectionItem> {
+        let mut items: Vec<_> = self
+            .quarantined
+            .iter()
+            .filter(|(key, _)| key.algorithm == algorithm)
+            .map(|(key, reason)| MemoQuarantineInspectionItem {
+                key: key.clone(),
+                reason: reason.clone(),
+            })
+            .collect();
+        sort_quarantine_inspection_items(&mut items);
+        items
+    }
+
     /// Remove every inspected quarantine tombstone for an algorithm and
     /// return a deterministic audit list of what was collected.
     pub(crate) fn garbage_collect_quarantined_algorithm(
@@ -564,6 +583,42 @@ mod tests {
     }
 
     #[test]
+    fn preview_garbage_collect_quarantined_algorithm_is_deterministic_and_non_mutating() {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(6);
+        let lexical_b = key(b"lex-b", "lexical-normalize", "v1");
+        let lexical_a = key(b"lex-a", "lexical-normalize", "v1");
+        let semantic = key(b"semantic", "semantic-embed", "v2");
+
+        cache.insert(lexical_b.clone(), "lexical-b".into());
+        cache.insert(semantic.clone(), "semantic".into());
+        cache.insert(lexical_a.clone(), "lexical-a".into());
+        cache.quarantine(lexical_b, "normalizer panic replay");
+        cache.quarantine(semantic.clone(), "embedding checksum mismatch");
+        cache.quarantine(lexical_a, "invalid unicode boundary");
+
+        let preview = cache.preview_garbage_collect_quarantined_algorithm("lexical-normalize");
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].key, key(b"lex-a", "lexical-normalize", "v1"));
+        assert_eq!(preview[0].reason, "invalid unicode boundary");
+        assert_eq!(preview[1].key, key(b"lex-b", "lexical-normalize", "v1"));
+        assert_eq!(preview[1].reason, "normalizer panic replay");
+
+        let summary = cache.quarantine_summary();
+        assert_eq!(summary.quarantined_entries, 3);
+        assert_eq!(summary.algorithms.get("lexical-normalize"), Some(&2));
+        assert!(matches!(
+            cache.get(&semantic),
+            MemoLookup::Quarantined { .. }
+        ));
+        assert!(
+            cache
+                .preview_garbage_collect_quarantined_algorithm("unknown-algorithm")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn garbage_collect_quarantined_algorithm_returns_stable_audit_items() {
         let mut cache: ContentAddressedMemoCache<String> =
             ContentAddressedMemoCache::with_capacity(6);
@@ -584,7 +639,6 @@ mod tests {
         assert_eq!(removed[0].reason, "invalid unicode boundary");
         assert_eq!(removed[1].key, key(b"lex-b", "lexical-normalize", "v1"));
         assert_eq!(removed[1].reason, "normalizer panic replay");
-
         let summary = cache.quarantine_summary();
         assert_eq!(summary.quarantined_entries, 1);
         assert_eq!(summary.algorithms.get("semantic-embed"), Some(&1));
