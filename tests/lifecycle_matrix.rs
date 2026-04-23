@@ -1460,3 +1460,56 @@ fn index_readiness_exposes_stale_refresh_config() {
         "state.index.status={status:?} is outside the documented enum"
     );
 }
+
+#[test]
+fn diag_artifact_paths_nest_inside_data_dir_for_safe_gc() {
+    // ibuuh.19 retention-safety row: derivative asset retention /
+    // quarantine / garbage-collection can only operate safely if every
+    // cass-managed artifact path lives inside the declared data_dir.
+    // If an artifact escapes (e.g. db_path points somewhere outside
+    // data_dir because a flag default changed), GC would either miss
+    // the artifact (retention leak) or delete something outside its
+    // jurisdiction (data loss). This row pins the invariant that every
+    // diag-advertised artifact path nests under data_dir.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(out.status.success(), "cass diag --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let diag: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let data_dir = diag["paths"]["data_dir"]
+        .as_str()
+        .expect("paths.data_dir must be a string");
+    let db_path = diag["paths"]["db_path"]
+        .as_str()
+        .expect("paths.db_path must be a string");
+    let index_path = diag["paths"]["index_path"]
+        .as_str()
+        .expect("paths.index_path must be a string");
+
+    // Retention invariant: both derivative artifact paths must live
+    // inside the declared data_dir so GC can reason about them.
+    assert!(
+        db_path.starts_with(data_dir),
+        "db_path ({db_path}) escapes data_dir ({data_dir}) — GC jurisdiction leak"
+    );
+    assert!(
+        index_path.starts_with(data_dir),
+        "index_path ({index_path}) escapes data_dir ({data_dir}) — GC jurisdiction leak"
+    );
+
+    // And data_dir itself must live inside the isolated test HOME
+    // so the retention sandbox is honored.
+    let home = test_home.path().to_string_lossy().into_owned();
+    assert!(
+        data_dir.starts_with(&home),
+        "data_dir ({data_dir}) escapes test HOME ({home}) — XDG_DATA_HOME/HOME pin bypassed"
+    );
+}
