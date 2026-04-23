@@ -83,15 +83,26 @@ fn test_models_status_json_output() {
     let json: Value =
         serde_json::from_str(stdout.trim()).expect("models status --json should return valid JSON");
 
-    // Verify expected fields exist (model_id not model_name)
+    // Bead 7k7pl: pin TYPE + non-empty content on model_id/state, not
+    // just "field present". A regression that emitted `null` or a
+    // number would slip past `.is_some()` while breaking downstream
+    // consumers that expect string IDs.
+    let model_id = json
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("model_id must be a string. Got: {}", json));
     assert!(
-        json.get("model_id").is_some(),
-        "JSON should have model_id field. Got: {}",
+        !model_id.is_empty(),
+        "model_id must be a non-empty string. Got: {}",
         json
     );
+    let state = json
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("state must be a string. Got: {}", json));
     assert!(
-        json.get("state").is_some(),
-        "JSON should have state field. Got: {}",
+        !state.is_empty(),
+        "state must be a non-empty string. Got: {}",
         json
     );
 }
@@ -142,15 +153,25 @@ fn test_models_verify_json_output() {
     let json: Value =
         serde_json::from_str(stdout.trim()).expect("models verify --json should return valid JSON");
 
-    // Verify expected fields exist
+    // Bead 7k7pl: pin TYPE on model_dir/status — both must be
+    // non-empty strings, not just "present". A null or numeric
+    // regression would slip past `.is_some()`.
+    let model_dir = json
+        .get("model_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("model_dir must be a string. Got: {}", json));
     assert!(
-        json.get("model_dir").is_some(),
-        "JSON should have model_dir field. Got: {}",
+        !model_dir.is_empty(),
+        "model_dir must be a non-empty string path. Got: {}",
         json
     );
+    let status = json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("status must be a string. Got: {}", json));
     assert!(
-        json.get("status").is_some(),
-        "JSON should have status field. Got: {}",
+        !status.is_empty(),
+        "status must be a non-empty string. Got: {}",
         json
     );
 }
@@ -201,15 +222,18 @@ fn test_models_check_update_json_output() {
     let json: Value = serde_json::from_str(stdout.trim())
         .expect("models check-update --json should return valid JSON");
 
-    // Verify expected fields exist
+    // Bead 7k7pl: pin update_available as a boolean (not `null` or a
+    // string like "maybe"), and latest_revision as a string. CLI
+    // consumers branch on the bool; a type regression would slip past
+    // `.is_some()`.
     assert!(
-        json.get("update_available").is_some(),
-        "JSON should have update_available field. Got: {}",
+        json.get("update_available").and_then(|v| v.as_bool()).is_some(),
+        "update_available must be a boolean. Got: {}",
         json
     );
     assert!(
-        json.get("latest_revision").is_some(),
-        "JSON should have latest_revision field. Got: {}",
+        json.get("latest_revision").and_then(|v| v.as_str()).is_some(),
+        "latest_revision must be a string. Got: {}",
         json
     );
 }
@@ -623,13 +647,25 @@ fn test_robot_output_schema() {
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
 
-    // Verify top-level schema fields
-    assert!(json.get("hits").is_some(), "Should have hits field");
+    // Bead 7k7pl: pin TYPE on the robot-search response schema — hits
+    // must be an array, total_matches and limit must be integers. A
+    // regression that emitted null or swapped field types would slip
+    // past `.is_some()` while breaking every automated consumer.
     assert!(
-        json.get("total_matches").is_some(),
-        "Should have total_matches field"
+        json.get("hits").and_then(|v| v.as_array()).is_some(),
+        "hits must be an array. Got: {}",
+        json
     );
-    assert!(json.get("limit").is_some(), "Should have limit field");
+    assert!(
+        json.get("total_matches").and_then(|v| v.as_u64()).is_some(),
+        "total_matches must be a non-negative integer. Got: {}",
+        json
+    );
+    assert!(
+        json.get("limit").and_then(|v| v.as_u64()).is_some(),
+        "limit must be a non-negative integer. Got: {}",
+        json
+    );
 
     // Verify hit schema
     let hits = json
@@ -638,19 +674,30 @@ fn test_robot_output_schema() {
         .expect("hits array");
     if !hits.is_empty() {
         let hit = &hits[0];
-        // Required fields in each hit
+        // Bead 7k7pl: pin TYPE on every required hit field — all four
+        // must be strings, not just "present". A null / numeric
+        // regression in any field breaks JSON consumers that call
+        // `.as_str().unwrap()` downstream and would slip past
+        // `.is_some()`.
         assert!(
-            hit.get("content").is_some(),
-            "Hit should have content field"
+            hit.get("content").and_then(|v| v.as_str()).is_some(),
+            "hit.content must be a string. Got: {}",
+            hit
         );
-        assert!(hit.get("agent").is_some(), "Hit should have agent field");
         assert!(
-            hit.get("source_path").is_some(),
-            "Hit should have source_path field"
+            hit.get("agent").and_then(|v| v.as_str()).is_some(),
+            "hit.agent must be a string. Got: {}",
+            hit
         );
         assert!(
-            hit.get("match_type").is_some(),
-            "Hit should have match_type field"
+            hit.get("source_path").and_then(|v| v.as_str()).is_some(),
+            "hit.source_path must be a string. Got: {}",
+            hit
+        );
+        assert!(
+            hit.get("match_type").and_then(|v| v.as_str()).is_some(),
+            "hit.match_type must be a string. Got: {}",
+            hit
         );
     }
 }
