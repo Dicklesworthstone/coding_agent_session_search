@@ -7,7 +7,33 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
-> **Releases vs. tags**: Only [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0), [v0.2.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.1), [v0.2.2](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.2), [v0.2.3](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.3), [v0.2.4](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.4), [v0.2.5](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.5), [v0.2.6](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.6), [v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7), and [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+> **Releases vs. tags**: [v0.1.64](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.1.64), [v0.2.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.0)–[v0.2.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.2.7), [v0.3.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.0), and [v0.3.7](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.3.7) have published GitHub Releases with downloadable binaries. All other version numbers below are git tags only (no release artifacts).
+
+---
+
+## [v0.3.7] -- 2026-04-23
+
+**Indexer stall observability + zero-writer deadlock fix.**
+
+Cuts a release from current `main` so reporters hitting the [#196](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/196) "phase:indexing, current:0/N indefinitely" shape get the new forensic machinery and a credible root-cause candidate.
+
+### Added
+
+- **Stall-detection watchdog for `cass index --json`.** Emits a one-shot `stall_detected` NDJSON event when no forward progress has been observed for `CASS_INDEX_STALL_DETECT_SECS` (default 120s; `0` disables). The event carries an on-disk snapshot — lexical rebuild checkpoint (parsed when ≤64 KiB), Tantivy segment count/bytes, and the index-run lock file — plus a hint with strace/gdb/`/proc/<pid>/stack` snippets so operators hitting the hang can attach a live stack to the issue. Latched once per phase, reset on phase transitions, never cancels the run ([`ae411287`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ae411287)).
+
+### Fixed
+
+- **Zero-writer connection-manager deadlock.** `FrankenConnectionManager::new` now clamps `max_writers < 1` up to 1 and pre-fills the bounded writer-token channel accordingly. Previously, opening a connection manager with `max_writers: 0` left the writer-token channel empty, so the first writer acquisition blocked forever against an empty semaphore. Candidate root cause for [#196](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/196) ([`fd3196fb`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fd3196fb)).
+- **Indexer lexical manifest**: crash-safe rebuild manifest publish + propagate persistence failures instead of swallowing them ([`6decefa8`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/6decefa8)); sharded rebuild also persists the equivalence ledger and generation manifest ([`75262206`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/75262206)).
+- **Semantic backfill**: warn on NULL `created_at` during semantic backfill instead of silent drift ([`ff156d29`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ff156d29)).
+- **Search pre-cache**: propagate pre-cache reload failures instead of silently continuing ([`7ec6163f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/7ec6163f)).
+- **CLI robot output**: `--aggregate` rejects unknown fields as a usage error instead of silently dropping them ([`d3e8dc31`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d3e8dc31)); `--dry-run` robot output stays reproducible ([`e068eb83`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e068eb83)).
+
+### Testing
+
+- New proptest coverage for indexer memoization serde round-trips and quarantine summaries ([`a5522d71`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/a5522d71)).
+- Pinned WAL-compaction ordering for small-final resume publish ([`dc0dd881`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/dc0dd881)).
+- Connector and query parser fuzz harnesses added ([`d698f59a`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d698f59a)).
 
 ---
 

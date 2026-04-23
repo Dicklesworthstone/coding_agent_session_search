@@ -934,7 +934,7 @@ checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
 name = "coding-agent-search"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -978,7 +978,7 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "itoa",
  "lru 0.16.4",
  "memmap2",
@@ -1008,7 +1008,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serial_test",
- "sha2 0.11.0",
+ "sha2 0.10.9",
  "shell-words",
  "smallvec",
  "ssh2",
