@@ -277,7 +277,7 @@ pub(crate) struct LexicalGenerationRecoveryDecision {
 }
 
 /// Dry-run cleanup classification for one lexical artifact or generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LexicalCleanupDisposition {
     /// The artifact is part of the currently published search surface.
@@ -320,6 +320,89 @@ pub(crate) struct LexicalGenerationCleanupInventory {
     pub reclaimable_bytes: u64,
     pub retained_bytes: u64,
     pub shards: Vec<LexicalShardCleanupInventory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupDryRunPlan {
+    pub dry_run: bool,
+    pub generation_count: usize,
+    pub total_artifact_bytes: u64,
+    pub total_reclaimable_bytes: u64,
+    pub total_retained_bytes: u64,
+    pub reclaimable_generation_ids: Vec<String>,
+    pub fully_retained_generation_ids: Vec<String>,
+    pub quarantined_generation_ids: Vec<String>,
+    pub active_generation_ids: Vec<String>,
+    pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
+    pub inventories: Vec<LexicalGenerationCleanupInventory>,
+}
+
+impl LexicalCleanupDryRunPlan {
+    pub(crate) fn from_manifests<'a>(
+        manifests: impl IntoIterator<Item = &'a LexicalGenerationManifest>,
+    ) -> Self {
+        let mut plan = Self {
+            dry_run: true,
+            generation_count: 0,
+            total_artifact_bytes: 0,
+            total_reclaimable_bytes: 0,
+            total_retained_bytes: 0,
+            reclaimable_generation_ids: Vec::new(),
+            fully_retained_generation_ids: Vec::new(),
+            quarantined_generation_ids: Vec::new(),
+            active_generation_ids: Vec::new(),
+            disposition_counts: BTreeMap::new(),
+            inventories: Vec::new(),
+        };
+
+        for manifest in manifests {
+            plan.record_inventory(manifest.cleanup_inventory());
+        }
+
+        plan
+    }
+
+    pub(crate) fn has_reclaimable_artifacts(&self) -> bool {
+        self.total_reclaimable_bytes > 0
+    }
+
+    fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
+        self.generation_count += 1;
+        self.total_artifact_bytes = self
+            .total_artifact_bytes
+            .saturating_add(inventory.artifact_bytes);
+        self.total_reclaimable_bytes = self
+            .total_reclaimable_bytes
+            .saturating_add(inventory.reclaimable_bytes);
+        self.total_retained_bytes = self
+            .total_retained_bytes
+            .saturating_add(inventory.retained_bytes);
+        *self
+            .disposition_counts
+            .entry(inventory.disposition)
+            .or_insert(0) += 1;
+
+        if inventory.reclaimable_bytes > 0 {
+            self.reclaimable_generation_ids
+                .push(inventory.generation_id.clone());
+        } else {
+            self.fully_retained_generation_ids
+                .push(inventory.generation_id.clone());
+        }
+        if matches!(
+            inventory.disposition,
+            LexicalCleanupDisposition::QuarantinedRetained
+        ) {
+            self.quarantined_generation_ids
+                .push(inventory.generation_id.clone());
+        }
+        if matches!(inventory.disposition, LexicalCleanupDisposition::ActiveWork) {
+            self.active_generation_ids
+                .push(inventory.generation_id.clone());
+        }
+
+        self.inventories.push(inventory);
+    }
 }
 
 /// Single entry in a generation's append-only failure log.
@@ -1620,6 +1703,89 @@ mod tests {
         assert_eq!(inventory.reclaimable_bytes, 0);
         assert_eq!(inventory.retained_bytes, 3072);
         assert!(inventory.reason.contains("active"));
+    }
+
+    #[test]
+    fn cleanup_dry_run_plan_summarizes_reclaim_retain_and_quarantine_buckets() {
+        let mut current =
+            LexicalGenerationManifest::new_scratch("gen-current", "attempt-1", "fp", 1);
+        let mut current_shard =
+            test_shard("shard-live", 0, LexicalShardLifecycleState::Published, 4096);
+        current_shard.pinned = true;
+        current_shard.reclaimable = false;
+        current.set_shards(vec![current_shard], 2);
+        current.transition_build(LexicalGenerationBuildState::Validated, 3);
+        current.transition_publish(LexicalGenerationPublishState::Published, 4);
+
+        let mut superseded =
+            LexicalGenerationManifest::new_scratch("gen-old", "attempt-2", "fp", 10);
+        let mut reclaimable = test_shard(
+            "shard-old-a",
+            0,
+            LexicalShardLifecycleState::Published,
+            8192,
+        );
+        reclaimable.pinned = false;
+        reclaimable.reclaimable = true;
+        let mut retained = test_shard(
+            "shard-old-b",
+            1,
+            LexicalShardLifecycleState::Published,
+            1024,
+        );
+        retained.pinned = true;
+        retained.reclaimable = false;
+        superseded.set_shards(vec![reclaimable, retained], 11);
+        superseded.transition_build(LexicalGenerationBuildState::Validated, 12);
+        superseded.transition_publish(LexicalGenerationPublishState::Superseded, 13);
+
+        let mut quarantined =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-3", "fp", 20);
+        let quarantined_shard = test_shard(
+            "shard-bad",
+            0,
+            LexicalShardLifecycleState::Quarantined,
+            2048,
+        );
+        quarantined.set_shards(vec![quarantined_shard], 21);
+        assert!(quarantined.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            22,
+            Some("checksum mismatch".into()),
+        ));
+        quarantined.transition_publish(LexicalGenerationPublishState::Quarantined, 23);
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([&current, &superseded, &quarantined]);
+
+        assert!(plan.dry_run);
+        assert!(plan.has_reclaimable_artifacts());
+        assert_eq!(plan.generation_count, 3);
+        assert_eq!(plan.total_artifact_bytes, 15_360);
+        assert_eq!(plan.total_reclaimable_bytes, 8192);
+        assert_eq!(plan.total_retained_bytes, 7168);
+        assert_eq!(plan.reclaimable_generation_ids, vec!["gen-old"]);
+        assert_eq!(
+            plan.fully_retained_generation_ids,
+            vec!["gen-current", "gen-quarantined"]
+        );
+        assert_eq!(plan.quarantined_generation_ids, vec!["gen-quarantined"]);
+        assert_eq!(
+            plan.disposition_counts
+                .get(&LexicalCleanupDisposition::CurrentPublished),
+            Some(&1)
+        );
+        assert_eq!(
+            plan.disposition_counts
+                .get(&LexicalCleanupDisposition::SupersededReclaimable),
+            Some(&1)
+        );
+        assert_eq!(
+            plan.disposition_counts
+                .get(&LexicalCleanupDisposition::QuarantinedRetained),
+            Some(&1)
+        );
+        assert_eq!(plan.inventories.len(), 3);
     }
 
     fn test_shard_plan(
