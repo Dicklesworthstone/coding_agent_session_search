@@ -268,24 +268,18 @@ fn api_version_json_matches_golden() {
 }
 
 #[test]
-#[ignore = "cass introspect --json emits non-deterministic schema registry \
-            (HashMap iteration order + per-run subset drift — the golden file \
-            captures one run but consecutive invocations emit different shapes). \
-            Re-enable once introspect output is made stable upstream."]
 fn introspect_json_matches_golden() {
     // `cass introspect --json` is the full API schema surface — every
     // subcommand, its flags, positional args, and response-schema
-    // references. Once the output is stable this test will gate silent
-    // drift of the schema contract that agents rely on for typed-client
-    // generation.
+    // references. Agents that bind to cass programmatically use this
+    // to generate typed clients; silent drift breaks every downstream
+    // client.
     //
-    // TODAY (2026-04-22): UPDATE_GOLDENS=1 produces a golden that a
-    // second run does not match. The `response_schemas` block in
-    // particular drops entries (e.g. "diag" appears in one run, absent
-    // in the next) — consistent with HashMap iteration and per-run
-    // lazy-init of the schema registry. Left ignored with a captured
-    // reference golden so when the upstream non-determinism is fixed,
-    // dropping the `#[ignore]` immediately gives a live regression gate.
+    // Was #[ignore]'d when first captured (HashMap-based schema registry
+    // emitted non-deterministic key order — filed as bead
+    // coding_agent_session_search-8sl73). The underlying HashMap was
+    // swapped for BTreeMap in the same commit that re-enabled this test;
+    // byte-identical output is now verified across independent runs.
     let test_home = tempfile::tempdir().expect("create temp home");
     let scrubbed = capture_robot_json(
         test_home.path(),

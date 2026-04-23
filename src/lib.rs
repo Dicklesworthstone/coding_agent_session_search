@@ -13972,8 +13972,14 @@ pub struct IntrospectResponse {
     pub global_flags: Vec<ArgumentSchema>,
     /// All available commands with arguments
     pub commands: Vec<CommandSchema>,
-    /// Response schemas for JSON outputs
-    pub response_schemas: std::collections::HashMap<String, serde_json::Value>,
+    /// Response schemas for JSON outputs.
+    ///
+    /// Uses `BTreeMap` so the serialized JSON key order is deterministic
+    /// (alphabetical) across runs — agents that bind to cass programmatically
+    /// rely on stable `introspect --json` output for typed-client generation,
+    /// and golden-file regression tests require byte-stable output (bead
+    /// coding_agent_session_search-8sl73).
+    pub response_schemas: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Schema for a single CLI command
@@ -14732,10 +14738,14 @@ fn should_skip_arg(arg: &Arg) -> bool {
     arg.is_hide_set() || matches!(arg.get_id().as_str(), "help" | "version")
 }
 
-/// Build response schemas for commands that support JSON output
-fn build_response_schemas() -> std::collections::HashMap<String, serde_json::Value> {
+/// Build response schemas for commands that support JSON output.
+///
+/// Returns a `BTreeMap` so the serialized JSON object has deterministic
+/// key order (alphabetical) — see `IntrospectResponse::response_schemas`
+/// and bead coding_agent_session_search-8sl73 for why this matters.
+fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Value> {
     use serde_json::json;
-    let mut schemas = std::collections::HashMap::new();
+    let mut schemas = std::collections::BTreeMap::new();
 
     schemas.insert(
         "search".to_string(),
