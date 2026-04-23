@@ -394,11 +394,15 @@ pub enum Commands {
         /// Filter to last 7 days
         #[arg(long)]
         week: bool,
-        /// Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
-        #[arg(long)]
+        /// Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS),
+        /// keyword (`today`, `yesterday`, `now`), or relative offset
+        /// (`-7d`, `-24h`, `-30m`, `-1w`). `allow_hyphen_values` lets the
+        /// dash-prefixed forms pass clap without requiring the equals syntax
+        /// (reality-check bead hr0z4).
+        #[arg(long, allow_hyphen_values = true)]
         since: Option<String>,
-        /// Filter to entries until ISO date
-        #[arg(long)]
+        /// Filter to entries until ISO date / keyword / relative offset.
+        #[arg(long, allow_hyphen_values = true)]
         until: Option<String>,
         /// Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type`
         /// Returns buckets with counts instead of full results. Use with --limit to get both.
@@ -809,11 +813,13 @@ pub enum Commands {
     },
     /// Show activity timeline for a time range
     Timeline {
-        /// Start time (ISO date, 'today', 'yesterday', 'Nd' for N days ago)
-        #[arg(long)]
+        /// Start time (ISO date, 'today', 'yesterday', 'Nd' for N days ago,
+        /// or relative `-7d`/`-24h`/`-30m`/`-1w`). `allow_hyphen_values` lets
+        /// dash-prefixed offsets pass clap (reality-check bead hr0z4).
+        #[arg(long, allow_hyphen_values = true)]
         since: Option<String>,
-        /// End time (ISO date or relative)
-        #[arg(long)]
+        /// End time (ISO date, keyword, or relative offset).
+        #[arg(long, allow_hyphen_values = true)]
         until: Option<String>,
         /// Show today only
         #[arg(long)]
@@ -854,12 +860,14 @@ pub enum Commands {
         #[arg(long, value_delimiter = ',')]
         workspaces: Option<Vec<String>>,
 
-        /// Filter entries since ISO date or relative time
-        #[arg(long)]
+        /// Filter entries since ISO date, keyword, or relative offset
+        /// (`-7d`, `-1w`, etc.). `allow_hyphen_values` lets dash-prefixed
+        /// values pass clap (reality-check bead hr0z4).
+        #[arg(long, allow_hyphen_values = true)]
         since: Option<String>,
 
-        /// Filter entries until ISO date or relative time
-        #[arg(long)]
+        /// Filter entries until ISO date, keyword, or relative offset.
+        #[arg(long, allow_hyphen_values = true)]
         until: Option<String>,
 
         /// Path mode: relative (default), basename, full, hash
@@ -1428,12 +1436,15 @@ pub enum AnalyticsCommand {
 #[derive(Debug, Clone, clap::Args)]
 pub struct AnalyticsCommon {
     // ---- Time range ----
-    /// Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
-    #[arg(long)]
+    /// Filter to entries since ISO date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS),
+    /// keyword (`today`/`yesterday`/`now`), or relative offset
+    /// (`-7d`/`-24h`/`-30m`/`-1w`). `allow_hyphen_values` lets dash-prefixed
+    /// values pass clap (reality-check bead hr0z4).
+    #[arg(long, allow_hyphen_values = true)]
     pub since: Option<String>,
 
-    /// Filter to entries until ISO date
-    #[arg(long)]
+    /// Filter to entries until ISO date, keyword, or relative offset.
+    #[arg(long, allow_hyphen_values = true)]
     pub until: Option<String>,
 
     /// Filter to last N days
@@ -15069,6 +15080,234 @@ fn response_schema_index_freshness() -> serde_json::Value {
     })
 }
 
+fn response_schema_object(
+    properties: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in properties {
+        map.insert(key.to_string(), value);
+    }
+    serde_json::Value::Object(
+        [
+            ("type".to_string(), serde_json::json!("object")),
+            ("properties".to_string(), serde_json::Value::Object(map)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn response_schema_search_hit() -> serde_json::Value {
+    response_schema_object([
+        ("source_path", serde_json::json!({ "type": "string" })),
+        (
+            "line_number",
+            serde_json::json!({ "type": ["integer", "null"] }),
+        ),
+        ("agent", serde_json::json!({ "type": "string" })),
+        (
+            "workspace",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "workspace_original",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "description": "Original workspace path before remote path mapping"
+            }),
+        ),
+        ("title", serde_json::json!({ "type": ["string", "null"] })),
+        ("content", serde_json::json!({ "type": ["string", "null"] })),
+        ("snippet", serde_json::json!({ "type": ["string", "null"] })),
+        ("score", serde_json::json!({ "type": ["number", "null"] })),
+        (
+            "created_at",
+            serde_json::json!({ "type": ["integer", "string", "null"] }),
+        ),
+        (
+            "match_type",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "source_id",
+            serde_json::json!({
+                "type": "string",
+                "description": "Source identifier (e.g., 'local', 'work-laptop')"
+            }),
+        ),
+        (
+            "origin_kind",
+            serde_json::json!({
+                "type": "string",
+                "description": "Origin kind ('local' or 'ssh')"
+            }),
+        ),
+        (
+            "origin_host",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "description": "Host label for remote sources"
+            }),
+        ),
+    ])
+}
+
+fn response_schema_search_cache_stats() -> serde_json::Value {
+    response_schema_object([
+        ("hits", serde_json::json!({ "type": "integer" })),
+        ("misses", serde_json::json!({ "type": "integer" })),
+        ("shortfall", serde_json::json!({ "type": "integer" })),
+    ])
+}
+
+fn response_schema_search_timing() -> serde_json::Value {
+    response_schema_object([
+        ("search_ms", serde_json::json!({ "type": "integer" })),
+        ("rerank_ms", serde_json::json!({ "type": "integer" })),
+        ("other_ms", serde_json::json!({ "type": "integer" })),
+    ])
+}
+
+fn response_schema_search_meta() -> serde_json::Value {
+    response_schema_object([
+        ("elapsed_ms", serde_json::json!({ "type": "integer" })),
+        (
+            "search_mode",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "requested_search_mode",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "mode_defaulted",
+            serde_json::json!({ "type": ["boolean", "null"] }),
+        ),
+        (
+            "fallback_tier",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "fallback_reason",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "semantic_refinement",
+            serde_json::json!({ "type": ["boolean", "null"] }),
+        ),
+        (
+            "wildcard_fallback",
+            serde_json::json!({ "type": "boolean" }),
+        ),
+        ("cache_stats", response_schema_search_cache_stats()),
+        ("timing", response_schema_search_timing()),
+        (
+            "tokens_estimated",
+            serde_json::json!({ "type": ["integer", "null"] }),
+        ),
+        (
+            "max_tokens",
+            serde_json::json!({ "type": ["integer", "null"] }),
+        ),
+        (
+            "request_id",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        (
+            "next_cursor",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        ("hits_clamped", serde_json::json!({ "type": "boolean" })),
+        ("state", response_schema_state_meta()),
+        ("index_freshness", response_schema_index_freshness()),
+        (
+            "timeout_ms",
+            serde_json::json!({ "type": ["integer", "null"] }),
+        ),
+        (
+            "timed_out",
+            serde_json::json!({ "type": ["boolean", "null"] }),
+        ),
+        (
+            "partial_results",
+            serde_json::json!({ "type": ["boolean", "null"] }),
+        ),
+        (
+            "ann_stats",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": true
+            }),
+        ),
+    ])
+}
+
+fn response_schema_search() -> serde_json::Value {
+    response_schema_object([
+        ("query", serde_json::json!({ "type": "string" })),
+        ("limit", serde_json::json!({ "type": "integer" })),
+        ("offset", serde_json::json!({ "type": "integer" })),
+        ("count", serde_json::json!({ "type": "integer" })),
+        ("total_matches", serde_json::json!({ "type": "integer" })),
+        (
+            "max_tokens",
+            serde_json::json!({ "type": ["integer", "null"] }),
+        ),
+        (
+            "request_id",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        ("cursor", serde_json::json!({ "type": ["string", "null"] })),
+        ("hits_clamped", serde_json::json!({ "type": "boolean" })),
+        (
+            "hits",
+            serde_json::json!({
+                "type": "array",
+                "items": response_schema_search_hit()
+            }),
+        ),
+        (
+            "aggregations",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": {
+                    "type": "array",
+                    "items": response_schema_object([
+                        ("key", serde_json::json!({ "type": "string" })),
+                        ("count", serde_json::json!({ "type": "integer" })),
+                    ])
+                }
+            }),
+        ),
+        (
+            "_warning",
+            serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        ("_meta", response_schema_search_meta()),
+        (
+            "suggestions",
+            serde_json::json!({
+                "type": "array",
+                "items": { "type": "string" }
+            }),
+        ),
+        (
+            "explanation",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": true
+            }),
+        ),
+        (
+            "_timeout",
+            serde_json::json!({
+                "type": ["object", "null"],
+                "additionalProperties": true
+            }),
+        ),
+    ])
+}
+
 /// Build response schemas for commands that support JSON output.
 ///
 /// Returns a `BTreeMap` so the serialized JSON object has deterministic
@@ -15078,114 +15317,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     use serde_json::json;
     let mut schemas = std::collections::BTreeMap::new();
 
-    schemas.insert(
-        "search".to_string(),
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string" },
-                "limit": { "type": "integer" },
-                "offset": { "type": "integer" },
-                "count": { "type": "integer" },
-                "total_matches": { "type": "integer" },
-                "max_tokens": { "type": ["integer", "null"] },
-                "request_id": { "type": ["string", "null"] },
-                "cursor": { "type": ["string", "null"] },
-                "hits_clamped": { "type": "boolean" },
-                "hits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "source_path": { "type": "string" },
-                            "line_number": { "type": ["integer", "null"] },
-                            "agent": { "type": "string" },
-                            "workspace": { "type": ["string", "null"] },
-                            "workspace_original": { "type": ["string", "null"], "description": "Original workspace path before remote path mapping" },
-                            "title": { "type": ["string", "null"] },
-                            "content": { "type": ["string", "null"] },
-                            "snippet": { "type": ["string", "null"] },
-                            "score": { "type": ["number", "null"] },
-                            "created_at": { "type": ["integer", "string", "null"] },
-                            "match_type": { "type": ["string", "null"] },
-                            "source_id": { "type": "string", "description": "Source identifier (e.g., 'local', 'work-laptop')" },
-                            "origin_kind": { "type": "string", "description": "Origin kind ('local' or 'ssh')" },
-                            "origin_host": { "type": ["string", "null"], "description": "Host label for remote sources" }
-                        }
-                    }
-                },
-                "aggregations": {
-                    "type": ["object", "null"],
-                    "additionalProperties": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "key": { "type": "string" },
-                                "count": { "type": "integer" }
-                            }
-                        }
-                    }
-                },
-                "_warning": { "type": ["string", "null"] },
-                "_meta": {
-                    "type": "object",
-                    "properties": {
-                        "elapsed_ms": { "type": "integer" },
-                        "search_mode": { "type": ["string", "null"] },
-                        "requested_search_mode": { "type": ["string", "null"] },
-                        "mode_defaulted": { "type": ["boolean", "null"] },
-                        "fallback_tier": { "type": ["string", "null"] },
-                        "fallback_reason": { "type": ["string", "null"] },
-                        "semantic_refinement": { "type": ["boolean", "null"] },
-                        "wildcard_fallback": { "type": "boolean" },
-                        "cache_stats": {
-                            "type": "object",
-                            "properties": {
-                                "hits": { "type": "integer" },
-                                "misses": { "type": "integer" },
-                                "shortfall": { "type": "integer" }
-                            }
-                        },
-                        "timing": {
-                            "type": "object",
-                            "properties": {
-                                "search_ms": { "type": "integer" },
-                                "rerank_ms": { "type": "integer" },
-                                "other_ms": { "type": "integer" }
-                            }
-                        },
-                        "tokens_estimated": { "type": ["integer", "null"] },
-                        "max_tokens": { "type": ["integer", "null"] },
-                        "request_id": { "type": ["string", "null"] },
-                        "next_cursor": { "type": ["string", "null"] },
-                        "hits_clamped": { "type": "boolean" },
-                        "state": response_schema_state_meta(),
-                        "index_freshness": response_schema_index_freshness(),
-                        "timeout_ms": { "type": ["integer", "null"] },
-                        "timed_out": { "type": ["boolean", "null"] },
-                        "partial_results": { "type": ["boolean", "null"] },
-                        "ann_stats": {
-                            "type": ["object", "null"],
-                            "additionalProperties": true
-                        }
-                    }
-                },
-                "suggestions": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                },
-                "explanation": {
-                    "type": ["object", "null"],
-                    "additionalProperties": true
-                },
-                "_timeout": {
-                    "type": ["object", "null"],
-                    "additionalProperties": true
-                }
-            }
-        }),
-    );
+    schemas.insert("search".to_string(), response_schema_search());
 
     schemas.insert(
         "status".to_string(),
