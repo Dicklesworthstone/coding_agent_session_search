@@ -1017,3 +1017,63 @@ fn semantic_readiness_reports_lexical_fallback_when_models_absent() {
         "semantic.hint must be a non-empty user-facing guidance string"
     );
 }
+
+#[test]
+fn diag_reports_zero_sizes_for_absent_db_and_index() {
+    // ibuuh.19 retention-invariant row: when `cass diag --json` reports
+    // database/index as absent on a fresh isolated HOME, their
+    // size_bytes MUST be 0. A retention/quarantine bug where cached
+    // size from a prior run leaks into a fresh HOME would manifest
+    // here; this test pins the expected "clean slate = zero bytes"
+    // invariant so regressions fail CI instead of silently
+    // misreporting disk usage to operators.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(out.status.success(), "cass diag --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let diag: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let db_exists = diag["database"]["exists"]
+        .as_bool()
+        .expect("database.exists is bool");
+    let db_size = diag["database"]["size_bytes"]
+        .as_u64()
+        .expect("database.size_bytes is unsigned int");
+    let index_exists = diag["index"]["exists"]
+        .as_bool()
+        .expect("index.exists is bool");
+    let index_size = diag["index"]["size_bytes"]
+        .as_u64()
+        .expect("index.size_bytes is unsigned int");
+
+    // Fresh isolated HOME: neither artifact should exist.
+    assert!(!db_exists, "fresh HOME: database.exists must be false");
+    assert!(!index_exists, "fresh HOME: index.exists must be false");
+
+    // And the retention invariant: absent => zero bytes reported.
+    assert_eq!(
+        db_size, 0,
+        "database.exists=false but database.size_bytes={db_size} — retention/cache leak"
+    );
+    assert_eq!(
+        index_size, 0,
+        "index.exists=false but index.size_bytes={index_size} — retention/cache leak"
+    );
+
+    // Bonus: database.conversations / database.messages must also read
+    // as 0 (or null-absent), not inherit stale counts from elsewhere.
+    let conversations = diag["database"]["conversations"].as_u64().unwrap_or(0);
+    let messages = diag["database"]["messages"].as_u64().unwrap_or(0);
+    assert_eq!(
+        conversations, 0,
+        "database absent but conversations={conversations}"
+    );
+    assert_eq!(messages, 0, "database absent but messages={messages}");
+}
