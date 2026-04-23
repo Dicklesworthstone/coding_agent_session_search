@@ -2,6 +2,10 @@ use anyhow::{Context, Result, bail};
 use frankensqlite::Connection;
 use frankensqlite::compat::OpenFlags;
 use std::fs::Metadata;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+#[cfg(not(windows))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub mod analytics;
