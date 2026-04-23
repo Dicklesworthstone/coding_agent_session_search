@@ -349,6 +349,9 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub reclaim_candidates: Vec<LexicalCleanupReclaimCandidate>,
     pub reclaimable_generation_ids: Vec<String>,
     pub fully_retained_generation_ids: Vec<String>,
+    #[serde(default)]
+    pub protected_generation_ids: Vec<String>,
+    pub protected_retained_bytes: u64,
     pub quarantined_generation_ids: Vec<String>,
     pub active_generation_ids: Vec<String>,
     pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
@@ -437,6 +440,8 @@ impl LexicalCleanupDryRunPlan {
             reclaim_candidates: Vec::new(),
             reclaimable_generation_ids: Vec::new(),
             fully_retained_generation_ids: Vec::new(),
+            protected_generation_ids: Vec::new(),
+            protected_retained_bytes: 0,
             quarantined_generation_ids: Vec::new(),
             active_generation_ids: Vec::new(),
             disposition_counts: BTreeMap::new(),
@@ -583,6 +588,9 @@ impl LexicalCleanupDryRunPlan {
             self.active_generation_ids
                 .push(inventory.generation_id.clone());
         }
+        let mut has_protected_retention =
+            Self::is_protected_retention(inventory.disposition) && inventory.retained_bytes > 0;
+        let mut protected_retained_bytes_from_shards = 0u64;
         let inventory_requires_inspection = Self::requires_inspection(inventory.disposition);
         let mut shard_inspection_items = 0usize;
         for shard in &inventory.shards {
@@ -596,6 +604,11 @@ impl LexicalCleanupDryRunPlan {
                 .reclaimable_bytes
                 .saturating_add(shard.reclaimable_bytes);
             summary.retained_bytes = summary.retained_bytes.saturating_add(shard.retained_bytes);
+            if Self::is_protected_retention(shard.disposition) && shard.retained_bytes > 0 {
+                has_protected_retention = true;
+                protected_retained_bytes_from_shards =
+                    protected_retained_bytes_from_shards.saturating_add(shard.retained_bytes);
+            }
 
             if Self::requires_inspection(shard.disposition) {
                 shard_inspection_items = shard_inspection_items.saturating_add(1);
@@ -631,6 +644,24 @@ impl LexicalCleanupDryRunPlan {
             });
         }
 
+        if has_protected_retention {
+            if !self
+                .protected_generation_ids
+                .contains(&inventory.generation_id)
+            {
+                self.protected_generation_ids
+                    .push(inventory.generation_id.clone());
+            }
+            let protected_retained_bytes = if protected_retained_bytes_from_shards > 0 {
+                protected_retained_bytes_from_shards
+            } else {
+                inventory.retained_bytes
+            };
+            self.protected_retained_bytes = self
+                .protected_retained_bytes
+                .saturating_add(protected_retained_bytes);
+        }
+
         self.inventories.push(inventory);
     }
 
@@ -642,6 +673,18 @@ impl LexicalCleanupDryRunPlan {
         )
     }
 
+    fn is_protected_retention(disposition: LexicalCleanupDisposition) -> bool {
+        matches!(
+            disposition,
+            LexicalCleanupDisposition::CurrentPublished
+                | LexicalCleanupDisposition::ActiveWork
+                | LexicalCleanupDisposition::QuarantinedRetained
+                | LexicalCleanupDisposition::SupersededRetained
+                | LexicalCleanupDisposition::FailedRetained
+                | LexicalCleanupDisposition::PinnedRetained
+        )
+    }
+
     fn compute_approval_fingerprint(&self) -> String {
         let mut hasher = blake3::Hasher::new();
         hash_str(&mut hasher, "cass.lexical_cleanup_approval.v1");
@@ -649,6 +692,7 @@ impl LexicalCleanupDryRunPlan {
         hash_u64(&mut hasher, self.total_artifact_bytes);
         hash_u64(&mut hasher, self.total_reclaimable_bytes);
         hash_u64(&mut hasher, self.total_retained_bytes);
+        hash_u64(&mut hasher, self.protected_retained_bytes);
 
         for candidate in &self.reclaim_candidates {
             hash_str(&mut hasher, &candidate.generation_id);
@@ -667,6 +711,9 @@ impl LexicalCleanupDryRunPlan {
         }
 
         for generation_id in &self.active_generation_ids {
+            hash_str(&mut hasher, generation_id);
+        }
+        for generation_id in &self.protected_generation_ids {
             hash_str(&mut hasher, generation_id);
         }
         for (disposition, count) in &self.disposition_counts {
@@ -2052,10 +2099,15 @@ mod tests {
         assert_eq!(plan.total_artifact_bytes, 15_360);
         assert_eq!(plan.total_reclaimable_bytes, 8192);
         assert_eq!(plan.total_retained_bytes, 7168);
+        assert_eq!(plan.protected_retained_bytes, 7168);
         assert_eq!(plan.reclaimable_generation_ids, vec!["gen-old"]);
         assert_eq!(
             plan.fully_retained_generation_ids,
             vec!["gen-current", "gen-quarantined"]
+        );
+        assert_eq!(
+            plan.protected_generation_ids,
+            vec!["gen-current", "gen-old", "gen-quarantined"]
         );
         assert_eq!(plan.quarantined_generation_ids, vec!["gen-quarantined"]);
         assert_eq!(
@@ -2133,6 +2185,10 @@ mod tests {
         assert_eq!(pinned_summary.retained_bytes, 1024);
 
         let json = serde_json::to_value(&plan).expect("serialize cleanup dry-run plan");
+        assert_eq!(json["protected_retained_bytes"], 7168);
+        assert_eq!(json["protected_generation_ids"][0], "gen-current");
+        assert_eq!(json["protected_generation_ids"][1], "gen-old");
+        assert_eq!(json["protected_generation_ids"][2], "gen-quarantined");
         assert_eq!(
             json["generation_disposition_summaries"]["current_published"]["retained_bytes"],
             4096
@@ -2267,8 +2323,14 @@ mod tests {
         );
         assert_eq!(plan.total_reclaimable_bytes, 9216);
         assert_eq!(plan.total_retained_bytes, 6656);
+        assert_eq!(plan.protected_retained_bytes, 6656);
+        assert_eq!(
+            plan.protected_generation_ids,
+            vec!["gen-current", "gen-old", "gen-quarantined"]
+        );
 
         let json = serde_json::to_value(&plan).expect("serialize cleanup dry-run plan");
+        assert_eq!(json["protected_retained_bytes"], 6656);
         assert_eq!(json["reclaim_candidates"][0]["generation_id"], "gen-old");
         assert_eq!(json["reclaim_candidates"][0]["shard_id"], "shard-old-a");
         assert_eq!(
