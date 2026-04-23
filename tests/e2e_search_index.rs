@@ -2468,7 +2468,24 @@ fn force_rebuild_recreates_index() {
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     let hits = json.get("hits").and_then(|h| h.as_array()).expect("hits");
-    assert!(!hits.is_empty(), "Content should still be searchable");
+    // Bead 7k7pl: pin EXACT content — at least one hit must carry
+    // the seeded token `rebuild_test_initial` in its content field.
+    // A regression that returned unrelated hits after force-rebuild
+    // would slip past `!is_empty()` while breaking searchability.
+    assert!(
+        !hits.is_empty(),
+        "Content should still be searchable after force-rebuild"
+    );
+    let seeded_hit = hits.iter().find(|hit| {
+        hit.get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("rebuild_test_initial"))
+    });
+    assert!(
+        seeded_hit.is_some(),
+        "at least one hit must contain the seeded token `rebuild_test_initial`; \
+         got hits={hits:?}"
+    );
 }
 
 /// Test: JSON output mode (--json) for index command
@@ -2622,9 +2639,24 @@ fn search_wildcard_query() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     let hits = json.get("hits").and_then(|h| h.as_array()).expect("hits");
 
+    // Bead 7k7pl: pin EXACT content — the wildcard `wildcardtest*`
+    // must match the seeded token `wildcardtest_unique_suffix` in at
+    // least one hit's content. A regression that returned unrelated
+    // hits (wildcard falling back to match-all) would slip past
+    // `!is_empty()`.
     assert!(
         !hits.is_empty(),
         "Wildcard prefix search should find results"
+    );
+    let matched_seed = hits.iter().any(|hit| {
+        hit.get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("wildcardtest_unique_suffix"))
+    });
+    assert!(
+        matched_seed,
+        "wildcard search must return the seeded `wildcardtest_unique_suffix` token; \
+         got hits={hits:?}"
     );
 }
 
@@ -2721,6 +2753,21 @@ fn empty_query_returns_recent() {
         !hits.is_empty(),
         "Empty query should return recent indexed conversations"
     );
+    // Bead 7k7pl: pin the SHAPE of every returned hit. Empty-query
+    // returns recency-sorted conversations, so every hit must be a
+    // proper hit object with string `content` + `source_path` fields.
+    // A regression that emitted malformed hits (null content, missing
+    // source) would slip past `!is_empty()` while breaking consumers.
+    for hit in hits {
+        assert!(
+            hit.get("content").and_then(|c| c.as_str()).is_some(),
+            "every empty-query hit must have a string `content` field; got {hit}"
+        );
+        assert!(
+            hit.get("source_path").and_then(|s| s.as_str()).is_some(),
+            "every empty-query hit must have a string `source_path` field; got {hit}"
+        );
+    }
 }
 
 #[test]

@@ -353,9 +353,14 @@ fn search_semantic_mode_returns_results() {
         "verify_results",
         Some("Verify semantic search returns hits"),
     );
+    // Bead 7k7pl: pin TYPE on hits (must be a JSON array), not just
+    // "field present". A regression that emitted `null` or a scalar
+    // would slip past `.is_some()` while breaking every downstream
+    // consumer that calls `.as_array()`.
     assert!(
-        json.get("hits").is_some(),
-        "Response should have hits field"
+        json.get("hits").and_then(|v| v.as_array()).is_some(),
+        "hits must be an array. Got: {}",
+        json
     );
     tracker.end(
         "verify_results",
@@ -544,9 +549,14 @@ fn search_approximate_uses_hnsw() {
         serde_json::from_str(&stdout).expect("search output should be valid JSON");
 
     let ps = tracker.start("verify_results", Some("Verify approximate search results"));
+    // Bead 7k7pl: pin TYPE on hits (must be a JSON array), not just
+    // "field present". A regression that emitted `null` or a scalar
+    // would slip past `.is_some()` while breaking downstream
+    // `.as_array()` consumers.
     assert!(
-        json.get("hits").is_some(),
-        "Approximate search should return hits"
+        json.get("hits").and_then(|v| v.as_array()).is_some(),
+        "hits must be an array for approximate search. Got: {}",
+        json
     );
     tracker.end(
         "verify_results",
