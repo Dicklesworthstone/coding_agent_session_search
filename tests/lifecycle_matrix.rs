@@ -2170,3 +2170,101 @@ fn absent_db_drives_null_checkpoint_and_fingerprint_state() {
         );
     }
 }
+
+#[test]
+fn absent_index_collapses_timestamp_and_document_fields_to_null() {
+    // ibuuh.24 crash-safety row. The index block of `cass health --json`
+    // carries several "last seen" signals that downstream consumers
+    // (retention, freshness dashboards, resume logic) use to infer
+    // partial-rebuild state:
+    //
+    //   last_indexed_at  — when the last rebuild *completed*
+    //   age_seconds      — derived freshness
+    //   activity_at      — when the last rebuild *started* or was active
+    //   documents        — how many docs the index currently reports
+    //   empty_with_messages — "index exists but has zero docs while the
+    //                         DB has messages" signal
+    //   rebuilding       — is a rebuild running right now
+    //
+    // When exists=false there is no index to describe. A crashed
+    // rebuild must not leave any of these signals carrying stale
+    // non-null values, because:
+    //   - stale `last_indexed_at` / `age_seconds` would make retention
+    //     think a rebuild completed (never rebuild again)
+    //   - stale `documents` > 0 would make retention think the index
+    //     holds content that can be queried (lexical-ready lies)
+    //   - `rebuilding=true` with no actual rebuild would block other
+    //     rebuild attempts (deadlock)
+    //   - `empty_with_messages=true` with no index is a logic error
+    //     (the signal requires an index to exist)
+    //
+    // Pin the absent-index null/false collapse so crash-recovery-
+    // induced half-state can never leak these fields past the absent
+    // gate.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let idx = &health["state"]["index"];
+    assert!(idx.is_object(), "state.index must be an object");
+
+    // Precondition: isolated HOME has no index.
+    let exists = idx["exists"]
+        .as_bool()
+        .expect("state.index.exists must be a bool");
+    assert!(
+        !exists,
+        "isolated HOME unexpectedly reports index.exists=true"
+    );
+
+    // Nullable fields that must be null when index is absent.
+    for key in [
+        "last_indexed_at",
+        "age_seconds",
+        "activity_at",
+        "documents",
+    ] {
+        let v = &idx[key];
+        assert!(
+            v.is_null(),
+            "index.exists=false but {key}={v:?} — stale signal would mislead retention/freshness/resume logic"
+        );
+    }
+
+    // Boolean fields whose true-semantics require an index to exist.
+    let rebuilding = idx["rebuilding"]
+        .as_bool()
+        .expect("index.rebuilding must be a bool");
+    assert!(
+        !rebuilding,
+        "index.exists=false but rebuilding=true — phantom rebuild-in-progress would deadlock later rebuild attempts"
+    );
+    let ewm = idx["empty_with_messages"]
+        .as_bool()
+        .expect("index.empty_with_messages must be a bool");
+    assert!(
+        !ewm,
+        "index.exists=false but empty_with_messages=true — this signal requires an index to exist (degenerate precondition)"
+    );
+
+    // And stale_threshold_seconds is a configuration invariant: it
+    // must be positive regardless of index existence, because it is
+    // the policy knob that drives every freshness decision. A zero
+    // threshold would collapse "stale vs fresh" into a single always-
+    // stale state; a negative one is nonsensical.
+    let threshold = idx["stale_threshold_seconds"]
+        .as_u64()
+        .expect("index.stale_threshold_seconds must be a u64");
+    assert!(
+        threshold > 0,
+        "stale_threshold_seconds={threshold} but must be positive — zero/negative collapses freshness policy"
+    );
+}
