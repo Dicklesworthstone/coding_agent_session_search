@@ -409,6 +409,16 @@ pub(crate) enum LexicalCleanupApprovalFingerprintStatus {
     Mismatched,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalCleanupApplyBlocker {
+    NoReclaimableCandidates,
+    OperatorApprovalRequired,
+    ApprovalFingerprintMissing,
+    ApprovalFingerprintMismatched,
+    ActiveGenerationWork,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalCleanupApplyGate {
     pub apply_allowed: bool,
@@ -422,7 +432,11 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub reclaimable_bytes: u64,
     #[serde(default)]
     pub candidate_previews: Vec<LexicalCleanupReclaimCandidate>,
+    #[serde(default)]
+    pub blocker_codes: Vec<LexicalCleanupApplyBlocker>,
     pub blocked_reasons: Vec<String>,
+    #[serde(default)]
+    pub active_generation_ids: Vec<String>,
     pub inspection_required_generation_ids: Vec<String>,
 }
 
@@ -477,13 +491,16 @@ impl LexicalCleanupDryRunPlan {
         provided_approval_fingerprint: Option<&str>,
     ) -> LexicalCleanupApplyGate {
         let mut blocked_reasons = Vec::new();
+        let mut blocker_codes = Vec::new();
         if self.reclaim_candidates.is_empty() {
             blocked_reasons.push("no reclaimable cleanup candidates".to_string());
+            blocker_codes.push(LexicalCleanupApplyBlocker::NoReclaimableCandidates);
         }
         if !explicit_operator_approval {
             blocked_reasons.push(
                 "destructive cleanup requires explicit operator approval after dry-run".to_string(),
             );
+            blocker_codes.push(LexicalCleanupApplyBlocker::OperatorApprovalRequired);
         }
         let approval_fingerprint_status =
             match (explicit_operator_approval, provided_approval_fingerprint) {
@@ -500,18 +517,25 @@ impl LexicalCleanupDryRunPlan {
             LexicalCleanupApprovalFingerprintStatus::Mismatched => blocked_reasons.push(
                 "provided cleanup approval fingerprint does not match dry-run plan".to_string(),
             ),
-            LexicalCleanupApprovalFingerprintStatus::Missing => blocked_reasons.push(format!(
-                "cleanup apply requires confirming approval fingerprint {}",
-                self.approval_fingerprint
-            )),
+            LexicalCleanupApprovalFingerprintStatus::Missing => {
+                blocked_reasons.push(format!(
+                    "cleanup apply requires confirming approval fingerprint {}",
+                    self.approval_fingerprint
+                ));
+                blocker_codes.push(LexicalCleanupApplyBlocker::ApprovalFingerprintMissing);
+            }
             LexicalCleanupApprovalFingerprintStatus::NotRequested
             | LexicalCleanupApprovalFingerprintStatus::Matched => {}
+        }
+        if approval_fingerprint_status == LexicalCleanupApprovalFingerprintStatus::Mismatched {
+            blocker_codes.push(LexicalCleanupApplyBlocker::ApprovalFingerprintMismatched);
         }
         if !self.active_generation_ids.is_empty() {
             blocked_reasons.push(format!(
                 "active generation work must settle before cleanup apply: {}",
                 self.active_generation_ids.join(",")
             ));
+            blocker_codes.push(LexicalCleanupApplyBlocker::ActiveGenerationWork);
         }
 
         LexicalCleanupApplyGate {
@@ -525,7 +549,9 @@ impl LexicalCleanupDryRunPlan {
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
             candidate_previews: self.reclaim_candidates.clone(),
+            blocker_codes,
             blocked_reasons,
+            active_generation_ids: self.active_generation_ids.clone(),
             inspection_required_generation_ids: self.inspection_required_generation_ids(),
         }
     }
@@ -2406,6 +2432,14 @@ mod tests {
             blocked.approval_fingerprint_status,
             LexicalCleanupApprovalFingerprintStatus::NotRequested
         );
+        assert_eq!(
+            blocked.blocker_codes,
+            vec![
+                LexicalCleanupApplyBlocker::OperatorApprovalRequired,
+                LexicalCleanupApplyBlocker::ActiveGenerationWork,
+            ]
+        );
+        assert_eq!(blocked.active_generation_ids, vec!["gen-active"]);
         assert_eq!(blocked.candidate_count, 1);
         assert_eq!(blocked.reclaimable_bytes, 4096);
         assert_eq!(
@@ -2447,6 +2481,13 @@ mod tests {
             active_still_blocks.approval_fingerprint_status,
             LexicalCleanupApprovalFingerprintStatus::Missing
         );
+        assert_eq!(
+            active_still_blocks.blocker_codes,
+            vec![
+                LexicalCleanupApplyBlocker::ApprovalFingerprintMissing,
+                LexicalCleanupApplyBlocker::ActiveGenerationWork,
+            ]
+        );
         assert!(!active_still_blocks.approval_fingerprint_matches);
         assert!(
             active_still_blocks
@@ -2464,6 +2505,10 @@ mod tests {
             active_fingerprint_still_blocks.approval_fingerprint_status,
             LexicalCleanupApprovalFingerprintStatus::Matched
         );
+        assert_eq!(
+            active_fingerprint_still_blocks.blocker_codes,
+            vec![LexicalCleanupApplyBlocker::ActiveGenerationWork]
+        );
         assert!(active_fingerprint_still_blocks.approval_fingerprint_matches);
         assert_eq!(active_fingerprint_still_blocks.blocked_reasons.len(), 1);
 
@@ -2471,6 +2516,8 @@ mod tests {
         let allowed =
             safe_plan.apply_gate_with_fingerprint(true, Some(&safe_plan.approval_fingerprint));
         assert!(allowed.apply_allowed);
+        assert!(allowed.blocker_codes.is_empty());
+        assert!(allowed.active_generation_ids.is_empty());
         assert!(allowed.blocked_reasons.is_empty());
         assert_eq!(
             allowed.approval_fingerprint_status,
@@ -2491,6 +2538,8 @@ mod tests {
         );
         assert_eq!(allowed_json["approval_fingerprint_matches"], true);
         assert_eq!(allowed_json["approval_fingerprint_status"], "matched");
+        assert_eq!(allowed_json["blocker_codes"], serde_json::json!([]));
+        assert_eq!(allowed_json["active_generation_ids"], serde_json::json!([]));
         assert_eq!(
             allowed_json["candidate_previews"][0]["generation_id"],
             "gen-old"
@@ -2511,6 +2560,10 @@ mod tests {
             stale_fingerprint.approval_fingerprint_status,
             LexicalCleanupApprovalFingerprintStatus::Mismatched
         );
+        assert_eq!(
+            stale_fingerprint.blocker_codes,
+            vec![LexicalCleanupApplyBlocker::ApprovalFingerprintMismatched]
+        );
         assert!(!stale_fingerprint.approval_fingerprint_matches);
         assert!(
             stale_fingerprint
@@ -2519,6 +2572,15 @@ mod tests {
                 .any(|reason| reason.contains("does not match")),
             "missing stale fingerprint blocker: {:?}",
             stale_fingerprint.blocked_reasons
+        );
+
+        let empty_plan = LexicalCleanupDryRunPlan::from_manifests([&quarantined]);
+        let no_candidates =
+            empty_plan.apply_gate_with_fingerprint(true, Some(&empty_plan.approval_fingerprint));
+        assert!(!no_candidates.apply_allowed);
+        assert_eq!(
+            no_candidates.blocker_codes,
+            vec![LexicalCleanupApplyBlocker::NoReclaimableCandidates]
         );
     }
 
