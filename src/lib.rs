@@ -7234,6 +7234,39 @@ mod aggregate_field_validation_tests {
     }
 }
 
+fn search_dry_run_meta(robot_meta: bool, elapsed_ms: u128) -> serde_json::Value {
+    let mut meta = serde_json::json!({
+        "dry_run": true,
+    });
+    if robot_meta && let serde_json::Value::Object(ref mut map) = meta {
+        map.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+    }
+    meta
+}
+
+#[cfg(test)]
+mod search_dry_run_meta_tests {
+    use super::search_dry_run_meta;
+
+    #[test]
+    fn dry_run_meta_is_stable_without_robot_meta() {
+        let first = search_dry_run_meta(false, 1);
+        let second = search_dry_run_meta(false, 9_999);
+
+        assert_eq!(first, second);
+        assert_eq!(first["dry_run"].as_bool(), Some(true));
+        assert!(first.get("elapsed_ms").is_none());
+    }
+
+    #[test]
+    fn dry_run_meta_keeps_elapsed_ms_when_requested() {
+        let meta = search_dry_run_meta(true, 42);
+
+        assert_eq!(meta["dry_run"].as_bool(), Some(true));
+        assert_eq!(meta["elapsed_ms"].as_u64(), Some(42));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -7583,6 +7616,7 @@ fn run_cli_search(
     if dry_run {
         let explanation = QueryExplanation::analyze(query, &filters);
         let elapsed_ms = start_time.elapsed().as_millis();
+        let meta = search_dry_run_meta(robot_meta, elapsed_ms);
 
         let output = serde_json::json!({
             "dry_run": true,
@@ -7592,10 +7626,7 @@ fn run_cli_search(
             "estimated_cost": format!("{:?}", explanation.estimated_cost),
             "warnings": explanation.warnings,
             "request_id": request_id,
-            "_meta": {
-                "elapsed_ms": elapsed_ms,
-                "dry_run": true,
-            }
+            "_meta": meta,
         });
 
         println!(
