@@ -1708,3 +1708,80 @@ fn db_and_index_surface_flags_match_actual_filesystem() {
         "isolated empty HOME still has index on disk at {index_path}"
     );
 }
+
+#[test]
+fn index_checkpoint_and_fingerprint_blocks_have_stable_shape() {
+    // ibuuh.24 crash-safety row. The stale-refresh architecture promises
+    // crash-safe resume: a rebuild that crashed mid-way can be resumed
+    // because state.index.checkpoint + state.index.fingerprint carry
+    // enough info to decide whether to resume or start over. If any of
+    // those fields rename or drop, the resume logic silently loses the
+    // signal it needs and either re-starts from scratch (wasted work)
+    // or resumes against a mismatched DB (correctness risk).
+    //
+    // Pin the shape of both sub-blocks so contract drift fails fast.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let idx = &health["state"]["index"];
+
+    // checkpoint sub-block: present is always a bool. The other four
+    // boolean-semantic fields are bool-or-null (null when no checkpoint
+    // exists; bool when one does). Rename/drop of any of these loses
+    // the resume-vs-restart signal.
+    let cp = &idx["checkpoint"];
+    assert!(cp.is_object(), "state.index.checkpoint must be an object");
+    let present = cp["present"]
+        .as_bool()
+        .expect("checkpoint.present must be a bool");
+    for key in [
+        "completed",
+        "db_matches",
+        "schema_matches",
+        "page_size_matches",
+        "page_size_compatible",
+    ] {
+        let v = &cp[key];
+        assert!(
+            v.is_boolean() || v.is_null(),
+            "state.index.checkpoint.{key} must be bool or null; got {v:?}"
+        );
+        // When present=false, every bool-or-null field must be null
+        // (no checkpoint to describe) — this is the crash-safe resume
+        // invariant: absent checkpoint => absent checkpoint metadata.
+        if !present {
+            assert!(
+                v.is_null(),
+                "checkpoint.present=false but checkpoint.{key}={v:?}; expected null"
+            );
+        }
+    }
+
+    // fingerprint sub-block: three string-or-null fields, all
+    // nullable when no fingerprint exists yet.
+    let fp = &idx["fingerprint"];
+    assert!(fp.is_object(), "state.index.fingerprint must be an object");
+    for key in [
+        "current_db_fingerprint",
+        "checkpoint_fingerprint",
+    ] {
+        let v = &fp[key];
+        assert!(
+            v.is_string() || v.is_null(),
+            "state.index.fingerprint.{key} must be string or null; got {v:?}"
+        );
+    }
+    let matches_v = &fp["matches_current_db_fingerprint"];
+    assert!(
+        matches_v.is_boolean() || matches_v.is_null(),
+        "state.index.fingerprint.matches_current_db_fingerprint must be bool or null; got {matches_v:?}"
+    );
+}
