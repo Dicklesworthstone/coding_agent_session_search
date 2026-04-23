@@ -1,9 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use coding_agent_search::storage::sqlite::{MigrationError, SqliteStorage};
+use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+
+fn open_fixture_db(path: impl AsRef<Path>) -> FrankenConnection {
+    let path = path.as_ref().to_string_lossy();
+    FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
+}
 
 fn sample_agent() -> Agent {
     Agent {
@@ -645,14 +651,12 @@ fn open_disables_frankensqlite_autocommit_retain() {
 
 #[test]
 fn migration_from_v1_requires_rebuild() {
-    use rusqlite::Connection;
-
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("migrate_v1.db");
 
     // Manually create a v1 database
     {
-        let conn = Connection::open(&db_path).expect("create v1 db");
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -751,14 +755,12 @@ fn migration_from_v1_requires_rebuild() {
 
 #[test]
 fn migration_from_v2_requires_rebuild() {
-    use rusqlite::Connection;
-
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("migrate_v2.db");
 
     // Manually create a v2 database with FTS5 table
     {
-        let conn = Connection::open(&db_path).expect("create v2 db");
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1122,14 +1124,12 @@ fn sources_table_has_correct_columns() {
 
 #[test]
 fn migration_from_v3_requires_rebuild() {
-    use rusqlite::Connection;
-
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("migrate_v3.db");
 
     // Manually create a v3 database (without sources table)
     {
-        let conn = Connection::open(&db_path).expect("create v3 db");
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1365,14 +1365,12 @@ fn open_or_rebuild_creates_fresh_db() {
 
 #[test]
 fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
-    use rusqlite::Connection;
-
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("migrate.db");
 
     // Create a v4 database (without provenance columns in conversations)
     {
-        let conn = Connection::open(&db_path).expect("create v4 db");
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r"
             PRAGMA foreign_keys = ON;
@@ -1486,14 +1484,12 @@ fn open_or_rebuild_requires_rebuild_for_legacy_v4_schema() {
 
 #[test]
 fn open_or_rebuild_triggers_rebuild_for_future_version() {
-    use rusqlite::Connection;
-
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("future.db");
 
     // Create a database with a future schema version
     {
-        let conn = Connection::open(&db_path).expect("create future db");
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
