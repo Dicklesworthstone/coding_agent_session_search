@@ -509,3 +509,47 @@ fn cleanup_quarantine_inventory_trace_is_artifact_backed() {
         "lexical-gen-003/shard-0002"
     );
 }
+
+#[test]
+fn api_and_contract_versions_agree_across_capabilities_and_api_version() {
+    // Cross-surface invariant: cass ships TWO places where an agent can
+    // ask "what api + contract version am I talking to" — the full
+    // capabilities block and the dedicated api-version command. Both
+    // must agree on api_version AND contract_version. A silent bump in
+    // one surface without the other breaks agents that negotiate via
+    // the short command and then rely on the capabilities contract.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        assert!(out.status.success(), "cass {args:?} exited non-zero");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+    let caps = json_out(test_home.path(), &["capabilities", "--json"]);
+    let api = json_out(test_home.path(), &["api-version", "--json"]);
+
+    // Both surfaces emit integer api_version + string contract_version.
+    // Pull them out and compare.
+    assert_eq!(
+        caps["api_version"], api["api_version"],
+        "capabilities.api_version ({}) disagrees with api-version.api_version ({})",
+        caps["api_version"], api["api_version"],
+    );
+    assert_eq!(
+        caps["contract_version"], api["contract_version"],
+        "capabilities.contract_version ({}) disagrees with api-version.contract_version ({})",
+        caps["contract_version"], api["contract_version"],
+    );
+    assert_eq!(
+        caps["crate_version"], api["crate_version"],
+        "capabilities.crate_version ({}) disagrees with api-version.crate_version ({})",
+        caps["crate_version"], api["crate_version"],
+    );
+}
