@@ -298,6 +298,21 @@ pub(crate) enum LexicalCleanupDisposition {
     PinnedRetained,
 }
 
+impl LexicalCleanupDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentPublished => "current_published",
+            Self::ActiveWork => "active_work",
+            Self::QuarantinedRetained => "quarantined_retained",
+            Self::SupersededReclaimable => "superseded_reclaimable",
+            Self::SupersededRetained => "superseded_retained",
+            Self::FailedReclaimable => "failed_reclaimable",
+            Self::FailedRetained => "failed_retained",
+            Self::PinnedRetained => "pinned_retained",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalShardCleanupInventory {
     pub shard_id: String,
@@ -325,6 +340,7 @@ pub(crate) struct LexicalGenerationCleanupInventory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalCleanupDryRunPlan {
     pub dry_run: bool,
+    pub approval_fingerprint: String,
     pub generation_count: usize,
     pub total_artifact_bytes: u64,
     pub total_reclaimable_bytes: u64,
@@ -336,6 +352,9 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub quarantined_generation_ids: Vec<String>,
     pub active_generation_ids: Vec<String>,
     pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
+    #[serde(default)]
+    pub generation_disposition_summaries:
+        BTreeMap<LexicalCleanupDisposition, LexicalCleanupGenerationDispositionSummary>,
     #[serde(default)]
     pub inspection_items: Vec<LexicalCleanupInspectionItem>,
     #[serde(default)]
@@ -370,11 +389,20 @@ pub(crate) struct LexicalCleanupDispositionSummary {
     pub retained_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupGenerationDispositionSummary {
+    pub generation_count: usize,
+    pub artifact_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub retained_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalCleanupApplyGate {
     pub apply_allowed: bool,
     pub dry_run: bool,
     pub explicit_operator_approval: bool,
+    pub approval_fingerprint: String,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
     #[serde(default)]
@@ -389,6 +417,7 @@ impl LexicalCleanupDryRunPlan {
     ) -> Self {
         let mut plan = Self {
             dry_run: true,
+            approval_fingerprint: String::new(),
             generation_count: 0,
             total_artifact_bytes: 0,
             total_reclaimable_bytes: 0,
@@ -399,6 +428,7 @@ impl LexicalCleanupDryRunPlan {
             quarantined_generation_ids: Vec::new(),
             active_generation_ids: Vec::new(),
             disposition_counts: BTreeMap::new(),
+            generation_disposition_summaries: BTreeMap::new(),
             inspection_items: Vec::new(),
             shard_disposition_summaries: BTreeMap::new(),
             inventories: Vec::new(),
@@ -407,6 +437,7 @@ impl LexicalCleanupDryRunPlan {
         for manifest in manifests {
             plan.record_inventory(manifest.cleanup_inventory());
         }
+        plan.approval_fingerprint = plan.compute_approval_fingerprint();
 
         plan
     }
@@ -440,6 +471,7 @@ impl LexicalCleanupDryRunPlan {
             apply_allowed: blocked_reasons.is_empty(),
             dry_run: self.dry_run,
             explicit_operator_approval,
+            approval_fingerprint: self.approval_fingerprint.clone(),
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
             candidate_previews: self.reclaim_candidates.clone(),
@@ -473,6 +505,20 @@ impl LexicalCleanupDryRunPlan {
             .disposition_counts
             .entry(inventory.disposition)
             .or_insert(0) += 1;
+        let generation_summary = self
+            .generation_disposition_summaries
+            .entry(inventory.disposition)
+            .or_default();
+        generation_summary.generation_count = generation_summary.generation_count.saturating_add(1);
+        generation_summary.artifact_bytes = generation_summary
+            .artifact_bytes
+            .saturating_add(inventory.artifact_bytes);
+        generation_summary.reclaimable_bytes = generation_summary
+            .reclaimable_bytes
+            .saturating_add(inventory.reclaimable_bytes);
+        generation_summary.retained_bytes = generation_summary
+            .retained_bytes
+            .saturating_add(inventory.retained_bytes);
 
         if inventory.reclaimable_bytes > 0 {
             self.reclaimable_generation_ids
@@ -550,6 +596,54 @@ impl LexicalCleanupDryRunPlan {
                 | LexicalCleanupDisposition::FailedRetained
         )
     }
+
+    fn compute_approval_fingerprint(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hash_str(&mut hasher, "cass.lexical_cleanup_approval.v1");
+        hash_usize(&mut hasher, self.generation_count);
+        hash_u64(&mut hasher, self.total_artifact_bytes);
+        hash_u64(&mut hasher, self.total_reclaimable_bytes);
+        hash_u64(&mut hasher, self.total_retained_bytes);
+
+        for candidate in &self.reclaim_candidates {
+            hash_str(&mut hasher, &candidate.generation_id);
+            hash_str(&mut hasher, &candidate.shard_id);
+            hash_str(&mut hasher, candidate.disposition.as_str());
+            hash_str(&mut hasher, &candidate.reason);
+            hash_u64(&mut hasher, candidate.reclaimable_bytes);
+        }
+
+        for item in &self.inspection_items {
+            hash_str(&mut hasher, &item.generation_id);
+            hash_str(&mut hasher, item.shard_id.as_deref().unwrap_or(""));
+            hash_str(&mut hasher, item.disposition.as_str());
+            hash_str(&mut hasher, &item.reason);
+            hash_u64(&mut hasher, item.retained_bytes);
+        }
+
+        for generation_id in &self.active_generation_ids {
+            hash_str(&mut hasher, generation_id);
+        }
+        for (disposition, count) in &self.disposition_counts {
+            hash_str(&mut hasher, disposition.as_str());
+            hash_usize(&mut hasher, *count);
+        }
+
+        format!("cleanup-v1-{}", hasher.finalize().to_hex())
+    }
+}
+
+fn hash_str(hasher: &mut blake3::Hasher, value: &str) {
+    hash_usize(hasher, value.len());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_u64(hasher: &mut blake3::Hasher, value: u64) {
+    hasher.update(&value.to_le_bytes());
+}
+
+fn hash_usize(hasher: &mut blake3::Hasher, value: usize) {
+    hasher.update(&u64::try_from(value).unwrap_or(u64::MAX).to_le_bytes());
 }
 
 /// Single entry in a generation's append-only failure log.
@@ -1948,6 +2042,33 @@ mod tests {
                 .get(&LexicalCleanupDisposition::QuarantinedRetained),
             Some(&1)
         );
+        let current_generation_summary = plan
+            .generation_disposition_summaries
+            .get(&LexicalCleanupDisposition::CurrentPublished)
+            .expect("current published generation summary");
+        assert_eq!(current_generation_summary.generation_count, 1);
+        assert_eq!(current_generation_summary.artifact_bytes, 4096);
+        assert_eq!(current_generation_summary.reclaimable_bytes, 0);
+        assert_eq!(current_generation_summary.retained_bytes, 4096);
+
+        let superseded_generation_summary = plan
+            .generation_disposition_summaries
+            .get(&LexicalCleanupDisposition::SupersededReclaimable)
+            .expect("superseded reclaimable generation summary");
+        assert_eq!(superseded_generation_summary.generation_count, 1);
+        assert_eq!(superseded_generation_summary.artifact_bytes, 9216);
+        assert_eq!(superseded_generation_summary.reclaimable_bytes, 8192);
+        assert_eq!(superseded_generation_summary.retained_bytes, 1024);
+
+        let quarantined_generation_summary = plan
+            .generation_disposition_summaries
+            .get(&LexicalCleanupDisposition::QuarantinedRetained)
+            .expect("quarantined generation summary");
+        assert_eq!(quarantined_generation_summary.generation_count, 1);
+        assert_eq!(quarantined_generation_summary.artifact_bytes, 2048);
+        assert_eq!(quarantined_generation_summary.reclaimable_bytes, 0);
+        assert_eq!(quarantined_generation_summary.retained_bytes, 2048);
+
         let reclaimable_summary = plan
             .shard_disposition_summaries
             .get(&LexicalCleanupDisposition::SupersededReclaimable)
@@ -1967,6 +2088,22 @@ mod tests {
         assert_eq!(pinned_summary.retained_bytes, 1024);
 
         let json = serde_json::to_value(&plan).expect("serialize cleanup dry-run plan");
+        assert_eq!(
+            json["generation_disposition_summaries"]["current_published"]["retained_bytes"],
+            4096
+        );
+        assert_eq!(
+            json["generation_disposition_summaries"]["superseded_reclaimable"]["generation_count"],
+            1
+        );
+        assert_eq!(
+            json["generation_disposition_summaries"]["superseded_reclaimable"]["reclaimable_bytes"],
+            8192
+        );
+        assert_eq!(
+            json["generation_disposition_summaries"]["quarantined_retained"]["retained_bytes"],
+            2048
+        );
         assert_eq!(
             json["shard_disposition_summaries"]["superseded_reclaimable"]["reclaimable_bytes"],
             8192
@@ -2217,6 +2354,65 @@ mod tests {
             allowed_json["candidate_previews"][0]["reclaimable_bytes"],
             4096
         );
+    }
+
+    #[test]
+    fn cleanup_dry_run_plan_fingerprints_approval_surface() -> Result<(), serde_json::Error> {
+        let mut superseded =
+            LexicalGenerationManifest::new_scratch("gen-old", "attempt-1", "fp", 1);
+        let mut reclaimable_shard =
+            test_shard("shard-old", 0, LexicalShardLifecycleState::Published, 4096);
+        reclaimable_shard.pinned = false;
+        reclaimable_shard.reclaimable = true;
+        superseded.set_shards(vec![reclaimable_shard], 2);
+        superseded.transition_build(LexicalGenerationBuildState::Validated, 3);
+        superseded.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+
+        let mut larger = LexicalGenerationManifest::new_scratch("gen-old", "attempt-2", "fp", 10);
+        let mut larger_shard =
+            test_shard("shard-old", 0, LexicalShardLifecycleState::Published, 8192);
+        larger_shard.pinned = false;
+        larger_shard.reclaimable = true;
+        larger.set_shards(vec![larger_shard], 11);
+        larger.transition_build(LexicalGenerationBuildState::Validated, 12);
+        larger.transition_publish(LexicalGenerationPublishState::Superseded, 13);
+
+        let mut quarantined =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-3", "fp", 20);
+        quarantined.set_shards(
+            vec![test_shard(
+                "shard-bad",
+                0,
+                LexicalShardLifecycleState::Quarantined,
+                512,
+            )],
+            21,
+        );
+        assert!(quarantined.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            22,
+            Some("checksum mismatch".into()),
+        ));
+        quarantined.transition_publish(LexicalGenerationPublishState::Quarantined, 23);
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([&superseded, &quarantined]);
+        let changed_plan = LexicalCleanupDryRunPlan::from_manifests([&larger, &quarantined]);
+
+        assert!(plan.approval_fingerprint.starts_with("cleanup-v1-"));
+        assert_eq!(plan.approval_fingerprint.len(), "cleanup-v1-".len() + 64);
+        assert_ne!(
+            plan.approval_fingerprint, changed_plan.approval_fingerprint,
+            "approval fingerprint must change when reclaimable candidate bytes change"
+        );
+
+        let gate = plan.apply_gate(true);
+        assert_eq!(gate.approval_fingerprint, plan.approval_fingerprint);
+        let plan_json = serde_json::to_value(&plan)?;
+        let gate_json = serde_json::to_value(&gate)?;
+        assert_eq!(plan_json["approval_fingerprint"], plan.approval_fingerprint);
+        assert_eq!(gate_json["approval_fingerprint"], plan.approval_fingerprint);
+        Ok(())
     }
 
     #[test]
