@@ -4,7 +4,9 @@ mod tests {
     use coding_agent_search::pages::secret_scan::{
         SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
     };
-    use rusqlite::Connection;
+    use frankensqlite::Connection as FrankenConnection;
+    use frankensqlite::compat::ConnectionExt;
+    use frankensqlite::params as fparams;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -17,8 +19,13 @@ mod tests {
         }
     }
 
+    fn open_db(path: &Path) -> Result<FrankenConnection> {
+        let path_str = path.to_string_lossy();
+        Ok(FrankenConnection::open(path_str.as_ref())?)
+    }
+
     fn setup_db(path: &Path, message_content: &str) -> Result<()> {
-        let conn = Connection::open(path)?;
+        let conn = open_db(path)?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -48,20 +55,16 @@ mod tests {
             "#,
         )?;
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')", [])?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')",
-            [],
-        )?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project')")?;
         conn.execute(
             r#"INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, metadata_json)
              VALUES (1, 1, 1, 'Test Conversation', '/tmp/project/session.json', 1700000000000, '{"info":"none"}')"#,
-            [],
         )?;
-        conn.execute(
+        conn.execute_compat(
             r#"INSERT INTO messages (id, conversation_id, idx, content, extra_json)
              VALUES (1, 1, 0, ?1, '{"note":"none"}')"#,
-            [message_content],
+            fparams![message_content],
         )?;
 
         Ok(())
@@ -77,7 +80,7 @@ mod tests {
         started_at: i64,
         messages: &[(i64, &str, Option<&str>)], // (idx, content, extra_json)
     ) -> Result<()> {
-        let conn = Connection::open(path)?;
+        let conn = open_db(path)?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -107,22 +110,25 @@ mod tests {
             "#,
         )?;
 
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, ?1)", [agent_slug])?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (1, ?1)",
-            [workspace_path],
+        conn.execute_compat(
+            "INSERT INTO agents (id, slug) VALUES (1, ?1)",
+            fparams![agent_slug],
         )?;
-        conn.execute(
+        conn.execute_compat(
+            "INSERT INTO workspaces (id, path) VALUES (1, ?1)",
+            fparams![workspace_path],
+        )?;
+        conn.execute_compat(
             r#"INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, metadata_json)
              VALUES (1, 1, 1, ?1, '/test/session.json', ?2, ?3)"#,
-            rusqlite::params![title, started_at, metadata_json],
+            fparams![title, started_at, metadata_json],
         )?;
 
         for (i, (idx, content, extra)) in messages.iter().enumerate() {
-            conn.execute(
+            conn.execute_compat(
                 r#"INSERT INTO messages (id, conversation_id, idx, content, extra_json)
                  VALUES (?1, 1, ?2, ?3, ?4)"#,
-                rusqlite::params![i as i64 + 1, idx, content, extra.unwrap_or("null"),],
+                fparams![i as i64 + 1, *idx, *content, extra.unwrap_or("null")],
             )?;
         }
 
@@ -206,7 +212,7 @@ mod tests {
         let db_path = temp.path().join("scan.db");
         setup_db(&db_path, "harmless content")?;
 
-        let conn = Connection::open(&db_path)?;
+        let conn = open_db(&db_path)?;
         conn.execute_batch(
             r#"
             CREATE TABLE snippets (
@@ -227,7 +233,6 @@ mod tests {
                 1, 1, '/tmp/project/src/lib.rs', 10, 12, 'rust',
                 'const OPENAI = \"sk-TESTabcdefghijklmnopqrstuvwxyz012345\";'
             )"#,
-            [],
         )?;
         drop(conn);
 
@@ -624,7 +629,7 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
 
-        let conn = Connection::open(&db_path)?;
+        let conn = open_db(&db_path)?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);

@@ -770,6 +770,226 @@ fn shadow_divergence_demotes_segment_farm_to_verified_serial_path() {
 }
 
 #[test]
+fn unified_refresh_controller_records_policy_budget_and_demotion_reasons() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "unified_refresh_controller_policy_budget_demotion",
+        LoadScript::new(vec![
+            LoadSample::idle("serial_verified_start"),
+            LoadSample::idle("parallel_capacity_available"),
+            LoadSample::loaded("machine_pressure"),
+            LoadSample::busy("shadow_divergence"),
+            LoadSample::idle("stable_verified_fallback"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "serial_policy")
+        .turn(SimulationActor::LexicalRepair, "parallel_policy")
+        .turn(SimulationActor::BackgroundSemantic, "memo_budget_pressure")
+        .turn(SimulationActor::LexicalRepair, "preferred_path_demotion")
+        .turn(SimulationActor::ForegroundSearch, "controller_verdict");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "serial_policy") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller records verified-serial policy before enabling fast paths",
+                );
+                sim.snapshot_json(
+                    "serial_policy_decision",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "active_path": "verified_serial",
+                        "page_conversation_limit": 256,
+                        "commit_interval_pages": 8,
+                        "reason": "verified_baseline_before_parallel_rollout",
+                        "setting_source": "compiled_default",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "parallel_policy") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller admits segment-farm path with explicit shard and worker budgets",
+                );
+                sim.snapshot_json(
+                    "parallel_policy_decision",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "active_path": "segment_farm_shadow",
+                        "shard_width": 16,
+                        "worker_concurrency": 24,
+                        "reserved_cores": 4,
+                        "merge_pressure": "low",
+                        "reason": "idle_capacity_available",
+                        "setting_source": "runtime_telemetry",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::BackgroundSemantic, "memo_budget_pressure") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller shrinks memoization and worker budgets under pressure",
+                );
+                sim.snapshot_json(
+                    "memo_budget_pressure_decision",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "memo_cache_budget_mb_before": 256,
+                        "memo_cache_budget_mb_after": 96,
+                        "worker_concurrency_before": 24,
+                        "worker_concurrency_after": 8,
+                        "degraded_mode": "pressure_limited",
+                        "reason": "high_io_and_cpu_pressure",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "preferred_path_demotion") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller demotes the preferred parallel path after compare divergence",
+                );
+                sim.snapshot_json(
+                    "preferred_path_demotion_decision",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "preferred_path_before": "segment_farm",
+                        "preferred_path_after": "verified_serial",
+                        "fallback_policy": "automatic_demotion",
+                        "reason": "shadow_compare_digest_divergence",
+                        "operator_pin_required": false,
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "controller_verdict") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller verdict preserves serial, parallel, memo, and demotion reasons",
+                );
+                sim.snapshot_json(
+                    "unified_controller_verdict",
+                    &json!({
+                        "verdict": "pass",
+                        "gates": {
+                            "serial_policy_recorded": "pass",
+                            "parallel_budget_recorded": "pass",
+                            "memo_budget_pressure_recorded": "pass",
+                            "demotion_reason_recorded": "pass",
+                            "foreground_predictability_preserved": "pass"
+                        },
+                        "active_path": "verified_serial",
+                        "blocked_wait_ms": 0
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic unified-controller turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "unified controller policy trace should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 5);
+    assert_eq!(summary.actor_traces[0].load.label, "serial_verified_start");
+    assert_eq!(
+        summary.actor_traces[1].load.label,
+        "parallel_capacity_available"
+    );
+    assert_eq!(summary.actor_traces[2].load.label, "machine_pressure");
+    assert_eq!(summary.actor_traces[3].load.label, "shadow_divergence");
+    assert!(summary.actor_traces[3].load.user_active);
+    assert_eq!(summary.actor_traces[4].load.label, "stable_verified_fallback");
+
+    for expected in [
+        "001-serial_policy_decision.json",
+        "002-parallel_policy_decision.json",
+        "003-memo_budget_pressure_decision.json",
+        "004-preferred_path_demotion_decision.json",
+        "005-unified_controller_verdict.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing unified-controller snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write unified-controller artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("controller shrinks memoization and worker budgets"),
+        "phase log should preserve memo-budget pressure reasoning"
+    );
+    assert!(
+        phase_log.contains("controller demotes the preferred parallel path"),
+        "phase log should preserve preferred-path demotion reasoning"
+    );
+
+    let parallel_path = artifacts
+        .snapshot_dir
+        .join("002-parallel_policy_decision.json");
+    let parallel_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&parallel_path).expect("read parallel policy"))
+            .expect("parallel policy JSON");
+    assert_eq!(parallel_json["active_path"], "segment_farm_shadow");
+    assert_eq!(parallel_json["shard_width"], 16);
+    assert_eq!(parallel_json["worker_concurrency"], 24);
+
+    let memo_path = artifacts
+        .snapshot_dir
+        .join("003-memo_budget_pressure_decision.json");
+    let memo_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&memo_path).expect("read memo policy"))
+            .expect("memo policy JSON");
+    assert_eq!(memo_json["memo_cache_budget_mb_after"], 96);
+    assert_eq!(memo_json["worker_concurrency_after"], 8);
+    assert_eq!(memo_json["degraded_mode"], "pressure_limited");
+
+    let demotion_path = artifacts
+        .snapshot_dir
+        .join("004-preferred_path_demotion_decision.json");
+    let demotion_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&demotion_path).expect("read demotion policy"))
+            .expect("demotion policy JSON");
+    assert_eq!(demotion_json["preferred_path_before"], "segment_farm");
+    assert_eq!(demotion_json["preferred_path_after"], "verified_serial");
+    assert_eq!(
+        demotion_json["reason"],
+        "shadow_compare_digest_divergence"
+    );
+
+    let verdict_path = artifacts
+        .snapshot_dir
+        .join("005-unified_controller_verdict.json");
+    let verdict_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&verdict_path).expect("read verdict"))
+            .expect("verdict JSON");
+    assert_eq!(verdict_json["verdict"], "pass");
+    assert_eq!(
+        verdict_json["gates"]["foreground_predictability_preserved"],
+        "pass"
+    );
+    assert_eq!(verdict_json["active_path"], "verified_serial");
+}
+
+#[test]
 fn robot_style_demo_is_deterministic_and_persists_artifacts() {
     let (first_summary, first_artifacts, first_results) = run_robot_style_demo();
     let (second_summary, second_artifacts, second_results) = run_robot_style_demo();
