@@ -7,10 +7,16 @@
 //! - Backup is created before destructive operations
 
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, MigrationError, SqliteStorage};
-use rusqlite::Connection;
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+
+fn open_fixture_db(path: &Path) -> FrankenConnection {
+    let path = path.to_string_lossy();
+    FrankenConnection::open(path.as_ref()).expect("open frankensqlite fixture database")
+}
 
 // =============================================================================
 // Migration Flow Tests
@@ -24,7 +30,7 @@ fn test_migration_creates_backup() {
 
     // Create database with old schema
     {
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -109,7 +115,7 @@ fn test_migration_preserves_data() {
 
     // Create database with data
     {
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -207,14 +213,11 @@ fn test_migration_handles_corruption() {
 
     // Create a "corrupted" database (incomplete schema)
     {
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)", [])
+        let conn = open_fixture_db(&db_path);
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
             .unwrap();
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', '5')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '5')")
+            .unwrap();
         // Missing required tables - this simulates corruption
     }
 
@@ -277,7 +280,10 @@ fn test_schema_version_5_to_current() {
                 MigrationError::RebuildRequired { reason, .. } => {
                     assert!(!reason.is_empty(), "Rebuild reason should be provided");
                 }
-                other => panic!("Unexpected error type: {:?}", other),
+                other => {
+                    let unexpected = format!("{other:?}");
+                    assert!(unexpected.is_empty(), "Unexpected error type: {unexpected}");
+                }
             }
         }
     }
@@ -285,7 +291,7 @@ fn test_schema_version_5_to_current() {
 
 /// Create a v5 schema database for testing.
 fn create_v5_schema(path: &Path) {
-    let conn = Connection::open(path).unwrap();
+    let conn = open_fixture_db(path);
     conn.execute_batch(
         r#"
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -360,7 +366,7 @@ fn test_fts_rebuild() {
 
     // Create database with data but no FTS
     {
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -516,7 +522,7 @@ fn test_failed_migration_preserves_original() {
 
     // Create a valid database
     {
-        let conn = Connection::open(&db_path).unwrap();
+        let conn = open_fixture_db(&db_path);
         conn.execute_batch(&format!(
             r#"
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -572,12 +578,12 @@ fn test_failed_migration_preserves_original() {
     }
 
     // Verify we can still read the test_data
-    let conn = Connection::open(&db_path).unwrap();
+    let conn = open_fixture_db(&db_path);
     let test_data: String = conn
-        .query_row(
+        .query_row_map(
             "SELECT value FROM meta WHERE key = 'test_data'",
-            [],
-            |row| row.get(0),
+            &[],
+            |row: &frankensqlite::Row| row.get_typed(0),
         )
         .unwrap();
     assert_eq!(test_data, "important");
