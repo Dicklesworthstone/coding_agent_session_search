@@ -2661,3 +2661,134 @@ fn models_status_fail_open_and_manifest_integrity_invariants() {
         "duplicate files[].local_name detected in manifest {local_names:?} — two manifest entries point at the same filesystem location"
     );
 }
+
+#[test]
+fn models_verify_and_status_agree_on_cache_identity_and_phase() {
+    // ibuuh.19 cross-command model-cache agreement row.
+    // `cass models status --json` and `cass models verify --json` are
+    // two retention-critical surfaces that both read the same
+    // model-cache state:
+    //
+    //   status  — general retention inventory (what's cached, sizes)
+    //   verify  — integrity check (SHA-256 file validity)
+    //
+    // Both surfaces advertise `cache_lifecycle` and `model_dir`; if
+    // they disagree on *which* cache or *what phase* it's in, the
+    // retention/verification layers would operate on different
+    // assumptions. Specifically:
+    //
+    //   - model_dir drift between commands => verify could check
+    //     one directory while retention reclaims another
+    //   - cache_lifecycle.state drift => one command thinks
+    //     "not_acquired" while the other thinks "partial"
+    //   - lexical_fail_open drift => the fail-open guarantee would
+    //     depend on which command the operator happened to run
+    //
+    // Plus the verify-specific invariant: all_valid=false must hold
+    // when no files exist on disk (cannot validate hashes of absent
+    // files), and an error string must be present explaining why.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    let s_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(s_out.status.success(), "cass models status --json failed");
+    let status: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8"))
+            .expect("valid JSON");
+
+    let v_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "verify", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models verify --json");
+    // verify exits 0 with a JSON envelope even on verification failure
+    // when there is no model to verify yet.
+    assert!(v_out.status.success(), "cass models verify --json failed");
+    let verify: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(v_out.stdout).expect("utf8"))
+            .expect("valid JSON");
+
+    // Invariant A: model_dir agrees between status and verify.
+    let s_mdir = status["model_dir"]
+        .as_str()
+        .expect("status.model_dir must be a string");
+    let v_mdir = verify["model_dir"]
+        .as_str()
+        .expect("verify.model_dir must be a string");
+    assert_eq!(
+        s_mdir, v_mdir,
+        "status.model_dir ({s_mdir}) diverged from verify.model_dir ({v_mdir}) — verify and retention would target different directories"
+    );
+
+    // Invariant B: cache_lifecycle.model_dir agrees across commands.
+    let s_cl_mdir = status["cache_lifecycle"]["model_dir"]
+        .as_str()
+        .expect("status.cache_lifecycle.model_dir must be a string");
+    let v_cl_mdir = verify["cache_lifecycle"]["model_dir"]
+        .as_str()
+        .expect("verify.cache_lifecycle.model_dir must be a string");
+    assert_eq!(
+        s_cl_mdir, v_cl_mdir,
+        "cache_lifecycle.model_dir diverged across commands: status={s_cl_mdir}, verify={v_cl_mdir}"
+    );
+
+    // Invariant C: cache_lifecycle.state.state agrees across commands.
+    let s_state = status["cache_lifecycle"]["state"]["state"]
+        .as_str()
+        .expect("status.cache_lifecycle.state.state must be a string");
+    let v_state = verify["cache_lifecycle"]["state"]["state"]
+        .as_str()
+        .expect("verify.cache_lifecycle.state.state must be a string");
+    assert_eq!(
+        s_state, v_state,
+        "cache_lifecycle.state.state diverged across commands: status={s_state}, verify={v_state} — two retention-adjacent commands see different phases"
+    );
+
+    // Invariant D: lexical_fail_open agrees across commands (both
+    // surfaces advertise the fail-open promise; both must honor it).
+    let s_fo = status["lexical_fail_open"]
+        .as_bool()
+        .expect("status.lexical_fail_open must be a bool");
+    let v_fo = verify["lexical_fail_open"]
+        .as_bool()
+        .expect("verify.lexical_fail_open must be a bool");
+    assert_eq!(
+        s_fo, v_fo,
+        "lexical_fail_open diverged: status={s_fo}, verify={v_fo} — the fail-open guarantee must not depend on which command the operator runs"
+    );
+
+    // Invariant E: when no model is on disk (installed=false in the
+    // status surface), all_valid=false in the verify surface — you
+    // cannot validate absent files.
+    let installed = status["installed"]
+        .as_bool()
+        .expect("status.installed must be a bool");
+    assert!(!installed, "isolated HOME unexpectedly installed=true");
+    let all_valid = verify["all_valid"]
+        .as_bool()
+        .expect("verify.all_valid must be a bool");
+    assert!(
+        !all_valid,
+        "installed=false but verify.all_valid=true — cannot validate absent files; spurious 'ok' would let retention skip re-acquisition"
+    );
+
+    // And verify.error must be a non-empty string explaining why the
+    // verification did not succeed. An empty or null error here means
+    // operators cannot triage why the model is unusable.
+    let err = verify["error"]
+        .as_str()
+        .expect("verify.error must be a string when all_valid=false");
+    assert!(
+        !err.trim().is_empty(),
+        "verify.error is empty despite all_valid=false — operators lose the reason why verification failed"
+    );
+}
