@@ -101,3 +101,47 @@ fn models_check_update_reports_against_scoped_data_dir() -> Result<(), String> {
         }
     })
 }
+
+#[test]
+fn models_backfill_keeps_semantic_work_data_dir_and_db_scoped() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "models",
+            "backfill",
+            "--tier",
+            "quality",
+            "--embedder",
+            "fastembed",
+            "--batch-conversations",
+            "17",
+            "--scheduled",
+            "--data-dir",
+            "/cass/data",
+            "--db",
+            "/cass/data/agent_search.db",
+            "--json",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Backfill {
+                tier,
+                embedder: Some(embedder),
+                batch_conversations: 17,
+                scheduled: true,
+                data_dir: Some(data_dir),
+                db: Some(db),
+                json: true,
+            })) if tier == "quality"
+                && embedder == "fastembed"
+                && data_dir.display().to_string() == "/cass/data"
+                && db.display().to_string() == "/cass/data/agent_search.db" =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected scoped model backfill controls to parse: {other:?}"
+            )),
+        }
+    })
+}
