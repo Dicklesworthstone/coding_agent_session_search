@@ -3759,6 +3759,82 @@ fn persist_lexical_rebuild_equivalence_evidence(
     })
 }
 
+fn persist_lexical_rebuild_publish_artifacts(
+    index_path: &Path,
+    rebuild_state: &LexicalRebuildState,
+    total_conversations: usize,
+    final_observed_messages: usize,
+    indexed_docs: usize,
+    equivalence_evidence: &LexicalRebuildEquivalenceEvidence,
+) -> Result<()> {
+    tracing::info!(
+        document_count = equivalence_evidence.document_count,
+        manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
+        golden_query_digest = equivalence_evidence.golden_query_digest.as_str(),
+        golden_probe_count = equivalence_evidence.golden_query_hit_counts.len(),
+        golden_query_hit_total = equivalence_evidence
+            .golden_query_hit_counts
+            .iter()
+            .map(|hit| hit.hit_count)
+            .sum::<u64>(),
+        indexed_docs,
+        total_conversations,
+        processed_conversations = rebuild_state.processed_conversations,
+        "lexical rebuild authoritative equivalence evidence"
+    );
+    persist_lexical_rebuild_equivalence_evidence(index_path, equivalence_evidence)?;
+
+    let manifest_now_ms = lexical_generation::now_ms();
+    let generation_fingerprint_head = rebuild_state
+        .db
+        .storage_fingerprint
+        .get(..16)
+        .unwrap_or(rebuild_state.db.storage_fingerprint.as_str());
+    let generation_id = format!("gen-{manifest_now_ms:016x}-{generation_fingerprint_head}");
+    let attempt_id = format!("attempt-{manifest_now_ms:016x}");
+    let mut generation_manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
+        generation_id.clone(),
+        attempt_id.clone(),
+        rebuild_state.db.storage_fingerprint.clone(),
+        manifest_now_ms,
+    );
+    generation_manifest.conversation_count = u64::try_from(total_conversations).unwrap_or(u64::MAX);
+    generation_manifest.message_count = u64::try_from(final_observed_messages).unwrap_or(u64::MAX);
+    generation_manifest.indexed_doc_count = u64::try_from(indexed_docs).unwrap_or(u64::MAX);
+    generation_manifest.equivalence_manifest_fingerprint =
+        Some(equivalence_evidence.manifest_fingerprint.clone());
+    generation_manifest.transition_build(
+        lexical_generation::LexicalGenerationBuildState::Built,
+        manifest_now_ms,
+    );
+    generation_manifest.transition_build(
+        lexical_generation::LexicalGenerationBuildState::Validated,
+        manifest_now_ms,
+    );
+    generation_manifest.transition_publish(
+        lexical_generation::LexicalGenerationPublishState::Published,
+        manifest_now_ms,
+    );
+    lexical_generation::store_manifest(index_path, &generation_manifest).with_context(|| {
+        format!(
+            "persisting lexical generation manifest for published generation {} at {}",
+            generation_id,
+            index_path.display()
+        )
+    })?;
+    tracing::info!(
+        generation_id = generation_id.as_str(),
+        attempt_id = attempt_id.as_str(),
+        conversation_count = generation_manifest.conversation_count,
+        message_count = generation_manifest.message_count,
+        indexed_doc_count = generation_manifest.indexed_doc_count,
+        source_db_fingerprint = generation_manifest.source_db_fingerprint.as_str(),
+        equivalence_manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
+        "lexical generation manifest published"
+    );
+    Ok(())
+}
+
 // Lexical-rebuild batching defaults are tuned for cold rebuilds over tens of
 // thousands of conversations on a developer workstation (~512MB tantivy heap,
 // 4 writer threads). Raise via env vars on constrained hosts or when a corpus
@@ -10935,6 +11011,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
     let mut final_merge_input_artifacts: Option<Vec<LexicalRebuildShardMergeArtifact>> = None;
+    let mut equivalence_accumulator = LexicalRebuildEquivalenceAccumulator::new();
 
     let refresh_runtime =
         |latest_pipeline_runtime: &mut LexicalRebuildPipelineRuntimeSnapshot,
@@ -11296,6 +11373,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                                 {
                                     max_message_id = max_message_id.max(last_message_id);
                                 }
+                                equivalence_accumulator.absorb_packet(&packet);
                                 current_shard_message_bytes =
                                     current_shard_message_bytes.saturating_add(packet.message_bytes);
                                 current_shard_packets.push(packet);
@@ -11733,11 +11811,21 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         profile.log_summary();
     }
 
+    let equivalence_evidence = equivalence_accumulator.finalize();
+    persist_lexical_rebuild_publish_artifacts(
+        index_path,
+        &rebuild_state,
+        total_conversations,
+        final_observed_messages,
+        indexed_docs,
+        &equivalence_evidence,
+    )?;
+
     Ok(LexicalRebuildOutcome {
         indexed_docs,
         observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
-        equivalence: None,
+        equivalence: Some(equivalence_evidence),
     })
 }
 
@@ -12673,75 +12761,14 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     let equivalence_evidence = equivalence_accumulator.finalize();
-    tracing::info!(
-        document_count = equivalence_evidence.document_count,
-        manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
-        golden_query_digest = equivalence_evidence.golden_query_digest.as_str(),
-        golden_probe_count = equivalence_evidence.golden_query_hit_counts.len(),
-        golden_query_hit_total = equivalence_evidence
-            .golden_query_hit_counts
-            .iter()
-            .map(|hit| hit.hit_count)
-            .sum::<u64>(),
-        indexed_docs,
+    persist_lexical_rebuild_publish_artifacts(
+        &index_path,
+        &rebuild_state,
         total_conversations,
-        processed_conversations,
-        "lexical rebuild authoritative equivalence evidence"
-    );
-    persist_lexical_rebuild_equivalence_evidence(&index_path, &equivalence_evidence)?;
-
-    // Bead ibuuh.30 slice: write a generation manifest alongside the
-    // equivalence ledger. This slice builds in place rather than a scratch
-    // directory, so the final state is directly Validated+Published; a
-    // future slice introduces scratch directories and atomic promotion.
-    let manifest_now_ms = lexical_generation::now_ms();
-    let generation_fingerprint_head = rebuild_state
-        .db
-        .storage_fingerprint
-        .get(..16)
-        .unwrap_or(rebuild_state.db.storage_fingerprint.as_str());
-    let generation_id = format!("gen-{manifest_now_ms:016x}-{generation_fingerprint_head}");
-    let attempt_id = format!("attempt-{manifest_now_ms:016x}");
-    let mut generation_manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
-        generation_id.clone(),
-        attempt_id.clone(),
-        rebuild_state.db.storage_fingerprint.clone(),
-        manifest_now_ms,
-    );
-    generation_manifest.conversation_count = total_conversations as u64;
-    generation_manifest.message_count = final_observed_messages as u64;
-    generation_manifest.indexed_doc_count = indexed_docs as u64;
-    generation_manifest.equivalence_manifest_fingerprint =
-        Some(equivalence_evidence.manifest_fingerprint.clone());
-    generation_manifest.transition_build(
-        lexical_generation::LexicalGenerationBuildState::Built,
-        manifest_now_ms,
-    );
-    generation_manifest.transition_build(
-        lexical_generation::LexicalGenerationBuildState::Validated,
-        manifest_now_ms,
-    );
-    generation_manifest.transition_publish(
-        lexical_generation::LexicalGenerationPublishState::Published,
-        manifest_now_ms,
-    );
-    lexical_generation::store_manifest(&index_path, &generation_manifest).with_context(|| {
-        format!(
-            "persisting lexical generation manifest for published generation {} at {}",
-            generation_id,
-            index_path.display()
-        )
-    })?;
-    tracing::info!(
-        generation_id = generation_id.as_str(),
-        attempt_id = attempt_id.as_str(),
-        conversation_count = generation_manifest.conversation_count,
-        message_count = generation_manifest.message_count,
-        indexed_doc_count = generation_manifest.indexed_doc_count,
-        source_db_fingerprint = generation_manifest.source_db_fingerprint.as_str(),
-        equivalence_manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
-        "lexical generation manifest published"
-    );
+        final_observed_messages,
+        indexed_docs,
+        &equivalence_evidence,
+    )?;
 
     Ok(LexicalRebuildOutcome {
         indexed_docs,
@@ -23621,6 +23648,7 @@ mod tests {
             "1",
         );
 
+        let mut rebuild_equivalence = None;
         let logs = capture_logs(|| {
             let rebuild = rebuild_tantivy_from_db_with_options(
                 &db_path,
@@ -23992,7 +24020,10 @@ mod tests {
             assert_eq!(rebuild.indexed_docs, 30);
             assert_eq!(rebuild.observed_messages, Some(30));
             assert!(rebuild.exact_checkpoint_persisted);
+            rebuild_equivalence = rebuild.equivalence.clone();
         });
+        let evidence = rebuild_equivalence
+            .expect("staged shard rebuild must emit equivalence evidence like the normal path");
 
         assert!(
             logs.contains("staged shard-build path"),
@@ -24020,6 +24051,33 @@ mod tests {
             state.committed_meta_fingerprint.as_deref(),
             index_meta_fingerprint(&index_path).unwrap().as_deref(),
             "completed staged rebuild state should retain the live published meta fingerprint"
+        );
+        let evidence_path = lexical_rebuild_equivalence_evidence_path(&index_path);
+        let persisted_evidence: LexicalRebuildEquivalenceEvidence =
+            serde_json::from_slice(&std::fs::read(&evidence_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_evidence, evidence,
+            "staged shard rebuild must persist the same equivalence evidence it returns"
+        );
+        let manifest = lexical_generation::load_manifest(&index_path)
+            .unwrap()
+            .expect("staged shard rebuild must persist a published generation manifest");
+        assert_eq!(
+            manifest.build_state,
+            lexical_generation::LexicalGenerationBuildState::Validated
+        );
+        assert_eq!(
+            manifest.publish_state,
+            lexical_generation::LexicalGenerationPublishState::Published
+        );
+        assert_eq!(
+            manifest.equivalence_manifest_fingerprint.as_deref(),
+            Some(evidence.manifest_fingerprint.as_str()),
+            "staged shard generation manifest must point at the persisted equivalence evidence"
+        );
+        assert!(
+            logs.contains("lexical generation manifest published"),
+            "expected staged shard path to log generation manifest publish, got:\n{logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 30);
     }
