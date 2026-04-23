@@ -998,9 +998,31 @@ fn upsert_and_get_source() {
     assert_eq!(retrieved.host_label, Some("user@laptop.local".to_string()));
     assert_eq!(retrieved.machine_id, Some("abc123".to_string()));
     assert_eq!(retrieved.platform, Some("linux".to_string()));
-    assert!(retrieved.config_json.is_some());
-    assert!(retrieved.created_at.is_some());
-    assert!(retrieved.updated_at.is_some());
+    // Bead 7k7pl: pin the EXACT seeded config_json value and check
+    // both timestamps are plausible ms-epoch values (not 0 / MIN). A
+    // regression that stored `null` config, clock-zeroed timestamps,
+    // or 1970-epoch would slip past `.is_some()` while breaking
+    // downstream time-based queries.
+    assert_eq!(
+        retrieved.config_json,
+        Some(serde_json::json!({"port": 22})),
+        "seeded config_json must round-trip unchanged"
+    );
+    let created = retrieved
+        .created_at
+        .expect("created_at must be set after upsert");
+    let updated = retrieved
+        .updated_at
+        .expect("updated_at must be set after upsert");
+    // ms-epoch sanity floor: 2001-09-09 (1_000_000_000_000 ms).
+    assert!(
+        created >= 1_000_000_000_000,
+        "created_at must be a plausible ms-epoch value; got {created}"
+    );
+    assert!(
+        updated >= created,
+        "updated_at must be >= created_at; got created={created}, updated={updated}"
+    );
 }
 
 #[test]
@@ -1826,7 +1848,15 @@ fn timeline_json_includes_source_id_field() {
         )
         .unwrap();
 
-    assert!(!result.is_empty(), "should have at least one conversation");
+    // Bead 7k7pl: pin the EXACT count (1). The test seeds exactly
+    // one conversation; a regression that duplicated inserts or
+    // leaked prior state would slip past `!is_empty()` while
+    // silently skewing downstream timeline aggregates.
+    assert_eq!(
+        result.len(),
+        1,
+        "exactly one conversation expected; got {result:?}"
+    );
     let (_, source_id) = &result[0];
     assert_eq!(source_id, "local", "source_id should be 'local'");
 }
@@ -2291,14 +2321,23 @@ fn daily_stats_histogram() {
     // Find day 0 entry
     let day0_id = SqliteStorage::day_id_from_millis(base_ts);
     let day0 = histogram.iter().find(|d| d.day_id == day0_id);
-    assert!(day0.is_some(), "should have day 0 entry");
-    assert_eq!(day0.unwrap().sessions, 3, "day 0 should have 3 sessions");
+    // Bead 7k7pl: collapse `.is_some()` + `.unwrap().sessions == N`
+    // into a single pin that fails loudly on BOTH missing entry and
+    // wrong-count regressions.
+    assert_eq!(
+        day0.map(|d| d.sessions),
+        Some(3),
+        "day 0 must exist with 3 sessions; got {day0:?}"
+    );
 
     // Find day 2 entry
     let day2_id = SqliteStorage::day_id_from_millis(base_ts + (2 * 86400 * 1000));
     let day2 = histogram.iter().find(|d| d.day_id == day2_id);
-    assert!(day2.is_some(), "should have day 2 entry");
-    assert_eq!(day2.unwrap().sessions, 2, "day 2 should have 2 sessions");
+    assert_eq!(
+        day2.map(|d| d.sessions),
+        Some(2),
+        "day 2 must exist with 2 sessions; got {day2:?}"
+    );
 }
 
 #[test]

@@ -131,14 +131,15 @@ fn parity_migration_creates_local_source() {
     let sql_src = sql.get_source("local").unwrap();
     let frank_src = frank.get_source("local").unwrap();
 
-    assert!(sql_src.is_some(), "SqliteStorage should have local source");
-    assert!(
-        frank_src.is_some(),
-        "FrankenStorage should have local source"
-    );
-
-    let s = sql_src.unwrap();
-    let f = frank_src.unwrap();
+    // Bead 7k7pl: pin the EXACT id of the returned source instead of
+    // just "Some". The migration is supposed to seed the well-known
+    // "local" id and must stay in parity between both backends; a
+    // regression that seeded a different id (or a stray empty one)
+    // would slip past `.is_some()`.
+    let s = sql_src.expect("SqliteStorage should have local source");
+    let f = frank_src.expect("FrankenStorage should have local source");
+    assert_eq!(s.id, "local");
+    assert_eq!(f.id, "local");
     assert_eq!(s.id, f.id);
     assert_eq!(s.kind, f.kind);
 }
@@ -1002,7 +1003,12 @@ fn transition_rusqlite_db_readable_by_frankenstorage_basic() {
 
     // Verify sources readable
     let src = frank.get_source("local").unwrap();
-    assert!(src.is_some());
+    // Bead 7k7pl: pin the EXACT id — migration must preserve the
+    // well-known "local" id through the rusqlite→frankensqlite
+    // transition. A regression that renamed the id would slip past
+    // `.is_some()` while silently breaking source lookup by id.
+    let src = src.expect("local source must exist after transition");
+    assert_eq!(src.id, "local");
 }
 
 #[test]
