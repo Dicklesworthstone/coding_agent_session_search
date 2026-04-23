@@ -1,0 +1,49 @@
+{
+  "id": "chatgpt-structured-parts-001",
+  "title": "Structured Parts Fixture",
+  "mapping": {
+    "node-user": {
+      "parent": null,
+      "message": {
+        "author": {
+          "role": "user"
+        },
+        "content": {
+          "parts": [
+            "Leading plain text.",
+            {
+              "content_type": "text",
+              "text": "Structured text block that current parsing does not flatten."
+            },
+            {
+              "content_type": "image_asset_pointer",
+              "asset_pointer": "file-service://asset-structured-001"
+            },
+            "Trailing plain text."
+          ]
+        },
+        "create_time": 1702000000.5
+      }
+    },
+    "node-assistant": {
+      "parent": "node-user",
+      "message": {
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "parts": [
+            {
+              "content_type": "text",
+              "text": "Assistant structured-only block currently drops."
+            }
+          ]
+        },
+        "create_time": 1702000001.5,
+        "metadata": {
+          "model_slug": "gpt-4o"
+        }
+      }
+    }
+  }
+}

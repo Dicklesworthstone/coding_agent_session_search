@@ -380,6 +380,73 @@ fn scan_handles_content_text_field() {
 
 #[test]
 #[serial]
+fn scan_defaults_missing_mapping_role_to_assistant_explicitly() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let conv_dir = root.join("conversations-missing-mapping-role");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let json = r#"{
+        "id": "conv-missing-mapping-role",
+        "mapping": {
+            "node-1": {
+                "parent": null,
+                "message": {
+                    "author": {},
+                    "content": {"parts": ["Role fallback should stay explicit."]},
+                    "create_time": 1700000000.0
+                }
+            }
+        }
+    }"#;
+
+    write_json(&conv_dir, "missing-role.json", json);
+
+    let connector = ChatGptConnector::new();
+    let ctx = ScanContext::local_default(root.to_path_buf(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].messages.len(), 1);
+    assert_eq!(convs[0].messages[0].role, "assistant");
+    assert_eq!(
+        convs[0].messages[0].content,
+        "Role fallback should stay explicit."
+    );
+}
+
+#[test]
+#[serial]
+fn scan_defaults_missing_messages_array_role_to_assistant_explicitly() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let conv_dir = root.join("conversations-missing-array-role");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let json = r#"{
+        "id": "conv-missing-array-role",
+        "messages": [
+            {"content": "Array-role fallback should stay explicit.", "timestamp": 1700000010000}
+        ]
+    }"#;
+
+    write_json(&conv_dir, "missing-array-role.json", json);
+
+    let connector = ChatGptConnector::new();
+    let ctx = ScanContext::local_default(root.to_path_buf(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].messages.len(), 1);
+    assert_eq!(convs[0].messages[0].role, "assistant");
+    assert_eq!(
+        convs[0].messages[0].content,
+        "Array-role fallback should stay explicit."
+    );
+}
+
+#[test]
+#[serial]
 fn scan_joins_multipart_content_from_real_fixture() {
     let root = chatgpt_real_fixture_root();
     let expected_path = root.join("conversations-real/conv-multipart.json");
@@ -399,6 +466,29 @@ fn scan_joins_multipart_content_from_real_fixture() {
         "First paragraph.\nSecond paragraph.\n```rust\nfn main() {}\n```"
     );
     assert_eq!(conv.messages[0].role, "user");
+}
+
+#[test]
+#[serial]
+fn scan_preserves_string_parts_and_drops_object_only_structured_parts_from_real_fixture() {
+    let root = chatgpt_real_fixture_root();
+    let expected_path = root.join("conversations-real/conv-structured-parts.json");
+
+    let connector = ChatGptConnector::new();
+    let ctx = ScanContext::local_default(root.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+    let conv = convs
+        .into_iter()
+        .find(|conv| conv.source_path == expected_path)
+        .expect("structured-parts fixture should be discovered");
+
+    assert_eq!(conv.external_id.as_deref(), Some("chatgpt-structured-parts-001"));
+    assert_eq!(conv.messages.len(), 1);
+    assert_eq!(conv.messages[0].role, "user");
+    assert_eq!(
+        conv.messages[0].content,
+        "Leading plain text.\nTrailing plain text."
+    );
 }
 
 // ============================================================================
