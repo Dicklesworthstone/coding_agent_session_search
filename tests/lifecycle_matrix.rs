@@ -511,6 +511,234 @@ fn cleanup_quarantine_inventory_trace_is_artifact_backed() {
 }
 
 #[test]
+fn derivative_retention_dry_run_keeps_protected_assets_out_of_reclaim_plan() {
+    // Bead ibuuh.19 slice: cleanup must prove its inventory and dry-run
+    // decisions before any destructive reclaim step. This row freezes the
+    // protection set that the real worker must honor: canonical DB,
+    // published generation, pinned semantic/model assets, quarantines, and
+    // active scratch work are retained; only safely superseded derivatives are
+    // reclaimable.
+    let mut harness = SearchAssetSimulationHarness::new(
+        "lifecycle_matrix_derivative_retention_dry_run",
+        LoadScript::new(vec![
+            LoadSample::idle("inventory_scan"),
+            LoadSample::idle("policy_classification"),
+            LoadSample::idle("dry_run_reclaim_plan"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "scan_derivatives")
+        .turn(SimulationActor::LexicalRepair, "classify_retention")
+        .turn(SimulationActor::LexicalRepair, "dry_run_plan");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "scan_derivatives") => {
+                sim.phase(
+                    "cleanup",
+                    "scan derivative assets without deleting canonical or active files",
+                );
+                sim.snapshot_json(
+                    "derivative_inventory",
+                    &json!({
+                        "canonical_db": {
+                            "path": "agent_search.db",
+                            "state": "canonical",
+                            "protected": true,
+                            "reclaimable": false
+                        },
+                        "lexical_generations": [
+                            {"id": "lexical-gen-010", "state": "published", "bytes": 32768},
+                            {"id": "lexical-gen-009", "state": "superseded", "bytes": 16384},
+                            {"id": "lexical-gen-008", "state": "quarantined", "bytes": 8192},
+                            {"id": "lexical-gen-scratch-011", "state": "active_scratch", "bytes": 4096}
+                        ],
+                        "semantic_assets": [
+                            {"id": "semantic-fast-current", "state": "pinned", "bytes": 8192},
+                            {"id": "semantic-quality-old", "state": "superseded", "bytes": 4096}
+                        ],
+                        "model_caches": [
+                            {"id": "fastembed-default", "state": "pinned", "bytes": 65536},
+                            {"id": "fastembed-old", "state": "stale_optional", "bytes": 32768}
+                        ],
+                        "dry_run": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "classify_retention") => {
+                sim.phase(
+                    "cleanup",
+                    "classify retention states before building reclaim plan",
+                );
+                sim.snapshot_json(
+                    "retention_classification",
+                    &json!({
+                        "retained": [
+                            {
+                                "id": "agent_search.db",
+                                "state": "canonical",
+                                "reason": "canonical_sqlite_source_of_truth"
+                            },
+                            {
+                                "id": "lexical-gen-010",
+                                "state": "current_published",
+                                "reason": "published_lexical_generation"
+                            },
+                            {
+                                "id": "lexical-gen-008",
+                                "state": "quarantined",
+                                "reason": "operator_inspection_required"
+                            },
+                            {
+                                "id": "lexical-gen-scratch-011",
+                                "state": "active_scratch",
+                                "reason": "active_or_resumable_work"
+                            },
+                            {
+                                "id": "semantic-fast-current",
+                                "state": "pinned",
+                                "reason": "current_semantic_fast_tier"
+                            },
+                            {
+                                "id": "fastembed-default",
+                                "state": "pinned",
+                                "reason": "current_model_cache"
+                            }
+                        ],
+                        "reclaimable": [
+                            {
+                                "id": "lexical-gen-009",
+                                "state": "superseded",
+                                "bytes": 16384,
+                                "reason": "outside_retention_window"
+                            },
+                            {
+                                "id": "semantic-quality-old",
+                                "state": "superseded",
+                                "bytes": 4096,
+                                "reason": "newer_quality_generation_available"
+                            },
+                            {
+                                "id": "fastembed-old",
+                                "state": "stale_optional",
+                                "bytes": 32768,
+                                "reason": "optional_model_cache_budget"
+                            }
+                        ]
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "dry_run_plan") => {
+                sim.phase(
+                    "cleanup",
+                    "emit dry-run reclaim plan with protected assets excluded",
+                );
+                sim.snapshot_json(
+                    "retention_dry_run_plan",
+                    &json!({
+                        "cleanup_state": "dry_run_complete",
+                        "reclaim_started": false,
+                        "would_prune": [
+                            "lexical-gen-009",
+                            "semantic-quality-old",
+                            "fastembed-old"
+                        ],
+                        "would_retain": [
+                            "agent_search.db",
+                            "lexical-gen-010",
+                            "lexical-gen-008",
+                            "lexical-gen-scratch-011",
+                            "semantic-fast-current",
+                            "fastembed-default"
+                        ],
+                        "reclaimable_bytes": 53248,
+                        "retained_bytes": 118784,
+                        "published_generation_available": true,
+                        "canonical_db_protected": true
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic retention turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "retention dry-run trace should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 3);
+    assert_eq!(summary.actor_traces[0].load.label, "inventory_scan");
+    assert_eq!(summary.actor_traces[1].load.label, "policy_classification");
+    assert_eq!(summary.actor_traces[2].load.label, "dry_run_reclaim_plan");
+
+    for expected in [
+        "001-derivative_inventory.json",
+        "002-retention_classification.json",
+        "003-retention_dry_run_plan.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing retention dry-run snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write retention dry-run artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let plan_path = artifacts
+        .snapshot_dir
+        .join("003-retention_dry_run_plan.json");
+    let plan_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&plan_path).expect("read retention dry-run plan"),
+    )
+    .expect("retention dry-run plan JSON");
+
+    let would_prune = plan_json["would_prune"]
+        .as_array()
+        .expect("would_prune is an array");
+    let would_retain = plan_json["would_retain"]
+        .as_array()
+        .expect("would_retain is an array");
+
+    for protected in [
+        "agent_search.db",
+        "lexical-gen-010",
+        "lexical-gen-008",
+        "lexical-gen-scratch-011",
+        "semantic-fast-current",
+        "fastembed-default",
+    ] {
+        assert!(
+            would_retain
+                .iter()
+                .any(|item| item.as_str() == Some(protected)),
+            "protected asset {protected} must appear in would_retain"
+        );
+        assert!(
+            would_prune
+                .iter()
+                .all(|item| item.as_str() != Some(protected)),
+            "protected asset {protected} must not appear in would_prune"
+        );
+    }
+
+    assert_eq!(plan_json["cleanup_state"], "dry_run_complete");
+    assert_eq!(plan_json["reclaim_started"], false);
+    assert_eq!(plan_json["canonical_db_protected"], true);
+    assert_eq!(plan_json["published_generation_available"], true);
+    assert_eq!(plan_json["reclaimable_bytes"], 53248);
+}
+
+#[test]
 fn api_and_contract_versions_agree_across_capabilities_and_api_version() {
     // Cross-surface invariant: cass ships TWO places where an agent can
     // ask "what api + contract version am I talking to" — the full
@@ -669,4 +897,64 @@ fn health_and_diag_agree_on_db_and_index_presence() {
         !health_db_exists && !health_index_exists,
         "isolated empty HOME should report DB and index as absent; got db={health_db_exists}, index={health_index_exists}"
     );
+}
+
+#[test]
+fn health_status_and_healthy_flag_are_internally_consistent() {
+    // Internal-consistency row of the lifecycle matrix: within a single
+    // `cass health --json` payload the three top-level fields
+    // (status/healthy/initialized) MUST agree according to the robot-mode
+    // contract. A silent drift where e.g. status="healthy" but
+    // healthy=false breaks every agent branching on either field alone.
+    //
+    // Documented contract (from run_health / robot-docs):
+    //   healthy == true  <=> status is a "healthy/ok"-family string
+    //   initialized == false => status == "not_initialized" (and healthy=false)
+    //   healthy == false requires a non-empty errors array OR non-healthy status
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let status = health["status"].as_str().expect("status is string");
+    let healthy = health["healthy"].as_bool().expect("healthy is bool");
+    let initialized = health["initialized"]
+        .as_bool()
+        .expect("initialized is bool");
+    let errors_len = health["errors"]
+        .as_array()
+        .expect("errors is array")
+        .len();
+
+    if !initialized {
+        assert_eq!(
+            status, "not_initialized",
+            "initialized=false but status is {status:?} (expected \"not_initialized\")"
+        );
+        assert!(
+            !healthy,
+            "initialized=false but healthy=true — impossible per robot-mode contract"
+        );
+    }
+
+    let healthy_family = matches!(status, "healthy" | "ok");
+    assert_eq!(
+        healthy_family, healthy,
+        "status={status:?} and healthy={healthy} — status is {} a healthy-family string but healthy is {healthy}",
+        if healthy_family { "" } else { "not" }
+    );
+
+    if !healthy {
+        assert!(
+            errors_len > 0 || status != "healthy",
+            "healthy=false but status={status:?} with empty errors array — no explanation surface"
+        );
+    }
 }
