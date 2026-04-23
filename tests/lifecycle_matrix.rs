@@ -958,6 +958,52 @@ fn health_status_and_healthy_flag_are_internally_consistent() {
 }
 
 #[test]
+fn health_and_status_agree_on_readiness_contract() {
+    // Cross-surface row: `cass health --json` is the fast preflight
+    // surface, while `cass status --json` is the richer operator surface.
+    // For an isolated HOME, both must agree on readiness booleans and the
+    // basic artifact-presence facts that agents branch on before search.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let health = json_out(test_home.path(), &["health", "--json"]);
+    let status = json_out(test_home.path(), &["status", "--json"]);
+
+    assert_eq!(
+        health["initialized"], status["initialized"],
+        "health.initialized and status.initialized diverged"
+    );
+    assert_eq!(
+        health["healthy"], status["healthy"],
+        "health.healthy and status.healthy diverged"
+    );
+    assert_eq!(
+        health["db"]["exists"], status["database"]["exists"],
+        "health.db.exists and status.database.exists diverged"
+    );
+    assert_eq!(
+        health["state"]["index"]["exists"], status["index"]["exists"],
+        "health.state.index.exists and status.index.exists diverged"
+    );
+    assert_eq!(
+        health["recommended_action"], status["recommended_action"],
+        "health.recommended_action and status.recommended_action diverged"
+    );
+}
+
+#[test]
 fn semantic_readiness_reports_lexical_fallback_when_models_absent() {
     // ibuuh.11 contract row: 'Bootstrap semantic assets and verify live
     // default-hybrid behavior'. The core fail-open contract: when the
