@@ -302,10 +302,10 @@ Powered by [FrankenTUI (ftui)](https://github.com/Dicklesworthstone/frankentui) 
 
 ### 📄 HTML Session Export
 
-Export conversations as beautiful, self-contained HTML files with optional encryption:
+Export conversations as styled, portable HTML files with optional encryption:
 
-- **Self-Contained**: All CSS and JS inlined for offline viewing—no external dependencies required
-- **Progressive Enhancement**: CDN resources (Tailwind, Prism.js) enhance styling when online, graceful fallback when offline
+- **Mostly Self-Contained**: Critical structural CSS and the export payload are inlined directly; the file opens without a local web server. Tailwind's utility CSS runtime (`@tailwindcss/browser`) and Prism.js syntax-highlighting assets are loaded from `cdn.jsdelivr.net` for full fidelity.
+- **Progressive Enhancement / Graceful Degradation**: Prism.js resources fall back via `onerror="...no-prism"` — code blocks remain readable offline in plain monospace. Tailwind CDN does not currently have a built-in fallback: layout utilities require network on first open (the page is still legible but unstyled). Air-gapped archival users should note this limitation.
 - **Password Protection**: AES-256-GCM encryption with PBKDF2 key derivation (600,000 iterations)—opens directly in any browser
 - **Rich Styling**: Dark/light themes, syntax-highlighted code blocks, collapsible tool calls
 - **Print-Friendly**: Optimized print styles with page breaks and footers
