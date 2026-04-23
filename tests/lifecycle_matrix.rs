@@ -3426,3 +3426,145 @@ fn idle_rebuild_block_collapses_metadata_and_has_actionable_recommendation() {
         "healthy=false but recommended_action is empty — operator has no actionable guidance; retention leaving the system in this state must provide a path forward"
     );
 }
+
+#[test]
+fn doctor_dry_run_is_read_only_and_counters_agree_with_checks() {
+    // ibuuh.19 doctor retention-safety row. `cass doctor --json`
+    // without --fix is the canonical read-only retention inspection
+    // surface. This row pins four invariants the retention layer
+    // relies on:
+    //
+    //   A. Read-only safety: without --fix, doctor MUST NOT apply
+    //      any destructive action:
+    //          auto_fix_applied = false
+    //          auto_fix_actions = []  (empty array)
+    //          issues_fixed     = 0
+    //      A retention engine consuming doctor output trusts this
+    //      contract — if doctor silently applied fixes, retention
+    //      plans would see an already-mutated state tree and
+    //      misclassify what's still reclaimable.
+    //
+    //   B. Derived-value consistency: the counters must equal the
+    //      counts of the corresponding checks[].status values.
+    //          warnings = count(status == "warn")
+    //          failures = count(status == "fail")
+    //          issues_found = warnings + failures
+    //      Drift between counters and check results would make
+    //      retention escalation decisions use stale aggregates.
+    //
+    //   C. Manifest integrity: checks[].name values are unique.
+    //      Two checks with the same name would produce ambiguous
+    //      retention triggers (which check's fix_available applies?).
+    //
+    //   D. Cross-command agreement: doctor.status/healthy/
+    //      recommended_action must match `cass status --json`'s
+    //      matching fields. Retention may consult either command
+    //      during triage; divergent top-level verdict would send
+    //      retention into a different escalation branch depending
+    //      on which CLI ran.
+    //
+    // First lifecycle-matrix coverage of `cass doctor --json`.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        assert!(
+            out.status.success(),
+            "cass {args:?} exited non-zero; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let doctor = json_out(test_home.path(), &["doctor", "--json"]);
+    let status = json_out(test_home.path(), &["status", "--json"]);
+
+    // Invariant A: read-only safety.
+    let applied = doctor["auto_fix_applied"]
+        .as_bool()
+        .expect("doctor.auto_fix_applied must be a bool");
+    assert!(
+        !applied,
+        "doctor --json (no --fix) reported auto_fix_applied=true — destructive action silently taken without operator opt-in"
+    );
+    let actions = doctor["auto_fix_actions"]
+        .as_array()
+        .expect("doctor.auto_fix_actions must be an array");
+    assert!(
+        actions.is_empty(),
+        "doctor --json (no --fix) has non-empty auto_fix_actions {actions:?} — destructive actions applied silently"
+    );
+    let fixed = doctor["issues_fixed"]
+        .as_u64()
+        .expect("doctor.issues_fixed must be u64");
+    assert_eq!(
+        fixed, 0,
+        "doctor --json (no --fix) reports issues_fixed={fixed} — cannot have fixed issues without applying any fix"
+    );
+
+    // Invariant B: counter/check derived-value consistency.
+    let checks = doctor["checks"]
+        .as_array()
+        .expect("doctor.checks must be an array");
+    let warn_count = checks
+        .iter()
+        .filter(|c| c["status"].as_str() == Some("warn"))
+        .count() as u64;
+    let fail_count = checks
+        .iter()
+        .filter(|c| c["status"].as_str() == Some("fail"))
+        .count() as u64;
+    let warnings = doctor["warnings"]
+        .as_u64()
+        .expect("doctor.warnings must be u64");
+    let failures = doctor["failures"]
+        .as_u64()
+        .expect("doctor.failures must be u64");
+    let issues_found = doctor["issues_found"]
+        .as_u64()
+        .expect("doctor.issues_found must be u64");
+    assert_eq!(
+        warnings, warn_count,
+        "doctor.warnings={warnings} != count(checks[].status==warn)={warn_count} — aggregate drifted from component"
+    );
+    assert_eq!(
+        failures, fail_count,
+        "doctor.failures={failures} != count(checks[].status==fail)={fail_count} — aggregate drifted from component"
+    );
+    assert_eq!(
+        issues_found,
+        warnings + failures,
+        "doctor.issues_found={issues_found} != warnings+failures={} — retention escalation aggregates diverge from their components",
+        warnings + failures
+    );
+
+    // Invariant C: manifest integrity (unique check names).
+    let mut names: Vec<&str> = checks
+        .iter()
+        .map(|c| c["name"].as_str().expect("checks[].name must be a string"))
+        .collect();
+    names.sort();
+    let mut dedup = names.clone();
+    dedup.dedup();
+    assert_eq!(
+        names.len(),
+        dedup.len(),
+        "duplicate checks[].name in doctor manifest {names:?} — ambiguous fix_available triggers"
+    );
+
+    // Invariant D: cross-command agreement.
+    for key in ["status", "healthy", "recommended_action"] {
+        assert_eq!(
+            doctor[key], status[key],
+            "doctor.{key} and status.{key} diverged — retention triage would take different escalation branches depending on which command ran"
+        );
+    }
+}
