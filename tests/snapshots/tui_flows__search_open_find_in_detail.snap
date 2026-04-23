@@ -2,10 +2,11 @@
 source: tests/tui_flows.rs
 expression: "flow_snapshot(&app, \"search_open_find_in_detail\", \"login <SearchCompleted:1 hit> <Enter> / error <Enter>\")"
 ---
-flow: search_open_find_in_detail
-keys: login <SearchCompleted:1 hit> <Enter> / error <Enter>
-state: query="login" detail_open=true detail_tab=Messages find_query="error" palette_visible=false theme_dark=true status="Loaded 1 results in 7ms"
---- frame ---
+FLOW: search_open_find_in_detail
+-----
+KEYS: login <SearchCompleted:1 hit> <Enter> / error <Enter>
+STATE: query="login" detail_open=true detail_tab=Messages find_query="error" palette_visible=false theme_dark=true status="Loaded 1 results in 7ms"
+FINAL_FRAME:
  ▐ Search ▌  · Analytics   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=
 ╭╭ Detail · Messages ↩ ───────────────────────────────────────────────────────────────────────────╮╮
 ││  ▐Messages▌  │  Snippets  │  Raw  │  Json  │  Analytics  │  Export                             ││

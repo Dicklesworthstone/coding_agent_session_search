@@ -2,10 +2,11 @@
 source: tests/tui_flows.rs
 expression: "flow_snapshot(&app, \"keystroke_driven_command_palette\", \"<Ctrl-P> theme <Enter>\")"
 ---
-flow: keystroke_driven_command_palette
-keys: <Ctrl-P> theme <Enter>
-state: query="" detail_open=false detail_tab=Messages find_query="<none>" palette_visible=false theme_dark=false status="Theme: Daylight"
---- frame ---
+FLOW: keystroke_driven_command_palette
+-----
+KEYS: <Ctrl-P> theme <Enter>
+STATE: query="" detail_open=false detail_tab=Messages find_query="<none>" palette_visible=false theme_dark=false status="Theme: Daylight"
+FINAL_FRAME:
  ▐ Search ▌  · Analytics   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=
 ╭ ██ cass · Daylight · Hybrid · Standard ─────────────────╭──────────────────────────────────────╮─╮
 │ ?? │ Search sessions, messages, code across all agents… │ i Theme: Daylight                    │ │

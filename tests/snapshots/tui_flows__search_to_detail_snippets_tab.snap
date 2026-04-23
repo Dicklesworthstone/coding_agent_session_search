@@ -2,10 +2,11 @@
 source: tests/tui_flows.rs
 expression: "flow_snapshot(&app, \"search_to_detail_snippets_tab\", \"authentication <SearchCompleted:1 hit> <Enter> <Tab>\")"
 ---
-flow: search_to_detail_snippets_tab
-keys: authentication <SearchCompleted:1 hit> <Enter> <Tab>
-state: query="authentication" detail_open=true detail_tab=Snippets find_query="authentication" palette_visible=false theme_dark=true status="Loaded 1 results in 7ms"
---- frame ---
+FLOW: search_to_detail_snippets_tab
+-----
+KEYS: authentication <SearchCompleted:1 hit> <Enter> <Tab>
+STATE: query="authentication" detail_open=true detail_tab=Snippets find_query="authentication" palette_visible=false theme_dark=true status="Loaded 1 results in 7ms"
+FINAL_FRAME:
  ▐ Search ▌  · Analytics   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  Ctrl+P=palette  F1=
 ╭╭ Detail · Snippets ↩ ───────────────────────────────────────────────────────────────────────────╮╮
 ││  Messages  │  ▐Snippets▌  │  Raw  │  Json  │  Analytics  │  Export                             ││
