@@ -3452,6 +3452,28 @@ impl LexicalRebuildPerfProfile {
     }
 }
 
+fn log_lexical_rebuild_prep_profile_step(
+    rebuild_started: Option<Instant>,
+    step_started: Instant,
+    step: &str,
+) {
+    if let Some(rebuild_started) = rebuild_started {
+        let step_ms = step_started.elapsed().as_millis() as u64;
+        let total_ms = rebuild_started.elapsed().as_millis() as u64;
+        eprintln!(
+            "CASS_PREP_PROFILE step={step} step_ms={} total_ms={}",
+            step_ms, total_ms
+        );
+        tracing::info!(
+            component = "main",
+            step,
+            step_ms,
+            total_ms,
+            "lexical rebuild prep profile"
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LexicalRebuildDbState {
@@ -11126,6 +11148,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     total_conversations: usize,
     progress: Option<Arc<IndexingProgress>>,
     options: LexicalRebuildStartupOptions,
+    prep_profile_started: Option<Instant>,
     storage: FrankenStorage,
     mut rebuild_state: LexicalRebuildState,
     shard_plan: LexicalShardPlan,
@@ -11144,7 +11167,13 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     mut perf_profile: Option<LexicalRebuildPerfProfile>,
     rebuild_profile_started: Option<Instant>,
 ) -> Result<LexicalRebuildOutcome> {
+    let persist_initial_checkpoint_started = Instant::now();
     persist_lexical_rebuild_state_for_active_run_start(index_path, &rebuild_state)?;
+    log_lexical_rebuild_prep_profile_step(
+        prep_profile_started,
+        persist_initial_checkpoint_started,
+        "persist_initial_checkpoint",
+    );
 
     if let Some(p) = &progress {
         p.phase.store(2, Ordering::Relaxed);
@@ -12387,6 +12416,7 @@ fn rebuild_tantivy_from_db_with_options(
             total_conversations,
             progress,
             options,
+            prep_profile.then_some(prep_started),
             storage,
             rebuild_state,
             shard_plan.clone(),
@@ -25134,6 +25164,7 @@ mod tests {
         )
         .unwrap();
 
+        let _prep_profile = set_env("CASS_PREP_PROFILE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
         let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
         let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
@@ -25163,6 +25194,49 @@ mod tests {
         assert!(
             logs.contains("discarding non-resumable staged lexical rebuild checkpoint"),
             "expected staged checkpoint reset log, got:\n{logs}"
+        );
+        for needle in [
+            r#"step="restart_from_zero_reset""#,
+            r#"step="plan_lexical_shards""#,
+            r#"step="start_packet_producer""#,
+            r#"step="persist_initial_checkpoint""#,
+            r#"step="first_batch_handoff""#,
+        ] {
+            assert!(
+                logs.contains(needle),
+                "expected staged restart prep-profile log fragment `{needle}`, got:\n{logs}"
+            );
+        }
+        let restart_from_zero_reset = logs
+            .find(r#"step="restart_from_zero_reset""#)
+            .expect("restart_from_zero_reset log position");
+        let plan_lexical_shards = logs
+            .find(r#"step="plan_lexical_shards""#)
+            .expect("plan_lexical_shards log position");
+        let start_packet_producer = logs
+            .find(r#"step="start_packet_producer""#)
+            .expect("start_packet_producer log position");
+        let persist_initial_checkpoint = logs
+            .find(r#"step="persist_initial_checkpoint""#)
+            .expect("persist_initial_checkpoint log position");
+        let first_batch_handoff = logs
+            .find(r#"step="first_batch_handoff""#)
+            .expect("first_batch_handoff log position");
+        assert!(
+            restart_from_zero_reset < plan_lexical_shards,
+            "restart-from-zero rebuild should clear stale checkpoint state before replanning staged shards: {logs}"
+        );
+        assert!(
+            plan_lexical_shards < start_packet_producer,
+            "restart-from-zero rebuild should finish shard planning before producer startup overlap: {logs}"
+        );
+        assert!(
+            start_packet_producer < persist_initial_checkpoint,
+            "restart-from-zero staged rebuild should overlap producer startup before persisting the fresh startup checkpoint: {logs}"
+        );
+        assert!(
+            persist_initial_checkpoint < first_batch_handoff,
+            "restart-from-zero rebuild must persist the fresh startup checkpoint before the producer hands off its first batch: {logs}"
         );
         let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
             .unwrap()
