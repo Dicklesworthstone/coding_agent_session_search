@@ -437,6 +437,11 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub blocked_reasons: Vec<String>,
     #[serde(default)]
     pub active_generation_ids: Vec<String>,
+    #[serde(default)]
+    pub protected_generation_ids: Vec<String>,
+    pub protected_retained_bytes: u64,
+    pub inspection_required_count: usize,
+    pub inspection_required_retained_bytes: u64,
     pub inspection_required_generation_ids: Vec<String>,
 }
 
@@ -537,6 +542,8 @@ impl LexicalCleanupDryRunPlan {
             ));
             blocker_codes.push(LexicalCleanupApplyBlocker::ActiveGenerationWork);
         }
+        let inspection_required_generation_ids = self.inspection_required_generation_ids();
+        let inspection_required_retained_bytes = self.inspection_required_retained_bytes();
 
         LexicalCleanupApplyGate {
             apply_allowed: blocked_reasons.is_empty(),
@@ -552,7 +559,11 @@ impl LexicalCleanupDryRunPlan {
             blocker_codes,
             blocked_reasons,
             active_generation_ids: self.active_generation_ids.clone(),
-            inspection_required_generation_ids: self.inspection_required_generation_ids(),
+            protected_generation_ids: self.protected_generation_ids.clone(),
+            protected_retained_bytes: self.protected_retained_bytes,
+            inspection_required_count: self.inspection_items.len(),
+            inspection_required_retained_bytes,
+            inspection_required_generation_ids,
         }
     }
 
@@ -564,6 +575,12 @@ impl LexicalCleanupDryRunPlan {
             }
         }
         generation_ids
+    }
+
+    pub(crate) fn inspection_required_retained_bytes(&self) -> u64 {
+        self.inspection_items.iter().fold(0u64, |total, item| {
+            total.saturating_add(item.retained_bytes)
+        })
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
@@ -2457,6 +2474,13 @@ mod tests {
             blocked.inspection_required_generation_ids,
             vec!["gen-quarantined".to_string()]
         );
+        assert_eq!(blocked.inspection_required_count, 1);
+        assert_eq!(blocked.inspection_required_retained_bytes, 512);
+        assert_eq!(
+            blocked.protected_generation_ids,
+            vec!["gen-active".to_string(), "gen-quarantined".to_string()]
+        );
+        assert_eq!(blocked.protected_retained_bytes, 2560);
         assert!(
             blocked
                 .blocked_reasons
@@ -2518,6 +2542,10 @@ mod tests {
         assert!(allowed.apply_allowed);
         assert!(allowed.blocker_codes.is_empty());
         assert!(allowed.active_generation_ids.is_empty());
+        assert!(allowed.protected_generation_ids.is_empty());
+        assert_eq!(allowed.protected_retained_bytes, 0);
+        assert_eq!(allowed.inspection_required_count, 0);
+        assert_eq!(allowed.inspection_required_retained_bytes, 0);
         assert!(allowed.blocked_reasons.is_empty());
         assert_eq!(
             allowed.approval_fingerprint_status,
@@ -2540,6 +2568,13 @@ mod tests {
         assert_eq!(allowed_json["approval_fingerprint_status"], "matched");
         assert_eq!(allowed_json["blocker_codes"], serde_json::json!([]));
         assert_eq!(allowed_json["active_generation_ids"], serde_json::json!([]));
+        assert_eq!(
+            allowed_json["protected_generation_ids"],
+            serde_json::json!([])
+        );
+        assert_eq!(allowed_json["protected_retained_bytes"], 0);
+        assert_eq!(allowed_json["inspection_required_count"], 0);
+        assert_eq!(allowed_json["inspection_required_retained_bytes"], 0);
         assert_eq!(
             allowed_json["candidate_previews"][0]["generation_id"],
             "gen-old"
@@ -2582,6 +2617,13 @@ mod tests {
             no_candidates.blocker_codes,
             vec![LexicalCleanupApplyBlocker::NoReclaimableCandidates]
         );
+        assert_eq!(
+            no_candidates.protected_generation_ids,
+            vec!["gen-quarantined".to_string()]
+        );
+        assert_eq!(no_candidates.protected_retained_bytes, 512);
+        assert_eq!(no_candidates.inspection_required_count, 1);
+        assert_eq!(no_candidates.inspection_required_retained_bytes, 512);
     }
 
     #[test]
