@@ -418,6 +418,19 @@ fn capabilities_json_matches_golden() {
 }
 
 #[test]
+fn capabilities_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let capabilities = capture_robot_json_value(
+        test_home.path(),
+        &["capabilities", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical = serde_json::to_string_pretty(&json_value_schema(&capabilities))
+        .expect("pretty-print JSON");
+    assert_golden("robot/capabilities_shape.json.golden", &canonical);
+}
+
+#[test]
 fn models_status_json_matches_golden() {
     // `cass models status --json` reads XDG_DATA_HOME for the model cache
     // directory. In our isolated test home the cache is always empty, so

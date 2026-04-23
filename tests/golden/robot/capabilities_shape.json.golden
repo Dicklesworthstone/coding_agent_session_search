@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "crate_version": {
+      "type": "string"
+    },
+    "api_version": {
+      "type": "integer"
+    },
+    "contract_version": {
+      "type": "string"
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_limit": {
+          "type": "integer"
+        },
+        "max_content_length": {
+          "type": "integer"
+        },
+        "max_fields": {
+          "type": "integer"
+        },
+        "max_agg_buckets": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}
