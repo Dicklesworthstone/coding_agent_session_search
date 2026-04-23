@@ -198,16 +198,18 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 
-### 🧠 Optional Semantic Search (Local, No Network)
-- **Local-only**: Uses a MiniLM model via FastEmbed; no cloud calls.
-- **Manual install**: Place model files under your data directory (see below); cass will not auto-download.
-- **Required files** (all must be present):
+### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
+- **Local inference**: Uses a MiniLM model via FastEmbed. Once the model is installed, no network traffic is required to answer queries; the model runs entirely on-device.
+- **Opt-in acquisition**: `cass models install` downloads the MiniLM model (~90 MB) from Hugging Face on explicit request and verifies checksums. Nothing is fetched until you run the install command.
+- **Air-gapped install**: `cass models install --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
+- **Required files** (all must be present after install; `cass models verify` checks them):
   - `model.onnx`
   - `tokenizer.json`
   - `config.json`
   - `special_tokens_map.json`
   - `tokenizer_config.json`
 - **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
+- **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
 
 #### Hash Embedder Fallback
 
@@ -2446,28 +2448,40 @@ Summary: 6 passed, 1 warning, 0 failed
 Commands for managing the semantic search ML model:
 
 ```bash
-# Check current model status
+# Check current model status (abbreviated schema — real output also
+# includes cache_lifecycle, files[], revision, license, and more):
 cass models status --json
-# → { "installed": true, "model": "all-MiniLM-L6-v2", "size_bytes": 91234567 }
+# → {
+#     "model_id": "all-minilm-l6-v2",
+#     "model_dir": "~/.local/share/coding-agent-search/models/all-MiniLM-L6-v2",
+#     "installed": false,
+#     "state": "not_acquired",
+#     "state_detail": "model not acquired (user consent required); missing ...",
+#     "next_step": "Run `cass models install`, or keep using lexical search.",
+#     "lexical_fail_open": true,
+#     "revision": "c9745ed1...",
+#     "license": "Apache-2.0",
+#     "total_size_bytes": 90872535,
+#     "installed_size_bytes": 0,
+#     "observed_file_bytes": 0,
+#     "policy_source": "semantic_policy"
+#   }
 
-# Install model (downloads ~90MB)
+# Install model (downloads ~90MB from Hugging Face on explicit request)
 cass models install
 # → Downloads from Hugging Face, verifies checksum
 
-# Install from local file (air-gapped environments)
-cass models install --from-file /path/to/model.tar.gz
+# Install from local directory (air-gapped environments)
+cass models install --from-file /path/to/model-dir
 
 # Verify model integrity
 cass models verify --json
-# → Checks all required files exist with correct checksums
-
-# Repair corrupted installation
-cass models verify --repair
-# → Re-downloads missing or corrupted files
+# → all_valid bool + per-file SHA-256 checks (see `cass models verify --help`)
 
 # Check for model updates
 cass models check-update --json
-# → Compares local version with latest available
+# → { "update_available": bool, "reason": str,
+#     "current_revision": str|null, "latest_revision": str }
 ```
 
 **Model Files** (stored in `$CASS_DATA_DIR/models/all-MiniLM-L6-v2/`):
