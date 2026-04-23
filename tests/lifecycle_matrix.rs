@@ -2992,3 +2992,93 @@ fn model_dir_lives_under_canonical_models_parent() {
         "model_dir ({model_dir}) and index_path ({index_path}) overlap — retention jurisdictions must be disjoint"
     );
 }
+
+#[test]
+fn semantic_not_initialized_collapses_readiness_and_path_fields() {
+    // ibuuh.19 retention post-reclamation coherence row.
+    //
+    // When the semantic subsystem is in state "not_initialized"
+    // (which is exactly the state retention leaves it in after
+    // reclaiming model caches), every readiness bool must be false
+    // and every nullable asset path must actually be null. Other
+    // lifecycle rows pin shape (string-or-null types) and cross-
+    // surface fallback agreement, but nothing currently asserts the
+    // *collapse*: that retention reclamation cannot leave half-state
+    // such as `hnsw_ready=true` + `hnsw_path=null`, or
+    // `model_dir=null` + `embedder_id="all-minilm..."`, which would
+    // mean the semantic subsystem is reporting itself as partially
+    // ready with no backing assets.
+    //
+    // Invariants under status="not_initialized":
+    //
+    //   A. available=false, can_search=false, hnsw_ready=false,
+    //      progressive_ready=false (no readiness bool stays true)
+    //   B. embedder_id=null, vector_index_path=null, model_dir=null,
+    //      hnsw_path=null (no asset-path field stays non-null)
+    //   C. fallback_mode="lexical" (fail-open promise holds after
+    //      reclamation)
+    //   D. availability=="not_initialized" (the top-level availability
+    //      string must mirror status — these are two fields intended
+    //      to agree so retention/acquisition code can read either
+    //      without divergence)
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let sem = &health["state"]["semantic"];
+    assert!(sem.is_object(), "state.semantic must be an object");
+
+    // Precondition: isolated HOME ⇒ status must be not_initialized.
+    let status = sem["status"]
+        .as_str()
+        .expect("state.semantic.status must be a string");
+    assert_eq!(
+        status, "not_initialized",
+        "isolated HOME unexpectedly reports state.semantic.status={status}"
+    );
+
+    // Invariant A: every readiness bool collapses to false.
+    for key in ["available", "can_search", "hnsw_ready", "progressive_ready"] {
+        let v = sem[key]
+            .as_bool()
+            .unwrap_or_else(|| panic!("state.semantic.{key} must be bool; got {:?}", sem[key]));
+        assert!(
+            !v,
+            "status=not_initialized but state.semantic.{key}=true — retention reclamation left semantic subsystem in half-ready state"
+        );
+    }
+
+    // Invariant B: every nullable asset-path field is actually null.
+    for key in ["embedder_id", "vector_index_path", "model_dir", "hnsw_path"] {
+        let v = &sem[key];
+        assert!(
+            v.is_null(),
+            "status=not_initialized but state.semantic.{key}={v:?} — semantic subsystem reports an asset path without a loaded model"
+        );
+    }
+
+    // Invariant C: fallback_mode is lexical (fail-open after reclaim).
+    let fallback = sem["fallback_mode"]
+        .as_str()
+        .expect("state.semantic.fallback_mode must be a string");
+    assert_eq!(
+        fallback, "lexical",
+        "status=not_initialized but fallback_mode={fallback} — the fail-open promise must hold after retention reclaims the model cache"
+    );
+
+    // Invariant D: availability mirrors status.
+    let availability = sem["availability"]
+        .as_str()
+        .expect("state.semantic.availability must be a string");
+    assert_eq!(
+        availability, status,
+        "availability ({availability}) diverged from status ({status}) — retention/acquisition code reading either field would see different phases"
+    );
+}
