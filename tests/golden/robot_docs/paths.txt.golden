@@ -1,5 +1,5 @@
 paths:
   data dir default: [TEST_HOME]/coding-agent-search
   db path default: [TEST_HOME]/coding-agent-search/agent_search.db
-  log path: <data-dir>/cass.log (daily rolling)
-  trace: user-provided path (JSONL).
+  log path (cass tui only): <data-dir>/cass.log.YYYY-MM-DD (daily rolling). Non-TUI subcommands emit to stderr; redirect with `2> /path/to/cass.log` or use -v / CASS_TRACE_FILE=<path> for a persistent artifact.
+  trace: CASS_TRACE_FILE=<path> or --trace-file <path> (JSONL, available on every subcommand).
