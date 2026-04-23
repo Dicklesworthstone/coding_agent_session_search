@@ -22467,12 +22467,20 @@ mod tests {
         insert_demo_conversation(&healthy_backup, "backup-1", 0, 1_700_000_000_100);
         insert_demo_conversation(&healthy_backup, "backup-2", 1, 1_700_000_000_200);
 
-        let conn = rusqlite::Connection::open(&canonical_db).unwrap();
-        conn.execute(
+        // Migrated from rusqlite per AGENTS.md Rule 2 + bead uiojh: the
+        // meta row seed is a plain INSERT into a user table (not a
+        // writable_schema path), so fsqlite handles it with no upstream
+        // feature dependency. Opens a FrankenConnection directly against
+        // the file written by SqliteStorage above.
+        let canonical_db_path = canonical_db.to_string_lossy().to_string();
+        let conn = frankensqlite::Connection::open(canonical_db_path).unwrap();
+        conn.execute_compat(
             "INSERT INTO meta(key, value) VALUES(?1, ?2)",
-            rusqlite::params![
-                "historical_bundle_salvaged:test",
-                "{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}"
+            &[
+                ParamValue::from("historical_bundle_salvaged:test"),
+                ParamValue::from(
+                    "{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}",
+                ),
             ],
         )
         .unwrap();
