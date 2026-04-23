@@ -131,6 +131,10 @@ pub(crate) enum RecommendedAction {
     /// The lexical index is missing or quarantined and must be
     /// rebuilt before search can resume.
     RepairLexicalNow,
+    /// A lexical repair is already running. Foreground callers should
+    /// attach or wait boundedly instead of starting another rebuild or
+    /// reporting the semantic tier as the active wait reason.
+    WaitForLexicalRepair,
     /// Lexical search is working; semantic assets are still
     /// converging. Waiting is sufficient.
     WaitForSemanticCatchUp,
@@ -176,20 +180,10 @@ impl ReadinessSnapshot {
                 RecommendedAction::RepairLexicalNow
             }
             LexicalReadinessState::Repairing => {
-                // Mid-repair: waiting is both the correct action AND
-                // what the user would do anyway. Prefer the more
-                // specific semantic hint when relevant.
-                match self.semantic {
-                    SemanticReadinessState::Backfilling | SemanticReadinessState::Absent => {
-                        RecommendedAction::WaitForSemanticCatchUp
-                    }
-                    SemanticReadinessState::PolicyDisabled => {
-                        RecommendedAction::SemanticDisabledByPolicy
-                    }
-                    SemanticReadinessState::FastTierReady | SemanticReadinessState::HybridReady => {
-                        RecommendedAction::NothingRequired
-                    }
-                }
+                // Lexical repair dominates every semantic state: the
+                // foreground contract is attach/wait/fail-open for the
+                // active repair, not a second rebuild or a semantic wait.
+                RecommendedAction::WaitForLexicalRepair
             }
             LexicalReadinessState::StaleButSearchable => RecommendedAction::RefreshLexicalSoon,
             LexicalReadinessState::Ready => match self.semantic {
@@ -295,6 +289,40 @@ mod tests {
     }
 
     #[test]
+    fn recommended_actions_serialize_as_snake_case() {
+        let pairs: &[(RecommendedAction, &str)] = &[
+            (RecommendedAction::NothingRequired, "nothing_required"),
+            (RecommendedAction::RepairLexicalNow, "repair_lexical_now"),
+            (
+                RecommendedAction::WaitForLexicalRepair,
+                "wait_for_lexical_repair",
+            ),
+            (
+                RecommendedAction::WaitForSemanticCatchUp,
+                "wait_for_semantic_catch_up",
+            ),
+            (
+                RecommendedAction::RefreshLexicalSoon,
+                "refresh_lexical_soon",
+            ),
+            (
+                RecommendedAction::SemanticDisabledByPolicy,
+                "semantic_disabled_by_policy",
+            ),
+        ];
+        for (action, expected) in pairs {
+            let expected_json = format!("\"{expected}\"");
+            assert!(
+                matches!(
+                    serde_json::to_string(action).as_deref(),
+                    Ok(actual) if actual == expected_json.as_str()
+                ),
+                "action should serialize as {expected_json}"
+            );
+        }
+    }
+
+    #[test]
     fn recommended_action_missing_lexical_always_repair_now() {
         for sem in [
             SemanticReadinessState::Absent,
@@ -321,6 +349,24 @@ mod tests {
             snap.recommended_action(),
             RecommendedAction::RepairLexicalNow
         );
+    }
+
+    #[test]
+    fn recommended_action_active_lexical_repair_dominates_semantic_state() {
+        for sem in [
+            SemanticReadinessState::Absent,
+            SemanticReadinessState::Backfilling,
+            SemanticReadinessState::FastTierReady,
+            SemanticReadinessState::HybridReady,
+            SemanticReadinessState::PolicyDisabled,
+        ] {
+            let snap = ReadinessSnapshot::new(LexicalReadinessState::Repairing, sem);
+            assert_eq!(
+                snap.recommended_action(),
+                RecommendedAction::WaitForLexicalRepair
+            );
+            assert!(snap.is_searchable());
+        }
     }
 
     #[test]
