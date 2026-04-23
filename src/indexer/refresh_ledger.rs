@@ -173,6 +173,23 @@ pub struct RefreshReadinessMilestones {
     pub time_to_search_ready_ms: Option<u64>,
     pub time_to_full_settled_ms: Option<u64>,
     pub failed_phase: Option<String>,
+    pub search_readiness_state: RefreshSearchReadinessState,
+}
+
+/// Why ordinary search can or cannot see the refreshed lexical asset yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshSearchReadinessState {
+    /// The publish phase completed successfully, so refreshed lexical results
+    /// are visible to search.
+    Published,
+    /// Earlier phases succeeded, but no publish phase has completed yet.
+    #[default]
+    WaitingForPublish,
+    /// A phase before publish failed, so publish was never reached safely.
+    BlockedBeforePublish,
+    /// Publish itself failed, preserving the previous good lexical asset.
+    PublishFailed,
 }
 
 impl Default for RefreshLedger {
@@ -248,6 +265,7 @@ impl RefreshLedger {
                 .failed_phases()
                 .first()
                 .map(|phase| phase.phase.as_str().to_owned()),
+            search_readiness_state: self.search_readiness_state(),
         }
     }
 
@@ -275,6 +293,23 @@ impl RefreshLedger {
             .iter()
             .map(|phase| phase.duration_ms)
             .fold(0u64, u64::saturating_add)
+    }
+
+    fn search_readiness_state(&self) -> RefreshSearchReadinessState {
+        for phase in &self.phases {
+            if !phase.success {
+                return if phase.phase == RefreshPhase::Publish {
+                    RefreshSearchReadinessState::PublishFailed
+                } else {
+                    RefreshSearchReadinessState::BlockedBeforePublish
+                };
+            }
+            if phase.phase == RefreshPhase::Publish {
+                return RefreshSearchReadinessState::Published;
+            }
+        }
+
+        RefreshSearchReadinessState::WaitingForPublish
     }
 }
 
@@ -692,11 +727,16 @@ mod tests {
         assert_eq!(milestones.time_to_search_ready_ms, Some(65));
         assert_eq!(milestones.time_to_full_settled_ms, Some(90));
         assert_eq!(milestones.failed_phase, None);
+        assert_eq!(
+            milestones.search_readiness_state,
+            RefreshSearchReadinessState::Published
+        );
 
         let json = serde_json::to_value(&milestones).unwrap();
         assert_eq!(json["time_to_lexical_ready_ms"], 60);
         assert_eq!(json["time_to_search_ready_ms"], 65);
         assert_eq!(json["time_to_full_settled_ms"], 90);
+        assert_eq!(json["search_readiness_state"], "published");
     }
 
     #[test]
@@ -718,6 +758,55 @@ mod tests {
         assert_eq!(milestones.time_to_search_ready_ms, None);
         assert_eq!(milestones.time_to_full_settled_ms, None);
         assert_eq!(milestones.failed_phase.as_deref(), Some("lexical_rebuild"));
+        assert_eq!(
+            milestones.search_readiness_state,
+            RefreshSearchReadinessState::BlockedBeforePublish
+        );
+    }
+
+    #[test]
+    fn readiness_milestones_explain_unpublished_and_publish_failed_states() {
+        let unpublished = RefreshLedger {
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+                phase_record(RefreshPhase::LexicalRebuild, 30, true),
+            ],
+            ..Default::default()
+        };
+
+        let unpublished_milestones = unpublished.readiness_milestones();
+
+        assert_eq!(unpublished_milestones.time_to_lexical_ready_ms, Some(60));
+        assert_eq!(unpublished_milestones.time_to_search_ready_ms, None);
+        assert_eq!(unpublished_milestones.failed_phase, None);
+        assert_eq!(
+            unpublished_milestones.search_readiness_state,
+            RefreshSearchReadinessState::WaitingForPublish
+        );
+
+        let publish_failed = RefreshLedger {
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+                phase_record(RefreshPhase::LexicalRebuild, 30, true),
+                phase_record(RefreshPhase::Publish, 5, false),
+            ],
+            ..Default::default()
+        };
+
+        let publish_failed_milestones = publish_failed.readiness_milestones();
+
+        assert_eq!(publish_failed_milestones.time_to_lexical_ready_ms, Some(60));
+        assert_eq!(publish_failed_milestones.time_to_search_ready_ms, None);
+        assert_eq!(
+            publish_failed_milestones.failed_phase.as_deref(),
+            Some("publish")
+        );
+        assert_eq!(
+            publish_failed_milestones.search_readiness_state,
+            RefreshSearchReadinessState::PublishFailed
+        );
     }
 
     #[test]
