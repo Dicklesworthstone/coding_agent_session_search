@@ -276,6 +276,52 @@ pub(crate) struct LexicalGenerationRecoveryDecision {
     pub abandoned_shards: Vec<String>,
 }
 
+/// Dry-run cleanup classification for one lexical artifact or generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalCleanupDisposition {
+    /// The artifact is part of the currently published search surface.
+    CurrentPublished,
+    /// The artifact is still being built, validated, resumed, or merged.
+    ActiveWork,
+    /// The artifact is intentionally retained for operator inspection.
+    QuarantinedRetained,
+    /// A superseded artifact is no longer pinned and can be reclaimed.
+    SupersededReclaimable,
+    /// A superseded artifact must stay on disk because policy still pins it.
+    SupersededRetained,
+    /// A failed or abandoned artifact can be reclaimed after dry-run approval.
+    FailedReclaimable,
+    /// A failed or abandoned artifact must stay on disk for inspection.
+    FailedRetained,
+    /// The artifact is explicitly pinned by current policy.
+    PinnedRetained,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalShardCleanupInventory {
+    pub shard_id: String,
+    pub state: LexicalShardLifecycleState,
+    pub disposition: LexicalCleanupDisposition,
+    pub reason: String,
+    pub artifact_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalGenerationCleanupInventory {
+    pub generation_id: String,
+    pub build_state: LexicalGenerationBuildState,
+    pub publish_state: LexicalGenerationPublishState,
+    pub disposition: LexicalCleanupDisposition,
+    pub reason: String,
+    pub artifact_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub retained_bytes: u64,
+    pub shards: Vec<LexicalShardCleanupInventory>,
+}
+
 /// Single entry in a generation's append-only failure log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalGenerationFailure {
@@ -520,6 +566,46 @@ impl LexicalGenerationManifest {
         self.is_serveable() && self.merge_debt.is_fully_settled()
     }
 
+    /// Build an auditable dry-run inventory for cleanup/quarantine decisions.
+    pub(crate) fn cleanup_inventory(&self) -> LexicalGenerationCleanupInventory {
+        let shards: Vec<_> = self
+            .shards
+            .iter()
+            .map(|shard| self.classify_shard_for_cleanup(shard))
+            .collect();
+        let shard_artifact_bytes = shards.iter().map(|shard| shard.artifact_bytes).sum::<u64>();
+        let shard_reclaimable_bytes = shards
+            .iter()
+            .map(|shard| shard.reclaimable_bytes)
+            .sum::<u64>();
+        let pending_merge_bytes = if self.merge_debt.has_pending_work() {
+            self.merge_debt.pending_artifact_bytes
+        } else {
+            0
+        };
+        let artifact_bytes = shard_artifact_bytes.saturating_add(pending_merge_bytes);
+        let generation_reclaimable_bytes = if self.generation_cleanup_allows_reclaim() {
+            shard_reclaimable_bytes
+        } else {
+            0
+        };
+        let retained_bytes = artifact_bytes.saturating_sub(generation_reclaimable_bytes);
+        let (disposition, reason) =
+            self.classify_generation_for_cleanup(generation_reclaimable_bytes);
+
+        LexicalGenerationCleanupInventory {
+            generation_id: self.generation_id.clone(),
+            build_state: self.build_state,
+            publish_state: self.publish_state,
+            disposition,
+            reason,
+            artifact_bytes,
+            reclaimable_bytes: generation_reclaimable_bytes,
+            retained_bytes,
+            shards,
+        }
+    }
+
     /// Derive the crash-startup action from durable manifest state. This is
     /// intentionally conservative: any quarantined or abandoned shard prevents
     /// partial shard sets from becoming visible to search.
@@ -639,6 +725,201 @@ impl LexicalGenerationManifest {
                 Some(plan) => usize::try_from(plan.shard_count) == Ok(self.shards.len()),
                 None => true,
             }
+    }
+
+    fn classify_shard_for_cleanup(
+        &self,
+        shard: &LexicalShardManifest,
+    ) -> LexicalShardCleanupInventory {
+        let (disposition, reason) =
+            if matches!(self.publish_state, LexicalGenerationPublishState::Published) {
+                (
+                    LexicalCleanupDisposition::CurrentPublished,
+                    "shard is part of the published search surface".to_string(),
+                )
+            } else if shard.pinned {
+                (
+                    LexicalCleanupDisposition::PinnedRetained,
+                    "shard is pinned by current retention policy".to_string(),
+                )
+            } else if matches!(shard.state, LexicalShardLifecycleState::Quarantined) {
+                (
+                    LexicalCleanupDisposition::QuarantinedRetained,
+                    shard
+                        .quarantine_reason
+                        .clone()
+                        .unwrap_or_else(|| "quarantined shard requires inspection".to_string()),
+                )
+            } else if self.generation_has_active_work()
+                || matches!(
+                    shard.state,
+                    LexicalShardLifecycleState::Building
+                        | LexicalShardLifecycleState::Staged
+                        | LexicalShardLifecycleState::Resumable
+                )
+            {
+                (
+                    LexicalCleanupDisposition::ActiveWork,
+                    "shard belongs to active or resumable maintenance work".to_string(),
+                )
+            } else if matches!(
+                self.publish_state,
+                LexicalGenerationPublishState::Superseded
+            ) {
+                if shard.reclaimable {
+                    (
+                        LexicalCleanupDisposition::SupersededReclaimable,
+                        "superseded shard is unpinned and safe to reclaim after dry-run approval"
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        LexicalCleanupDisposition::SupersededRetained,
+                        "superseded shard is retained by policy".to_string(),
+                    )
+                }
+            } else if matches!(shard.state, LexicalShardLifecycleState::Abandoned)
+                || matches!(self.build_state, LexicalGenerationBuildState::Failed)
+            {
+                if shard.reclaimable {
+                    (
+                        LexicalCleanupDisposition::FailedReclaimable,
+                        shard.recovery_reason.clone().unwrap_or_else(|| {
+                            "failed shard can be rebuilt from source".to_string()
+                        }),
+                    )
+                } else {
+                    (
+                        LexicalCleanupDisposition::FailedRetained,
+                        "failed shard is retained for inspection".to_string(),
+                    )
+                }
+            } else {
+                (
+                    LexicalCleanupDisposition::ActiveWork,
+                    "shard is staged until generation lifecycle reaches a terminal state"
+                        .to_string(),
+                )
+            };
+
+        let reclaimable_bytes = if matches!(
+            disposition,
+            LexicalCleanupDisposition::SupersededReclaimable
+                | LexicalCleanupDisposition::FailedReclaimable
+        ) && shard.reclaimable
+            && !shard.pinned
+        {
+            shard.artifact_bytes
+        } else {
+            0
+        };
+
+        LexicalShardCleanupInventory {
+            shard_id: shard.shard_id.clone(),
+            state: shard.state,
+            disposition,
+            reason,
+            artifact_bytes: shard.artifact_bytes,
+            reclaimable_bytes,
+            retained_bytes: shard.artifact_bytes.saturating_sub(reclaimable_bytes),
+        }
+    }
+
+    fn classify_generation_for_cleanup(
+        &self,
+        reclaimable_bytes: u64,
+    ) -> (LexicalCleanupDisposition, String) {
+        if self.is_serveable() {
+            return (
+                LexicalCleanupDisposition::CurrentPublished,
+                "current published lexical generation is never reclaimable".to_string(),
+            );
+        }
+        if matches!(
+            self.publish_state,
+            LexicalGenerationPublishState::Quarantined
+        ) || self
+            .shards
+            .iter()
+            .any(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
+        {
+            return (
+                LexicalCleanupDisposition::QuarantinedRetained,
+                "quarantined lexical generation is retained for inspection".to_string(),
+            );
+        }
+        if self.generation_has_active_work() {
+            return (
+                LexicalCleanupDisposition::ActiveWork,
+                "active lexical generation work is retained".to_string(),
+            );
+        }
+        if matches!(
+            self.publish_state,
+            LexicalGenerationPublishState::Superseded
+        ) {
+            return if reclaimable_bytes > 0 {
+                (
+                    LexicalCleanupDisposition::SupersededReclaimable,
+                    "superseded lexical generation has unpinned reclaimable artifacts".to_string(),
+                )
+            } else {
+                (
+                    LexicalCleanupDisposition::SupersededRetained,
+                    "superseded lexical generation is retained by policy".to_string(),
+                )
+            };
+        }
+        if matches!(self.build_state, LexicalGenerationBuildState::Failed)
+            || self
+                .shards
+                .iter()
+                .any(|shard| matches!(shard.state, LexicalShardLifecycleState::Abandoned))
+        {
+            return if reclaimable_bytes > 0 {
+                (
+                    LexicalCleanupDisposition::FailedReclaimable,
+                    "failed lexical generation can be rebuilt from canonical source".to_string(),
+                )
+            } else {
+                (
+                    LexicalCleanupDisposition::FailedRetained,
+                    "failed lexical generation is retained for inspection".to_string(),
+                )
+            };
+        }
+        (
+            LexicalCleanupDisposition::PinnedRetained,
+            "lexical generation is retained until cleanup policy marks it reclaimable".to_string(),
+        )
+    }
+
+    fn generation_cleanup_allows_reclaim(&self) -> bool {
+        (matches!(
+            self.publish_state,
+            LexicalGenerationPublishState::Superseded
+        ) || matches!(self.build_state, LexicalGenerationBuildState::Failed)
+            || self
+                .shards
+                .iter()
+                .any(|shard| matches!(shard.state, LexicalShardLifecycleState::Abandoned)))
+            && !self.generation_has_active_work()
+    }
+
+    fn generation_has_active_work(&self) -> bool {
+        matches!(
+            self.build_state,
+            LexicalGenerationBuildState::Scratch
+                | LexicalGenerationBuildState::Building
+                | LexicalGenerationBuildState::Built
+                | LexicalGenerationBuildState::Validating
+        ) || matches!(
+            self.merge_debt.state,
+            LexicalGenerationMergeDebtState::Pending
+                | LexicalGenerationMergeDebtState::Running
+                | LexicalGenerationMergeDebtState::Paused
+                | LexicalGenerationMergeDebtState::Blocked
+        )
     }
 }
 
@@ -1218,6 +1499,129 @@ mod tests {
         assert!(!shard.reclaimable);
     }
 
+    #[test]
+    fn cleanup_inventory_retains_current_published_generation() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-current", "attempt-1", "fp", 1);
+        let mut shard = test_shard("shard-live", 0, LexicalShardLifecycleState::Published, 4096);
+        shard.pinned = true;
+        shard.reclaimable = false;
+        manifest.set_shards(vec![shard], 2);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 3);
+        manifest.transition_publish(LexicalGenerationPublishState::Published, 4);
+
+        let inventory = manifest.cleanup_inventory();
+        assert_eq!(
+            inventory.disposition,
+            LexicalCleanupDisposition::CurrentPublished
+        );
+        assert_eq!(inventory.artifact_bytes, 4096);
+        assert_eq!(inventory.reclaimable_bytes, 0);
+        assert_eq!(inventory.retained_bytes, 4096);
+        assert_eq!(
+            inventory.shards[0].disposition,
+            LexicalCleanupDisposition::CurrentPublished
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_marks_superseded_unpinned_shards_reclaimable() {
+        let mut manifest = LexicalGenerationManifest::new_scratch("gen-old", "attempt-1", "fp", 1);
+        let mut reclaimable = test_shard(
+            "shard-old-a",
+            0,
+            LexicalShardLifecycleState::Published,
+            8192,
+        );
+        reclaimable.pinned = false;
+        reclaimable.reclaimable = true;
+        let mut retained = test_shard(
+            "shard-old-b",
+            1,
+            LexicalShardLifecycleState::Published,
+            2048,
+        );
+        retained.pinned = true;
+        retained.reclaimable = false;
+        manifest.set_shards(vec![reclaimable, retained], 2);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 3);
+        manifest.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+
+        let inventory = manifest.cleanup_inventory();
+        assert_eq!(
+            inventory.disposition,
+            LexicalCleanupDisposition::SupersededReclaimable
+        );
+        assert_eq!(inventory.artifact_bytes, 10_240);
+        assert_eq!(inventory.reclaimable_bytes, 8192);
+        assert_eq!(inventory.retained_bytes, 2048);
+        assert_eq!(
+            inventory.shards[0].disposition,
+            LexicalCleanupDisposition::SupersededReclaimable
+        );
+        assert_eq!(
+            inventory.shards[1].disposition,
+            LexicalCleanupDisposition::PinnedRetained
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_keeps_quarantined_artifacts_for_inspection() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-1", "fp", 1);
+        let shard = test_shard(
+            "shard-bad",
+            0,
+            LexicalShardLifecycleState::Quarantined,
+            4096,
+        );
+        manifest.set_shards(vec![shard], 2);
+        assert!(manifest.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            3,
+            Some("manifest checksum mismatch".into()),
+        ));
+        manifest.transition_publish(LexicalGenerationPublishState::Quarantined, 4);
+
+        let inventory = manifest.cleanup_inventory();
+        assert_eq!(
+            inventory.disposition,
+            LexicalCleanupDisposition::QuarantinedRetained
+        );
+        assert_eq!(inventory.reclaimable_bytes, 0);
+        assert_eq!(inventory.retained_bytes, 4096);
+        assert_eq!(
+            inventory.shards[0].reason,
+            "manifest checksum mismatch".to_string()
+        );
+    }
+
+    #[test]
+    fn cleanup_inventory_preserves_active_merge_debt() {
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-debt-active", "attempt-1", "fp", 1);
+        let mut shard = test_shard(
+            "shard-pending",
+            0,
+            LexicalShardLifecycleState::Published,
+            1024,
+        );
+        shard.pinned = false;
+        shard.reclaimable = true;
+        manifest.set_shards(vec![shard], 2);
+        manifest.transition_build(LexicalGenerationBuildState::Validated, 3);
+        manifest.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+        manifest.record_merge_debt(1, 2048, "background merge still running", 5);
+
+        let inventory = manifest.cleanup_inventory();
+        assert_eq!(inventory.disposition, LexicalCleanupDisposition::ActiveWork);
+        assert_eq!(inventory.artifact_bytes, 3072);
+        assert_eq!(inventory.reclaimable_bytes, 0);
+        assert_eq!(inventory.retained_bytes, 3072);
+        assert!(inventory.reason.contains("active"));
+    }
+
     fn test_shard_plan(
         source_db_fingerprint: &str,
         shard_count: u32,
@@ -1242,5 +1646,22 @@ mod tests {
             controller_reason: Some("test budget".into()),
             extra_limits: BTreeMap::from([("staged_merge_jobs".into(), 1)]),
         }
+    }
+
+    fn test_shard(
+        shard_id: &str,
+        shard_ordinal: u32,
+        state: LexicalShardLifecycleState,
+        artifact_bytes: u64,
+    ) -> LexicalShardManifest {
+        let mut shard = LexicalShardManifest::planned(shard_id, shard_ordinal, 1);
+        shard.transition(state, 2);
+        shard.artifact_bytes = artifact_bytes;
+        shard.reclaimable = matches!(
+            state,
+            LexicalShardLifecycleState::Planned | LexicalShardLifecycleState::Abandoned
+        );
+        shard.pinned = matches!(state, LexicalShardLifecycleState::Published);
+        shard
     }
 }
