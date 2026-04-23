@@ -498,10 +498,25 @@ fn embedding_input_from_row(row: CanonicalEmbeddingRow) -> Option<EmbeddingInput
         );
         return None;
     };
+    // `created_at_ms` feeds time-range filters in the vector index
+    // (src/search/vector_index.rs range predicates) and contributes to
+    // `stable_hit_hash`. Defaulting a NULL created_at to 0 silently
+    // masquerades the message as Unix-epoch (1970), which is indistinguishable
+    // from a legitimately-ancient row in downstream filters. Emit a warn
+    // so operators see NULL-created_at rows in the logs instead of only
+    // finding them by puzzling over 1970 timestamps in semantic hits.
+    let created_at_ms = row.created_at.unwrap_or_else(|| {
+        tracing::warn!(
+            message_id,
+            "semantic backfill: row has NULL created_at; defaulting to 0 (Unix epoch). \
+             Downstream time-range filters will treat this message as 1970-01-01."
+        );
+        0
+    });
     let source_id = row.source_id.unwrap_or_else(|| "local".to_string());
     Some(EmbeddingInput {
         message_id,
-        created_at_ms: row.created_at.unwrap_or(0),
+        created_at_ms,
         agent_id: saturating_u32_from_i64(row.agent_id),
         workspace_id: saturating_u32_from_i64(row.workspace_id.unwrap_or(0)),
         source_id: crc32fast::hash(source_id.as_bytes()),
@@ -951,22 +966,25 @@ impl SemanticIndexer {
 
         let embeddings = self.embed_messages(messages)?;
         let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
-        let staged_index = self.write_backfill_staging_index(
+        let mut staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
             prior_checkpoint.is_some(),
         )?;
-        let docs_embedded = u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
         let conversations_processed = prior_conversations
             .saturating_add(plan.conversations_in_batch)
             .min(plan.total_conversations);
-        let checkpoint_docs = prior_docs.saturating_add(embedded_docs).max(docs_embedded);
         let complete = conversations_processed >= plan.total_conversations;
 
         manifest.refresh_backlog(plan.total_conversations, &plan.db_fingerprint);
 
         if complete {
             let db_fingerprint = plan.db_fingerprint.clone();
+            if staged_index.wal_record_count() > 0 {
+                staged_index
+                    .compact()
+                    .map_err(|err| anyhow::anyhow!("compact staged semantic index failed: {err}"))?;
+            }
             drop(staged_index);
             fs::rename(&staging_path, &final_path).with_context(|| {
                 format!(
@@ -1007,6 +1025,11 @@ impl SemanticIndexer {
             manifest.refresh_backlog(plan.total_conversations, &db_fingerprint);
             manifest.save(data_dir)?;
         } else {
+            let docs_embedded_on_disk =
+                u64::try_from(staged_index.record_count()).unwrap_or(u64::MAX);
+            let checkpoint_docs = prior_docs
+                .saturating_add(embedded_docs)
+                .max(docs_embedded_on_disk);
             manifest.save_checkpoint(BuildCheckpoint {
                 tier: plan.tier,
                 embedder_id: self.embedder_id().to_string(),
