@@ -11163,6 +11163,7 @@ fn spawn_lexical_rebuild_packet_producer(
     })
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LexicalPublishRenameSite {
     FirstPublish,
@@ -26819,6 +26820,207 @@ mod tests {
         assert!(
             !lexical_publish_backups_dir(&index_path).exists(),
             "pure restore recovery should not materialize retained-backup storage when there is no newer live index yet"
+        );
+    }
+
+    /// Simulate an ENOSPC-style failure while the Linux atomic publish
+    /// path is parking OLD at the canonical sidecar after the swap but
+    /// before retention. The publish must roll the swap back so the
+    /// prior live generation stays live and the new generation remains
+    /// stranded only in the staged tempdir.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn publish_staged_lexical_index_rolls_back_when_enospc_blocks_linux_sidecar_park() {
+        const ENOSPC_RAW_OS_ERROR: i32 = 28;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let prior_conv = norm_conv(
+            Some("enospc-park-prior"),
+            vec![
+                norm_msg(0, 1_700_012_000_000),
+                norm_msg(1, 1_700_012_000_100),
+                norm_msg(2, 1_700_012_000_200),
+            ],
+        );
+        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        prior_live
+            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(1_200))
+            .unwrap();
+        prior_live.commit().unwrap();
+        drop(prior_live);
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-enospc-park-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(Some("enospc-park-new"), vec![norm_msg(0, 1_700_012_001_000)]);
+        let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(1_201))
+            .unwrap();
+        staged.commit().unwrap();
+        drop(staged);
+
+        let _fault = inject_lexical_publish_rename_failure_once(
+            LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+            ENOSPC_RAW_OS_ERROR,
+        );
+        let err = publish_staged_lexical_index(&staged_index_path, &index_path)
+            .expect_err("ENOSPC while parking OLD must fail the publish");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("rolled back to keep previous live index"),
+            "expected rollback context in ENOSPC publish error, got: {err_text}"
+        );
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "ENOSPC while parking OLD must leave the prior live index intact after rollback"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&staged_index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "rollback must return the new generation to the staged tempdir instead of discarding it"
+        );
+        assert!(
+            !lexical_publish_in_progress_backup_path(&index_path).exists(),
+            "rollback must not leave a stale canonical sidecar behind"
+        );
+        let retained_backups: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            retained_backups.is_empty(),
+            "failed pre-commit publish must not retain any prior-live backups yet; got {retained_backups:?}"
+        );
+    }
+
+    /// Simulate an ENOSPC-style failure after the Linux atomic publish
+    /// has already committed NEW live content but before OLD can be
+    /// moved from the canonical sidecar into retained-backup storage.
+    /// The publish should still succeed, leave the sidecar intact, and
+    /// let the next recovery pass finish retention without changing live.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn publish_staged_lexical_index_recovers_after_enospc_blocks_linux_retained_backup_move() {
+        const ENOSPC_RAW_OS_ERROR: i32 = 28;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let prior_conv = norm_conv(
+            Some("enospc-retain-prior"),
+            vec![
+                norm_msg(0, 1_700_012_100_000),
+                norm_msg(1, 1_700_012_100_100),
+                norm_msg(2, 1_700_012_100_200),
+            ],
+        );
+        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        prior_live
+            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(1_210))
+            .unwrap();
+        prior_live.commit().unwrap();
+        drop(prior_live);
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-enospc-retain-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv =
+            norm_conv(Some("enospc-retain-new"), vec![norm_msg(0, 1_700_012_101_000)]);
+        let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(1_211))
+            .unwrap();
+        staged.commit().unwrap();
+        drop(staged);
+
+        let _fault = inject_lexical_publish_rename_failure_once(
+            LexicalPublishRenameSite::LinuxRetainCanonicalSidecar,
+            ENOSPC_RAW_OS_ERROR,
+        );
+        publish_staged_lexical_index(&staged_index_path, &index_path)
+            .expect("ENOSPC while retaining OLD after the swap should keep NEW live");
+
+        let canonical_sidecar = lexical_publish_in_progress_backup_path(&index_path);
+        assert!(
+            canonical_sidecar.exists(),
+            "retain failure after commit must preserve the canonical sidecar for later recovery"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&canonical_sidecar)
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "the canonical sidecar must continue to hold the old live generation after retain ENOSPC"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "retain ENOSPC must not roll back the already-published live generation"
+        );
+        let retained_backups: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            retained_backups.is_empty(),
+            "retain ENOSPC should leave recovery work in the canonical sidecar, not partially retain backups: {retained_backups:?}"
+        );
+
+        recover_or_finalize_interrupted_lexical_publish_backup(&index_path).unwrap();
+
+        assert!(
+            !canonical_sidecar.exists(),
+            "recovery after retain ENOSPC must consume the canonical sidecar"
+        );
+        let retained_backups: Vec<_> = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            retained_backups.len(),
+            1,
+            "recovery should retain exactly one old live artifact after post-commit ENOSPC"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&retained_backups[0])
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "recovery must preserve the old live generation in retained-backup storage"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "recovery after retain ENOSPC must not disturb the already-published live generation"
         );
     }
 
