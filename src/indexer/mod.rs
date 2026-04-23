@@ -22478,9 +22478,7 @@ mod tests {
             "INSERT INTO meta(key, value) VALUES(?1, ?2)",
             &[
                 ParamValue::from("historical_bundle_salvaged:test"),
-                ParamValue::from(
-                    "{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}",
-                ),
+                ParamValue::from("{\"salvage_version\":2,\"method\":\"baseline-bulk-sql-copy\"}"),
             ],
         )
         .unwrap();
