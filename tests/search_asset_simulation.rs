@@ -591,6 +591,185 @@ fn many_core_responsiveness_gate_persists_phase_utilization_evidence() {
 }
 
 #[test]
+fn shadow_divergence_demotes_segment_farm_to_verified_serial_path() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "shadow_divergence_demotes_segment_farm",
+        LoadScript::new(vec![
+            LoadSample::idle("verified_serial_baseline"),
+            LoadSample::idle("segment_farm_shadow"),
+            LoadSample::busy("divergence_review"),
+            LoadSample::idle("post_demotion_search"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "record_verified_serial")
+        .turn(
+            SimulationActor::LexicalRepair,
+            "compare_shadow_segment_farm",
+        )
+        .turn(SimulationActor::LexicalRepair, "demote_on_divergence")
+        .turn(SimulationActor::ForegroundSearch, "serve_after_demotion");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "record_verified_serial") => {
+                sim.phase(
+                    "shadow_compare",
+                    "record verified serial golden-query digest baseline",
+                );
+                sim.snapshot_json(
+                    "verified_serial_digest",
+                    &json!({
+                        "path": "verified_serial",
+                        "generation": "lexical-gen-serial-017",
+                        "golden_query_digest": "digest:stable-old-good",
+                        "search_ready": true,
+                        "serving_allowed": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "compare_shadow_segment_farm") => {
+                sim.phase(
+                    "shadow_compare",
+                    "segment-farm candidate runs in shadow and reports digest divergence",
+                );
+                sim.snapshot_json(
+                    "shadow_divergence_report",
+                    &json!({
+                        "path": "segment_farm_shadow",
+                        "candidate_generation": "lexical-gen-segment-farm-018",
+                        "expected_digest": "digest:stable-old-good",
+                        "observed_digest": "digest:segment-farm-diverged",
+                        "divergent_queries": ["auth error", "checkpoint resume"],
+                        "serving_allowed": false,
+                        "status": "fail"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "demote_on_divergence") => {
+                sim.phase(
+                    "rollout_gate",
+                    "controller demotes shadow segment-farm path after divergence",
+                );
+                sim.snapshot_json(
+                    "automatic_demotion_verdict",
+                    &json!({
+                        "decision": "demote_to_verified_serial",
+                        "reason": "shadow_digest_divergence",
+                        "active_path": "verified_serial",
+                        "demoted_path": "segment_farm",
+                        "automatic_demotion": true,
+                        "operator_action_required": false,
+                        "rollout_gate": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "serve_after_demotion") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground query uses verified serial path after automatic demotion",
+                );
+                sim.snapshot_json(
+                    "post_demotion_foreground_status",
+                    &json!({
+                        "requested_search_mode": "hybrid",
+                        "realized_index_path": "verified_serial",
+                        "visible_generation": "lexical-gen-serial-017",
+                        "blocked_wait_ms": 0,
+                        "demoted_candidate": "lexical-gen-segment-farm-018",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic shadow-demotion turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "shadow demotion rollout gate should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 4);
+    assert_eq!(
+        summary.actor_traces[0].load.label,
+        "verified_serial_baseline"
+    );
+    assert_eq!(summary.actor_traces[1].load.label, "segment_farm_shadow");
+    assert_eq!(summary.actor_traces[2].load.label, "divergence_review");
+    assert!(summary.actor_traces[2].load.user_active);
+    assert_eq!(summary.actor_traces[3].load.label, "post_demotion_search");
+
+    for expected in [
+        "001-verified_serial_digest.json",
+        "002-shadow_divergence_report.json",
+        "003-automatic_demotion_verdict.json",
+        "004-post_demotion_foreground_status.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing shadow-demotion snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write shadow-demotion artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("segment-farm candidate runs in shadow"),
+        "phase log should preserve the shadow comparison context"
+    );
+    assert!(
+        phase_log.contains("controller demotes shadow segment-farm path"),
+        "phase log should preserve the automatic demotion context"
+    );
+
+    let divergence_path = artifacts
+        .snapshot_dir
+        .join("002-shadow_divergence_report.json");
+    let divergence_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&divergence_path).expect("read divergence"))
+            .expect("divergence snapshot JSON");
+    assert_eq!(divergence_json["status"], "fail");
+    assert_eq!(divergence_json["serving_allowed"], false);
+    assert_ne!(
+        divergence_json["expected_digest"], divergence_json["observed_digest"],
+        "shadow report must retain the mismatched digests that triggered demotion"
+    );
+
+    let demotion_path = artifacts
+        .snapshot_dir
+        .join("003-automatic_demotion_verdict.json");
+    let demotion_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&demotion_path).expect("read demotion"))
+            .expect("demotion snapshot JSON");
+    assert_eq!(demotion_json["decision"], "demote_to_verified_serial");
+    assert_eq!(demotion_json["active_path"], "verified_serial");
+    assert_eq!(demotion_json["automatic_demotion"], true);
+    assert_eq!(demotion_json["rollout_gate"], "pass");
+
+    let foreground_path = artifacts
+        .snapshot_dir
+        .join("004-post_demotion_foreground_status.json");
+    let foreground_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&foreground_path).expect("read foreground"))
+            .expect("foreground snapshot JSON");
+    assert_eq!(foreground_json["realized_index_path"], "verified_serial");
+    assert_eq!(foreground_json["blocked_wait_ms"], 0);
+    assert_eq!(foreground_json["status"], "pass");
+}
+
+#[test]
 fn robot_style_demo_is_deterministic_and_persists_artifacts() {
     let (first_summary, first_artifacts, first_results) = run_robot_style_demo();
     let (second_summary, second_artifacts, second_results) = run_robot_style_demo();

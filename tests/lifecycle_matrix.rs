@@ -620,7 +620,10 @@ fn health_and_diag_agree_on_db_and_index_presence() {
     // contradictory diagnostic commands and can't tell which to trust.
     let test_home = tempfile::tempdir().expect("tempdir");
 
-    fn cass_stdout_json(home: &Path, args: &[&str]) -> (serde_json::Value, std::process::ExitStatus) {
+    fn cass_stdout_json(
+        home: &Path,
+        args: &[&str],
+    ) -> (serde_json::Value, std::process::ExitStatus) {
         let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
             .args(args)
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
