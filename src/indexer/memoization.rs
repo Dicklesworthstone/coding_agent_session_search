@@ -128,6 +128,13 @@ pub(crate) struct MemoCacheStats {
     pub live_entries: u64,
 }
 
+/// Stable operator-facing inspection row for a quarantined memo entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MemoQuarantineInspectionItem {
+    pub key: MemoKey,
+    pub reason: String,
+}
+
 /// Bounded in-memory content-addressed cache. Keyed on `MemoKey` and
 /// driven by LRU eviction when `max_entries` is reached. Quarantined
 /// entries stay resident (so an operator can inspect them) but never
@@ -233,6 +240,31 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         &self.stats
     }
 
+    pub(crate) fn quarantine_inspection_items(&self) -> Vec<MemoQuarantineInspectionItem> {
+        let mut items: Vec<_> = self
+            .quarantined
+            .iter()
+            .map(|(key, reason)| MemoQuarantineInspectionItem {
+                key: key.clone(),
+                reason: reason.clone(),
+            })
+            .collect();
+        items.sort_by(|left, right| {
+            left.key
+                .algorithm
+                .cmp(&right.key.algorithm)
+                .then_with(|| left.key.algorithm_version.cmp(&right.key.algorithm_version))
+                .then_with(|| {
+                    left.key
+                        .content_hash
+                        .as_bytes()
+                        .cmp(right.key.content_hash.as_bytes())
+                })
+                .then_with(|| left.reason.cmp(&right.reason))
+        });
+        items
+    }
+
     fn touch(&mut self, key: &MemoKey) {
         if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
             self.lru.remove(pos);
@@ -267,20 +299,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_cache_returns_miss_and_records_stat() {
+    fn empty_cache_returns_miss_and_records_stat() -> Result<(), String> {
         let mut cache: ContentAddressedMemoCache<String> =
             ContentAddressedMemoCache::with_capacity(4);
         let k = key(b"missing", "lex", "v1");
         match cache.get(&k) {
             MemoLookup::Miss => {}
-            other => panic!("expected Miss, got {other:?}"),
+            other => return Err(format!("expected Miss, got {other:?}")),
         }
         assert_eq!(cache.stats().misses, 1);
         assert_eq!(cache.stats().hits, 0);
+        Ok(())
     }
 
     #[test]
-    fn insert_then_get_returns_hit_and_bumps_counters() {
+    fn insert_then_get_returns_hit_and_bumps_counters() -> Result<(), String> {
         let mut cache: ContentAddressedMemoCache<String> =
             ContentAddressedMemoCache::with_capacity(4);
         let k = key(b"x", "lex", "v1");
@@ -288,24 +321,26 @@ mod tests {
         assert_eq!(event, MemoCacheEvent::Insert);
         match cache.get(&k) {
             MemoLookup::Hit { value } => assert_eq!(value, "derived"),
-            other => panic!("expected Hit, got {other:?}"),
+            other => return Err(format!("expected Hit, got {other:?}")),
         }
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.inserts, 1);
         assert_eq!(stats.live_entries, 1);
+        Ok(())
     }
 
     #[test]
-    fn version_bump_does_not_hit_prior_entry() {
+    fn version_bump_does_not_hit_prior_entry() -> Result<(), String> {
         let mut cache: ContentAddressedMemoCache<String> =
             ContentAddressedMemoCache::with_capacity(4);
         cache.insert(key(b"x", "lex", "v1"), "old".into());
         // Same content + algorithm, new version fingerprint.
         match cache.get(&key(b"x", "lex", "v2")) {
             MemoLookup::Miss => {}
-            other => panic!("version bump must miss prior cache; got {other:?}"),
+            other => return Err(format!("version bump must miss prior cache; got {other:?}")),
         }
+        Ok(())
     }
 
     #[test]
@@ -355,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantined_entry_stays_resident_but_never_hits() {
+    fn quarantined_entry_stays_resident_but_never_hits() -> Result<(), String> {
         let mut cache: ContentAddressedMemoCache<String> =
             ContentAddressedMemoCache::with_capacity(4);
         let k = key(b"x", "lex", "v1");
@@ -363,16 +398,47 @@ mod tests {
         cache.quarantine(k.clone(), "suspected-corruption");
         match cache.get(&k) {
             MemoLookup::Quarantined { reason } => assert_eq!(reason, "suspected-corruption"),
-            other => panic!("expected Quarantined, got {other:?}"),
+            other => return Err(format!("expected Quarantined, got {other:?}")),
         }
         // Re-inserting a quarantined key must NOT silently overwrite.
         let event = cache.insert(k.clone(), "replacement".into());
         assert!(matches!(event, MemoCacheEvent::Quarantine { .. }));
         match cache.get(&k) {
             MemoLookup::Quarantined { .. } => {}
-            other => panic!("quarantine must persist; got {other:?}"),
+            other => return Err(format!("quarantine must persist; got {other:?}")),
         }
         assert_eq!(cache.stats().quarantined, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_inspection_items_are_stable_and_reasoned() {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(4);
+        let semantic = key(b"semantic", "semantic-embed", "v2");
+        let lexical_b = key(b"lex-b", "lexical-normalize", "v1");
+        let lexical_a = key(b"lex-a", "lexical-normalize", "v1");
+
+        cache.insert(semantic.clone(), "semantic-value".into());
+        cache.insert(lexical_b.clone(), "lexical-b".into());
+        cache.insert(lexical_a.clone(), "lexical-a".into());
+        cache.quarantine(semantic, "embedding checksum mismatch");
+        cache.quarantine(lexical_b, "normalizer panic replay");
+        cache.quarantine(lexical_a, "invalid unicode boundary");
+
+        let items = cache.quarantine_inspection_items();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].key, key(b"lex-a", "lexical-normalize", "v1"));
+        assert_eq!(items[0].reason, "invalid unicode boundary");
+        assert_eq!(items[1].key, key(b"lex-b", "lexical-normalize", "v1"));
+        assert_eq!(items[1].reason, "normalizer panic replay");
+        assert_eq!(items[2].key, key(b"semantic", "semantic-embed", "v2"));
+        assert_eq!(items[2].reason, "embedding checksum mismatch");
+
+        let json = serde_json::to_value(&items).expect("serialize quarantine inspection items");
+        assert_eq!(json[0]["key"]["algorithm"], "lexical-normalize");
+        assert_eq!(json[0]["reason"], "invalid unicode boundary");
+        assert_eq!(json[2]["key"]["algorithm"], "semantic-embed");
     }
 
     #[test]
