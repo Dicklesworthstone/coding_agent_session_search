@@ -3905,7 +3905,7 @@ fn build_authoritative_lexical_refresh_ledger(
         started_at_ms,
         completed_at_ms,
         total_duration_ms,
-        full_rebuild: false,
+        full_rebuild: true,
         corpus_family: "authoritative_canonical_packet_replay".to_string(),
         phases: vec![
             PhaseRecord {
@@ -25203,6 +25203,10 @@ mod tests {
             assert_eq!(
                 ledger.tags.get("publish_mode").map(String::as_str),
                 Some("atomic_staged_swap")
+            );
+            assert!(
+                ledger.full_rebuild,
+                "authoritative canonical packet replay is a full lexical rebuild"
             );
             assert_eq!(
                 ledger
