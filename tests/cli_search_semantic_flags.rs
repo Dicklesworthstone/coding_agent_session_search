@@ -159,7 +159,15 @@ fn search_combines_mode_and_model_flags() {
 
     match cli.command {
         Some(Commands::Search { mode, model, .. }) => {
-            assert!(mode.is_some());
+            // Pin the exact parsed mode — a regression that silently
+            // defaults --mode semantic to Lexical or Hybrid would
+            // otherwise slip past `.is_some()`.
+            assert_eq!(
+                mode,
+                Some(SearchMode::Semantic),
+                "--mode semantic must parse to SearchMode::Semantic exactly; \
+                 got {mode:?}"
+            );
             assert_eq!(model, Some("minilm".to_string()));
         }
         other => panic!("expected search command, got {other:?}"),
@@ -235,7 +243,12 @@ fn search_combines_mode_semantic_and_approximate() {
         Some(Commands::Search {
             mode, approximate, ..
         }) => {
-            assert!(mode.is_some());
+            assert_eq!(
+                mode,
+                Some(SearchMode::Semantic),
+                "--mode semantic + --approximate must preserve \
+                 SearchMode::Semantic as the parsed mode; got {mode:?}"
+            );
             assert!(approximate, "approximate should be true");
         }
         other => panic!("expected search command, got {other:?}"),
@@ -257,7 +270,12 @@ fn search_combines_mode_hybrid_and_approximate() {
         Some(Commands::Search {
             mode, approximate, ..
         }) => {
-            assert!(mode.is_some());
+            assert_eq!(
+                mode,
+                Some(SearchMode::Hybrid),
+                "--mode hybrid + --approximate must preserve \
+                 SearchMode::Hybrid as the parsed mode; got {mode:?}"
+            );
             assert!(approximate, "approximate should be true");
         }
         other => panic!("expected search command, got {other:?}"),
