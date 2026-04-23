@@ -1,0 +1,139 @@
+{
+  "status": "not_initialized",
+  "healthy": false,
+  "initialized": false,
+  "explanation": "No cass database or search index exists in [TEST_HOME]/cass-data yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+  "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+  "issues_found": 3,
+  "issues_fixed": 0,
+  "failures": 0,
+  "warnings": 3,
+  "needs_rebuild": false,
+  "auto_fix_applied": false,
+  "auto_fix_actions": [],
+  "checks": [
+    {
+      "name": "data_directory",
+      "status": "pass",
+      "message": "Data directory exists: [TEST_HOME]/cass-data",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "lock_file",
+      "status": "pass",
+      "message": "No stale lock files",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "database",
+      "status": "warn",
+      "message": "Database not initialized yet - no archive has been created in this data dir",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "index",
+      "status": "warn",
+      "message": "Search index not initialized yet - run the first index to build Tantivy metadata",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "config",
+      "status": "pass",
+      "message": "No config file (using defaults)",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "sources_config",
+      "status": "pass",
+      "message": "No remote sources configured",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "sessions",
+      "status": "warn",
+      "message": "No agent session directories found",
+      "fix_available": false,
+      "fix_applied": false
+    }
+  ],
+  "quarantine": {
+    "summary": {
+      "failed_seed_bundle_count": 2,
+      "retained_publish_backup_count": 2,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_quarantined_generation_count": 1,
+      "lexical_quarantined_shard_count": 1,
+      "total_retained_bytes": 1138,
+      "gc_eligible_asset_count": 1,
+      "gc_eligible_bytes": 25,
+      "inspection_required_asset_count": 3,
+      "inspection_required_bytes": 1088
+    },
+    "failed_seed_bundle_files": [
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+        "size_bytes": 11,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal",
+        "size_bytes": 8,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      }
+    ],
+    "retained_publish_backups": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-newer",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "retained lexical publish backup is still protected by retention cap (1)"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-older",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": true,
+        "gc_reason": "retained lexical publish backup falls outside retention cap (1)"
+      }
+    ],
+    "lexical_generations": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "publish_state": "quarantined",
+        "quarantined_shards": 1,
+        "total_shards": 1,
+        "artifact_bytes": 1069,
+        "updated_at_ms": 1733000000321,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "reclaimable_bytes": 0,
+        "inspection_required": true,
+        "safe_to_gc": false,
+        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
+      }
+    ],
+    "warnings": []
+  },
+  "_meta": {
+    "elapsed_ms": 0,
+    "data_dir": "[TEST_HOME]/cass-data",
+    "db_path": "[TEST_HOME]/cass-data/agent_search.db",
+    "fix_mode": false
+  }
+}
