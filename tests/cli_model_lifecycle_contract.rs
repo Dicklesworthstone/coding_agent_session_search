@@ -180,6 +180,28 @@ fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String
 }
 
 #[test]
+fn models_remove_defaults_to_interactive_reclamation() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "models", "remove", "--data-dir", "/cass/models"])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Remove {
+                model,
+                yes: false,
+                data_dir: Some(data_dir),
+            })) if model == "all-minilm-l6-v2"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected model removal to default to interactive reclamation: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn models_check_update_reports_against_scoped_data_dir() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
