@@ -1,0 +1,61 @@
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string"
+    },
+    "limit": {
+      "type": "integer"
+    },
+    "offset": {
+      "type": "integer"
+    },
+    "count": {
+      "type": "integer"
+    },
+    "total_matches": {
+      "type": "integer"
+    },
+    "hits": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "max_tokens": {
+      "type": "null"
+    },
+    "request_id": {
+      "type": "null"
+    },
+    "cursor": {
+      "type": "null"
+    },
+    "hits_clamped": {
+      "type": "boolean"
+    },
+    "suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "suggested_query": {
+            "type": "string"
+          },
+          "suggested_filters": {
+            "type": "null"
+          },
+          "shortcut": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

@@ -26,8 +26,10 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
 use serde_json::{Value, json};
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+use walkdir::WalkDir;
 
 /// Build a `cass` binary invocation with the env knobs required for
 /// deterministic test output (no update check, no ambient data-dir surprise).
@@ -139,6 +141,28 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     .expect("write quarantined generation artifact");
 
     data_dir
+}
+
+fn isolated_search_demo_data(test_home: &std::path::Path) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("search_demo_data");
+    let dst_root = test_home.join("search_demo_data");
+    for entry in WalkDir::new(&src) {
+        let entry = entry.expect("walk search demo data");
+        let rel = entry.path().strip_prefix(&src).expect("relative fixture path");
+        let dst = dst_root.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dst).expect("create fixture dir");
+        } else {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).expect("create fixture parent");
+            }
+            fs::copy(entry.path(), &dst).expect("copy fixture file");
+        }
+    }
+    dst_root
 }
 
 fn json_value_schema(value: &Value) -> Value {
@@ -726,4 +750,65 @@ fn introspect_json_matches_golden() {
         ExpectStatus::ExitOk,
     );
     assert_golden("robot/introspect.json.golden", &scrubbed);
+}
+
+#[test]
+fn search_robot_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = isolated_search_demo_data(test_home.path());
+    let output = cass_cmd(test_home.path())
+        .args([
+            "search",
+            "hello",
+            "--json",
+            "--limit",
+            "2",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass search --json");
+    assert!(
+        output.status.success(),
+        "cass search --json exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("search stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/search_robot.json.golden", &scrubbed);
+}
+
+#[test]
+fn search_robot_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = isolated_search_demo_data(test_home.path());
+    let output = cass_cmd(test_home.path())
+        .args([
+            "search",
+            "hello",
+            "--json",
+            "--limit",
+            "2",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass search --json");
+    assert!(
+        output.status.success(),
+        "cass search --json exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid search JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden("robot/search_robot_shape.json.golden", &canonical);
 }

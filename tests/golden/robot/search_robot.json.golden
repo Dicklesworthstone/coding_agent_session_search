@@ -1,0 +1,35 @@
+{
+  "query": "hello",
+  "limit": 2,
+  "offset": 0,
+  "count": 0,
+  "total_matches": 0,
+  "hits": [],
+  "max_tokens": null,
+  "request_id": null,
+  "cursor": null,
+  "hits_clamped": false,
+  "suggestions": [
+    {
+      "kind": "wildcard_query",
+      "message": "Try broader search: \"*hello*\"",
+      "suggested_query": "*hello*",
+      "suggested_filters": null,
+      "shortcut": 1
+    },
+    {
+      "kind": "alternate_agent",
+      "message": "Try searching in: aider",
+      "suggested_query": null,
+      "suggested_filters": {
+        "agents": [
+          "aider"
+        ],
+        "workspaces": [],
+        "created_from": null,
+        "created_to": null
+      },
+      "shortcut": 2
+    }
+  ]
+}
