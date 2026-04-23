@@ -2544,3 +2544,124 @@ fn models_status_and_cache_lifecycle_agree_on_state_machine_identity() {
         );
     }
 }
+
+#[test]
+fn models_status_fail_open_and_manifest_integrity_invariants() {
+    // ibuuh.19 operator-safety + manifest-integrity row. Model-cache
+    // retention has knock-on effects on the user-visible fail-open
+    // promise (lexical works even without semantic) and on the
+    // content-addressing used to key versioned caches. This row pins
+    // four invariants on `cass models status --json` that, if
+    // violated, would let retention or acquisition silently break
+    // user-visible guarantees:
+    //
+    //   A. state="not_acquired" ⇒ lexical_fail_open=true
+    //      The fail-open policy guarantees users still get lexical
+    //      search when the semantic model is absent. If retention
+    //      reclaimed the model cache but lexical_fail_open stopped
+    //      being true, users would see "search unavailable" instead
+    //      of the intended graceful degradation.
+    //
+    //   B. next_step is a non-empty string. Operator guidance must
+    //      always be actionable — an empty next_step defeats the
+    //      purpose of the surface.
+    //
+    //   C. revision and license are non-empty strings. revision is
+    //      the content-addressing key retention uses to key
+    //      versioned model caches (two revisions of the same model
+    //      are distinct retention candidates); license is a
+    //      compliance-retention invariant (retention must preserve
+    //      license strings through reclamation).
+    //
+    //   D. files[].name and files[].local_name values are unique
+    //      within the manifest. Duplicate names would cause
+    //      retention to double-count bytes or collide on the same
+    //      filesystem location during acquisition.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(
+        out.status.success(),
+        "cass models status --json exited non-zero"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Invariant A: fail-open guarantee under not_acquired.
+    let state = status["state"]
+        .as_str()
+        .expect("status.state must be a string");
+    let fail_open = status["lexical_fail_open"]
+        .as_bool()
+        .expect("lexical_fail_open must be a bool");
+    if state == "not_acquired" {
+        assert!(
+            fail_open,
+            "state=not_acquired but lexical_fail_open=false — retention/reclamation of the model cache would break the lexical-search fail-open guarantee"
+        );
+    }
+
+    // Invariant B: next_step is non-empty actionable guidance.
+    let next_step = status["next_step"]
+        .as_str()
+        .expect("status.next_step must be a string");
+    assert!(
+        !next_step.trim().is_empty(),
+        "next_step is empty — operator has no actionable guidance on how to progress the state machine"
+    );
+
+    // Invariant C: revision and license are non-empty.
+    let revision = status["revision"]
+        .as_str()
+        .expect("status.revision must be a string");
+    assert!(
+        !revision.trim().is_empty(),
+        "revision is empty — retention cannot key versioned model caches by content address"
+    );
+    let license = status["license"]
+        .as_str()
+        .expect("status.license must be a string");
+    assert!(
+        !license.trim().is_empty(),
+        "license is empty — retention must preserve license strings for compliance"
+    );
+
+    // Invariant D: files[].name and files[].local_name uniqueness.
+    let files = status["files"]
+        .as_array()
+        .expect("files must be an array");
+    let mut names: Vec<&str> = files
+        .iter()
+        .map(|f| f["name"].as_str().expect("files[].name must be a string"))
+        .collect();
+    names.sort();
+    let mut dedup = names.clone();
+    dedup.dedup();
+    assert_eq!(
+        names.len(),
+        dedup.len(),
+        "duplicate files[].name detected in manifest {names:?} — retention would double-count bytes or acquisition would collide on fetch"
+    );
+    let mut local_names: Vec<&str> = files
+        .iter()
+        .map(|f| {
+            f["local_name"]
+                .as_str()
+                .expect("files[].local_name must be a string")
+        })
+        .collect();
+    local_names.sort();
+    let mut dedup_local = local_names.clone();
+    dedup_local.dedup();
+    assert_eq!(
+        local_names.len(),
+        dedup_local.len(),
+        "duplicate files[].local_name detected in manifest {local_names:?} — two manifest entries point at the same filesystem location"
+    );
+}
