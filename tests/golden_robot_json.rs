@@ -133,21 +133,16 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     // would still fail the golden because the sentinel would differ
     // between runs — the goal is deterministic scrubbing, not semantic
     // parsing.
-    let last_snapshot_obj_re = regex::Regex::new(
-        r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#,
-    )
-    .unwrap();
+    let last_snapshot_obj_re = regex::Regex::new(r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#).unwrap();
     out = last_snapshot_obj_re
         .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
         .to_string();
-    let last_snapshot_null_re =
-        regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
+    let last_snapshot_null_re = regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
     out = last_snapshot_null_re
         .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
         .to_string();
 
-    let last_reason_re =
-        regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
+    let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
     out = last_reason_re
         .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
         .to_string();
