@@ -7174,18 +7174,64 @@ fn compute_aggregations(
     aggregations
 }
 
-/// Parse aggregate field strings into enum values, warning on unknown fields
-fn parse_aggregate_fields(fields: &[String]) -> Vec<AggregateField> {
-    fields
-        .iter()
-        .filter_map(|f| {
-            let parsed = AggregateField::from_str(f);
-            if parsed.is_none() {
-                warn!(field = %f, "Unknown aggregate field, ignoring. Valid: agent, workspace, date, match_type");
-            }
-            parsed
-        })
-        .collect()
+const VALID_AGGREGATE_FIELDS: &str = "agent, workspace, date, match_type";
+
+/// Parse aggregate field strings into enum values.
+fn parse_aggregate_fields(fields: &[String]) -> CliResult<Vec<AggregateField>> {
+    let mut parsed = Vec::with_capacity(fields.len());
+    let mut invalid = Vec::new();
+
+    for field in fields {
+        let trimmed = field.trim();
+        if trimmed.is_empty() {
+            invalid.push("<empty>".to_string());
+            continue;
+        }
+
+        match AggregateField::from_str(trimmed) {
+            Some(field) => parsed.push(field),
+            None => invalid.push(field.clone()),
+        }
+    }
+
+    if invalid.is_empty() {
+        Ok(parsed)
+    } else {
+        Err(CliError::usage(
+            format!("invalid --aggregate field(s): {}", invalid.join(", ")),
+            Some(format!("Valid aggregate fields: {VALID_AGGREGATE_FIELDS}")),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod aggregate_field_validation_tests {
+    use super::{AggregateField, parse_aggregate_fields};
+
+    #[test]
+    fn aggregate_fields_reject_unknown_values() {
+        let err = parse_aggregate_fields(&["agnet".to_string()]).unwrap_err();
+
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "usage");
+        assert!(err.message.contains("agnet"));
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("agent, workspace, date, match_type"))
+        );
+    }
+
+    #[test]
+    fn aggregate_fields_trim_whitespace() {
+        let fields = parse_aggregate_fields(&["agent".to_string(), " workspace ".to_string()])
+            .expect("aggregate fields should parse");
+
+        assert_eq!(
+            fields,
+            vec![AggregateField::Agent, AggregateField::Workspace]
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7529,6 +7575,7 @@ fn run_cli_search(
     let agg_fields = aggregate
         .as_ref()
         .map(|f| parse_aggregate_fields(f))
+        .transpose()?
         .unwrap_or_default();
     let has_aggregation = !agg_fields.is_empty();
 
