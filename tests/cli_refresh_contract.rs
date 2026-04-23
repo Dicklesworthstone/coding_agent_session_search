@@ -88,6 +88,54 @@ fn refresh_preflight_stays_opt_in_for_search_and_tui() -> Result<(), String> {
 }
 
 #[test]
+fn refresh_preflight_remains_scoped_to_requested_data_dir() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let search = parse(&[
+            "cass",
+            "search",
+            "needle",
+            "--refresh",
+            "--data-dir",
+            "/tmp/cass-refresh-contract",
+            "--json",
+        ])?;
+        match search.command {
+            Some(Commands::Search {
+                refresh: true,
+                data_dir: Some(data_dir),
+                json: true,
+                ..
+            }) if data_dir.display().to_string() == "/tmp/cass-refresh-contract" => {}
+            other => {
+                return Err(format!(
+                    "search refresh preflight must stay data-dir scoped: {other:?}"
+                ));
+            }
+        }
+
+        let tui = parse(&[
+            "cass",
+            "tui",
+            "--once",
+            "--catch-up",
+            "--data-dir",
+            "/tmp/cass-refresh-contract",
+        ])?;
+        match tui.command {
+            Some(Commands::Tui {
+                once: true,
+                refresh: true,
+                data_dir: Some(data_dir),
+                ..
+            }) if data_dir.display().to_string() == "/tmp/cass-refresh-contract" => Ok(()),
+            other => Err(format!(
+                "tui catch-up preflight must stay data-dir scoped: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn index_refresh_operator_controls_remain_parseable() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
