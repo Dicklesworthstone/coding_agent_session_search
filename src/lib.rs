@@ -15593,8 +15593,14 @@ mod response_schema_tests {
         let schemas = build_response_schemas();
         let status = &schemas["status"]["properties"];
 
-        assert!(status.get("semantic").is_some(), "status schema missing semantic block");
-        assert!(status.get("rebuild").is_some(), "status schema missing rebuild block");
+        assert!(
+            status.get("semantic").is_some(),
+            "status schema missing semantic block"
+        );
+        assert!(
+            status.get("rebuild").is_some(),
+            "status schema missing rebuild block"
+        );
         assert_eq!(
             status["index"]["properties"]["status"]["type"],
             serde_json::json!("string")
@@ -15610,8 +15616,14 @@ mod response_schema_tests {
         let schemas = build_response_schemas();
         let state = &schemas["health"]["properties"]["state"]["properties"];
 
-        assert!(state.get("semantic").is_some(), "health.state schema missing semantic block");
-        assert!(state.get("rebuild").is_some(), "health.state schema missing rebuild block");
+        assert!(
+            state.get("semantic").is_some(),
+            "health.state schema missing semantic block"
+        );
+        assert!(
+            state.get("rebuild").is_some(),
+            "health.state schema missing rebuild block"
+        );
         assert_eq!(
             schemas["health"]["properties"]["db"]["properties"]["open_error"]["type"],
             serde_json::json!(["string", "null"])
