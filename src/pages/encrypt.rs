@@ -965,7 +965,7 @@ mod tests {
         let archive_dir = tmp.path().join("archive");
         fs::create_dir_all(&archive_dir).expect("create archive dir");
         fs::write(archive_dir.join("index.html"), b"<html></html>").unwrap();
-        fs::write(archive_dir.join("chunk-0.bin"), &[0u8; 16]).unwrap();
+        fs::write(archive_dir.join("chunk-0.bin"), [0u8; 16]).unwrap();
         let nested = archive_dir.join("assets");
         fs::create_dir_all(&nested).expect("create nested");
         fs::write(nested.join("style.css"), b"body{}").unwrap();
