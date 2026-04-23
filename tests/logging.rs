@@ -60,9 +60,7 @@ fn search_logs_backend_selection() {
     let search_start_line = out
         .lines()
         .find(|line| line.contains("search_start"))
-        .unwrap_or_else(|| {
-            panic!("trace output must contain a `search_start` event; got:\n{out}")
-        });
+        .unwrap_or_else(|| panic!("trace output must contain a `search_start` event; got:\n{out}"));
     assert!(
         search_start_line.contains("backend=\"tantivy\""),
         "search_start span must name the tantivy backend; got line:\n{search_start_line}"

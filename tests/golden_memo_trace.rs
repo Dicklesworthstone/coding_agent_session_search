@@ -9,14 +9,14 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
-use serial_test::serial;
 use serde_json::{Map, Value, json};
+use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
-use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::Registry;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 mod util;
 
@@ -123,9 +123,12 @@ fn assert_golden(name: &str, actual: &str) -> Result<()> {
         .join(name);
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
-        let parent = golden_path
-            .parent()
-            .ok_or_else(|| anyhow!("golden path should have a parent: {}", golden_path.display()))?;
+        let parent = golden_path.parent().ok_or_else(|| {
+            anyhow!(
+                "golden path should have a parent: {}",
+                golden_path.display()
+            )
+        })?;
         std::fs::create_dir_all(parent).context("create golden parent")?;
         std::fs::write(&golden_path, actual).context("write golden")?;
         eprintln!("[GOLDEN] Updated: {}", golden_path.display());

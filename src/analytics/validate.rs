@@ -152,10 +152,7 @@ pub fn build_repair_plan(report: &ValidationReport) -> RepairPlan {
         .map(|(kind, mut check_ids)| {
             check_ids.sort();
             RepairDecision {
-                fixable: matches!(
-                    kind,
-                    RepairKind::RebuildTrackA | RepairKind::RebuildTrackB
-                ),
+                fixable: matches!(kind, RepairKind::RebuildTrackA | RepairKind::RebuildTrackB),
                 reason: repair_reason(kind).into(),
                 kind,
                 check_ids,
@@ -207,9 +204,9 @@ fn classify_repair_kind(check: &Check, report: &ValidationReport) -> RepairKind 
             // cannot repair on its own: either the ledger is gone, or a
             // required joined table is missing, or the query itself
             // couldn't execute.
-            "track_b.tables_exist"
-            | "track_b.agents_table_missing"
-            | "track_b.query_exec" => RepairKind::TrackAllRebuildUnavailable,
+            "track_b.tables_exist" | "track_b.agents_table_missing" | "track_b.query_exec" => {
+                RepairKind::TrackAllRebuildUnavailable
+            }
             // Every other Track B check ("has_data", "grand_total_match",
             // "tool_calls_match", "non_negative_counters", and any future
             // same-shape checks) describes a state rebuild_token_daily_stats

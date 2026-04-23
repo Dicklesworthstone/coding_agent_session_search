@@ -151,7 +151,10 @@ fn isolated_search_demo_data(test_home: &std::path::Path) -> PathBuf {
     let dst_root = test_home.join("search_demo_data");
     for entry in WalkDir::new(&src) {
         let entry = entry.expect("walk search demo data");
-        let rel = entry.path().strip_prefix(&src).expect("relative fixture path");
+        let rel = entry
+            .path()
+            .strip_prefix(&src)
+            .expect("relative fixture path");
         let dst = dst_root.join(rel);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&dst).expect("create fixture dir");
@@ -449,8 +452,8 @@ fn capabilities_shape_matches_golden() {
         &["capabilities", "--json"],
         ExpectStatus::ExitOk,
     );
-    let canonical = serde_json::to_string_pretty(&json_value_schema(&capabilities))
-        .expect("pretty-print JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&capabilities)).expect("pretty-print JSON");
     assert_golden("robot/capabilities_shape.json.golden", &canonical);
 }
 
@@ -508,7 +511,11 @@ fn health_json_matches_golden() {
 #[test]
 fn health_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let health = capture_robot_json_value(test_home.path(), &["health", "--json"], ExpectStatus::ExitAny);
+    let health = capture_robot_json_value(
+        test_home.path(),
+        &["health", "--json"],
+        ExpectStatus::ExitAny,
+    );
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&health)).expect("pretty-print JSON");
     assert_golden("robot/health_shape.json.golden", &canonical);
@@ -532,7 +539,8 @@ fn diag_json_matches_golden() {
 #[test]
 fn diag_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let diag = capture_robot_json_value(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
+    let diag =
+        capture_robot_json_value(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&diag)).expect("pretty-print JSON");
     assert_golden("robot/diag_shape.json.golden", &canonical);
@@ -661,7 +669,11 @@ fn quarantine_summary_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let data_dir = seed_diag_quarantine_fixture(test_home.path());
 
-    fn command_json(test_home: &std::path::Path, data_dir: &std::path::Path, args: &[&str]) -> Value {
+    fn command_json(
+        test_home: &std::path::Path,
+        data_dir: &std::path::Path,
+        args: &[&str],
+    ) -> Value {
         let output = cass_cmd(test_home)
             .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
             .args(args)

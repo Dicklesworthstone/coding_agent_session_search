@@ -48,7 +48,9 @@ fn codex_connector_reads_modern_envelope_jsonl() {
     // started must be strictly before ended. A regression that
     // dropped ISO parsing (emitting 0 / default) would slip past
     // `.is_some()`.
-    let started = c.started_at.expect("started_at must be parsed from ISO-8601");
+    let started = c
+        .started_at
+        .expect("started_at must be parsed from ISO-8601");
     let ended = c.ended_at.expect("ended_at must be parsed from ISO-8601");
     // ms-epoch floor: 2020-01-01 (1_577_836_800_000 ms). Fixture is
     // 2025 so this is well below the real value but catches 0/MIN.

@@ -47,7 +47,10 @@ fn amp_parses_minimal_cache() {
         external_id.len() >= 8,
         "amp external_id must be at least 8 chars (UUID-like); got {external_id:?}"
     );
-    assert!(!c.messages.is_empty(), "amp conversation must have messages");
+    assert!(
+        !c.messages.is_empty(),
+        "amp conversation must have messages"
+    );
 }
 
 /// since_ts controls file-level filtering (via file mtime), NOT message-level filtering.

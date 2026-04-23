@@ -227,12 +227,16 @@ fn test_models_check_update_json_output() {
     // consumers branch on the bool; a type regression would slip past
     // `.is_some()`.
     assert!(
-        json.get("update_available").and_then(|v| v.as_bool()).is_some(),
+        json.get("update_available")
+            .and_then(|v| v.as_bool())
+            .is_some(),
         "update_available must be a boolean. Got: {}",
         json
     );
     assert!(
-        json.get("latest_revision").and_then(|v| v.as_str()).is_some(),
+        json.get("latest_revision")
+            .and_then(|v| v.as_str())
+            .is_some(),
         "latest_revision must be a string. Got: {}",
         json
     );

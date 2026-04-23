@@ -197,7 +197,9 @@ fn aider_timestamps_from_mtime() {
     // ms-epoch value (file mtime), not just "present". Aider uses
     // the file's mtime for both started/ended; a regression that
     // emitted 0 / MIN / time::now() would slip past `.is_some()`.
-    let started = convs[0].started_at.expect("started_at must be set from mtime");
+    let started = convs[0]
+        .started_at
+        .expect("started_at must be set from mtime");
     let ended = convs[0].ended_at.expect("ended_at must be set from mtime");
     // ms-epoch sanity floor: 2001-09-09 (1_000_000_000_000 ms).
     assert!(

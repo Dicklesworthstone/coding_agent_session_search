@@ -1,12 +1,12 @@
 mod util;
 
-use coding_agent_search::connectors::chatgpt::ChatGptConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
 use base64::prelude::*;
+use coding_agent_search::connectors::chatgpt::ChatGptConnector;
+use coding_agent_search::connectors::{Connector, ScanContext};
 use serial_test::serial;
 use std::fs::{self, File};
 use std::path::Path;
@@ -31,9 +31,8 @@ fn chatgpt_real_fixture_root() -> std::path::PathBuf {
 }
 
 const CHATGPT_TEST_KEY: [u8; 32] = [
-    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
-    0xef, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d,
-    0x1e, 0x0f,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
 ];
 
 fn load_fixture_bytes(rel_path: &str) -> Vec<u8> {
@@ -482,7 +481,10 @@ fn scan_preserves_string_parts_and_drops_object_only_structured_parts_from_real_
         .find(|conv| conv.source_path == expected_path)
         .expect("structured-parts fixture should be discovered");
 
-    assert_eq!(conv.external_id.as_deref(), Some("chatgpt-structured-parts-001"));
+    assert_eq!(
+        conv.external_id.as_deref(),
+        Some("chatgpt-structured-parts-001")
+    );
     assert_eq!(conv.messages.len(), 1);
     assert_eq!(conv.messages[0].role, "user");
     assert_eq!(

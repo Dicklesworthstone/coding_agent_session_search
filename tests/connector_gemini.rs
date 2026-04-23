@@ -84,7 +84,9 @@ fn gemini_parses_timestamps() {
     // parsed the wrong timestamp field (e.g., swapped started/ended or
     // used epoch 0 as a fallback) would slip past bare presence
     // checks but fires here.
-    let started = c.started_at.expect("conversation started_at must be populated");
+    let started = c
+        .started_at
+        .expect("conversation started_at must be populated");
     let ended = c.ended_at.expect("conversation ended_at must be populated");
     assert!(
         started <= ended,

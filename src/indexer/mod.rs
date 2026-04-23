@@ -1524,6 +1524,9 @@ impl IndexRunLockGuard {
         self.file
             .flush()
             .with_context(|| format!("flushing index-run lock file {}", self._path.display()))?;
+        self.file
+            .sync_all()
+            .with_context(|| format!("syncing index-run lock file {}", self._path.display()))?;
         Ok(())
     }
 
@@ -1631,26 +1634,33 @@ fn heartbeat_index_run_lock_with_lock(
         refreshed.push('\n');
     }
 
-    write_index_run_lock_heartbeat_atomically(&lock_path, &refreshed)
+    write_index_run_lock_heartbeat_in_place(&lock_path, &refreshed)
 }
 
-fn write_index_run_lock_heartbeat_atomically(lock_path: &Path, refreshed: &str) -> Result<()> {
-    let tmp_path = unique_atomic_temp_path(lock_path);
-    {
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("creating heartbeat temp file {}", tmp_path.display()))?;
-        let mut writer = BufWriter::new(file);
-        writer
-            .write_all(refreshed.as_bytes())
-            .with_context(|| format!("writing heartbeat temp file {}", tmp_path.display()))?;
-        writer.flush()?;
-        writer
-            .get_ref()
-            .sync_all()
-            .with_context(|| format!("syncing heartbeat temp file {}", tmp_path.display()))?;
-    }
-    replace_file_from_temp(&tmp_path, lock_path)
-        .with_context(|| format!("replacing index-run lock heartbeat {}", lock_path.display()))
+fn write_index_run_lock_heartbeat_in_place(lock_path: &Path, refreshed: &str) -> Result<()> {
+    // Do not temp-file+rename `index-run.lock`: POSIX advisory locks attach
+    // to the existing file inode/open handle, and replacing the path would
+    // let another process lock a fresh inode while this process still holds
+    // the old one.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("opening index-run lock heartbeat {}", lock_path.display()))?;
+    file.set_len(0).with_context(|| {
+        format!(
+            "truncating index-run lock heartbeat {}",
+            lock_path.display()
+        )
+    })?;
+    file.rewind()
+        .with_context(|| format!("rewinding index-run lock heartbeat {}", lock_path.display()))?;
+    file.write_all(refreshed.as_bytes())
+        .with_context(|| format!("writing index-run lock heartbeat {}", lock_path.display()))?;
+    file.flush()
+        .with_context(|| format!("flushing index-run lock heartbeat {}", lock_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing index-run lock heartbeat {}", lock_path.display()))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -18446,32 +18456,46 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn heartbeat_index_run_lock_surfaces_atomic_temp_create_errors() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn heartbeat_index_run_lock_surfaces_in_place_open_errors() {
         let tmp = TempDir::new().unwrap();
-        let lock_path = tmp.path().join("index-run.lock");
-        let original =
-            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\ndb_path=/tmp/db.sqlite\nmode=index\n";
-        std::fs::write(&lock_path, original).unwrap();
+        let parent_as_file = tmp.path().join("not-a-directory");
+        std::fs::write(&parent_as_file, b"not a directory").unwrap();
+        let lock_path = parent_as_file.join("index-run.lock");
 
-        let original_permissions = std::fs::metadata(tmp.path()).unwrap().permissions();
-        let mut read_only_permissions = original_permissions.clone();
-        read_only_permissions.set_mode(0o500);
-        std::fs::set_permissions(tmp.path(), read_only_permissions).unwrap();
+        let err = write_index_run_lock_heartbeat_in_place(&lock_path, "updated_at_ms=123\n")
+            .expect_err("non-directory parent should make heartbeat open fail");
 
-        let result = heartbeat_index_run_lock(tmp.path());
-
-        std::fs::set_permissions(tmp.path(), original_permissions).unwrap();
-        let err = result.expect_err("read-only data dir should fail before replacing heartbeat");
         let err_text = format!("{err:#}");
         assert!(
-            err_text.contains("creating heartbeat temp file"),
+            err_text.contains("opening index-run lock heartbeat"),
             "unexpected heartbeat error: {err_text}"
         );
-        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_index_run_lock_preserves_lock_file_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+        let guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)
+            .expect("acquire index run lock");
+        let lock_path = tmp.path().join("index-run.lock");
+        let before = std::fs::metadata(&lock_path).expect("lock metadata before heartbeat");
+
+        heartbeat_index_run_lock_with_lock(tmp.path(), Some(&guard.metadata_write_lock))
+            .expect("heartbeat refresh should succeed");
+
+        let after = std::fs::metadata(&lock_path).expect("lock metadata after heartbeat");
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "heartbeat refresh must not replace index-run.lock while a flock is held"
+        );
+        drop(guard);
     }
 
     #[test]

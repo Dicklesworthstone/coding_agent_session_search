@@ -13,8 +13,8 @@ use chrono::{SecondsFormat, Utc};
 use coding_agent_search::search::tantivy::{
     SearchableIndexSummary, index_dir, open_federated_search_readers, searchable_index_summary,
 };
-use frankensearch::lexical::ReloadPolicy;
 use coding_agent_search::storage::sqlite::SqliteStorage;
+use frankensearch::lexical::ReloadPolicy;
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection as RusqliteConnection;
 use std::fs;
@@ -248,13 +248,22 @@ fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
     cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "6");
     cmd.env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
     cmd.env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
-    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS", "1");
+    cmd.env(
+        "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+        "1",
+    );
     cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
-    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS", "1");
+    cmd.env(
+        "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+        "1",
+    );
     cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "2");
     cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "2");
     cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
-    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES", "4096");
+    cmd.env(
+        "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+        "4096",
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -286,10 +295,7 @@ fn lexical_publish_backups_dir(index_path: &Path) -> std::path::PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_publish_kill_relaunch_sentinel(
-    path: &Path,
-    timeout: Duration,
-) -> serde_json::Value {
+fn wait_for_publish_kill_relaunch_sentinel(path: &Path, timeout: Duration) -> serde_json::Value {
     let deadline = Instant::now() + timeout;
     loop {
         match fs::read(path) {
@@ -848,8 +854,9 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
 
 #[test]
 fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish() {
-    let tracker =
-        tracker_for("force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish");
+    let tracker = tracker_for(
+        "force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish",
+    );
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
@@ -891,7 +898,10 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         .expect("read baseline searchable index summary")
         .expect("baseline index should exist");
     let before_docs = before_summary.docs;
-    assert!(before_docs > 0, "baseline index should contain at least one doc");
+    assert!(
+        before_docs > 0,
+        "baseline index should contain at least one doc"
+    );
 
     let baseline_search = cargo_bin_cmd!("cass")
         .args([
@@ -1058,7 +1068,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
     let rebuild_json: serde_json::Value =
         serde_json::from_slice(&rebuild_output.stdout).expect("parse force rebuild json");
     assert_eq!(
-        rebuild_json.get("success").and_then(|value| value.as_bool()),
+        rebuild_json
+            .get("success")
+            .and_then(|value| value.as_bool()),
         Some(true),
         "force rebuild should report success in --json output"
     );
@@ -1396,7 +1408,9 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     let rebuild_json: serde_json::Value =
         serde_json::from_slice(&rebuild_output.stdout).expect("parse federated force rebuild json");
     assert_eq!(
-        rebuild_json.get("success").and_then(|value| value.as_bool()),
+        rebuild_json
+            .get("success")
+            .and_then(|value| value.as_bool()),
         Some(true),
         "federated force rebuild should report success in --json output"
     );
@@ -1499,14 +1513,18 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
             .with_custom("max_search_duration_ms", search_stats.max_duration_ms)
             .with_custom("stable_doc_count", before_docs as u64)
             .with_custom("stable_total_matches", baseline_total_matches)
-            .with_custom("federated_shard_count", after_federated_readers.len() as u64),
+            .with_custom(
+                "federated_shard_count",
+                after_federated_readers.len() as u64,
+            ),
     );
     tracker.complete();
 }
 
 #[test]
 fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
-    let tracker = tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
+    let tracker =
+        tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
     let _trace_guard = tracker.trace_env_guard();
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
@@ -1638,7 +1656,9 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
         let rebuild_json: serde_json::Value = serde_json::from_slice(&rebuild_output.stdout)
             .expect("parse repeated federated force rebuild json");
         assert_eq!(
-            rebuild_json.get("success").and_then(|value| value.as_bool()),
+            rebuild_json
+                .get("success")
+                .and_then(|value| value.as_bool()),
             Some(true),
             "repeated federated force rebuild cycle {cycle} should report success in --json output"
         );
@@ -1767,7 +1787,10 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
         .expect("read baseline searchable index summary")
         .expect("baseline index should exist");
     let before_docs = before_summary.docs;
-    assert!(before_docs > 0, "baseline index should contain at least one doc");
+    assert!(
+        before_docs > 0,
+        "baseline index should contain at least one doc"
+    );
 
     let baseline_search = cargo_bin_cmd!("cass")
         .args([
@@ -1818,15 +1841,16 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
     child.arg(&data_dir);
     let mut child = child.spawn().expect("spawn force rebuild child process");
 
-    let sentinel =
-        wait_for_publish_kill_relaunch_sentinel(&sentinel_path, Duration::from_secs(20));
+    let sentinel = wait_for_publish_kill_relaunch_sentinel(&sentinel_path, Duration::from_secs(20));
     assert_eq!(
         sentinel.get("stage").and_then(|value| value.as_str()),
         Some("linux_swap_committed_prior_live_parked"),
         "sentinel must prove the child paused after NEW went live and OLD was parked"
     );
     assert_eq!(
-        sentinel.get("live_index_path").and_then(|value| value.as_str()),
+        sentinel
+            .get("live_index_path")
+            .and_then(|value| value.as_str()),
         Some(live_index_path.to_string_lossy().as_ref()),
         "sentinel should describe the live index path under test"
     );
@@ -1939,7 +1963,9 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
     let relaunch_json: serde_json::Value =
         serde_json::from_slice(&relaunch_output.stdout).expect("parse relaunch index json");
     assert_eq!(
-        relaunch_json.get("success").and_then(|value| value.as_bool()),
+        relaunch_json
+            .get("success")
+            .and_then(|value| value.as_bool()),
         Some(true),
         "relaunch force rebuild should report success in --json output"
     );
@@ -2001,7 +2027,10 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
         &E2ePerformanceMetrics::new()
             .with_custom("stable_doc_count", before_docs as u64)
             .with_custom("stable_total_matches", baseline_total_matches)
-            .with_custom("retained_backup_count_after_relaunch", retained_backup_count as u64),
+            .with_custom(
+                "retained_backup_count_after_relaunch",
+                retained_backup_count as u64,
+            ),
     );
     tracker.complete();
 }

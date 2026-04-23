@@ -806,7 +806,9 @@ fn maintenance_publish_pause_resume_cleanup_story_is_artifact_backed() {
         "phase log should preserve the after-publish artifact inventory"
     );
 
-    let published_path = artifacts.snapshot_dir.join("003-maintenance_published.json");
+    let published_path = artifacts
+        .snapshot_dir
+        .join("003-maintenance_published.json");
     let published_json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&published_path).expect("read published snapshot"),
     )
