@@ -428,6 +428,9 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub provided_approval_fingerprint: Option<String>,
     pub approval_fingerprint_status: LexicalCleanupApprovalFingerprintStatus,
     pub approval_fingerprint_matches: bool,
+    pub generation_count: usize,
+    pub total_artifact_bytes: u64,
+    pub total_retained_bytes: u64,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
     #[serde(default)]
@@ -553,6 +556,9 @@ impl LexicalCleanupDryRunPlan {
             provided_approval_fingerprint: provided_approval_fingerprint.map(str::to_owned),
             approval_fingerprint_status,
             approval_fingerprint_matches,
+            generation_count: self.generation_count,
+            total_artifact_bytes: self.total_artifact_bytes,
+            total_retained_bytes: self.total_retained_bytes,
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
             candidate_previews: self.reclaim_candidates.clone(),
@@ -2449,6 +2455,9 @@ mod tests {
             blocked.approval_fingerprint_status,
             LexicalCleanupApprovalFingerprintStatus::NotRequested
         );
+        assert_eq!(blocked.generation_count, 3);
+        assert_eq!(blocked.total_artifact_bytes, 6656);
+        assert_eq!(blocked.total_retained_bytes, 2560);
         assert_eq!(
             blocked.blocker_codes,
             vec![
@@ -2556,6 +2565,9 @@ mod tests {
             allowed.provided_approval_fingerprint.as_deref(),
             Some(safe_plan.approval_fingerprint.as_str())
         );
+        assert_eq!(allowed.generation_count, 1);
+        assert_eq!(allowed.total_artifact_bytes, 4096);
+        assert_eq!(allowed.total_retained_bytes, 0);
         assert_eq!(allowed.candidate_count, 1);
         assert_eq!(allowed.reclaimable_bytes, 4096);
         let allowed_json =
@@ -2568,6 +2580,9 @@ mod tests {
         assert_eq!(allowed_json["approval_fingerprint_status"], "matched");
         assert_eq!(allowed_json["blocker_codes"], serde_json::json!([]));
         assert_eq!(allowed_json["active_generation_ids"], serde_json::json!([]));
+        assert_eq!(allowed_json["generation_count"], 1);
+        assert_eq!(allowed_json["total_artifact_bytes"], 4096);
+        assert_eq!(allowed_json["total_retained_bytes"], 0);
         assert_eq!(
             allowed_json["protected_generation_ids"],
             serde_json::json!([])
@@ -2617,6 +2632,9 @@ mod tests {
             no_candidates.blocker_codes,
             vec![LexicalCleanupApplyBlocker::NoReclaimableCandidates]
         );
+        assert_eq!(no_candidates.generation_count, 1);
+        assert_eq!(no_candidates.total_artifact_bytes, 512);
+        assert_eq!(no_candidates.total_retained_bytes, 512);
         assert_eq!(
             no_candidates.protected_generation_ids,
             vec!["gen-quarantined".to_string()]
