@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "properties": {
+    "failed_seed_bundle_count": {
+      "type": "integer"
+    },
+    "retained_publish_backup_count": {
+      "type": "integer"
+    },
+    "retained_publish_backup_retention_limit": {
+      "type": "integer"
+    },
+    "lexical_quarantined_generation_count": {
+      "type": "integer"
+    },
+    "lexical_quarantined_shard_count": {
+      "type": "integer"
+    },
+    "total_retained_bytes": {
+      "type": "integer"
+    },
+    "gc_eligible_asset_count": {
+      "type": "integer"
+    },
+    "gc_eligible_bytes": {
+      "type": "integer"
+    },
+    "inspection_required_asset_count": {
+      "type": "integer"
+    },
+    "inspection_required_bytes": {
+      "type": "integer"
+    }
+  }
+}

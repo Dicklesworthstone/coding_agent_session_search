@@ -25,7 +25,7 @@
 
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -139,6 +139,41 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     .expect("write quarantined generation artifact");
 
     data_dir
+}
+
+fn json_value_schema(value: &Value) -> Value {
+    match value {
+        Value::Null => json!({ "type": "null" }),
+        Value::Bool(_) => json!({ "type": "boolean" }),
+        Value::Number(number) => {
+            if number.is_f64() {
+                json!({ "type": "number" })
+            } else {
+                json!({ "type": "integer" })
+            }
+        }
+        Value::String(_) => json!({ "type": "string" }),
+        Value::Array(values) => {
+            let items = values
+                .first()
+                .map(json_value_schema)
+                .unwrap_or_else(|| json!({ "type": "unknown" }));
+            json!({
+                "type": "array",
+                "items": items
+            })
+        }
+        Value::Object(map) => {
+            let properties = map
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value_schema(value)))
+                .collect::<serde_json::Map<String, Value>>();
+            json!({
+                "type": "object",
+                "properties": properties
+            })
+        }
+    }
 }
 
 /// Strip non-deterministic values from a robot-mode JSON payload so the
@@ -500,6 +535,61 @@ fn status_quarantine_json_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/status_quarantine.json.golden", &scrubbed);
+}
+
+#[test]
+fn quarantine_summary_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = seed_diag_quarantine_fixture(test_home.path());
+
+    fn command_json(test_home: &std::path::Path, data_dir: &std::path::Path, args: &[&str]) -> Value {
+        let output = cass_cmd(test_home)
+            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+            .args(args)
+            .arg(data_dir)
+            .output()
+            .expect("run cass command");
+        assert!(
+            output.status.success(),
+            "cass {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    }
+
+    let status = command_json(
+        test_home.path(),
+        &data_dir,
+        &["status", "--json", "--data-dir"],
+    );
+    let diag = command_json(
+        test_home.path(),
+        &data_dir,
+        &["diag", "--json", "--quarantine", "--data-dir"],
+    );
+    let doctor = command_json(
+        test_home.path(),
+        &data_dir,
+        &["doctor", "--json", "--data-dir"],
+    );
+
+    let status_shape = json_value_schema(&status["quarantine"]["summary"]);
+    let diag_shape = json_value_schema(&diag["quarantine"]["summary"]);
+    let doctor_shape = json_value_schema(&doctor["quarantine"]["summary"]);
+
+    assert_eq!(
+        status_shape, diag_shape,
+        "status and diag quarantine summaries must expose the same schema"
+    );
+    assert_eq!(
+        status_shape, doctor_shape,
+        "status and doctor quarantine summaries must expose the same schema"
+    );
+
+    let canonical = serde_json::to_string_pretty(&status_shape).expect("pretty-print JSON");
+    assert_golden("robot/quarantine_summary_shape.json.golden", &canonical);
 }
 
 #[test]
