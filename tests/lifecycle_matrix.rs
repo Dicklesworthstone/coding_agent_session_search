@@ -2499,9 +2499,7 @@ fn models_status_and_cache_lifecycle_agree_on_state_machine_identity() {
         .expect("installed must be a bool");
     assert!(!installed, "isolated HOME unexpectedly installed=true");
 
-    let files = status["files"]
-        .as_array()
-        .expect("files must be an array");
+    let files = status["files"].as_array().expect("files must be an array");
     let mut file_local_names: Vec<String> = files
         .iter()
         .map(|f| {
@@ -2633,9 +2631,7 @@ fn models_status_fail_open_and_manifest_integrity_invariants() {
     );
 
     // Invariant D: files[].name and files[].local_name uniqueness.
-    let files = status["files"]
-        .as_array()
-        .expect("files must be an array");
+    let files = status["files"].as_array().expect("files must be an array");
     let mut names: Vec<&str> = files
         .iter()
         .map(|f| f["name"].as_str().expect("files[].name must be a string"))
