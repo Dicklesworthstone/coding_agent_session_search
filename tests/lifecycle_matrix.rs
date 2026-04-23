@@ -634,6 +634,204 @@ fn cleanup_quarantine_inventory_trace_is_artifact_backed() {
 }
 
 #[test]
+fn maintenance_publish_pause_resume_cleanup_story_is_artifact_backed() {
+    // Another ibuuh.23 lifecycle row: freeze a realistic long-running
+    // maintenance story with the same artifact-first discipline as the
+    // earlier scheduler and cleanup traces. The row proves operators keep
+    // enough evidence to diagnose a job that starts under idle budget, yields
+    // to foreground pressure, resumes, publishes a new generation, marks the
+    // prior live generation superseded, and previews conservative cleanup.
+    let mut harness = SearchAssetSimulationHarness::new(
+        "lifecycle_matrix_publish_pause_resume_cleanup",
+        LoadScript::new(vec![
+            LoadSample::idle("maintenance_start"),
+            LoadSample::busy("foreground_pressure"),
+            LoadSample::idle("pressure_cleared"),
+            LoadSample::idle("cleanup_preview"),
+        ]),
+    );
+
+    let derivatives_dir = harness.artifact_root().join("derivatives");
+    fs::create_dir_all(&derivatives_dir).expect("create derivatives dir");
+    for (name, bytes) in [
+        ("lexical-gen-002.snapshot", b"superseded-old".as_slice()),
+        ("lexical-gen-004.live", b"current-live".as_slice()),
+        ("lexical-gen-005.staging", b"next-generation".as_slice()),
+    ] {
+        fs::write(derivatives_dir.join(name), bytes).expect("seed derivative artifact");
+    }
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "start_publish")
+        .turn(SimulationActor::ForegroundSearch, "pause_publish")
+        .turn(SimulationActor::LexicalRepair, "resume_and_publish")
+        .turn(SimulationActor::LexicalRepair, "cleanup_preview");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "start_publish") => {
+                sim.phase(
+                    "maintenance",
+                    "long-running maintenance begins publish preparation under idle budget",
+                );
+                sim.snapshot_dir("inventory_before_publish", &derivatives_dir);
+                sim.snapshot_json(
+                    "maintenance_start",
+                    &json!({
+                        "maintenance_state": "running",
+                        "reason": "idle_budget_available",
+                        "candidate_generation": "lexical-gen-005",
+                        "published_generation": "lexical-gen-004",
+                        "superseded_generations": ["lexical-gen-002"],
+                        "published_generation_available": true,
+                        "cleanup_pending": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "pause_publish") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground pressure pauses maintenance before publish swap",
+                );
+                sim.snapshot_json(
+                    "maintenance_pause",
+                    &json!({
+                        "maintenance_state": "paused",
+                        "reason": "foreground_pressure",
+                        "yielded": true,
+                        "candidate_generation": "lexical-gen-005",
+                        "published_generation": "lexical-gen-004",
+                        "published_generation_available": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "resume_and_publish") => {
+                fs::write(
+                    derivatives_dir.join("lexical-gen-004.superseded"),
+                    b"retained-for-rollback",
+                )
+                .expect("mark superseded generation");
+                fs::write(
+                    derivatives_dir.join("lexical-gen-005.published"),
+                    b"published-current",
+                )
+                .expect("mark published generation");
+                sim.phase(
+                    "maintenance",
+                    "maintenance resumes, publishes lexical-gen-005, and marks lexical-gen-004 superseded",
+                );
+                sim.snapshot_dir("inventory_after_publish", &derivatives_dir);
+                sim.snapshot_json(
+                    "maintenance_published",
+                    &json!({
+                        "maintenance_state": "running",
+                        "reason": "pressure_cleared",
+                        "published_generation": "lexical-gen-005",
+                        "superseded_generation": "lexical-gen-004",
+                        "published_generation_available": true,
+                        "cleanup_pending": true,
+                        "publish_state": "published"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "cleanup_preview") => {
+                sim.phase(
+                    "cleanup",
+                    "cleanup keeps the immediate predecessor for rollback and only previews pruning older superseded artifacts",
+                );
+                sim.snapshot_dir("inventory_cleanup_preview", &derivatives_dir);
+                sim.snapshot_json(
+                    "maintenance_cleanup_preview",
+                    &json!({
+                        "cleanup_state": "dry_run_complete",
+                        "published_generation": "lexical-gen-005",
+                        "retained_superseded_generations": ["lexical-gen-004"],
+                        "would_prune": ["lexical-gen-002"],
+                        "would_retain": ["lexical-gen-004"],
+                        "published_generation_available": true,
+                        "reason": "rollback_window_active"
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic long-running maintenance turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "publish/pause/resume cleanup story should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 4);
+    assert_eq!(summary.actor_traces[0].load.label, "maintenance_start");
+    assert_eq!(summary.actor_traces[1].load.label, "foreground_pressure");
+    assert!(summary.actor_traces[1].load.user_active);
+    assert_eq!(summary.actor_traces[2].load.label, "pressure_cleared");
+    assert_eq!(summary.actor_traces[3].load.label, "cleanup_preview");
+
+    for expected in [
+        "001-maintenance_start.json",
+        "002-maintenance_pause.json",
+        "003-maintenance_published.json",
+        "004-maintenance_cleanup_preview.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing maintenance lifecycle snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write maintenance lifecycle artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = std::fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("foreground pressure pauses maintenance before publish swap"),
+        "phase log should preserve the publish-pause reason"
+    );
+    assert!(
+        phase_log.contains("inventory_before_publish"),
+        "phase log should preserve the before-publish artifact inventory"
+    );
+    assert!(
+        phase_log.contains("inventory_after_publish"),
+        "phase log should preserve the after-publish artifact inventory"
+    );
+
+    let published_path = artifacts.snapshot_dir.join("003-maintenance_published.json");
+    let published_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&published_path).expect("read published snapshot"),
+    )
+    .expect("published snapshot JSON");
+    assert_eq!(published_json["published_generation"], "lexical-gen-005");
+    assert_eq!(published_json["superseded_generation"], "lexical-gen-004");
+    assert_eq!(published_json["publish_state"], "published");
+
+    let cleanup_path = artifacts
+        .snapshot_dir
+        .join("004-maintenance_cleanup_preview.json");
+    let cleanup_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&cleanup_path).expect("read cleanup preview"),
+    )
+    .expect("cleanup preview JSON");
+    assert_eq!(cleanup_json["cleanup_state"], "dry_run_complete");
+    assert_eq!(
+        cleanup_json["retained_superseded_generations"][0],
+        "lexical-gen-004"
+    );
+    assert_eq!(cleanup_json["would_prune"][0], "lexical-gen-002");
+    assert_eq!(cleanup_json["reason"], "rollback_window_active");
+}
+
+#[test]
 fn derivative_retention_dry_run_keeps_protected_assets_out_of_reclaim_plan() {
     // Bead ibuuh.19 slice: cleanup must prove its inventory and dry-run
     // decisions before any destructive reclaim step. This row freezes the
