@@ -15950,6 +15950,23 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    // One final poll so the terminal reflects the final counters instead of
+    // whatever the last mid-run sample happened to catch (e.g. 140/145 right
+    // before completion would otherwise jump straight to `done.`).
+    let final_phase = progress.phase.load(Ordering::Relaxed);
+    let final_current = progress.current.load(Ordering::Relaxed);
+    let final_total = progress.total.load(Ordering::Relaxed);
+    if (final_phase != last_phase || final_current != last_current || final_total != last_total)
+        && final_total > 0
+    {
+        let phase_str = match final_phase {
+            1 => "scanning",
+            2 => "indexing",
+            _ => "preparing",
+        };
+        eprintln!("  {phase_str}: {final_current}/{final_total}");
+    }
+
     match index_handle.join() {
         Ok(Ok(())) => {
             eprintln!("  done.");
@@ -15959,10 +15976,10 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
             tracing::warn!(error = %e, "refresh_index_inline failed; proceeding with stale index");
         }
         Err(_panic) => {
-            eprintln!(
-                "Warning: --refresh indexing panicked. Continuing with existing index."
+            eprintln!("Warning: --refresh indexing panicked. Continuing with existing index.");
+            tracing::warn!(
+                "refresh_index_inline indexer thread panicked; proceeding with stale index"
             );
-            tracing::warn!("refresh_index_inline indexer thread panicked; proceeding with stale index");
         }
     }
 }
