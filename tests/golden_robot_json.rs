@@ -434,6 +434,19 @@ fn models_status_json_matches_golden() {
 }
 
 #[test]
+fn models_status_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let status = capture_robot_json_value(
+        test_home.path(),
+        &["models", "status", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
+    assert_golden("robot/models_status_shape.json.golden", &canonical);
+}
+
+#[test]
 fn health_json_matches_golden() {
     // `cass health --json` reports readiness for an isolated empty HOME:
     // status=not_initialized, healthy=false, db.exists=false,
