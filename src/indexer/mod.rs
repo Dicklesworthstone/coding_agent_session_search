@@ -14616,7 +14616,9 @@ pub mod persist {
     use rayon::prelude::*;
 
     use crate::connectors::NormalizedConversation;
-    use crate::indexer::semantic::{EmbeddingInput, packet_embedding_inputs_from_canonical_delta};
+    use crate::indexer::semantic::{
+        EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
+    };
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
     use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
@@ -14655,24 +14657,6 @@ pub mod persist {
         }
     }
 
-    fn load_conversation_embedding_ids(
-        storage: &FrankenStorage,
-        conversation_id: i64,
-    ) -> Result<(i64, Option<i64>)> {
-        storage
-            .raw()
-            .query_row_map(
-                "SELECT COALESCE(agent_id, 0), workspace_id
-                 FROM conversations
-                 WHERE id = ?1",
-                &[ParamValue::from(conversation_id)],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )
-            .with_context(|| {
-                format!("loading canonical embedding ids for conversation {conversation_id}")
-            })
-    }
-
     fn load_inserted_message_ids_by_idx(
         storage: &FrankenStorage,
         conversation_id: i64,
@@ -14707,56 +14691,34 @@ pub mod persist {
 
     fn packet_semantic_delta_for_outcome(
         storage: &FrankenStorage,
-        template: &Conversation,
         outcome: &InsertOutcome,
     ) -> Result<(Vec<EmbeddingInput>, Option<i64>)> {
         if outcome.inserted_indices.is_empty() {
             return Ok((Vec::new(), None));
         }
 
-        let (agent_id, workspace_id) =
-            load_conversation_embedding_ids(storage, outcome.conversation_id)?;
         let message_ids_by_idx = load_inserted_message_ids_by_idx(
             storage,
             outcome.conversation_id,
             &outcome.inserted_indices,
         )?;
-        let max_message_id = message_ids_by_idx.values().copied().max();
-
-        let inserted_index_set: HashSet<i64> = outcome.inserted_indices.iter().copied().collect();
-        let messages: Vec<Message> = template
-            .messages
-            .iter()
-            .filter(|message| inserted_index_set.contains(&message.idx))
-            .filter_map(|message| {
-                let raw_message_id = message_ids_by_idx.get(&message.idx).copied();
-                if raw_message_id.is_none() {
-                    tracing::warn!(
-                        conversation_id = outcome.conversation_id,
-                        message_idx = message.idx,
-                        "skipping packet semantic delta message without persisted canonical id"
-                    );
-                }
-                raw_message_id.map(|raw_message_id| {
-                    let mut message = message.clone();
-                    message.id = Some(raw_message_id);
-                    message
-                })
-            })
-            .collect();
-
-        if messages.is_empty() {
-            return Ok((Vec::new(), max_message_id));
+        if message_ids_by_idx.len() != outcome.inserted_indices.len() {
+            tracing::warn!(
+                conversation_id = outcome.conversation_id,
+                expected_inserted_indices = outcome.inserted_indices.len(),
+                resolved_canonical_message_ids = message_ids_by_idx.len(),
+                "skipping packet semantic delta rows without persisted canonical ids"
+            );
         }
+        let inserted_message_ids: HashSet<i64> = message_ids_by_idx.values().copied().collect();
+        let max_message_id = inserted_message_ids.iter().copied().max();
 
-        let mut canonical_delta = template.clone();
-        canonical_delta.id = Some(outcome.conversation_id);
-        canonical_delta.messages = messages;
-
-        Ok((
-            packet_embedding_inputs_from_canonical_delta(&canonical_delta, agent_id, workspace_id),
-            max_message_id,
-        ))
+        let inputs = packet_embedding_inputs_from_storage_for_message_ids(
+            storage,
+            &[outcome.conversation_id],
+            &inserted_message_ids,
+        )?;
+        Ok((inputs, max_message_id))
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -15372,7 +15334,7 @@ pub mod persist {
             if defer_lexical_updates {
                 if capture_semantic_delta {
                     let (inputs, max_message_id) =
-                        packet_semantic_delta_for_outcome(storage, &internal_convs[idx], &outcome)?;
+                        packet_semantic_delta_for_outcome(storage, &outcome)?;
                     batch_outcome.extend_semantic_delta(inputs, max_message_id);
                 }
                 continue;
@@ -15412,7 +15374,7 @@ pub mod persist {
 
             if capture_semantic_delta {
                 let (inputs, max_message_id) =
-                    packet_semantic_delta_for_outcome(storage, &internal_convs[idx], &outcome)?;
+                    packet_semantic_delta_for_outcome(storage, &outcome)?;
                 batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
         }
@@ -15817,9 +15779,8 @@ pub mod persist {
         }
 
         if capture_semantic_delta {
-            for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
-                let (inputs, max_message_id) =
-                    packet_semantic_delta_for_outcome(storage, internal_conv, outcome)?;
+            for outcome in outcomes.iter() {
+                let (inputs, max_message_id) = packet_semantic_delta_for_outcome(storage, outcome)?;
                 batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
         }
@@ -16005,6 +15966,136 @@ pub mod persist {
             let reader = index.reader().expect("reader");
             reader.reload().expect("reload");
             reader.searcher().num_docs()
+        }
+
+        #[test]
+        fn packet_semantic_delta_for_outcome_replays_persisted_canonical_state() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("semantic-delta-replay.db");
+            let storage = create_franken_db(&db_path);
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let workspace_id = storage
+                .ensure_workspace(std::path::Path::new("/tmp/persist-semantic"), None)
+                .unwrap();
+
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: Some(std::path::PathBuf::from("/tmp/persist-semantic")),
+                external_id: Some("semantic-delta-replay".into()),
+                title: Some("Semantic delta replay".into()),
+                source_path: std::path::PathBuf::from("/tmp/persist-semantic.jsonl"),
+                started_at: Some(1_700_000_200_000),
+                ended_at: Some(1_700_000_200_200),
+                approx_tokens: Some(32),
+                metadata_json: serde_json::json!({}),
+                messages: vec![
+                    crate::model::types::Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_200_010),
+                        content: "original user".into(),
+                        extra_json: serde_json::json!({}),
+                        snippets: Vec::new(),
+                    },
+                    crate::model::types::Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: Some("assistant".into()),
+                        created_at: Some(1_700_000_200_020),
+                        content: "original assistant".into(),
+                        extra_json: serde_json::json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+                source_id: "initial-remote".into(),
+                origin_host: Some("initial-host".into()),
+            };
+
+            let outcome = storage
+                .insert_conversation_tree(agent_id, Some(workspace_id), &conversation)
+                .unwrap();
+            let inserted_ids = load_inserted_message_ids_by_idx(
+                &storage,
+                outcome.conversation_id,
+                &outcome.inserted_indices,
+            )
+            .unwrap();
+            let assistant_id = inserted_ids.get(&1).copied().expect("assistant message id");
+            storage
+                .upsert_source(&Source {
+                    id: "replayed-remote".into(),
+                    kind: SourceKind::Ssh,
+                    host_label: Some("replayed-host".into()),
+                    machine_id: None,
+                    platform: None,
+                    config_json: None,
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE conversations SET source_id = ?1, origin_host = ?2 WHERE id = ?3",
+                    &[
+                        ParamValue::from("replayed-remote"),
+                        ParamValue::from("replayed-host"),
+                        ParamValue::from(outcome.conversation_id),
+                    ],
+                )
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE messages SET role = ?1, content = ?2 WHERE id = ?3",
+                    &[
+                        ParamValue::from("tool"),
+                        ParamValue::from("persisted tool reply"),
+                        ParamValue::from(assistant_id),
+                    ],
+                )
+                .unwrap();
+
+            let (inputs, max_message_id) =
+                packet_semantic_delta_for_outcome(&storage, &outcome).unwrap();
+            assert_eq!(max_message_id, Some(assistant_id));
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(inputs[0].content, "original user");
+            assert_eq!(
+                crate::indexer::semantic_role_name(inputs[0].role),
+                Some("user")
+            );
+            assert_eq!(inputs[1].content, "persisted tool reply");
+            assert_eq!(
+                crate::indexer::semantic_role_name(inputs[1].role),
+                Some("tool")
+            );
+
+            let expected_source_id = crate::search::tantivy::normalized_index_source_id(
+                Some("replayed-remote"),
+                None,
+                Some("replayed-host"),
+            );
+            let expected_source_hash = crc32fast::hash(expected_source_id.as_bytes());
+            assert!(
+                inputs
+                    .iter()
+                    .all(|input| input.source_id == expected_source_hash),
+                "semantic delta should use canonical replay provenance: {inputs:#?}"
+            );
         }
 
         #[test]
