@@ -17,7 +17,14 @@
 mod util;
 
 use assert_cmd::Command;
+use coding_agent_search::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
+use coding_agent_search::search::semantic_manifest::{
+    ArtifactRecord, BacklogLedger, BuildCheckpoint, SemanticManifest, TierKind,
+};
+use coding_agent_search::search::tantivy::index_dir;
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::json;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -78,6 +85,74 @@ fn scrub(input: &str, test_home: &Path) -> String {
             .to_string();
     }
     out
+}
+
+fn cass_json_with_data_dir(data_dir: &Path, subcommand: &str) -> serde_json::Value {
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([subcommand, "--json", "--data-dir"])
+        .arg(data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass command");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    serde_json::from_str(&stdout).expect("valid JSON")
+}
+
+fn seed_semantic_progress_fixture(
+    data_dir: &Path,
+    fast_tier_ready: bool,
+    checkpoint_tier: TierKind,
+) {
+    let db_path = data_dir.join("agent_search.db");
+    FrankenStorage::open(&db_path)
+        .expect("create canonical DB")
+        .close()
+        .expect("close canonical DB");
+
+    let index_path = index_dir(data_dir).expect("index dir");
+    fs::create_dir_all(&index_path).expect("create index dir");
+    fs::write(index_path.join("meta.json"), b"{}").expect("write index meta");
+
+    let mut manifest = SemanticManifest::default();
+    if fast_tier_ready {
+        manifest.fast_tier = Some(ArtifactRecord {
+            tier: TierKind::Fast,
+            embedder_id: "hash".to_string(),
+            model_revision: "hash".to_string(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            dimension: 256,
+            doc_count: 120,
+            conversation_count: 12,
+            db_fingerprint: "fixture-db-fingerprint".to_string(),
+            index_path: "vector_index/vector.fast.idx".to_string(),
+            size_bytes: 4_096,
+            started_at_ms: 1_733_100_000_000,
+            completed_at_ms: 1_733_100_100_000,
+            ready: true,
+        });
+    }
+    manifest.backlog = BacklogLedger {
+        total_conversations: 20,
+        fast_tier_processed: if fast_tier_ready { 12 } else { 0 },
+        quality_tier_processed: 3,
+        db_fingerprint: "fixture-db-fingerprint".to_string(),
+        computed_at_ms: 1_733_100_200_000,
+    };
+    manifest.checkpoint = Some(BuildCheckpoint {
+        tier: checkpoint_tier,
+        embedder_id: "all-minilm-l6-v2".to_string(),
+        last_offset: 77,
+        docs_embedded: 66,
+        conversations_processed: 3,
+        total_conversations: 20,
+        db_fingerprint: "fixture-db-fingerprint".to_string(),
+        schema_version: SEMANTIC_SCHEMA_VERSION,
+        chunking_version: CHUNKING_STRATEGY_VERSION,
+        saved_at_ms: 1_733_100_300_000,
+    });
+    manifest.save(data_dir).expect("save semantic manifest");
 }
 
 #[test]
@@ -1040,6 +1115,56 @@ fn health_and_status_agree_on_semantic_fallback_state() {
         health_semantic["fallback_mode"], "lexical",
         "semantic fallback must remain lexical when assets are absent"
     );
+}
+
+#[test]
+fn health_and_status_surface_semantic_backlog_checkpoint_and_tier_truth() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    seed_semantic_progress_fixture(test_home.path(), true, TierKind::Quality);
+
+    let health = cass_json_with_data_dir(test_home.path(), "health");
+    let status = cass_json_with_data_dir(test_home.path(), "status");
+
+    for semantic in [&health["state"]["semantic"], &status["semantic"]] {
+        assert_eq!(semantic["fast_tier"]["present"], true);
+        assert_eq!(semantic["fast_tier"]["ready"], true);
+        assert_eq!(semantic["quality_tier"]["present"], false);
+        assert_eq!(semantic["backlog"]["total_conversations"], 20);
+        assert_eq!(semantic["backlog"]["fast_tier_processed"], 12);
+        assert_eq!(semantic["backlog"]["fast_tier_remaining"], 8);
+        assert_eq!(semantic["backlog"]["quality_tier_processed"], 3);
+        assert_eq!(semantic["backlog"]["quality_tier_remaining"], 17);
+        assert_eq!(semantic["backlog"]["pending_work"], true);
+        assert_eq!(semantic["checkpoint"]["active"], true);
+        assert_eq!(semantic["checkpoint"]["tier"], "quality");
+        assert_eq!(semantic["checkpoint"]["conversations_processed"], 3);
+        assert_eq!(semantic["checkpoint"]["total_conversations"], 20);
+        assert_eq!(semantic["checkpoint"]["progress_pct"], 15);
+    }
+}
+
+#[test]
+fn semantic_backfill_without_ready_fast_tier_recommends_waiting() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    seed_semantic_progress_fixture(test_home.path(), false, TierKind::Fast);
+
+    let health = cass_json_with_data_dir(test_home.path(), "health");
+    let status = cass_json_with_data_dir(test_home.path(), "status");
+
+    assert_eq!(
+        health["recommended_action"], status["recommended_action"],
+        "health/status should agree on semantic catch-up guidance"
+    );
+    let action = status["recommended_action"]
+        .as_str()
+        .expect("status.recommended_action should be a string");
+    assert!(
+        action.contains("semantic assets are still catching up"),
+        "status should guide the caller to wait for semantic catch-up instead of implying lexical breakage: {status}"
+    );
+    assert_eq!(status["semantic"]["fast_tier"]["present"], false);
+    assert_eq!(status["semantic"]["checkpoint"]["tier"], "fast");
+    assert_eq!(status["semantic"]["backlog"]["pending_work"], true);
 }
 
 #[test]

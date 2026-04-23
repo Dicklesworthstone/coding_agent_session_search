@@ -5594,6 +5594,10 @@ fn state_meta_json(
                 hnsw_ready: false,
                 progressive_ready: false,
                 hint: Some("Use --mode lexical until semantic assets are repaired".to_string()),
+                fast_tier: Default::default(),
+                quality_tier: Default::default(),
+                backlog: Default::default(),
+                checkpoint: Default::default(),
             },
         }
     });
@@ -5620,6 +5624,10 @@ fn state_meta_json(
             "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical."
                 .to_string(),
         );
+        assets.semantic.fast_tier = Default::default();
+        assets.semantic.quality_tier = Default::default();
+        assets.semantic.backlog = Default::default();
+        assets.semantic.checkpoint = Default::default();
     }
     let lexical = &assets.lexical;
     let semantic = &assets.semantic;
@@ -5814,6 +5822,62 @@ fn state_meta_json(
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
             "hint": semantic.hint,
+            "fast_tier": {
+                "present": semantic.fast_tier.present,
+                "ready": semantic.fast_tier.ready,
+                "current_db_matches": semantic.fast_tier.current_db_matches,
+                "conversation_count": semantic.fast_tier.conversation_count,
+                "doc_count": semantic.fast_tier.doc_count,
+                "embedder_id": semantic.fast_tier.embedder_id,
+                "model_revision": semantic.fast_tier.model_revision,
+                "completed_at": semantic
+                    .fast_tier
+                    .completed_at_ms
+                    .and_then(format_timestamp_millis_rfc3339),
+                "size_bytes": semantic.fast_tier.size_bytes,
+            },
+            "quality_tier": {
+                "present": semantic.quality_tier.present,
+                "ready": semantic.quality_tier.ready,
+                "current_db_matches": semantic.quality_tier.current_db_matches,
+                "conversation_count": semantic.quality_tier.conversation_count,
+                "doc_count": semantic.quality_tier.doc_count,
+                "embedder_id": semantic.quality_tier.embedder_id,
+                "model_revision": semantic.quality_tier.model_revision,
+                "completed_at": semantic
+                    .quality_tier
+                    .completed_at_ms
+                    .and_then(format_timestamp_millis_rfc3339),
+                "size_bytes": semantic.quality_tier.size_bytes,
+            },
+            "backlog": {
+                "total_conversations": semantic.backlog.total_conversations,
+                "fast_tier_processed": semantic.backlog.fast_tier_processed,
+                "fast_tier_remaining": semantic.backlog.fast_tier_remaining,
+                "quality_tier_processed": semantic.backlog.quality_tier_processed,
+                "quality_tier_remaining": semantic.backlog.quality_tier_remaining,
+                "pending_work": semantic.backlog.pending_work,
+                "current_db_matches": semantic.backlog.current_db_matches,
+                "computed_at": semantic
+                    .backlog
+                    .computed_at_ms
+                    .and_then(format_timestamp_millis_rfc3339),
+            },
+            "checkpoint": {
+                "active": semantic.checkpoint.active,
+                "tier": semantic.checkpoint.tier,
+                "current_db_matches": semantic.checkpoint.current_db_matches,
+                "completed": semantic.checkpoint.completed,
+                "conversations_processed": semantic.checkpoint.conversations_processed,
+                "total_conversations": semantic.checkpoint.total_conversations,
+                "progress_pct": semantic.checkpoint.progress_pct,
+                "docs_embedded": semantic.checkpoint.docs_embedded,
+                "last_offset": semantic.checkpoint.last_offset,
+                "saved_at": semantic
+                    .checkpoint
+                    .saved_at_ms
+                    .and_then(format_timestamp_millis_rfc3339),
+            },
         },
         "_meta": {
             "timestamp": ts_str,
@@ -5918,6 +5982,140 @@ fn refresh_state_database_counts_if_needed(
         "counts_skipped".to_string(),
         serde_json::Value::Bool(refreshed.counts_skipped),
     );
+}
+
+fn readiness_snapshot_from_state(
+    state: &serde_json::Value,
+    not_initialized: bool,
+) -> crate::search::readiness::ReadinessSnapshot {
+    use crate::search::readiness::ReadinessSnapshot;
+
+    let lexical = lexical_readiness_from_state(state, not_initialized);
+    let semantic = semantic_readiness_from_state(state);
+    ReadinessSnapshot::new(lexical, semantic)
+}
+
+fn lexical_readiness_from_state(
+    state: &serde_json::Value,
+    not_initialized: bool,
+) -> crate::search::readiness::LexicalReadinessState {
+    use crate::search::readiness::LexicalReadinessState;
+
+    if not_initialized {
+        return LexicalReadinessState::Missing;
+    }
+
+    let index = state.get("index");
+    let rebuild_active = state
+        .get("rebuild")
+        .and_then(|rebuild| rebuild.get("active"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if rebuild_active {
+        return LexicalReadinessState::Repairing;
+    }
+
+    let exists = index
+        .and_then(|idx| idx.get("exists"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !exists {
+        return LexicalReadinessState::Missing;
+    }
+
+    let status = index
+        .and_then(|idx| idx.get("status"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let reason = index
+        .and_then(|idx| idx.get("reason"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if status == "error" && reason.contains("quarantin") {
+        return LexicalReadinessState::CorruptQuarantined;
+    }
+    if status == "stale"
+        || index
+            .and_then(|idx| idx.get("fresh"))
+            .and_then(|value| value.as_bool())
+            == Some(false)
+    {
+        return LexicalReadinessState::StaleButSearchable;
+    }
+
+    LexicalReadinessState::Ready
+}
+
+fn semantic_readiness_from_state(
+    state: &serde_json::Value,
+) -> crate::search::readiness::SemanticReadinessState {
+    use crate::search::readiness::SemanticReadinessState;
+
+    let semantic = state.get("semantic");
+    let availability = semantic
+        .and_then(|sem| sem.get("availability"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    if availability == "disabled" {
+        return SemanticReadinessState::PolicyDisabled;
+    }
+
+    let can_search = semantic
+        .and_then(|sem| sem.get("can_search"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let fast_ready = semantic
+        .and_then(|sem| sem.get("fast_tier"))
+        .and_then(|tier| tier.get("ready"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let quality_ready = semantic
+        .and_then(|sem| sem.get("quality_tier"))
+        .and_then(|tier| tier.get("ready"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let checkpoint_active = semantic
+        .and_then(|sem| sem.get("checkpoint"))
+        .and_then(|checkpoint| checkpoint.get("active"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let backlog_pending = semantic
+        .and_then(|sem| sem.get("backlog"))
+        .and_then(|backlog| backlog.get("pending_work"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if quality_ready && (fast_ready || can_search) {
+        return SemanticReadinessState::HybridReady;
+    }
+    if fast_ready || can_search {
+        return SemanticReadinessState::FastTierReady;
+    }
+    if checkpoint_active
+        || backlog_pending
+        || matches!(availability, "downloading" | "verifying" | "index_building")
+    {
+        return SemanticReadinessState::Backfilling;
+    }
+
+    SemanticReadinessState::Absent
+}
+
+fn semantic_recommended_action(state: &serde_json::Value, not_initialized: bool) -> Option<String> {
+    use crate::search::readiness::RecommendedAction;
+
+    match readiness_snapshot_from_state(state, not_initialized).recommended_action() {
+        RecommendedAction::WaitForSemanticCatchUp => Some(
+            "Lexical search is ready; semantic assets are still catching up. Continue with lexical results or wait for hybrid refinement to finish."
+                .to_string(),
+        ),
+        RecommendedAction::SemanticDisabledByPolicy => Some(
+            "Semantic refinement is disabled by policy; continue with lexical search or re-enable semantic mode for hybrid results."
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 fn warn_tui_terminal_profile(stderr_is_tty: bool) {
@@ -10329,7 +10527,7 @@ fn run_status(
             "Run 'cass index' to refresh the index{pending_msg}"
         ))
     } else {
-        None
+        semantic_recommended_action(&state, not_initialized)
     };
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -10571,7 +10769,7 @@ fn run_health(
     } else if !healthy {
         Some("Run 'cass index --full' to rebuild the index/database.".to_string())
     } else {
-        None
+        semantic_recommended_action(&state, not_initialized)
     };
 
     // Collect structured errors for the JSON response.
@@ -15036,7 +15234,63 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "hnsw_path": { "type": ["string", "null"] },
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
-            "hint": { "type": ["string", "null"] }
+            "hint": { "type": ["string", "null"] },
+            "fast_tier": {
+                "type": "object",
+                "properties": {
+                    "present": { "type": "boolean" },
+                    "ready": { "type": "boolean" },
+                    "current_db_matches": { "type": ["boolean", "null"] },
+                    "conversation_count": { "type": ["integer", "null"] },
+                    "doc_count": { "type": ["integer", "null"] },
+                    "embedder_id": { "type": ["string", "null"] },
+                    "model_revision": { "type": ["string", "null"] },
+                    "completed_at": { "type": ["string", "null"] },
+                    "size_bytes": { "type": ["integer", "null"] }
+                }
+            },
+            "quality_tier": {
+                "type": "object",
+                "properties": {
+                    "present": { "type": "boolean" },
+                    "ready": { "type": "boolean" },
+                    "current_db_matches": { "type": ["boolean", "null"] },
+                    "conversation_count": { "type": ["integer", "null"] },
+                    "doc_count": { "type": ["integer", "null"] },
+                    "embedder_id": { "type": ["string", "null"] },
+                    "model_revision": { "type": ["string", "null"] },
+                    "completed_at": { "type": ["string", "null"] },
+                    "size_bytes": { "type": ["integer", "null"] }
+                }
+            },
+            "backlog": {
+                "type": "object",
+                "properties": {
+                    "total_conversations": { "type": "integer" },
+                    "fast_tier_processed": { "type": "integer" },
+                    "fast_tier_remaining": { "type": "integer" },
+                    "quality_tier_processed": { "type": "integer" },
+                    "quality_tier_remaining": { "type": "integer" },
+                    "pending_work": { "type": "boolean" },
+                    "current_db_matches": { "type": ["boolean", "null"] },
+                    "computed_at": { "type": ["string", "null"] }
+                }
+            },
+            "checkpoint": {
+                "type": "object",
+                "properties": {
+                    "active": { "type": "boolean" },
+                    "tier": { "type": ["string", "null"] },
+                    "current_db_matches": { "type": ["boolean", "null"] },
+                    "completed": { "type": ["boolean", "null"] },
+                    "conversations_processed": { "type": ["integer", "null"] },
+                    "total_conversations": { "type": ["integer", "null"] },
+                    "progress_pct": { "type": ["integer", "null"] },
+                    "docs_embedded": { "type": ["integer", "null"] },
+                    "last_offset": { "type": ["integer", "null"] },
+                    "saved_at": { "type": ["string", "null"] }
+                }
+            }
         }
     })
 }

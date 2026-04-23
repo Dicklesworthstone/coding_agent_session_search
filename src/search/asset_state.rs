@@ -29,6 +29,7 @@ use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, load_hash_semantic_context, load_semantic_context,
 };
+use crate::search::semantic_manifest::{ArtifactRecord, BuildCheckpoint, SemanticManifest};
 use crate::search::tantivy::SCHEMA_HASH;
 use crate::search::vector_index::{VECTOR_INDEX_DIR, vector_index_path};
 
@@ -287,6 +288,49 @@ pub(crate) struct SemanticAssetState {
     pub hnsw_ready: bool,
     pub progressive_ready: bool,
     pub hint: Option<String>,
+    pub fast_tier: SemanticTierAssetState,
+    pub quality_tier: SemanticTierAssetState,
+    pub backlog: SemanticBacklogProgressState,
+    pub checkpoint: SemanticCheckpointProgressState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticTierAssetState {
+    pub present: bool,
+    pub ready: bool,
+    pub current_db_matches: Option<bool>,
+    pub conversation_count: Option<u64>,
+    pub doc_count: Option<u64>,
+    pub embedder_id: Option<String>,
+    pub model_revision: Option<String>,
+    pub completed_at_ms: Option<i64>,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticBacklogProgressState {
+    pub total_conversations: u64,
+    pub fast_tier_processed: u64,
+    pub fast_tier_remaining: u64,
+    pub quality_tier_processed: u64,
+    pub quality_tier_remaining: u64,
+    pub pending_work: bool,
+    pub current_db_matches: Option<bool>,
+    pub computed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SemanticCheckpointProgressState {
+    pub active: bool,
+    pub tier: Option<&'static str>,
+    pub current_db_matches: Option<bool>,
+    pub completed: Option<bool>,
+    pub conversations_processed: Option<u64>,
+    pub total_conversations: Option<u64>,
+    pub progress_pct: Option<u8>,
+    pub docs_embedded: Option<u64>,
+    pub last_offset: Option<i64>,
+    pub saved_at_ms: Option<i64>,
 }
 
 pub(crate) struct InspectSearchAssetsInput<'a> {
@@ -356,37 +400,49 @@ pub(crate) fn inspect_search_assets(
         compute_lexical_fingerprint,
     } = input;
 
-    Ok(SearchAssetSnapshot {
-        lexical: inspect_lexical_assets(InspectLexicalAssetsInput {
-            data_dir,
-            db_path,
-            stale_threshold,
-            last_indexed_at_ms,
-            now_secs,
-            maintenance,
-            db_available,
-            compute_lexical_fingerprint,
-        })?,
-        semantic: inspect_semantic_assets(data_dir, db_path, semantic_preference),
-    })
+    let lexical = inspect_lexical_assets(InspectLexicalAssetsInput {
+        data_dir,
+        db_path,
+        stale_threshold,
+        last_indexed_at_ms,
+        now_secs,
+        maintenance,
+        db_available,
+        compute_lexical_fingerprint,
+    })?;
+    let semantic = inspect_semantic_assets(
+        data_dir,
+        db_path,
+        semantic_preference,
+        lexical.fingerprint.current_db_fingerprint.as_deref(),
+    );
+
+    Ok(SearchAssetSnapshot { lexical, semantic })
 }
 
 pub(crate) fn inspect_semantic_assets(
     data_dir: &Path,
     db_path: &Path,
     preference: SemanticPreference,
+    current_db_fingerprint: Option<&str>,
 ) -> SemanticAssetState {
     let setup = match preference {
         SemanticPreference::DefaultModel => load_semantic_context(data_dir, db_path),
         SemanticPreference::HashFallback => load_hash_semantic_context(data_dir, db_path),
     };
-    semantic_state_from_availability(data_dir, &setup.availability, preference)
+    semantic_state_from_availability(
+        data_dir,
+        &setup.availability,
+        preference,
+        current_db_fingerprint,
+    )
 }
 
 pub(crate) fn semantic_state_from_availability(
     data_dir: &Path,
     availability: &SemanticAvailability,
     preference: SemanticPreference,
+    current_db_fingerprint: Option<&str>,
 ) -> SemanticAssetState {
     let preferred_backend = match preference {
         SemanticPreference::DefaultModel => "fastembed",
@@ -408,6 +464,8 @@ pub(crate) fn semantic_state_from_availability(
     let summary = availability.summary();
     let can_search = availability.can_search();
     let hint = semantic_hint(availability, preference);
+    let (fast_tier, quality_tier, backlog, checkpoint) =
+        semantic_manifest_progress(data_dir, current_db_fingerprint);
 
     SemanticAssetState {
         status,
@@ -424,6 +482,94 @@ pub(crate) fn semantic_state_from_availability(
         hnsw_ready,
         progressive_ready,
         hint,
+        fast_tier,
+        quality_tier,
+        backlog,
+        checkpoint,
+    }
+}
+
+fn semantic_manifest_progress(
+    data_dir: &Path,
+    current_db_fingerprint: Option<&str>,
+) -> (
+    SemanticTierAssetState,
+    SemanticTierAssetState,
+    SemanticBacklogProgressState,
+    SemanticCheckpointProgressState,
+) {
+    let manifest = SemanticManifest::load_or_default(data_dir).unwrap_or_default();
+    let fast_tier = semantic_tier_asset_state(manifest.fast_tier.as_ref(), current_db_fingerprint);
+    let quality_tier =
+        semantic_tier_asset_state(manifest.quality_tier.as_ref(), current_db_fingerprint);
+    let backlog = semantic_backlog_progress_state(&manifest, current_db_fingerprint);
+    let checkpoint =
+        semantic_checkpoint_progress_state(manifest.checkpoint.as_ref(), current_db_fingerprint);
+    (fast_tier, quality_tier, backlog, checkpoint)
+}
+
+fn semantic_tier_asset_state(
+    artifact: Option<&ArtifactRecord>,
+    current_db_fingerprint: Option<&str>,
+) -> SemanticTierAssetState {
+    let Some(artifact) = artifact else {
+        return SemanticTierAssetState::default();
+    };
+
+    SemanticTierAssetState {
+        present: true,
+        ready: artifact.ready,
+        current_db_matches: current_db_fingerprint.map(|fp| artifact.db_fingerprint == fp),
+        conversation_count: Some(artifact.conversation_count),
+        doc_count: Some(artifact.doc_count),
+        embedder_id: Some(artifact.embedder_id.clone()),
+        model_revision: Some(artifact.model_revision.clone()),
+        completed_at_ms: Some(artifact.completed_at_ms),
+        size_bytes: Some(artifact.size_bytes),
+    }
+}
+
+fn semantic_backlog_progress_state(
+    manifest: &SemanticManifest,
+    current_db_fingerprint: Option<&str>,
+) -> SemanticBacklogProgressState {
+    let backlog = &manifest.backlog;
+    let current_db_matches = current_db_fingerprint.and_then(|fp| {
+        (backlog.computed_at_ms > 0 || !backlog.db_fingerprint.is_empty())
+            .then(|| backlog.is_current(fp))
+    });
+
+    SemanticBacklogProgressState {
+        total_conversations: backlog.total_conversations,
+        fast_tier_processed: backlog.fast_tier_processed,
+        fast_tier_remaining: backlog.fast_tier_remaining(),
+        quality_tier_processed: backlog.quality_tier_processed,
+        quality_tier_remaining: backlog.quality_tier_remaining(),
+        pending_work: backlog.has_pending_work() || manifest.checkpoint.is_some(),
+        current_db_matches,
+        computed_at_ms: (backlog.computed_at_ms > 0).then_some(backlog.computed_at_ms),
+    }
+}
+
+fn semantic_checkpoint_progress_state(
+    checkpoint: Option<&BuildCheckpoint>,
+    current_db_fingerprint: Option<&str>,
+) -> SemanticCheckpointProgressState {
+    let Some(checkpoint) = checkpoint else {
+        return SemanticCheckpointProgressState::default();
+    };
+
+    SemanticCheckpointProgressState {
+        active: true,
+        tier: Some(checkpoint.tier.as_str()),
+        current_db_matches: current_db_fingerprint.map(|fp| checkpoint.is_valid(fp)),
+        completed: Some(checkpoint.is_complete()),
+        conversations_processed: Some(checkpoint.conversations_processed),
+        total_conversations: Some(checkpoint.total_conversations),
+        progress_pct: Some(checkpoint.progress_pct()),
+        docs_embedded: Some(checkpoint.docs_embedded),
+        last_offset: Some(checkpoint.last_offset),
+        saved_at_ms: Some(checkpoint.saved_at_ms),
     }
 }
 
@@ -1687,6 +1833,7 @@ mod tests {
             Path::new("/tmp/cass"),
             &SemanticAvailability::HashFallback,
             SemanticPreference::HashFallback,
+            None,
         );
 
         assert_eq!(state.status, "hash_fallback");
@@ -1713,6 +1860,7 @@ mod tests {
                 embedder_id: FastEmbedder::embedder_id_static().to_string(),
             },
             SemanticPreference::DefaultModel,
+            None,
         );
 
         assert_eq!(state.status, "ready");
