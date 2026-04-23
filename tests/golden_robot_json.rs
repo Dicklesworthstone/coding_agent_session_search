@@ -700,6 +700,19 @@ fn api_version_json_matches_golden() {
 }
 
 #[test]
+fn api_version_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let api_version = capture_robot_json_value(
+        test_home.path(),
+        &["api-version", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&api_version)).expect("pretty-print JSON");
+    assert_golden("robot/api_version_shape.json.golden", &canonical);
+}
+
+#[test]
 fn stats_json_missing_db_error_envelope_matches_golden() {
     // `cass stats --json` against an isolated empty HOME emits the
     // error-envelope variant of the robot-mode JSON contract: a structured

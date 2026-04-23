@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "crate_version": {
+      "type": "string"
+    },
+    "api_version": {
+      "type": "integer"
+    },
+    "contract_version": {
+      "type": "string"
+    }
+  }
+}
