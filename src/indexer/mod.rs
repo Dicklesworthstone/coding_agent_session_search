@@ -26515,6 +26515,69 @@ mod tests {
         );
     }
 
+    /// Simulate a hard-kill restart boundary after the prior live index
+    /// has already been parked at `.<name>.publish-in-progress.bak` but
+    /// before any subsequent publish starts. Startup recovery must be
+    /// able to restore the prior live index from the stranded sidecar
+    /// without requiring a new staged publish to complete first.
+    #[test]
+    fn recover_or_finalize_interrupted_lexical_publish_backup_restores_live_index_without_new_publish(
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let prior_conv = norm_conv(
+            Some("restart-recovery-prior"),
+            vec![
+                norm_msg(0, 1_700_000_905_000),
+                norm_msg(1, 1_700_000_905_100),
+                norm_msg(2, 1_700_000_905_200),
+            ],
+        );
+        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        prior_live
+            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(905))
+            .unwrap();
+        prior_live.commit().unwrap();
+        drop(prior_live);
+
+        let in_progress_backup_path = lexical_publish_in_progress_backup_path(&index_path);
+        fs::rename(&index_path, &in_progress_backup_path).unwrap();
+        assert!(
+            !index_path.exists(),
+            "precondition: live index path should be absent after the simulated hard-kill window"
+        );
+        assert!(
+            in_progress_backup_path.exists(),
+            "precondition: interrupted publish sidecar should hold the recoverable live index"
+        );
+
+        recover_or_finalize_interrupted_lexical_publish_backup(&index_path).unwrap();
+
+        assert!(
+            index_path.exists(),
+            "startup recovery must restore the live index path from the stranded sidecar"
+        );
+        assert!(
+            !in_progress_backup_path.exists(),
+            "startup recovery must consume the stranded sidecar after restoring the live index"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "startup recovery must restore the exact prior-live document surface"
+        );
+        assert!(
+            !lexical_publish_backups_dir(&index_path).exists(),
+            "pure restore recovery should not materialize retained-backup storage when there is no newer live index yet"
+        );
+    }
+
     /// Regression guard for bead coding_agent_session_search-9wkx5:
     /// Linux atomic-swap publish path now parks OLD at the canonical
     /// `.<name>.publish-in-progress.bak` sidecar AFTER renameat2
@@ -26666,6 +26729,141 @@ mod tests {
                 None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
             }
         }
+    }
+
+    /// On Unix, unlinking a retained backup while a reader still has
+    /// that old index open must not corrupt the reader. This pins the
+    /// common GC case where bounded retention prunes older backup
+    /// generations after a successful publish, while some concurrent
+    /// diagnostic or stale reader still has the old directory mapped.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn publish_staged_lexical_index_prunes_retained_backup_without_breaking_open_reader() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let build_generation =
+            |path: &Path, label: &str, doc_count: usize, conversation_id: i64, base_ts: i64| {
+                let messages = (0..doc_count)
+                    .map(|idx| norm_msg(idx as i64, base_ts + (idx as i64 * 100)))
+                    .collect::<Vec<_>>();
+                let conv = norm_conv(Some(label), messages);
+                let mut index = TantivyIndex::open_or_create(path).unwrap();
+                index
+                    .add_messages_with_conversation_id(&conv, &conv.messages, Some(conversation_id))
+                    .unwrap();
+                index.commit().unwrap();
+                drop(index);
+            };
+
+        build_generation(&index_path, "retained-reader-seed", 1, 1_100, 1_700_011_000_000);
+
+        let (oldest_backup_path, oldest_backup_reader) = {
+            let _retention_two = set_env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "2");
+
+            for (iteration, doc_count, conversation_id) in
+                [(1_usize, 2_usize, 1_101_i64), (2_usize, 3_usize, 1_102_i64)]
+            {
+                let stage_root = TempDirBuilder::new()
+                    .prefix(&format!("cass-test-open-reader-retention-{iteration}."))
+                    .tempdir_in(data_dir.parent().unwrap())
+                    .unwrap();
+                let staged_index_path = stage_root.path().join("staged");
+                build_generation(
+                    &staged_index_path,
+                    &format!("retained-reader-stage-{iteration}"),
+                    doc_count,
+                    conversation_id,
+                    1_700_011_100_000 + iteration as i64 * 1_000,
+                );
+                publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+            }
+
+            let backups_dir = lexical_publish_backups_dir(&index_path);
+            let mut retained_with_docs: Vec<(usize, PathBuf)> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let docs = crate::search::tantivy::searchable_index_summary(&path)
+                        .unwrap()
+                        .unwrap()
+                        .docs;
+                    (docs, path)
+                })
+                .collect();
+            retained_with_docs.sort_by_key(|(docs, _path)| *docs);
+            assert_eq!(
+                retained_with_docs.iter().map(|(docs, _)| *docs).collect::<Vec<_>>(),
+                vec![1, 2],
+                "retention=2 should retain the oldest two prior-live generations before pruning is tightened"
+            );
+
+            let oldest_backup_path = retained_with_docs[0].1.clone();
+            let oldest_backup_index = TantivyIndex::open_or_create(&oldest_backup_path).unwrap();
+            let oldest_backup_reader = oldest_backup_index.reader().unwrap();
+            oldest_backup_reader.reload().unwrap();
+            assert_eq!(
+                oldest_backup_reader.searcher().num_docs(),
+                1,
+                "precondition: the pinned reader must observe the oldest retained backup generation"
+            );
+            drop(oldest_backup_index);
+
+            (oldest_backup_path, oldest_backup_reader)
+        };
+
+        let _retention_one = set_env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1");
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-open-reader-retention-prune.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        build_generation(
+            &staged_index_path,
+            "retained-reader-stage-prune",
+            4,
+            1_103,
+            1_700_011_200_000,
+        );
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert!(
+            !oldest_backup_path.exists(),
+            "bounded retention should prune the oldest retained backup path once the cap drops to 1"
+        );
+        assert_eq!(
+            oldest_backup_reader.searcher().num_docs(),
+            1,
+            "an open reader pinned to a pruned retained backup must keep serving the prior doc surface"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            4,
+            "live index must advance to the newly published generation while stale-reader GC runs"
+        );
+
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        let retained_doc_counts: Vec<usize> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                crate::search::tantivy::searchable_index_summary(&path)
+                    .unwrap()
+                    .unwrap()
+                    .docs
+            })
+            .collect();
+        assert_eq!(
+            retained_doc_counts,
+            vec![3],
+            "retention=1 should leave exactly the immediately prior live generation after pruning"
+        );
     }
 
     #[test]
