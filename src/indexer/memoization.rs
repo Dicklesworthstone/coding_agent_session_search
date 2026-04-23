@@ -389,9 +389,108 @@ fn sort_quarantine_inspection_items(items: &mut [MemoQuarantineInspectionItem]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn key(content: &[u8], algo: &str, version: &str) -> MemoKey {
         MemoKey::new(MemoContentHash::from_bytes(content.to_vec()), algo, version)
+    }
+
+    fn memo_key_strategy() -> impl Strategy<Value = MemoKey> {
+        (
+            proptest::collection::vec(any::<u8>(), 0..65),
+            ".{0,64}",
+            ".{0,64}",
+        )
+            .prop_map(|(content_hash, algorithm, algorithm_version)| {
+                MemoKey::new(
+                    MemoContentHash::from_bytes(content_hash),
+                    algorithm,
+                    algorithm_version,
+                )
+            })
+    }
+
+    fn memo_event_strategy() -> impl Strategy<Value = MemoCacheEvent> {
+        prop_oneof![
+            Just(MemoCacheEvent::Hit),
+            Just(MemoCacheEvent::Miss),
+            Just(MemoCacheEvent::Insert),
+            Just(MemoCacheEvent::Evict {
+                reason: MemoEvictReason::CapacityLru,
+            }),
+            Just(MemoCacheEvent::Evict {
+                reason: MemoEvictReason::Invalidated,
+            }),
+            ".{0,96}".prop_map(|reason| MemoCacheEvent::Quarantine { reason }),
+            Just(MemoCacheEvent::Invalidate),
+        ]
+    }
+
+    fn memo_lookup_strategy() -> impl Strategy<Value = MemoLookup<String>> {
+        prop_oneof![
+            ".{0,128}".prop_map(|value| MemoLookup::Hit { value }),
+            Just(MemoLookup::Miss),
+            ".{0,96}".prop_map(|reason| MemoLookup::Quarantined { reason }),
+        ]
+    }
+
+    fn quarantine_item_strategy() -> impl Strategy<Value = MemoQuarantineInspectionItem> {
+        (memo_key_strategy(), ".{0,96}")
+            .prop_map(|(key, reason)| MemoQuarantineInspectionItem { key, reason })
+    }
+
+    fn quarantine_summary_strategy() -> impl Strategy<Value = MemoQuarantineSummary> {
+        (
+            0usize..1_000_000,
+            proptest::collection::btree_map(".{0,32}", 0usize..1_000, 0..16),
+            proptest::collection::btree_map(".{0,32}", 0usize..1_000, 0..16),
+        )
+            .prop_map(
+                |(quarantined_entries, reasons, algorithms)| MemoQuarantineSummary {
+                    quarantined_entries,
+                    reasons,
+                    algorithms,
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn memo_key_json_round_trips_for_random_payloads(k in memo_key_strategy()) {
+            let bytes = serde_json::to_vec(&k)?;
+            let parsed: MemoKey = serde_json::from_slice(&bytes)?;
+            prop_assert_eq!(parsed, k);
+        }
+
+        #[test]
+        fn memo_lookup_json_round_trips_for_random_payloads(lookup in memo_lookup_strategy()) {
+            let bytes = serde_json::to_vec(&lookup)?;
+            let parsed: MemoLookup<String> = serde_json::from_slice(&bytes)?;
+            prop_assert_eq!(parsed, lookup);
+        }
+
+        #[test]
+        fn memo_cache_event_json_round_trips_for_random_payloads(event in memo_event_strategy()) {
+            let bytes = serde_json::to_vec(&event)?;
+            let parsed: MemoCacheEvent = serde_json::from_slice(&bytes)?;
+            prop_assert_eq!(parsed, event);
+        }
+
+        #[test]
+        fn memo_quarantine_json_round_trips_for_random_payloads(
+            item in quarantine_item_strategy(),
+            summary in quarantine_summary_strategy(),
+        ) {
+            let item_bytes = serde_json::to_vec(&item)?;
+            let parsed_item: MemoQuarantineInspectionItem = serde_json::from_slice(&item_bytes)?;
+            prop_assert_eq!(parsed_item, item);
+
+            let summary_bytes = serde_json::to_vec(&summary)?;
+            let parsed_summary: MemoQuarantineSummary = serde_json::from_slice(&summary_bytes)?;
+            prop_assert_eq!(parsed_summary, summary);
+        }
     }
 
     #[test]
