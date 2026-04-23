@@ -273,6 +273,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             evicted = true;
         }
         // Re-insert OR fresh-insert both retain position at tail.
+        let audit_key = key.clone();
         self.lru.retain(|existing| existing != &key);
         self.lru.push_back(key.clone());
         self.entries.insert(key, value);
@@ -286,12 +287,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         } else {
             MemoCacheEvent::Insert
         };
-        let inserted_key = self
-            .lru
-            .back()
-            .cloned()
-            .unwrap_or_else(|| unreachable!("inserted key must exist in LRU"));
-        self.audit_record(MemoCacheOperation::Insert, inserted_key, event, true)
+        self.audit_record(MemoCacheOperation::Insert, audit_key, event, true)
     }
 
     pub(crate) fn invalidate(&mut self, key: &MemoKey) -> bool {
