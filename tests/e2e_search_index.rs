@@ -1444,6 +1444,221 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     tracker.complete();
 }
 
+#[test]
+fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
+    let tracker = tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    const QUERY: &str = "federatedrebuildstabilityanchor";
+    const REBUILD_CYCLES: usize = 20;
+    for (filename, content, ts) in [
+        (
+            "rollout-fed-stability-1.jsonl",
+            format!("{QUERY} stability_alpha"),
+            1_732_311_000_000_u64,
+        ),
+        (
+            "rollout-fed-stability-2.jsonl",
+            format!("{QUERY} stability_beta"),
+            1_732_311_100_000_u64,
+        ),
+        (
+            "rollout-fed-stability-3.jsonl",
+            format!("{QUERY} stability_gamma"),
+            1_732_311_200_000_u64,
+        ),
+    ] {
+        make_codex_session(&codex_home, "2024/11/24", filename, &content, ts);
+    }
+
+    tracker.phase(
+        "seed_and_index_repeated_federated_fixture",
+        "Create three sessions and force an initial federated lexical publish bundle",
+        || {
+            let mut initial_index = cargo_bin_cmd!("cass");
+            force_federated_publish_env(&mut initial_index);
+            initial_index
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(&home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", &home)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        },
+    );
+
+    let live_index_path = index_dir(&data_dir).expect("resolve live Tantivy index path");
+    let before_summary = searchable_index_summary(&live_index_path)
+        .expect("read baseline federated searchable index summary")
+        .expect("baseline federated index should exist");
+    let before_docs = before_summary.docs;
+    assert!(
+        before_docs >= 3,
+        "baseline federated index should contain multiple docs"
+    );
+    let before_federated_readers =
+        open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
+            .expect("load federated readers before repeated rebuilds")
+            .expect("baseline federated manifest should exist");
+    let baseline_federated_reader_count = before_federated_readers.len();
+    assert!(
+        baseline_federated_reader_count > 1,
+        "forced shard planner settings should produce a federated live index"
+    );
+
+    let baseline_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            QUERY,
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run baseline repeated federated lexical search");
+    assert!(
+        baseline_search.status.success(),
+        "baseline repeated federated lexical search should succeed before force rebuild loop\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline_search.stdout),
+        String::from_utf8_lossy(&baseline_search.stderr)
+    );
+    let baseline_total_matches = total_matches_from_search_output(&baseline_search.stdout);
+    assert!(
+        baseline_total_matches > 0,
+        "baseline repeated federated lexical search should return at least one hit before rebuild loop"
+    );
+
+    let repeated_rebuild_started = tracker.start(
+        "repeat_federated_force_rebuilds_and_validate_stability",
+        Some("Run repeated cass index --full --force-rebuild cycles with forced multi-shard planning and verify reader/search stability after every publish"),
+    );
+    let mut max_rebuild_duration_ms = 0_u64;
+    for cycle in 0..REBUILD_CYCLES {
+        let rebuild_started = Instant::now();
+        let mut rebuild = cargo_bin_cmd!("cass");
+        force_federated_publish_env(&mut rebuild);
+        let rebuild_output = rebuild
+            .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+            .arg(&data_dir)
+            .current_dir(&home)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", &home)
+            .timeout(Duration::from_secs(60))
+            .output()
+            .expect("run repeated federated force rebuild");
+        let rebuild_duration_ms = rebuild_started.elapsed().as_millis() as u64;
+        max_rebuild_duration_ms = max_rebuild_duration_ms.max(rebuild_duration_ms);
+
+        assert!(
+            rebuild_output.status.success(),
+            "repeated federated force rebuild cycle {cycle} should succeed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&rebuild_output.stdout),
+            String::from_utf8_lossy(&rebuild_output.stderr)
+        );
+        let rebuild_json: serde_json::Value = serde_json::from_slice(&rebuild_output.stdout)
+            .expect("parse repeated federated force rebuild json");
+        assert_eq!(
+            rebuild_json.get("success").and_then(|value| value.as_bool()),
+            Some(true),
+            "repeated federated force rebuild cycle {cycle} should report success in --json output"
+        );
+
+        let cycle_summary = searchable_index_summary(&live_index_path)
+            .expect("read searchable summary after repeated federated rebuild cycle")
+            .expect("live index should exist after repeated federated rebuild cycle");
+        assert_eq!(
+            cycle_summary.docs, before_docs,
+            "repeated federated force rebuild cycle {cycle} changed the live doc count from {before_docs} to {}; \
+             the publish path should remain stable for unchanged content",
+            cycle_summary.docs
+        );
+
+        let cycle_federated_readers =
+            open_federated_search_readers(&live_index_path, ReloadPolicy::Manual)
+                .expect("load federated readers after repeated rebuild cycle")
+                .expect("federated manifest should exist after repeated rebuild cycle");
+        assert_eq!(
+            cycle_federated_readers.len(),
+            baseline_federated_reader_count,
+            "repeated federated force rebuild cycle {cycle} changed the shard bundle width from {baseline_federated_reader_count} to {}; \
+             forced federated publish should remain structurally stable",
+            cycle_federated_readers.len()
+        );
+
+        let cycle_search = cargo_bin_cmd!("cass")
+            .args([
+                "search",
+                QUERY,
+                "--json",
+                "--mode",
+                "lexical",
+                "--fields",
+                "minimal",
+                "--limit",
+                "10",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .current_dir(&home)
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", &home)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("run repeated post-rebuild federated lexical search");
+        assert!(
+            cycle_search.status.success(),
+            "repeated federated lexical search after cycle {cycle} should succeed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&cycle_search.stdout),
+            String::from_utf8_lossy(&cycle_search.stderr)
+        );
+        let cycle_total_matches = total_matches_from_search_output(&cycle_search.stdout);
+        assert_eq!(
+            cycle_total_matches, baseline_total_matches,
+            "repeated federated force rebuild cycle {cycle} changed the logical lexical hit count from {baseline_total_matches} to {cycle_total_matches}"
+        );
+    }
+    tracker.end(
+        "repeat_federated_force_rebuilds_and_validate_stability",
+        Some("Run repeated cass index --full --force-rebuild cycles with forced multi-shard planning and verify reader/search stability after every publish"),
+        repeated_rebuild_started,
+    );
+
+    tracker.metrics(
+        "repeated_federated_rebuild_stability_surface",
+        &E2ePerformanceMetrics::new()
+            .with_duration(repeated_rebuild_started.elapsed().as_millis() as u64)
+            .with_custom("rebuild_cycles", REBUILD_CYCLES as u64)
+            .with_custom("max_rebuild_duration_ms", max_rebuild_duration_ms)
+            .with_custom("stable_doc_count", before_docs as u64)
+            .with_custom("stable_total_matches", baseline_total_matches)
+            .with_custom(
+                "federated_shard_count",
+                baseline_federated_reader_count as u64,
+            ),
+    );
+    tracker.complete();
+}
+
 /// Test: Full index pipeline - index --full creates DB and index
 #[test]
 fn index_full_creates_artifacts() {
