@@ -772,6 +772,19 @@ fn introspect_json_matches_golden() {
 }
 
 #[test]
+fn introspect_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let introspect = capture_robot_json_value(
+        test_home.path(),
+        &["introspect", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&introspect)).expect("pretty-print JSON");
+    assert_golden("robot/introspect_shape.json.golden", &canonical);
+}
+
+#[test]
 fn search_robot_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let data_dir = isolated_search_demo_data(test_home.path());
