@@ -2745,8 +2745,19 @@ fn hit_content_for_noise_check(hit: &SearchHit) -> &str {
 
 fn hit_is_noise(hit: &SearchHit, query: &str) -> bool {
     let content_to_check = hit_content_for_noise_check(hit);
-    is_search_noise_text(content_to_check, query)
-        || (!content_to_check.is_empty() && is_tool_invocation_noise(content_to_check))
+    // When both `content` and `snippet` are empty, it usually means the caller
+    // explicitly asked for a projection (`--fields minimal` / `summary`) that
+    // excludes both fields — NOT that the underlying row was empty. Treating
+    // the hit as noise in that case silently drops every real match and makes
+    // `cass search --fields minimal` return zero results even when matches
+    // exist (reality-check bead q6xf9). The noise classifier cannot make a
+    // correctness-preserving decision without text to inspect, so default to
+    // "not noise" in that case and let the hit through; downstream projection
+    // will apply the requested field subset.
+    if content_to_check.is_empty() {
+        return false;
+    }
+    is_search_noise_text(content_to_check, query) || is_tool_invocation_noise(content_to_check)
 }
 
 fn snippet_from_content(content: &str) -> String {
