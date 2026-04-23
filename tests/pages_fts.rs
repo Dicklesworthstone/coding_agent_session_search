@@ -12,15 +12,19 @@ mod tests {
         Fts5SearchMode, detect_search_mode, escape_fts5_query, format_fts5_query,
         validate_fts5_query,
     };
-    use frankensqlite::Connection as FrankenConnection;
     use frankensqlite::compat::{ConnectionExt, RowExt};
-    use rusqlite::Connection as RusqliteConnection;
+    use frankensqlite::{Connection as FrankenConnection, params as fparams};
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn open_franken_db(path: &Path) -> Result<FrankenConnection> {
+        let path_str = path.to_string_lossy();
+        Ok(FrankenConnection::open(path_str.as_ref())?)
+    }
+
     /// Set up a source database with test data for FTS5 testing
     fn setup_fts_source_db(path: &Path) -> Result<()> {
-        let conn = RusqliteConnection::open(path)?;
+        let conn = open_franken_db(path)?;
 
         conn.execute_batch(
             r#"
@@ -63,17 +67,13 @@ mod tests {
         )?;
 
         // Agents + workspaces
-        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')", [])?;
-        conn.execute(
-            "INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project')",
-            [],
-        )?;
+        conn.execute("INSERT INTO agents (id, slug) VALUES (1, 'claude')")?;
+        conn.execute("INSERT INTO workspaces (id, path) VALUES (1, '/home/user/project')")?;
 
         // Insert test conversations
         conn.execute(
             "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, message_count)
-             VALUES (1, 1, 1, 'FTS Test', '/path/1.json', 1600000000000, 5)",
-            [],
+             VALUES (1, 1, 1, 'FTS Test', '/path/1.json', 1600000000000, 5)"
         )?;
 
         // Insert messages with various content types for FTS testing
@@ -81,36 +81,31 @@ mod tests {
         // Message 1: Natural language with stemming test ("running" should match "run")
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)",
-            [],
+             VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)"
         )?;
 
         // Message 2: Code identifier with underscore (snake_case)
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)",
-            [],
+             VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)"
         )?;
 
         // Message 3: File path / filename
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)",
-            [],
+             VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)"
         )?;
 
         // Message 4: More content for BM25 ranking tests
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)",
-            [],
+             VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)"
         )?;
 
         // Message 5: Single mention for ranking comparison
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)",
-            [],
         )?;
 
         Ok(())
@@ -138,9 +133,9 @@ mod tests {
         Ok((conn, output_path))
     }
 
-    fn create_runtime_fts_db(temp_dir: &TempDir) -> Result<RusqliteConnection> {
+    fn create_runtime_fts_db(temp_dir: &TempDir) -> Result<FrankenConnection> {
         let db_path = temp_dir.path().join("runtime_fts.db");
-        let conn = RusqliteConnection::open(db_path)?;
+        let conn = open_franken_db(&db_path)?;
 
         conn.execute_batch(
             r#"
@@ -183,41 +178,31 @@ mod tests {
 
         conn.execute(
             "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, message_count)
-             VALUES (1, 'claude', '/home/user/project', 'FTS Test', '/path/1.json', 1600000000000, 5)",
-            [],
+             VALUES (1, 'claude', '/home/user/project', 'FTS Test', '/path/1.json', 1600000000000, 5)"
         )?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)",
-            [],
+             VALUES (1, 1, 0, 'user', 'I am running the tests and they keep running forever', 1600000000000)"
         )?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)",
-            [],
+             VALUES (2, 1, 1, 'assistant', 'You should call my_function and get_user_by_id to fix the issue', 1600000001000)"
         )?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)",
-            [],
+             VALUES (3, 1, 2, 'user', 'The error is in AuthController.ts at line 42', 1600000002000)"
         )?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
-             VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)",
-            [],
+             VALUES (4, 1, 3, 'assistant', 'Error error error - this message has many errors', 1600000003000)"
         )?;
         conn.execute(
             "INSERT INTO messages (id, conversation_id, idx, role, content, created_at)
              VALUES (5, 1, 4, 'user', 'I found one error in the code', 1600000004000)",
-            [],
         )?;
-        conn.execute(
-            "INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages",
-            [],
-        )?;
+        conn.execute("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages")?;
         conn.execute(
             "INSERT INTO messages_code_fts(rowid, content) SELECT id, content FROM messages",
-            [],
         )?;
 
         Ok(conn)
@@ -233,16 +218,15 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for "run" should match content with "running" due to porter stemmer
-        let mut stmt = conn.prepare(
+        let results: Vec<String> = conn.query_map_collect(
             r#"
                 SELECT snippet(messages_fts, 0, '[', ']', '...', 20) as snippet
                 FROM messages_fts
                 WHERE messages_fts MATCH '"run"'
             "#,
+            &[],
+            |row| row.get_typed(0),
         )?;
-        let results: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
 
         assert!(
             !results.is_empty(),
@@ -265,10 +249,10 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for "running" should also work
-        let count: i64 = conn.query_row(
+        let count: i64 = conn.query_row_map(
             r#"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '"running"'"#,
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
 
         assert!(count > 0, "Should find messages containing 'running'");
@@ -286,10 +270,10 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for snake_case identifier in code FTS
-        let count: i64 = conn.query_row(
+        let count: i64 = conn.query_row_map(
             r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"my_function"'"#,
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
 
         assert!(
@@ -298,10 +282,10 @@ mod tests {
         );
 
         // Also test get_user_by_id
-        let count2: i64 = conn.query_row(
+        let count2: i64 = conn.query_row_map(
             r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"get_user_by_id"'"#,
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
 
         assert!(
@@ -318,10 +302,10 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for filename with extension
-        let count: i64 = conn.query_row(
+        let count: i64 = conn.query_row_map(
             r#"SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH '"AuthController.ts"'"#,
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
 
         assert!(
@@ -380,13 +364,13 @@ mod tests {
             let escaped = escape_fts5_query(query);
 
             // Escaped query should be safe to execute
-            let result = conn.query_row(
+            let result = conn.query_row_map(
                 &format!(
                     r#"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH '{}'"#,
                     escaped
                 ),
-                [],
-                |row| row.get::<_, i64>(0),
+                &[],
+                |row| row.get_typed::<i64>(0),
             );
 
             // Should not error, may return 0 results
@@ -420,7 +404,7 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Search for "error" - message 4 has many, message 5 has one
-        let mut stmt = conn.prepare(
+        let results: Vec<(i64, f64)> = conn.query_map_collect(
             r#"
                 SELECT m.id, bm25(messages_fts) as score
                 FROM messages_fts
@@ -428,10 +412,9 @@ mod tests {
                 WHERE messages_fts MATCH '"error"'
                 ORDER BY score
             "#,
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )?;
-        let results: Vec<(i64, f64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
 
         assert!(
             results.len() >= 2,
@@ -539,15 +522,15 @@ mod tests {
         let conn = create_runtime_fts_db(&temp_dir)?;
 
         // Test snippet generation with highlighting
-        let snippet: String = conn.query_row(
+        let snippet: String = conn.query_row_map(
             r#"
             SELECT snippet(messages_fts, 0, '<mark>', '</mark>', '...', 32)
             FROM messages_fts
             WHERE messages_fts MATCH '"error"'
             LIMIT 1
             "#,
-            [],
-            |row| row.get(0),
+            &[],
+            |row| row.get_typed(0),
         )?;
 
         // Snippet should contain the matched term with highlighting
@@ -573,12 +556,10 @@ mod tests {
         // Build and execute the generated SQL
         let sql = build_fts5_search_sql("messages_fts", 64, false);
 
-        let mut stmt = conn.prepare(&sql)?;
-        let results: Vec<(i64, String)> = stmt
-            .query_map(rusqlite::params!["\"error\"", 10, 0], |row| {
-                Ok((row.get(0)?, row.get::<_, String>(3)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let results: Vec<(i64, String)> =
+            conn.query_map_collect(&sql, fparams!["\"error\"", 10_i64, 0_i64], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(3)?))
+            })?;
 
         assert!(!results.is_empty(), "Search SQL should return results");
 
@@ -595,12 +576,11 @@ mod tests {
         // Build SQL with agent filter
         let sql = build_fts5_search_sql("messages_fts", 64, true);
 
-        let mut stmt = conn.prepare(&sql)?;
-        let results: Vec<i64> = stmt
-            .query_map(rusqlite::params!["\"error\"", "claude", 10, 0], |row| {
-                row.get(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let results: Vec<i64> = conn.query_map_collect(
+            &sql,
+            fparams!["\"error\"", "claude", 10_i64, 0_i64],
+            |row| row.get_typed(0),
+        )?;
 
         // Should find results with agent="claude"
         assert!(
@@ -609,12 +589,11 @@ mod tests {
         );
 
         // Try with non-existent agent
-        let no_results: Vec<i64> = stmt
-            .query_map(
-                rusqlite::params!["\"error\"", "nonexistent", 10, 0],
-                |row| row.get(0),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+        let no_results: Vec<i64> = conn.query_map_collect(
+            &sql,
+            fparams!["\"error\"", "nonexistent", 10_i64, 0_i64],
+            |row| row.get_typed(0),
+        )?;
 
         assert!(
             no_results.is_empty(),
