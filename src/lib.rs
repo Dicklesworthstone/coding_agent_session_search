@@ -5664,9 +5664,20 @@ fn state_meta_json(
         );
         let runtime_value = lexical_rebuild_pipeline_runtime
             .map(|runtime| {
+                let queue_capacity = lexical_rebuild_pipeline.pipeline_channel_size;
+                let inflight_message_bytes_limit = if runtime.max_message_bytes_in_flight > 0 {
+                    runtime.max_message_bytes_in_flight
+                } else {
+                    lexical_rebuild_pipeline.pipeline_max_message_bytes_in_flight.max(1)
+                };
                 serde_json::json!({
                     "queue_depth": runtime.queue_depth,
+                    "queue_capacity": queue_capacity,
+                    "queue_headroom": queue_capacity.saturating_sub(runtime.queue_depth),
                     "inflight_message_bytes": runtime.inflight_message_bytes,
+                    "max_message_bytes_in_flight": inflight_message_bytes_limit,
+                    "inflight_message_bytes_headroom": inflight_message_bytes_limit
+                        .saturating_sub(runtime.inflight_message_bytes),
                     "pending_batch_conversations": runtime.pending_batch_conversations,
                     "pending_batch_message_bytes": runtime.pending_batch_message_bytes,
                     "page_prep_workers": runtime.page_prep_workers,
@@ -11645,6 +11656,7 @@ mod cli_read_db_tests {
                 "runtime": {
                     "queue_depth": 3,
                     "inflight_message_bytes": 65_536,
+                    "max_message_bytes_in_flight": 131_072,
                     "pending_batch_conversations": 9,
                     "pending_batch_message_bytes": 131_072,
                     "page_prep_workers": 6,
@@ -11697,9 +11709,28 @@ mod cli_read_db_tests {
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         let runtime = &state["rebuild"]["pipeline"]["runtime"];
+        let pipeline = &state["rebuild"]["pipeline"];
 
         assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
+        assert_eq!(
+            runtime["queue_capacity"].as_u64(),
+            pipeline["pipeline_channel_size"].as_u64()
+        );
+        assert_eq!(
+            runtime["queue_headroom"].as_u64(),
+            runtime["queue_capacity"]
+                .as_u64()
+                .map(|value| value.saturating_sub(3))
+        );
         assert_eq!(runtime["inflight_message_bytes"].as_u64(), Some(65_536));
+        assert_eq!(
+            runtime["max_message_bytes_in_flight"].as_u64(),
+            Some(131_072)
+        );
+        assert_eq!(
+            runtime["inflight_message_bytes_headroom"].as_u64(),
+            Some(65_536)
+        );
         assert_eq!(runtime["pending_batch_conversations"].as_u64(), Some(9));
         assert_eq!(
             runtime["pending_batch_message_bytes"].as_u64(),
