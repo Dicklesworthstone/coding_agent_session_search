@@ -1,8 +1,10 @@
 use std::error::Error;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::default_data_dir;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::semantic_manifest::SemanticManifest;
 use coding_agent_search::storage::sqlite::FrankenStorage;
@@ -133,6 +135,254 @@ fn run_robot_scheduled_backfill_paused(data_dir: &Path, db_path: &Path) -> TestR
     Ok(serde_json::from_str(stdout.trim())?)
 }
 
+#[derive(Debug, Clone)]
+struct LiveBootstrapHarnessConfig {
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    artifact_root: PathBuf,
+    query: String,
+    min_hits: usize,
+    limit: usize,
+    tier: String,
+    embedder: String,
+    batch_conversations: usize,
+    max_backfill_runs: usize,
+    timeout: Duration,
+    run_backfill: bool,
+}
+
+#[derive(Debug)]
+struct LiveRobotArtifact {
+    label: String,
+    args: Vec<String>,
+    exit_code: i32,
+    duration_ms: u64,
+    stdout: String,
+    stderr: String,
+    stdout_json: Option<Value>,
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn live_rollout_run_label() -> String {
+    format!("run-{}-pid{}", now_ms(), std::process::id())
+}
+
+fn resolve_live_bootstrap_paths(
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    artifact_base_override: Option<PathBuf>,
+    run_label: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let artifact_root = artifact_base_override
+        .unwrap_or_else(|| data_dir.join("test-artifacts").join("ibuuh.11-live"))
+        .join(run_label);
+    (data_dir, db_path, artifact_root)
+}
+
+impl LiveBootstrapHarnessConfig {
+    fn from_env() -> Self {
+        let run_label = live_rollout_run_label();
+        let (data_dir, db_path, artifact_root) = resolve_live_bootstrap_paths(
+            std::env::var_os("CASS_TEST_LIVE_DATA_DIR").map(PathBuf::from),
+            std::env::var_os("CASS_TEST_LIVE_DB").map(PathBuf::from),
+            std::env::var_os("CASS_TEST_LIVE_ARTIFACT_DIR").map(PathBuf::from),
+            &run_label,
+        );
+
+        Self {
+            data_dir,
+            db_path,
+            artifact_root,
+            query: std::env::var("CASS_TEST_LIVE_QUERY")
+                .unwrap_or_else(|_| "authentication".to_string()),
+            min_hits: env_usize("CASS_TEST_LIVE_MIN_HITS", 1).max(1),
+            limit: env_usize("CASS_TEST_LIVE_LIMIT", 5).max(1),
+            tier: std::env::var("CASS_TEST_LIVE_TIER").unwrap_or_else(|_| "fast".to_string()),
+            embedder: std::env::var("CASS_TEST_LIVE_EMBEDDER")
+                .unwrap_or_else(|_| "hash".to_string()),
+            batch_conversations: env_usize("CASS_TEST_LIVE_BATCH_CONVERSATIONS", 64).max(1),
+            max_backfill_runs: env_usize("CASS_TEST_LIVE_MAX_BACKFILL_RUNS", 3).max(1),
+            timeout: Duration::from_secs(env_u64("CASS_TEST_LIVE_TIMEOUT_SECS", 300).max(30)),
+            run_backfill: !env_truthy("CASS_TEST_LIVE_SKIP_BACKFILL"),
+        }
+    }
+
+    fn manifest_json(&self) -> Value {
+        json!({
+            "data_dir": self.data_dir,
+            "db_path": self.db_path,
+            "artifact_root": self.artifact_root,
+            "query": self.query,
+            "min_hits": self.min_hits,
+            "limit": self.limit,
+            "tier": self.tier,
+            "embedder": self.embedder,
+            "batch_conversations": self.batch_conversations,
+            "max_backfill_runs": self.max_backfill_runs,
+            "timeout_secs": self.timeout.as_secs(),
+            "run_backfill": self.run_backfill,
+            "commands": [
+                "cass health --json --data-dir <data_dir>",
+                "cass status --json --data-dir <data_dir>",
+                "cass models status --json --data-dir <data_dir>",
+                "cass search <query> --json --robot-meta --limit <limit> --data-dir <data_dir>",
+                "cass models backfill --tier <tier> --embedder <embedder> --batch-conversations <n> --json --data-dir <data_dir> --db <db_path>"
+            ]
+        })
+    }
+}
+
+fn write_live_json_artifact(path: &Path, payload: &Value) -> TestResult {
+    let body = serde_json::to_vec_pretty(payload)?;
+    fs::write(path, body)?;
+    Ok(())
+}
+
+fn run_live_robot_capture(
+    config: &LiveBootstrapHarnessConfig,
+    step_index: usize,
+    label: &str,
+    args: Vec<String>,
+    allowed_exit_codes: &[i32],
+) -> TestResult<LiveRobotArtifact> {
+    let mut command = cargo_bin_cmd!("cass");
+    command
+        .args(args.iter().map(String::as_str))
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .timeout(config.timeout);
+
+    let started_at_ms = now_ms();
+    let output = command.output()?;
+    let finished_at_ms = now_ms();
+    let duration_ms = finished_at_ms.saturating_sub(started_at_ms);
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let stdout_json = serde_json::from_str(stdout.trim()).ok();
+
+    let artifact = LiveRobotArtifact {
+        label: label.to_string(),
+        args: args.clone(),
+        exit_code,
+        duration_ms,
+        stdout,
+        stderr,
+        stdout_json,
+    };
+
+    write_live_json_artifact(
+        &config
+            .artifact_root
+            .join(format!("{step_index:02}-{label}.json")),
+        &json!({
+            "label": artifact.label,
+            "command": artifact.args,
+            "exit_code": artifact.exit_code,
+            "duration_ms": artifact.duration_ms,
+            "stdout": artifact.stdout,
+            "stderr": artifact.stderr,
+            "stdout_json": artifact.stdout_json,
+        }),
+    )?;
+
+    if !allowed_exit_codes.contains(&exit_code) {
+        return Err(format!(
+            "cass {} failed with exit code {exit_code}\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            artifact.stdout,
+            artifact.stderr
+        )
+        .into());
+    }
+
+    Ok(artifact)
+}
+
+fn assert_default_hybrid_contract(
+    artifact: &LiveRobotArtifact,
+    min_hits: usize,
+) -> TestResult<Value> {
+    let payload = artifact
+        .stdout_json
+        .as_ref()
+        .ok_or("search output should be valid JSON")?;
+    let meta = payload
+        .get("_meta")
+        .and_then(Value::as_object)
+        .ok_or("search --robot-meta output should include _meta")?;
+    let hits = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or("search output should include hits array")?;
+
+    if hits.len() < min_hits {
+        return Err(format!(
+            "live canonical query {:?} returned {} hits, expected at least {}; set CASS_TEST_LIVE_QUERY to a known-good term",
+            artifact.args.get(1).cloned().unwrap_or_default(),
+            hits.len(),
+            min_hits
+        )
+        .into());
+    }
+
+    if meta.get("requested_search_mode").and_then(Value::as_str) != Some("hybrid") {
+        return Err("default search intent should request hybrid mode".into());
+    }
+    if meta.get("mode_defaulted").and_then(Value::as_bool) != Some(true) {
+        return Err("default search intent should report mode_defaulted=true".into());
+    }
+
+    match meta.get("search_mode").and_then(Value::as_str) {
+        Some("hybrid") => {}
+        Some("lexical") => {
+            if meta.get("fallback_tier").and_then(Value::as_str) != Some("lexical") {
+                return Err("lexical fail-open should surface fallback_tier=lexical".into());
+            }
+            if meta.get("semantic_refinement").and_then(Value::as_bool) != Some(false) {
+                return Err("lexical fail-open should report semantic_refinement=false".into());
+            }
+        }
+        Some(other) => {
+            return Err(format!("unexpected realized search mode {other}").into());
+        }
+        None => return Err("search output missing realized search_mode".into()),
+    }
+
+    Ok(payload.clone())
+}
+
 #[test]
 fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     let temp = tempfile::tempdir()?;
@@ -238,6 +488,193 @@ fn robot_models_backfill_scheduled_yields_to_foreground_pressure() -> TestResult
         !SemanticManifest::path(&data_dir).exists(),
         "paused scheduled backfill should not touch semantic manifests"
     );
+
+    Ok(())
+}
+
+#[test]
+fn live_bootstrap_paths_default_under_standard_data_dir() {
+    let data_dir = PathBuf::from("/tmp/cass-live");
+    let (resolved_data_dir, resolved_db_path, artifact_root) =
+        resolve_live_bootstrap_paths(Some(data_dir.clone()), None, None, "run-123");
+
+    assert_eq!(resolved_data_dir, data_dir);
+    assert_eq!(resolved_db_path, data_dir.join("agent_search.db"));
+    assert_eq!(
+        artifact_root,
+        data_dir
+            .join("test-artifacts")
+            .join("ibuuh.11-live")
+            .join("run-123")
+    );
+}
+
+#[test]
+#[ignore = "live canonical rollout harness; run explicitly with CASS_TEST_LIVE_CANONICAL_BOOTSTRAP=1"]
+fn live_canonical_bootstrap_captures_repeatable_robot_artifacts() -> TestResult {
+    if !env_truthy("CASS_TEST_LIVE_CANONICAL_BOOTSTRAP") {
+        return Err(
+            "set CASS_TEST_LIVE_CANONICAL_BOOTSTRAP=1 before running this ignored live rollout harness"
+                .into(),
+        );
+    }
+
+    let config = LiveBootstrapHarnessConfig::from_env();
+    fs::create_dir_all(&config.artifact_root)?;
+    write_live_json_artifact(
+        &config.artifact_root.join("00-config.json"),
+        &config.manifest_json(),
+    )?;
+
+    let before_health = run_live_robot_capture(
+        &config,
+        1,
+        "health-before",
+        vec![
+            "health".to_string(),
+            "--json".to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0, 1],
+    )?;
+    let before_status = run_live_robot_capture(
+        &config,
+        2,
+        "status-before",
+        vec![
+            "status".to_string(),
+            "--json".to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0],
+    )?;
+    let before_models = run_live_robot_capture(
+        &config,
+        3,
+        "models-status-before",
+        vec![
+            "models".to_string(),
+            "status".to_string(),
+            "--json".to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0],
+    )?;
+    let before_search = run_live_robot_capture(
+        &config,
+        4,
+        "search-before",
+        vec![
+            "search".to_string(),
+            config.query.clone(),
+            "--json".to_string(),
+            "--robot-meta".to_string(),
+            "--limit".to_string(),
+            config.limit.to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0],
+    )?;
+    let before_search_payload = assert_default_hybrid_contract(&before_search, config.min_hits)?;
+
+    let mut backfill_statuses = Vec::new();
+    if config.run_backfill {
+        for run in 0..config.max_backfill_runs {
+            let label = format!("models-backfill-{:02}", run + 1);
+            let artifact = run_live_robot_capture(
+                &config,
+                5 + run,
+                &label,
+                vec![
+                    "models".to_string(),
+                    "backfill".to_string(),
+                    "--tier".to_string(),
+                    config.tier.clone(),
+                    "--embedder".to_string(),
+                    config.embedder.clone(),
+                    "--batch-conversations".to_string(),
+                    config.batch_conversations.to_string(),
+                    "--data-dir".to_string(),
+                    config.data_dir.display().to_string(),
+                    "--db".to_string(),
+                    config.db_path.display().to_string(),
+                    "--json".to_string(),
+                ],
+                &[0],
+            )?;
+            let payload = artifact
+                .stdout_json
+                .as_ref()
+                .ok_or("models backfill output should be JSON")?;
+            let status = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .ok_or("models backfill output missing status")?;
+            backfill_statuses.push(status.to_string());
+            if matches!(status, "published" | "ready") {
+                break;
+            }
+        }
+    }
+
+    let after_models = run_live_robot_capture(
+        &config,
+        20,
+        "models-status-after",
+        vec![
+            "models".to_string(),
+            "status".to_string(),
+            "--json".to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0],
+    )?;
+    let after_search = run_live_robot_capture(
+        &config,
+        21,
+        "search-after",
+        vec![
+            "search".to_string(),
+            config.query.clone(),
+            "--json".to_string(),
+            "--robot-meta".to_string(),
+            "--limit".to_string(),
+            config.limit.to_string(),
+            "--data-dir".to_string(),
+            config.data_dir.display().to_string(),
+        ],
+        &[0],
+    )?;
+    let after_search_payload = assert_default_hybrid_contract(&after_search, config.min_hits)?;
+
+    write_live_json_artifact(
+        &config.artifact_root.join("summary.json"),
+        &json!({
+            "data_dir": config.data_dir,
+            "db_path": config.db_path,
+            "artifact_root": config.artifact_root,
+            "before": {
+                "health_exit_code": before_health.exit_code,
+                "status_exit_code": before_status.exit_code,
+                "models_status_exit_code": before_models.exit_code,
+                "search_duration_ms": before_search.duration_ms,
+                "search_mode_meta": before_search_payload.get("_meta"),
+                "hits": before_search_payload.get("hits").and_then(Value::as_array).map(|hits| hits.len()),
+            },
+            "backfill_statuses": backfill_statuses,
+            "after": {
+                "models_status_exit_code": after_models.exit_code,
+                "search_duration_ms": after_search.duration_ms,
+                "search_mode_meta": after_search_payload.get("_meta"),
+                "hits": after_search_payload.get("hits").and_then(Value::as_array).map(|hits| hits.len()),
+            }
+        }),
+    )?;
 
     Ok(())
 }
