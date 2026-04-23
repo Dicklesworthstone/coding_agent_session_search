@@ -347,3 +347,165 @@ fn scheduler_pause_resume_trace_is_artifact_backed() {
     assert_eq!(pause_json["reason"], "foreground_pressure");
     assert_eq!(pause_json["yielded"], true);
 }
+
+#[test]
+fn cleanup_quarantine_inventory_trace_is_artifact_backed() {
+    // Row 5 of the matrix: cleanup/quarantine proof must preserve a
+    // machine-readable inventory, quarantine reason, pause reason, and dry-run
+    // reclamation verdict. This stays harness-level until the full cleanup
+    // worker is unblocked, but it freezes the evidence format the worker must
+    // emit.
+    let mut harness = SearchAssetSimulationHarness::new(
+        "lifecycle_matrix_cleanup_quarantine_inventory",
+        LoadScript::new(vec![
+            LoadSample::idle("cleanup_inventory"),
+            LoadSample::idle("quarantine_detected"),
+            LoadSample::busy("foreground_pressure"),
+            LoadSample::idle("cleanup_resume"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "inventory")
+        .turn(SimulationActor::LexicalRepair, "quarantine")
+        .turn(SimulationActor::ForegroundSearch, "pause_cleanup")
+        .turn(SimulationActor::LexicalRepair, "dry_run_resume");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "inventory") => {
+                sim.phase(
+                    "cleanup",
+                    "capture derivative asset inventory before cleanup decision",
+                );
+                sim.snapshot_json(
+                    "cleanup_inventory_before",
+                    &json!({
+                        "current_generation": "lexical-gen-004",
+                        "superseded_generations": ["lexical-gen-002", "lexical-gen-003"],
+                        "quarantine_candidates": ["lexical-gen-003/shard-0002"],
+                        "published_generation_available": true,
+                        "dry_run": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "quarantine") => {
+                sim.phase(
+                    "cleanup",
+                    "quarantine corrupt superseded shard and keep it out of pruning",
+                );
+                sim.snapshot_json(
+                    "cleanup_quarantine",
+                    &json!({
+                        "generation": "lexical-gen-003",
+                        "shard": "shard-0002",
+                        "state": "quarantined",
+                        "reason": "manifest_checksum_mismatch",
+                        "reclaimable": false,
+                        "published_generation_available": true
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "pause_cleanup") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground pressure pauses cleanup before reclaiming superseded assets",
+                );
+                sim.snapshot_json(
+                    "cleanup_paused",
+                    &json!({
+                        "cleanup_state": "paused",
+                        "reason": "foreground_pressure",
+                        "published_generation_available": true,
+                        "reclaim_started": false
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "dry_run_resume") => {
+                sim.phase(
+                    "cleanup",
+                    "cleanup resumes as dry-run and reports retained versus reclaimable bytes",
+                );
+                sim.snapshot_json(
+                    "cleanup_resume_preview",
+                    &json!({
+                        "cleanup_state": "dry_run_complete",
+                        "retained_quarantined_bytes": 4096,
+                        "reclaimable_superseded_bytes": 16384,
+                        "would_prune": ["lexical-gen-002"],
+                        "would_retain": ["lexical-gen-003/shard-0002"],
+                        "published_generation_available": true
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic cleanup turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "cleanup/quarantine trace should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 4);
+    assert_eq!(summary.actor_traces[0].load.label, "cleanup_inventory");
+    assert_eq!(summary.actor_traces[1].load.label, "quarantine_detected");
+    assert_eq!(summary.actor_traces[2].load.label, "foreground_pressure");
+    assert!(summary.actor_traces[2].load.user_active);
+    assert_eq!(summary.actor_traces[3].load.label, "cleanup_resume");
+
+    for expected in [
+        "001-cleanup_inventory_before.json",
+        "002-cleanup_quarantine.json",
+        "003-cleanup_paused.json",
+        "004-cleanup_resume_preview.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing cleanup snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness.write_artifacts().expect("write cleanup artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = std::fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("quarantine corrupt superseded shard"),
+        "phase log should preserve quarantine context"
+    );
+    assert!(
+        phase_log.contains("foreground pressure pauses cleanup"),
+        "phase log should preserve cleanup pause context"
+    );
+
+    let quarantine_path = artifacts.snapshot_dir.join("002-cleanup_quarantine.json");
+    let quarantine_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&quarantine_path).expect("read quarantine snapshot"),
+    )
+    .expect("quarantine snapshot JSON");
+    assert_eq!(quarantine_json["state"], "quarantined");
+    assert_eq!(quarantine_json["reason"], "manifest_checksum_mismatch");
+    assert_eq!(quarantine_json["reclaimable"], false);
+
+    let preview_path = artifacts
+        .snapshot_dir
+        .join("004-cleanup_resume_preview.json");
+    let preview_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&preview_path).expect("read cleanup preview"),
+    )
+    .expect("cleanup preview JSON");
+    assert_eq!(preview_json["cleanup_state"], "dry_run_complete");
+    assert_eq!(preview_json["published_generation_available"], true);
+    assert_eq!(preview_json["would_prune"][0], "lexical-gen-002");
+    assert_eq!(
+        preview_json["would_retain"][0],
+        "lexical-gen-003/shard-0002"
+    );
+}
