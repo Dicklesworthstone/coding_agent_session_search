@@ -337,6 +337,15 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub inventories: Vec<LexicalGenerationCleanupInventory>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupReclaimCandidate {
+    pub generation_id: String,
+    pub shard_id: String,
+    pub disposition: LexicalCleanupDisposition,
+    pub reason: String,
+    pub reclaimable_bytes: u64,
+}
+
 impl LexicalCleanupDryRunPlan {
     pub(crate) fn from_manifests<'a>(
         manifests: impl IntoIterator<Item = &'a LexicalGenerationManifest>,
@@ -364,6 +373,26 @@ impl LexicalCleanupDryRunPlan {
 
     pub(crate) fn has_reclaimable_artifacts(&self) -> bool {
         self.total_reclaimable_bytes > 0
+    }
+
+    pub(crate) fn reclaim_candidates(&self) -> Vec<LexicalCleanupReclaimCandidate> {
+        self.inventories
+            .iter()
+            .flat_map(|inventory| {
+                inventory.shards.iter().filter_map(|shard| {
+                    if shard.reclaimable_bytes == 0 {
+                        return None;
+                    }
+                    Some(LexicalCleanupReclaimCandidate {
+                        generation_id: inventory.generation_id.clone(),
+                        shard_id: shard.shard_id.clone(),
+                        disposition: shard.disposition,
+                        reason: shard.reason.clone(),
+                        reclaimable_bytes: shard.reclaimable_bytes,
+                    })
+                })
+            })
+            .collect()
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
@@ -1786,6 +1815,104 @@ mod tests {
             Some(&1)
         );
         assert_eq!(plan.inventories.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_dry_run_plan_lists_only_reclaimable_shard_candidates() {
+        let mut current =
+            LexicalGenerationManifest::new_scratch("gen-current", "attempt-1", "fp", 1);
+        let mut current_shard =
+            test_shard("shard-live", 0, LexicalShardLifecycleState::Published, 4096);
+        current_shard.pinned = true;
+        current_shard.reclaimable = false;
+        current.set_shards(vec![current_shard], 2);
+        current.transition_build(LexicalGenerationBuildState::Validated, 3);
+        current.transition_publish(LexicalGenerationPublishState::Published, 4);
+
+        let mut superseded =
+            LexicalGenerationManifest::new_scratch("gen-old", "attempt-2", "fp", 10);
+        let mut old_a = test_shard(
+            "shard-old-a",
+            0,
+            LexicalShardLifecycleState::Published,
+            8192,
+        );
+        old_a.pinned = false;
+        old_a.reclaimable = true;
+        let mut old_b = test_shard(
+            "shard-old-b",
+            1,
+            LexicalShardLifecycleState::Published,
+            2048,
+        );
+        old_b.pinned = true;
+        old_b.reclaimable = false;
+        superseded.set_shards(vec![old_a, old_b], 11);
+        superseded.transition_build(LexicalGenerationBuildState::Validated, 12);
+        superseded.transition_publish(LexicalGenerationPublishState::Superseded, 13);
+
+        let mut failed =
+            LexicalGenerationManifest::new_scratch("gen-failed", "attempt-3", "fp", 20);
+        let mut failed_shard = test_shard(
+            "shard-failed",
+            0,
+            LexicalShardLifecycleState::Abandoned,
+            1024,
+        );
+        failed_shard.reclaimable = true;
+        failed.set_shards(vec![failed_shard], 21);
+        assert!(failed.transition_shard(
+            "shard-failed",
+            LexicalShardLifecycleState::Abandoned,
+            22,
+            Some("source changed before publish".into()),
+        ));
+        failed.transition_build(LexicalGenerationBuildState::Failed, 23);
+
+        let mut quarantined =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-4", "fp", 30);
+        let quarantined_shard =
+            test_shard("shard-bad", 0, LexicalShardLifecycleState::Quarantined, 512);
+        quarantined.set_shards(vec![quarantined_shard], 31);
+        assert!(quarantined.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            32,
+            Some("checksum mismatch".into()),
+        ));
+        quarantined.transition_publish(LexicalGenerationPublishState::Quarantined, 33);
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([
+            &current,
+            &superseded,
+            &failed,
+            &quarantined,
+        ]);
+        let candidates = plan.reclaim_candidates();
+
+        assert_eq!(
+            candidates,
+            vec![
+                LexicalCleanupReclaimCandidate {
+                    generation_id: "gen-old".to_string(),
+                    shard_id: "shard-old-a".to_string(),
+                    disposition: LexicalCleanupDisposition::SupersededReclaimable,
+                    reason:
+                        "superseded shard is unpinned and safe to reclaim after dry-run approval"
+                            .to_string(),
+                    reclaimable_bytes: 8192,
+                },
+                LexicalCleanupReclaimCandidate {
+                    generation_id: "gen-failed".to_string(),
+                    shard_id: "shard-failed".to_string(),
+                    disposition: LexicalCleanupDisposition::FailedReclaimable,
+                    reason: "source changed before publish".to_string(),
+                    reclaimable_bytes: 1024,
+                },
+            ]
+        );
+        assert_eq!(plan.total_reclaimable_bytes, 9216);
+        assert_eq!(plan.total_retained_bytes, 6656);
     }
 
     fn test_shard_plan(
