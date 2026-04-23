@@ -14,6 +14,7 @@ use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
+use crate::indexer::memoization::{ContentAddressedMemoCache, MemoContentHash, MemoKey, MemoLookup};
 use crate::indexer::responsiveness;
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
@@ -38,6 +39,9 @@ use crate::storage::sqlite::FrankenStorage;
 /// kernels saturated, small enough that one batch fits comfortably in L2 and
 /// memory reservation stays bounded for large corpora.
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
+const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
+const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
+const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v1";
 
 fn resolved_default_batch_size() -> usize {
     dotenvy::var("CASS_SEMANTIC_BATCH_SIZE")
@@ -45,6 +49,14 @@ fn resolved_default_batch_size() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_SEMANTIC_BATCH_SIZE)
+}
+
+fn resolved_semantic_prep_memo_capacity() -> usize {
+    dotenvy::var("CASS_SEMANTIC_PREP_MEMO_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY)
 }
 
 /// Opt in to the rayon-parallel canonicalize+hash prep step. **Default: OFF.**
@@ -871,6 +883,58 @@ struct Prepared<'a> {
     hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoizedPreparedMessage {
+    canonical: String,
+    hash: [u8; 32],
+}
+
+fn semantic_prep_memo_key(content: &str) -> MemoKey {
+    MemoKey::new(
+        MemoContentHash::from_bytes(content.as_bytes().to_vec()),
+        SEMANTIC_PREP_MEMO_ALGORITHM,
+        SEMANTIC_PREP_MEMO_VERSION,
+    )
+}
+
+fn prepare_window_with_memo<'a>(
+    window: &'a [EmbeddingInput],
+    cache: &mut ContentAddressedMemoCache<MemoizedPreparedMessage>,
+) -> Vec<Prepared<'a>> {
+    window
+        .iter()
+        .filter_map(|msg| {
+            let key = semantic_prep_memo_key(&msg.content);
+            match cache.get(&key) {
+                MemoLookup::Hit { value } => Some(Prepared {
+                    msg,
+                    canonical: value.canonical,
+                    hash: value.hash,
+                }),
+                MemoLookup::Miss | MemoLookup::Quarantined { .. } => {
+                    let canonical = canonicalize_for_embedding(&msg.content);
+                    if canonical.is_empty() {
+                        return None;
+                    }
+                    let hash = content_hash(&canonical);
+                    let _ = cache.insert(
+                        key,
+                        MemoizedPreparedMessage {
+                            canonical: canonical.clone(),
+                            hash,
+                        },
+                    );
+                    Some(Prepared {
+                        msg,
+                        canonical,
+                        hash,
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
 /// Canonicalize + hash a window of messages. Default is serial; opt in to
 /// the rayon-parallel path via `CASS_SEMANTIC_PREP_PARALLEL=1` (see the
 /// `parallel_prep_enabled` docstring for why it is not the default).
@@ -1019,8 +1083,14 @@ impl SemanticIndexer {
         // `resolved_default_batch_size` both guarantee `batch_size >= 1`,
         // so saturating_mul(4) is always >= batch_size — no further clamp.
         let window = self.batch_size.saturating_mul(4);
+        let serial_prep = !parallel_prep_enabled();
+        let mut prep_memo =
+            serial_prep.then(|| ContentAddressedMemoCache::with_capacity(resolved_semantic_prep_memo_capacity()));
         for window_slice in messages.chunks(window) {
-            let prepared_window = prepare_window(window_slice, !parallel_prep_enabled());
+            let prepared_window = match prep_memo.as_mut() {
+                Some(cache) => prepare_window_with_memo(window_slice, cache),
+                None => prepare_window(window_slice, false),
+            };
             let skipped_in_window = window_slice.len() - prepared_window.len();
             if skipped_in_window > 0 {
                 pb.inc(skipped_in_window as u64);
@@ -1029,6 +1099,21 @@ impl SemanticIndexer {
             for batch in prepared_window.chunks(self.batch_size) {
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
             }
+        }
+
+        if let Some(cache) = prep_memo.as_ref() {
+            let stats = cache.stats();
+            tracing::debug!(
+                algorithm = SEMANTIC_PREP_MEMO_ALGORITHM,
+                algorithm_version = SEMANTIC_PREP_MEMO_VERSION,
+                hits = stats.hits,
+                misses = stats.misses,
+                inserts = stats.inserts,
+                quarantined = stats.quarantined,
+                live_entries = stats.live_entries,
+                entry_capacity = resolved_semantic_prep_memo_capacity(),
+                "semantic prep memo cache summary"
+            );
         }
 
         pb.finish_with_message("Embedding complete");
@@ -1739,6 +1824,49 @@ mod tests {
         // ids 2 and 3 should be dropped because their canonicals are empty.
         assert!(!ids.contains(&2));
         assert!(!ids.contains(&3));
+    }
+
+    #[test]
+    fn memoized_serial_prep_matches_stateless_prepare_window() {
+        let inputs = vec![
+            EmbeddingInput::new(1, "repeat me exactly"),
+            EmbeddingInput::new(2, "repeat me exactly"),
+            EmbeddingInput::new(3, "unique payload"),
+            EmbeddingInput::new(4, ""),
+            EmbeddingInput::new(5, "repeat me exactly"),
+        ];
+
+        let baseline = prepare_window(&inputs, true);
+        let mut cache = ContentAddressedMemoCache::with_capacity(16);
+        let memoized = prepare_window_with_memo(&inputs, &mut cache);
+
+        assert_eq!(baseline.len(), memoized.len());
+        for (plain, cached) in baseline.iter().zip(memoized.iter()) {
+            assert_eq!(plain.msg.message_id, cached.msg.message_id);
+            assert_eq!(plain.canonical, cached.canonical);
+            assert_eq!(plain.hash, cached.hash);
+        }
+    }
+
+    #[test]
+    fn memoized_serial_prep_reuses_duplicate_content_across_windows() {
+        let inputs = vec![
+            EmbeddingInput::new(1, "repeat me exactly"),
+            EmbeddingInput::new(2, "repeat me exactly"),
+            EmbeddingInput::new(3, "unique payload"),
+            EmbeddingInput::new(4, ""),
+            EmbeddingInput::new(5, "repeat me exactly"),
+        ];
+
+        let mut cache = ContentAddressedMemoCache::with_capacity(16);
+        let prepared = prepare_window_with_memo(&inputs, &mut cache);
+        let stats = cache.stats().clone();
+
+        assert_eq!(prepared.len(), 4);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.inserts, 2);
+        assert_eq!(stats.live_entries, 2);
     }
 
     #[test]
