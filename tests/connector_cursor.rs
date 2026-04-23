@@ -1,7 +1,8 @@
 use coding_agent_search::connectors::cursor::CursorConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
 use frankensqlite::Connection as FrankenConnection;
 use frankensqlite::compat::ConnectionExt;
+use serde::Deserialize;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -35,6 +36,100 @@ fn insert_item(conn: &FrankenConnection, key: &str, value: &str) {
         frankensqlite::params![key, value],
     )
     .unwrap();
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorFixtureRow {
+    key: String,
+    value: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorFixtureExpectedMessage {
+    role: String,
+    content: String,
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorFixture {
+    composer_key: String,
+    composer_data: serde_json::Value,
+    bubble_rows: Vec<CursorFixtureRow>,
+    expected_workspace: Option<String>,
+    expected_title: Option<String>,
+    expected_messages: Vec<CursorFixtureExpectedMessage>,
+}
+
+fn load_cursor_fixture(name: &str) -> CursorFixture {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cursor")
+        .join(name);
+    let body = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("failed to read cursor fixture {}: {err}", path.display())
+    });
+    serde_json::from_str(&body).unwrap_or_else(|err| {
+        panic!("failed to parse cursor fixture {}: {err}", path.display())
+    })
+}
+
+fn scan_cursor_fixture(name: &str) -> NormalizedConversation {
+    let fixture = load_cursor_fixture(name);
+    let tmp = TempDir::new().unwrap();
+    let global_dir = tmp.path().join("globalStorage");
+    fs::create_dir_all(&global_dir).unwrap();
+
+    let db_path = global_dir.join("state.vscdb");
+    let conn = create_test_db(&db_path);
+    insert_kv(
+        &conn,
+        &fixture.composer_key,
+        &serde_json::to_string(&fixture.composer_data).unwrap(),
+    );
+    for row in &fixture.bubble_rows {
+        insert_kv(&conn, &row.key, &serde_json::to_string(&row.value).unwrap());
+    }
+    drop(conn);
+
+    let connector = CursorConnector::new();
+    let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
+    let mut convs = connector.scan(&ctx).unwrap();
+    assert_eq!(convs.len(), 1, "expected one conversation from fixture {name}");
+    let conv = convs.remove(0);
+
+    if let Some(expected_workspace) = fixture.expected_workspace {
+        assert_eq!(
+            conv.workspace.as_deref(),
+            Some(Path::new(&expected_workspace)),
+            "fixture {name} workspace mismatch"
+        );
+    }
+    if let Some(expected_title) = fixture.expected_title {
+        assert_eq!(
+            conv.title.as_deref(),
+            Some(expected_title.as_str()),
+            "fixture {name} title mismatch"
+        );
+    }
+    assert_eq!(
+        conv.messages.len(),
+        fixture.expected_messages.len(),
+        "fixture {name} message count mismatch"
+    );
+    for (actual, expected) in conv.messages.iter().zip(&fixture.expected_messages) {
+        assert_eq!(actual.role, expected.role, "fixture {name} role mismatch");
+        assert_eq!(
+            actual.content, expected.content,
+            "fixture {name} content mismatch"
+        );
+        assert_eq!(
+            actual.author.as_deref(),
+            expected.author.as_deref(),
+            "fixture {name} author mismatch"
+        );
+    }
+
+    conv
 }
 
 // ============================================================================
@@ -494,4 +589,43 @@ fn scan_respects_since_ts() {
     let ctx = ScanContext::local_default(tmp.path().to_path_buf(), Some(far_future));
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
+}
+
+// ============================================================================
+// Scan — fullConversationHeadersOnly fixture coverage (v0.40+ lazy bubble load)
+// ============================================================================
+
+#[test]
+fn scan_parses_headers_only_fixture_with_workspace_project_dir_and_content_fallbacks() {
+    let conv = scan_cursor_fixture("headers_only_workspace_project_dir.json");
+
+    assert_eq!(conv.external_id.as_deref(), Some("comp-fixture-headers"));
+    assert_eq!(conv.agent_slug, "cursor");
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/workspace/cursor-fixture"))
+    );
+    assert_eq!(conv.messages[0].idx, 0);
+    assert_eq!(conv.messages[1].idx, 1);
+    assert_eq!(conv.messages[2].idx, 2);
+}
+
+#[test]
+fn scan_parses_headers_only_fixture_with_file_workspace_uri() {
+    let conv = scan_cursor_fixture("headers_only_workspace_file_uri.json");
+
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/home/tester/cursor project"))
+    );
+}
+
+#[test]
+fn scan_parses_headers_only_fixture_with_vscode_remote_workspace_uri() {
+    let conv = scan_cursor_fixture("headers_only_workspace_vscode_remote_uri.json");
+
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/home/ubuntu/remote-cursor"))
+    );
 }

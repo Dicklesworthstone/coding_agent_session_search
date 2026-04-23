@@ -1,0 +1,33 @@
+{
+  "composer_key": "composerData:comp-fixture-remote-uri",
+  "composer_data": {
+    "name": "Cursor Remote URI Fixture",
+    "createdAt": 1700000200000,
+    "lastUpdatedAt": 1700000201000,
+    "fullConversationHeadersOnly": [
+      { "bubbleId": "bubble-remote-uri" }
+    ]
+  },
+  "bubble_rows": [
+    {
+      "key": "bubbleId:comp-fixture-remote-uri:bubble-remote-uri",
+      "value": {
+        "type": 2,
+        "text": "Workspace from vscode remote URI",
+        "timestamp": 1700000200000,
+        "workspaceUris": [
+          "vscode-remote://ssh-remote+%7B%22host%22%3A%22prod%22%7D/home/ubuntu/remote-cursor"
+        ]
+      }
+    }
+  ],
+  "expected_workspace": "/home/ubuntu/remote-cursor",
+  "expected_title": "Cursor Remote URI Fixture",
+  "expected_messages": [
+    {
+      "role": "assistant",
+      "content": "Workspace from vscode remote URI",
+      "author": null
+    }
+  ]
+}

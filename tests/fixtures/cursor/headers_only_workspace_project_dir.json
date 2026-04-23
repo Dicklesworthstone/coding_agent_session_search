@@ -1,0 +1,65 @@
+{
+  "composer_key": "composerData:comp-fixture-headers",
+  "composer_data": {
+    "name": "Cursor Headers Fixture",
+    "createdAt": 1700000000000,
+    "lastUpdatedAt": 1700000003000,
+    "modelConfig": {
+      "modelName": "claude-3.5-sonnet"
+    },
+    "fullConversationHeadersOnly": [
+      { "bubbleId": "bubble-user" },
+      { "bubbleId": "bubble-assistant" },
+      { "bubbleId": "bubble-tool" }
+    ]
+  },
+  "bubble_rows": [
+    {
+      "key": "bubbleId:comp-fixture-headers:bubble-user",
+      "value": {
+        "type": 1,
+        "rawText": "User content from rawText",
+        "timestamp": 1700000000000,
+        "workspaceProjectDir": "/workspace/cursor-fixture"
+      }
+    },
+    {
+      "key": "bubbleId:comp-fixture-headers:bubble-assistant",
+      "value": {
+        "type": 2,
+        "content": "Assistant content from content",
+        "timestamp": 1700000001000,
+        "modelInfo": {
+          "modelName": "claude-3.5-sonnet"
+        }
+      }
+    },
+    {
+      "key": "bubbleId:comp-fixture-headers:bubble-tool",
+      "value": {
+        "type": 99,
+        "message": "Tool output from message field",
+        "timestamp": 1700000002000
+      }
+    }
+  ],
+  "expected_workspace": "/workspace/cursor-fixture",
+  "expected_title": "Cursor Headers Fixture",
+  "expected_messages": [
+    {
+      "role": "user",
+      "content": "User content from rawText",
+      "author": null
+    },
+    {
+      "role": "assistant",
+      "content": "Assistant content from content",
+      "author": "claude-3.5-sonnet"
+    },
+    {
+      "role": "assistant",
+      "content": "Tool output from message field",
+      "author": null
+    }
+  ]
+}
