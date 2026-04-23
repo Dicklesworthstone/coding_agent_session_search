@@ -294,6 +294,33 @@ pub(crate) struct SemanticAssetState {
     pub checkpoint: SemanticCheckpointProgressState,
 }
 
+struct SemanticRuntimeSurface {
+    status: &'static str,
+    availability: &'static str,
+    summary: String,
+    can_search: bool,
+    fallback_mode: Option<&'static str>,
+    hint: Option<String>,
+    embedder_id: Option<String>,
+    vector_index_path: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    hnsw_path: Option<PathBuf>,
+}
+
+struct SemanticRuntimeInputs<'a> {
+    data_dir: &'a Path,
+    availability: &'a SemanticAvailability,
+    preference: SemanticPreference,
+    fast_tier: &'a SemanticTierAssetState,
+    quality_tier: &'a SemanticTierAssetState,
+    backlog: &'a SemanticBacklogProgressState,
+    checkpoint: &'a SemanticCheckpointProgressState,
+    base_embedder_id: Option<String>,
+    base_vector_index_path: Option<PathBuf>,
+    base_model_dir: Option<PathBuf>,
+    base_hnsw_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SemanticTierAssetState {
     pub present: bool,
@@ -444,36 +471,61 @@ pub(crate) fn semantic_state_from_availability(
     preference: SemanticPreference,
     current_db_fingerprint: Option<&str>,
 ) -> SemanticAssetState {
+    let (fast_tier, quality_tier, backlog, checkpoint) =
+        semantic_manifest_progress(data_dir, current_db_fingerprint);
     let preferred_backend = match preference {
         SemanticPreference::DefaultModel => "fastembed",
         SemanticPreference::HashFallback => "hash",
     };
-    let embedder_id = semantic_embedder_id(availability, preference);
-    let vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
-    let model_dir = match preference {
+    let base_embedder_id = semantic_embedder_id(availability, preference);
+    let base_vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
+    let base_model_dir = match preference {
         SemanticPreference::DefaultModel => Some(FastEmbedder::default_model_dir(data_dir)),
         SemanticPreference::HashFallback => None,
     };
-    let hnsw_path = embedder_id
+    let base_hnsw_path = base_embedder_id
         .as_deref()
         .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
+    let runtime = semantic_runtime_surface(SemanticRuntimeInputs {
+        data_dir,
+        availability,
+        preference,
+        fast_tier: &fast_tier,
+        quality_tier: &quality_tier,
+        backlog: &backlog,
+        checkpoint: &checkpoint,
+        base_embedder_id: base_embedder_id.clone(),
+        base_vector_index_path: base_vector_index_path.clone(),
+        base_model_dir: base_model_dir.clone(),
+        base_hnsw_path: base_hnsw_path.clone(),
+    });
+    let use_runtime_paths = runtime.embedder_id.is_some();
+    let embedder_id = runtime.embedder_id.or(base_embedder_id);
+    let vector_index_path = if use_runtime_paths {
+        runtime.vector_index_path
+    } else {
+        runtime.vector_index_path.or(base_vector_index_path)
+    };
+    let model_dir = if use_runtime_paths {
+        runtime.model_dir
+    } else {
+        runtime.model_dir.or(base_model_dir)
+    };
+    let hnsw_path = if use_runtime_paths {
+        runtime.hnsw_path
+    } else {
+        runtime.hnsw_path.or(base_hnsw_path)
+    };
     let hnsw_ready = hnsw_path.as_ref().is_some_and(|path| path.is_file());
     let progressive_ready = semantic_progressive_assets_ready(data_dir);
-    let availability_code = semantic_availability_code(availability);
-    let status = semantic_status_from_availability(availability);
-    let summary = availability.summary();
-    let can_search = availability.can_search();
-    let hint = semantic_hint(availability, preference);
-    let (fast_tier, quality_tier, backlog, checkpoint) =
-        semantic_manifest_progress(data_dir, current_db_fingerprint);
 
     SemanticAssetState {
-        status,
-        availability: availability_code,
-        summary,
-        available: can_search,
-        can_search,
-        fallback_mode: (!can_search).then_some("lexical"),
+        status: runtime.status,
+        availability: runtime.availability,
+        summary: runtime.summary,
+        available: runtime.can_search,
+        can_search: runtime.can_search,
+        fallback_mode: runtime.fallback_mode,
         preferred_backend,
         embedder_id,
         vector_index_path,
@@ -481,12 +533,197 @@ pub(crate) fn semantic_state_from_availability(
         hnsw_path,
         hnsw_ready,
         progressive_ready,
-        hint,
+        hint: runtime.hint,
         fast_tier,
         quality_tier,
         backlog,
         checkpoint,
     }
+}
+
+fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntimeSurface {
+    let SemanticRuntimeInputs {
+        data_dir,
+        availability,
+        preference,
+        fast_tier,
+        quality_tier,
+        backlog,
+        checkpoint,
+        base_embedder_id,
+        base_vector_index_path,
+        base_model_dir,
+        base_hnsw_path,
+    } = inputs;
+    let base_status = semantic_status_from_availability(availability);
+    let base_availability = semantic_availability_code(availability);
+    let base_summary = availability.summary();
+    let base_can_search = availability.can_search();
+    let base_hint = semantic_hint(availability, preference);
+
+    if matches!(
+        availability,
+        SemanticAvailability::Disabled { .. }
+            | SemanticAvailability::DatabaseUnavailable { .. }
+            | SemanticAvailability::LoadFailed { .. }
+    ) {
+        return SemanticRuntimeSurface {
+            status: base_status,
+            availability: base_availability,
+            summary: base_summary,
+            can_search: base_can_search,
+            fallback_mode: (!base_can_search).then_some("lexical"),
+            hint: base_hint,
+            embedder_id: base_embedder_id,
+            vector_index_path: base_vector_index_path,
+            model_dir: base_model_dir,
+            hnsw_path: base_hnsw_path,
+        };
+    }
+
+    let quality_queryable = semantic_tier_queryable(availability, quality_tier);
+    let fast_queryable = semantic_tier_queryable(availability, fast_tier);
+    let checkpoint_active = checkpoint.active;
+    let backlog_pending = backlog.pending_work;
+    let manifest_assets_present = fast_tier.present || quality_tier.present;
+    let backfill_active = checkpoint_active || backlog_pending;
+
+    let effective_embedder_id = if quality_queryable {
+        quality_tier.embedder_id.clone()
+    } else if fast_queryable {
+        fast_tier.embedder_id.clone()
+    } else {
+        None
+    };
+    let effective_vector_index_path = effective_embedder_id
+        .as_deref()
+        .map(|embedder_id| vector_index_path(data_dir, embedder_id));
+    let effective_model_dir = effective_embedder_id.as_deref().and_then(|embedder_id| {
+        (!semantic_embedder_is_hash(embedder_id)).then(|| FastEmbedder::default_model_dir(data_dir))
+    });
+    let effective_hnsw_path = effective_embedder_id
+        .as_deref()
+        .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
+
+    if quality_queryable || fast_queryable {
+        let fully_ready = (quality_queryable || fast_queryable) && !backfill_active;
+        let summary = if quality_queryable && backfill_active {
+            "semantic quality tier is usable; residual semantic backfill is still finishing"
+                .to_string()
+        } else if quality_queryable {
+            "semantic quality tier ready".to_string()
+        } else if backfill_active {
+            "semantic fast tier is usable; higher-quality semantic backfill is still in progress"
+                .to_string()
+        } else {
+            "semantic fast tier ready".to_string()
+        };
+        let hint = if backfill_active {
+            Some(
+                "Semantic refinement is already usable; continue searching while higher-quality backfill finishes."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        return SemanticRuntimeSurface {
+            status: if fully_ready { "ready" } else { "building" },
+            availability: if fully_ready {
+                "ready"
+            } else {
+                "index_building"
+            },
+            summary,
+            can_search: true,
+            fallback_mode: None,
+            hint,
+            embedder_id: effective_embedder_id,
+            vector_index_path: effective_vector_index_path,
+            model_dir: effective_model_dir,
+            hnsw_path: effective_hnsw_path,
+        };
+    }
+
+    if backfill_active {
+        return SemanticRuntimeSurface {
+            status: "building",
+            availability: "index_building",
+            summary: "semantic backfill is in progress for the current database".to_string(),
+            can_search: false,
+            fallback_mode: Some("lexical"),
+            hint: Some(
+                "Run 'cass index --semantic' to finish backfilling current semantic assets, or keep using --mode lexical."
+                    .to_string(),
+            ),
+            embedder_id: base_embedder_id,
+            vector_index_path: base_vector_index_path,
+            model_dir: base_model_dir,
+            hnsw_path: base_hnsw_path,
+        };
+    }
+
+    if manifest_assets_present {
+        return SemanticRuntimeSurface {
+            status: "stale",
+            availability: "update_available",
+            summary: "semantic artifacts exist but do not match the current database".to_string(),
+            can_search: false,
+            fallback_mode: Some("lexical"),
+            hint: Some(
+                "Run 'cass index --semantic' to refresh semantic assets for the current database, or keep using --mode lexical."
+                    .to_string(),
+            ),
+            embedder_id: base_embedder_id,
+            vector_index_path: base_vector_index_path,
+            model_dir: base_model_dir,
+            hnsw_path: base_hnsw_path,
+        };
+    }
+
+    SemanticRuntimeSurface {
+        status: base_status,
+        availability: base_availability,
+        summary: base_summary,
+        can_search: base_can_search,
+        fallback_mode: (!base_can_search).then_some("lexical"),
+        hint: base_hint,
+        embedder_id: base_embedder_id,
+        vector_index_path: base_vector_index_path,
+        model_dir: base_model_dir,
+        hnsw_path: base_hnsw_path,
+    }
+}
+
+fn semantic_tier_queryable(
+    availability: &SemanticAvailability,
+    tier: &SemanticTierAssetState,
+) -> bool {
+    if !tier.ready || tier.current_db_matches != Some(true) {
+        return false;
+    }
+    let Some(embedder_id) = tier.embedder_id.as_deref() else {
+        return false;
+    };
+    if semantic_embedder_is_hash(embedder_id) {
+        !matches!(
+            availability,
+            SemanticAvailability::Disabled { .. }
+                | SemanticAvailability::DatabaseUnavailable { .. }
+                | SemanticAvailability::LoadFailed { .. }
+        )
+    } else {
+        matches!(
+            availability,
+            SemanticAvailability::Ready { .. }
+                | SemanticAvailability::UpdateAvailable { .. }
+                | SemanticAvailability::IndexBuilding { .. }
+                | SemanticAvailability::IndexMissing { .. }
+        )
+    }
+}
+
+fn semantic_embedder_is_hash(embedder_id: &str) -> bool {
+    embedder_id == HashEmbedder::default().id()
 }
 
 fn semantic_manifest_progress(
@@ -1870,6 +2107,116 @@ mod tests {
             state.embedder_id.as_deref(),
             Some(FastEmbedder::embedder_id_static())
         );
+    }
+
+    #[test]
+    fn semantic_state_reports_backfill_when_manifest_only_has_stale_assets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest::default();
+        manifest.fast_tier = Some(ArtifactRecord {
+            tier: crate::search::semantic_manifest::TierKind::Fast,
+            embedder_id: HashEmbedder::default().id().to_string(),
+            model_revision: "hash".to_string(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            dimension: 256,
+            doc_count: 12,
+            conversation_count: 3,
+            db_fingerprint: "stale-db".to_string(),
+            index_path: "vector_index/vector.fast.idx".to_string(),
+            size_bytes: 4096,
+            started_at_ms: 1_733_100_000_000,
+            completed_at_ms: 1_733_100_100_000,
+            ready: true,
+        });
+        manifest.backlog = crate::search::semantic_manifest::BacklogLedger {
+            total_conversations: 20,
+            fast_tier_processed: 3,
+            quality_tier_processed: 0,
+            db_fingerprint: "current-db".to_string(),
+            computed_at_ms: 1_733_100_200_000,
+        };
+        manifest.checkpoint = Some(BuildCheckpoint {
+            tier: crate::search::semantic_manifest::TierKind::Fast,
+            embedder_id: HashEmbedder::default().id().to_string(),
+            last_offset: 77,
+            docs_embedded: 66,
+            conversations_processed: 3,
+            total_conversations: 20,
+            db_fingerprint: "current-db".to_string(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            saved_at_ms: 1_733_100_300_000,
+        });
+        manifest.save(temp.path()).expect("save semantic manifest");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            Some("current-db"),
+        );
+
+        assert_eq!(state.status, "building");
+        assert_eq!(state.availability, "index_building");
+        assert!(!state.can_search);
+        assert_eq!(state.fallback_mode, Some("lexical"));
+        assert!(state.summary.contains("backfill"));
+        assert!(
+            state
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("finish backfilling"))
+        );
+    }
+
+    #[test]
+    fn semantic_state_prefers_current_hash_tier_over_missing_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut manifest = SemanticManifest::default();
+        manifest.fast_tier = Some(ArtifactRecord {
+            tier: crate::search::semantic_manifest::TierKind::Fast,
+            embedder_id: HashEmbedder::default().id().to_string(),
+            model_revision: "hash".to_string(),
+            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+            dimension: 256,
+            doc_count: 12,
+            conversation_count: 3,
+            db_fingerprint: "current-db".to_string(),
+            index_path: "vector_index/vector.fast.idx".to_string(),
+            size_bytes: 4096,
+            started_at_ms: 1_733_100_000_000,
+            completed_at_ms: 1_733_100_100_000,
+            ready: true,
+        });
+        manifest.save(temp.path()).expect("save semantic manifest");
+        let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
+        std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector dir");
+        std::fs::write(&vector_path, b"fast").expect("write fast vector index");
+
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::NeedsConsent,
+            SemanticPreference::DefaultModel,
+            Some("current-db"),
+        );
+
+        assert_eq!(state.status, "ready");
+        assert_eq!(state.availability, "ready");
+        assert!(state.can_search);
+        assert_eq!(state.fallback_mode, None);
+        assert_eq!(
+            state.embedder_id.as_deref(),
+            Some(HashEmbedder::default().id())
+        );
+        assert_eq!(state.model_dir, None);
+        assert_eq!(
+            state.vector_index_path.as_deref(),
+            Some(vector_path.as_path())
+        );
+        assert_eq!(state.hint, None);
     }
 
     // -----------------------------------------------------------------------

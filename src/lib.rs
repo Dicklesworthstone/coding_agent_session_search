@@ -6080,12 +6080,22 @@ fn semantic_readiness_from_state(
         .and_then(|sem| sem.get("fast_tier"))
         .and_then(|tier| tier.get("ready"))
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && semantic
+            .and_then(|sem| sem.get("fast_tier"))
+            .and_then(|tier| tier.get("current_db_matches"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
     let quality_ready = semantic
         .and_then(|sem| sem.get("quality_tier"))
         .and_then(|tier| tier.get("ready"))
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        && semantic
+            .and_then(|sem| sem.get("quality_tier"))
+            .and_then(|tier| tier.get("current_db_matches"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
     let checkpoint_active = semantic
         .and_then(|sem| sem.get("checkpoint"))
         .and_then(|checkpoint| checkpoint.get("active"))
@@ -6126,6 +6136,71 @@ fn semantic_recommended_action(state: &serde_json::Value, not_initialized: bool)
                 .to_string(),
         ),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod readiness_projection_tests {
+    use super::semantic_readiness_from_state;
+    use crate::search::readiness::SemanticReadinessState;
+    use serde_json::json;
+
+    #[test]
+    fn semantic_readiness_requires_current_db_match_for_fast_tier() {
+        let state = json!({
+            "semantic": {
+                "availability": "index_building",
+                "can_search": false,
+                "fast_tier": {
+                    "ready": true,
+                    "current_db_matches": false
+                },
+                "quality_tier": {
+                    "ready": false,
+                    "current_db_matches": null
+                },
+                "checkpoint": {
+                    "active": true
+                },
+                "backlog": {
+                    "pending_work": true
+                }
+            }
+        });
+
+        assert_eq!(
+            semantic_readiness_from_state(&state),
+            SemanticReadinessState::Backfilling
+        );
+    }
+
+    #[test]
+    fn semantic_readiness_accepts_current_fast_tier() {
+        let state = json!({
+            "semantic": {
+                "availability": "index_building",
+                "can_search": true,
+                "fast_tier": {
+                    "ready": true,
+                    "current_db_matches": true
+                },
+                "quality_tier": {
+                    "ready": false,
+                    "current_db_matches": null
+                },
+                "checkpoint": {
+                    "active": false
+                },
+                "backlog": {
+                    "pending_work": false
+                }
+            }
+        });
+
+        assert_eq!(
+            semantic_readiness_from_state(&state),
+            SemanticReadinessState::FastTierReady
+        );
     }
 }
 

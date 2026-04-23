@@ -1,7 +1,15 @@
 {
   "surface": "health",
-  "recommended_action": null,
+  "recommended_action": "Lexical search is ready; semantic assets are still catching up. Continue with lexical results or wait for hybrid refinement to finish.",
   "semantic": {
+    "status": "building",
+    "availability": "index_building",
+    "summary": "semantic backfill is in progress for the current database",
+    "available": false,
+    "can_search": false,
+    "fallback_mode": "lexical",
+    "embedder_id": "minilm-384",
+    "hint": "Run 'cass index --semantic' to finish backfilling current semantic assets, or keep using --mode lexical.",
     "fast_tier": {
       "present": true,
       "ready": true,
