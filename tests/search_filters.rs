@@ -182,7 +182,26 @@ fn minimal_field_mask_preserves_order() {
         assert!(hit.content.is_empty());
         assert!(hit.snippet.is_empty());
         assert!(hit.title.is_empty());
-        assert!(!hit.source_path.is_empty());
-        assert!(!hit.agent.is_empty());
+        // Bead 7k7pl: pin the EXACT values minimal mask preserves,
+        // not just "not empty". The test seeds conversations with
+        // agent="tester" and source_path ∈ {strong.jsonl,
+        // weak.jsonl}; a regression that returned an empty, default,
+        // or wrong-field string would slip past `!is_empty()` but
+        // fires here.
+        assert_eq!(
+            hit.agent, "tester",
+            "minimal mask must preserve the seeded agent `tester`; got {:?}",
+            hit.agent
+        );
+        let path_file_name = std::path::Path::new(&hit.source_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(
+            matches!(path_file_name, "strong.jsonl" | "weak.jsonl"),
+            "minimal mask source_path must match one of the two seeded files; \
+             got {:?} (file_name={path_file_name:?})",
+            hit.source_path
+        );
     }
 }

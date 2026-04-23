@@ -625,7 +625,22 @@ mod tests {
         env.injector.write_partial_build("minilm-384");
 
         let manifest = env.load_manifest().expect("manifest should load");
-        assert!(manifest.checkpoint.is_some());
+        // Bead 7k7pl: pin the EXACT checkpoint shape that
+        // write_partial_build seeds — embedder_id, docs_embedded,
+        // conversations_processed / total_conversations ratio, and
+        // db_fingerprint. A regression that emitted a default-filled
+        // BuildCheckpoint (e.g., all zeros or a different embedder)
+        // would slip past `.is_some()` while breaking the
+        // partial-build readiness semantics this test probes.
+        let checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .expect("write_partial_build must seed a checkpoint");
+        assert_eq!(checkpoint.embedder_id, "minilm-384");
+        assert_eq!(checkpoint.docs_embedded, 200);
+        assert_eq!(checkpoint.conversations_processed, 50);
+        assert_eq!(checkpoint.total_conversations, 100);
+        assert_eq!(checkpoint.db_fingerprint, "fp-partial");
         assert!(manifest.quality_tier.is_none()); // no completed artifact
 
         let policy = SemanticPolicy::compiled_defaults();
@@ -672,8 +687,23 @@ mod tests {
 
         let jsonl = log.to_jsonl();
         assert!(!jsonl.is_empty());
-        // Should be valid JSON (single line).
-        let _: serde_json::Value = serde_json::from_str(&jsonl).expect("valid JSON");
+        // Bead 7k7pl: pin the SHAPE of the emitted JSONL — phase name
+        // and message must both appear as distinct fields, not just
+        // "valid JSON arrived". A serializer regression that emitted
+        // a valid-but-empty `{}` or swapped field names would slip
+        // past `.is_empty()` + `from_str(..)` probes.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&jsonl).expect("harness log line must be valid JSON");
+        assert_eq!(
+            parsed.get("phase").and_then(|v| v.as_str()),
+            Some("test"),
+            "harness JSONL must carry the phase name verbatim; got {parsed}"
+        );
+        assert_eq!(
+            parsed.get("msg").and_then(|v| v.as_str()),
+            Some("hello world"),
+            "harness JSONL must carry the phase message verbatim; got {parsed}"
+        );
     }
 
     #[test]

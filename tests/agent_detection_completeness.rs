@@ -232,7 +232,24 @@ fn detect_installed_agents_report_structure() {
         report.installed_agents.len()
     );
     assert_eq!(report.format_version, 1);
-    assert!(!report.generated_at.is_empty());
+    // Bead 7k7pl: generated_at must be an ISO-8601-shaped timestamp,
+    // not just any non-empty string. A regression that stored
+    // `"unknown"` or a Unix-epoch integer as a string would slip past
+    // `!is_empty()` while breaking downstream parsers that expect
+    // RFC-3339. Check the canonical prefix shape: "YYYY-MM-DD" (10
+    // chars, dashes at positions 4 and 7).
+    assert!(
+        report.generated_at.len() >= 10,
+        "generated_at must be an ISO-8601 timestamp (>= 10 chars); got {:?}",
+        report.generated_at
+    );
+    let bytes = report.generated_at.as_bytes();
+    assert!(
+        bytes[4] == b'-' && bytes[7] == b'-',
+        "generated_at must have dashes at positions 4 and 7 (YYYY-MM-DD prefix); \
+         got {:?}",
+        report.generated_at
+    );
     assert_eq!(report.summary.total_count, report.installed_agents.len());
 
     let slugs: HashSet<&str> = report

@@ -471,11 +471,21 @@ fn frankensearch_rrf_fuse_produces_valid_scores() {
         assert!(result.rrf_score > 0.0, "RRF scores should be positive");
     }
 
-    // Verify we see all three unique doc_ids
+    // Bead 7k7pl: pin the EXACT set of doc_ids, not just presence of
+    // each. The fusion contract says: given two input lists with doc_a
+    // + doc_b and doc_b + doc_c, RRF must produce EXACTLY {doc_a,
+    // doc_b, doc_c} — no extras (would indicate phantom docs leaking
+    // from another source), no missing ids (would indicate a dedup
+    // bug). Three separate `.contains()` probes accept a regression
+    // that also introduces extra doc_ids.
     let doc_ids: HashSet<&str> = fused.iter().map(|r| r.doc_id.as_str()).collect();
-    assert!(doc_ids.contains("doc_a"));
-    assert!(doc_ids.contains("doc_b"));
-    assert!(doc_ids.contains("doc_c"));
+    let expected: HashSet<&str> = ["doc_a", "doc_b", "doc_c"].into_iter().collect();
+    assert_eq!(
+        doc_ids, expected,
+        "RRF fusion output must contain EXACTLY the union of the two input \
+         lists with no phantom ids; got {:?}",
+        doc_ids
+    );
 }
 
 // =============================================================================
