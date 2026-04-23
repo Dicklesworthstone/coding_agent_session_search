@@ -3019,7 +3019,7 @@ impl SearchClient {
         // Invalidate prefix cache if the index has been updated since last search.
         // This must happen BEFORE the cache check below to avoid serving stale results.
         if let Some((reader, _)) = &self.reader {
-            let _ = self.maybe_reload_reader(reader);
+            self.maybe_reload_reader(reader)?;
             let searcher = self.searcher_for_thread(reader);
             self.track_generation(searcher.generation().generation_id());
         } else if let Some(readers) = self.federated_readers()
