@@ -123,6 +123,30 @@ fn models_install_rejects_ambiguous_mirror_and_from_file_sources() -> Result<(),
 }
 
 #[test]
+fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "models", "install", "--data-dir", "/cass/models"])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Install {
+                model,
+                mirror: None,
+                from_file: None,
+                yes: false,
+                data_dir: Some(data_dir),
+            })) if model == "all-minilm-l6-v2"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected default model acquisition controls to stay confirmation-gated: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn models_verify_repair_controls_remain_data_dir_scoped() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
