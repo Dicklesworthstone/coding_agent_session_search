@@ -16004,6 +16004,206 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     }
 }
 
+/// Collect forensic context for a stalled `cass index` run so the JSON stall
+/// event carries enough on-disk state for issue triage without requiring the
+/// reporter to run secondary commands. All lookups are best-effort: if a path
+/// is missing or unreadable, we record the failure but never propagate an
+/// error out of the watchdog emitter.
+fn collect_stall_diagnostics(data_dir: &Path) -> serde_json::Value {
+    // Keep the snapshot compact — this is an observability event on stderr,
+    // not a full forensic bundle. If the reporter needs more, the event hint
+    // already tells them how to grab a stack trace.
+    const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
+
+    let mut out = serde_json::Map::new();
+
+    let index_dir = data_dir.join("index");
+    out.insert(
+        "index_dir".into(),
+        serde_json::json!(index_dir.display().to_string()),
+    );
+    out.insert(
+        "index_dir_exists".into(),
+        serde_json::json!(index_dir.is_dir()),
+    );
+
+    // Candidate checkpoint filenames observed across cass versions. Recording
+    // any we find means the hang reporter doesn't need to hunt for the right
+    // name on their host.
+    let checkpoint_candidates = [
+        "lexical_rebuild_state.json",
+        "lexical_rebuild_state.v2.json",
+    ];
+    let mut checkpoints = serde_json::Map::new();
+    for name in checkpoint_candidates {
+        let path = index_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let meta = std::fs::metadata(&path).ok();
+        let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
+        let modified_ms = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
+        let mut entry = serde_json::Map::new();
+        entry.insert("path".into(), serde_json::json!(path.display().to_string()));
+        entry.insert("size_bytes".into(), serde_json::json!(size));
+        if let Some(ms) = modified_ms {
+            entry.insert("modified_ms".into(), serde_json::json!(ms));
+        }
+        if size <= MAX_CHECKPOINT_BYTES {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        entry.insert("content".into(), parsed);
+                    } else {
+                        entry.insert("content_raw".into(), serde_json::json!(contents));
+                    }
+                }
+                Err(err) => {
+                    entry.insert("read_error".into(), serde_json::json!(err.to_string()));
+                }
+            }
+        } else {
+            entry.insert(
+                "content_omitted".into(),
+                serde_json::json!("file larger than 64 KiB; dump manually with `cat`"),
+            );
+        }
+        checkpoints.insert(name.to_string(), serde_json::Value::Object(entry));
+    }
+    out.insert(
+        "lexical_rebuild_checkpoint".into(),
+        serde_json::Value::Object(checkpoints),
+    );
+
+    // Tantivy segment count at stall time — catches the producer/consumer
+    // mismatch where segments are being written but the checkpoint still
+    // reports zero processed conversations.
+    if let Ok(entries) = std::fs::read_dir(&index_dir) {
+        let mut segment_count: u64 = 0;
+        let mut segment_bytes: u64 = 0;
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str())
+                && matches!(ext, "idx" | "pos" | "fast" | "term" | "store" | "fieldnorm")
+            {
+                segment_count = segment_count.saturating_add(1);
+                if let Ok(meta) = entry.metadata() {
+                    segment_bytes = segment_bytes.saturating_add(meta.len());
+                }
+            }
+        }
+        out.insert(
+            "tantivy_segment_files".into(),
+            serde_json::json!(segment_count),
+        );
+        out.insert(
+            "tantivy_segment_bytes".into(),
+            serde_json::json!(segment_bytes),
+        );
+    }
+
+    // Index run lock file — if heartbeating, tells the reporter another
+    // process may actually be holding the writer.
+    let lock_path = data_dir.join("index_run.lock");
+    if lock_path.exists() {
+        let mut lock = serde_json::Map::new();
+        lock.insert(
+            "path".into(),
+            serde_json::json!(lock_path.display().to_string()),
+        );
+        if let Ok(contents) = std::fs::read_to_string(&lock_path) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
+                lock.insert("content".into(), parsed);
+            } else {
+                lock.insert("content_raw".into(), serde_json::json!(contents));
+            }
+        }
+        out.insert("index_run_lock".into(), serde_json::Value::Object(lock));
+    }
+
+    serde_json::Value::Object(out)
+}
+
+#[cfg(test)]
+mod stall_diagnostics_tests {
+    use super::collect_stall_diagnostics;
+    use tempfile::TempDir;
+
+    #[test]
+    fn empty_data_dir_produces_null_checkpoint_and_no_lock() {
+        let tmp = TempDir::new().expect("temp dir");
+        let diag = collect_stall_diagnostics(tmp.path());
+        let obj = diag.as_object().expect("object");
+        assert_eq!(obj["index_dir_exists"], serde_json::json!(false));
+        assert!(obj["lexical_rebuild_checkpoint"].is_object());
+        assert!(
+            obj["lexical_rebuild_checkpoint"]
+                .as_object()
+                .expect("object")
+                .is_empty()
+        );
+        assert!(!obj.contains_key("index_run_lock"));
+    }
+
+    #[test]
+    fn captures_checkpoint_contents_and_lock_when_present() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).expect("create index dir");
+        std::fs::write(
+            index_dir.join("lexical_rebuild_state.json"),
+            r#"{"completed": true, "committed_conversation_id": 42}"#,
+        )
+        .expect("write checkpoint");
+        std::fs::write(
+            tmp.path().join("index_run.lock"),
+            r#"{"pid": 12345, "mode": "index"}"#,
+        )
+        .expect("write lock");
+        // Synthetic Tantivy-like segment so we exercise the segment counter.
+        std::fs::write(index_dir.join("abcd.idx"), b"x").expect("write segment");
+
+        let diag = collect_stall_diagnostics(tmp.path());
+        let obj = diag.as_object().expect("object");
+        assert_eq!(obj["index_dir_exists"], serde_json::json!(true));
+        assert_eq!(obj["tantivy_segment_files"], serde_json::json!(1));
+        let checkpoint = obj["lexical_rebuild_checkpoint"]
+            .as_object()
+            .expect("checkpoint object");
+        let entry = checkpoint["lexical_rebuild_state.json"]
+            .as_object()
+            .expect("entry");
+        assert_eq!(
+            entry["content"]["completed"],
+            serde_json::json!(true),
+            "parsed checkpoint JSON should round-trip"
+        );
+        let lock = obj["index_run_lock"].as_object().expect("lock object");
+        assert_eq!(lock["content"]["pid"], serde_json::json!(12345));
+    }
+
+    #[test]
+    fn oversized_checkpoint_omits_content_but_records_size() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&index_dir).expect("create index dir");
+        let big = vec![b'x'; 128 * 1024];
+        std::fs::write(index_dir.join("lexical_rebuild_state.json"), &big)
+            .expect("write oversize checkpoint");
+
+        let diag = collect_stall_diagnostics(tmp.path());
+        let entry = diag["lexical_rebuild_checkpoint"]["lexical_rebuild_state.json"]
+            .as_object()
+            .expect("entry");
+        assert!(entry.contains_key("content_omitted"));
+        assert!(!entry.contains_key("content"));
+        assert_eq!(entry["size_bytes"], serde_json::json!(big.len() as u64));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -16427,6 +16627,29 @@ fn run_index_with_data(
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
 
+        // Stall-detection watchdog (issue #196). Latches a one-shot
+        // `stall_detected` event on stderr when `current` hasn't advanced for
+        // `stall_threshold` during an active (non-idle) phase. The watchdog is
+        // observability-only: it never cancels the run or touches shared
+        // indexer state. Threshold is tunable via
+        // `CASS_INDEX_STALL_DETECT_SECS` (0 disables; default 120s). We clamp
+        // below at `progress_interval` so the emitter has a chance to publish
+        // at least one progress event before the stall fires.
+        let stall_threshold_secs = dotenvy::var("CASS_INDEX_STALL_DETECT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120);
+        let stall_threshold = if stall_threshold_secs == 0 {
+            None
+        } else {
+            let min = progress_interval.saturating_add(Duration::from_secs(1));
+            Some(Duration::from_secs(stall_threshold_secs).max(min))
+        };
+        let mut last_current: usize = 0;
+        let mut last_progress_advance = std::time::Instant::now();
+        let mut stall_reported_for_phase: Option<usize> = None;
+        let stall_diagnostics_data_dir = data_dir.clone();
+
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
         loop {
@@ -16435,6 +16658,7 @@ fn run_index_with_data(
             }
 
             let phase_code = index_progress.phase.load(Ordering::Relaxed);
+            let current = index_progress.current.load(Ordering::Relaxed);
             let elapsed_ms = start.elapsed().as_millis();
 
             // Always emit on phase transitions, independent of the interval, so
@@ -16451,6 +16675,11 @@ fn run_index_with_data(
                 emit_event(payload);
                 last_phase = phase_code;
                 last_emit = std::time::Instant::now();
+                // Phase change is forward progress for the watchdog's purpose,
+                // even if `current` is reset to 0 in the new phase.
+                last_progress_advance = std::time::Instant::now();
+                last_current = current;
+                stall_reported_for_phase = None;
             } else if last_emit.elapsed() >= progress_interval {
                 let mut payload = index_progress.snapshot_json(elapsed_ms);
                 if let serde_json::Value::Object(ref mut m) = payload {
@@ -16462,6 +16691,54 @@ fn run_index_with_data(
                 }
                 emit_event(payload);
                 last_emit = std::time::Instant::now();
+            }
+
+            if current != last_current {
+                last_progress_advance = std::time::Instant::now();
+                last_current = current;
+            }
+
+            // Only arm the watchdog in active phases (scanning=1 or
+            // indexing=2). phase_code == 0 is preparing/idle and staying at
+            // current=0 there is expected. Latch once per phase so we don't
+            // spam stderr on long stalls.
+            if let Some(threshold) = stall_threshold
+                && phase_code != 0
+                && stall_reported_for_phase != Some(phase_code)
+                && last_progress_advance.elapsed() >= threshold
+            {
+                let stall_elapsed_ms = last_progress_advance.elapsed().as_millis();
+                let mut payload = index_progress.snapshot_json(elapsed_ms);
+                if let serde_json::Value::Object(ref mut m) = payload {
+                    m.insert("event".into(), serde_json::json!("stall_detected"));
+                    m.insert(
+                        "ts_ms".into(),
+                        serde_json::json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                    m.insert(
+                        "stall_elapsed_ms".into(),
+                        serde_json::json!(stall_elapsed_ms as u64),
+                    );
+                    m.insert(
+                        "stall_threshold_secs".into(),
+                        serde_json::json!(threshold.as_secs()),
+                    );
+                    m.insert(
+                        "diagnostics".into(),
+                        collect_stall_diagnostics(&stall_diagnostics_data_dir),
+                    );
+                    m.insert(
+                        "hint".into(),
+                        serde_json::json!(concat!(
+                            "Indexer made no forward progress for the configured stall window. ",
+                            "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
+                            "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
+                            "and attach to issue #196. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable."
+                        )),
+                    );
+                }
+                emit_event(payload);
+                stall_reported_for_phase = Some(phase_code);
             }
 
             std::thread::sleep(Duration::from_millis(100));
