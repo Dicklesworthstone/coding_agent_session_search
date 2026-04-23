@@ -204,6 +204,13 @@ pub enum Commands {
         /// Play back a previously recorded macro file
         #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "record_macro")]
         play_macro: Option<PathBuf>,
+
+        /// Run an incremental `cass index` pass before launching the TUI so
+        /// new conversations created since the last index are searchable.
+        /// No-op when the index is already current; indexing errors are
+        /// logged and the TUI opens on the existing index (non-fatal).
+        #[arg(long, visible_alias = "catch-up", default_value_t = false)]
+        refresh: bool,
     },
     /// Run indexer
     Index {
@@ -424,6 +431,13 @@ pub enum Commands {
         /// Requires daemon to be available; falls back to fast if unavailable.
         #[arg(long, default_value_t = false)]
         quality_only: bool,
+
+        /// Run an incremental `cass index` pass before the search so new
+        /// conversations created since the last index are matched. No-op
+        /// when the index is already current; indexing errors are logged
+        /// and the search runs against the existing index (non-fatal).
+        #[arg(long, visible_alias = "catch-up", default_value_t = false)]
+        refresh: bool,
     },
     /// Show statistics about indexed data
     Stats {
@@ -2774,6 +2788,7 @@ async fn execute_cli(
         anchor: "bottom".to_string(),
         record_macro: None,
         play_macro: None,
+        refresh: false,
     });
 
     if cli.robot_help {
@@ -2912,8 +2927,12 @@ async fn execute_cli(
                 anchor,
                 record_macro,
                 play_macro,
+                refresh,
             } = command.clone()
             {
+                if refresh {
+                    refresh_index_inline(cli.db.clone(), data_dir.clone());
+                }
                 info!(once, inline, ui_height, %anchor, record_macro = ?record_macro, play_macro = ?play_macro, "launching ftui runtime");
 
                 let inline_config = if inline {
@@ -3093,7 +3112,11 @@ async fn execute_cli(
                     two_tier,
                     fast_only,
                     quality_only,
+                    refresh,
                 } => {
+                    if refresh {
+                        refresh_index_inline(cli.db.clone(), data_dir.clone());
+                    }
                     // Validate mutually exclusive two-tier flags
                     let tier_count = [two_tier, fast_only, quality_only]
                         .iter()
@@ -15814,6 +15837,43 @@ fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Op
     ))
 }
 
+/// Run an incremental index pass before a TUI or Search invocation when the
+/// user passes `--refresh` (alias `--catch-up`). Mirrors `cass index` with
+/// `full=false`, `force_rebuild=false`, `watch=false`, `semantic=false` so it
+/// does the minimum work needed to catch up.
+///
+/// This is deliberately non-fatal: if the refresh fails we emit a warning and
+/// return, leaving the caller to proceed against the existing (possibly stale)
+/// index. That way a bad indexer state never blocks a search or TUI launch.
+fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<PathBuf>) {
+    use std::sync::Arc;
+
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let progress = Arc::new(indexer::IndexingProgress::default());
+    let opts = indexer::IndexOptions {
+        full: false,
+        force_rebuild: false,
+        watch: false,
+        watch_once_paths: None,
+        db_path,
+        data_dir,
+        semantic: false,
+        build_hnsw: false,
+        embedder: "fastembed".to_string(),
+        progress: Some(progress),
+        watch_interval_secs: 30,
+    };
+    eprintln!("Refreshing index...");
+    match indexer::run_index(opts, None) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("Warning: --refresh indexing failed: {e}. Continuing with existing index.");
+            tracing::warn!(error = %e, "refresh_index_inline failed; proceeding with stale index");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -26060,6 +26120,40 @@ mod subcommand_robot_output_tests {
         assert!(default_hybrid.fail_open_on_semantic_unavailable());
         assert!(explicit_hybrid.fail_open_on_semantic_unavailable());
         assert!(!explicit_semantic.fail_open_on_semantic_unavailable());
+    }
+
+    #[test]
+    fn refresh_catchup_flags_are_opt_in_for_search_and_tui() {
+        run_on_large_stack(|| {
+            for args in [
+                vec!["cass", "search", "needle", "--refresh"],
+                vec!["cass", "search", "needle", "--catch-up"],
+            ] {
+                let cli = Cli::try_parse_from(args.clone()).expect("parse search refresh flag");
+                let Some(Commands::Search { refresh, .. }) = cli.command else {
+                    panic!("expected search command for args {args:?}");
+                };
+                assert!(refresh, "refresh should be enabled for args {args:?}");
+            }
+
+            for args in [
+                vec!["cass", "tui", "--once", "--refresh"],
+                vec!["cass", "tui", "--once", "--catch-up"],
+            ] {
+                let cli = Cli::try_parse_from(args.clone()).expect("parse tui refresh flag");
+                let Some(Commands::Tui { refresh, .. }) = cli.command else {
+                    panic!("expected tui command for args {args:?}");
+                };
+                assert!(refresh, "refresh should be enabled for args {args:?}");
+            }
+
+            let cli = Cli::try_parse_from(["cass", "search", "needle"])
+                .expect("parse search without refresh");
+            let Some(Commands::Search { refresh, .. }) = cli.command else {
+                panic!("expected search command without refresh");
+            };
+            assert!(!refresh, "refresh should stay opt-in");
+        });
     }
 }
 
