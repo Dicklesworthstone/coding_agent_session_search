@@ -1,2 +1,9 @@
 exit-codes:
- 0 ok | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown
+ 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown
+ 10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable
+ 20-21 model | 22 io | 23 download | 24 io
+ NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).
+       Use `err.kind` from the JSON envelope as the canonical identifier — kinds are
+       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,
+       ambiguous-source, timeout, config, lock-busy, network, model, download, io).
+       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.

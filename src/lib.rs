@@ -6927,7 +6927,14 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Schemas => render_schema_docs(),
         RobotTopic::ExitCodes => vec![
             "exit-codes:".to_string(),
-            " 0 ok | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown".to_string(),
+            " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown".to_string(),
+            " 10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable".to_string(),
+            " 20-21 model | 22 io | 23 download | 24 io".to_string(),
+            " NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).".to_string(),
+            "       Use `err.kind` from the JSON envelope as the canonical identifier — kinds are".to_string(),
+            "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
+            "       ambiguous-source, timeout, config, lock-busy, network, model, download, io).".to_string(),
+            "       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.".to_string(),
         ],
         RobotTopic::Examples => vec![
             "examples:".to_string(),

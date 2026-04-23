@@ -791,8 +791,18 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result | Increase `--timeout` or reduce scope |
 | 9 | Unknown error | Check `retryable` flag |
+| 10 | Config / timeout | Depends on `err.kind` |
+| 11 | Config validation | Fix config |
+| 12 | Source / SSH | Check remote host |
+| 13 | Mapping / not-found | Depends on `err.kind` |
+| 14 | I/O / mapping | Retry or inspect path |
+| 15 | Semantic / embedder unavailable | Install model or `--mode lexical` |
+| 20-21 | Model acquisition | Check `err.kind`, `err.hint` |
+| 22 | I/O during model handling | Retry |
+| 23 | Model download | Retry or use `--from-file` |
+| 24 | I/O during model verify/install | Retry |
 
-Codes ≥ 10 cover domain-specific failures (semantic tier unavailable, analytics validation, export errors, etc.). Consult `err.kind` in the JSON envelope for the canonical identifier when `err.code ≥ 10`.
+**Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
 The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path).
 

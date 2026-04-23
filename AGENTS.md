@@ -585,6 +585,18 @@ Returns in <50ms:
 | 7 | Lock/busy | Yes — retry later |
 | 8 | Partial result | Yes — increase timeout |
 | 9 | Unknown error | Maybe |
+| 10 | Config / timeout (domain-specific) | Depends on `err.kind` |
+| 11 | Config validation | No — fix config |
+| 12 | Source / SSH problem | Maybe — check remote host |
+| 13 | Mapping / not-found | Depends on `err.kind` |
+| 14 | I/O / mapping | Maybe |
+| 15 | Semantic / embedder unavailable | Yes — install model or fall back to `--mode lexical` |
+| 20-21 | Model acquisition failure | Maybe — check `err.kind`, `err.hint` |
+| 22 | I/O during model handling | Maybe |
+| 23 | Download failure | Yes — retry or use `--from-file` |
+| 24 | I/O during model verify/install | Maybe |
+
+**Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`, `model`, `download`, `io`). The full set (~50 kinds) lives in `src/lib.rs`.
 
 ### Multi-Machine Search Setup
 
