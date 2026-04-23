@@ -1169,3 +1169,63 @@ fn concurrent_diag_readings_agree_on_inventory_snapshot() {
         );
     }
 }
+
+#[test]
+fn concurrent_introspect_readings_agree_after_btreemap_fix() {
+    // Regression gate for bead 8sl73 (fixed in commit 6a5f159b). The
+    // introspect schema registry used to be std::collections::HashMap,
+    // which iterates in random order per-run — two back-to-back
+    // invocations produced byte-different response_schemas blocks and
+    // broke every downstream typed-client generator. After the fix to
+    // BTreeMap (deterministic sorted iteration), independent runs must
+    // produce byte-identical output.
+    //
+    // This row spawns three concurrent cass introspect --json invocations
+    // against the same isolated HOME. If any of them drift in future (or
+    // the HashMap regression is reintroduced), this fails the build
+    // immediately.
+    let test_home = Arc::new(tempfile::tempdir().expect("tempdir"));
+
+    fn isolated_introspect(home: Arc<tempfile::TempDir>) -> String {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(["introspect", "--json"])
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home.path())
+            .env("HOME", home.path())
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass introspect --json");
+        assert!(
+            out.status.success(),
+            "cass introspect --json exited non-zero"
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        // Parse-and-reserialize canonicalizes whitespace; scrub paths for
+        // host independence.  Any remaining drift means the registry is
+        // non-deterministic again.
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("JSON");
+        let canonical = serde_json::to_string_pretty(&parsed).expect("pretty");
+        scrub(&canonical, home.path())
+    }
+
+    let handles: Vec<_> = (0..3)
+        .map(|_| {
+            let home = Arc::clone(&test_home);
+            thread::spawn(move || isolated_introspect(home))
+        })
+        .collect();
+
+    let outputs: Vec<String> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
+
+    let first = &outputs[0];
+    for (i, other) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            other, first,
+            "introspect --json output #{i} diverged from output #0 — \
+             HashMap/registry non-determinism may have regressed (bead 8sl73)"
+        );
+    }
+}
