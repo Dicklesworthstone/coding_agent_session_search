@@ -2408,3 +2408,139 @@ fn models_status_aggregates_equal_component_sums_and_files_cohere_on_absence() {
         "observed_file_bytes={observed} != sum(files[].actual_size)={sum_actual} — aggregate drifted from component breakdown"
     );
 }
+
+#[test]
+fn models_status_and_cache_lifecycle_agree_on_state_machine_identity() {
+    // ibuuh.19 cross-block agreement row. `cass models status --json`
+    // exposes the same state-machine identity on two surfaces:
+    //
+    //   top-level:           model_id, state, policy_source
+    //   cache_lifecycle:     model_id, state.state, policy_source
+    //
+    // Acquisition code reads the top level; retention may consult
+    // cache_lifecycle for richer detail (missing_files, needs_consent).
+    // If the two surfaces diverge on any of these identity/state
+    // fields, the layers would disagree about *which* model they are
+    // managing and *what phase* that model is in:
+    //
+    //   - model_id drift => acquisition fetches a different model than
+    //                       retention is tracking (leak + miss)
+    //   - state drift   => one layer thinks "not_acquired" and
+    //                       re-fetches while the other thinks
+    //                       "cached" and tries to reclaim
+    //   - policy_source drift => different retention budgets applied
+    //                            simultaneously
+    //
+    // Plus a derived-value check: when installed=false, the
+    // cache_lifecycle.state.missing_files list must enumerate every
+    // files[].local_name — the machinery that produced "all files
+    // are missing" must not silently drop entries.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(
+        out.status.success(),
+        "cass models status --json exited non-zero"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let cl = &status["cache_lifecycle"];
+    assert!(cl.is_object(), "cache_lifecycle must be an object");
+
+    // Invariant A: top-level model_id == cache_lifecycle.model_id.
+    let top_mid = status["model_id"]
+        .as_str()
+        .expect("top-level model_id must be a string");
+    let cl_mid = cl["model_id"]
+        .as_str()
+        .expect("cache_lifecycle.model_id must be a string");
+    assert_eq!(
+        top_mid, cl_mid,
+        "top-level model_id ({top_mid}) diverged from cache_lifecycle.model_id ({cl_mid}) — acquisition and retention would manage different models"
+    );
+
+    // Invariant B: top-level state string == cache_lifecycle.state.state.
+    let top_state = status["state"]
+        .as_str()
+        .expect("top-level state must be a string");
+    let cl_state = cl["state"]["state"]
+        .as_str()
+        .expect("cache_lifecycle.state.state must be a string");
+    assert_eq!(
+        top_state, cl_state,
+        "top-level state ({top_state}) diverged from cache_lifecycle.state.state ({cl_state}) — acquisition and retention would see different phases"
+    );
+
+    // Invariant C: policy_source agreement.
+    let top_ps = status["policy_source"]
+        .as_str()
+        .expect("top-level policy_source must be a string");
+    let cl_ps = cl["policy_source"]
+        .as_str()
+        .expect("cache_lifecycle.policy_source must be a string");
+    assert_eq!(
+        top_ps, cl_ps,
+        "top-level policy_source ({top_ps}) diverged from cache_lifecycle.policy_source ({cl_ps}) — different retention budgets would apply"
+    );
+
+    // Invariant D: installed=false ⇒ missing_files enumerates every
+    // file in files[] (by local_name). If the list drifted, the
+    // acquisition layer would under-fetch and retention would see
+    // phantom "already cached" files.
+    let installed = status["installed"]
+        .as_bool()
+        .expect("installed must be a bool");
+    assert!(!installed, "isolated HOME unexpectedly installed=true");
+
+    let files = status["files"]
+        .as_array()
+        .expect("files must be an array");
+    let mut file_local_names: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f["local_name"]
+                .as_str()
+                .expect("files[].local_name must be a string")
+                .to_string()
+        })
+        .collect();
+    file_local_names.sort();
+
+    let missing = cl["state"]["missing_files"]
+        .as_array()
+        .expect("cache_lifecycle.state.missing_files must be an array when not_acquired");
+    let mut missing_names: Vec<String> = missing
+        .iter()
+        .map(|m| {
+            m.as_str()
+                .expect("missing_files entries must be strings")
+                .to_string()
+        })
+        .collect();
+    missing_names.sort();
+
+    assert_eq!(
+        missing_names, file_local_names,
+        "cache_lifecycle.state.missing_files drifted from files[].local_name — acquisition would under-fetch or over-fetch"
+    );
+
+    // Invariant E: needs_consent=true ⇒ state=='not_acquired'. A model
+    // cannot simultaneously need consent AND be cached/installed; the
+    // state-machine precondition must hold.
+    let needs_consent = cl["state"]["needs_consent"]
+        .as_bool()
+        .expect("state.needs_consent must be a bool");
+    if needs_consent {
+        assert_eq!(
+            cl_state, "not_acquired",
+            "needs_consent=true but state={cl_state} — needs_consent only makes sense in the not_acquired phase"
+        );
+    }
+}
