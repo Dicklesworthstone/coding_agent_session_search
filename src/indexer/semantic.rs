@@ -1393,7 +1393,7 @@ impl SemanticIndexer {
 mod tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-    use crate::storage::sqlite::{FrankenStorage, MessageForEmbedding};
+    use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
@@ -1420,44 +1420,6 @@ mod tests {
                 source_id: input.source_id,
                 role: input.role,
                 content: input.content,
-            })
-            .collect();
-        comparable.sort();
-        comparable
-    }
-
-    fn comparable_legacy_semantic_inputs(
-        messages: Vec<MessageForEmbedding>,
-    ) -> Vec<ComparableSemanticInput> {
-        let mut comparable: Vec<ComparableSemanticInput> = messages
-            .into_iter()
-            .filter_map(|msg| {
-                if crate::search::canonicalize::is_hard_message_noise(
-                    Some(msg.role.as_str()),
-                    &msg.content,
-                ) {
-                    return None;
-                }
-
-                let role = match msg.role.as_str() {
-                    "user" => role_code_from_str("user").unwrap(),
-                    "agent" | "assistant" => role_code_from_str("assistant").unwrap(),
-                    "system" => role_code_from_str("system").unwrap(),
-                    "tool" => role_code_from_str("tool").unwrap(),
-                    _ => role_code_from_str("user").unwrap(),
-                };
-
-                super::message_id_from_db(msg.message_id).map(|message_id| {
-                    ComparableSemanticInput {
-                        message_id,
-                        created_at_ms: msg.created_at.unwrap_or(0),
-                        agent_id: super::saturating_u32_from_i64(msg.agent_id),
-                        workspace_id: super::saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
-                        source_id: msg.source_id_hash,
-                        role,
-                        content: msg.content,
-                    }
-                })
             })
             .collect();
         comparable.sort();
@@ -2199,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_since_fetch_and_packet_catch_up_emit_equivalent_semantic_docs() -> Result<()> {
+    fn packet_catch_up_emits_expected_semantic_docs_after_watermark() -> Result<()> {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path)?;
@@ -2327,7 +2289,6 @@ mod tests {
             ),
         )?;
 
-        let legacy_raw = storage.fetch_messages_for_embedding_since(watermark)?;
         let packet_batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
         let normalized_source_id =
             normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
@@ -2353,7 +2314,6 @@ mod tests {
             },
         ];
 
-        assert_eq!(comparable_legacy_semantic_inputs(legacy_raw), expected);
         assert_eq!(comparable_semantic_inputs(packet_batch.inputs), expected);
         assert_eq!(packet_batch.conversations_in_batch, 2);
         assert_eq!(packet_batch.raw_max_message_id, Some(watermark + 4));

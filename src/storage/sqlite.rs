@@ -6967,39 +6967,6 @@ impl FrankenStorage {
             .with_context(|| "fetching messages for embedding")
     }
 
-    /// Fetch messages for embedding generation that were inserted after `since_id`.
-    ///
-    /// Used by incremental semantic indexing in watch mode.
-    pub fn fetch_messages_for_embedding_since(
-        &self,
-        since_id: i64,
-    ) -> Result<Vec<MessageForEmbedding>> {
-        // Same COALESCE(c.agent_id, 0) guard as fetch_messages_for_embedding.
-        self.conn
-            .query_map_collect(
-                "SELECT m.id, m.created_at, COALESCE(c.agent_id, 0), c.workspace_id, c.source_id, m.role, m.content
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 WHERE m.id > ?1
-                 ORDER BY m.id",
-                fparams![since_id],
-                |row| {
-                    let source_id: String = row.get_typed::<Option<String>>(4)?
-                        .unwrap_or_else(|| "local".to_string());
-                    Ok(MessageForEmbedding {
-                        message_id: row.get_typed(0)?,
-                        created_at: row.get_typed(1)?,
-                        agent_id: row.get_typed(2)?,
-                        workspace_id: row.get_typed(3)?,
-                        source_id_hash: crc32fast::hash(source_id.as_bytes()),
-                        role: row.get_typed(5)?,
-                        content: row.get_typed(6)?,
-                    })
-                },
-            )
-            .with_context(|| format!("fetching messages for embedding after id {since_id}"))
-    }
-
     /// Get the watermark for incremental semantic embedding.
     pub fn get_last_embedded_message_id(&self) -> Result<Option<i64>> {
         let result: Result<String, _> = self.conn.query_row_map(
