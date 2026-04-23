@@ -185,33 +185,32 @@ fn concurrent_reader_never_sees_half_torn_lexical_index_during_publish_swap() {
     );
 
     // Invariant: every observation is one of:
-    //   - Ok(Some(stable doc count))
-    //   - Ok(Some(0 docs)) — legal transient during the rebuild's
-    //     pre-wipe window where restart_from_zero clears the live
-    //     index directory before the new staged index is populated.
-    //     This is the "cleared live" side of the rebuild lifecycle,
-    //     NOT the atomic-swap window itself; the atomic-swap proper
-    //     only covers the final staged → live rename (commit
-    //     109560e5) and is tested separately by the in-process
-    //     `publish_staged_lexical_index_*` guards. Filed as bead
-    //     coding_agent_session_search-9ct8r: once the rebuild
-    //     pre-wipe moves inside the atomic-swap logic, drop the 0
-    //     carve-out so this test enforces the stronger invariant.
+    //   - Ok(Some(stable doc count)) — the rebuild must not wipe the
+    //     live index. Bead 9ct8r's fix guards the pre-wipe behind a
+    //     `!will_use_atomic_staged_publish` check so the live index
+    //     stays intact until publish_staged_lexical_index atomically
+    //     swaps the new one in.
     //   - Ok(None) — path briefly absent during non-Linux rename
     //     fallback between park and swap.
     //   - Err(_) — transient Tantivy open errors during a swap
     //     (meta.json being renamed into place, etc.).
-    // Any other positive doc count would be a genuinely torn
-    // intermediate Tantivy directory — a search-surface regression.
+    // Any other doc count — including `Ok(Some(0))` — would mean a
+    // reader observed a half-torn intermediate Tantivy state, which is
+    // exactly what the atomic-swap publish path exists to prevent. If
+    // this test starts failing with `Ok(Some(0))` observations, bead
+    // 9ct8r regressed: the staged-shards delegation stopped running
+    // (e.g., total_conversations dropped to 0 or the shard plan
+    // collapsed to a single shard), or a new non-atomic wipe snuck
+    // into the rebuild lifecycle.
     for (i, obs) in observations.iter().enumerate() {
         if let Ok(Some(summary)) = obs {
-            assert!(
-                summary.docs == before_docs || summary.docs == 0,
-                "observation #{i} returned {docs} docs; expected either the \
-                 stable count {before_docs} or 0 (transient cleared-live). \
-                 Any other positive doc count means a reader observed a \
-                 half-torn intermediate Tantivy state. total observations = \
-                 {total}",
+            assert_eq!(
+                summary.docs, before_docs,
+                "observation #{i} returned {docs} docs; expected the stable \
+                 count {before_docs}. An intermediate doc count means a \
+                 reader observed a half-torn Tantivy state — the atomic-swap \
+                 rebuild invariant from bead 9ct8r has regressed. total \
+                 observations = {total}",
                 docs = summary.docs,
                 total = observations.len()
             );

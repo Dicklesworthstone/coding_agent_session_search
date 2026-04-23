@@ -12455,21 +12455,16 @@ fn rebuild_tantivy_from_db_with_options(
 
     let restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
-    if restart_from_zero {
-        if let Err(err) = fs::remove_dir_all(&index_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(err)
-                .with_context(|| format!("removing stale index {}", index_path.display()));
-        }
-        fs::create_dir_all(&index_path).with_context(|| {
-            format!("creating rebuilt index directory {}", index_path.display())
-        })?;
-        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
-    }
 
-    log_prep_step("restart_from_zero_reset", &mut prep_step_started);
-
+    // Plan staged shards BEFORE deciding whether to pre-wipe the live index.
+    // Bead 9ct8r: when the rebuild will go through
+    // `rebuild_tantivy_from_db_via_staged_shards`, the build happens in a
+    // scratch tmpdir and `publish_staged_lexical_index` atomically swaps it
+    // into the live path at commit time. Pre-wiping the live index in that
+    // case is both redundant AND actively harmful — it exposes a multi-
+    // second 0-doc window to any concurrent reader (tests/atomic_swap_publish_crash_window.rs
+    // currently tolerates this window with an `Ok(Some(0))` carve-out; the
+    // carve-out's bead-0k0sk follow-up is this fix).
     let page_size = LEXICAL_REBUILD_PAGE_SIZE;
     let pipeline_settings = lexical_rebuild_pipeline_settings_snapshot();
     let staged_shard_plan = if restart_from_zero && total_conversations > 0 {
@@ -12483,6 +12478,38 @@ fn rebuild_tantivy_from_db_with_options(
     if staged_shard_plan.is_some() {
         log_prep_step("plan_lexical_shards", &mut prep_step_started);
     }
+    // Any fresh non-empty shard plan can rebuild off-live and publish
+    // atomically, even when the plan collapses to a single shard. The
+    // final staged artifact already supports the single-input fast-path,
+    // and forcing single-shard fresh rebuilds through that path closes
+    // bead 9ct8r's remaining 0-doc crash window for concurrent readers.
+    let will_use_atomic_staged_publish = staged_shard_plan.is_some();
+
+    if restart_from_zero && !will_use_atomic_staged_publish {
+        if let Err(err) = fs::remove_dir_all(&index_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err)
+                .with_context(|| format!("removing stale index {}", index_path.display()));
+        }
+        fs::create_dir_all(&index_path).with_context(|| {
+            format!("creating rebuilt index directory {}", index_path.display())
+        })?;
+        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+    } else if restart_from_zero && will_use_atomic_staged_publish {
+        // Staged-shards path will atomically swap the new index into
+        // `index_path` via `publish_staged_lexical_index`. The live
+        // index stays intact for concurrent readers until the swap —
+        // that's the whole point. We still need to reset the in-memory
+        // rebuild_state so the rebuild starts from pristine accounting;
+        // the staged-shards delegation writes a fresh state file to
+        // the old live path (which gets moved to retained-backups on
+        // publish) and a completed state file to the new live path
+        // after publish succeeds.
+        rebuild_state = LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE);
+    }
+
+    log_prep_step("restart_from_zero_reset", &mut prep_step_started);
     let batch_conversation_limit = lexical_rebuild_batch_fetch_conversation_limit(page_size);
     let initial_batch_conversation_limit =
         lexical_rebuild_initial_batch_fetch_conversation_limit(batch_conversation_limit);
@@ -12632,9 +12659,7 @@ fn rebuild_tantivy_from_db_with_options(
         log_prep_step("start_packet_producer", &mut prep_step_started);
     }
 
-    if let Some(ref shard_plan) = staged_shard_plan
-        && shard_plan.shards.len() > 1
-    {
+    if let Some(ref shard_plan) = staged_shard_plan {
         rebuild_state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
         let pipeline_rx = pipeline_rx
             .take()
