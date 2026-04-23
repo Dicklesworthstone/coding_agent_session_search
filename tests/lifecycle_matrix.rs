@@ -1873,3 +1873,84 @@ fn diag_paths_use_canonical_filename_and_index_parent() {
         expected_index_root.display()
     );
 }
+
+#[test]
+fn diag_absent_artifacts_report_zero_counters_and_sizes() {
+    // ibuuh.19 retention-coherence row. GC and retention planning read
+    // three signals from `cass diag --json` for each artifact:
+    //
+    //   - database: { exists, size_bytes, conversations, messages }
+    //   - index:    { exists, size_bytes }
+    //
+    // Retention decides "skip vs reclaim" by fusing these. An absent
+    // artifact must report *coherently* absent: exists=false AND
+    // size_bytes=0 AND (for the DB) conversations=0 AND messages=0.
+    // If any counter drifts (e.g. exists=false but messages=N from a
+    // stale in-memory cache), retention will either:
+    //   - see phantom live data and refuse to reclaim, or
+    //   - see phantom reclaimable bytes and try to delete nothing.
+    // Both outcomes silently degrade the retention contract.
+    //
+    // An isolated HOME guarantees both artifacts are truly absent, so
+    // the "coherently absent" state is the one under test.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(out.status.success(), "cass diag --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let diag: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Database block: absent ⇒ every counter must be the zero value.
+    let db = &diag["database"];
+    assert!(db.is_object(), "diag.database must be an object");
+    let db_exists = db["exists"]
+        .as_bool()
+        .expect("database.exists must be a bool");
+    assert!(
+        !db_exists,
+        "isolated HOME unexpectedly has database.exists=true"
+    );
+    let db_size = db["size_bytes"]
+        .as_u64()
+        .expect("database.size_bytes must be a u64");
+    let db_conv = db["conversations"]
+        .as_u64()
+        .expect("database.conversations must be a u64");
+    let db_msgs = db["messages"]
+        .as_u64()
+        .expect("database.messages must be a u64");
+    assert_eq!(
+        db_size, 0,
+        "database.exists=false but size_bytes={db_size} — stale size reading would mislead retention reclaim plans"
+    );
+    assert_eq!(
+        db_conv, 0,
+        "database.exists=false but conversations={db_conv} — phantom row count would block retention reclaim of 'live' data that is not actually there"
+    );
+    assert_eq!(
+        db_msgs, 0,
+        "database.exists=false but messages={db_msgs} — phantom row count would block retention reclaim of 'live' data that is not actually there"
+    );
+
+    // Index block: absent ⇒ size must be 0.
+    let idx = &diag["index"];
+    assert!(idx.is_object(), "diag.index must be an object");
+    let idx_exists = idx["exists"].as_bool().expect("index.exists must be a bool");
+    assert!(
+        !idx_exists,
+        "isolated HOME unexpectedly has index.exists=true"
+    );
+    let idx_size = idx["size_bytes"]
+        .as_u64()
+        .expect("index.size_bytes must be a u64");
+    assert_eq!(
+        idx_size, 0,
+        "index.exists=false but size_bytes={idx_size} — phantom reclaimable bytes would mislead retention budget accounting"
+    );
+}
