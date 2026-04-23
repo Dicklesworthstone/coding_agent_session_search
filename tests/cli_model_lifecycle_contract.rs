@@ -58,6 +58,42 @@ fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), St
 }
 
 #[test]
+fn models_install_from_mirror_keeps_acquisition_data_dir_scoped() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "models",
+            "install",
+            "--model",
+            "all-minilm-l6-v2",
+            "--mirror",
+            "https://mirror.example/models",
+            "--data-dir",
+            "/cass/models",
+            "--yes",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Install {
+                model,
+                mirror: Some(mirror),
+                from_file: None,
+                yes: true,
+                data_dir: Some(data_dir),
+            })) if model == "all-minilm-l6-v2"
+                && mirror == "https://mirror.example/models"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected mirror model acquisition controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn models_install_rejects_ambiguous_mirror_and_from_file_sources() -> Result<(), String> {
     run_on_large_stack(|| {
         let result = Cli::try_parse_from([
