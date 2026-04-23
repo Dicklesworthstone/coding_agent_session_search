@@ -336,6 +336,9 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub quarantined_generation_ids: Vec<String>,
     pub active_generation_ids: Vec<String>,
     pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
+    #[serde(default)]
+    pub shard_disposition_summaries:
+        BTreeMap<LexicalCleanupDisposition, LexicalCleanupDispositionSummary>,
     pub inventories: Vec<LexicalGenerationCleanupInventory>,
 }
 
@@ -346,6 +349,14 @@ pub(crate) struct LexicalCleanupReclaimCandidate {
     pub disposition: LexicalCleanupDisposition,
     pub reason: String,
     pub reclaimable_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupDispositionSummary {
+    pub shard_count: usize,
+    pub artifact_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +386,7 @@ impl LexicalCleanupDryRunPlan {
             quarantined_generation_ids: Vec::new(),
             active_generation_ids: Vec::new(),
             disposition_counts: BTreeMap::new(),
+            shard_disposition_summaries: BTreeMap::new(),
             inventories: Vec::new(),
         };
 
@@ -456,6 +468,17 @@ impl LexicalCleanupDryRunPlan {
                 .push(inventory.generation_id.clone());
         }
         for shard in &inventory.shards {
+            let summary = self
+                .shard_disposition_summaries
+                .entry(shard.disposition)
+                .or_default();
+            summary.shard_count = summary.shard_count.saturating_add(1);
+            summary.artifact_bytes = summary.artifact_bytes.saturating_add(shard.artifact_bytes);
+            summary.reclaimable_bytes = summary
+                .reclaimable_bytes
+                .saturating_add(shard.reclaimable_bytes);
+            summary.retained_bytes = summary.retained_bytes.saturating_add(shard.retained_bytes);
+
             if shard.reclaimable_bytes == 0 {
                 continue;
             }
@@ -1852,6 +1875,33 @@ mod tests {
             plan.disposition_counts
                 .get(&LexicalCleanupDisposition::QuarantinedRetained),
             Some(&1)
+        );
+        let reclaimable_summary = plan
+            .shard_disposition_summaries
+            .get(&LexicalCleanupDisposition::SupersededReclaimable)
+            .expect("superseded reclaimable shard summary");
+        assert_eq!(reclaimable_summary.shard_count, 1);
+        assert_eq!(reclaimable_summary.artifact_bytes, 8192);
+        assert_eq!(reclaimable_summary.reclaimable_bytes, 8192);
+        assert_eq!(reclaimable_summary.retained_bytes, 0);
+
+        let pinned_summary = plan
+            .shard_disposition_summaries
+            .get(&LexicalCleanupDisposition::PinnedRetained)
+            .expect("pinned retained shard summary");
+        assert_eq!(pinned_summary.shard_count, 1);
+        assert_eq!(pinned_summary.artifact_bytes, 1024);
+        assert_eq!(pinned_summary.reclaimable_bytes, 0);
+        assert_eq!(pinned_summary.retained_bytes, 1024);
+
+        let json = serde_json::to_value(&plan).expect("serialize cleanup dry-run plan");
+        assert_eq!(
+            json["shard_disposition_summaries"]["superseded_reclaimable"]["reclaimable_bytes"],
+            8192
+        );
+        assert_eq!(
+            json["shard_disposition_summaries"]["pinned_retained"]["retained_bytes"],
+            1024
         );
         assert_eq!(plan.inventories.len(), 3);
     }
