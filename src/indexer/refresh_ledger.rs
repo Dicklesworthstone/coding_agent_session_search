@@ -302,20 +302,28 @@ impl RefreshLedger {
     }
 
     fn search_readiness_state(&self) -> RefreshSearchReadinessState {
+        let mut published = false;
+
         for phase in &self.phases {
             if !phase.success {
                 return if phase.phase == RefreshPhase::Publish {
                     RefreshSearchReadinessState::PublishFailed
+                } else if published {
+                    RefreshSearchReadinessState::Published
                 } else {
                     RefreshSearchReadinessState::BlockedBeforePublish
                 };
             }
             if phase.phase == RefreshPhase::Publish {
-                return RefreshSearchReadinessState::Published;
+                published = true;
             }
         }
 
-        RefreshSearchReadinessState::WaitingForPublish
+        if published {
+            RefreshSearchReadinessState::Published
+        } else {
+            RefreshSearchReadinessState::WaitingForPublish
+        }
     }
 }
 
@@ -814,6 +822,40 @@ mod tests {
         assert_eq!(
             publish_failed_milestones.search_readiness_state,
             RefreshSearchReadinessState::PublishFailed
+        );
+
+        let post_publish_failure = RefreshLedger {
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+                phase_record(RefreshPhase::LexicalRebuild, 30, true),
+                phase_record(RefreshPhase::Publish, 5, true),
+                phase_record(RefreshPhase::Analytics, 7, false),
+            ],
+            ..Default::default()
+        };
+
+        let post_publish_failure_milestones = post_publish_failure.readiness_milestones();
+
+        assert_eq!(
+            post_publish_failure_milestones.time_to_lexical_ready_ms,
+            Some(60)
+        );
+        assert_eq!(
+            post_publish_failure_milestones.time_to_search_ready_ms,
+            Some(65)
+        );
+        assert_eq!(
+            post_publish_failure_milestones.time_to_full_settled_ms,
+            None
+        );
+        assert_eq!(
+            post_publish_failure_milestones.failed_phase.as_deref(),
+            Some("analytics")
+        );
+        assert_eq!(
+            post_publish_failure_milestones.search_readiness_state,
+            RefreshSearchReadinessState::Published
         );
     }
 

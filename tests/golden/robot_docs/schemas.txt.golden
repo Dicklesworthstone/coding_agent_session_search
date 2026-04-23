@@ -113,15 +113,19 @@ schemas: (auto-generated from contract)
       - semantic: object
         - availability: string
         - available: boolean
+        - backlog: object
         - can_search: boolean
+        - checkpoint: object
         - embedder_id: ?
         - fallback_mode: ?
+        - fast_tier: object
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
+        - quality_tier: object
         - status: string
         - summary: string
         - vector_index_path: ?
@@ -267,15 +271,55 @@ schemas: (auto-generated from contract)
     - semantic: object
       - availability: string
       - available: boolean
+      - backlog: object
+        - computed_at: ?
+        - current_db_matches: ?
+        - fast_tier_processed: integer
+        - fast_tier_remaining: integer
+        - pending_work: boolean
+        - quality_tier_processed: integer
+        - quality_tier_remaining: integer
+        - total_conversations: integer
       - can_search: boolean
+      - checkpoint: object
+        - active: boolean
+        - completed: ?
+        - conversations_processed: ?
+        - current_db_matches: ?
+        - docs_embedded: ?
+        - last_offset: ?
+        - progress_pct: ?
+        - saved_at: ?
+        - tier: ?
+        - total_conversations: ?
       - embedder_id: ?
       - fallback_mode: ?
+      - fast_tier: object
+        - completed_at: ?
+        - conversation_count: ?
+        - current_db_matches: ?
+        - doc_count: ?
+        - embedder_id: ?
+        - model_revision: ?
+        - present: boolean
+        - ready: boolean
+        - size_bytes: ?
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - quality_tier: object
+        - completed_at: ?
+        - conversation_count: ?
+        - current_db_matches: ?
+        - doc_count: ?
+        - embedder_id: ?
+        - model_revision: ?
+        - present: boolean
+        - ready: boolean
+        - size_bytes: ?
       - status: string
       - summary: string
       - vector_index_path: ?
@@ -352,15 +396,55 @@ schemas: (auto-generated from contract)
     - semantic: object
       - availability: string
       - available: boolean
+      - backlog: object
+        - computed_at: ?
+        - current_db_matches: ?
+        - fast_tier_processed: integer
+        - fast_tier_remaining: integer
+        - pending_work: boolean
+        - quality_tier_processed: integer
+        - quality_tier_remaining: integer
+        - total_conversations: integer
       - can_search: boolean
+      - checkpoint: object
+        - active: boolean
+        - completed: ?
+        - conversations_processed: ?
+        - current_db_matches: ?
+        - docs_embedded: ?
+        - last_offset: ?
+        - progress_pct: ?
+        - saved_at: ?
+        - tier: ?
+        - total_conversations: ?
       - embedder_id: ?
       - fallback_mode: ?
+      - fast_tier: object
+        - completed_at: ?
+        - conversation_count: ?
+        - current_db_matches: ?
+        - doc_count: ?
+        - embedder_id: ?
+        - model_revision: ?
+        - present: boolean
+        - ready: boolean
+        - size_bytes: ?
       - hint: ?
       - hnsw_path: ?
       - hnsw_ready: boolean
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
+      - quality_tier: object
+        - completed_at: ?
+        - conversation_count: ?
+        - current_db_matches: ?
+        - doc_count: ?
+        - embedder_id: ?
+        - model_revision: ?
+        - present: boolean
+        - ready: boolean
+        - size_bytes: ?
       - status: string
       - summary: string
       - vector_index_path: ?
