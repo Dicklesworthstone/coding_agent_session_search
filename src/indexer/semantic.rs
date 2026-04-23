@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,9 @@ use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
-use crate::indexer::memoization::{ContentAddressedMemoCache, MemoContentHash, MemoKey, MemoLookup};
+use crate::indexer::memoization::{
+    ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
+};
 use crate::indexer::responsiveness;
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
@@ -41,7 +44,7 @@ use crate::storage::sqlite::FrankenStorage;
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
-const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v1";
+const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
 
 fn resolved_default_batch_size() -> usize {
     dotenvy::var("CASS_SEMANTIC_BATCH_SIZE")
@@ -845,36 +848,39 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
     })
 }
 
-pub(crate) fn packet_embedding_inputs_from_canonical_delta(
-    conversation: &Conversation,
-    agent_id: i64,
-    workspace_id: Option<i64>,
-) -> Vec<EmbeddingInput> {
-    let Some(conversation_id) = conversation.id else {
-        tracing::warn!(
-            source_path = %conversation.source_path.display(),
-            "skipping semantic delta ConversationPacket replay without canonical conversation id"
-        );
-        return Vec::new();
-    };
+pub(crate) fn packet_embedding_inputs_from_storage_for_message_ids(
+    storage: &FrankenStorage,
+    conversation_ids: &[i64],
+    message_ids: &HashSet<i64>,
+) -> Result<Vec<EmbeddingInput>> {
+    if conversation_ids.is_empty() || message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let row = CanonicalEmbeddingConversationRow {
-        conversation_id,
-        agent_slug: conversation.agent_slug.clone(),
-        agent_id,
-        workspace: conversation.workspace.clone(),
-        workspace_id,
-        external_id: conversation.external_id.clone(),
-        title: conversation.title.clone(),
-        source_path: conversation.source_path.clone(),
-        started_at: conversation.started_at,
-        ended_at: conversation.ended_at,
-        source_id: Some(conversation.source_id.clone()),
-        origin_host: conversation.origin_host.clone(),
-    };
-    let provenance = canonical_embedding_packet_provenance(&row);
-    let packet = ConversationPacket::from_canonical_replay(conversation, provenance);
-    embedding_inputs_from_conversation_packet(&row, &packet)
+    let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+
+    for conversation in &conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        messages.retain(|message| message.id.is_some_and(|id| message_ids.contains(&id)));
+        if messages.is_empty() {
+            continue;
+        }
+
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
+    }
+
+    Ok(inputs)
 }
 
 struct Prepared<'a> {
@@ -891,10 +897,45 @@ struct MemoizedPreparedMessage {
 
 fn semantic_prep_memo_key(content: &str) -> MemoKey {
     MemoKey::new(
-        MemoContentHash::from_bytes(content.as_bytes().to_vec()),
+        MemoContentHash::from_bytes(content_hash(content).to_vec()),
         SEMANTIC_PREP_MEMO_ALGORITHM,
         SEMANTIC_PREP_MEMO_VERSION,
     )
+}
+
+fn memo_counter_delta(after: u64, before: u64) -> u64 {
+    after.saturating_sub(before)
+}
+
+fn trace_semantic_prep_memo_window(
+    window_index: usize,
+    window_len: usize,
+    prepared_len: usize,
+    entry_capacity: usize,
+    before: &crate::indexer::memoization::MemoCacheStats,
+    after: &crate::indexer::memoization::MemoCacheStats,
+) {
+    tracing::trace!(
+        algorithm = SEMANTIC_PREP_MEMO_ALGORITHM,
+        algorithm_version = SEMANTIC_PREP_MEMO_VERSION,
+        window_index,
+        window_len,
+        prepared_messages = prepared_len,
+        skipped_messages = window_len.saturating_sub(prepared_len),
+        hit_delta = memo_counter_delta(after.hits, before.hits),
+        miss_delta = memo_counter_delta(after.misses, before.misses),
+        insert_delta = memo_counter_delta(after.inserts, before.inserts),
+        evictions_capacity_delta =
+            memo_counter_delta(after.evictions_capacity, before.evictions_capacity),
+        quarantined_delta = memo_counter_delta(after.quarantined, before.quarantined),
+        live_entries = after.live_entries,
+        entry_capacity,
+        "semantic prep memo cache window"
+    );
+}
+
+fn trace_semantic_prep_memo_audit(audit: &MemoCacheAuditRecord) {
+    tracing::trace!(?audit, "semantic prep memo cache audit");
 }
 
 fn prepare_window_with_memo<'a>(
@@ -905,7 +946,9 @@ fn prepare_window_with_memo<'a>(
         .iter()
         .filter_map(|msg| {
             let key = semantic_prep_memo_key(&msg.content);
-            match cache.get(&key) {
+            let (lookup, lookup_audit) = cache.get_with_audit(&key);
+            trace_semantic_prep_memo_audit(&lookup_audit);
+            match lookup {
                 MemoLookup::Hit { value } => Some(Prepared {
                     msg,
                     canonical: value.canonical,
@@ -917,13 +960,14 @@ fn prepare_window_with_memo<'a>(
                         return None;
                     }
                     let hash = content_hash(&canonical);
-                    let _ = cache.insert(
+                    let insert_audit = cache.insert_with_audit(
                         key,
                         MemoizedPreparedMessage {
                             canonical: canonical.clone(),
                             hash,
                         },
                     );
+                    trace_semantic_prep_memo_audit(&insert_audit);
                     Some(Prepared {
                         msg,
                         canonical,
@@ -1084,11 +1128,24 @@ impl SemanticIndexer {
         // so saturating_mul(4) is always >= batch_size — no further clamp.
         let window = self.batch_size.saturating_mul(4);
         let serial_prep = !parallel_prep_enabled();
+        let prep_memo_capacity = resolved_semantic_prep_memo_capacity();
         let mut prep_memo =
-            serial_prep.then(|| ContentAddressedMemoCache::with_capacity(resolved_semantic_prep_memo_capacity()));
-        for window_slice in messages.chunks(window) {
+            serial_prep.then(|| ContentAddressedMemoCache::with_capacity(prep_memo_capacity));
+        for (window_index, window_slice) in messages.chunks(window).enumerate() {
             let prepared_window = match prep_memo.as_mut() {
-                Some(cache) => prepare_window_with_memo(window_slice, cache),
+                Some(cache) => {
+                    let stats_before = cache.stats().clone();
+                    let prepared_window = prepare_window_with_memo(window_slice, cache);
+                    trace_semantic_prep_memo_window(
+                        window_index,
+                        window_slice.len(),
+                        prepared_window.len(),
+                        prep_memo_capacity,
+                        &stats_before,
+                        cache.stats(),
+                    );
+                    prepared_window
+                }
                 None => prepare_window(window_slice, false),
             };
             let skipped_in_window = window_slice.len() - prepared_window.len();
@@ -1111,7 +1168,7 @@ impl SemanticIndexer {
                 inserts = stats.inserts,
                 quarantined = stats.quarantined,
                 live_entries = stats.live_entries,
-                entry_capacity = resolved_semantic_prep_memo_capacity(),
+                entry_capacity = prep_memo_capacity,
                 "semantic prep memo cache summary"
             );
         }
@@ -1849,6 +1906,17 @@ mod tests {
     }
 
     #[test]
+    fn semantic_prep_memo_key_uses_stable_content_hash_bytes() {
+        let key = semantic_prep_memo_key("repeat me exactly");
+        let expected = content_hash("repeat me exactly");
+
+        assert_eq!(key.content_hash.as_bytes(), expected.as_slice());
+        assert_eq!(key.content_hash.as_bytes().len(), expected.len());
+        assert_eq!(key.algorithm, SEMANTIC_PREP_MEMO_ALGORITHM);
+        assert_eq!(key.algorithm_version, SEMANTIC_PREP_MEMO_VERSION);
+    }
+
+    #[test]
     fn memoized_serial_prep_reuses_duplicate_content_across_windows() {
         let inputs = vec![
             EmbeddingInput::new(1, "repeat me exactly"),
@@ -1867,6 +1935,99 @@ mod tests {
         assert_eq!(stats.misses, 3);
         assert_eq!(stats.inserts, 2);
         assert_eq!(stats.live_entries, 2);
+    }
+
+    #[test]
+    fn packet_embedding_inputs_reuse_memoized_prep_for_duplicate_content() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "packet-memo-conv-one",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_010_100),
+                        content: "shared semantic payload".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_010_200),
+                        content: "unique semantic payload one".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "packet-memo-conv-two",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::Tool,
+                        author: None,
+                        created_at: Some(1_700_000_010_300),
+                        content: "shared semantic payload".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_010_400),
+                        content: "unique semantic payload two".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let packet_inputs = packet_embedding_inputs_from_storage(&storage)?;
+        let mut cache = ContentAddressedMemoCache::with_capacity(16);
+        let prepared = prepare_window_with_memo(&packet_inputs, &mut cache);
+        let stats = cache.stats().clone();
+
+        assert_eq!(packet_inputs.len(), 4);
+        assert_eq!(prepared.len(), 4);
+        assert_eq!(
+            semantic_prep_memo_key("shared semantic payload")
+                .content_hash
+                .as_bytes()
+                .len(),
+            32
+        );
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.inserts, 3);
+        assert_eq!(stats.live_entries, 3);
+        Ok(())
     }
 
     #[test]
