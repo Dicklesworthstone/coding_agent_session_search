@@ -553,3 +553,58 @@ fn api_and_contract_versions_agree_across_capabilities_and_api_version() {
         caps["crate_version"], api["crate_version"],
     );
 }
+
+#[test]
+fn capabilities_and_diag_connectors_enumerate_the_same_set() {
+    // Cross-surface invariant: cass capabilities --json exposes a
+    // `connectors` string-array listing every connector cass can scan;
+    // cass diag --json exposes a `connectors` object-array with
+    // per-connector detection status. Both enumerate the same underlying
+    // connector registry. A drift — e.g. a newly-added connector that
+    // lands in capabilities but not in diag, or vice versa — is a real
+    // contract bug: agents that discover capabilities and then call diag
+    // to plan ingestion will silently skip the mismatched connector.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        assert!(out.status.success(), "cass {args:?} exited non-zero");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let caps = json_out(test_home.path(), &["capabilities", "--json"]);
+    let diag = json_out(test_home.path(), &["diag", "--json"]);
+
+    let mut caps_names: Vec<String> = caps["connectors"]
+        .as_array()
+        .expect("capabilities.connectors is an array")
+        .iter()
+        .map(|v| v.as_str().expect("connector name is string").to_string())
+        .collect();
+    let mut diag_names: Vec<String> = diag["connectors"]
+        .as_array()
+        .expect("diag.connectors is an array")
+        .iter()
+        .map(|entry| {
+            entry["name"]
+                .as_str()
+                .expect("diag.connectors[].name is string")
+                .to_string()
+        })
+        .collect();
+    caps_names.sort();
+    diag_names.sort();
+
+    assert_eq!(
+        caps_names, diag_names,
+        "capabilities.connectors and diag.connectors enumerate different sets — \
+         a connector landed in one surface but not the other"
+    );
+}
