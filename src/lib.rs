@@ -11638,46 +11638,6 @@ fn run_health(
     }
 }
 
-#[allow(dead_code)]
-fn ensure_cass_origin(
-    metadata: &mut serde_json::Value,
-    source_id: &str,
-    kind: crate::sources::provenance::SourceKind,
-    host: Option<&str>,
-) {
-    if !metadata.is_object() {
-        *metadata = serde_json::json!({});
-    }
-
-    let Some(obj) = metadata.as_object_mut() else {
-        return;
-    };
-
-    let cass = obj
-        .entry("cass".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(cass_obj) = cass.as_object_mut() else {
-        return;
-    };
-
-    let origin = cass_obj
-        .entry("origin".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    if let Some(origin_obj) = origin.as_object_mut() {
-        origin_obj
-            .entry("source_id".to_string())
-            .or_insert_with(|| serde_json::Value::String(source_id.to_string()));
-        origin_obj
-            .entry("kind".to_string())
-            .or_insert_with(|| serde_json::Value::String(kind.as_str().to_string()));
-        if let Some(host) = host {
-            origin_obj
-                .entry("host".to_string())
-                .or_insert_with(|| serde_json::Value::String(host.to_string()));
-        }
-    }
-}
-
 fn rebuild_tantivy_from_db(
     db_path: &Path,
     data_dir: &Path,
