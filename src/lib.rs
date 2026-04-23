@@ -15890,11 +15890,17 @@ fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Op
 /// `full=false`, `force_rebuild=false`, `watch=false`, `semantic=false` so it
 /// does the minimum work needed to catch up.
 ///
+/// Progress is emitted as one-line updates on stderr whenever the indexer's
+/// phase or batch counter changes (matching the "plain" progress style the
+/// issue asked for). This avoids a silent multi-second wait when launching
+/// the TUI or running a search against a slightly stale index.
+///
 /// This is deliberately non-fatal: if the refresh fails we emit a warning and
 /// return, leaving the caller to proceed against the existing (possibly stale)
 /// index. That way a bad indexer state never blocks a search or TUI launch.
 fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<PathBuf>) {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -15909,15 +15915,54 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         semantic: false,
         build_hnsw: false,
         embedder: "fastembed".to_string(),
-        progress: Some(progress),
+        progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
     };
     eprintln!("Refreshing index...");
-    match indexer::run_index(opts, None) {
-        Ok(()) => {}
-        Err(e) => {
+
+    // Run the indexer on a dedicated thread so the main thread can poll the
+    // progress counters and emit plain-text status lines while it runs. We
+    // move the whole opts struct (it contains the shared progress handle).
+    let index_handle = std::thread::spawn(move || indexer::run_index(opts, None));
+
+    let mut last_phase = usize::MAX;
+    let mut last_current = usize::MAX;
+    let mut last_total = 0usize;
+    while !index_handle.is_finished() {
+        let phase = progress.phase.load(Ordering::Relaxed);
+        let current = progress.current.load(Ordering::Relaxed);
+        let total = progress.total.load(Ordering::Relaxed);
+        if phase != last_phase || current != last_current || total != last_total {
+            let phase_str = match phase {
+                1 => "scanning",
+                2 => "indexing",
+                _ => "preparing",
+            };
+            if total > 0 {
+                eprintln!("  {phase_str}: {current}/{total}");
+            } else {
+                eprintln!("  {phase_str}...");
+            }
+            last_phase = phase;
+            last_current = current;
+            last_total = total;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    match index_handle.join() {
+        Ok(Ok(())) => {
+            eprintln!("  done.");
+        }
+        Ok(Err(e)) => {
             eprintln!("Warning: --refresh indexing failed: {e}. Continuing with existing index.");
             tracing::warn!(error = %e, "refresh_index_inline failed; proceeding with stale index");
+        }
+        Err(_panic) => {
+            eprintln!(
+                "Warning: --refresh indexing panicked. Continuing with existing index."
+            );
+            tracing::warn!("refresh_index_inline indexer thread panicked; proceeding with stale index");
         }
     }
 }
