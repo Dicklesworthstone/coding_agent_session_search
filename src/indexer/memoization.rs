@@ -285,6 +285,21 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         summary
     }
 
+    /// Remove an inspected quarantine tombstone and return its audit
+    /// record. This is in-memory metadata GC only; persisted artifact
+    /// retention stays with the caller.
+    pub(crate) fn garbage_collect_quarantined(
+        &mut self,
+        key: &MemoKey,
+    ) -> Option<MemoQuarantineInspectionItem> {
+        self.quarantined
+            .remove(key)
+            .map(|reason| MemoQuarantineInspectionItem {
+                key: key.clone(),
+                reason,
+            })
+    }
+
     fn touch(&mut self, key: &MemoKey) {
         if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
             self.lru.remove(pos);
@@ -487,6 +502,40 @@ mod tests {
         assert_eq!(json["quarantined_entries"], 3);
         assert_eq!(json["reasons"]["checksum mismatch"], 2);
         assert_eq!(json["algorithms"]["semantic-embed"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn garbage_collect_quarantined_entry_after_inspection() -> Result<(), String> {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(4);
+        let k = key(b"semantic", "semantic-embed", "v2");
+
+        cache.insert(k.clone(), "old-vector".into());
+        cache.quarantine(k.clone(), "checksum mismatch");
+        let removed = cache
+            .garbage_collect_quarantined(&k)
+            .ok_or_else(|| "expected quarantined tombstone to be collected".to_string())?;
+        assert_eq!(removed.key, k);
+        assert_eq!(removed.reason, "checksum mismatch");
+        assert_eq!(cache.quarantine_summary().quarantined_entries, 0);
+
+        match cache.get(&removed.key) {
+            MemoLookup::Miss => {}
+            other => {
+                return Err(format!(
+                    "collected quarantine should expose a cache miss, got {other:?}"
+                ));
+            }
+        }
+        assert_eq!(
+            cache.insert(removed.key.clone(), "replacement-vector".into()),
+            MemoCacheEvent::Insert
+        );
+        match cache.get(&removed.key) {
+            MemoLookup::Hit { value } => assert_eq!(value, "replacement-vector"),
+            other => return Err(format!("expected reinsertion hit, got {other:?}")),
+        }
         Ok(())
     }
 
