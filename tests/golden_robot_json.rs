@@ -378,6 +378,28 @@ fn capture_robot_json(
     scrub_robot_json(&canonical, test_home)
 }
 
+fn capture_robot_json_value(
+    test_home: &std::path::Path,
+    args: &[&str],
+    expect_status: ExpectStatus,
+) -> Value {
+    let output = cass_cmd(test_home)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("run cass {args:?}: {err}"));
+    if matches!(expect_status, ExpectStatus::ExitOk) {
+        assert!(
+            output.status.success(),
+            "cass {args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("cass {args:?} stdout is not JSON: {err}"))
+}
+
 #[derive(Clone, Copy)]
 enum ExpectStatus {
     ExitOk,
@@ -431,6 +453,15 @@ fn health_json_matches_golden() {
         ExpectStatus::ExitAny,
     );
     assert_golden("robot/health.json.golden", &scrubbed);
+}
+
+#[test]
+fn health_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let health = capture_robot_json_value(test_home.path(), &["health", "--json"], ExpectStatus::ExitAny);
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&health)).expect("pretty-print JSON");
+    assert_golden("robot/health_shape.json.golden", &canonical);
 }
 
 #[test]

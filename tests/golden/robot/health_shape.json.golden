@@ -1,0 +1,618 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "healthy": {
+      "type": "boolean"
+    },
+    "initialized": {
+      "type": "boolean"
+    },
+    "explanation": {
+      "type": "string"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "latency_ms": {
+      "type": "integer"
+    },
+    "db": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "opened": {
+          "type": "boolean"
+        },
+        "conversations": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "open_error": {
+          "type": "null"
+        },
+        "counts_skipped": {
+          "type": "boolean"
+        }
+      }
+    },
+    "responsiveness": {
+      "type": "object",
+      "properties": {
+        "current_capacity_pct": {
+          "type": "integer"
+        },
+        "resource_policy": {
+          "type": "object",
+          "properties": {
+            "available_parallelism": {
+              "type": "integer"
+            },
+            "reserved_cores": {
+              "type": "integer"
+            },
+            "max_workers": {
+              "type": "integer"
+            },
+            "effective_worker_ceiling": {
+              "type": "integer"
+            },
+            "max_inflight_bytes": {
+              "type": "integer"
+            },
+            "min_inflight_bytes": {
+              "type": "integer"
+            }
+          }
+        },
+        "healthy_streak": {
+          "type": "integer"
+        },
+        "shrink_count": {
+          "type": "integer"
+        },
+        "grow_count": {
+          "type": "integer"
+        },
+        "ticks_total": {
+          "type": "integer"
+        },
+        "disabled_via_env": {
+          "type": "boolean"
+        },
+        "last_snapshot": {
+          "type": "object",
+          "properties": {
+            "load_per_core": {
+              "type": "number"
+            },
+            "psi_cpu_some_avg10": {
+              "type": "number"
+            }
+          }
+        },
+        "last_reason": {
+          "type": "string"
+        },
+        "recent_decisions": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "calibration": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "load_window_len": {
+              "type": "integer"
+            },
+            "psi_window_len": {
+              "type": "integer"
+            },
+            "conformal_k": {
+              "type": "integer"
+            },
+            "conformal_k_min": {
+              "type": "integer"
+            },
+            "conformal_alpha_pressured": {
+              "type": "number"
+            },
+            "conformal_alpha_severe": {
+              "type": "number"
+            },
+            "drift_reset_count": {
+              "type": "integer"
+            },
+            "outliers_rejected": {
+              "type": "integer"
+            },
+            "observations_total": {
+              "type": "integer"
+            },
+            "load_pressured_q": {
+              "type": "null"
+            },
+            "load_severe_q": {
+              "type": "null"
+            },
+            "psi_pressured_q": {
+              "type": "null"
+            },
+            "psi_severe_q": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "parallel_wal_shadow": {
+      "type": "object",
+      "properties": {
+        "recent_chunks": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "chunks_observed": {
+          "type": "integer"
+        },
+        "cumulative_wall_micros": {
+          "type": "integer"
+        },
+        "chunk_errors": {
+          "type": "integer"
+        },
+        "active": {
+          "type": "boolean"
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "properties": {
+        "index": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "fresh": {
+              "type": "boolean"
+            },
+            "last_indexed_at": {
+              "type": "null"
+            },
+            "age_seconds": {
+              "type": "null"
+            },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_threshold_seconds": {
+              "type": "integer"
+            },
+            "rebuilding": {
+              "type": "boolean"
+            },
+            "activity_at": {
+              "type": "null"
+            },
+            "documents": {
+              "type": "null"
+            },
+            "empty_with_messages": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "object",
+              "properties": {
+                "current_db_fingerprint": {
+                  "type": "null"
+                },
+                "checkpoint_fingerprint": {
+                  "type": "null"
+                },
+                "matches_current_db_fingerprint": {
+                  "type": "null"
+                }
+              }
+            },
+            "checkpoint": {
+              "type": "object",
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "completed": {
+                  "type": "null"
+                },
+                "db_matches": {
+                  "type": "null"
+                },
+                "schema_matches": {
+                  "type": "null"
+                },
+                "page_size_matches": {
+                  "type": "null"
+                },
+                "page_size_compatible": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        "database": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "opened": {
+              "type": "boolean"
+            },
+            "conversations": {
+              "type": "integer"
+            },
+            "messages": {
+              "type": "integer"
+            },
+            "open_error": {
+              "type": "null"
+            },
+            "open_retryable": {
+              "type": "boolean"
+            },
+            "counts_skipped": {
+              "type": "boolean"
+            }
+          }
+        },
+        "pending": {
+          "type": "object",
+          "properties": {
+            "sessions": {
+              "type": "integer"
+            },
+            "watch_active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            }
+          }
+        },
+        "rebuild": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            },
+            "pid": {
+              "type": "null"
+            },
+            "mode": {
+              "type": "null"
+            },
+            "job_id": {
+              "type": "null"
+            },
+            "job_kind": {
+              "type": "null"
+            },
+            "phase": {
+              "type": "null"
+            },
+            "started_at": {
+              "type": "null"
+            },
+            "updated_at": {
+              "type": "null"
+            },
+            "processed_conversations": {
+              "type": "null"
+            },
+            "total_conversations": {
+              "type": "null"
+            },
+            "indexed_docs": {
+              "type": "null"
+            },
+            "pipeline": {
+              "type": "object",
+              "properties": {
+                "workers": {
+                  "type": "integer"
+                },
+                "available_parallelism": {
+                  "type": "integer"
+                },
+                "reserved_cores": {
+                  "type": "integer"
+                },
+                "tantivy_writer_threads": {
+                  "type": "integer"
+                },
+                "staged_shard_builders": {
+                  "type": "integer"
+                },
+                "staged_merge_workers": {
+                  "type": "integer"
+                },
+                "controller_mode": {
+                  "type": "string"
+                },
+                "controller_restore_clear_samples": {
+                  "type": "integer"
+                },
+                "controller_restore_hold_ms": {
+                  "type": "integer"
+                },
+                "pipeline_max_message_bytes_in_flight": {
+                  "type": "integer"
+                },
+                "page_prep_workers": {
+                  "type": "integer"
+                },
+                "page_size": {
+                  "type": "integer"
+                },
+                "steady_batch_fetch_conversations": {
+                  "type": "integer"
+                },
+                "startup_batch_fetch_conversations": {
+                  "type": "integer"
+                },
+                "steady_commit_every_conversations": {
+                  "type": "integer"
+                },
+                "startup_commit_every_conversations": {
+                  "type": "integer"
+                },
+                "steady_commit_every_messages": {
+                  "type": "integer"
+                },
+                "startup_commit_every_messages": {
+                  "type": "integer"
+                },
+                "steady_commit_every_message_bytes": {
+                  "type": "integer"
+                },
+                "startup_commit_every_message_bytes": {
+                  "type": "integer"
+                },
+                "pipeline_channel_size": {
+                  "type": "integer"
+                },
+                "controller_loadavg_high_watermark_1m": {
+                  "type": "number"
+                },
+                "controller_loadavg_low_watermark_1m": {
+                  "type": "number"
+                },
+                "runtime": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        "semantic": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "availability": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "available": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "fallback_mode": {
+              "type": "string"
+            },
+            "preferred_backend": {
+              "type": "string"
+            },
+            "embedder_id": {
+              "type": "null"
+            },
+            "vector_index_path": {
+              "type": "null"
+            },
+            "model_dir": {
+              "type": "null"
+            },
+            "hnsw_path": {
+              "type": "null"
+            },
+            "hnsw_ready": {
+              "type": "boolean"
+            },
+            "progressive_ready": {
+              "type": "boolean"
+            },
+            "hint": {
+              "type": "string"
+            },
+            "fast_tier": {
+              "type": "object",
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "ready": {
+                  "type": "boolean"
+                },
+                "current_db_matches": {
+                  "type": "null"
+                },
+                "conversation_count": {
+                  "type": "null"
+                },
+                "doc_count": {
+                  "type": "null"
+                },
+                "embedder_id": {
+                  "type": "null"
+                },
+                "model_revision": {
+                  "type": "null"
+                },
+                "completed_at": {
+                  "type": "null"
+                },
+                "size_bytes": {
+                  "type": "null"
+                }
+              }
+            },
+            "quality_tier": {
+              "type": "object",
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "ready": {
+                  "type": "boolean"
+                },
+                "current_db_matches": {
+                  "type": "null"
+                },
+                "conversation_count": {
+                  "type": "null"
+                },
+                "doc_count": {
+                  "type": "null"
+                },
+                "embedder_id": {
+                  "type": "null"
+                },
+                "model_revision": {
+                  "type": "null"
+                },
+                "completed_at": {
+                  "type": "null"
+                },
+                "size_bytes": {
+                  "type": "null"
+                }
+              }
+            },
+            "backlog": {
+              "type": "object",
+              "properties": {
+                "total_conversations": {
+                  "type": "integer"
+                },
+                "fast_tier_processed": {
+                  "type": "integer"
+                },
+                "fast_tier_remaining": {
+                  "type": "integer"
+                },
+                "quality_tier_processed": {
+                  "type": "integer"
+                },
+                "quality_tier_remaining": {
+                  "type": "integer"
+                },
+                "pending_work": {
+                  "type": "boolean"
+                },
+                "current_db_matches": {
+                  "type": "null"
+                },
+                "computed_at": {
+                  "type": "null"
+                }
+              }
+            },
+            "checkpoint": {
+              "type": "object",
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "tier": {
+                  "type": "null"
+                },
+                "current_db_matches": {
+                  "type": "null"
+                },
+                "completed": {
+                  "type": "null"
+                },
+                "conversations_processed": {
+                  "type": "null"
+                },
+                "total_conversations": {
+                  "type": "null"
+                },
+                "progress_pct": {
+                  "type": "null"
+                },
+                "docs_embedded": {
+                  "type": "null"
+                },
+                "last_offset": {
+                  "type": "null"
+                },
+                "saved_at": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        "_meta": {
+          "type": "object",
+          "properties": {
+            "timestamp": {
+              "type": "string"
+            },
+            "data_dir": {
+              "type": "string"
+            },
+            "db_path": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
