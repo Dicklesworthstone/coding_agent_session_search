@@ -337,6 +337,8 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub active_generation_ids: Vec<String>,
     pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
     #[serde(default)]
+    pub inspection_items: Vec<LexicalCleanupInspectionItem>,
+    #[serde(default)]
     pub shard_disposition_summaries:
         BTreeMap<LexicalCleanupDisposition, LexicalCleanupDispositionSummary>,
     pub inventories: Vec<LexicalGenerationCleanupInventory>,
@@ -349,6 +351,15 @@ pub(crate) struct LexicalCleanupReclaimCandidate {
     pub disposition: LexicalCleanupDisposition,
     pub reason: String,
     pub reclaimable_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupInspectionItem {
+    pub generation_id: String,
+    pub shard_id: Option<String>,
+    pub disposition: LexicalCleanupDisposition,
+    pub reason: String,
+    pub retained_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +377,8 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub explicit_operator_approval: bool,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
+    #[serde(default)]
+    pub candidate_previews: Vec<LexicalCleanupReclaimCandidate>,
     pub blocked_reasons: Vec<String>,
     pub inspection_required_generation_ids: Vec<String>,
 }
@@ -386,6 +399,7 @@ impl LexicalCleanupDryRunPlan {
             quarantined_generation_ids: Vec::new(),
             active_generation_ids: Vec::new(),
             disposition_counts: BTreeMap::new(),
+            inspection_items: Vec::new(),
             shard_disposition_summaries: BTreeMap::new(),
             inventories: Vec::new(),
         };
@@ -428,9 +442,20 @@ impl LexicalCleanupDryRunPlan {
             explicit_operator_approval,
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
+            candidate_previews: self.reclaim_candidates.clone(),
             blocked_reasons,
-            inspection_required_generation_ids: self.quarantined_generation_ids.clone(),
+            inspection_required_generation_ids: self.inspection_required_generation_ids(),
         }
+    }
+
+    pub(crate) fn inspection_required_generation_ids(&self) -> Vec<String> {
+        let mut generation_ids = Vec::new();
+        for item in &self.inspection_items {
+            if !generation_ids.contains(&item.generation_id) {
+                generation_ids.push(item.generation_id.clone());
+            }
+        }
+        generation_ids
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
@@ -467,6 +492,8 @@ impl LexicalCleanupDryRunPlan {
             self.active_generation_ids
                 .push(inventory.generation_id.clone());
         }
+        let inventory_requires_inspection = Self::requires_inspection(inventory.disposition);
+        let mut shard_inspection_items = 0usize;
         for shard in &inventory.shards {
             let summary = self
                 .shard_disposition_summaries
@@ -478,6 +505,17 @@ impl LexicalCleanupDryRunPlan {
                 .reclaimable_bytes
                 .saturating_add(shard.reclaimable_bytes);
             summary.retained_bytes = summary.retained_bytes.saturating_add(shard.retained_bytes);
+
+            if Self::requires_inspection(shard.disposition) {
+                shard_inspection_items = shard_inspection_items.saturating_add(1);
+                self.inspection_items.push(LexicalCleanupInspectionItem {
+                    generation_id: inventory.generation_id.clone(),
+                    shard_id: Some(shard.shard_id.clone()),
+                    disposition: shard.disposition,
+                    reason: shard.reason.clone(),
+                    retained_bytes: shard.retained_bytes,
+                });
+            }
 
             if shard.reclaimable_bytes == 0 {
                 continue;
@@ -492,7 +530,25 @@ impl LexicalCleanupDryRunPlan {
                 });
         }
 
+        if inventory_requires_inspection && shard_inspection_items == 0 {
+            self.inspection_items.push(LexicalCleanupInspectionItem {
+                generation_id: inventory.generation_id.clone(),
+                shard_id: None,
+                disposition: inventory.disposition,
+                reason: inventory.reason.clone(),
+                retained_bytes: inventory.retained_bytes,
+            });
+        }
+
         self.inventories.push(inventory);
+    }
+
+    fn requires_inspection(disposition: LexicalCleanupDisposition) -> bool {
+        matches!(
+            disposition,
+            LexicalCleanupDisposition::QuarantinedRetained
+                | LexicalCleanupDisposition::FailedRetained
+        )
     }
 }
 
@@ -965,7 +1021,9 @@ impl LexicalGenerationManifest {
                 } else {
                     (
                         LexicalCleanupDisposition::FailedRetained,
-                        "failed shard is retained for inspection".to_string(),
+                        shard.recovery_reason.clone().unwrap_or_else(|| {
+                            "failed shard is retained for inspection".to_string()
+                        }),
                     )
                 }
             } else {
@@ -1862,6 +1920,20 @@ mod tests {
         );
         assert_eq!(plan.quarantined_generation_ids, vec!["gen-quarantined"]);
         assert_eq!(
+            plan.inspection_required_generation_ids(),
+            vec!["gen-quarantined".to_string()]
+        );
+        assert_eq!(
+            plan.inspection_items,
+            vec![LexicalCleanupInspectionItem {
+                generation_id: "gen-quarantined".to_string(),
+                shard_id: Some("shard-bad".to_string()),
+                disposition: LexicalCleanupDisposition::QuarantinedRetained,
+                reason: "checksum mismatch".to_string(),
+                retained_bytes: 2048,
+            }]
+        );
+        assert_eq!(
             plan.disposition_counts
                 .get(&LexicalCleanupDisposition::CurrentPublished),
             Some(&1)
@@ -1903,6 +1975,16 @@ mod tests {
             json["shard_disposition_summaries"]["pinned_retained"]["retained_bytes"],
             1024
         );
+        assert_eq!(
+            json["inspection_items"][0]["generation_id"],
+            "gen-quarantined"
+        );
+        assert_eq!(json["inspection_items"][0]["shard_id"], "shard-bad");
+        assert_eq!(
+            json["inspection_items"][0]["disposition"],
+            "quarantined_retained"
+        );
+        assert_eq!(json["inspection_items"][0]["retained_bytes"], 2048);
         assert_eq!(plan.inventories.len(), 3);
     }
 
@@ -2079,6 +2161,17 @@ mod tests {
         assert_eq!(blocked.candidate_count, 1);
         assert_eq!(blocked.reclaimable_bytes, 4096);
         assert_eq!(
+            blocked.candidate_previews,
+            vec![LexicalCleanupReclaimCandidate {
+                generation_id: "gen-old".to_string(),
+                shard_id: "shard-old".to_string(),
+                disposition: LexicalCleanupDisposition::SupersededReclaimable,
+                reason: "superseded shard is unpinned and safe to reclaim after dry-run approval"
+                    .to_string(),
+                reclaimable_bytes: 4096,
+            }]
+        );
+        assert_eq!(
             blocked.inspection_required_generation_ids,
             vec!["gen-quarantined".to_string()]
         );
@@ -2110,6 +2203,101 @@ mod tests {
         assert!(allowed.blocked_reasons.is_empty());
         assert_eq!(allowed.candidate_count, 1);
         assert_eq!(allowed.reclaimable_bytes, 4096);
+        let allowed_json =
+            serde_json::to_value(&allowed).expect("serialize cleanup apply gate preview");
+        assert_eq!(
+            allowed_json["candidate_previews"][0]["generation_id"],
+            "gen-old"
+        );
+        assert_eq!(
+            allowed_json["candidate_previews"][0]["shard_id"],
+            "shard-old"
+        );
+        assert_eq!(
+            allowed_json["candidate_previews"][0]["reclaimable_bytes"],
+            4096
+        );
+    }
+
+    #[test]
+    fn cleanup_dry_run_plan_lists_inspection_items_for_retained_risky_artifacts() {
+        let mut quarantined =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-1", "fp", 1);
+        quarantined.set_shards(
+            vec![test_shard(
+                "shard-bad",
+                0,
+                LexicalShardLifecycleState::Quarantined,
+                512,
+            )],
+            2,
+        );
+        assert!(quarantined.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            3,
+            Some("checksum mismatch".into()),
+        ));
+        quarantined.transition_publish(LexicalGenerationPublishState::Quarantined, 4);
+
+        let mut failed =
+            LexicalGenerationManifest::new_scratch("gen-failed-retained", "attempt-2", "fp", 10);
+        let mut failed_shard = test_shard(
+            "shard-failed",
+            0,
+            LexicalShardLifecycleState::Abandoned,
+            256,
+        );
+        failed_shard.reclaimable = false;
+        failed.set_shards(vec![failed_shard], 11);
+        assert!(failed.transition_shard(
+            "shard-failed",
+            LexicalShardLifecycleState::Abandoned,
+            12,
+            Some("operator retained failed shard for postmortem".into()),
+        ));
+        failed.shards[0].reclaimable = false;
+        failed.transition_build(LexicalGenerationBuildState::Failed, 13);
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([&quarantined, &failed]);
+
+        assert_eq!(
+            plan.inspection_required_generation_ids(),
+            vec![
+                "gen-quarantined".to_string(),
+                "gen-failed-retained".to_string()
+            ]
+        );
+        assert_eq!(
+            plan.inspection_items,
+            vec![
+                LexicalCleanupInspectionItem {
+                    generation_id: "gen-quarantined".to_string(),
+                    shard_id: Some("shard-bad".to_string()),
+                    disposition: LexicalCleanupDisposition::QuarantinedRetained,
+                    reason: "checksum mismatch".to_string(),
+                    retained_bytes: 512,
+                },
+                LexicalCleanupInspectionItem {
+                    generation_id: "gen-failed-retained".to_string(),
+                    shard_id: Some("shard-failed".to_string()),
+                    disposition: LexicalCleanupDisposition::FailedRetained,
+                    reason: "operator retained failed shard for postmortem".to_string(),
+                    retained_bytes: 256,
+                },
+            ]
+        );
+
+        let json = serde_json::to_value(&plan).expect("serialize cleanup inspection dry-run plan");
+        assert_eq!(
+            json["inspection_items"][0]["disposition"],
+            "quarantined_retained"
+        );
+        assert_eq!(
+            json["inspection_items"][1]["generation_id"],
+            "gen-failed-retained"
+        );
+        assert_eq!(json["inspection_items"][1]["retained_bytes"], 256);
     }
 
     fn test_shard_plan(
