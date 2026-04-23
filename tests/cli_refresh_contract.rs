@@ -86,3 +86,53 @@ fn refresh_preflight_stays_opt_in_for_search_and_tui() -> Result<(), String> {
         Ok(())
     })
 }
+
+#[test]
+fn index_refresh_operator_controls_remain_parseable() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "index",
+            "--full",
+            "--force-rebuild",
+            "--json",
+            "--idempotency-key",
+            "stale-refresh-001",
+            "--progress-interval-ms",
+            "250",
+            "--no-progress-events",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Index {
+                full: true,
+                force_rebuild: true,
+                json: true,
+                idempotency_key: Some(key),
+                progress_interval_ms: 250,
+                no_progress_events: true,
+                ..
+            }) if key == "stale-refresh-001" => Ok(()),
+            other => Err(format!(
+                "expected full refresh operator controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn index_refresh_force_alias_stays_available_for_repair_scripts() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "index", "--force"])?;
+
+        match cli.command {
+            Some(Commands::Index {
+                force_rebuild: true,
+                ..
+            }) => Ok(()),
+            other => Err(format!(
+                "expected --force alias to map to force_rebuild: {other:?}"
+            )),
+        }
+    })
+}
