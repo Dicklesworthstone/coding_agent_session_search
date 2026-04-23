@@ -24162,7 +24162,10 @@ mod tests {
         let staged_index_path = stage_root.path().join("staged");
         let new_conv = norm_conv(
             Some("publish-new"),
-            vec![norm_msg(0, 1_700_000_001_000), norm_msg(1, 1_700_000_001_100)],
+            vec![
+                norm_msg(0, 1_700_000_001_000),
+                norm_msg(1, 1_700_000_001_100),
+            ],
         );
         let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
         staged_index
@@ -24225,7 +24228,10 @@ mod tests {
 
         let old_conv = norm_conv(
             Some("interrupted-old"),
-            vec![norm_msg(0, 1_700_000_010_000), norm_msg(1, 1_700_000_010_100)],
+            vec![
+                norm_msg(0, 1_700_000_010_000),
+                norm_msg(1, 1_700_000_010_100),
+            ],
         );
         let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
         live_index
@@ -24246,7 +24252,10 @@ mod tests {
             .tempdir_in(in_progress_backup_path.parent().unwrap())
             .unwrap();
         let staged_index_path = stage_root.path().join("staged");
-        let new_conv = norm_conv(Some("interrupted-new"), vec![norm_msg(0, 1_700_000_020_000)]);
+        let new_conv = norm_conv(
+            Some("interrupted-new"),
+            vec![norm_msg(0, 1_700_000_020_000)],
+        );
         let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
         staged_index
             .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(11))
@@ -24281,6 +24290,254 @@ mod tests {
                 .docs,
             2,
             "the retained backup should still preserve the old live publish recovered from the interrupted swap"
+        );
+    }
+
+    /// First-ever publish when no live index exists yet. The atomic-swap
+    /// path at src/indexer/mod.rs:~10720 short-circuits to a plain rename
+    /// in that case; this test pins that contract so a future refactor
+    /// doesn't accidentally introduce a renameat2 call on a missing live
+    /// path (EEXIST / ENOENT depending on flags).
+    #[test]
+    fn publish_staged_lexical_index_first_publish_with_no_prior_live_index_uses_plain_rename() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+        assert!(!index_path.exists(), "precondition: no prior live index");
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-first-publish-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let conv = norm_conv(Some("first-publish"), vec![norm_msg(0, 1_700_000_100_000)]);
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(1))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "first publish must land the staged index exactly"
+        );
+        assert!(
+            !staged_index_path.exists(),
+            "staged path must be consumed by the rename"
+        );
+        // No retained backup is legitimate: there was nothing to retain.
+        // The backups dir is ensured only on the prior-live branch, so it
+        // may or may not exist — just confirm that if it exists, it's empty.
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        if backups_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&backups_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "first publish must not create retained backups; got {entries:?}"
+            );
+        }
+    }
+
+    /// An interrupted prior publish left a `.<name>.publish-in-progress.bak`
+    /// sidecar AND the live index has since been re-created (e.g. a
+    /// partially-recovered run followed by a fresh rebuild that
+    /// short-circuited on the completed checkpoint). The recovery path at
+    /// recover_or_finalize_interrupted_lexical_publish_backup() must move
+    /// the stale in-progress backup into retained-backup storage rather
+    /// than overwrite the newer live index.
+    #[test]
+    fn publish_staged_lexical_index_retains_stale_in_progress_backup_when_live_present() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        // Populate the current live index with a "newer" conversation.
+        let live_conv = norm_conv(
+            Some("live-newer"),
+            vec![
+                norm_msg(0, 1_700_000_200_000),
+                norm_msg(1, 1_700_000_200_100),
+            ],
+        );
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&live_conv, &live_conv.messages, Some(20))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        // Leave a stale `.publish-in-progress.bak` sibling that looks
+        // like an interrupted prior publish with its OWN (older)
+        // conversation content. Different doc count so we can tell them
+        // apart after recovery.
+        let stale_conv = norm_conv(Some("stale-older"), vec![norm_msg(0, 1_700_000_100_000)]);
+        let in_progress_backup_path = lexical_publish_in_progress_backup_path(&index_path);
+        let mut stale_index = TantivyIndex::open_or_create(&in_progress_backup_path).unwrap();
+        stale_index
+            .add_messages_with_conversation_id(&stale_conv, &stale_conv.messages, Some(10))
+            .unwrap();
+        stale_index.commit().unwrap();
+        drop(stale_index);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&in_progress_backup_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "precondition: stale in-progress backup has exactly 1 doc"
+        );
+
+        // Publish a brand-new staged index: this exercises the
+        // recovery-then-publish path where BOTH a live index and a stale
+        // in-progress backup exist.
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-stale-recovery-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let fresh_conv = norm_conv(
+            Some("freshly-staged"),
+            vec![
+                norm_msg(0, 1_700_000_300_000),
+                norm_msg(1, 1_700_000_300_100),
+                norm_msg(2, 1_700_000_300_200),
+            ],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&fresh_conv, &fresh_conv.messages, Some(30))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        // The live index must expose the freshly-staged publish (3 docs).
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "live index must reflect the freshly-staged publish"
+        );
+        // The in-progress sidecar must be gone — recovery moved it.
+        assert!(
+            !in_progress_backup_path.exists(),
+            "stale in-progress backup must be consumed by recovery"
+        );
+
+        // Retained backups dir must contain BOTH:
+        //   - the stale older backup (1 doc) recovered from the sidecar
+        //   - the prior live (2 docs) moved during the actual publish
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        let retained_backups: Vec<_> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            retained_backups.len(),
+            2,
+            "both the stale sidecar and the prior live index must be retained as separate backups; got {retained_backups:?}"
+        );
+        let mut backup_doc_counts: Vec<usize> = retained_backups
+            .iter()
+            .map(|path| {
+                crate::search::tantivy::searchable_index_summary(path)
+                    .unwrap()
+                    .unwrap()
+                    .docs
+            })
+            .collect();
+        backup_doc_counts.sort_unstable();
+        assert_eq!(
+            backup_doc_counts,
+            vec![1, 2],
+            "retained backups must preserve both the stale-older (1 doc) \
+             and the just-displaced-prior-live (2 docs) artifacts"
+        );
+    }
+
+    /// Bead 0k0sk (cross-review finding): publish_staged_lexical_index
+    /// retains EVERY prior live index indefinitely under
+    /// .lexical-publish-backups/, with no pruning. For real corpora
+    /// (~50k docs, multi-hundred-MB Tantivy trees) this linearly exhausts
+    /// disk across repeated rebuilds. This test characterizes the
+    /// current unbounded-growth behavior so a follow-up fix (bounded
+    /// retention, K-most-recent policy) can flip this assertion to
+    /// `<= RETENTION_CAP` once landed. Until then, it prevents an
+    /// accidental "silent prune" change from going unnoticed.
+    #[test]
+    fn publish_staged_lexical_index_retains_every_backup_unboundedly_today_pending_retention_cap() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        // Seed an initial live index so the first publish exercises the
+        // "prior-live-exists" branch that actually retains a backup.
+        let seed = norm_conv(Some("retention-seed"), vec![norm_msg(0, 1_700_000_500_000)]);
+        let mut live = TantivyIndex::open_or_create(&index_path).unwrap();
+        live.add_messages_with_conversation_id(&seed, &seed.messages, Some(100))
+            .unwrap();
+        live.commit().unwrap();
+        drop(live);
+
+        let publish_count = 4_usize;
+        for iteration in 0..publish_count {
+            let stage_root = TempDirBuilder::new()
+                .prefix(&format!("cass-test-retention-stage-{iteration}."))
+                .tempdir_in(data_dir.parent().unwrap())
+                .unwrap();
+            let staged_index_path = stage_root.path().join("staged");
+            let conv = norm_conv(
+                Some(&format!("retention-iter-{iteration}")),
+                vec![norm_msg(0, 1_700_000_510_000 + iteration as i64)],
+            );
+            let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+            staged
+                .add_messages_with_conversation_id(
+                    &conv,
+                    &conv.messages,
+                    Some(200 + iteration as i64),
+                )
+                .unwrap();
+            staged.commit().unwrap();
+            drop(staged);
+
+            publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+        }
+
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        let retained_backups: Vec<_> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+
+        // CURRENT contract: every publish retains exactly one more backup.
+        // TODO(bead 0k0sk): introduce bounded retention (default K=1 via
+        // env CASS_LEXICAL_PUBLISH_BACKUP_RETENTION) and flip this to
+        // `assert!(retained_backups.len() <= retention_cap, ...)`.
+        assert_eq!(
+            retained_backups.len(),
+            publish_count,
+            "current behavior: every publish retains one more backup (bead 0k0sk); \
+             if you see this assertion fail with fewer backups, you've \
+             implemented retention — update the assertion and the bead \
+             together. If you see it fail with MORE, the in-progress-backup \
+             recovery path is double-counting and that's a separate bug."
         );
     }
 
