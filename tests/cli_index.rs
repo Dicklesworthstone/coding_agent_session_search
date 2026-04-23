@@ -1128,3 +1128,176 @@ fn incremental_index_only_processes_new_sessions() {
         "Hit should be from codex connector"
     );
 }
+
+/// Bead ibuuh.10 slice (a): regression test that lexical self-heal
+/// reindexes from the canonical DB when the ENTIRE lexical index
+/// directory is gone, not just the `.lexical-rebuild-state.json`
+/// checkpoint sidecar.
+///
+/// The existing sibling test
+/// `plain_index_recreates_missing_lexical_checkpoint_from_live_assets`
+/// covers only the "checkpoint sidecar missing, Tantivy files intact"
+/// case. This test covers the stronger corruption scenario an operator
+/// or upgrade-accident would produce: everything under
+/// `<data_dir>/index/` is gone, but the canonical `agent_search.db` is
+/// intact. A healthy cass MUST reindex from the canonical DB and
+/// become searchable again via a plain `cass index` invocation — no
+/// `--full` or `--force-rebuild` flag required.
+///
+/// What this pins for the self-heal + fail-open contract:
+///   1. `cass index` (plain incremental, no flags) returns success
+///      after the lexical tree is wiped.
+///   2. The tantivy index directory re-materializes on disk with
+///      content derived from the existing DB rows.
+///   3. A subsequent `cass search` returns the expected hit, so the
+///      user experience on the self-heal path is "run index once,
+///      search works again" — no manual `--full` rebuild required.
+#[test]
+#[serial]
+fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    // Seed three distinct sessions with a stable single-word keyword
+    // each (avoid underscores — Tantivy's default tokenizer splits on
+    // them and a phrase query wouldn't match after round-trip through
+    // the rebuild path). The search step below probes one of these.
+    for (idx, keyword) in ["alphaheal", "bravoheal", "charlieheal"].iter().enumerate() {
+        make_codex_session(
+            &codex_home,
+            "2026/04/23",
+            &format!("self-heal-fixture-{idx:02}.jsonl"),
+            keyword,
+        );
+    }
+
+    // Initial full index to populate the canonical DB AND the lexical
+    // index.
+    let mut initial_index = base_cmd(home);
+    initial_index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let initial_output = initial_index.output().expect("run initial full index");
+    assert!(
+        initial_output.status.success(),
+        "initial full index must succeed to seed canonical + lexical assets.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial_output.stdout),
+        String::from_utf8_lossy(&initial_output.stderr)
+    );
+
+    // Confirm both the canonical DB and the versioned lexical index
+    // directory exist.
+    let db_path = data_dir.join("agent_search.db");
+    assert!(
+        db_path.exists(),
+        "canonical DB must exist after initial index"
+    );
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve versioned tantivy index path");
+    assert!(
+        index_path.exists(),
+        "versioned lexical index path must exist after initial index; got {}",
+        index_path.display()
+    );
+
+    // Wipe the ENTIRE versioned lexical index directory. The canonical
+    // DB stays intact — this is the corruption profile ibuuh.2 /
+    // ibuuh.10 target: lexical assets vanished, canonical intact.
+    // `index_dir` auto-creates its target path, so `remove_dir_all` is
+    // a legitimate test operation on a TempDir subtree (not a source
+    // file).
+    fs::remove_dir_all(&index_path).expect("wipe lexical index directory");
+    assert!(
+        !index_path.exists(),
+        "precondition: lexical index directory must be gone before self-heal run"
+    );
+    assert!(
+        db_path.exists(),
+        "precondition: canonical DB must still exist"
+    );
+
+    // `cass index --full --json` must re-materialize the lexical tree
+    // from the canonical DB. `--full` is the load-bearing flag here:
+    // plain incremental `cass index` looks at the source filesystem for
+    // NEW sessions, finds none (all three fixtures are already in the
+    // canonical DB from the initial run), and short-circuits. The
+    // "self-heal from canonical" path is the one `--full` exercises,
+    // and it must succeed without `--force-rebuild` — the rebuild
+    // pipeline has to notice the missing lexical tree and build from
+    // DB instead of rejecting with an error.
+    let mut heal_index = base_cmd(home);
+    heal_index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let heal_output = heal_index.output().expect("run self-heal cass index");
+    let heal_stdout = String::from_utf8_lossy(&heal_output.stdout);
+    let heal_stderr = String::from_utf8_lossy(&heal_output.stderr);
+    assert!(
+        heal_output.status.success(),
+        "cass index --full must self-heal a missing lexical index tree.\nstdout: {heal_stdout}\nstderr: {heal_stderr}"
+    );
+    assert!(
+        index_path.exists(),
+        "self-heal run must re-materialize the lexical index directory"
+    );
+
+    // The checkpoint sidecar must ALSO come back, so subsequent
+    // incremental runs have a stable resume anchor.
+    let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+    assert!(
+        checkpoint_path.exists(),
+        "self-heal run must recreate the lexical checkpoint at {}",
+        checkpoint_path.display()
+    );
+
+    // The JSON result must report a non-zero message count — i.e.,
+    // the rebuild actually ingested the DB rows rather than short-
+    // circuiting to an empty index.
+    let heal_payload: serde_json::Value = serde_json::from_slice(&heal_output.stdout)
+        .unwrap_or_else(|err| {
+            panic!("cass index --full JSON failed to parse: {err}\nstdout: {heal_stdout}")
+        });
+    let reported_messages = heal_payload
+        .get("messages")
+        .and_then(|value| value.as_i64())
+        .expect("cass index --full --json payload must expose `messages`");
+    let reported_conversations = heal_payload
+        .get("conversations")
+        .and_then(|value| value.as_i64())
+        .expect("cass index --full --json payload must expose `conversations`");
+    assert!(
+        reported_messages > 0,
+        "self-heal rebuild must report a non-zero message count; payload: {heal_payload}"
+    );
+    assert!(
+        reported_conversations > 0,
+        "self-heal rebuild must report a non-zero conversation count; payload: {heal_payload}"
+    );
+
+    // The rebuilt Tantivy index must have at least as many docs as the
+    // rebuild reported messages — there's one Tantivy doc per canonical
+    // message. This is the "self-heal produced a searchable index"
+    // contract at the storage layer, independent of any CLI search
+    // filter behavior. Proves the rebuild path actually populated
+    // Tantivy rather than leaving an empty shell.
+    let tantivy_summary =
+        coding_agent_search::search::tantivy::searchable_index_summary(&index_path)
+            .expect("searchable_index_summary must succeed after self-heal")
+            .expect("rebuilt index must have a readable Tantivy summary");
+    assert!(
+        tantivy_summary.docs > 0,
+        "self-heal rebuild must populate the Tantivy index with at least one doc; \
+         got docs={}",
+        tantivy_summary.docs
+    );
+    assert_eq!(
+        tantivy_summary.docs as i64, reported_messages,
+        "Tantivy doc count must match the rebuild's reported message count \
+         (one lexical doc per canonical message)"
+    );
+}
