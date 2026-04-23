@@ -15945,6 +15945,34 @@ fn response_schema_rebuild_state() -> serde_json::Value {
     })
 }
 
+fn response_schema_rebuild_progress() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "active": { "type": "boolean" },
+            "mode": { "type": ["string", "null"] },
+            "phase": { "type": ["string", "null"] },
+            "processed_conversations": { "type": ["integer", "null"] },
+            "total_conversations": { "type": ["integer", "null"] },
+            "remaining_conversations": { "type": ["integer", "null"] },
+            "completion_ratio": { "type": ["number", "null"] },
+            "indexed_docs": { "type": ["integer", "null"] },
+            "runtime_available": { "type": "boolean" },
+            "queue_depth": { "type": ["integer", "null"] },
+            "queue_capacity": { "type": ["integer", "null"] },
+            "queue_headroom": { "type": ["integer", "null"] },
+            "pending_batch_conversations": { "type": ["integer", "null"] },
+            "pending_batch_message_bytes": { "type": ["integer", "null"] },
+            "inflight_message_bytes": { "type": ["integer", "null"] },
+            "max_message_bytes_in_flight": { "type": ["integer", "null"] },
+            "inflight_message_bytes_headroom": { "type": ["integer", "null"] },
+            "controller_mode": { "type": ["string", "null"] },
+            "controller_reason": { "type": ["string", "null"] },
+            "updated_at": { "type": ["string", "null"] }
+        }
+    })
+}
+
 fn response_schema_semantic_state() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -16315,6 +16343,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "database": response_schema_status_database(),
                 "pending": response_schema_pending_state(),
                 "rebuild": response_schema_rebuild_state(),
+                "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
                 "_meta": {
                     "type": "object",
@@ -16369,6 +16398,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "database": response_schema_status_database(),
                 "pending": response_schema_pending_state(),
                 "rebuild": response_schema_rebuild_state(),
+                "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
                 "_meta": {
                     "type": "object",
@@ -16625,6 +16655,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "items": { "type": "string" }
                 },
                 "latency_ms": { "type": "integer" },
+                "rebuild_progress": response_schema_rebuild_progress(),
                 "db": response_schema_health_db(),
                 "responsiveness": {
                     "type": "object",
@@ -16715,6 +16746,14 @@ mod response_schema_tests {
             status.get("rebuild").is_some(),
             "status schema missing rebuild block"
         );
+        assert!(
+            status.get("rebuild_progress").is_some(),
+            "status schema missing rebuild_progress block"
+        );
+        assert_eq!(
+            status["rebuild_progress"]["properties"]["completion_ratio"]["type"],
+            serde_json::json!(["number", "null"])
+        );
         assert_eq!(
             status["index"]["properties"]["status"]["type"],
             serde_json::json!("string")
@@ -16737,6 +16776,16 @@ mod response_schema_tests {
         assert!(
             state.get("rebuild").is_some(),
             "health.state schema missing rebuild block"
+        );
+        assert!(
+            schemas["health"]["properties"]
+                .get("rebuild_progress")
+                .is_some(),
+            "health schema missing top-level rebuild_progress block"
+        );
+        assert_eq!(
+            schemas["health"]["properties"]["rebuild_progress"]["properties"]["updated_at"]["type"],
+            serde_json::json!(["string", "null"])
         );
         assert_eq!(
             schemas["health"]["properties"]["db"]["properties"]["open_error"]["type"],
