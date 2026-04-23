@@ -59,8 +59,6 @@ fn test_wizard_state_default() {
     assert!(!state.no_encryption);
     assert!(!state.unencrypted_confirmed);
 
-    // Default attachments
-    assert!(!state.include_attachments);
     assert!(state.final_site_dir.is_none());
 }
 
@@ -247,17 +245,8 @@ fn test_wizard_state_validation_output_dir() {
     );
 }
 
-#[test]
-fn test_wizard_state_with_attachments() {
-    let _tracker = PhaseTracker::new("pages_wizard", "state_with_attachments");
-
-    let state = WizardState {
-        include_attachments: true,
-        ..WizardState::default()
-    };
-
-    assert!(state.include_attachments);
-}
+// Test `test_wizard_state_with_attachments` removed: `include_attachments`
+// flag was accepted but unimplemented and has been removed per bead adyyt.
 
 // =============================================================================
 // Secret Scan State Tests

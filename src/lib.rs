@@ -934,11 +934,6 @@ pub enum Commands {
         #[arg(long)]
         i_understand_unencrypted_risks: bool,
 
-        /// Include message attachments (images, PDFs, code snapshots).
-        /// Not yet implemented; config validation rejects this flag.
-        #[arg(long, hide = true)]
-        include_attachments: bool,
-
         /// Preview an existing export locally (starts HTTP server)
         #[arg(long)]
         preview: Option<PathBuf>,
@@ -1926,7 +1921,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "secrets-deny",
         "no-encryption",
         "i-understand-unencrypted-risks",
-        "include-attachments",
         "no-open",
         "stale-threshold",
         "by-source",
@@ -3366,7 +3360,6 @@ async fn execute_cli(
                     verbose,
                     no_encryption,
                     i_understand_unencrypted_risks,
-                    include_attachments,
                     preview,
                     port,
                     no_open,
@@ -3397,10 +3390,6 @@ async fn execute_cli(
                             ),
                             retryable: false,
                         })?;
-
-                        if include_attachments {
-                            pages_config.bundle.include_attachments = true;
-                        }
 
                         if let Some(target) = target {
                             pages_config.deployment.target = target.as_config_value().to_string();
@@ -3538,20 +3527,6 @@ async fn execute_cli(
                         })?;
 
                         return Ok(());
-                    }
-
-                    if include_attachments {
-                        return Err(CliError {
-                            code: 2,
-                            kind: "pages",
-                            message: "--include-attachments is not implemented for pages exports"
-                                .to_string(),
-                            hint: Some(
-                                "Remove --include-attachments. The current pages pipeline cannot extract attachment blobs from the source database yet."
-                                    .to_string(),
-                            ),
-                            retryable: false,
-                        });
                     }
 
                     // Handle --validate-config without --config
@@ -3828,9 +3803,6 @@ async fn execute_cli(
                         }
                         if no_encryption {
                             wizard.set_no_encryption(true);
-                        }
-                        if include_attachments {
-                            wizard.set_include_attachments(true);
                         }
                         if let Some(target) = target {
                             wizard.set_deploy_target(target.to_wizard_target());
@@ -27884,68 +27856,7 @@ mod subcommand_robot_output_tests {
     }
 }
 
-#[cfg(test)]
-mod pages_cli_flag_tests {
-    use super::*;
-    use clap::CommandFactory;
-
-    #[test]
-    fn include_attachments_flag_hidden_from_pages_help() {
-        // --include-attachments is not yet implemented (config validation rejects it).
-        // The flag is hidden from --help so users don't discover a non-functional feature.
-        // It must still parse when explicitly passed for forward-compatible config files.
-        run_on_large_stack(|| {
-            let cmd = Cli::command();
-            let pages_cmd = cmd
-                .find_subcommand("pages")
-                .expect("pages subcommand must exist");
-            let mut help_buf = Vec::new();
-            pages_cmd.clone().write_help(&mut help_buf).unwrap();
-            let help_text = String::from_utf8(help_buf).unwrap();
-            assert!(
-                !help_text.contains("include-attachments"),
-                "--include-attachments should be hidden from pages help until implemented.\nHelp text:\n{}",
-                help_text,
-            );
-        });
-    }
-
-    #[test]
-    fn include_attachments_still_accepted_when_explicitly_passed() {
-        // Even though hidden, the CLI must still accept the flag without a parse error.
-        // Config validation (not CLI parsing) is responsible for rejecting it.
-        //
-        // The `Cli`/`Commands` enum is large enough that clap's derive-generated
-        // parser blows past the 2 MB default thread stack in debug builds
-        // (monomorphized dispatch with no inlining, plus per-argument parser
-        // frames). Running the test body on a dedicated thread with a larger
-        // stack makes the test self-sufficient, so it passes whether or not the
-        // outer test runner was launched with `RUST_MIN_STACK` set.
-        run_on_large_stack(|| {
-            let cli = Cli::try_parse_from([
-                "cass",
-                "pages",
-                "--include-attachments",
-                "--export-only",
-                "/tmp/test",
-                "--dry-run",
-            ]);
-            assert!(
-                cli.is_ok(),
-                "--include-attachments must parse even when hidden: {:?}",
-                cli.err()
-            );
-            if let Ok(ref parsed) = cli {
-                if let Some(Commands::Pages {
-                    include_attachments,
-                    ..
-                }) = &parsed.command
-                {
-                    assert!(include_attachments, "flag should be true when passed");
-                } else {
-                    panic!("expected Pages command");
-                }
-            }
-        });
-    }
-}
+// Tests for `--include-attachments` removed: the flag was accepted
+// but unimplemented and has been removed from the pages CLI surface
+// (bead adyyt). Any future attachment-bundling work will add a new
+// flag with end-to-end implementation + fresh tests at that time.

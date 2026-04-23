@@ -90,9 +90,6 @@ pub struct WizardState {
     pub no_encryption: bool,
     pub unencrypted_confirmed: bool,
 
-    // Attachment support
-    pub include_attachments: bool,
-
     // Cloudflare Pages deployment
     pub cloudflare_branch: Option<String>,
     pub cloudflare_account_id: Option<String>,
@@ -130,7 +127,6 @@ impl std::fmt::Debug for WizardState {
             .field("password_entropy_bits", &self.password_entropy_bits)
             .field("no_encryption", &self.no_encryption)
             .field("unencrypted_confirmed", &self.unencrypted_confirmed)
-            .field("include_attachments", &self.include_attachments)
             .field("cloudflare_branch", &self.cloudflare_branch)
             .field("cloudflare_account_id", &self.cloudflare_account_id)
             .field(
@@ -169,7 +165,6 @@ impl Default for WizardState {
             password_entropy_bits: 0.0,
             no_encryption: false,
             unencrypted_confirmed: false,
-            include_attachments: false,
             cloudflare_branch: None,
             cloudflare_account_id: None,
             cloudflare_api_token: None,
@@ -206,11 +201,6 @@ impl PagesWizard {
     pub fn set_no_encryption(&mut self, no_encryption: bool) {
         self.no_encryption_mode = no_encryption;
         self.state.no_encryption = no_encryption;
-    }
-
-    /// Set whether to include attachments in the export.
-    pub fn set_include_attachments(&mut self, include: bool) {
-        self.state.include_attachments = include;
     }
 
     /// Set the deployment target.
@@ -2190,9 +2180,6 @@ mod tests {
         // Unencrypted mode defaults
         assert!(!state.no_encryption);
         assert!(!state.unencrypted_confirmed);
-
-        // Attachments default
-        assert!(!state.include_attachments);
     }
 
     #[test]
@@ -2254,17 +2241,8 @@ mod tests {
         assert!(!wizard.state.no_encryption);
     }
 
-    #[test]
-    fn pages_wizard_set_include_attachments() {
-        let mut wizard = PagesWizard::new();
-        assert!(!wizard.state.include_attachments);
-
-        wizard.set_include_attachments(true);
-        assert!(wizard.state.include_attachments);
-
-        wizard.set_include_attachments(false);
-        assert!(!wizard.state.include_attachments);
-    }
+    // Test for pages_wizard_set_include_attachments removed: flag removed
+    // from WizardState per bead adyyt.
 
     // =========================
     // Time Range Mapping Tests

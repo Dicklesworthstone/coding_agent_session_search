@@ -25,7 +25,6 @@
 //!     "title": "Team Archive",
 //!     "description": "Encrypted cass export",
 //!     "include_pwa": false,
-//!     "include_attachments": false,
 //!     "hide_metadata": false
 //!   },
 //!   "deployment": {
@@ -119,7 +118,6 @@ pub struct ResolvedBundle {
     pub title: String,
     pub description: String,
     pub include_pwa: bool,
-    pub include_attachments: bool,
     pub hide_metadata: bool,
 }
 
@@ -241,11 +239,6 @@ pub struct BundleConfig {
     #[serde(default)]
     pub include_pwa: bool,
 
-    /// Include message attachments (images, PDFs, etc.).
-    /// Not yet implemented; validation rejects this flag.
-    #[serde(default)]
-    pub include_attachments: bool,
-
     /// Hide workspace/agent metadata in UI.
     #[serde(default)]
     pub hide_metadata: bool,
@@ -257,7 +250,6 @@ impl Default for BundleConfig {
             title: default_title(),
             description: default_description(),
             include_pwa: false,
-            include_attachments: false,
             hide_metadata: false,
         }
     }
@@ -516,12 +508,6 @@ impl PagesConfig {
             );
         }
 
-        if self.bundle.include_attachments {
-            errors.push(
-                "include_attachments is not implemented for pages exports yet. The current pipeline cannot extract attachment blobs from the source database."
-                    .to_string(),
-            );
-        }
         if self.encryption.no_encryption {
             warnings.push(
                 "no_encryption is enabled. Content will be publicly readable without a password."
@@ -586,7 +572,6 @@ impl PagesConfig {
                 title: self.bundle.title.clone(),
                 description: self.bundle.description.clone(),
                 include_pwa: self.bundle.include_pwa,
-                include_attachments: self.bundle.include_attachments,
                 hide_metadata: self.bundle.hide_metadata,
             },
             deployment: ResolvedDeployment {
@@ -647,7 +632,6 @@ impl PagesConfig {
             password_entropy_bits: 0.0,
             no_encryption: self.encryption.no_encryption,
             unencrypted_confirmed: self.encryption.i_understand_risks,
-            include_attachments: self.bundle.include_attachments,
             cloudflare_branch: self.deployment.branch.clone(),
             cloudflare_account_id: self.deployment.account_id.clone(),
             cloudflare_api_token: self.deployment.api_token.clone(),
@@ -706,7 +690,6 @@ pub fn example_config() -> &'static str {
     "title": "My Archive",
     "description": "Encrypted cass export",
     "include_pwa": false,
-    "include_attachments": false,
     "hide_metadata": false
   },
   "deployment": {
@@ -741,41 +724,10 @@ mod tests {
         assert_eq!(config.deployment.target, "local");
     }
 
-    #[test]
-    fn test_validate_rejects_include_attachments_until_supported() {
-        let json = r#"{
-            "encryption": {"password": "test-password-123"},
-            "bundle": {"include_attachments": true}
-        }"#;
-        let config: PagesConfig = serde_json::from_str(json).unwrap();
-        let validation = config.validate();
-
-        assert!(!validation.valid);
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|err| err.contains("include_attachments is not implemented"))
-        );
-    }
-
-    #[test]
-    fn test_include_attachments_still_deserializes_before_validation_rejects_it() {
-        let json = r#"{
-            "bundle": {"include_attachments": true},
-            "encryption": {"password": "test-password-123"}
-        }"#;
-        let config: PagesConfig = serde_json::from_str(json).unwrap();
-        assert!(config.bundle.include_attachments);
-
-        let validation = config.validate();
-        assert!(
-            validation
-                .errors
-                .iter()
-                .any(|err| err.contains("include_attachments is not implemented"))
-        );
-    }
+    // Tests for `include_attachments` config field removed: the flag was
+    // accepted but unimplemented and has been removed from the pages
+    // config surface (bead adyyt). Any future attachment-bundling work
+    // will re-add the field with end-to-end implementation + fresh tests.
 
     #[test]
     fn test_validate_missing_password() {

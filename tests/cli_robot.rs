@@ -950,22 +950,10 @@ fn search_no_match_returns_empty_hits() {
     assert!(hits.is_empty(), "Hits array should be empty");
 }
 
-#[test]
-fn include_attachments_flag_hidden_from_pages_help() {
-    run_on_large_stack(|| {
-        let cmd = Cli::command();
-        let pages_cmd = cmd
-            .find_subcommand("pages")
-            .expect("pages subcommand must exist");
-        let mut help_buf = Vec::new();
-        pages_cmd.clone().write_help(&mut help_buf).unwrap();
-        let help_text = String::from_utf8(help_buf).unwrap();
-        assert!(
-            !help_text.contains("include-attachments"),
-            "--include-attachments should stay hidden from pages help until implemented.\n{help_text}"
-        );
-    });
-}
+// Test `include_attachments_flag_hidden_from_pages_help` removed:
+// the --include-attachments flag has been removed from the pages CLI
+// surface (bead adyyt). The flag was accepted but unimplemented; removal
+// eliminates the mock-code surface entirely.
 
 #[test]
 fn search_writes_trace_on_success() {

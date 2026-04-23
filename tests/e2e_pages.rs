@@ -252,7 +252,6 @@ fn write_pages_config(path: &Path, output_dir: &Path) {
             "title": "CLI E2E Archive",
             "description": "Full CLI pages export workflow",
             "include_pwa": false,
-            "include_attachments": false,
             "hide_metadata": false
         },
         "deployment": {
