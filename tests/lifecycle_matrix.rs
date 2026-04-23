@@ -2074,3 +2074,99 @@ fn models_status_model_dir_nests_under_data_dir_and_coheres_on_absence() {
         "installed=false but cache_lifecycle.installed_size_bytes={cl_installed_size} — retention layer would see phantom cached bytes"
     );
 }
+
+#[test]
+fn absent_db_drives_null_checkpoint_and_fingerprint_state() {
+    // ibuuh.24 crash-safety row. Crash-safe resume relies on two
+    // blocks in `cass health --json`:
+    //
+    //   state.index.checkpoint   — describes a paused rebuild pass
+    //   state.index.fingerprint  — binds that pass to a specific DB
+    //
+    // The resume decision reads both: if the checkpoint says "still
+    // in progress" AND the fingerprint matches the current DB, resume;
+    // otherwise restart from scratch. That logic only works if the
+    // "no DB exists" case collapses both blocks to fully-null state.
+    // If any checkpoint or fingerprint field were to carry leftover
+    // non-null values when `state.db == null`, crash-safe resume would
+    // either:
+    //   - spuriously resume against a non-existent DB (corruption
+    //     risk), or
+    //   - compare against stale fingerprints and fail to resume when
+    //     resumption was actually valid (wasted work).
+    //
+    // The existing index_checkpoint_and_fingerprint_blocks_have_stable_shape
+    // row pins intra-checkpoint shape only (present=false ⇒ checkpoint
+    // fields null). This row adds the cross-block invariant that
+    // db-absence drives checkpoint.present=false AND every fingerprint
+    // field null.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Precondition: isolated HOME has no DB, so state.db is null.
+    // This is the specific case the crash-safety invariant constrains.
+    let db = &health["state"]["db"];
+    assert!(
+        db.is_null(),
+        "isolated HOME unexpectedly has non-null state.db: {db:?}"
+    );
+
+    let idx = &health["state"]["index"];
+    assert!(idx.is_object(), "state.index must be an object");
+
+    // Invariant A: state.db absent ⇒ checkpoint.present = false.
+    let cp = &idx["checkpoint"];
+    let present = cp["present"]
+        .as_bool()
+        .expect("checkpoint.present must be a bool");
+    assert!(
+        !present,
+        "state.db is null but checkpoint.present=true — a checkpoint cannot describe progress against a DB that does not exist; crash-safe resume would target phantom state"
+    );
+
+    // Invariant B: state.db absent ⇒ every fingerprint field is null.
+    // Fingerprinting requires a real DB to hash; no DB means no
+    // fingerprint machinery should produce any non-null value.
+    let fp = &idx["fingerprint"];
+    assert!(fp.is_object(), "state.index.fingerprint must be an object");
+    for key in [
+        "current_db_fingerprint",
+        "checkpoint_fingerprint",
+        "matches_current_db_fingerprint",
+    ] {
+        let v = &fp[key];
+        assert!(
+            v.is_null(),
+            "state.db is null but fingerprint.{key}={v:?} — stale fingerprint would poison resume decision; expected null"
+        );
+    }
+
+    // Invariant C: the already-shape-pinned checkpoint bool-or-null
+    // fields must also be null when state.db is null (redundant with
+    // the existing shape row's `!present ⇒ null` rule, but we assert
+    // it again here so this row stands on its own against cross-block
+    // regressions — if present gets flipped to true without the
+    // cascade updating the DB state, this arm still fires).
+    for key in [
+        "completed",
+        "db_matches",
+        "schema_matches",
+        "page_size_matches",
+        "page_size_compatible",
+    ] {
+        let v = &cp[key];
+        assert!(
+            v.is_null(),
+            "state.db is null but checkpoint.{key}={v:?} — checkpoint sub-field must be null when no DB exists"
+        );
+    }
+}
