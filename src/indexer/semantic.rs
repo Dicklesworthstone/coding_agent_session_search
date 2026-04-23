@@ -456,6 +456,12 @@ struct CanonicalEmbeddingBatch {
     total_conversations: u64,
 }
 
+pub(crate) struct CanonicalIncrementalEmbeddingBatch {
+    pub inputs: Vec<EmbeddingInput>,
+    pub conversations_in_batch: u64,
+    pub raw_max_message_id: Option<i64>,
+}
+
 fn matching_semantic_checkpoint_offset(
     manifest: &SemanticManifest,
     tier: TierKind,
@@ -616,6 +622,65 @@ fn embedding_inputs_from_conversation_packet(
         .collect()
 }
 
+fn fetch_canonical_embedding_conversations(
+    storage: &FrankenStorage,
+    conversation_ids: &[i64],
+) -> Result<Vec<CanonicalEmbeddingConversationRow>> {
+    let mut envelope_sql = String::from(
+        "SELECT c.id,
+                COALESCE(a.slug, 'unknown'),
+                COALESCE(c.agent_id, 0),
+                c.workspace_id,
+                w.path,
+                c.external_id,
+                c.title,
+                c.source_path,
+                c.started_at,
+                c.ended_at,
+                c.source_id,
+                c.origin_host
+         FROM conversations c
+         LEFT JOIN agents a ON a.id = c.agent_id
+         LEFT JOIN workspaces w ON w.id = c.workspace_id
+         WHERE c.id IN (",
+    );
+    let mut params = Vec::with_capacity(conversation_ids.len());
+    for (idx, conversation_id) in conversation_ids.iter().enumerate() {
+        if idx > 0 {
+            envelope_sql.push_str(", ");
+        }
+        envelope_sql.push_str(&format!("?{}", idx + 1));
+        params.push(ParamValue::from(*conversation_id));
+    }
+    envelope_sql.push_str(") ORDER BY c.id ASC");
+
+    storage
+        .raw()
+        .query_map_collect(&envelope_sql, &params, |row| {
+            let workspace_path: Option<String> = row.get_typed(4)?;
+            Ok(CanonicalEmbeddingConversationRow {
+                conversation_id: row.get_typed(0)?,
+                agent_slug: row.get_typed(1)?,
+                agent_id: row.get_typed(2)?,
+                workspace_id: row.get_typed(3)?,
+                workspace: workspace_path.map(PathBuf::from),
+                external_id: row.get_typed(5)?,
+                title: row.get_typed(6)?,
+                source_path: PathBuf::from(row.get_typed::<String>(7)?),
+                started_at: row.get_typed(8)?,
+                ended_at: row.get_typed(9)?,
+                source_id: row.get_typed(10)?,
+                origin_host: row.get_typed(11)?,
+            })
+        })
+        .with_context(|| {
+            format!(
+                "fetching semantic backfill conversation envelopes for {} conversations",
+                conversation_ids.len()
+            )
+        })
+}
+
 fn fetch_canonical_embedding_batch(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -651,59 +716,7 @@ fn fetch_canonical_embedding_batch(
         });
     }
 
-    let mut envelope_sql = String::from(
-        "SELECT c.id,
-                COALESCE(a.slug, 'unknown'),
-                COALESCE(c.agent_id, 0),
-                c.workspace_id,
-                w.path,
-                c.external_id,
-                c.title,
-                c.source_path,
-                c.started_at,
-                c.ended_at,
-                c.source_id,
-                c.origin_host
-         FROM conversations c
-         LEFT JOIN agents a ON a.id = c.agent_id
-         LEFT JOIN workspaces w ON w.id = c.workspace_id
-         WHERE c.id IN (",
-    );
-    let mut params = Vec::with_capacity(conversation_ids.len());
-    for (idx, conversation_id) in conversation_ids.iter().enumerate() {
-        if idx > 0 {
-            envelope_sql.push_str(", ");
-        }
-        envelope_sql.push_str(&format!("?{}", idx + 1));
-        params.push(ParamValue::from(*conversation_id));
-    }
-    envelope_sql.push_str(") ORDER BY c.id ASC");
-
-    let conversations: Vec<CanonicalEmbeddingConversationRow> = storage
-        .raw()
-        .query_map_collect(&envelope_sql, &params, |row| {
-            let workspace_path: Option<String> = row.get_typed(4)?;
-            Ok(CanonicalEmbeddingConversationRow {
-                conversation_id: row.get_typed(0)?,
-                agent_slug: row.get_typed(1)?,
-                agent_id: row.get_typed(2)?,
-                workspace_id: row.get_typed(3)?,
-                workspace: workspace_path.map(PathBuf::from),
-                external_id: row.get_typed(5)?,
-                title: row.get_typed(6)?,
-                source_path: PathBuf::from(row.get_typed::<String>(7)?),
-                started_at: row.get_typed(8)?,
-                ended_at: row.get_typed(9)?,
-                source_id: row.get_typed(10)?,
-                origin_host: row.get_typed(11)?,
-            })
-        })
-        .with_context(|| {
-            format!(
-                "fetching semantic backfill conversation envelopes for {} conversations",
-                conversation_ids.len()
-            )
-        })?;
+    let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
     let mut grouped_messages =
         storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
@@ -741,6 +754,83 @@ pub(crate) fn packet_embedding_inputs_from_storage(
     storage: &FrankenStorage,
 ) -> Result<Vec<EmbeddingInput>> {
     Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
+}
+
+pub(crate) fn packet_embedding_inputs_from_storage_since(
+    storage: &FrankenStorage,
+    since_message_id: i64,
+) -> Result<CanonicalIncrementalEmbeddingBatch> {
+    let conversation_ids: Vec<i64> = storage
+        .raw()
+        .query_map_collect(
+            "SELECT DISTINCT m.conversation_id
+             FROM messages m
+             WHERE m.id > ?1
+             ORDER BY m.conversation_id ASC",
+            &[ParamValue::from(since_message_id)],
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!(
+                "fetching canonical semantic catch-up conversation ids after message {since_message_id}"
+            )
+        })?;
+
+    if conversation_ids.is_empty() {
+        return Ok(CanonicalIncrementalEmbeddingBatch {
+            inputs: Vec::new(),
+            conversations_in_batch: 0,
+            raw_max_message_id: None,
+        });
+    }
+
+    let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+    let mut raw_max_message_id: Option<i64> = None;
+
+    for conversation in &conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        messages.retain(|message| message.id.is_some_and(|id| id > since_message_id));
+        if messages.is_empty() {
+            continue;
+        }
+        if let Some(conversation_max_message_id) =
+            messages.iter().filter_map(|message| message.id).max()
+        {
+            raw_max_message_id = Some(
+                raw_max_message_id.map_or(conversation_max_message_id, |current| {
+                    current.max(conversation_max_message_id)
+                }),
+            );
+        }
+
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
+    }
+
+    let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        since_message_id,
+        conversations_in_batch,
+        packet_driven = true,
+        semantic_inputs = inputs.len(),
+        "built semantic catch-up batch from ConversationPacket canonical replay"
+    );
+
+    Ok(CanonicalIncrementalEmbeddingBatch {
+        inputs,
+        conversations_in_batch,
+        raw_max_message_id,
+    })
 }
 
 pub(crate) fn packet_embedding_inputs_from_canonical_delta(
@@ -1916,6 +2006,128 @@ mod tests {
         let expected_hash = crc32fast::hash(normalized_source_id.as_bytes());
         assert_eq!(batch.inputs[0].source_id, expected_hash);
         assert_eq!(batch.inputs[1].source_id, expected_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn packet_embedding_inputs_from_storage_since_only_emits_new_canonical_messages() -> Result<()>
+    {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "packet-delta",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "existing semantic text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "existing assistant text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        let watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "packet-delta",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "existing semantic text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "existing assistant text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_700),
+                        content: "new packet semantic text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 3,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_000_800),
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
+
+        assert_eq!(batch.conversations_in_batch, 1);
+        assert_eq!(batch.inputs.len(), 1);
+        assert_eq!(batch.inputs[0].content, "new packet semantic text");
+        assert_eq!(
+            batch.inputs[0].role,
+            role_code_from_str("assistant").unwrap()
+        );
+        let normalized_source_id =
+            normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
+        assert_eq!(
+            batch.inputs[0].source_id,
+            crc32fast::hash(normalized_source_id.as_bytes())
+        );
+        let expected_raw_max_id: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(batch.raw_max_message_id, Some(expected_raw_max_id));
         Ok(())
     }
 

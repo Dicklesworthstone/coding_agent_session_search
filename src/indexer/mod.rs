@@ -57,7 +57,10 @@ use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome, MigrationError,
     seed_canonical_from_best_historical_bundle,
 };
-use semantic::{EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage};
+use semantic::{
+    EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
+    packet_embedding_inputs_from_storage_since,
+};
 
 #[cfg(test)]
 use std::iter::Peekable;
@@ -165,10 +168,12 @@ pub(crate) struct LexicalRebuildPacketFingerprintInput<'a> {
     pub message_bytes: usize,
 }
 
+#[cfg(test)]
 fn message_id_from_db(raw: i64) -> Option<u64> {
     u64::try_from(raw).ok()
 }
 
+#[cfg(test)]
 fn saturating_u32_from_i64(raw: i64) -> u32 {
     match u32::try_from(raw) {
         Ok(value) => value,
@@ -9568,61 +9573,30 @@ fn incremental_semantic_embed(
         .get_last_embedded_message_id()?
         .unwrap_or(0);
 
-    // 2. Fetch new messages since watermark
-    let raw_messages = storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?
-        .fetch_messages_for_embedding_since(watermark)?;
+    // 2. Fetch new packet-derived canonical batches since watermark.
+    let batch = {
+        let storage = storage
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock storage for message fetch: {e}"))?;
+        packet_embedding_inputs_from_storage_since(&storage, watermark)?
+    };
 
-    if raw_messages.is_empty() {
+    let Some(raw_max_id) = batch.raw_max_message_id else {
         return Ok(0);
-    }
-
-    // Track the max raw DB id so we always advance the watermark, even if
-    // all messages are filtered out (e.g., empty content, out-of-range ids).
-    let raw_max_id = raw_messages.iter().map(|m| m.message_id).max().unwrap_or(0);
+    };
 
     tracing::info!(
         since_id = watermark,
-        count = raw_messages.len(),
-        "incremental semantic: fetched new messages"
+        conversations = batch.conversations_in_batch,
+        count = batch.inputs.len(),
+        packet_driven = true,
+        "incremental semantic: fetched canonical packet catch-up batch"
     );
 
-    // 3. Convert to EmbeddingInput
-    let embedding_inputs: Vec<EmbeddingInput> = raw_messages
+    let embedding_inputs: Vec<EmbeddingInput> = batch
+        .inputs
         .into_iter()
-        .filter_map(|msg| {
-            if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
-                return None;
-            }
-
-            let role_u8 = match msg.role.as_str() {
-                "user" => ROLE_USER,
-                "agent" | "assistant" => ROLE_ASSISTANT,
-                "system" => ROLE_SYSTEM,
-                "tool" => ROLE_TOOL,
-                _ => ROLE_USER,
-            };
-
-            let Some(message_id) = message_id_from_db(msg.message_id) else {
-                tracing::warn!(
-                    raw_message_id = msg.message_id,
-                    "skipping out-of-range id during incremental semantic indexing"
-                );
-                return None;
-            };
-
-            Some(EmbeddingInput {
-                message_id,
-                created_at_ms: msg.created_at.unwrap_or(0),
-                agent_id: saturating_u32_from_i64(msg.agent_id),
-                workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
-                source_id: msg.source_id_hash,
-                role: role_u8,
-                chunk_idx: 0,
-                content: msg.content,
-            })
-        })
+        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
         .collect();
 
     embed_incremental_semantic_inputs(
