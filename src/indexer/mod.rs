@@ -24304,6 +24304,11 @@ mod tests {
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
         let index_path = index_dir(&data_dir).unwrap();
+        // `index_dir` calls std::fs::create_dir_all, so we have to remove
+        // the freshly-created empty directory to simulate the truly
+        // pristine "no prior live index" state that the fast-path branch
+        // in publish_staged_lexical_index is written to handle.
+        fs::remove_dir_all(&index_path).unwrap();
         assert!(!index_path.exists(), "precondition: no prior live index");
 
         let stage_root = TempDirBuilder::new()
