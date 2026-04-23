@@ -2484,7 +2484,10 @@ mod tests {
             blocked.reclaimable_generation_ids,
             vec!["gen-old".to_string()]
         );
-        assert!(blocked.fully_retained_generation_ids.is_empty());
+        assert_eq!(
+            blocked.fully_retained_generation_ids,
+            vec!["gen-active".to_string(), "gen-quarantined".to_string()]
+        );
         assert_eq!(
             blocked.quarantined_generation_ids,
             vec!["gen-quarantined".to_string()]
