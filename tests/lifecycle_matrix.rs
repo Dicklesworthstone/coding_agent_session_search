@@ -928,10 +928,7 @@ fn health_status_and_healthy_flag_are_internally_consistent() {
     let initialized = health["initialized"]
         .as_bool()
         .expect("initialized is bool");
-    let errors_len = health["errors"]
-        .as_array()
-        .expect("errors is array")
-        .len();
+    let errors_len = health["errors"].as_array().expect("errors is array").len();
 
     if !initialized {
         assert_eq!(
@@ -946,7 +943,8 @@ fn health_status_and_healthy_flag_are_internally_consistent() {
 
     let healthy_family = matches!(status, "healthy" | "ok");
     assert_eq!(
-        healthy_family, healthy,
+        healthy_family,
+        healthy,
         "status={status:?} and healthy={healthy} — status is {} a healthy-family string but healthy is {healthy}",
         if healthy_family { "" } else { "not" }
     );
@@ -1076,4 +1074,52 @@ fn diag_reports_zero_sizes_for_absent_db_and_index() {
         "database absent but conversations={conversations}"
     );
     assert_eq!(messages, 0, "database absent but messages={messages}");
+}
+
+#[test]
+fn concurrent_diag_readings_agree_on_inventory_snapshot() {
+    // Parallel to concurrent_health_readings_agree_on_readiness_snapshot
+    // but for the diag surface. cass diag --json reports version,
+    // platform, paths, database/index inventory, and per-connector
+    // detection. Under process-level concurrency three invocations
+    // against the same isolated HOME MUST return byte-identical output
+    // after scrubbing — any drift signals a racy read in the inventory
+    // computation (e.g. a stat() call that races connector detection).
+    let test_home = Arc::new(tempfile::tempdir().expect("tempdir"));
+
+    fn isolated_diag(home: Arc<tempfile::TempDir>) -> String {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(["diag", "--json"])
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home.path())
+            .env("HOME", home.path())
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass diag --json");
+        assert!(out.status.success(), "cass diag --json exited non-zero");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let canonical = serde_json::to_string_pretty(&parsed).expect("pretty");
+        scrub(&canonical, home.path())
+    }
+
+    let handles: Vec<_> = (0..3)
+        .map(|_| {
+            let home = Arc::clone(&test_home);
+            thread::spawn(move || isolated_diag(home))
+        })
+        .collect();
+
+    let outputs: Vec<String> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
+
+    let first = &outputs[0];
+    for (i, other) in outputs.iter().enumerate().skip(1) {
+        assert_eq!(
+            other, first,
+            "diag --json output #{i} diverged from output #0 under concurrent reads"
+        );
+    }
 }
