@@ -10763,25 +10763,67 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
 
     #[cfg(target_os = "linux")]
     {
+        // A: atomic renameat2(RENAME_EXCHANGE). After the syscall,
+        // `index_path` holds NEW content (live readers see it atomically)
+        // and `staged_index_path` holds the OLD prior-live content.
         atomic_exchange_paths(index_path, staged_index_path)?;
-        if let Err(retain_err) = fs::rename(staged_index_path, &retained_backup_path) {
+
+        // A.5 (bead 9wkx5): park OLD at the canonical
+        // `.<name>.publish-in-progress.bak` sidecar — the SAME handle the
+        // non-Linux path and recovery already understand. Without this
+        // step, a crash between A and B would strand OLD inside the
+        // `cass-lexical-merge.<RANDOM>` TempDir (which gets reclaimed on
+        // normal Drop but persists on hard crash), silently breaking the
+        // retained-backup contract pinned by
+        // publish_staged_lexical_index_retains_every_backup_unboundedly_today_pending_retention_cap.
+        //
+        // Same-filesystem rename within `index_path`'s parent is
+        // essentially atomic, so this narrows the uncovered crash window
+        // from "two rename operations across potentially different FS
+        // mount points" to "one same-dir rename". Recovery on next
+        // startup (`recover_or_finalize_interrupted_lexical_publish_backup`)
+        // finds the canonical sidecar and moves it into
+        // `.lexical-publish-backups/` automatically.
+        let canonical_sidecar = lexical_publish_in_progress_backup_path(index_path);
+        if let Err(park_err) = fs::rename(staged_index_path, &canonical_sidecar) {
+            // A.5 failed: staged_index_path still holds OLD (inside the
+            // merge tempdir). Roll the atomic swap back so live returns
+            // to OLD and the NEW content goes back into the tempdir
+            // (where normal Drop discards it).
             match atomic_exchange_paths(index_path, staged_index_path) {
                 Ok(()) => {
-                    return Err(retain_err).with_context(|| {
+                    return Err(park_err).with_context(|| {
                         format!(
-                            "retaining prior published lexical index at {} after atomic swap publish failed; rolled back to keep previous live index at {}",
-                            retained_backup_path.display(),
+                            "parking prior lexical index at canonical sidecar {} after atomic swap publish failed; rolled back to keep previous live index at {}",
+                            canonical_sidecar.display(),
                             index_path.display()
                         )
                     });
                 }
                 Err(rollback_err) => {
                     return Err(anyhow::anyhow!(
-                        "retaining prior published lexical index at {} after atomic swap publish failed: {retain_err:#}; rollback also failed: {rollback_err:#}",
-                        retained_backup_path.display()
+                        "parking prior lexical index at canonical sidecar {} after atomic swap publish failed: {park_err:#}; rollback also failed: {rollback_err:#}",
+                        canonical_sidecar.display()
                     ));
                 }
             }
+        }
+
+        // B: move canonical sidecar into `.lexical-publish-backups/` under
+        // a unique dated name. Failure here is recoverable without rollback:
+        // the live index is NEW (step A already committed), the canonical
+        // sidecar holds OLD at a fixed-name handle, and startup recovery
+        // will complete the retain step on the next cass invocation. We
+        // intentionally do NOT roll the swap back here because (a) rolling
+        // back would discard the validated NEW publish, and (b) recovery
+        // is idempotent.
+        if let Err(retain_err) = fs::rename(&canonical_sidecar, &retained_backup_path) {
+            tracing::warn!(
+                error = %retain_err,
+                canonical_sidecar = %canonical_sidecar.display(),
+                retained_backup_path = %retained_backup_path.display(),
+                "published staged lexical index but could not move the prior live artifact into retained-backup storage; canonical sidecar preserved — startup recovery will finish the retain step"
+            );
         }
     }
 
@@ -24922,6 +24964,144 @@ mod tests {
                 .docs,
             3,
             "retained backup must preserve the prior-live artifact recovered from the crash sidecar"
+        );
+    }
+
+    /// Regression guard for bead coding_agent_session_search-9wkx5:
+    /// Linux atomic-swap publish path now parks OLD at the canonical
+    /// `.<name>.publish-in-progress.bak` sidecar AFTER renameat2
+    /// succeeds but BEFORE moving it to `.lexical-publish-backups/`.
+    ///
+    /// This test simulates the resulting mid-publish state — sidecar
+    /// holds OLD, live holds NEW — then verifies that a subsequent
+    /// `publish_staged_lexical_index` call correctly recovers by
+    /// moving the sidecar into retained-backup storage as part of its
+    /// `recover_or_finalize_interrupted_lexical_publish_backup` pass.
+    ///
+    /// Without the A.5 canonical-sidecar step in the Linux path, OLD
+    /// would have been stranded inside a `cass-lexical-merge.*`
+    /// TempDir and the retained-backup contract broken.
+    #[test]
+    fn publish_staged_lexical_index_recovers_from_crash_between_linux_swap_and_retain() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        // Build the crash-state: live holds NEW (post-renameat2),
+        // canonical sidecar holds OLD (post-A.5), but retain step (B)
+        // never completed.
+        let new_live_conv = norm_conv(
+            Some("wkx5-linux-new-live"),
+            vec![norm_msg(0, 1_700_009_000_000)],
+        );
+        let mut new_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        new_live
+            .add_messages_with_conversation_id(&new_live_conv, &new_live_conv.messages, Some(1))
+            .unwrap();
+        new_live.commit().unwrap();
+        drop(new_live);
+
+        let canonical_sidecar = lexical_publish_in_progress_backup_path(&index_path);
+        let old_backup_conv = norm_conv(
+            Some("wkx5-linux-old-backup"),
+            vec![
+                norm_msg(0, 1_700_008_000_000),
+                norm_msg(1, 1_700_008_000_100),
+                norm_msg(2, 1_700_008_000_200),
+            ],
+        );
+        let mut sidecar_index = TantivyIndex::open_or_create(&canonical_sidecar).unwrap();
+        sidecar_index
+            .add_messages_with_conversation_id(
+                &old_backup_conv,
+                &old_backup_conv.messages,
+                Some(2),
+            )
+            .unwrap();
+        sidecar_index.commit().unwrap();
+        drop(sidecar_index);
+
+        assert!(
+            canonical_sidecar.exists(),
+            "precondition: canonical sidecar with OLD content"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "precondition: live has NEW (1 doc)"
+        );
+
+        // Stage a third-generation index and publish. The publish will
+        // first recover the A.5-sidecar via
+        // `recover_or_finalize_interrupted_lexical_publish_backup`,
+        // moving OLD into `.lexical-publish-backups/` before the new
+        // generation lands.
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-wkx5-linux-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let third_gen_conv = norm_conv(
+            Some("wkx5-linux-third-gen"),
+            vec![
+                norm_msg(0, 1_700_010_000_000),
+                norm_msg(1, 1_700_010_000_100),
+            ],
+        );
+        let mut third_gen = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        third_gen
+            .add_messages_with_conversation_id(&third_gen_conv, &third_gen_conv.messages, Some(3))
+            .unwrap();
+        third_gen.commit().unwrap();
+        drop(third_gen);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        // Live index == third-gen (2 docs).
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            2,
+            "live must be third-gen publish after recovery + publish"
+        );
+        // Canonical sidecar must be consumed.
+        assert!(
+            !canonical_sidecar.exists(),
+            "canonical sidecar must be moved into retained-backup storage by recovery"
+        );
+        // Retained backups contain BOTH:
+        //  - the OLD (3 docs) recovered from the A.5 sidecar,
+        //  - the NEW (1 doc) moved during the third-gen publish's own retain step.
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        let retained: Vec<_> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            retained.len(),
+            2,
+            "both the A.5 sidecar (OLD, 3 docs) and the prior-live (NEW, 1 doc) must be retained; got {retained:?}"
+        );
+        let mut doc_counts: Vec<usize> = retained
+            .iter()
+            .map(|path| {
+                crate::search::tantivy::searchable_index_summary(path)
+                    .unwrap()
+                    .unwrap()
+                    .docs
+            })
+            .collect();
+        doc_counts.sort_unstable();
+        assert_eq!(
+            doc_counts,
+            vec![1, 3],
+            "retained backups must have exactly the expected doc counts (1 = NEW prior-live, 3 = OLD from A.5 sidecar)"
         );
     }
 
