@@ -480,6 +480,15 @@ fn diag_json_matches_golden() {
 }
 
 #[test]
+fn diag_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let diag = capture_robot_json_value(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&diag)).expect("pretty-print JSON");
+    assert_golden("robot/diag_shape.json.golden", &canonical);
+}
+
+#[test]
 fn diag_quarantine_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let data_dir = seed_diag_quarantine_fixture(test_home.path());

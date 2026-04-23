@@ -1,0 +1,78 @@
+{
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "platform": {
+      "type": "object",
+      "properties": {
+        "os": {
+          "type": "string"
+        },
+        "arch": {
+          "type": "string"
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "properties": {
+        "data_dir": {
+          "type": "string"
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "index_path": {
+          "type": "string"
+        }
+      }
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "conversations": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer"
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      }
+    },
+    "connectors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "found": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}
