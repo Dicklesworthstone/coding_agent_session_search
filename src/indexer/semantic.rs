@@ -15,6 +15,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::indexer::responsiveness;
+use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
+use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
@@ -22,6 +24,9 @@ use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
 use crate::search::semantic_manifest::{
     ArtifactRecord, BuildCheckpoint, SemanticManifest, TierKind,
+};
+use crate::search::tantivy::{
+    normalized_index_origin_host, normalized_index_origin_kind, normalized_index_source_id,
 };
 use crate::search::vector_index::{
     ROLE_USER, SemanticDocId, VECTOR_INDEX_DIR, role_code_from_str, vector_index_path,
@@ -429,15 +434,19 @@ fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
     .to_doc_id_string()
 }
 
-struct CanonicalEmbeddingRow {
+struct CanonicalEmbeddingConversationRow {
     conversation_id: i64,
-    message_id: i64,
-    created_at: Option<i64>,
+    agent_slug: String,
     agent_id: i64,
+    workspace: Option<PathBuf>,
     workspace_id: Option<i64>,
+    external_id: Option<String>,
+    title: Option<String>,
+    source_path: PathBuf,
+    started_at: Option<i64>,
+    ended_at: Option<i64>,
     source_id: Option<String>,
-    role: String,
-    content: String,
+    origin_host: Option<String>,
 }
 
 struct CanonicalEmbeddingBatch {
@@ -490,14 +499,7 @@ fn saturating_u32_from_i64(raw: i64) -> u32 {
     }
 }
 
-fn embedding_input_from_row(row: CanonicalEmbeddingRow) -> Option<EmbeddingInput> {
-    let Some(message_id) = message_id_from_db(row.message_id) else {
-        tracing::warn!(
-            raw_message_id = row.message_id,
-            "skipping out-of-range id during semantic backfill"
-        );
-        return None;
-    };
+fn canonical_embedding_created_at_ms(message_id: u64, created_at: Option<i64>) -> i64 {
     // `created_at_ms` feeds time-range filters in the vector index
     // (src/search/vector_index.rs range predicates) and contributes to
     // `stable_hit_hash`. Defaulting a NULL created_at to 0 silently
@@ -505,25 +507,113 @@ fn embedding_input_from_row(row: CanonicalEmbeddingRow) -> Option<EmbeddingInput
     // from a legitimately-ancient row in downstream filters. Emit a warn
     // so operators see NULL-created_at rows in the logs instead of only
     // finding them by puzzling over 1970 timestamps in semantic hits.
-    let created_at_ms = row.created_at.unwrap_or_else(|| {
+    created_at.unwrap_or_else(|| {
         tracing::warn!(
             message_id,
             "semantic backfill: row has NULL created_at; defaulting to 0 (Unix epoch). \
              Downstream time-range filters will treat this message as 1970-01-01."
         );
         0
-    });
-    let source_id = row.source_id.unwrap_or_else(|| "local".to_string());
+    })
+}
+
+fn canonical_embedding_packet_provenance(
+    row: &CanonicalEmbeddingConversationRow,
+) -> ConversationPacketProvenance {
+    let source_id =
+        normalized_index_source_id(row.source_id.as_deref(), None, row.origin_host.as_deref());
+    ConversationPacketProvenance {
+        origin_kind: normalized_index_origin_kind(&source_id, None),
+        origin_host: normalized_index_origin_host(row.origin_host.as_deref()),
+        source_id,
+    }
+}
+
+fn canonical_embedding_conversation(
+    row: &CanonicalEmbeddingConversationRow,
+    provenance: &ConversationPacketProvenance,
+    messages: Vec<Message>,
+) -> Conversation {
+    Conversation {
+        id: Some(row.conversation_id),
+        agent_slug: row.agent_slug.clone(),
+        workspace: row.workspace.clone(),
+        external_id: row.external_id.clone(),
+        title: row.title.clone(),
+        source_path: row.source_path.clone(),
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+        approx_tokens: None,
+        metadata_json: serde_json::Value::Null,
+        messages,
+        source_id: provenance.source_id.clone(),
+        origin_host: provenance.origin_host.clone(),
+    }
+}
+
+fn embedding_input_from_packet_message(
+    conversation_id: i64,
+    agent_id: u32,
+    workspace_id: u32,
+    source_id_hash: u32,
+    message: &crate::model::conversation_packet::ConversationPacketMessage,
+) -> Option<EmbeddingInput> {
+    let Some(raw_message_id) = message.message_id else {
+        tracing::warn!(
+            conversation_id,
+            message_idx = message.idx,
+            "skipping semantic backfill message without canonical id in ConversationPacket replay"
+        );
+        return None;
+    };
+    let Some(message_id) = message_id_from_db(raw_message_id) else {
+        tracing::warn!(
+            conversation_id,
+            raw_message_id,
+            "skipping out-of-range id during semantic backfill"
+        );
+        return None;
+    };
     Some(EmbeddingInput {
         message_id,
-        created_at_ms,
-        agent_id: saturating_u32_from_i64(row.agent_id),
-        workspace_id: saturating_u32_from_i64(row.workspace_id.unwrap_or(0)),
-        source_id: crc32fast::hash(source_id.as_bytes()),
-        role: role_code_from_str(&row.role).unwrap_or(ROLE_USER),
+        created_at_ms: canonical_embedding_created_at_ms(message_id, message.created_at),
+        agent_id,
+        workspace_id,
+        source_id: source_id_hash,
+        role: role_code_from_str(&message.role).unwrap_or(ROLE_USER),
         chunk_idx: 0,
-        content: row.content,
+        content: message.content.clone(),
     })
+}
+
+fn embedding_inputs_from_conversation_packet(
+    row: &CanonicalEmbeddingConversationRow,
+    packet: &ConversationPacket,
+) -> Vec<EmbeddingInput> {
+    let agent_id = saturating_u32_from_i64(row.agent_id);
+    let workspace_id = saturating_u32_from_i64(row.workspace_id.unwrap_or(0));
+    let source_id_hash = crc32fast::hash(packet.payload.provenance.source_id.as_bytes());
+    packet
+        .projections
+        .semantic
+        .message_indices
+        .iter()
+        .filter_map(|message_index| {
+            packet
+                .payload
+                .messages
+                .get(*message_index)
+                .and_then(|message| {
+                    embedding_input_from_packet_message(
+                        row.conversation_id,
+                        agent_id,
+                        workspace_id,
+                        source_id_hash,
+                        message,
+                    )
+                })
+        })
+        .collect()
 }
 
 fn fetch_canonical_embedding_batch(
@@ -561,55 +651,83 @@ fn fetch_canonical_embedding_batch(
         });
     }
 
-    let mut sql = String::from(
-        "SELECT c.id, m.id, m.created_at, COALESCE(c.agent_id, 0), c.workspace_id, c.source_id, m.role, m.content
-         FROM messages m
-         JOIN conversations c ON c.id = m.conversation_id
+    let mut envelope_sql = String::from(
+        "SELECT c.id,
+                COALESCE(a.slug, 'unknown'),
+                COALESCE(c.agent_id, 0),
+                c.workspace_id,
+                w.path,
+                c.external_id,
+                c.title,
+                c.source_path,
+                c.started_at,
+                c.ended_at,
+                c.source_id,
+                c.origin_host
+         FROM conversations c
+         LEFT JOIN agents a ON a.id = c.agent_id
+         LEFT JOIN workspaces w ON w.id = c.workspace_id
          WHERE c.id IN (",
     );
     let mut params = Vec::with_capacity(conversation_ids.len());
     for (idx, conversation_id) in conversation_ids.iter().enumerate() {
         if idx > 0 {
-            sql.push_str(", ");
+            envelope_sql.push_str(", ");
         }
-        sql.push_str(&format!("?{}", idx + 1));
+        envelope_sql.push_str(&format!("?{}", idx + 1));
         params.push(ParamValue::from(*conversation_id));
     }
-    sql.push_str(") ORDER BY c.id ASC, m.idx ASC, m.id ASC");
+    envelope_sql.push_str(") ORDER BY c.id ASC");
 
-    let rows: Vec<CanonicalEmbeddingRow> = storage
+    let conversations: Vec<CanonicalEmbeddingConversationRow> = storage
         .raw()
-        .query_map_collect(&sql, &params, |row| {
-            Ok(CanonicalEmbeddingRow {
+        .query_map_collect(&envelope_sql, &params, |row| {
+            let workspace_path: Option<String> = row.get_typed(4)?;
+            Ok(CanonicalEmbeddingConversationRow {
                 conversation_id: row.get_typed(0)?,
-                message_id: row.get_typed(1)?,
-                created_at: row.get_typed(2)?,
-                agent_id: row.get_typed(3)?,
-                workspace_id: row.get_typed(4)?,
-                source_id: row.get_typed(5)?,
-                role: row.get_typed(6)?,
-                content: row.get_typed(7)?,
+                agent_slug: row.get_typed(1)?,
+                agent_id: row.get_typed(2)?,
+                workspace_id: row.get_typed(3)?,
+                workspace: workspace_path.map(PathBuf::from),
+                external_id: row.get_typed(5)?,
+                title: row.get_typed(6)?,
+                source_path: PathBuf::from(row.get_typed::<String>(7)?),
+                started_at: row.get_typed(8)?,
+                ended_at: row.get_typed(9)?,
+                source_id: row.get_typed(10)?,
+                origin_host: row.get_typed(11)?,
             })
         })
         .with_context(|| {
             format!(
-                "fetching semantic backfill messages for {} conversations",
+                "fetching semantic backfill conversation envelopes for {} conversations",
                 conversation_ids.len()
             )
         })?;
 
-    let mut conversations_in_batch = 0_u64;
-    let mut last_seen_conversation_id = None;
-    let mut inputs = Vec::with_capacity(rows.len());
-    for row in rows {
-        if last_seen_conversation_id != Some(row.conversation_id) {
-            conversations_in_batch = conversations_in_batch.saturating_add(1);
-            last_seen_conversation_id = Some(row.conversation_id);
-        }
-        if let Some(input) = embedding_input_from_row(row) {
-            inputs.push(input);
-        }
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+    for conversation in &conversations {
+        let messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
     }
+
+    let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
+    tracing::debug!(
+        conversations_in_batch,
+        packet_driven = true,
+        semantic_inputs = inputs.len(),
+        "built semantic backfill batch from ConversationPacket canonical replay"
+    );
 
     Ok(CanonicalEmbeddingBatch {
         inputs,
@@ -1178,6 +1296,24 @@ mod tests {
         }
     }
 
+    fn test_conversation_with_messages(external_id: &str, messages: Vec<Message>) -> Conversation {
+        Conversation {
+            id: None,
+            agent_slug: "codex".to_string(),
+            workspace: None,
+            external_id: Some(external_id.to_string()),
+            title: Some(format!("semantic {external_id}")),
+            source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_001_000),
+            approx_tokens: None,
+            metadata_json: json!({}),
+            messages,
+            source_id: "remote-laptop".to_string(),
+            origin_host: Some("builder-host".to_string()),
+        }
+    }
+
     fn default_scheduler_signals() -> SemanticBackfillSchedulerSignals {
         SemanticBackfillSchedulerSignals {
             foreground_pressure: false,
@@ -1674,6 +1810,74 @@ mod tests {
             manifest.fast_tier.as_ref().map(|record| record.doc_count),
             Some(2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_embedding_batch_uses_conversation_packet_semantic_projection() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "packet-projection",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "user semantic text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Tool,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "tool semantic text".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_000_700),
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let batch = fetch_canonical_embedding_batch(&storage, 0, 1)?;
+
+        assert_eq!(batch.conversations_in_batch, 1);
+        assert_eq!(batch.inputs.len(), 2);
+        assert_eq!(batch.inputs[0].content, "user semantic text");
+        assert_eq!(batch.inputs[1].content, "tool semantic text");
+        assert_eq!(batch.inputs[0].role, role_code_from_str("user").unwrap());
+        assert_eq!(batch.inputs[1].role, role_code_from_str("tool").unwrap());
+        let normalized_source_id =
+            normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
+        let expected_hash = crc32fast::hash(normalized_source_id.as_bytes());
+        assert_eq!(batch.inputs[0].source_id, expected_hash);
+        assert_eq!(batch.inputs[1].source_id, expected_hash);
         Ok(())
     }
 
