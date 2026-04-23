@@ -771,6 +771,52 @@ pub(crate) fn packet_embedding_inputs_from_storage(
     Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
 }
 
+fn packet_embedding_inputs_from_selected_canonical_messages<F>(
+    storage: &FrankenStorage,
+    conversation_ids: &[i64],
+    mut include_message: F,
+) -> Result<(Vec<EmbeddingInput>, Option<i64>)>
+where
+    F: FnMut(&Message) -> bool,
+{
+    if conversation_ids.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
+    let mut grouped_messages =
+        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    let mut inputs = Vec::new();
+    let mut raw_max_message_id: Option<i64> = None;
+
+    for conversation in &conversations {
+        let mut messages = grouped_messages
+            .remove(&conversation.conversation_id)
+            .unwrap_or_default();
+        messages.retain(|message| {
+            let keep = include_message(message);
+            if keep && let Some(message_id) = message.id {
+                raw_max_message_id =
+                    Some(raw_max_message_id.map_or(message_id, |current| current.max(message_id)));
+            }
+            keep
+        });
+        if messages.is_empty() {
+            continue;
+        }
+
+        let provenance = canonical_embedding_packet_provenance(conversation);
+        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        inputs.extend(embedding_inputs_from_conversation_packet(
+            conversation,
+            &packet,
+        ));
+    }
+
+    Ok((inputs, raw_max_message_id))
+}
+
 pub(crate) fn packet_embedding_inputs_from_storage_since(
     storage: &FrankenStorage,
     since_message_id: i64,
@@ -799,38 +845,11 @@ pub(crate) fn packet_embedding_inputs_from_storage_since(
         });
     }
 
-    let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
-    let mut inputs = Vec::new();
-    let mut raw_max_message_id: Option<i64> = None;
-
-    for conversation in &conversations {
-        let mut messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
-        messages.retain(|message| message.id.is_some_and(|id| id > since_message_id));
-        if messages.is_empty() {
-            continue;
-        }
-        if let Some(conversation_max_message_id) =
-            messages.iter().filter_map(|message| message.id).max()
-        {
-            raw_max_message_id = Some(
-                raw_max_message_id.map_or(conversation_max_message_id, |current| {
-                    current.max(conversation_max_message_id)
-                }),
-            );
-        }
-
-        let provenance = canonical_embedding_packet_provenance(conversation);
-        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
-        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
-        inputs.extend(embedding_inputs_from_conversation_packet(
-            conversation,
-            &packet,
-        ));
-    }
+    let (inputs, raw_max_message_id) = packet_embedding_inputs_from_selected_canonical_messages(
+        storage,
+        &conversation_ids,
+        |message| message.id.is_some_and(|id| id > since_message_id),
+    )?;
 
     let conversations_in_batch = u64::try_from(conversation_ids.len()).unwrap_or(u64::MAX);
     tracing::debug!(
@@ -857,28 +876,19 @@ pub(crate) fn packet_embedding_inputs_from_storage_for_message_ids(
         return Ok(Vec::new());
     }
 
-    let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
-    let mut inputs = Vec::new();
-
-    for conversation in &conversations {
-        let mut messages = grouped_messages
-            .remove(&conversation.conversation_id)
-            .unwrap_or_default();
-        messages.retain(|message| message.id.is_some_and(|id| message_ids.contains(&id)));
-        if messages.is_empty() {
-            continue;
-        }
-
-        let provenance = canonical_embedding_packet_provenance(conversation);
-        let canonical = canonical_embedding_conversation(conversation, &provenance, messages);
-        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
-        inputs.extend(embedding_inputs_from_conversation_packet(
-            conversation,
-            &packet,
-        ));
-    }
+    let (inputs, raw_max_message_id) = packet_embedding_inputs_from_selected_canonical_messages(
+        storage,
+        conversation_ids,
+        |message| message.id.is_some_and(|id| message_ids.contains(&id)),
+    )?;
+    tracing::debug!(
+        conversations_in_batch = conversation_ids.len(),
+        selected_message_ids = message_ids.len(),
+        semantic_inputs = inputs.len(),
+        raw_max_message_id,
+        packet_driven = true,
+        "built selected semantic batch from ConversationPacket canonical replay"
+    );
 
     Ok(inputs)
 }
@@ -2606,6 +2616,157 @@ mod tests {
         assert_eq!(comparable_semantic_inputs(packet_batch.inputs), expected);
         assert_eq!(packet_batch.conversations_in_batch, 2);
         assert_eq!(packet_batch.raw_max_message_id, Some(watermark + 4));
+        Ok(())
+    }
+
+    #[test]
+    fn packet_embedding_inputs_for_message_ids_matches_since_selection() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace_id = storage.ensure_workspace(Path::new("/tmp/workspace"), None)?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "selected-vs-since",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_100_100),
+                        content: "before watermark".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_100_200),
+                        content: "before watermark assistant".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "selected-vs-since",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_100_100),
+                        content: "before watermark".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_100_200),
+                        content: "before watermark assistant".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::Tool,
+                        author: None,
+                        created_at: Some(1_700_000_100_300),
+                        content: "after watermark tool".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 3,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_100_400),
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "selected-vs-since-second",
+                vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_100_500),
+                    content: "after watermark assistant".to_string(),
+                    extra_json: json!({}),
+                    snippets: Vec::new(),
+                }],
+            ),
+        )?;
+
+        let since_batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
+        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT DISTINCT conversation_id
+             FROM messages
+             WHERE id > ?1
+             ORDER BY conversation_id ASC",
+            &[ParamValue::from(watermark)],
+            |row| row.get_typed(0),
+        )?;
+        let selected_message_ids: HashSet<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT id
+                 FROM messages
+                 WHERE id > ?1
+                 ORDER BY id ASC",
+                &[ParamValue::from(watermark)],
+                |row| row.get_typed(0),
+            )?
+            .into_iter()
+            .collect();
+        let selected_inputs = packet_embedding_inputs_from_storage_for_message_ids(
+            &storage,
+            &conversation_ids,
+            &selected_message_ids,
+        )?;
+
+        assert_eq!(
+            comparable_semantic_inputs(selected_inputs),
+            comparable_semantic_inputs(since_batch.inputs)
+        );
         Ok(())
     }
 
