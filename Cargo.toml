@@ -32,7 +32,7 @@ which = "*"
 shell-words = "*"
 dotenvy = "*"
 notify = "*"
-frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "05361327", package = "fsqlite", features = ["fts5"] }
+frankensqlite = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "18a512b6", package = "fsqlite", features = ["fts5"] }
 rayon = "*"
 crossbeam-channel = "*"
 parking_lot = "*"
@@ -72,7 +72,7 @@ memmap2 = "*"
 bytemuck = "*"
 fastembed = { version = "*", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
 frankensearch = { version = "*", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "3dbab624", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
-franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "fa03e5f922ccf052f1d738ad629e8f64023ca4ae", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
+franken-agent-detection = { version = "*", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "9ead6659b98c087c4edcef405f2b01d789c22764", features = ["connectors", "cursor", "chatgpt", "opencode", "crush"] }
 wide = "*"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "*"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -145,7 +145,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
-fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "05361327", package = "fsqlite-types" }
+fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "18a512b6", package = "fsqlite-types" }
 
 [[bin]]
 name = "cass"
