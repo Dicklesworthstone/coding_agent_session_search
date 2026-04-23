@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": 3,
+    "kind": "missing-db",
+    "message": "Database not found at [TEST_HOME]/agent_search.db. Run 'cass index --full' first.",
+    "hint": "Run 'cass index --full' to create the database.",
+    "retryable": true
+  }
+}

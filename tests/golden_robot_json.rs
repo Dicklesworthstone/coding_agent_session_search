@@ -268,6 +268,37 @@ fn api_version_json_matches_golden() {
 }
 
 #[test]
+fn stats_json_missing_db_error_envelope_matches_golden() {
+    // `cass stats --json` against an isolated empty HOME emits the
+    // error-envelope variant of the robot-mode JSON contract: a structured
+    // `{"error": {"code", "kind", "message", "hint", "retryable"}}` payload
+    // documented in robot-docs' exit-codes topic. Freezing this catches
+    // silent drift in the error-envelope shape — important because agent
+    // error-handling branches key on these exact fields.
+    //
+    // Per the robot-mode convention (cass --robot-help):
+    //   "stdout=data only; stderr=warnings/errors only"
+    // — so the error envelope lands on stderr. We parse stderr as JSON
+    // and scrub the same way the stdout helper does.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args([
+            "stats",
+            "--json",
+            "--data-dir",
+            test_home.path().to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass stats --json");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stderr).expect("stats error envelope is JSON");
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/stats_missing_db.json.golden", &scrubbed);
+}
+
+#[test]
 fn introspect_json_matches_golden() {
     // `cass introspect --json` is the full API schema surface — every
     // subcommand, its flags, positional args, and response-schema
