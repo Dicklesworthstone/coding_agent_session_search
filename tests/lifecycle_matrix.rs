@@ -1523,3 +1523,50 @@ fn diag_artifact_paths_nest_inside_data_dir_for_safe_gc() {
         test_home.path().display()
     );
 }
+
+#[test]
+fn index_subcommand_exposes_all_entrypoint_flags() {
+    // tin8o migration-safety row. The bead's scope is "migrate watch,
+    // import, salvage, and incremental entrypoints onto the same
+    // streaming packet pipeline" — a refactor that touches every cass
+    // index entrypoint flag. If the refactor accidentally drops or
+    // renames any entrypoint flag (--full, --watch, --watch-once,
+    // --semantic, --force-rebuild) during migration, every downstream
+    // automation breaks. This row pins the CLI contract by parsing
+    // `cass index --help` and asserting each required flag is still
+    // advertised.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["index", "--help"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass index --help");
+    assert!(out.status.success(), "cass index --help exited non-zero");
+    let help = String::from_utf8(out.stdout).expect("utf8");
+
+    // Every documented entrypoint flag must be advertised in the help
+    // text. Missing any of these signals a refactor that accidentally
+    // dropped the flag — every automation downstream breaks silently.
+    for flag in [
+        "--full",
+        "--watch",
+        "--watch-once",
+        "--semantic",
+        "--force-rebuild",
+    ] {
+        assert!(
+            help.contains(flag),
+            "cass index --help is missing documented flag {flag:?} — entrypoint drift detected\n\nhelp output:\n{help}"
+        );
+    }
+
+    // And --force-rebuild must still advertise its --force alias per
+    // the current flag contract, so existing scripts keep working.
+    assert!(
+        help.contains("--force"),
+        "cass index --help dropped the --force alias for --force-rebuild"
+    );
+}
