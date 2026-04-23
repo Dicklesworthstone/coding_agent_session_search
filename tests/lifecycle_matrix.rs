@@ -2699,8 +2699,7 @@ fn models_verify_and_status_agree_on_cache_identity_and_phase() {
         .expect("run cass models status --json");
     assert!(s_out.status.success(), "cass models status --json failed");
     let status: serde_json::Value =
-        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8"))
-            .expect("valid JSON");
+        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8")).expect("valid JSON");
 
     let v_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
         .args(["models", "verify", "--json"])
@@ -2714,8 +2713,7 @@ fn models_verify_and_status_agree_on_cache_identity_and_phase() {
     // when there is no model to verify yet.
     assert!(v_out.status.success(), "cass models verify --json failed");
     let verify: serde_json::Value =
-        serde_json::from_str(&String::from_utf8(v_out.stdout).expect("utf8"))
-            .expect("valid JSON");
+        serde_json::from_str(&String::from_utf8(v_out.stdout).expect("utf8")).expect("valid JSON");
 
     // Invariant A: model_dir agrees between status and verify.
     let s_mdir = status["model_dir"]
@@ -2833,8 +2831,7 @@ fn models_check_update_and_status_agree_on_revision_when_absent() {
         .expect("run cass models status --json");
     assert!(s_out.status.success(), "cass models status --json failed");
     let status: serde_json::Value =
-        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8"))
-            .expect("valid JSON");
+        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8")).expect("valid JSON");
 
     let u_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
         .args(["models", "check-update", "--json"])
@@ -2849,8 +2846,7 @@ fn models_check_update_and_status_agree_on_revision_when_absent() {
         "cass models check-update --json failed"
     );
     let check: serde_json::Value =
-        serde_json::from_str(&String::from_utf8(u_out.stdout).expect("utf8"))
-            .expect("valid JSON");
+        serde_json::from_str(&String::from_utf8(u_out.stdout).expect("utf8")).expect("valid JSON");
 
     // Invariant A: cross-command revision identity.
     let s_rev = status["revision"]
