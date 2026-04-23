@@ -85,6 +85,28 @@
       "runtime": null
     }
   },
+  "rebuild_progress": {
+    "active": false,
+    "mode": null,
+    "phase": null,
+    "processed_conversations": null,
+    "total_conversations": null,
+    "remaining_conversations": null,
+    "completion_ratio": null,
+    "indexed_docs": null,
+    "runtime_available": false,
+    "queue_depth": null,
+    "queue_capacity": null,
+    "queue_headroom": null,
+    "pending_batch_conversations": null,
+    "pending_batch_message_bytes": null,
+    "inflight_message_bytes": null,
+    "max_message_bytes_in_flight": null,
+    "inflight_message_bytes_headroom": null,
+    "controller_mode": null,
+    "controller_reason": null,
+    "updated_at": null
+  },
   "semantic": {
     "status": "not_initialized",
     "availability": "not_initialized",
