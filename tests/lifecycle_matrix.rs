@@ -958,3 +958,62 @@ fn health_status_and_healthy_flag_are_internally_consistent() {
         );
     }
 }
+
+#[test]
+fn semantic_readiness_reports_lexical_fallback_when_models_absent() {
+    // ibuuh.11 contract row: 'Bootstrap semantic assets and verify live
+    // default-hybrid behavior'. The core fail-open contract: when the
+    // semantic model is NOT installed (isolated empty HOME), cass health
+    // --json must report state.semantic as available=false with
+    // fallback_mode="lexical". Agents decide whether to wait for
+    // semantic or proceed with lexical based on this signal; silent
+    // drift breaks every hybrid-preferred flow.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let sem = &health["state"]["semantic"];
+    assert!(
+        sem.is_object(),
+        "health.state.semantic must be an object; got {sem:?}"
+    );
+
+    let available = sem["available"].as_bool().expect("available is bool");
+    let can_search = sem["can_search"].as_bool().expect("can_search is bool");
+    let fallback = sem["fallback_mode"]
+        .as_str()
+        .expect("fallback_mode is string");
+    let status = sem["status"].as_str().expect("semantic.status is string");
+
+    // With an empty HOME the semantic model CANNOT be available.
+    assert!(
+        !available,
+        "isolated empty HOME: semantic.available must be false; got true with status={status:?}"
+    );
+    assert!(
+        !can_search,
+        "isolated empty HOME: semantic.can_search must be false; got true with status={status:?}"
+    );
+    // The fail-open contract: fallback_mode MUST be lexical (not e.g.
+    // empty or an unhelpful placeholder) so agents know search still
+    // works via the lexical tier.
+    assert_eq!(
+        fallback, "lexical",
+        "semantic.fallback_mode must be \"lexical\" when model is absent; got {fallback:?}"
+    );
+    // And there MUST be an operator-facing hint explaining what to do
+    // (install the model, or proceed with lexical).
+    let hint = sem["hint"].as_str().expect("semantic.hint is a string");
+    assert!(
+        !hint.is_empty(),
+        "semantic.hint must be a non-empty user-facing guidance string"
+    );
+}
