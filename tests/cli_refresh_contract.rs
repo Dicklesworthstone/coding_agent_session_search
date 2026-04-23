@@ -1,5 +1,5 @@
 use clap::Parser;
-use coding_agent_search::{Cli, Commands};
+use coding_agent_search::{Cli, Commands, RobotFormat};
 
 fn parse(args: &[&str]) -> Result<Cli, String> {
     Cli::try_parse_from(args).map_err(|err| format!("parse cass CLI for {args:?}: {err}"))
@@ -163,6 +163,42 @@ fn index_refresh_operator_controls_remain_parseable() -> Result<(), String> {
             }) if key == "stale-refresh-001" => Ok(()),
             other => Err(format!(
                 "expected full refresh operator controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn index_refresh_robot_alias_keeps_global_format_contract() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "--robot-format",
+            "jsonl",
+            "index",
+            "--full",
+            "--robot",
+            "--idempotency-key",
+            "stale-refresh-jsonl-001",
+            "--progress-interval-ms",
+            "500",
+        ])?;
+
+        match cli {
+            Cli {
+                robot_format: Some(RobotFormat::Jsonl),
+                command:
+                    Some(Commands::Index {
+                        full: true,
+                        json: true,
+                        idempotency_key: Some(key),
+                        progress_interval_ms: 500,
+                        ..
+                    }),
+                ..
+            } if key == "stale-refresh-jsonl-001" => Ok(()),
+            other => Err(format!(
+                "index refresh robot alias must preserve global robot format: {other:?}"
             )),
         }
     })
