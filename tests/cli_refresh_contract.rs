@@ -136,3 +136,69 @@ fn index_refresh_force_alias_stays_available_for_repair_scripts() -> Result<(), 
         }
     })
 }
+
+#[test]
+fn index_watch_refresh_entrypoints_remain_parseable() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "index",
+            "--watch",
+            "--watch-interval",
+            "7",
+            "--watch-once",
+            "/sessions/a.jsonl,/sessions/b.jsonl",
+            "--watch-once",
+            "/sessions/c.jsonl",
+            "--json",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Index {
+                watch: true,
+                watch_interval: 7,
+                watch_once: Some(paths),
+                json: true,
+                ..
+            }) => {
+                let rendered: Vec<String> = paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                if rendered
+                    == [
+                        "/sessions/a.jsonl",
+                        "/sessions/b.jsonl",
+                        "/sessions/c.jsonl",
+                    ]
+                {
+                    Ok(())
+                } else {
+                    Err(format!("watch-once paths parsed incorrectly: {rendered:?}"))
+                }
+            }
+            other => Err(format!(
+                "expected watch refresh entrypoint controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn index_watch_refresh_defaults_stay_bounded() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "index", "--watch"])?;
+
+        match cli.command {
+            Some(Commands::Index {
+                watch: true,
+                watch_interval: 30,
+                watch_once: None,
+                ..
+            }) => Ok(()),
+            other => Err(format!(
+                "expected bounded watch refresh defaults to parse: {other:?}"
+            )),
+        }
+    })
+}
