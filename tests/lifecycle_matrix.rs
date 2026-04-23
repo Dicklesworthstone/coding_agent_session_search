@@ -1329,3 +1329,72 @@ fn capabilities_features_and_connectors_contain_no_duplicates() {
         assert!(n >= 0, "limits.{key} must be non-negative; got {n}");
     }
 }
+
+#[test]
+fn semantic_readiness_block_has_expected_shape() {
+    // ibuuh.11 shape-contract row: the `state.semantic` block in
+    // `cass health --json` is a stable LLM-contract surface that agents
+    // parse to decide whether to wait for semantic catch-up, proceed
+    // with lexical-only, or prompt the operator. This test asserts each
+    // documented field is present with the expected type; a silent
+    // field rename like fallback_mode to fallback would degrade every
+    // agent's hybrid-planning branch without necessarily breaking the
+    // wider health golden.
+    //
+    // Separate-from-golden shape assertions catch the REAL intent
+    // (contract preservation) while leaving the golden free to change
+    // for cosmetic reasons like new added fields.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    assert!(
+        out.status.success(),
+        "cass health --json exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let sem = &health["state"]["semantic"];
+    assert!(sem.is_object(), "state.semantic must be an object");
+
+    // String-valued fields that must always be present.
+    for key in [
+        "status",
+        "availability",
+        "summary",
+        "fallback_mode",
+        "preferred_backend",
+        "hint",
+    ] {
+        assert!(
+            sem[key].is_string(),
+            "state.semantic.{key} must be a string; got {:?}",
+            sem[key]
+        );
+    }
+
+    // Bool-valued fields.
+    for key in ["available", "can_search", "hnsw_ready", "progressive_ready"] {
+        assert!(
+            sem[key].is_boolean(),
+            "state.semantic.{key} must be a bool; got {:?}",
+            sem[key]
+        );
+    }
+
+    // Nullable-path fields (must exist as either a string or null,
+    // present in every readiness payload regardless of install state).
+    for key in ["embedder_id", "vector_index_path", "model_dir", "hnsw_path"] {
+        let v = &sem[key];
+        assert!(
+            v.is_string() || v.is_null(),
+            "state.semantic.{key} must be string or null; got {v:?}"
+        );
+    }
+}
