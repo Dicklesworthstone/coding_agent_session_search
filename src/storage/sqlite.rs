@@ -542,10 +542,15 @@ impl FrankenConnectionManager {
             readers.push(parking_lot::Mutex::new(SendFrankenConnection(conn)));
         }
 
-        // Pre-fill bounded channel with tokens (acts as counting semaphore)
-        let (tx, rx) = crossbeam_channel::bounded(config.max_writers);
-        for _ in 0..config.max_writers {
-            tx.send(()).expect("pre-filling writer tokens");
+        let max_writers = config.max_writers.max(1);
+
+        // Pre-fill bounded channel with tokens (acts as counting semaphore).
+        // A zero-capacity channel with no initial tokens would make the first
+        // writer acquisition block forever.
+        let (tx, rx) = crossbeam_channel::bounded(max_writers);
+        for _ in 0..max_writers {
+            tx.send(())
+                .map_err(|_| anyhow!("writer token channel closed during initialization"))?;
         }
 
         Ok(Self {
@@ -553,7 +558,10 @@ impl FrankenConnectionManager {
             readers,
             reader_idx: std::sync::atomic::AtomicUsize::new(0),
             writer_tokens: (tx, rx),
-            config,
+            config: ConnectionManagerConfig {
+                reader_count,
+                max_writers,
+            },
         })
     }
 
@@ -18808,6 +18816,42 @@ mod tests {
         let mgr = FrankenConnectionManager::new(&db_path, config).unwrap();
         assert_eq!(mgr.reader_count(), 3);
         assert_eq!(mgr.max_writers(), 2);
+    }
+
+    #[test]
+    fn connection_manager_clamps_zero_writer_limit_to_prevent_deadlock() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cm.db");
+
+        let fs = FrankenStorage::open(&db_path).unwrap();
+        drop(fs);
+
+        let mgr = std::sync::Arc::new(
+            FrankenConnectionManager::new(
+                &db_path,
+                ConnectionManagerConfig {
+                    reader_count: 0,
+                    max_writers: 0,
+                },
+            )
+            .unwrap(),
+        );
+        assert_eq!(mgr.reader_count(), 1);
+        assert_eq!(mgr.max_writers(), 1);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mgr_for_thread = std::sync::Arc::clone(&mgr);
+        std::thread::spawn(move || {
+            let result = mgr_for_thread.writer().map(|mut guard| {
+                guard.mark_committed();
+            });
+            tx.send(result.is_ok()).expect("writer result send");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            "writer acquisition should not block forever when configured with zero writer slots"
+        );
     }
 
     #[test]
