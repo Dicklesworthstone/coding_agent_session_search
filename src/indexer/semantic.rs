@@ -737,6 +737,12 @@ fn fetch_canonical_embedding_batch(
     })
 }
 
+pub(crate) fn packet_embedding_inputs_from_storage(
+    storage: &FrankenStorage,
+) -> Result<Vec<EmbeddingInput>> {
+    Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
+}
+
 struct Prepared<'a> {
     msg: &'a EmbeddingInput,
     canonical: String,

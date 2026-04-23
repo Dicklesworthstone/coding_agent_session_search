@@ -57,7 +57,7 @@ use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome, MigrationError,
     seed_canonical_from_best_historical_bundle,
 };
-use semantic::{EmbeddingInput, SemanticIndexer};
+use semantic::{EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage};
 
 #[cfg(test)]
 use std::iter::Peekable;
@@ -1037,6 +1037,7 @@ fn capture_lexical_rebuild_pipeline_runtime(
     LexicalRebuildPipelineRuntimeSnapshot {
         queue_depth: sink_runtime.queue_depth,
         inflight_message_bytes: flow_limiter.bytes_in_flight(),
+        max_message_bytes_in_flight: flow_limiter.max_bytes_in_flight(),
         pending_batch_conversations: sink_runtime.pending_batch_conversations,
         pending_batch_message_bytes: sink_runtime.pending_batch_message_bytes,
         page_prep_workers: producer_snapshot.page_prep_workers,
@@ -3500,6 +3501,7 @@ struct PendingLexicalCommit {
 pub(crate) struct LexicalRebuildPipelineRuntimeSnapshot {
     pub queue_depth: usize,
     pub inflight_message_bytes: usize,
+    pub max_message_bytes_in_flight: usize,
     pub pending_batch_conversations: usize,
     pub pending_batch_message_bytes: usize,
     pub page_prep_workers: usize,
@@ -6959,7 +6961,6 @@ impl StreamingByteLimiter {
         self.cv.notify_all();
     }
 
-    #[cfg(test)]
     fn max_bytes_in_flight(&self) -> usize {
         self.max_bytes_in_flight.load(Ordering::Acquire)
     }
@@ -8951,49 +8952,16 @@ pub fn run_index(
 
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
 
-            // Fetch all messages with metadata from SQLite
-            let raw_messages = storage.fetch_messages_for_embedding()?;
+            let mut embedding_inputs = packet_embedding_inputs_from_storage(&storage)?;
             tracing::info!(
-                message_count = raw_messages.len(),
-                "fetched messages for embedding"
+                message_count = embedding_inputs.len(),
+                packet_driven = true,
+                "built semantic inputs from canonical ConversationPacket replay"
             );
 
-            // Convert to EmbeddingInput format
-            let embedding_inputs: Vec<EmbeddingInput> = raw_messages
-                .into_iter()
-                .filter_map(|msg| {
-                    if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
-                        return None;
-                    }
-
-                    let role_u8 = match msg.role.as_str() {
-                        "user" => ROLE_USER,
-                        "agent" | "assistant" => ROLE_ASSISTANT,
-                        "system" => ROLE_SYSTEM,
-                        "tool" => ROLE_TOOL,
-                        _ => ROLE_USER, // default to user for unknown roles
-                    };
-
-                    let Some(message_id) = message_id_from_db(msg.message_id) else {
-                        tracing::warn!(
-                            raw_message_id = msg.message_id,
-                            "Skipping message with out-of-range id during semantic indexing"
-                        );
-                        return None;
-                    };
-
-                    Some(EmbeddingInput {
-                        message_id,
-                        created_at_ms: msg.created_at.unwrap_or(0),
-                        agent_id: saturating_u32_from_i64(msg.agent_id),
-                        workspace_id: saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
-                        source_id: msg.source_id_hash,
-                        role: role_u8,
-                        chunk_idx: 0,
-                        content: msg.content,
-                    })
-                })
-                .collect();
+            embedding_inputs.retain(|message| {
+                !is_hard_message_noise(semantic_role_name(message.role), &message.content)
+            });
 
             // Generate embeddings
             let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
@@ -9454,6 +9422,16 @@ fn release_watch_storage_after_index(
                 db_path.display()
             ))
         }
+    }
+}
+
+fn semantic_role_name(role: u8) -> Option<&'static str> {
+    match role {
+        ROLE_USER => Some("user"),
+        ROLE_ASSISTANT => Some("assistant"),
+        ROLE_SYSTEM => Some("system"),
+        ROLE_TOOL => Some("tool"),
+        _ => None,
     }
 }
 
@@ -26745,6 +26723,7 @@ mod tests {
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 3,
             inflight_message_bytes: 65_536,
+            max_message_bytes_in_flight: 131_072,
             pending_batch_conversations: 9,
             pending_batch_message_bytes: 131_072,
             page_prep_workers: 6,
@@ -26821,6 +26800,7 @@ mod tests {
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 2,
             inflight_message_bytes: 32_768,
+            max_message_bytes_in_flight: 65_536,
             pending_batch_conversations: 4,
             pending_batch_message_bytes: 65_536,
             page_prep_workers: 4,
@@ -27132,6 +27112,7 @@ mod tests {
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 2,
             inflight_message_bytes: 32_768,
+            max_message_bytes_in_flight: 65_536,
             pending_batch_conversations: 4,
             pending_batch_message_bytes: 65_536,
             page_prep_workers: 4,
@@ -27224,6 +27205,7 @@ mod tests {
         stale_state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 2,
             inflight_message_bytes: 32_768,
+            max_message_bytes_in_flight: 65_536,
             pending_batch_conversations: 4,
             pending_batch_message_bytes: 65_536,
             page_prep_workers: 4,
@@ -27303,6 +27285,7 @@ mod tests {
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 1,
             inflight_message_bytes: 1_024,
+            max_message_bytes_in_flight: 4_096,
             pending_batch_conversations: 1,
             pending_batch_message_bytes: 2_048,
             page_prep_workers: 2,
@@ -27334,6 +27317,7 @@ mod tests {
         let refreshed_runtime = LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 3,
             inflight_message_bytes: 4_096,
+            max_message_bytes_in_flight: 16_384,
             pending_batch_conversations: 2,
             pending_batch_message_bytes: 8_192,
             page_prep_workers: 4,
@@ -27397,6 +27381,7 @@ mod tests {
         let runtime = LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 2,
             inflight_message_bytes: 2_048,
+            max_message_bytes_in_flight: 8_192,
             pending_batch_conversations: 1,
             pending_batch_message_bytes: 4_096,
             page_prep_workers: 2,
@@ -27488,6 +27473,7 @@ mod tests {
         let runtime = LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 0,
             inflight_message_bytes: 0,
+            max_message_bytes_in_flight: 4_096,
             pending_batch_conversations: 1,
             pending_batch_message_bytes: 128,
             page_prep_workers: 1,
@@ -27576,6 +27562,7 @@ mod tests {
         let runtime = LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 1,
             inflight_message_bytes: 1_024,
+            max_message_bytes_in_flight: 4_096,
             pending_batch_conversations: 1,
             pending_batch_message_bytes: 2_048,
             page_prep_workers: 2,
@@ -27653,6 +27640,7 @@ mod tests {
         state.set_runtime(&LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 1,
             inflight_message_bytes: 1_024,
+            max_message_bytes_in_flight: 4_096,
             pending_batch_conversations: 1,
             pending_batch_message_bytes: 2_048,
             page_prep_workers: 2,
@@ -27684,6 +27672,7 @@ mod tests {
         let refreshed_runtime = LexicalRebuildPipelineRuntimeSnapshot {
             queue_depth: 0,
             inflight_message_bytes: 0,
+            max_message_bytes_in_flight: 4_096,
             pending_batch_conversations: 0,
             pending_batch_message_bytes: 0,
             page_prep_workers: 2,
