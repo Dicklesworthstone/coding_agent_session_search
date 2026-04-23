@@ -591,6 +591,276 @@ fn many_core_responsiveness_gate_persists_phase_utilization_evidence() {
 }
 
 #[test]
+fn segment_farm_rebuild_validates_shards_before_atomic_publish() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "segment_farm_validated_atomic_publish",
+        LoadScript::new(vec![
+            LoadSample::idle("planning_budget"),
+            LoadSample::idle("parallel_workers"),
+            LoadSample::loaded("assembly_validation"),
+            LoadSample::busy("publish_crash"),
+            LoadSample::idle("fallback_recovery"),
+            LoadSample::idle("atomic_publish_success"),
+        ]),
+    );
+
+    harness.install_failpoint_once(
+        FailpointId::Publish(PublishCrashWindow::SwapPublishedGeneration),
+        FailpointEffect::CrashOnce,
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "deterministic_shard_plan")
+        .turn(SimulationActor::LexicalRepair, "parallel_shard_validation")
+        .turn(SimulationActor::LexicalRepair, "assemble_generation")
+        .turn(SimulationActor::LexicalRepair, "publish_swap_crash")
+        .turn(SimulationActor::ForegroundSearch, "serve_old_good")
+        .turn(SimulationActor::LexicalRepair, "retry_atomic_publish");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "deterministic_shard_plan") => {
+                sim.phase(
+                    "segment_farm_planning",
+                    "deterministic shard planning records conversation, message, byte, and worker budgets",
+                );
+                sim.snapshot_json(
+                    "deterministic_shard_plan",
+                    &json!({
+                        "corpus_digest": "blake3:canonical-corpus-042",
+                        "stable_order": "conversation_id,message_ordinal,byte_offset",
+                        "conversation_budget_per_shard": 4_000,
+                        "message_budget_per_shard": 80_000,
+                        "byte_budget_per_shard": 268_435_456,
+                        "worker_concurrency": 24,
+                        "reserved_cores": 4,
+                        "shard_ids": ["shard-000", "shard-001", "shard-002", "shard-003"],
+                        "plan_digest": "blake3:segment-plan-stable",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "parallel_shard_validation") => {
+                sim.phase(
+                    "segment_farm_validation",
+                    "parallel shard outputs validate independently before assembly",
+                );
+                sim.snapshot_json(
+                    "parallel_shard_validation",
+                    &json!({
+                        "validated_shards": [
+                            {"id": "shard-000", "segment_digest": "blake3:seg-000", "doc_count": 41_000},
+                            {"id": "shard-001", "segment_digest": "blake3:seg-001", "doc_count": 39_500},
+                            {"id": "shard-002", "segment_digest": "blake3:seg-002", "doc_count": 40_250},
+                            {"id": "shard-003", "segment_digest": "blake3:seg-003", "doc_count": 38_900}
+                        ],
+                        "validation": "all_shards_passed",
+                        "partial_success_publishable": false,
+                        "capability_fallback": "improved_serial",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "assemble_generation") => {
+                sim.phase(
+                    "segment_farm_assembly",
+                    "validated shards assemble into exactly one publishable lexical generation",
+                );
+                sim.snapshot_json(
+                    "assembled_publishable_generation",
+                    &json!({
+                        "generation_id": "lexical-gen-segment-farm-019",
+                        "source_shard_count": 4,
+                        "assembly_digest": "blake3:assembled-generation-019",
+                        "manifest_digest": "blake3:manifest-019",
+                        "search_ready": true,
+                        "publishable_generation_count": 1,
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "publish_swap_crash") => {
+                sim.phase(
+                    "atomic_publish",
+                    "swap crash is injected before the segment-farm generation becomes visible",
+                );
+                sim.snapshot_json(
+                    "publish_swap_crash_window",
+                    &json!({
+                        "candidate_generation": "lexical-gen-segment-farm-019",
+                        "previous_visible_generation": "old_good",
+                        "publish_step": "swap_published_generation",
+                        "visible_after_crash": "old_good",
+                        "rollback_safety": "old_good_generation_retained",
+                        "status": "crash_injected"
+                    }),
+                );
+                sim.trigger_failpoint(FailpointId::Publish(
+                    PublishCrashWindow::SwapPublishedGeneration,
+                ))
+            }
+            (SimulationActor::ForegroundSearch, "serve_old_good") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground search serves old-good generation after publish crash",
+                );
+                sim.snapshot_json(
+                    "old_good_fallback_after_publish_crash",
+                    &json!({
+                        "requested_search_mode": "hybrid",
+                        "realized_index_path": "verified_serial",
+                        "visible_generation": "old_good",
+                        "candidate_generation_visible": false,
+                        "blocked_wait_ms": 0,
+                        "fallback_reason": "segment_farm_publish_crash",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "retry_atomic_publish") => {
+                sim.phase(
+                    "atomic_publish",
+                    "retry promotes the validated segment-farm generation atomically",
+                );
+                sim.snapshot_json(
+                    "retry_atomic_publish_success",
+                    &json!({
+                        "published_generation": "lexical-gen-segment-farm-019",
+                        "previous_generation": "old_good",
+                        "atomic_swap": true,
+                        "old_good_retained_for_rollback": true,
+                        "manifest_digest": "blake3:manifest-019",
+                        "search_ready": true,
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic segment-farm turn"),
+        });
+
+    assert_eq!(results.len(), 6);
+    assert!(results[0].is_ok());
+    assert!(results[1].is_ok());
+    assert!(results[2].is_ok());
+    assert!(matches!(
+        &results[3],
+        Err(SimulationFailure::Crash { failpoint })
+            if *failpoint == FailpointId::Publish(PublishCrashWindow::SwapPublishedGeneration)
+    ));
+    assert!(results[4].is_ok());
+    assert!(results[5].is_ok());
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 6);
+    assert_eq!(summary.actor_traces[0].load.label, "planning_budget");
+    assert_eq!(summary.actor_traces[1].load.label, "parallel_workers");
+    assert_eq!(summary.actor_traces[2].load.label, "assembly_validation");
+    assert_eq!(summary.actor_traces[3].load.label, "publish_crash");
+    assert!(summary.actor_traces[3].load.user_active);
+    assert_eq!(summary.actor_traces[4].load.label, "fallback_recovery");
+    assert_eq!(summary.actor_traces[5].load.label, "atomic_publish_success");
+
+    for expected in [
+        "001-deterministic_shard_plan.json",
+        "002-parallel_shard_validation.json",
+        "003-assembled_publishable_generation.json",
+        "004-publish_swap_crash_window.json",
+        "005-old_good_fallback_after_publish_crash.json",
+        "006-retry_atomic_publish_success.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing segment-farm snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write segment-farm artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.failpoints_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("deterministic shard planning records"),
+        "phase log should preserve shard-planning budgets"
+    );
+    assert!(
+        phase_log.contains("foreground search serves old-good generation"),
+        "phase log should preserve old-good fallback evidence"
+    );
+
+    let plan_path = artifacts
+        .snapshot_dir
+        .join("001-deterministic_shard_plan.json");
+    let plan_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("read shard plan"))
+            .expect("shard plan JSON");
+    assert_eq!(plan_json["worker_concurrency"], 24);
+    assert_eq!(plan_json["reserved_cores"], 4);
+    assert_eq!(plan_json["plan_digest"], "blake3:segment-plan-stable");
+    assert_eq!(
+        plan_json["shard_ids"]
+            .as_array()
+            .expect("shard ids array")
+            .len(),
+        4
+    );
+
+    let validation_path = artifacts
+        .snapshot_dir
+        .join("002-parallel_shard_validation.json");
+    let validation_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&validation_path).expect("read shard validation"))
+            .expect("shard validation JSON");
+    assert_eq!(validation_json["validation"], "all_shards_passed");
+    assert_eq!(validation_json["partial_success_publishable"], false);
+    assert_eq!(validation_json["capability_fallback"], "improved_serial");
+
+    let assembly_path = artifacts
+        .snapshot_dir
+        .join("003-assembled_publishable_generation.json");
+    let assembly_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&assembly_path).expect("read assembly"))
+            .expect("assembly JSON");
+    assert_eq!(assembly_json["publishable_generation_count"], 1);
+    assert_eq!(
+        assembly_json["generation_id"],
+        "lexical-gen-segment-farm-019"
+    );
+
+    let fallback_path = artifacts
+        .snapshot_dir
+        .join("005-old_good_fallback_after_publish_crash.json");
+    let fallback_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&fallback_path).expect("read fallback"))
+            .expect("fallback JSON");
+    assert_eq!(fallback_json["visible_generation"], "old_good");
+    assert_eq!(fallback_json["candidate_generation_visible"], false);
+    assert_eq!(fallback_json["blocked_wait_ms"], 0);
+
+    let publish_path = artifacts
+        .snapshot_dir
+        .join("006-retry_atomic_publish_success.json");
+    let publish_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&publish_path).expect("read publish success"))
+            .expect("publish success JSON");
+    assert_eq!(
+        publish_json["published_generation"],
+        "lexical-gen-segment-farm-019"
+    );
+    assert_eq!(publish_json["atomic_swap"], true);
+    assert_eq!(publish_json["old_good_retained_for_rollback"], true);
+}
+
+#[test]
 fn shadow_divergence_demotes_segment_farm_to_verified_serial_path() {
     let mut harness = SearchAssetSimulationHarness::new(
         "shadow_divergence_demotes_segment_farm",
