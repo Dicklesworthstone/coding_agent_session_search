@@ -2792,3 +2792,108 @@ fn models_verify_and_status_agree_on_cache_identity_and_phase() {
         "verify.error is empty despite all_valid=false — operators lose the reason why verification failed"
     );
 }
+
+#[test]
+fn models_check_update_and_status_agree_on_revision_when_absent() {
+    // ibuuh.19 cross-command revision-agreement row.
+    //
+    // `cass models check-update --json` and `cass models status --json`
+    // both advertise a revision string that keys the model cache for
+    // retention and acquisition:
+    //
+    //   status:        status.revision                 — canonical content-addressing key
+    //   check-update:  check-update.latest_revision    — upstream target revision
+    //                  check-update.current_revision   — locally-installed revision (null if none)
+    //
+    // For retention to reason about "what version we have vs what
+    // version upstream advertises," the two commands MUST agree on
+    // the identity of the upstream model. If `status.revision` and
+    // `check-update.latest_revision` drifted, retention would
+    // compare the installed revision against the wrong target and
+    // either falsely decide "up to date" or falsely decide "stale."
+    //
+    // Plus the absent-gate coherence: when `status.installed=false`,
+    // `check-update.current_revision` must be null (nothing is
+    // installed to report a revision for) and `update_available`
+    // must be false (you cannot "update" something that isn't
+    // installed — the operator should `install` first), with a
+    // non-empty `reason` explaining why.
+    //
+    // This is the first lifecycle-matrix coverage of
+    // `cass models check-update --json`.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    let s_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(s_out.status.success(), "cass models status --json failed");
+    let status: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8"))
+            .expect("valid JSON");
+
+    let u_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "check-update", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models check-update --json");
+    assert!(
+        u_out.status.success(),
+        "cass models check-update --json failed"
+    );
+    let check: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(u_out.stdout).expect("utf8"))
+            .expect("valid JSON");
+
+    // Invariant A: cross-command revision identity.
+    let s_rev = status["revision"]
+        .as_str()
+        .expect("status.revision must be a string");
+    let latest_rev = check["latest_revision"]
+        .as_str()
+        .expect("check-update.latest_revision must be a string");
+    assert_eq!(
+        s_rev, latest_rev,
+        "status.revision ({s_rev}) diverged from check-update.latest_revision ({latest_rev}) — the two commands disagree on which upstream revision is canonical"
+    );
+
+    // Precondition: isolated HOME, nothing installed.
+    let installed = status["installed"]
+        .as_bool()
+        .expect("status.installed must be a bool");
+    assert!(!installed, "isolated HOME unexpectedly installed=true");
+
+    // Invariant B: installed=false ⇒ check-update.current_revision=null.
+    let current_rev = &check["current_revision"];
+    assert!(
+        current_rev.is_null(),
+        "installed=false but check-update.current_revision={current_rev:?} — there is no installed revision to report"
+    );
+
+    // Invariant C: installed=false ⇒ update_available=false.
+    let update_available = check["update_available"]
+        .as_bool()
+        .expect("check-update.update_available must be a bool");
+    assert!(
+        !update_available,
+        "installed=false but check-update.update_available=true — you cannot 'update' a model that is not installed; operator should 'install' first"
+    );
+
+    // Invariant D: reason is a non-empty string explaining why
+    // (e.g. 'model_not_installed'). Operators lose triage info if
+    // the reason is empty or null.
+    let reason = check["reason"]
+        .as_str()
+        .expect("check-update.reason must be a string");
+    assert!(
+        !reason.trim().is_empty(),
+        "check-update.reason is empty — operator has no explanation for update_available={update_available}"
+    );
+}
