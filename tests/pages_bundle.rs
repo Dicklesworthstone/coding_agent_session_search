@@ -191,7 +191,29 @@ mod tests {
         let manifest: IntegrityManifest = serde_json::from_str(&integrity_content)?;
 
         assert_eq!(manifest.version, 1);
-        assert!(!manifest.files.is_empty(), "Should have file entries");
+        // BundleBuilder embeds a fixed set of static assets from
+        // src/pages/bundle.rs::PAGES_ASSETS (index.html + 14 JS/CSS
+        // modules = 15 assets) plus whatever payload chunks the
+        // encrypted archive produced. A manifest with fewer than 15
+        // entries means the asset-embedding step silently dropped
+        // files — `!is_empty()` would silently accept a broken 1-file
+        // bundle.
+        assert!(
+            manifest.files.len() >= 15,
+            "integrity manifest must list at least the 15 embedded \
+             PAGES_ASSETS + payload chunks; got {} entries: {:?}",
+            manifest.files.len(),
+            manifest.files.keys().collect::<Vec<_>>()
+        );
+        for expected_asset in ["index.html", "styles.css", "sw.js", "viewer.js", "auth.js"] {
+            assert!(
+                manifest.files.contains_key(expected_asset),
+                "integrity manifest must list the expected static asset `{}`; \
+                 got keys: {:?}",
+                expected_asset,
+                manifest.files.keys().collect::<Vec<_>>()
+            );
+        }
 
         // Verify integrity.json is not in the manifest (chicken/egg)
         assert!(!manifest.files.contains_key("integrity.json"));
