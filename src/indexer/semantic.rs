@@ -1393,9 +1393,76 @@ impl SemanticIndexer {
 mod tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::sqlite::{FrankenStorage, MessageForEmbedding};
     use serde_json::json;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct ComparableSemanticInput {
+        message_id: u64,
+        created_at_ms: i64,
+        agent_id: u32,
+        workspace_id: u32,
+        source_id: u32,
+        role: u8,
+        content: String,
+    }
+
+    fn comparable_semantic_inputs(mut inputs: Vec<EmbeddingInput>) -> Vec<ComparableSemanticInput> {
+        let mut comparable: Vec<ComparableSemanticInput> = inputs
+            .drain(..)
+            .map(|input| ComparableSemanticInput {
+                message_id: input.message_id,
+                created_at_ms: input.created_at_ms,
+                agent_id: input.agent_id,
+                workspace_id: input.workspace_id,
+                source_id: input.source_id,
+                role: input.role,
+                content: input.content,
+            })
+            .collect();
+        comparable.sort();
+        comparable
+    }
+
+    fn comparable_legacy_semantic_inputs(
+        messages: Vec<MessageForEmbedding>,
+    ) -> Vec<ComparableSemanticInput> {
+        let mut comparable: Vec<ComparableSemanticInput> = messages
+            .into_iter()
+            .filter_map(|msg| {
+                if crate::search::canonicalize::is_hard_message_noise(
+                    Some(msg.role.as_str()),
+                    &msg.content,
+                ) {
+                    return None;
+                }
+
+                let role = match msg.role.as_str() {
+                    "user" => role_code_from_str("user").unwrap(),
+                    "agent" | "assistant" => role_code_from_str("assistant").unwrap(),
+                    "system" => role_code_from_str("system").unwrap(),
+                    "tool" => role_code_from_str("tool").unwrap(),
+                    _ => role_code_from_str("user").unwrap(),
+                };
+
+                super::message_id_from_db(msg.message_id).map(|message_id| {
+                    ComparableSemanticInput {
+                        message_id,
+                        created_at_ms: msg.created_at.unwrap_or(0),
+                        agent_id: super::saturating_u32_from_i64(msg.agent_id),
+                        workspace_id: super::saturating_u32_from_i64(msg.workspace_id.unwrap_or(0)),
+                        source_id: msg.source_id_hash,
+                        role,
+                        content: msg.content,
+                    }
+                })
+            })
+            .collect();
+        comparable.sort();
+        comparable
+    }
 
     fn test_conversation(external_id: &str, body: &str) -> Conversation {
         Conversation {
@@ -2128,6 +2195,168 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         assert_eq!(batch.raw_max_message_id, Some(expected_raw_max_id));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_since_fetch_and_packet_catch_up_emit_equivalent_semantic_docs() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace_id = storage.ensure_workspace(Path::new("/tmp/workspace"), None)?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "legacy-packet-semantics",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "before watermark".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "before watermark assistant".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let watermark: i64 = storage.raw().query_row_map(
+            "SELECT MAX(id) FROM messages",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "legacy-packet-semantics",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "before watermark".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "before watermark assistant".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_700),
+                        content: "after watermark assistant".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 3,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_000_800),
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "legacy-packet-semantics-second-conv",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::Tool,
+                        author: None,
+                        created_at: Some(1_700_000_000_900),
+                        content: "after watermark tool".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_001_000),
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        let legacy_raw = storage.fetch_messages_for_embedding_since(watermark)?;
+        let packet_batch = packet_embedding_inputs_from_storage_since(&storage, watermark)?;
+        let normalized_source_id =
+            normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
+        let source_id_hash = crc32fast::hash(normalized_source_id.as_bytes());
+        let expected = vec![
+            ComparableSemanticInput {
+                message_id: u64::try_from(watermark + 1).unwrap(),
+                created_at_ms: 1_700_000_000_700,
+                agent_id: u32::try_from(agent_id).unwrap(),
+                workspace_id: u32::try_from(workspace_id).unwrap(),
+                source_id: source_id_hash,
+                role: role_code_from_str("assistant").unwrap(),
+                content: "after watermark assistant".to_string(),
+            },
+            ComparableSemanticInput {
+                message_id: u64::try_from(watermark + 3).unwrap(),
+                created_at_ms: 1_700_000_000_900,
+                agent_id: u32::try_from(agent_id).unwrap(),
+                workspace_id: u32::try_from(workspace_id).unwrap(),
+                source_id: source_id_hash,
+                role: role_code_from_str("tool").unwrap(),
+                content: "after watermark tool".to_string(),
+            },
+        ];
+
+        assert_eq!(comparable_legacy_semantic_inputs(legacy_raw), expected);
+        assert_eq!(comparable_semantic_inputs(packet_batch.inputs), expected);
+        assert_eq!(packet_batch.conversations_in_batch, 2);
+        assert_eq!(packet_batch.raw_max_message_id, Some(watermark + 4));
         Ok(())
     }
 
