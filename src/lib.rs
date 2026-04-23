@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod analytics;
 pub mod bakeoff;
 pub mod bookmarks;
@@ -14892,6 +14894,181 @@ fn should_skip_arg(arg: &Arg) -> bool {
     arg.is_hide_set() || matches!(arg.get_id().as_str(), "help" | "version")
 }
 
+fn response_schema_index_state() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "exists": { "type": "boolean" },
+            "status": { "type": "string" },
+            "reason": { "type": ["string", "null"] },
+            "fresh": { "type": "boolean" },
+            "last_indexed_at": { "type": ["string", "null"] },
+            "age_seconds": { "type": ["integer", "null"] },
+            "stale": { "type": "boolean" },
+            "stale_threshold_seconds": { "type": "integer" },
+            "rebuilding": { "type": "boolean" },
+            "activity_at": { "type": ["string", "null"] },
+            "documents": { "type": ["integer", "null"] },
+            "empty_with_messages": { "type": "boolean" },
+            "fingerprint": {
+                "type": "object",
+                "properties": {
+                    "current_db_fingerprint": { "type": ["string", "null"] },
+                    "checkpoint_fingerprint": { "type": ["string", "null"] },
+                    "matches_current_db_fingerprint": { "type": ["boolean", "null"] }
+                }
+            },
+            "checkpoint": {
+                "type": "object",
+                "properties": {
+                    "present": { "type": "boolean" },
+                    "completed": { "type": ["boolean", "null"] },
+                    "db_matches": { "type": ["boolean", "null"] },
+                    "schema_matches": { "type": ["boolean", "null"] },
+                    "page_size_matches": { "type": ["boolean", "null"] },
+                    "page_size_compatible": { "type": ["boolean", "null"] }
+                }
+            }
+        }
+    })
+}
+
+fn response_schema_state_database() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "exists": { "type": "boolean" },
+            "opened": { "type": "boolean" },
+            "conversations": { "type": ["integer", "null"] },
+            "messages": { "type": ["integer", "null"] },
+            "open_error": { "type": ["string", "null"] },
+            "open_retryable": { "type": "boolean" },
+            "counts_skipped": { "type": "boolean" }
+        }
+    })
+}
+
+fn response_schema_status_database() -> serde_json::Value {
+    let mut schema = response_schema_state_database();
+    let props = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("status database schema should expose properties");
+    props.insert("path".to_string(), serde_json::json!({ "type": "string" }));
+    schema
+}
+
+fn response_schema_health_db() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "exists": { "type": "boolean" },
+            "opened": { "type": "boolean" },
+            "conversations": { "type": ["integer", "null"] },
+            "messages": { "type": ["integer", "null"] },
+            "open_error": { "type": ["string", "null"] },
+            "counts_skipped": { "type": "boolean" }
+        }
+    })
+}
+
+fn response_schema_pending_state() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "sessions": { "type": "integer" },
+            "watch_active": { "type": "boolean" },
+            "orphaned": { "type": "boolean" }
+        }
+    })
+}
+
+fn response_schema_rebuild_state() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "active": { "type": "boolean" },
+            "orphaned": { "type": "boolean" },
+            "pid": { "type": ["integer", "null"] },
+            "mode": { "type": ["string", "null"] },
+            "job_id": { "type": ["string", "null"] },
+            "job_kind": { "type": ["string", "null"] },
+            "phase": { "type": ["string", "null"] },
+            "started_at": { "type": ["string", "null"] },
+            "updated_at": { "type": ["string", "null"] },
+            "processed_conversations": { "type": ["integer", "null"] },
+            "total_conversations": { "type": ["integer", "null"] },
+            "indexed_docs": { "type": ["integer", "null"] },
+            "pipeline": {
+                "type": "object",
+                "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
+                "additionalProperties": true
+            }
+        }
+    })
+}
+
+fn response_schema_semantic_state() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string" },
+            "availability": { "type": "string" },
+            "summary": { "type": "string" },
+            "available": { "type": "boolean" },
+            "can_search": { "type": "boolean" },
+            "fallback_mode": { "type": ["string", "null"] },
+            "preferred_backend": { "type": "string" },
+            "embedder_id": { "type": ["string", "null"] },
+            "vector_index_path": { "type": ["string", "null"] },
+            "model_dir": { "type": ["string", "null"] },
+            "hnsw_path": { "type": ["string", "null"] },
+            "hnsw_ready": { "type": "boolean" },
+            "progressive_ready": { "type": "boolean" },
+            "hint": { "type": ["string", "null"] }
+        }
+    })
+}
+
+fn response_schema_state_meta() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "index": response_schema_index_state(),
+            "database": response_schema_state_database(),
+            "pending": response_schema_pending_state(),
+            "rebuild": response_schema_rebuild_state(),
+            "semantic": response_schema_semantic_state(),
+            "_meta": {
+                "type": "object",
+                "properties": {
+                    "timestamp": { "type": "string" },
+                    "data_dir": { "type": "string" },
+                    "db_path": { "type": "string" }
+                }
+            }
+        }
+    })
+}
+
+fn response_schema_index_freshness() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "exists": { "type": "boolean" },
+            "status": { "type": "string" },
+            "reason": { "type": ["string", "null"] },
+            "fresh": { "type": "boolean" },
+            "last_indexed_at": { "type": ["string", "null"] },
+            "age_seconds": { "type": ["integer", "null"] },
+            "stale": { "type": "boolean" },
+            "stale_threshold_seconds": { "type": "integer" },
+            "rebuilding": { "type": "boolean" },
+            "pending_sessions": { "type": "integer" }
+        }
+    })
+}
+
 /// Build response schemas for commands that support JSON output.
 ///
 /// Returns a `BTreeMap` so the serialized JSON object has deterministic
@@ -14955,6 +15132,12 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "type": "object",
                     "properties": {
                         "elapsed_ms": { "type": "integer" },
+                        "search_mode": { "type": ["string", "null"] },
+                        "requested_search_mode": { "type": ["string", "null"] },
+                        "mode_defaulted": { "type": ["boolean", "null"] },
+                        "fallback_tier": { "type": ["string", "null"] },
+                        "fallback_reason": { "type": ["string", "null"] },
+                        "semantic_refinement": { "type": ["boolean", "null"] },
                         "wildcard_fallback": { "type": "boolean" },
                         "cache_stats": {
                             "type": "object",
@@ -14964,46 +15147,41 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                                 "shortfall": { "type": "integer" }
                             }
                         },
+                        "timing": {
+                            "type": "object",
+                            "properties": {
+                                "search_ms": { "type": "integer" },
+                                "rerank_ms": { "type": "integer" },
+                                "other_ms": { "type": "integer" }
+                            }
+                        },
                         "tokens_estimated": { "type": ["integer", "null"] },
                         "max_tokens": { "type": ["integer", "null"] },
                         "request_id": { "type": ["string", "null"] },
                         "next_cursor": { "type": ["string", "null"] },
                         "hits_clamped": { "type": "boolean" },
-                        "state": {
-                            "type": "object",
-                            "properties": {
-                                "index": {
-                                    "type": "object",
-                                    "properties": {
-                                        "exists": { "type": "boolean" },
-                                        "fresh": { "type": "boolean" },
-                                        "last_indexed_at": { "type": ["string", "null"] },
-                                        "age_seconds": { "type": ["integer", "null"] },
-                                        "stale": { "type": "boolean" },
-                                        "stale_threshold_seconds": { "type": "integer" }
-                                    }
-                                },
-                                "database": {
-                                    "type": "object",
-                                    "properties": {
-                                        "exists": { "type": "boolean" },
-                                        "conversations": { "type": "integer" },
-                                        "messages": { "type": "integer" }
-                                    }
-                                }
-                            }
-                        },
-                        "index_freshness": {
-                            "type": "object",
-                            "properties": {
-                                "last_indexed_at": { "type": ["string", "null"] },
-                                "age_seconds": { "type": ["integer", "null"] },
-                                "stale": { "type": "boolean" },
-                                "pending_sessions": { "type": "integer" },
-                                "fresh": { "type": "boolean" }
-                            }
+                        "state": response_schema_state_meta(),
+                        "index_freshness": response_schema_index_freshness(),
+                        "timeout_ms": { "type": ["integer", "null"] },
+                        "timed_out": { "type": ["boolean", "null"] },
+                        "partial_results": { "type": ["boolean", "null"] },
+                        "ann_stats": {
+                            "type": ["object", "null"],
+                            "additionalProperties": true
                         }
                     }
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                },
+                "explanation": {
+                    "type": ["object", "null"],
+                    "additionalProperties": true
+                },
+                "_timeout": {
+                    "type": ["object", "null"],
+                    "additionalProperties": true
                 }
             }
         }),
@@ -15019,33 +15197,11 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
-                "index": {
-                    "type": "object",
-                    "properties": {
-                        "exists": { "type": "boolean" },
-                        "fresh": { "type": "boolean" },
-                        "last_indexed_at": { "type": ["string", "null"] },
-                        "age_seconds": { "type": ["integer", "null"] },
-                        "stale": { "type": "boolean" },
-                        "stale_threshold_seconds": { "type": "integer" }
-                    }
-                },
-                "database": {
-                    "type": "object",
-                    "properties": {
-                        "exists": { "type": "boolean" },
-                        "conversations": { "type": "integer" },
-                        "messages": { "type": "integer" },
-                        "path": { "type": "string" }
-                    }
-                },
-                "pending": {
-                    "type": "object",
-                    "properties": {
-                        "sessions": { "type": "integer" },
-                        "watch_active": { "type": ["boolean", "null"] }
-                    }
-                },
+                "index": response_schema_index_state(),
+                "database": response_schema_status_database(),
+                "pending": response_schema_pending_state(),
+                "rebuild": response_schema_rebuild_state(),
+                "semantic": response_schema_semantic_state(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -15095,33 +15251,11 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
                 "recommended_action": { "type": ["string", "null"] },
-                "index": {
-                    "type": "object",
-                    "properties": {
-                        "exists": { "type": "boolean" },
-                        "fresh": { "type": "boolean" },
-                        "last_indexed_at": { "type": ["string", "null"] },
-                        "age_seconds": { "type": ["integer", "null"] },
-                        "stale": { "type": "boolean" },
-                        "stale_threshold_seconds": { "type": "integer" }
-                    }
-                },
-                "database": {
-                    "type": "object",
-                    "properties": {
-                        "exists": { "type": "boolean" },
-                        "conversations": { "type": "integer" },
-                        "messages": { "type": "integer" },
-                        "path": { "type": "string" }
-                    }
-                },
-                "pending": {
-                    "type": "object",
-                    "properties": {
-                        "sessions": { "type": "integer" },
-                        "watch_active": { "type": ["boolean", "null"] }
-                    }
-                },
+                "index": response_schema_index_state(),
+                "database": response_schema_status_database(),
+                "pending": response_schema_pending_state(),
+                "rebuild": response_schema_rebuild_state(),
+                "semantic": response_schema_semantic_state(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -15377,6 +15511,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "items": { "type": "string" }
                 },
                 "latency_ms": { "type": "integer" },
+                "db": response_schema_health_db(),
                 "responsiveness": {
                     "type": "object",
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -15417,6 +15552,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         }
                     }
                 },
+                "state": response_schema_state_meta(),
                 "parallel_wal_shadow": {
                     "type": "object",
                     "description": "Parallel-WAL shadow observer (Card 1, shadow-only phase). Activates under CASS_INDEXER_PARALLEL_WAL=shadow. Records per-chunk wall-clock on begin-concurrent writes so operators can assess what an epoch-ordered group-commit coordinator would have decided. NEVER changes commit semantics.",
@@ -15440,51 +15576,65 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                             }
                         }
                     }
-                },
-                "state": {
-                    "type": "object",
-                    "properties": {
-                        "_meta": {
-                            "type": "object",
-                            "properties": {
-                                "data_dir": { "type": "string" },
-                                "db_path": { "type": "string" },
-                                "timestamp": { "type": "string" }
-                            }
-                        },
-                        "database": {
-                            "type": "object",
-                            "properties": {
-                                "exists": { "type": "boolean" },
-                                "conversations": { "type": "integer" },
-                                "messages": { "type": "integer" }
-                            }
-                        },
-                        "index": {
-                            "type": "object",
-                            "properties": {
-                                "exists": { "type": "boolean" },
-                                "fresh": { "type": "boolean" },
-                                "last_indexed_at": { "type": ["string", "null"] },
-                                "age_seconds": { "type": ["integer", "null"] },
-                                "stale": { "type": "boolean" },
-                                "stale_threshold_seconds": { "type": "integer" }
-                            }
-                        },
-                        "pending": {
-                            "type": "object",
-                            "properties": {
-                                "sessions": { "type": "integer" },
-                                "watch_active": { "type": ["boolean", "null"] }
-                            }
-                        }
-                    }
                 }
             }
         }),
     );
 
     schemas
+}
+
+#[cfg(test)]
+mod response_schema_tests {
+    use super::*;
+
+    #[test]
+    fn status_schema_includes_semantic_and_rebuild_truth() {
+        let schemas = build_response_schemas();
+        let status = &schemas["status"]["properties"];
+
+        assert!(status.get("semantic").is_some(), "status schema missing semantic block");
+        assert!(status.get("rebuild").is_some(), "status schema missing rebuild block");
+        assert_eq!(
+            status["index"]["properties"]["status"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(
+            status["database"]["properties"]["open_retryable"]["type"],
+            serde_json::json!("boolean")
+        );
+    }
+
+    #[test]
+    fn health_schema_tracks_full_nested_state() {
+        let schemas = build_response_schemas();
+        let state = &schemas["health"]["properties"]["state"]["properties"];
+
+        assert!(state.get("semantic").is_some(), "health.state schema missing semantic block");
+        assert!(state.get("rebuild").is_some(), "health.state schema missing rebuild block");
+        assert_eq!(
+            schemas["health"]["properties"]["db"]["properties"]["open_error"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+    }
+
+    #[test]
+    fn search_schema_includes_mode_and_fallback_metadata() {
+        let schemas = build_response_schemas();
+        let meta = &schemas["search"]["properties"]["_meta"]["properties"];
+
+        for key in [
+            "search_mode",
+            "requested_search_mode",
+            "fallback_tier",
+            "fallback_reason",
+            "semantic_refinement",
+            "timing",
+            "state",
+        ] {
+            assert!(meta.get(key).is_some(), "search _meta schema missing {key}");
+        }
+    }
 }
 
 fn role_to_export_string(role: &crate::model::types::MessageRole) -> String {
