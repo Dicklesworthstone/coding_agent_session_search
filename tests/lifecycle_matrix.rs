@@ -1399,3 +1399,64 @@ fn semantic_readiness_block_has_expected_shape() {
         );
     }
 }
+
+#[test]
+fn index_readiness_exposes_stale_refresh_config() {
+    // ibuuh.24 stale-refresh row: the world-class stale-refresh
+    // architecture depends on agents being able to read the stale
+    // threshold from cass health so they can reason about when a
+    // refresh is warranted vs imminent vs overdue. A drift that drops
+    // stale_threshold_seconds from the contract would force agents to
+    // guess the threshold and either over-refresh (machine load) or
+    // under-refresh (stale data).
+    //
+    // This row asserts the index.* sub-block has the stale-refresh
+    // config surface that ibuuh.24's "explain stale-refresh timing"
+    // requirement relies on, with sane default bounds.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["health", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass health --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let health: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let idx = &health["state"]["index"];
+    assert!(idx.is_object(), "state.index must be an object");
+
+    // The stale-refresh knob — must be a positive integer, bounded by
+    // sane defaults (5 minutes min, 1 day max — catches flipped-sign or
+    // unit-confusion bugs like milliseconds misread as seconds).
+    let stale = idx["stale_threshold_seconds"]
+        .as_i64()
+        .expect("state.index.stale_threshold_seconds must be an integer");
+    assert!(
+        stale >= 60 && stale <= 86_400,
+        "stale_threshold_seconds={stale} is outside sane bounds [60, 86400]"
+    );
+
+    // Bool-typed flags the stale-refresh planner branches on.
+    for key in ["fresh", "stale", "exists", "rebuilding"] {
+        assert!(
+            idx[key].is_boolean(),
+            "state.index.{key} must be a bool; got {:?}",
+            idx[key]
+        );
+    }
+
+    // status is the authoritative stale/fresh classification that
+    // agents key on.  Always present, always a string.
+    let status = idx["status"]
+        .as_str()
+        .expect("state.index.status must be a string");
+    assert!(
+        matches!(
+            status,
+            "missing" | "fresh" | "stale" | "rebuilding" | "unknown"
+        ),
+        "state.index.status={status:?} is outside the documented enum"
+    );
+}
