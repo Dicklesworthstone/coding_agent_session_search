@@ -743,6 +743,38 @@ pub(crate) fn packet_embedding_inputs_from_storage(
     Ok(fetch_canonical_embedding_batch(storage, 0, usize::MAX)?.inputs)
 }
 
+pub(crate) fn packet_embedding_inputs_from_canonical_delta(
+    conversation: &Conversation,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+) -> Vec<EmbeddingInput> {
+    let Some(conversation_id) = conversation.id else {
+        tracing::warn!(
+            source_path = %conversation.source_path.display(),
+            "skipping semantic delta ConversationPacket replay without canonical conversation id"
+        );
+        return Vec::new();
+    };
+
+    let row = CanonicalEmbeddingConversationRow {
+        conversation_id,
+        agent_slug: conversation.agent_slug.clone(),
+        agent_id,
+        workspace: conversation.workspace.clone(),
+        workspace_id,
+        external_id: conversation.external_id.clone(),
+        title: conversation.title.clone(),
+        source_path: conversation.source_path.clone(),
+        started_at: conversation.started_at,
+        ended_at: conversation.ended_at,
+        source_id: Some(conversation.source_id.clone()),
+        origin_host: conversation.origin_host.clone(),
+    };
+    let provenance = canonical_embedding_packet_provenance(&row);
+    let packet = ConversationPacket::from_canonical_replay(conversation, provenance);
+    embedding_inputs_from_conversation_packet(&row, &packet)
+}
+
 struct Prepared<'a> {
     msg: &'a EmbeddingInput,
     canonical: String,

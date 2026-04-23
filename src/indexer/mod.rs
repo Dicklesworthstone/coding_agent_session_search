@@ -4390,6 +4390,7 @@ struct LexicalRebuildResponsivenessController {
     reason: String,
     clear_samples: usize,
     last_transition_at: Instant,
+    last_observed_producer_handoff_wait_count: usize,
 }
 
 impl LexicalRebuildResponsivenessController {
@@ -4437,6 +4438,7 @@ impl LexicalRebuildResponsivenessController {
             reason,
             clear_samples: 0,
             last_transition_at: Instant::now(),
+            last_observed_producer_handoff_wait_count: 0,
         }
     }
 
@@ -4491,13 +4493,15 @@ impl LexicalRebuildResponsivenessController {
         &mut self,
         runtime: &LexicalRebuildPipelineRuntimeSnapshot,
     ) -> Option<LexicalRebuildBudgetTransition> {
+        let new_producer_handoff_wait =
+            self.observe_new_producer_handoff_wait(runtime.producer_handoff_wait_count);
         if self.policy != LexicalRebuildResponsivenessPolicy::Auto
             || self.state == LexicalRebuildResponsivenessState::Startup
         {
             return None;
         }
 
-        if let Some(reason) = self.detect_pressure(runtime) {
+        if let Some(reason) = self.detect_pressure(runtime, new_producer_handoff_wait) {
             self.clear_samples = 0;
             self.reason = reason.clone();
             if self.state != LexicalRebuildResponsivenessState::PressureLimited {
@@ -4565,7 +4569,17 @@ impl LexicalRebuildResponsivenessController {
         None
     }
 
-    fn detect_pressure(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> Option<String> {
+    fn observe_new_producer_handoff_wait(&mut self, observed_count: usize) -> bool {
+        let new_wait_observed = observed_count > self.last_observed_producer_handoff_wait_count;
+        self.last_observed_producer_handoff_wait_count = observed_count;
+        new_wait_observed
+    }
+
+    fn detect_pressure(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        new_producer_handoff_wait: bool,
+    ) -> Option<String> {
         let current_budget = self.current_budget();
         if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
             runtime.host_loadavg_1m_milli,
@@ -4576,6 +4590,12 @@ impl LexicalRebuildResponsivenessController {
                 "host_loadavg_1m_{}_reached_high_watermark_{}",
                 format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli),
                 format_lexical_rebuild_loadavg_1m_milli(high_watermark_1m_milli)
+            ));
+        }
+        if new_producer_handoff_wait {
+            return Some(format!(
+                "producer_handoff_wait_count_{}_observed_consumer_backpressure",
+                runtime.producer_handoff_wait_count
             ));
         }
         if runtime.queue_depth >= self.pipeline_channel_size {
@@ -9212,6 +9232,7 @@ pub fn run_index(
             stale_detector,
             opts.watch_interval_secs,
             move |paths, roots, is_rebuild| {
+                let mut semantic_delta = WatchSemanticDelta::default();
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
@@ -9241,7 +9262,7 @@ pub fn run_index(
                     )
                 } else if watch_once_mode {
                     let indexed = finalize_watch_once_reindex_result(
-                        reindex_paths(
+                        reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
@@ -9249,6 +9270,7 @@ pub fn run_index(
                             &storage_for_watch,
                             &t_index,
                             false,
+                            semantic_enabled.then_some(&mut semantic_delta),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -9267,7 +9289,7 @@ pub fn run_index(
                     indexed
                 } else {
                     let indexed = finalize_watch_reindex_result(
-                        reindex_paths(
+                        reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
@@ -9275,6 +9297,7 @@ pub fn run_index(
                             &storage_for_watch,
                             &t_index,
                             false,
+                            semantic_enabled.then_some(&mut semantic_delta),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -9305,11 +9328,21 @@ pub fn run_index(
                         .map(|t| t.elapsed() >= semantic_cooldown)
                         .unwrap_or(false);
                     if should_embed {
-                        match incremental_semantic_embed(
-                            &embedder_id,
-                            &data_dir_for_semantic,
-                            &storage_for_watch,
-                        ) {
+                        let embed_result = if semantic_delta.max_message_id.is_some() {
+                            incremental_semantic_embed_from_delta(
+                                &embedder_id,
+                                &data_dir_for_semantic,
+                                &storage_for_watch,
+                                semantic_delta,
+                            )
+                        } else {
+                            incremental_semantic_embed(
+                                &embedder_id,
+                                &data_dir_for_semantic,
+                                &storage_for_watch,
+                            )
+                        };
+                        match embed_result {
                             Ok(0) => {} // no new messages to embed
                             Ok(n) => {
                                 tracing::info!(
@@ -9435,6 +9468,91 @@ fn semantic_role_name(role: u8) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, Default)]
+struct WatchSemanticDelta {
+    inputs: Vec<EmbeddingInput>,
+    max_message_id: Option<i64>,
+}
+
+impl WatchSemanticDelta {
+    fn extend_from_batch(
+        &mut self,
+        batch_inputs: Vec<EmbeddingInput>,
+        max_message_id: Option<i64>,
+    ) {
+        self.inputs.extend(batch_inputs);
+        if let Some(max_message_id) = max_message_id {
+            self.max_message_id = Some(
+                self.max_message_id
+                    .map_or(max_message_id, |current| current.max(max_message_id)),
+            );
+        }
+    }
+}
+
+fn update_incremental_semantic_watermark(
+    storage: &Mutex<FrankenStorage>,
+    raw_max_id: i64,
+    context: &str,
+) -> Result<()> {
+    let guard = storage
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?;
+    persist::with_ephemeral_writer(&guard, false, context, |writer| {
+        writer.set_last_embedded_message_id(raw_max_id)
+    })?;
+    Ok(())
+}
+
+fn embed_incremental_semantic_inputs(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+    embedding_inputs: Vec<EmbeddingInput>,
+    raw_max_id: i64,
+    filtered_watermark_context: &str,
+    success_watermark_context: &str,
+) -> Result<usize> {
+    if embedding_inputs.is_empty() {
+        update_incremental_semantic_watermark(storage, raw_max_id, filtered_watermark_context)?;
+        return Ok(0);
+    }
+
+    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
+    let count = semantic_indexer.append_to_index(embedded, data_dir)?;
+
+    update_incremental_semantic_watermark(storage, raw_max_id, success_watermark_context)?;
+    Ok(count)
+}
+
+fn incremental_semantic_embed_from_delta(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &Mutex<FrankenStorage>,
+    semantic_delta: WatchSemanticDelta,
+) -> Result<usize> {
+    let Some(raw_max_id) = semantic_delta.max_message_id else {
+        return Ok(0);
+    };
+
+    let embedding_inputs: Vec<EmbeddingInput> = semantic_delta
+        .inputs
+        .into_iter()
+        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
+        .collect();
+
+    embed_incremental_semantic_inputs(
+        embedder,
+        data_dir,
+        storage,
+        embedding_inputs,
+        raw_max_id,
+        "advancing incremental semantic watermark for filtered packet delta",
+        "updating incremental semantic watermark from packet delta",
+    )
+}
+
 /// Perform incremental semantic embedding for messages added since the last
 /// watermark. Loads the ONNX model, embeds the batch, appends to the existing
 /// FSVI index via WAL, and updates the watermark.
@@ -9507,38 +9625,15 @@ fn incremental_semantic_embed(
         })
         .collect();
 
-    if embedding_inputs.is_empty() {
-        // All messages were filtered out; advance watermark to avoid re-fetching
-        let guard = storage
-            .lock()
-            .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?;
-        persist::with_ephemeral_writer(
-            &guard,
-            false,
-            "advancing incremental semantic watermark for filtered batch",
-            |writer| writer.set_last_embedded_message_id(raw_max_id),
-        )?;
-        return Ok(0);
-    }
-
-    // 4. Load model, embed, append to existing index
-    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
-
-    let embedded = semantic_indexer.embed_messages(&embedding_inputs)?;
-    let count = semantic_indexer.append_to_index(embedded, data_dir)?;
-
-    // 5. Update watermark to highest raw DB id (not filtered embedding id)
-    let guard = storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("lock storage for watermark write: {e}"))?;
-    persist::with_ephemeral_writer(
-        &guard,
-        false,
+    embed_incremental_semantic_inputs(
+        embedder,
+        data_dir,
+        storage,
+        embedding_inputs,
+        raw_max_id,
+        "advancing incremental semantic watermark for filtered batch",
         "updating incremental semantic watermark",
-        |writer| writer.set_last_embedded_message_id(raw_max_id),
-    )?;
-
-    Ok(count)
+    )
 }
 
 /// Open frankensqlite storage for indexing with forward-compatibility recovery.
@@ -10874,7 +10969,150 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         live_index_path = %index_path.display(),
         "published staged lexical index and retained the prior live artifact as a backup"
     );
+
+    // Bead 0k0sk: enforce a bounded retention cap on the backups dir so
+    // `.lexical-publish-backups/` does not grow unboundedly across many
+    // successive publishes. Default: keep only the last K backups
+    // (K=1 by default), configurable via CASS_LEXICAL_PUBLISH_BACKUP_RETENTION.
+    // A best-effort failure here does NOT fail the publish — the live
+    // index is already committed and retained; pruning is cleanup hygiene.
+    if let Err(prune_err) = prune_lexical_publish_backups(index_path) {
+        tracing::warn!(
+            error = %prune_err,
+            live_index_path = %index_path.display(),
+            "failed to prune old retained lexical-publish backups; disk may not be reclaimed until the next successful prune attempt"
+        );
+    }
     Ok(())
+}
+
+/// How many retained lexical-publish backups to keep on disk. Defaults to
+/// 1 (just the most-recent prior-live tree, sufficient for a one-step
+/// manual rollback). Operators who want to disable retention entirely can
+/// set the env var to 0; operators who want a deeper rollback history can
+/// set it to N. Bead 0k0sk.
+fn lexical_publish_backup_retention_limit() -> usize {
+    const DEFAULT_RETENTION: usize = 1;
+    dotenvy::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RETENTION)
+}
+
+/// Remove retained backups beyond the configured retention cap, oldest
+/// first. Safe to call when the backups dir is missing or empty; emits
+/// `tracing::info!` per pruned backup with freed-byte accounting so
+/// operators can correlate disk recovery. Bead 0k0sk.
+fn prune_lexical_publish_backups(index_path: &Path) -> Result<()> {
+    let retention_limit = lexical_publish_backup_retention_limit();
+    let backups_dir = lexical_publish_backups_dir(index_path);
+    if !backups_dir.exists() {
+        return Ok(());
+    }
+
+    // Collect (path, modified_ts, size_bytes). Unreadable entries are
+    // skipped with a debug log — we do not let one bad entry block
+    // pruning of the rest.
+    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    for entry in fs::read_dir(&backups_dir).with_context(|| {
+        format!(
+            "reading retained lexical-publish backups dir for pruning {}",
+            backups_dir.display()
+        )
+    })? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    backups_dir = %backups_dir.display(),
+                    "skipping unreadable entry while enumerating retained lexical-publish backups"
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    path = %path.display(),
+                    "skipping retained lexical-publish backup without readable metadata"
+                );
+                continue;
+            }
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let size = directory_size_bytes_best_effort(&path);
+        entries.push((path, modified, size));
+    }
+
+    if entries.len() <= retention_limit {
+        return Ok(());
+    }
+
+    // Sort newest-first by modified time (falls back to path ordering
+    // on ties, which stabilizes against filesystems without
+    // nanosecond resolution).
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Keep the first `retention_limit`, prune the rest.
+    let mut pruned_count = 0usize;
+    let mut freed_bytes: u64 = 0;
+    for (path, _modified, size) in entries.into_iter().skip(retention_limit) {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                pruned_count = pruned_count.saturating_add(1);
+                freed_bytes = freed_bytes.saturating_add(size);
+                tracing::info!(
+                    pruned_backup_path = %path.display(),
+                    freed_bytes = size,
+                    retention_limit,
+                    "pruned a retained lexical-publish backup beyond retention cap"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    pruned_backup_path = %path.display(),
+                    "failed to prune retained lexical-publish backup; leaving on disk"
+                );
+            }
+        }
+    }
+
+    if pruned_count > 0 {
+        tracing::info!(
+            pruned_count,
+            freed_bytes,
+            retention_limit,
+            backups_dir = %backups_dir.display(),
+            "completed lexical-publish retention prune"
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort recursive byte count for a directory. Returns 0 on any
+/// I/O error — this is purely for tracing, never fails the caller.
+fn directory_size_bytes_best_effort(path: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(iter) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in iter.flatten() {
+            let entry_path = entry.path();
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => stack.push(entry_path),
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(_) => continue,
+            }
+        }
+    }
+    total
 }
 
 fn lexical_publish_backups_dir(index_path: &Path) -> PathBuf {
@@ -13101,6 +13339,40 @@ fn ingest_batch(
     })
 }
 
+fn ingest_batch_with_semantic_delta(
+    storage: &FrankenStorage,
+    t_index: Option<&mut TantivyIndex>,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    lexical_strategy: LexicalPopulationStrategy,
+    defer_checkpoints: bool,
+    semantic_delta: Option<&mut WatchSemanticDelta>,
+) -> Result<persist::PersistBatchOutcome> {
+    let batch_outcome = if semantic_delta.is_some() {
+        persist::persist_conversations_batched_with_semantic_delta(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+        )?
+    } else {
+        persist::persist_conversations_batched(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+        )?
+    };
+
+    if let Some(p) = progress {
+        p.current.fetch_add(convs.len(), Ordering::Relaxed);
+    }
+
+    Ok(batch_outcome)
+}
+
 /// Get all available connector factories.
 ///
 /// Delegates to `franken_agent_detection::get_connector_factories()`.
@@ -13419,6 +13691,22 @@ fn reindex_paths(
     t_index: &Mutex<TantivyIndex>,
     force_full: bool,
 ) -> Result<usize> {
+    reindex_paths_with_semantic_delta(
+        opts, paths, roots, state, storage, t_index, force_full, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reindex_paths_with_semantic_delta(
+    opts: &IndexOptions,
+    paths: Vec<PathBuf>,
+    roots: &[(ConnectorKind, ScanRoot)],
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    storage: &Mutex<FrankenStorage>,
+    t_index: &Mutex<TantivyIndex>,
+    force_full: bool,
+    semantic_delta: Option<&mut WatchSemanticDelta>,
+) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
@@ -13434,6 +13722,8 @@ fn reindex_paths(
     }
 
     let mut total_indexed = 0usize;
+
+    let mut semantic_delta = semantic_delta;
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -13545,14 +13835,21 @@ fn reindex_paths(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
 
-            ingest_batch(
+            let batch_outcome = ingest_batch_with_semantic_delta(
                 &storage,
                 Some(&mut t_index),
                 &convs,
                 &opts.progress,
                 LexicalPopulationStrategy::IncrementalInline,
                 !opts.watch,
+                semantic_delta.as_deref_mut(),
             )?;
+            if let Some(delta) = semantic_delta.as_deref_mut() {
+                delta.extend_from_batch(
+                    batch_outcome.semantic_delta_inputs,
+                    batch_outcome.semantic_delta_max_message_id,
+                );
+            }
 
             // Commit to Tantivy immediately to ensure index consistency before advancing watch state.
             t_index.commit()?;
@@ -14340,19 +14637,23 @@ pub mod persist {
 
     use anyhow::{Context, Result, anyhow};
     use frankensqlite::FrankenError;
+    use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
     use rand::RngExt;
     use rayon::prelude::*;
 
     use crate::connectors::NormalizedConversation;
+    use crate::indexer::semantic::{EmbeddingInput, packet_embedding_inputs_from_canonical_delta};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
     use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
 
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[derive(Debug, Clone, Default)]
     pub(super) struct PersistBatchOutcome {
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
+        pub semantic_delta_max_message_id: Option<i64>,
+        pub semantic_delta_inputs: Vec<EmbeddingInput>,
     }
 
     impl PersistBatchOutcome {
@@ -14364,6 +14665,124 @@ pub mod persist {
                 .inserted_messages
                 .saturating_add(outcome.inserted_indices.len());
         }
+
+        fn extend_semantic_delta(
+            &mut self,
+            inputs: Vec<EmbeddingInput>,
+            max_message_id: Option<i64>,
+        ) {
+            self.semantic_delta_inputs.extend(inputs);
+            if let Some(max_message_id) = max_message_id {
+                self.semantic_delta_max_message_id = Some(
+                    self.semantic_delta_max_message_id
+                        .map_or(max_message_id, |current| current.max(max_message_id)),
+                );
+            }
+        }
+    }
+
+    fn load_conversation_embedding_ids(
+        storage: &FrankenStorage,
+        conversation_id: i64,
+    ) -> Result<(i64, Option<i64>)> {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COALESCE(agent_id, 0), workspace_id
+                 FROM conversations
+                 WHERE id = ?1",
+                &[ParamValue::from(conversation_id)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .with_context(|| {
+                format!("loading canonical embedding ids for conversation {conversation_id}")
+            })
+    }
+
+    fn load_inserted_message_ids_by_idx(
+        storage: &FrankenStorage,
+        conversation_id: i64,
+        inserted_indices: &[i64],
+    ) -> Result<HashMap<i64, i64>> {
+        if inserted_indices.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut sql = String::from(
+            "SELECT id, idx
+             FROM messages
+             WHERE conversation_id = ?1
+               AND idx IN (",
+        );
+        let mut params = Vec::with_capacity(inserted_indices.len() + 1);
+        params.push(ParamValue::from(conversation_id));
+        for (offset, idx) in inserted_indices.iter().enumerate() {
+            if offset > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", offset + 2));
+            params.push(ParamValue::from(*idx));
+        }
+        sql.push_str(") ORDER BY id ASC");
+
+        let rows: Vec<(i64, i64)> = storage.raw().query_map_collect(&sql, &params, |row| {
+            Ok((row.get_typed(0)?, row.get_typed(1)?))
+        })?;
+        Ok(rows.into_iter().map(|(id, idx)| (idx, id)).collect())
+    }
+
+    fn packet_semantic_delta_for_outcome(
+        storage: &FrankenStorage,
+        template: &Conversation,
+        outcome: &InsertOutcome,
+    ) -> Result<(Vec<EmbeddingInput>, Option<i64>)> {
+        if outcome.inserted_indices.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+
+        let (agent_id, workspace_id) =
+            load_conversation_embedding_ids(storage, outcome.conversation_id)?;
+        let message_ids_by_idx = load_inserted_message_ids_by_idx(
+            storage,
+            outcome.conversation_id,
+            &outcome.inserted_indices,
+        )?;
+        let max_message_id = message_ids_by_idx.values().copied().max();
+
+        let inserted_index_set: HashSet<i64> = outcome.inserted_indices.iter().copied().collect();
+        let messages: Vec<Message> = template
+            .messages
+            .iter()
+            .filter(|message| inserted_index_set.contains(&message.idx))
+            .filter_map(|message| {
+                let raw_message_id = message_ids_by_idx.get(&message.idx).copied();
+                if raw_message_id.is_none() {
+                    tracing::warn!(
+                        conversation_id = outcome.conversation_id,
+                        message_idx = message.idx,
+                        "skipping packet semantic delta message without persisted canonical id"
+                    );
+                }
+                raw_message_id.map(|raw_message_id| {
+                    let mut message = message.clone();
+                    message.id = Some(raw_message_id);
+                    message
+                })
+            })
+            .collect();
+
+        if messages.is_empty() {
+            return Ok((Vec::new(), max_message_id));
+        }
+
+        let mut canonical_delta = template.clone();
+        canonical_delta.id = Some(outcome.conversation_id);
+        canonical_delta.messages = messages;
+
+        Ok((
+            packet_embedding_inputs_from_canonical_delta(&canonical_delta, agent_id, workspace_id),
+            max_message_id,
+        ))
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -14835,11 +15254,13 @@ pub mod persist {
     }
 
     fn persist_conversations_batched_begin_concurrent(
+        storage: &FrankenStorage,
         db_path: &std::path::Path,
         mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        capture_semantic_delta: bool,
     ) -> Result<PersistBatchOutcome> {
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
@@ -14975,6 +15396,11 @@ pub mod persist {
             let conv = &convs[idx];
             batch_outcome.record_insert_outcome(&outcome);
             if defer_lexical_updates {
+                if capture_semantic_delta {
+                    let (inputs, max_message_id) =
+                        packet_semantic_delta_for_outcome(storage, &internal_convs[idx], &outcome)?;
+                    batch_outcome.extend_semantic_delta(inputs, max_message_id);
+                }
                 continue;
             }
 
@@ -15008,6 +15434,12 @@ pub mod persist {
                             )?;
                     }
                 }
+            }
+
+            if capture_semantic_delta {
+                let (inputs, max_message_id) =
+                    packet_semantic_delta_for_outcome(storage, &internal_convs[idx], &outcome)?;
+                batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
         }
 
@@ -15204,10 +15636,45 @@ pub mod persist {
     /// Set `CASS_SQLITE_CACHE=0` to disable caching for debugging.
     pub(super) fn persist_conversations_batched(
         storage: &FrankenStorage,
+        t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+    ) -> Result<PersistBatchOutcome> {
+        persist_conversations_batched_inner(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            false,
+        )
+    }
+
+    pub(super) fn persist_conversations_batched_with_semantic_delta(
+        storage: &FrankenStorage,
+        t_index: Option<&mut TantivyIndex>,
+        convs: &[NormalizedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+    ) -> Result<PersistBatchOutcome> {
+        persist_conversations_batched_inner(
+            storage,
+            t_index,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            true,
+        )
+    }
+
+    fn persist_conversations_batched_inner(
+        storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
+        capture_semantic_delta: bool,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
@@ -15234,11 +15701,13 @@ pub mod persist {
                 "using begin-concurrent write path for indexing"
             );
             return persist_conversations_batched_begin_concurrent(
+                storage,
                 &db_path,
                 t_index,
                 convs,
                 lexical_strategy,
                 defer_checkpoints,
+                capture_semantic_delta,
             );
         }
 
@@ -15271,7 +15740,7 @@ pub mod persist {
                 let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for (conv, internal_conv) in convs.iter().zip(internal_convs) {
+                for (conv, internal_conv) in convs.iter().zip(internal_convs.iter().cloned()) {
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
@@ -15370,6 +15839,14 @@ pub mod persist {
         } else {
             for outcome in &outcomes {
                 batch_outcome.record_insert_outcome(outcome);
+            }
+        }
+
+        if capture_semantic_delta {
+            for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
+                let (inputs, max_message_id) =
+                    packet_semantic_delta_for_outcome(storage, internal_conv, outcome)?;
+                batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
         }
 
@@ -15621,10 +16098,12 @@ pub mod persist {
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
 
             persist_conversations_batched_begin_concurrent(
+                &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
                 Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
                 false,
             )
             .expect("begin-concurrent persist should succeed");
@@ -15722,10 +16201,12 @@ pub mod persist {
             }];
 
             persist_conversations_batched_begin_concurrent(
+                &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
                 Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
                 false,
             )
             .expect("single conversation begin-concurrent persist should succeed");
@@ -15870,10 +16351,12 @@ pub mod persist {
             }];
 
             persist_conversations_batched_begin_concurrent(
+                &FrankenStorage::open(&db_path).unwrap(),
                 &db_path,
                 Some(&mut t_index),
                 &convs,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
                 false,
             )
             .expect("begin-concurrent deferred persist should succeed");
@@ -19996,6 +20479,61 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn lexical_rebuild_responsiveness_controller_demotes_on_new_handoff_wait_delta() {
+        let _clear_samples = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_CLEAR_SAMPLES", "2");
+        let _hold_ms = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_RESTORE_HOLD_MS", "1");
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            false,
+            None,
+            None,
+        );
+
+        let baseline_runtime = LexicalRebuildPipelineRuntimeSnapshot::default();
+        assert!(controller.observe_runtime(&baseline_runtime).is_none());
+        assert_eq!(controller.mode(), "steady");
+
+        let pressured_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 9,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let transition = controller
+            .observe_runtime(&pressured_runtime)
+            .expect("a new producer handoff stall should demote the runtime budget");
+        assert_eq!(transition.old_budget, steady_budget);
+        assert_eq!(transition.new_budget, startup_budget);
+        assert_eq!(transition.mode, "pressure_limited");
+        assert!(
+            transition
+                .reason
+                .contains("producer_handoff_wait_count_1_observed_consumer_backpressure"),
+            "unexpected transition reason: {}",
+            transition.reason
+        );
+
+        controller.last_transition_at = Instant::now() - controller.restore_hold;
+        assert!(
+            controller.observe_runtime(&pressured_runtime).is_none(),
+            "cumulative handoff counters alone must not keep the controller permanently pressured"
+        );
+        let restore = controller
+            .observe_runtime(&pressured_runtime)
+            .expect("steady state should restore after the clear-window hold expires");
+        assert_eq!(restore.old_budget, startup_budget);
+        assert_eq!(restore.new_budget, steady_budget);
+        assert_eq!(restore.mode, "steady");
+    }
+
+    #[test]
     fn lexical_rebuild_responsiveness_controller_honors_pinned_conservative_mode() {
         let startup_budget =
             LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
@@ -20386,6 +20924,147 @@ mod tests {
             flow_limiter.bytes_in_flight(),
             0,
             "disconnect path must release any reserved pipeline byte budget"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_packet_producer_records_handoff_wait_under_sustained_burst() {
+        let _page_prep_workers = set_env("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", "2");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("producer-handoff-backpressure.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_lexical_rebuild_fixture(&storage);
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        for suffix in 3..=8 {
+            let external_id = format!("handoff-burst-{suffix}");
+            let base_ts = 1_700_000_300_000_i64 + i64::from(suffix) * 1_000;
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some(external_id.clone()),
+                        title: Some("Handoff burst fixture".into()),
+                        source_path: PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+                        started_at: Some(base_ts),
+                        ended_at: Some(base_ts + 100),
+                        approx_tokens: Some(64),
+                        metadata_json: serde_json::Value::Null,
+                        messages: vec![
+                            Message {
+                                id: None,
+                                idx: 0,
+                                role: MessageRole::User,
+                                author: Some("user".into()),
+                                created_at: Some(base_ts + 10),
+                                content: format!("{external_id}-first"),
+                                extra_json: serde_json::json!({"opaque": true}),
+                                snippets: Vec::new(),
+                            },
+                            Message {
+                                id: None,
+                                idx: 1,
+                                role: MessageRole::Agent,
+                                author: Some("assistant".into()),
+                                created_at: Some(base_ts + 20),
+                                content: format!("{external_id}-second"),
+                                extra_json: serde_json::json!({"opaque": true}),
+                                snippets: Vec::new(),
+                            },
+                        ],
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        }
+        drop(storage);
+
+        let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(1);
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(256 * 1024));
+        let producer_telemetry = Arc::new(LexicalRebuildProducerTelemetry::default());
+        let handle = spawn_lexical_rebuild_packet_producer(
+            db_path,
+            None,
+            None,
+            1,
+            1,
+            None,
+            Arc::new(LexicalRebuildPipelineBudgetController::new(
+                lexical_rebuild_runtime_pipeline_budget_snapshot(
+                    1,
+                    32,
+                    64 * 1024,
+                    1,
+                    1,
+                    32,
+                    64 * 1024,
+                ),
+            )),
+            tx,
+            flow_limiter.clone(),
+            None,
+            producer_telemetry.clone(),
+        );
+
+        let first_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            LexicalRebuildPipelineMessage::Batch(batch) => batch,
+            other => panic!("expected first burst batch, got {other:?}"),
+        };
+        assert_eq!(first_batch.packets.len(), 1);
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            rx.len(),
+            1,
+            "a stalled consumer should saturate the bounded handoff queue under burst load"
+        );
+
+        let second_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            LexicalRebuildPipelineMessage::Batch(batch) => batch,
+            other => panic!("expected second burst batch, got {other:?}"),
+        };
+        release_lexical_rebuild_prepared_page_reservation(&first_batch, flow_limiter.as_ref());
+        release_lexical_rebuild_prepared_page_reservation(&second_batch, flow_limiter.as_ref());
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                LexicalRebuildPipelineMessage::Batch(batch) => {
+                    release_lexical_rebuild_prepared_page_reservation(&batch, flow_limiter.as_ref());
+                }
+                LexicalRebuildPipelineMessage::Done => break,
+                LexicalRebuildPipelineMessage::Error(error) => {
+                    panic!("producer returned error: {error}")
+                }
+            }
+        }
+        handle.join().unwrap();
+
+        let telemetry = producer_telemetry.snapshot();
+        assert!(
+            telemetry.handoff_wait_count >= 1,
+            "producer should observe at least one bounded handoff stall when the consumer is slower than the burst"
+        );
+        assert!(
+            telemetry.handoff_wait_ms > 0,
+            "bounded handoff stalls should accrue measurable wait time"
+        );
+        assert_eq!(
+            flow_limiter.bytes_in_flight(),
+            0,
+            "consumer-owned releases should drain all reserved bytes after the burst completes"
         );
     }
 
@@ -24554,8 +25233,20 @@ mod tests {
     /// recover_or_finalize_interrupted_lexical_publish_backup() must move
     /// the stale in-progress backup into retained-backup storage rather
     /// than overwrite the newer live index.
+    ///
+    /// Bead 0k0sk: retention is now bounded (default 1). Raise the cap
+    /// to 2 inside this test so both the sidecar-recovered backup AND
+    /// the publish's own retained prior-live remain observable — the
+    /// recovery-semantic invariant this test pins is orthogonal to the
+    /// retention policy. Marked #[serial] because it mutates a
+    /// process-wide env var.
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_retains_stale_in_progress_backup_when_live_present() {
+        let _prior = std::env::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION").ok();
+        unsafe {
+            std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "2");
+        }
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -24666,6 +25357,15 @@ mod tests {
             "retained backups must preserve both the stale-older (1 doc) \
              and the just-displaced-prior-live (2 docs) artifacts"
         );
+
+        // Restore the prior env state so other serial tests see the
+        // default retention cap.
+        unsafe {
+            match _prior {
+                Some(v) => std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", v),
+                None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
+            }
+        }
     }
 
     /// Bead 0k0sk (cross-review finding): publish_staged_lexical_index
@@ -24677,12 +25377,27 @@ mod tests {
     /// retention, K-most-recent policy) can flip this assertion to
     /// `<= RETENTION_CAP` once landed. Until then, it prevents an
     /// accidental "silent prune" change from going unnoticed.
+    ///
+    /// Updated by bead 0k0sk: bounded retention is now implemented.
+    /// Default cap = 1 (keep only the most-recent prior-live), overridable
+    /// via `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION`. This test now asserts
+    /// the default-cap behavior and is serialized on the env lock because
+    /// it touches a process-wide env var.
     #[test]
-    fn publish_staged_lexical_index_retains_every_backup_unboundedly_today_pending_retention_cap() {
+    #[serial]
+    fn publish_staged_lexical_index_prunes_retained_backups_to_default_retention_cap() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
         let index_path = index_dir(&data_dir).unwrap();
+
+        // Force default retention (remove the env if anything else set it).
+        // The test is #[serial] so we can safely mutate the env for the
+        // duration of this test.
+        let _prior = std::env::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION").ok();
+        unsafe {
+            std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION");
+        }
 
         // Seed an initial live index so the first publish exercises the
         // "prior-live-exists" branch that actually retains a backup.
@@ -24724,19 +25439,103 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
 
-        // CURRENT contract: every publish retains exactly one more backup.
-        // TODO(bead 0k0sk): introduce bounded retention (default K=1 via
-        // env CASS_LEXICAL_PUBLISH_BACKUP_RETENTION) and flip this to
-        // `assert!(retained_backups.len() <= retention_cap, ...)`.
+        // New contract (bead 0k0sk): default retention cap of 1 means
+        // exactly 1 retained backup regardless of publish count.
         assert_eq!(
             retained_backups.len(),
-            publish_count,
-            "current behavior: every publish retains one more backup (bead 0k0sk); \
-             if you see this assertion fail with fewer backups, you've \
-             implemented retention — update the assertion and the bead \
-             together. If you see it fail with MORE, the in-progress-backup \
-             recovery path is double-counting and that's a separate bug."
+            1,
+            "default retention cap is 1, got {} retained after {publish_count} publishes: {retained_backups:?}",
+            retained_backups.len()
         );
+
+        // Restore prior env state for any subsequent tests.
+        unsafe {
+            match _prior {
+                Some(v) => std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", v),
+                None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
+            }
+        }
+    }
+
+    /// Regression guard for bead 0k0sk: the retention cap is configurable
+    /// via `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION`. This test exercises
+    /// two distinct non-default values (0 = no retention, 3 = deeper
+    /// rollback history) to prove the knob actually flows through
+    /// `lexical_publish_backup_retention_limit()` into the prune step.
+    #[test]
+    #[serial]
+    fn publish_staged_lexical_index_retention_cap_is_env_configurable() {
+        let _prior = std::env::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION").ok();
+
+        for (cap_value, expected_retained) in [("0", 0_usize), ("3", 3_usize)] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            fs::create_dir_all(&data_dir).unwrap();
+            let index_path = index_dir(&data_dir).unwrap();
+
+            unsafe {
+                std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", cap_value);
+            }
+
+            // Seed live + do 5 successive publishes.
+            let seed = norm_conv(
+                Some(&format!("retention-env-seed-{cap_value}")),
+                vec![norm_msg(0, 1_700_000_600_000)],
+            );
+            let mut live = TantivyIndex::open_or_create(&index_path).unwrap();
+            live.add_messages_with_conversation_id(&seed, &seed.messages, Some(100))
+                .unwrap();
+            live.commit().unwrap();
+            drop(live);
+
+            for iteration in 0..5_usize {
+                let stage_root = TempDirBuilder::new()
+                    .prefix(&format!("cass-test-retention-env-{cap_value}-{iteration}."))
+                    .tempdir_in(data_dir.parent().unwrap())
+                    .unwrap();
+                let staged_index_path = stage_root.path().join("staged");
+                let conv = norm_conv(
+                    Some(&format!("retention-env-{cap_value}-iter-{iteration}")),
+                    vec![norm_msg(0, 1_700_000_610_000 + iteration as i64)],
+                );
+                let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+                staged
+                    .add_messages_with_conversation_id(
+                        &conv,
+                        &conv.messages,
+                        Some(200 + iteration as i64),
+                    )
+                    .unwrap();
+                staged.commit().unwrap();
+                drop(staged);
+
+                publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+            }
+
+            let backups_dir = lexical_publish_backups_dir(&index_path);
+            let retained: Vec<_> = if backups_dir.exists() {
+                fs::read_dir(&backups_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                retained.len(),
+                expected_retained,
+                "CASS_LEXICAL_PUBLISH_BACKUP_RETENTION={cap_value} should produce {expected_retained} retained backups after 5 publishes; got {}: {retained:?}",
+                retained.len()
+            );
+        }
+
+        // Restore prior env state.
+        unsafe {
+            match _prior {
+                Some(v) => std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", v),
+                None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
+            }
+        }
     }
 
     /// Staged path must exist before `publish_staged_lexical_index` is
@@ -24981,8 +25780,19 @@ mod tests {
     /// Without the A.5 canonical-sidecar step in the Linux path, OLD
     /// would have been stranded inside a `cass-lexical-merge.*`
     /// TempDir and the retained-backup contract broken.
+    ///
+    /// Bead 0k0sk: retention is now bounded (default 1). Raise the cap
+    /// to 2 inside this test so BOTH the A.5-sidecar-recovered OLD and
+    /// the prior-live NEW remain observable — the crash-recovery invariant
+    /// this test pins is orthogonal to the retention policy. Marked
+    /// #[serial] because it mutates a process-wide env var.
     #[test]
+    #[serial]
     fn publish_staged_lexical_index_recovers_from_crash_between_linux_swap_and_retain() {
+        let _prior = std::env::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION").ok();
+        unsafe {
+            std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "2");
+        }
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -25013,11 +25823,7 @@ mod tests {
         );
         let mut sidecar_index = TantivyIndex::open_or_create(&canonical_sidecar).unwrap();
         sidecar_index
-            .add_messages_with_conversation_id(
-                &old_backup_conv,
-                &old_backup_conv.messages,
-                Some(2),
-            )
+            .add_messages_with_conversation_id(&old_backup_conv, &old_backup_conv.messages, Some(2))
             .unwrap();
         sidecar_index.commit().unwrap();
         drop(sidecar_index);
@@ -25103,6 +25909,14 @@ mod tests {
             vec![1, 3],
             "retained backups must have exactly the expected doc counts (1 = NEW prior-live, 3 = OLD from A.5 sidecar)"
         );
+
+        // Restore prior env state so other serial tests see the default cap.
+        unsafe {
+            match _prior {
+                Some(v) => std::env::set_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", v),
+                None => std::env::remove_var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION"),
+            }
+        }
     }
 
     #[test]
@@ -25929,6 +26743,133 @@ mod tests {
         assert!(loaded.contains_key(&ConnectorKind::Amp));
         let ts = loaded.get(&ConnectorKind::Amp).copied().unwrap();
         assert!(ts > 0);
+
+        if let Some(prev) = prev {
+            unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
+        } else {
+            unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_carries_only_new_packet_semantic_delta_messages() {
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg_watch_semantic_delta");
+        std::fs::create_dir_all(&xdg).unwrap();
+        let prev = dotenvy::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &xdg) };
+
+        let data_dir = xdg.join("amp");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+        let amp_file = amp_dir.join("thread-semantic.json");
+        let now_u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let base_ts = i64::try_from(now_u128)
+            .unwrap_or(i64::MAX)
+            .saturating_add(10_000);
+
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{
+  "id": "thread-semantic",
+  "title": "Amp semantic delta test",
+  "messages": [
+    {{"role":"user","text":"hi","createdAt":{base_ts}}},
+    {{"role":"assistant","text":"hello","createdAt":{assistant_ts}}}
+  ]
+}}"#,
+                assistant_ts = base_ts + 100,
+            ),
+        )
+        .unwrap();
+
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: true,
+            build_hnsw: false,
+            embedder: "hash".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let t_index = TantivyIndex::open_or_create(&index_dir(&opts.data_dir).unwrap()).unwrap();
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let t_index = std::sync::Mutex::new(t_index);
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))];
+
+        let mut first_delta = WatchSemanticDelta::default();
+        let indexed = reindex_paths_with_semantic_delta(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            false,
+            Some(&mut first_delta),
+        )
+        .unwrap();
+        assert_eq!(indexed, 1);
+        let first_contents: Vec<_> = first_delta
+            .inputs
+            .iter()
+            .map(|input| input.content.as_str())
+            .collect();
+        assert_eq!(first_contents, vec!["hi", "hello"]);
+        assert!(first_delta.max_message_id.is_some());
+
+        std::thread::sleep(Duration::from_millis(25));
+        std::fs::write(
+            &amp_file,
+            format!(
+                r#"{{
+  "id": "thread-semantic",
+  "title": "Amp semantic delta test",
+  "messages": [
+    {{"role":"user","text":"hi","createdAt":{base_ts}}},
+    {{"role":"assistant","text":"hello","createdAt":{assistant_ts}}},
+    {{"role":"assistant","text":"followup","createdAt":{followup_ts}}}
+  ]
+}}"#,
+                assistant_ts = base_ts + 100,
+                followup_ts = base_ts + 200,
+            ),
+        )
+        .unwrap();
+
+        let mut second_delta = WatchSemanticDelta::default();
+        let indexed = reindex_paths_with_semantic_delta(
+            &opts,
+            vec![amp_file.clone()],
+            &roots,
+            &state,
+            &storage,
+            &t_index,
+            false,
+            Some(&mut second_delta),
+        )
+        .unwrap();
+        assert_eq!(indexed, 1);
+        assert_eq!(second_delta.inputs.len(), 1);
+        assert_eq!(second_delta.inputs[0].content, "followup");
+        assert_eq!(
+            semantic_role_name(second_delta.inputs[0].role),
+            Some("assistant")
+        );
+        assert!(second_delta.max_message_id.is_some());
 
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
