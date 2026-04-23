@@ -1941,7 +1941,9 @@ fn diag_absent_artifacts_report_zero_counters_and_sizes() {
     // Index block: absent ⇒ size must be 0.
     let idx = &diag["index"];
     assert!(idx.is_object(), "diag.index must be an object");
-    let idx_exists = idx["exists"].as_bool().expect("index.exists must be a bool");
+    let idx_exists = idx["exists"]
+        .as_bool()
+        .expect("index.exists must be a bool");
     assert!(
         !idx_exists,
         "isolated HOME unexpectedly has index.exists=true"
@@ -1952,5 +1954,123 @@ fn diag_absent_artifacts_report_zero_counters_and_sizes() {
     assert_eq!(
         idx_size, 0,
         "index.exists=false but size_bytes={idx_size} — phantom reclaimable bytes would mislead retention budget accounting"
+    );
+}
+
+#[test]
+fn models_status_model_dir_nests_under_data_dir_and_coheres_on_absence() {
+    // ibuuh.19 model-cache retention row. The bead explicitly names
+    // "stale model caches as first-class cleanup candidates". Model
+    // cache hygiene depends on three retention invariants that
+    // nothing else in the matrix currently pins:
+    //
+    //   1. `model_dir` (the model-cache root) must live inside the
+    //      declared data_dir — GC jurisdiction. If the model cache
+    //      escapes data_dir, retention either misses it (cache bloat)
+    //      or would need to sweep outside its sandbox (data-loss risk).
+    //
+    //   2. `model_dir` must be the same value on the top-level surface
+    //      and inside `cache_lifecycle`. Those are two code paths that
+    //      retention and acquisition both consult; silent divergence
+    //      means one layer could try to clean up a dir the other layer
+    //      still considers authoritative.
+    //
+    //   3. When `installed=false`, the byte counters retention would
+    //      use to decide "reclaim vs keep" must all be zero
+    //      (installed_size_bytes + observed_file_bytes). A stale
+    //      non-zero value would produce phantom reclaimable bytes and
+    //      mislead budget accounting.
+    //
+    // Isolated HOME guarantees the model is not installed, so the
+    // coherently-absent case is the one under test.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(
+        out.status.success(),
+        "cass models status --json exited non-zero"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // Re-derive data_dir from diag so we do not hard-code the layout.
+    let diag_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(
+        diag_out.status.success(),
+        "cass diag --json exited non-zero"
+    );
+    let diag: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(diag_out.stdout).expect("utf8"))
+            .expect("valid JSON");
+    let data_dir = diag["paths"]["data_dir"]
+        .as_str()
+        .expect("paths.data_dir must be a string");
+
+    // Invariant 1: model_dir nests under data_dir (GC jurisdiction).
+    let model_dir = status["model_dir"]
+        .as_str()
+        .expect("models status must expose model_dir as a string");
+    assert!(
+        Path::new(model_dir).starts_with(data_dir),
+        "model_dir ({model_dir}) escapes data_dir ({data_dir}) — retention GC cannot safely reach this model-cache root"
+    );
+
+    // Invariant 2: model_dir == cache_lifecycle.model_dir.
+    let cl = &status["cache_lifecycle"];
+    assert!(
+        cl.is_object(),
+        "models status must expose cache_lifecycle as an object"
+    );
+    let cl_model_dir = cl["model_dir"]
+        .as_str()
+        .expect("cache_lifecycle.model_dir must be a string");
+    assert_eq!(
+        model_dir, cl_model_dir,
+        "top-level model_dir ({model_dir}) diverged from cache_lifecycle.model_dir ({cl_model_dir}); acquisition and retention would target different directories"
+    );
+
+    // Invariant 3: installed=false ⇒ byte counters all zero.
+    let installed = status["installed"]
+        .as_bool()
+        .expect("models status must expose installed as bool");
+    assert!(
+        !installed,
+        "isolated HOME unexpectedly reports installed=true — test assumption broken"
+    );
+    let installed_size = status["installed_size_bytes"]
+        .as_u64()
+        .expect("installed_size_bytes must be u64");
+    let observed = status["observed_file_bytes"]
+        .as_u64()
+        .expect("observed_file_bytes must be u64");
+    assert_eq!(
+        installed_size, 0,
+        "installed=false but installed_size_bytes={installed_size} — phantom reclaimable bytes would mislead model-cache retention budgets"
+    );
+    assert_eq!(
+        observed, 0,
+        "installed=false but observed_file_bytes={observed} — phantom cached bytes would mislead model-cache retention budgets"
+    );
+
+    // And the cache_lifecycle mirror of the same counter must agree.
+    let cl_installed_size = cl["installed_size_bytes"]
+        .as_u64()
+        .expect("cache_lifecycle.installed_size_bytes must be u64");
+    assert_eq!(
+        cl_installed_size, 0,
+        "installed=false but cache_lifecycle.installed_size_bytes={cl_installed_size} — retention layer would see phantom cached bytes"
     );
 }
