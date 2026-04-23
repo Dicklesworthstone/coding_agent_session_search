@@ -3327,3 +3327,105 @@ fn status_and_health_stale_threshold_diverge_in_default_only_not_in_computation(
         );
     }
 }
+
+#[test]
+fn idle_rebuild_block_collapses_metadata_and_has_actionable_recommendation() {
+    // ibuuh.19 rebuild-interruption coherence row.
+    //
+    // `cass status --json` surfaces a `rebuild` block with an
+    // `active` flag plus ten metadata fields that only have meaning
+    // *during* an in-flight rebuild:
+    //
+    //   pid, mode, job_id, job_kind, phase, started_at, updated_at,
+    //   processed_conversations, total_conversations, indexed_docs
+    //
+    // Retention may need to interrupt a rebuild (e.g. reclaiming
+    // scratch space mid-build to stay under the disk budget). After
+    // a clean interruption the rebuild block must report coherently
+    // IDLE — every metadata field null, orphaned=false. Leaked
+    // metadata is dangerous because:
+    //   - stale pid => retention thinks a rebuild is running
+    //     (deadlocks the next rebuild attempt)
+    //   - stale phase/counts => operator and monitoring dashboards
+    //     show a "stuck" rebuild forever
+    //   - orphaned=true without active=false => type-confused state
+    //     that the retention decision-tree has no case for
+    //
+    // Plus the operator-facing invariant: when healthy=false (as is
+    // the case on a freshly-reclaimed / never-initialized system),
+    // `recommended_action` must be a non-empty actionable string.
+    // Retention that leaves the system in "unhealthy but no guidance"
+    // forces operators to guess which command to run next.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass status --json");
+    assert!(out.status.success(), "cass status --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let status: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let rebuild = &status["rebuild"];
+    assert!(rebuild.is_object(), "status.rebuild must be an object");
+
+    // Precondition: isolated HOME, no rebuild is active.
+    let active = rebuild["active"]
+        .as_bool()
+        .expect("rebuild.active must be a bool");
+    assert!(
+        !active,
+        "isolated HOME unexpectedly reports rebuild.active=true"
+    );
+
+    // Invariant A: every metadata field is null when not active.
+    for key in [
+        "pid",
+        "mode",
+        "job_id",
+        "job_kind",
+        "phase",
+        "started_at",
+        "updated_at",
+        "processed_conversations",
+        "total_conversations",
+        "indexed_docs",
+    ] {
+        let v = &rebuild[key];
+        assert!(
+            v.is_null(),
+            "rebuild.active=false but rebuild.{key}={v:?} — stale metadata would deadlock retention and mislead operator dashboards"
+        );
+    }
+
+    // Invariant B: orphaned is a bool AND false when not active
+    // (an orphaned rebuild is by definition one whose process
+    // disappeared; without an active flag there is no rebuild to
+    // be orphaned).
+    let orphaned = rebuild["orphaned"]
+        .as_bool()
+        .expect("rebuild.orphaned must be a bool");
+    assert!(
+        !orphaned,
+        "rebuild.active=false but rebuild.orphaned=true — an orphaned rebuild requires a rebuild to exist first; this is a type-confused state"
+    );
+
+    // Invariant C: healthy=false ⇒ recommended_action is non-empty.
+    let healthy = status["healthy"]
+        .as_bool()
+        .expect("status.healthy must be a bool");
+    assert!(
+        !healthy,
+        "isolated HOME unexpectedly reports healthy=true"
+    );
+    let rec = status["recommended_action"]
+        .as_str()
+        .expect("status.recommended_action must be a string when healthy=false");
+    assert!(
+        !rec.trim().is_empty(),
+        "healthy=false but recommended_action is empty — operator has no actionable guidance; retention leaving the system in this state must provide a path forward"
+    );
+}
