@@ -3207,3 +3207,123 @@ fn status_and_diag_agree_on_db_path_and_absence_coherence() {
         "database.exists=false but open_retryable=true — retry semantics only apply when a real open attempt occurred"
     );
 }
+
+#[test]
+fn status_and_health_stale_threshold_diverge_in_default_only_not_in_computation() {
+    // ibuuh.19 retention-policy divergence documentation row.
+    //
+    // `cass health --json` and `cass status --json` BOTH surface
+    // `stale_threshold_seconds` in their index block, but they use
+    // *different defaults by design*:
+    //
+    //   health: --stale-threshold default = 300  (5 min — pre-flight)
+    //   status: --stale-threshold default = 1800 (30 min — operator)
+    //
+    // The tighter health default is intentional: health is the
+    // machine-readable pre-flight check consumed by monitoring and
+    // agent readiness gates, so it should flag stale indexes sooner.
+    // status is operator-facing with a more forgiving default so
+    // human operators are not pestered by mild staleness.
+    //
+    // The retention-adjacent invariant this row pins: the divergence
+    // MUST live purely in the CLI default — the underlying
+    // freshness computation (fed into state_meta_json) must produce
+    // identical stale_threshold_seconds when the two commands are
+    // invoked with the same explicit --stale-threshold value. If
+    // anyone ever hardcoded a constant into either handler, or
+    // dropped the --stale-threshold plumbing, retention/monitoring
+    // dashboards would silently drift.
+    //
+    // Three assertions:
+    //   A. Both commands honor --stale-threshold=<N> and emit N.
+    //   B. The defaults ARE different (policy pin — a future change
+    //      collapsing them should force a conscious decision rather
+    //      than slip through unnoticed).
+    //   C. Both defaults are in sane bounds [60, 86400].
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn threshold_from(home: &Path, args: &[&str], path: &[&str]) -> u64 {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        let mut cur = &v;
+        for k in path {
+            cur = &cur[*k];
+        }
+        cur.as_u64()
+            .unwrap_or_else(|| panic!("expected u64 at path {path:?}, got {cur:?}"))
+    }
+
+    // Invariant A: both honor --stale-threshold=600, a value distinct
+    // from both defaults (300 and 1800) so any default-bleed-through
+    // bug would immediately show.
+    let overridden = 600u64;
+    let h_override = threshold_from(
+        test_home.path(),
+        &[
+            "health",
+            "--stale-threshold",
+            &overridden.to_string(),
+            "--json",
+        ],
+        &["state", "index", "stale_threshold_seconds"],
+    );
+    let s_override = threshold_from(
+        test_home.path(),
+        &[
+            "status",
+            "--stale-threshold",
+            &overridden.to_string(),
+            "--json",
+        ],
+        &["index", "stale_threshold_seconds"],
+    );
+    assert_eq!(
+        h_override, overridden,
+        "health did not honor --stale-threshold={overridden}; emitted {h_override} — retention monitoring would silently use the wrong threshold"
+    );
+    assert_eq!(
+        s_override, overridden,
+        "status did not honor --stale-threshold={overridden}; emitted {s_override} — operator-facing surface diverged from the configured policy"
+    );
+    assert_eq!(
+        h_override, s_override,
+        "health and status produced different stale_threshold_seconds ({h_override} vs {s_override}) despite identical --stale-threshold overrides — divergence is in computation, not just default"
+    );
+
+    // Invariant B: defaults ARE intentionally different (design pin).
+    let h_default = threshold_from(
+        test_home.path(),
+        &["health", "--json"],
+        &["state", "index", "stale_threshold_seconds"],
+    );
+    let s_default = threshold_from(
+        test_home.path(),
+        &["status", "--json"],
+        &["index", "stale_threshold_seconds"],
+    );
+    assert_ne!(
+        h_default, s_default,
+        "health and status stale_threshold defaults collapsed to {h_default} — if this is intentional, update this test; otherwise it's a default-policy regression"
+    );
+    // Tighter machine vs looser operator — document the direction.
+    assert!(
+        h_default < s_default,
+        "health default ({h_default}) must remain <= status default ({s_default}) so pre-flight remains at least as strict as operator-facing staleness"
+    );
+
+    // Invariant C: both defaults in sane bounds.
+    for (label, v) in [("health", h_default), ("status", s_default)] {
+        assert!(
+            (60..=86_400).contains(&v),
+            "{label} default stale_threshold={v} is outside sane bounds [60, 86400]"
+        );
+    }
+}
