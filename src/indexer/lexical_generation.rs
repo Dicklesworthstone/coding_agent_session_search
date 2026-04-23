@@ -356,6 +356,10 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     #[serde(default)]
     pub inspection_items: Vec<LexicalCleanupInspectionItem>,
     #[serde(default)]
+    pub inspection_required_count: usize,
+    #[serde(default)]
+    pub inspection_required_retained_bytes: u64,
+    #[serde(default)]
     pub shard_disposition_summaries:
         BTreeMap<LexicalCleanupDisposition, LexicalCleanupDispositionSummary>,
     pub inventories: Vec<LexicalGenerationCleanupInventory>,
@@ -459,11 +463,15 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub active_generation_ids: Vec<String>,
     #[serde(default)]
     pub protected_generation_ids: Vec<String>,
+    #[serde(default)]
     pub protected_retained_bytes: u64,
     #[serde(default)]
     pub inspection_previews: Vec<LexicalCleanupInspectionItem>,
+    #[serde(default)]
     pub inspection_required_count: usize,
+    #[serde(default)]
     pub inspection_required_retained_bytes: u64,
+    #[serde(default)]
     pub inspection_required_generation_ids: Vec<String>,
 }
 
@@ -488,6 +496,8 @@ impl LexicalCleanupDryRunPlan {
             disposition_counts: BTreeMap::new(),
             generation_disposition_summaries: BTreeMap::new(),
             inspection_items: Vec::new(),
+            inspection_required_count: 0,
+            inspection_required_retained_bytes: 0,
             shard_disposition_summaries: BTreeMap::new(),
             inventories: Vec::new(),
         };
@@ -565,7 +575,6 @@ impl LexicalCleanupDryRunPlan {
             blocker_codes.push(LexicalCleanupApplyBlocker::ActiveGenerationWork);
         }
         let inspection_required_generation_ids = self.inspection_required_generation_ids();
-        let inspection_required_retained_bytes = self.inspection_required_retained_bytes();
 
         LexicalCleanupApplyGate {
             apply_allowed: blocked_reasons.is_empty(),
@@ -593,8 +602,8 @@ impl LexicalCleanupDryRunPlan {
             protected_generation_ids: self.protected_generation_ids.clone(),
             protected_retained_bytes: self.protected_retained_bytes,
             inspection_previews: self.inspection_items.clone(),
-            inspection_required_count: self.inspection_items.len(),
-            inspection_required_retained_bytes,
+            inspection_required_count: self.inspection_required_count,
+            inspection_required_retained_bytes: self.inspection_required_retained_bytes,
             inspection_required_generation_ids,
         }
     }
@@ -610,9 +619,15 @@ impl LexicalCleanupDryRunPlan {
     }
 
     pub(crate) fn inspection_required_retained_bytes(&self) -> u64 {
-        self.inspection_items.iter().fold(0u64, |total, item| {
-            total.saturating_add(item.retained_bytes)
-        })
+        self.inspection_required_retained_bytes
+    }
+
+    fn record_inspection_item(&mut self, item: LexicalCleanupInspectionItem) {
+        self.inspection_required_count = self.inspection_required_count.saturating_add(1);
+        self.inspection_required_retained_bytes = self
+            .inspection_required_retained_bytes
+            .saturating_add(item.retained_bytes);
+        self.inspection_items.push(item);
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
@@ -684,7 +699,7 @@ impl LexicalCleanupDryRunPlan {
 
             if Self::requires_inspection(shard.disposition) {
                 shard_inspection_items = shard_inspection_items.saturating_add(1);
-                self.inspection_items.push(LexicalCleanupInspectionItem {
+                self.record_inspection_item(LexicalCleanupInspectionItem {
                     generation_id: inventory.generation_id.clone(),
                     shard_id: Some(shard.shard_id.clone()),
                     disposition: shard.disposition,
@@ -707,7 +722,7 @@ impl LexicalCleanupDryRunPlan {
         }
 
         if inventory_requires_inspection && shard_inspection_items == 0 {
-            self.inspection_items.push(LexicalCleanupInspectionItem {
+            self.record_inspection_item(LexicalCleanupInspectionItem {
                 generation_id: inventory.generation_id.clone(),
                 shard_id: None,
                 disposition: inventory.disposition,
@@ -763,12 +778,26 @@ impl LexicalCleanupDryRunPlan {
         hash_u64(&mut hasher, self.total_reclaimable_bytes);
         hash_u64(&mut hasher, self.total_retained_bytes);
         hash_u64(&mut hasher, self.protected_retained_bytes);
+        hash_usize(&mut hasher, self.inspection_required_count);
+        hash_u64(&mut hasher, self.inspection_required_retained_bytes);
 
         let mut candidates: Vec<&LexicalCleanupReclaimCandidate> =
             self.reclaim_candidates.iter().collect();
         candidates.sort_by(|a, b| {
-            (&a.generation_id, &a.shard_id, a.disposition.as_str())
-                .cmp(&(&b.generation_id, &b.shard_id, b.disposition.as_str()))
+            (
+                &a.generation_id,
+                &a.shard_id,
+                a.disposition.as_str(),
+                &a.reason,
+                a.reclaimable_bytes,
+            )
+                .cmp(&(
+                    &b.generation_id,
+                    &b.shard_id,
+                    b.disposition.as_str(),
+                    &b.reason,
+                    b.reclaimable_bytes,
+                ))
         });
         for candidate in candidates {
             hash_str(&mut hasher, &candidate.generation_id);
@@ -785,11 +814,15 @@ impl LexicalCleanupDryRunPlan {
                 &a.generation_id,
                 a.shard_id.as_deref().unwrap_or(""),
                 a.disposition.as_str(),
+                &a.reason,
+                a.retained_bytes,
             )
                 .cmp(&(
                     &b.generation_id,
                     b.shard_id.as_deref().unwrap_or(""),
                     b.disposition.as_str(),
+                    &b.reason,
+                    b.retained_bytes,
                 ))
         });
         for item in inspections {
@@ -813,6 +846,22 @@ impl LexicalCleanupDryRunPlan {
         for (disposition, count) in &self.disposition_counts {
             hash_str(&mut hasher, disposition.as_str());
             hash_usize(&mut hasher, *count);
+        }
+        for (disposition, summary) in &self.generation_disposition_summaries {
+            hash_str(&mut hasher, "generation_disposition_summary");
+            hash_str(&mut hasher, disposition.as_str());
+            hash_usize(&mut hasher, summary.generation_count);
+            hash_u64(&mut hasher, summary.artifact_bytes);
+            hash_u64(&mut hasher, summary.reclaimable_bytes);
+            hash_u64(&mut hasher, summary.retained_bytes);
+        }
+        for (disposition, summary) in &self.shard_disposition_summaries {
+            hash_str(&mut hasher, "shard_disposition_summary");
+            hash_str(&mut hasher, disposition.as_str());
+            hash_usize(&mut hasher, summary.shard_count);
+            hash_u64(&mut hasher, summary.artifact_bytes);
+            hash_u64(&mut hasher, summary.reclaimable_bytes);
+            hash_u64(&mut hasher, summary.retained_bytes);
         }
 
         format!("cleanup-v1-{}", hasher.finalize().to_hex())
@@ -2223,6 +2272,9 @@ mod tests {
             plan.inspection_required_generation_ids(),
             vec!["gen-quarantined".to_string()]
         );
+        assert_eq!(plan.inspection_required_count, 1);
+        assert_eq!(plan.inspection_required_retained_bytes, 2048);
+        assert_eq!(plan.inspection_required_retained_bytes(), 2048);
         assert_eq!(
             plan.inspection_items,
             vec![LexicalCleanupInspectionItem {
@@ -2326,6 +2378,8 @@ mod tests {
             json["inspection_items"][0]["generation_id"],
             "gen-quarantined"
         );
+        assert_eq!(json["inspection_required_count"], 1);
+        assert_eq!(json["inspection_required_retained_bytes"], 2048);
         assert_eq!(json["inspection_items"][0]["shard_id"], "shard-bad");
         assert_eq!(
             json["inspection_items"][0]["disposition"],
@@ -2803,6 +2857,33 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_apply_gate_deserializes_legacy_payload_without_lifecycle_summaries() {
+        let legacy = serde_json::json!({
+            "apply_allowed": false,
+            "dry_run": true,
+            "explicit_operator_approval": false,
+            "candidate_count": 0,
+            "reclaimable_bytes": 0,
+            "blocked_reasons": []
+        });
+
+        let gate: LexicalCleanupApplyGate =
+            serde_json::from_value(legacy).expect("legacy cleanup apply gate should deserialize");
+        assert_eq!(
+            gate.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::NotRequested
+        );
+        assert!(!gate.approval_fingerprint_matches);
+        assert!(gate.active_generation_ids.is_empty());
+        assert!(gate.protected_generation_ids.is_empty());
+        assert_eq!(gate.protected_retained_bytes, 0);
+        assert!(gate.inspection_previews.is_empty());
+        assert_eq!(gate.inspection_required_count, 0);
+        assert_eq!(gate.inspection_required_retained_bytes, 0);
+        assert!(gate.inspection_required_generation_ids.is_empty());
+    }
+
+    #[test]
     fn cleanup_dry_run_plan_fingerprints_approval_surface() -> Result<(), serde_json::Error> {
         let mut superseded =
             LexicalGenerationManifest::new_scratch("gen-old", "attempt-1", "fp", 1);
@@ -2850,6 +2931,102 @@ mod tests {
         assert_ne!(
             plan.approval_fingerprint, changed_plan.approval_fingerprint,
             "approval fingerprint must change when reclaimable candidate bytes change"
+        );
+
+        let mut current =
+            LexicalGenerationManifest::new_scratch("gen-current", "attempt-current", "fp", 30);
+        current.set_shards(
+            vec![test_shard(
+                "shard-current",
+                0,
+                LexicalShardLifecycleState::Published,
+                100,
+            )],
+            31,
+        );
+        current.transition_build(LexicalGenerationBuildState::Validated, 32);
+        current.transition_publish(LexicalGenerationPublishState::Published, 33);
+
+        let mut pinned =
+            LexicalGenerationManifest::new_scratch("gen-pinned", "attempt-pinned", "fp", 40);
+        pinned.set_shards(
+            vec![test_shard(
+                "shard-pinned",
+                0,
+                LexicalShardLifecycleState::Published,
+                200,
+            )],
+            41,
+        );
+        pinned.transition_build(LexicalGenerationBuildState::Validated, 42);
+
+        let mut larger_current =
+            LexicalGenerationManifest::new_scratch("gen-current", "attempt-current", "fp", 50);
+        larger_current.set_shards(
+            vec![test_shard(
+                "shard-current",
+                0,
+                LexicalShardLifecycleState::Published,
+                200,
+            )],
+            51,
+        );
+        larger_current.transition_build(LexicalGenerationBuildState::Validated, 52);
+        larger_current.transition_publish(LexicalGenerationPublishState::Published, 53);
+
+        let mut smaller_pinned =
+            LexicalGenerationManifest::new_scratch("gen-pinned", "attempt-pinned", "fp", 60);
+        smaller_pinned.set_shards(
+            vec![test_shard(
+                "shard-pinned",
+                0,
+                LexicalShardLifecycleState::Published,
+                100,
+            )],
+            61,
+        );
+        smaller_pinned.transition_build(LexicalGenerationBuildState::Validated, 62);
+
+        let retained_plan = LexicalCleanupDryRunPlan::from_manifests([&current, &pinned]);
+        let shifted_retained_plan =
+            LexicalCleanupDryRunPlan::from_manifests([&larger_current, &smaller_pinned]);
+        assert_eq!(
+            retained_plan.total_retained_bytes,
+            shifted_retained_plan.total_retained_bytes
+        );
+        assert_eq!(
+            retained_plan.disposition_counts,
+            shifted_retained_plan.disposition_counts
+        );
+        assert_ne!(
+            retained_plan.approval_fingerprint, shifted_retained_plan.approval_fingerprint,
+            "approval fingerprint must change when retained bytes move between protected disposition summaries"
+        );
+
+        let mut duplicate_key_a =
+            LexicalGenerationManifest::new_scratch("gen-dup", "attempt-dup", "fp", 70);
+        let mut dup_small = test_shard("dup-shard", 0, LexicalShardLifecycleState::Published, 100);
+        dup_small.pinned = false;
+        dup_small.reclaimable = true;
+        let mut dup_large = test_shard("dup-shard", 1, LexicalShardLifecycleState::Published, 200);
+        dup_large.pinned = false;
+        dup_large.reclaimable = true;
+        duplicate_key_a.set_shards(vec![dup_small.clone(), dup_large.clone()], 71);
+        duplicate_key_a.transition_build(LexicalGenerationBuildState::Validated, 72);
+        duplicate_key_a.transition_publish(LexicalGenerationPublishState::Superseded, 73);
+
+        let mut duplicate_key_b =
+            LexicalGenerationManifest::new_scratch("gen-dup", "attempt-dup", "fp", 80);
+        duplicate_key_b.set_shards(vec![dup_large, dup_small], 81);
+        duplicate_key_b.transition_build(LexicalGenerationBuildState::Validated, 82);
+        duplicate_key_b.transition_publish(LexicalGenerationPublishState::Superseded, 83);
+
+        let duplicate_order_plan_a = LexicalCleanupDryRunPlan::from_manifests([&duplicate_key_a]);
+        let duplicate_order_plan_b = LexicalCleanupDryRunPlan::from_manifests([&duplicate_key_b]);
+        assert_eq!(
+            duplicate_order_plan_a.approval_fingerprint,
+            duplicate_order_plan_b.approval_fingerprint,
+            "approval fingerprint must sort equal generation/shard/disposition keys by the rest of the hashed candidate payload"
         );
 
         let gate = plan.apply_gate_with_fingerprint(true, Some(&plan.approval_fingerprint));
@@ -2938,8 +3115,13 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(plan.inspection_required_count, 2);
+        assert_eq!(plan.inspection_required_retained_bytes, 768);
+        assert_eq!(plan.inspection_required_retained_bytes(), 768);
 
         let json = serde_json::to_value(&plan).expect("serialize cleanup inspection dry-run plan");
+        assert_eq!(json["inspection_required_count"], 2);
+        assert_eq!(json["inspection_required_retained_bytes"], 768);
         assert_eq!(
             json["inspection_items"][0]["disposition"],
             "quarantined_retained"
