@@ -1004,6 +1004,45 @@ fn health_and_status_agree_on_readiness_contract() {
 }
 
 #[test]
+fn health_and_status_agree_on_semantic_fallback_state() {
+    // Cross-surface row: health nests semantic readiness under
+    // state.semantic, while status promotes the same object to top-level
+    // semantic. When semantic assets are absent, both surfaces must tell
+    // agents the same fail-open story before they choose whether to wait
+    // for semantic refinement or continue with lexical-only results.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let health = json_out(test_home.path(), &["health", "--json"]);
+    let status = json_out(test_home.path(), &["status", "--json"]);
+    let health_semantic = &health["state"]["semantic"];
+    let status_semantic = &status["semantic"];
+
+    for key in ["available", "can_search", "fallback_mode", "status", "hint"] {
+        assert_eq!(
+            health_semantic[key], status_semantic[key],
+            "health.state.semantic.{key} and status.semantic.{key} diverged"
+        );
+    }
+    assert_eq!(
+        health_semantic["fallback_mode"], "lexical",
+        "semantic fallback must remain lexical when assets are absent"
+    );
+}
+
+#[test]
 fn semantic_readiness_reports_lexical_fallback_when_models_absent() {
     // ibuuh.11 contract row: 'Bootstrap semantic assets and verify live
     // default-hybrid behavior'. The core fail-open contract: when the
@@ -1227,5 +1266,69 @@ fn concurrent_introspect_readings_agree_after_btreemap_fix() {
             "introspect --json output #{i} diverged from output #0 — \
              HashMap/registry non-determinism may have regressed (bead 8sl73)"
         );
+    }
+}
+
+#[test]
+fn capabilities_features_and_connectors_contain_no_duplicates() {
+    // Registry-invariant row: cass capabilities --json enumerates the
+    // feature set and the connector set as string arrays. Each entry must
+    // be unique — a duplicate signals double-registration (e.g. a feature
+    // flag accidentally inserted twice during refactor, or a connector
+    // registered in two modules). Downstream agents dedupe by hashing
+    // into sets, so a duplicate silently skews feature-count metrics and
+    // can mask an unregistered dependency.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["capabilities", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass capabilities --json");
+    assert!(
+        out.status.success(),
+        "cass capabilities --json exited non-zero"
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let caps: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    for (field, label) in [("features", "feature"), ("connectors", "connector")] {
+        let arr = caps[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("capabilities.{field} must be an array"));
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("{label} entries must be strings"))
+            })
+            .collect();
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "capabilities.{field} contains duplicate entries: {names:?} vs unique {unique:?}"
+        );
+        assert!(
+            names.len() > 0,
+            "capabilities.{field} must not be empty — sanity check"
+        );
+    }
+
+    // Bonus invariant: limits is an object with the four documented
+    // integer fields, each non-negative.
+    let limits = &caps["limits"];
+    for key in [
+        "max_limit",
+        "max_content_length",
+        "max_fields",
+        "max_agg_buckets",
+    ] {
+        let n = limits[key]
+            .as_i64()
+            .unwrap_or_else(|| panic!("limits.{key} must be an integer"));
+        assert!(n >= 0, "limits.{key} must be non-negative; got {n}");
     }
 }
