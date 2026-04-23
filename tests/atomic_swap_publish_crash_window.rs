@@ -28,7 +28,10 @@
 //! the publish is in flight.
 
 use assert_cmd::Command;
-use coding_agent_search::search::tantivy::{SearchableIndexSummary, searchable_index_summary};
+use coding_agent_search::search::tantivy::{
+    SearchableIndexSummary, open_federated_search_readers, searchable_index_summary,
+};
+use frankensearch::lexical::ReloadPolicy;
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
@@ -93,6 +96,19 @@ fn seed_codex_session(
         body.push('\n');
     }
     fs::write(sessions.join(filename), body).unwrap();
+}
+
+fn force_federated_publish_env(cmd: &mut Command) {
+    cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "6");
+    cmd.env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
+    cmd.env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
+    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS", "1");
+    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1");
+    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS", "1");
+    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "2");
+    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "2");
+    cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
+    cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES", "4096");
 }
 
 #[test]
@@ -213,6 +229,104 @@ fn concurrent_reader_never_sees_half_torn_lexical_index_during_publish_swap() {
                  observations = {total}",
                 docs = summary.docs,
                 total = observations.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_reader_never_sees_half_torn_federated_lexical_index_during_publish_swap() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    for (filename, ts_ms, keyword) in [
+        ("swap-fed-1.jsonl", 1_714_100_000_000_i64, "federated alpha"),
+        ("swap-fed-2.jsonl", 1_714_100_100_000_i64, "federated beta"),
+        ("swap-fed-3.jsonl", 1_714_100_200_000_i64, "federated gamma"),
+    ] {
+        seed_codex_session(&codex_home, "2026/04/23", filename, ts_ms, keyword);
+    }
+
+    let mut initial_index = cass_cmd(&home);
+    force_federated_publish_env(&mut initial_index);
+    initial_index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve versioned tantivy index path");
+    let before = searchable_index_summary(&index_path)
+        .expect("initial federated summary readable")
+        .expect("initial federated index present");
+    let before_docs = before.docs;
+    assert!(
+        before_docs >= 3,
+        "precondition: live federated index should contain multiple docs"
+    );
+    let before_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
+        .expect("load federated readers before rebuild")
+        .expect("federated manifest should exist before rebuild");
+    assert!(
+        before_federated_readers.len() > 1,
+        "forced shard planner settings should materialize a federated live index before rebuild"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
+    let reader_index_path = index_path.clone();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let reader = thread::spawn(move || {
+        let mut observations: Vec<Result<Option<SearchableIndexSummary>, String>> = Vec::new();
+        while !reader_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let obs = searchable_index_summary(&reader_index_path).map_err(|e| format!("{e:#}"));
+            observations.push(obs);
+            thread::sleep(Duration::from_millis(1));
+        }
+        observations
+    });
+
+    let mut rebuild = cass_cmd(&home);
+    force_federated_publish_env(&mut rebuild);
+    rebuild
+        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
+    stop.store(true, Ordering::Relaxed);
+    let observations = reader.join().expect("reader thread panicked");
+
+    let after = searchable_index_summary(&index_path)
+        .expect("post-publish federated summary readable")
+        .expect("post-publish federated index present");
+    assert_eq!(
+        after.docs, before_docs,
+        "forced federated --force-rebuild on unchanged content must preserve the doc count"
+    );
+    let after_federated_readers = open_federated_search_readers(&index_path, ReloadPolicy::Manual)
+        .expect("load federated readers after rebuild")
+        .expect("federated manifest should still exist after rebuild");
+    assert!(
+        after_federated_readers.len() > 1,
+        "post-rebuild live index should remain a federated publish bundle"
+    );
+
+    assert!(
+        !observations.is_empty(),
+        "reader must collect observations during the federated publish window"
+    );
+    for (i, obs) in observations.iter().enumerate() {
+        if let Ok(Some(summary)) = obs {
+            assert_eq!(
+                summary.docs, before_docs,
+                "federated observation #{i} returned {docs} docs; expected the stable count {before_docs}. \
+                 Any other readable doc count indicates a half-torn federated lexical publish surface",
+                docs = summary.docs
             );
         }
     }
