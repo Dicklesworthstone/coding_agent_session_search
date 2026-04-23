@@ -329,6 +329,8 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     pub total_artifact_bytes: u64,
     pub total_reclaimable_bytes: u64,
     pub total_retained_bytes: u64,
+    #[serde(default)]
+    pub reclaim_candidates: Vec<LexicalCleanupReclaimCandidate>,
     pub reclaimable_generation_ids: Vec<String>,
     pub fully_retained_generation_ids: Vec<String>,
     pub quarantined_generation_ids: Vec<String>,
@@ -346,6 +348,17 @@ pub(crate) struct LexicalCleanupReclaimCandidate {
     pub reclaimable_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LexicalCleanupApplyGate {
+    pub apply_allowed: bool,
+    pub dry_run: bool,
+    pub explicit_operator_approval: bool,
+    pub candidate_count: usize,
+    pub reclaimable_bytes: u64,
+    pub blocked_reasons: Vec<String>,
+    pub inspection_required_generation_ids: Vec<String>,
+}
+
 impl LexicalCleanupDryRunPlan {
     pub(crate) fn from_manifests<'a>(
         manifests: impl IntoIterator<Item = &'a LexicalGenerationManifest>,
@@ -356,6 +369,7 @@ impl LexicalCleanupDryRunPlan {
             total_artifact_bytes: 0,
             total_reclaimable_bytes: 0,
             total_retained_bytes: 0,
+            reclaim_candidates: Vec::new(),
             reclaimable_generation_ids: Vec::new(),
             fully_retained_generation_ids: Vec::new(),
             quarantined_generation_ids: Vec::new(),
@@ -376,23 +390,35 @@ impl LexicalCleanupDryRunPlan {
     }
 
     pub(crate) fn reclaim_candidates(&self) -> Vec<LexicalCleanupReclaimCandidate> {
-        self.inventories
-            .iter()
-            .flat_map(|inventory| {
-                inventory.shards.iter().filter_map(|shard| {
-                    if shard.reclaimable_bytes == 0 {
-                        return None;
-                    }
-                    Some(LexicalCleanupReclaimCandidate {
-                        generation_id: inventory.generation_id.clone(),
-                        shard_id: shard.shard_id.clone(),
-                        disposition: shard.disposition,
-                        reason: shard.reason.clone(),
-                        reclaimable_bytes: shard.reclaimable_bytes,
-                    })
-                })
-            })
-            .collect()
+        self.reclaim_candidates.clone()
+    }
+
+    pub(crate) fn apply_gate(&self, explicit_operator_approval: bool) -> LexicalCleanupApplyGate {
+        let mut blocked_reasons = Vec::new();
+        if self.reclaim_candidates.is_empty() {
+            blocked_reasons.push("no reclaimable cleanup candidates".to_string());
+        }
+        if !explicit_operator_approval {
+            blocked_reasons.push(
+                "destructive cleanup requires explicit operator approval after dry-run".to_string(),
+            );
+        }
+        if !self.active_generation_ids.is_empty() {
+            blocked_reasons.push(format!(
+                "active generation work must settle before cleanup apply: {}",
+                self.active_generation_ids.join(",")
+            ));
+        }
+
+        LexicalCleanupApplyGate {
+            apply_allowed: blocked_reasons.is_empty(),
+            dry_run: self.dry_run,
+            explicit_operator_approval,
+            candidate_count: self.reclaim_candidates.len(),
+            reclaimable_bytes: self.total_reclaimable_bytes,
+            blocked_reasons,
+            inspection_required_generation_ids: self.quarantined_generation_ids.clone(),
+        }
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
@@ -428,6 +454,19 @@ impl LexicalCleanupDryRunPlan {
         if matches!(inventory.disposition, LexicalCleanupDisposition::ActiveWork) {
             self.active_generation_ids
                 .push(inventory.generation_id.clone());
+        }
+        for shard in &inventory.shards {
+            if shard.reclaimable_bytes == 0 {
+                continue;
+            }
+            self.reclaim_candidates
+                .push(LexicalCleanupReclaimCandidate {
+                    generation_id: inventory.generation_id.clone(),
+                    shard_id: shard.shard_id.clone(),
+                    disposition: shard.disposition,
+                    reason: shard.reason.clone(),
+                    reclaimable_bytes: shard.reclaimable_bytes,
+                });
         }
 
         self.inventories.push(inventory);
@@ -1890,6 +1929,7 @@ mod tests {
         ]);
         let candidates = plan.reclaim_candidates();
 
+        assert_eq!(plan.reclaim_candidates, candidates);
         assert_eq!(
             candidates,
             vec![
@@ -1913,6 +1953,113 @@ mod tests {
         );
         assert_eq!(plan.total_reclaimable_bytes, 9216);
         assert_eq!(plan.total_retained_bytes, 6656);
+
+        let json = serde_json::to_value(&plan).expect("serialize cleanup dry-run plan");
+        assert_eq!(json["reclaim_candidates"][0]["generation_id"], "gen-old");
+        assert_eq!(json["reclaim_candidates"][0]["shard_id"], "shard-old-a");
+        assert_eq!(
+            json["reclaim_candidates"][0]["disposition"],
+            "superseded_reclaimable"
+        );
+        assert_eq!(json["reclaim_candidates"][0]["reclaimable_bytes"], 8192);
+        assert_eq!(json["reclaim_candidates"][1]["generation_id"], "gen-failed");
+        assert_eq!(
+            json["reclaim_candidates"][1]["disposition"],
+            "failed_reclaimable"
+        );
+        assert_eq!(
+            json["reclaim_candidates"]
+                .as_array()
+                .expect("reclaim_candidates must serialize as an array")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cleanup_apply_gate_requires_approval_and_blocks_active_work() {
+        let mut superseded =
+            LexicalGenerationManifest::new_scratch("gen-old", "attempt-1", "fp", 1);
+        let mut reclaimable_shard =
+            test_shard("shard-old", 0, LexicalShardLifecycleState::Published, 4096);
+        reclaimable_shard.pinned = false;
+        reclaimable_shard.reclaimable = true;
+        superseded.set_shards(vec![reclaimable_shard], 2);
+        superseded.transition_build(LexicalGenerationBuildState::Validated, 3);
+        superseded.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+
+        let mut active =
+            LexicalGenerationManifest::new_scratch("gen-active", "attempt-2", "fp", 10);
+        active.set_shards(
+            vec![test_shard(
+                "shard-active",
+                0,
+                LexicalShardLifecycleState::Building,
+                2048,
+            )],
+            11,
+        );
+        active.transition_build(LexicalGenerationBuildState::Building, 12);
+
+        let mut quarantined =
+            LexicalGenerationManifest::new_scratch("gen-quarantined", "attempt-3", "fp", 20);
+        quarantined.set_shards(
+            vec![test_shard(
+                "shard-bad",
+                0,
+                LexicalShardLifecycleState::Quarantined,
+                512,
+            )],
+            21,
+        );
+        assert!(quarantined.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            22,
+            Some("checksum mismatch".into()),
+        ));
+        quarantined.transition_publish(LexicalGenerationPublishState::Quarantined, 23);
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([&superseded, &active, &quarantined]);
+
+        let blocked = plan.apply_gate(false);
+        assert!(!blocked.apply_allowed);
+        assert!(blocked.dry_run);
+        assert!(!blocked.explicit_operator_approval);
+        assert_eq!(blocked.candidate_count, 1);
+        assert_eq!(blocked.reclaimable_bytes, 4096);
+        assert_eq!(
+            blocked.inspection_required_generation_ids,
+            vec!["gen-quarantined".to_string()]
+        );
+        assert!(
+            blocked
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("explicit operator approval")),
+            "missing approval blocker: {:?}",
+            blocked.blocked_reasons
+        );
+        assert!(
+            blocked
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("gen-active")),
+            "missing active-work blocker: {:?}",
+            blocked.blocked_reasons
+        );
+
+        let active_still_blocks = plan.apply_gate(true);
+        assert!(!active_still_blocks.apply_allowed);
+        assert!(active_still_blocks.explicit_operator_approval);
+        assert_eq!(active_still_blocks.blocked_reasons.len(), 1);
+
+        let safe_plan = LexicalCleanupDryRunPlan::from_manifests([&superseded]);
+        let allowed = safe_plan.apply_gate(true);
+        assert!(allowed.apply_allowed);
+        assert!(allowed.blocked_reasons.is_empty());
+        assert_eq!(allowed.candidate_count, 1);
+        assert_eq!(allowed.reclaimable_bytes, 4096);
     }
 
     fn test_shard_plan(
