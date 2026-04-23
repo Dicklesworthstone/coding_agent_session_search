@@ -910,7 +910,10 @@ fn unified_refresh_controller_records_policy_budget_and_demotion_reasons() {
     assert_eq!(summary.actor_traces[2].load.label, "machine_pressure");
     assert_eq!(summary.actor_traces[3].load.label, "shadow_divergence");
     assert!(summary.actor_traces[3].load.user_active);
-    assert_eq!(summary.actor_traces[4].load.label, "stable_verified_fallback");
+    assert_eq!(
+        summary.actor_traces[4].load.label,
+        "stable_verified_fallback"
+    );
 
     for expected in [
         "001-serial_policy_decision.json",
@@ -970,10 +973,7 @@ fn unified_refresh_controller_records_policy_budget_and_demotion_reasons() {
             .expect("demotion policy JSON");
     assert_eq!(demotion_json["preferred_path_before"], "segment_farm");
     assert_eq!(demotion_json["preferred_path_after"], "verified_serial");
-    assert_eq!(
-        demotion_json["reason"],
-        "shadow_compare_digest_divergence"
-    );
+    assert_eq!(demotion_json["reason"], "shadow_compare_digest_divergence");
 
     let verdict_path = artifacts
         .snapshot_dir
@@ -987,6 +987,251 @@ fn unified_refresh_controller_records_policy_budget_and_demotion_reasons() {
         "pass"
     );
     assert_eq!(verdict_json["active_path"], "verified_serial");
+}
+
+#[test]
+fn unified_refresh_controller_preserves_pressure_mode_operator_controls() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "unified_refresh_controller_pressure_modes",
+        LoadScript::new(vec![
+            LoadSample::loaded("low_memory_pressure"),
+            LoadSample::loaded("wal_growth_pressure"),
+            LoadSample::loaded("slow_commit_pressure"),
+            LoadSample::busy("heavy_watch_pressure"),
+            LoadSample::idle("post_canary_review"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::BackgroundSemantic, "low_memory_budget")
+        .turn(SimulationActor::LexicalRepair, "wal_growth_commit_cadence")
+        .turn(
+            SimulationActor::LexicalRepair,
+            "slow_commit_parallel_shadow",
+        )
+        .turn(SimulationActor::ForegroundSearch, "watch_pressure_pin")
+        .turn(SimulationActor::LexicalRepair, "canary_divergence_demote");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::BackgroundSemantic, "low_memory_budget") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller drops memo budget and page size under low-memory pressure",
+                );
+                sim.snapshot_json(
+                    "low_memory_budget_policy",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "controller_enabled": true,
+                        "operator_pin": "auto",
+                        "memo_cache_budget_mb_before": 256,
+                        "memo_cache_budget_mb_after": 64,
+                        "page_conversation_limit_before": 256,
+                        "page_conversation_limit_after": 128,
+                        "commit_interval_pages_after": 4,
+                        "degraded_mode": "low_memory",
+                        "correctness_guard": "verified_serial_only",
+                        "reason": "resident_memory_pressure",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "wal_growth_commit_cadence") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller tightens commit cadence when WAL growth threatens recovery",
+                );
+                sim.snapshot_json(
+                    "wal_growth_commit_policy",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "wal_growth_mb": 896,
+                        "commit_interval_pages_before": 16,
+                        "commit_interval_pages_after": 2,
+                        "checkpoint_policy": "guarded_checkpoint_before_publish",
+                        "fallback_policy": "verified_serial",
+                        "rollback_safety": "old_good_generation_retained",
+                        "reason": "high_wal_growth",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "slow_commit_parallel_shadow") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller shrinks segment-farm width while keeping fast path shadowed",
+                );
+                sim.snapshot_json(
+                    "slow_commit_worker_policy",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "active_path": "segment_farm_shadow",
+                        "worker_concurrency_before": 24,
+                        "worker_concurrency_after": 6,
+                        "shard_width_before": 16,
+                        "shard_width_after": 4,
+                        "slow_commit_p95_ms": 3_400,
+                        "safe_disable_switch": true,
+                        "reason": "slow_commit_p95",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "watch_pressure_pin") => {
+                sim.phase(
+                    "unified_controller",
+                    "operator pin keeps heavy watch pressure on the verified serial path",
+                );
+                sim.snapshot_json(
+                    "watch_pressure_operator_override",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "operator_pin": "verified_serial",
+                        "advanced_fast_paths": "disabled",
+                        "watch_pressure": "heavy",
+                        "user_visible_latency_budget_ms": 200,
+                        "blocked_wait_ms": 0,
+                        "foreground_predictability": "preserved",
+                        "reason": "watch_pressure_operator_pin",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "canary_divergence_demote") => {
+                sim.phase(
+                    "unified_controller",
+                    "controller demotes canary fast path after compare-mode divergence",
+                );
+                sim.snapshot_json(
+                    "canary_divergence_policy",
+                    &json!({
+                        "policy_surface": "unified_refresh",
+                        "shadow_mode": "compare",
+                        "preferred_path_before": "segment_farm",
+                        "preferred_path_after": "verified_serial",
+                        "serving_allowed": false,
+                        "operator_action_required": false,
+                        "rollback_safety": "old_good_generation_retained",
+                        "reason": "canary_digest_divergence",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic pressure-mode turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "pressure-mode controller trace should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 5);
+    assert_eq!(summary.actor_traces[0].load.label, "low_memory_pressure");
+    assert_eq!(summary.actor_traces[1].load.label, "wal_growth_pressure");
+    assert_eq!(summary.actor_traces[2].load.label, "slow_commit_pressure");
+    assert_eq!(summary.actor_traces[3].load.label, "heavy_watch_pressure");
+    assert!(summary.actor_traces[3].load.user_active);
+    assert_eq!(summary.actor_traces[4].load.label, "post_canary_review");
+
+    for expected in [
+        "001-low_memory_budget_policy.json",
+        "002-wal_growth_commit_policy.json",
+        "003-slow_commit_worker_policy.json",
+        "004-watch_pressure_operator_override.json",
+        "005-canary_divergence_policy.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing pressure-mode snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write pressure-mode artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("controller drops memo budget"),
+        "phase log should preserve low-memory pressure reasoning"
+    );
+    assert!(
+        phase_log.contains("operator pin keeps heavy watch pressure"),
+        "phase log should preserve operator pin reasoning"
+    );
+    assert!(
+        phase_log.contains("controller demotes canary fast path"),
+        "phase log should preserve canary demotion reasoning"
+    );
+
+    let low_memory_path = artifacts
+        .snapshot_dir
+        .join("001-low_memory_budget_policy.json");
+    let low_memory_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&low_memory_path).expect("read low-memory policy"),
+    )
+    .expect("low-memory policy JSON");
+    assert_eq!(low_memory_json["memo_cache_budget_mb_after"], 64);
+    assert_eq!(low_memory_json["page_conversation_limit_after"], 128);
+    assert_eq!(low_memory_json["degraded_mode"], "low_memory");
+    assert_eq!(low_memory_json["correctness_guard"], "verified_serial_only");
+
+    let wal_path = artifacts
+        .snapshot_dir
+        .join("002-wal_growth_commit_policy.json");
+    let wal_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&wal_path).expect("read WAL policy"))
+            .expect("WAL policy JSON");
+    assert_eq!(wal_json["commit_interval_pages_after"], 2);
+    assert_eq!(
+        wal_json["checkpoint_policy"],
+        "guarded_checkpoint_before_publish"
+    );
+    assert_eq!(wal_json["rollback_safety"], "old_good_generation_retained");
+
+    let slow_commit_path = artifacts
+        .snapshot_dir
+        .join("003-slow_commit_worker_policy.json");
+    let slow_commit_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&slow_commit_path).expect("read slow-commit policy"),
+    )
+    .expect("slow-commit policy JSON");
+    assert_eq!(slow_commit_json["active_path"], "segment_farm_shadow");
+    assert_eq!(slow_commit_json["worker_concurrency_after"], 6);
+    assert_eq!(slow_commit_json["shard_width_after"], 4);
+    assert_eq!(slow_commit_json["safe_disable_switch"], true);
+
+    let watch_path = artifacts
+        .snapshot_dir
+        .join("004-watch_pressure_operator_override.json");
+    let watch_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&watch_path).expect("read watch pressure policy"))
+            .expect("watch pressure policy JSON");
+    assert_eq!(watch_json["operator_pin"], "verified_serial");
+    assert_eq!(watch_json["advanced_fast_paths"], "disabled");
+    assert_eq!(watch_json["blocked_wait_ms"], 0);
+    assert_eq!(watch_json["foreground_predictability"], "preserved");
+
+    let canary_path = artifacts
+        .snapshot_dir
+        .join("005-canary_divergence_policy.json");
+    let canary_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&canary_path).expect("read canary policy"))
+            .expect("canary policy JSON");
+    assert_eq!(canary_json["preferred_path_before"], "segment_farm");
+    assert_eq!(canary_json["preferred_path_after"], "verified_serial");
+    assert_eq!(canary_json["serving_allowed"], false);
+    assert_eq!(canary_json["reason"], "canary_digest_divergence");
 }
 
 #[test]
