@@ -1824,6 +1824,109 @@ fn diag_quarantine_gc_flags_match_retention_and_cleanup_policy() {
 }
 
 #[test]
+fn status_diag_and_doctor_quarantine_summaries_stay_in_lockstep() {
+    // ibuuh.19 lifecycle row: `cass status --json`, `cass diag --json
+    // --quarantine`, and `cass doctor --json` all expose derivative
+    // retention state. Their quarantine summaries must stay byte-identical
+    // so operators and agents do not branch on which command happened to
+    // run first.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let backups_dir = data_dir.join("backups");
+    fs::create_dir_all(&backups_dir).expect("create backups dir");
+    let failed_seed_root =
+        backups_dir.join("agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak");
+    fs::write(&failed_seed_root, b"seed-backup").expect("write failed seed root");
+    fs::write(
+        failed_seed_root.with_file_name(format!(
+            "{}-wal",
+            failed_seed_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("file name")
+        )),
+        b"seed-wal",
+    )
+    .expect("write failed seed wal");
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained backup");
+    thread::sleep(std::time::Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained backup");
+    let generation_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_generation_manifest(&generation_dir);
+    fs::write(
+        generation_dir.join("segment-a"),
+        b"quarantined-generation-bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    fn json_out(home: &Path, data_dir: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+            .arg(data_dir)
+            .output()
+            .expect("run cass");
+        assert!(
+            out.status.success(),
+            "cass {args:?} exited non-zero; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let status = json_out(
+        test_home.path(),
+        &data_dir,
+        &["status", "--json", "--data-dir"],
+    );
+    let diag = json_out(
+        test_home.path(),
+        &data_dir,
+        &["diag", "--json", "--quarantine", "--data-dir"],
+    );
+    let doctor = json_out(
+        test_home.path(),
+        &data_dir,
+        &["doctor", "--json", "--data-dir"],
+    );
+
+    let status_summary = &status["quarantine"]["summary"];
+    let diag_summary = &diag["quarantine"]["summary"];
+    let doctor_summary = &doctor["quarantine"]["summary"];
+
+    assert_eq!(
+        status_summary, diag_summary,
+        "status.quarantine.summary must match diag --quarantine summary exactly"
+    );
+    assert_eq!(
+        doctor_summary, diag_summary,
+        "doctor.quarantine.summary must match diag --quarantine summary exactly"
+    );
+}
+
+#[test]
 fn index_subcommand_exposes_all_entrypoint_flags() {
     // tin8o migration-safety row. The bead's scope is "migrate watch,
     // import, salvage, and incremental entrypoints onto the same
