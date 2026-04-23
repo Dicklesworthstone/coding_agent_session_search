@@ -2893,3 +2893,102 @@ fn models_check_update_and_status_agree_on_revision_when_absent() {
         "check-update.reason is empty — operator has no explanation for update_available={update_available}"
     );
 }
+
+#[test]
+fn model_dir_lives_under_canonical_models_parent() {
+    // ibuuh.19 model-cache path-layout row.
+    //
+    // The retention policy's "sweep `<data_dir>/index/` for superseded
+    // lexical generations" rule has a direct analogue for the
+    // model-cache asset class: `<data_dir>/models/<model-name>`. If
+    // retention sweeps `<data_dir>/models/` to reclaim stale model
+    // caches, the canonical parent layer must be preserved. A
+    // degenerate layout where model_dir == data_dir or sits next to
+    // the DB/index would make the sweep rule either miss the cache
+    // (retention leak) or expand its jurisdiction into non-model
+    // artifacts (data-loss risk).
+    //
+    // This row complements diag_paths_use_canonical_filename_and_index_parent
+    // (which pins index_path's `index/` parent) by pinning the
+    // analogous `models/` parent for model_dir.
+    //
+    // Three invariants:
+    //   1. model_dir is a strict descendant of `<data_dir>/models/`
+    //   2. model_dir != `<data_dir>/models` itself (degenerate case
+    //      where there is no per-model subdir — retention would
+    //      operate on the parent directory of all models)
+    //   3. model_dir is disjoint from data_dir, db_path, index_path
+    //      (catches accidental path-resolution regressions where one
+    //      artifact's directory aliases another's)
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    let s_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass models status --json");
+    assert!(s_out.status.success(), "cass models status --json failed");
+    let status: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(s_out.stdout).expect("utf8")).expect("valid JSON");
+
+    let d_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(d_out.status.success(), "cass diag --json failed");
+    let diag: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(d_out.stdout).expect("utf8")).expect("valid JSON");
+
+    let data_dir = diag["paths"]["data_dir"]
+        .as_str()
+        .expect("paths.data_dir must be a string");
+    let db_path = diag["paths"]["db_path"]
+        .as_str()
+        .expect("paths.db_path must be a string");
+    let index_path = diag["paths"]["index_path"]
+        .as_str()
+        .expect("paths.index_path must be a string");
+    let model_dir = status["model_dir"]
+        .as_str()
+        .expect("status.model_dir must be a string");
+
+    let expected_models_root = Path::new(data_dir).join("models");
+    let model_dir_p = Path::new(model_dir);
+
+    // Invariant 1: strict descendant of <data_dir>/models/.
+    assert!(
+        model_dir_p.starts_with(&expected_models_root),
+        "model_dir ({}) does not live under the canonical '{}' layer — retention rules that sweep <data_dir>/models/ for stale model caches would lose track of this artifact",
+        model_dir_p.display(),
+        expected_models_root.display()
+    );
+
+    // Invariant 2: model_dir != <data_dir>/models itself.
+    assert_ne!(
+        model_dir_p,
+        expected_models_root.as_path(),
+        "model_dir equals <data_dir>/models — retention would operate on the parent directory of ALL models rather than a specific model subdir"
+    );
+
+    // Invariant 3: model_dir doesn't alias db/index/data_dir paths.
+    assert_ne!(
+        model_dir, data_dir,
+        "model_dir aliases data_dir — retention would attempt to reclaim the entire data root"
+    );
+    assert_ne!(
+        model_dir, db_path,
+        "model_dir aliases db_path — model-cache retention would target the canonical DB (data-loss)"
+    );
+    assert!(
+        !Path::new(model_dir).starts_with(index_path)
+            && !Path::new(index_path).starts_with(model_dir),
+        "model_dir ({model_dir}) and index_path ({index_path}) overlap — retention jurisdictions must be disjoint"
+    );
+}
