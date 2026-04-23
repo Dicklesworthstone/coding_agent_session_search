@@ -307,6 +307,25 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         items
     }
 
+    /// Preview which quarantine tombstones would be collected for an
+    /// exact reason string without mutating the cache.
+    pub(crate) fn preview_garbage_collect_quarantined_reason(
+        &self,
+        reason: &str,
+    ) -> Vec<MemoQuarantineInspectionItem> {
+        let mut items: Vec<_> = self
+            .quarantined
+            .iter()
+            .filter(|(_, stored_reason)| stored_reason.as_str() == reason)
+            .map(|(key, stored_reason)| MemoQuarantineInspectionItem {
+                key: key.clone(),
+                reason: stored_reason.clone(),
+            })
+            .collect();
+        sort_quarantine_inspection_items(&mut items);
+        items
+    }
+
     /// Remove every inspected quarantine tombstone for an algorithm and
     /// return a deterministic audit list of what was collected.
     pub(crate) fn garbage_collect_quarantined_algorithm(
@@ -325,6 +344,19 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             .collect();
         sort_quarantine_inspection_items(&mut collected);
         collected
+    }
+
+    /// Remove every inspected quarantine tombstone with an exact reason
+    /// and return a deterministic audit list of what was collected.
+    pub(crate) fn garbage_collect_quarantined_reason(
+        &mut self,
+        reason: &str,
+    ) -> Vec<MemoQuarantineInspectionItem> {
+        let preview = self.preview_garbage_collect_quarantined_reason(reason);
+        for item in &preview {
+            self.quarantined.remove(&item.key);
+        }
+        preview
     }
 
     fn touch(&mut self, key: &MemoKey) {
@@ -650,6 +682,49 @@ mod tests {
         assert!(
             cache
                 .garbage_collect_quarantined_algorithm("lexical-normalize")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn garbage_collect_quarantined_reason_is_previewable_and_exact() {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(6);
+        let lexical_a = key(b"lex-a", "lexical-normalize", "v1");
+        let lexical_b = key(b"lex-b", "lexical-normalize", "v1");
+        let semantic = key(b"semantic", "semantic-embed", "v2");
+
+        cache.insert(lexical_a.clone(), "lexical-a".into());
+        cache.insert(semantic.clone(), "semantic".into());
+        cache.insert(lexical_b.clone(), "lexical-b".into());
+        cache.quarantine(lexical_a, "checksum mismatch");
+        cache.quarantine(semantic.clone(), "checksum mismatch");
+        cache.quarantine(lexical_b.clone(), "checksum mismatch - retriable");
+
+        let preview = cache.preview_garbage_collect_quarantined_reason("checksum mismatch");
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].key, key(b"lex-a", "lexical-normalize", "v1"));
+        assert_eq!(preview[0].reason, "checksum mismatch");
+        assert_eq!(preview[1].key, key(b"semantic", "semantic-embed", "v2"));
+        assert_eq!(preview[1].reason, "checksum mismatch");
+        assert_eq!(cache.quarantine_summary().quarantined_entries, 3);
+
+        let collected = cache.garbage_collect_quarantined_reason("checksum mismatch");
+        assert_eq!(collected, preview);
+        let summary = cache.quarantine_summary();
+        assert_eq!(summary.quarantined_entries, 1);
+        assert_eq!(summary.reasons.get("checksum mismatch"), None);
+        assert_eq!(
+            summary.reasons.get("checksum mismatch - retriable"),
+            Some(&1)
+        );
+        assert!(matches!(
+            cache.get(&lexical_b),
+            MemoLookup::Quarantined { .. }
+        ));
+        assert!(
+            cache
+                .garbage_collect_quarantined_reason("checksum mismatch")
                 .is_empty()
         );
     }
