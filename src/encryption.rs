@@ -120,8 +120,9 @@ pub fn hkdf_extract_expand(
 ) -> Result<Vec<u8>, String> {
     let salt = ring_hkdf::Salt::new(ring_hkdf::HKDF_SHA256, salt);
     let prk = salt.extract(ikm);
+    let info_components = [info];
     let okm = prk
-        .expand(&[info], HkdfOutputLen(len))
+        .expand(&info_components, HkdfOutputLen(len))
         .map_err(|_| "hkdf expand failed: invalid output length".to_string())?;
     let mut output = vec![0u8; len];
     okm.fill(&mut output)

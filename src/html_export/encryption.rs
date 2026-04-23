@@ -6,6 +6,8 @@
 use std::fmt;
 
 #[cfg(feature = "encryption")]
+use std::num::NonZeroU32;
+#[cfg(feature = "encryption")]
 use std::time::Instant;
 
 use serde::Serialize;
@@ -99,8 +101,7 @@ pub fn encrypt_content(
         Aes256Gcm, Nonce,
         aead::{Aead, KeyInit},
     };
-    use pbkdf2::pbkdf2_hmac;
-    use sha2::Sha256;
+    use ring::pbkdf2;
 
     if password.is_empty() {
         warn!(
@@ -146,7 +147,16 @@ pub fn encrypt_content(
     let derive_started = Instant::now();
     // Derive key using PBKDF2-SHA256
     let mut key = zeroize::Zeroizing::new([0u8; 32]); // 256 bits for AES-256
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, params.iterations, &mut *key);
+    let iterations = NonZeroU32::new(params.iterations).ok_or_else(|| {
+        EncryptionError::KeyDerivation("iterations must be greater than zero".to_string())
+    })?;
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        iterations,
+        &salt,
+        password.as_bytes(),
+        &mut *key,
+    );
     debug!(
         component = "encryption",
         operation = "derive_key",
@@ -336,8 +346,7 @@ mod tests {
         };
         use base64::Engine; // Required for decode() method
         use base64::prelude::BASE64_STANDARD;
-        use pbkdf2::pbkdf2_hmac;
-        use sha2::Sha256;
+        use ring::pbkdf2;
 
         let params = EncryptionParams {
             iterations: 1_000,
@@ -361,7 +370,13 @@ mod tests {
             .expect("ciphertext b64");
 
         let mut key = [0u8; 32];
-        pbkdf2_hmac::<Sha256>(test_phrase.as_bytes(), &salt, params.iterations, &mut key);
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(params.iterations).expect("test iterations should be non-zero"),
+            &salt,
+            test_phrase.as_bytes(),
+            &mut key,
+        );
 
         let cipher = Aes256Gcm::new_from_slice(&key).expect("cipher");
         let nonce = Nonce::from_slice(&iv);
