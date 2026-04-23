@@ -3781,43 +3781,23 @@ fn persist_lexical_rebuild_equivalence_evidence(
     })
 }
 
-fn persist_lexical_rebuild_publish_artifacts(
-    index_path: &Path,
-    rebuild_state: &LexicalRebuildState,
+fn build_lexical_rebuild_generation_manifest(
+    source_db_fingerprint: &str,
     total_conversations: usize,
     final_observed_messages: usize,
     indexed_docs: usize,
     equivalence_evidence: &LexicalRebuildEquivalenceEvidence,
-) -> Result<()> {
-    tracing::info!(
-        document_count = equivalence_evidence.document_count,
-        manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
-        golden_query_digest = equivalence_evidence.golden_query_digest.as_str(),
-        golden_probe_count = equivalence_evidence.golden_query_hit_counts.len(),
-        golden_query_hit_total = equivalence_evidence
-            .golden_query_hit_counts
-            .iter()
-            .map(|hit| hit.hit_count)
-            .sum::<u64>(),
-        indexed_docs,
-        total_conversations,
-        processed_conversations = rebuild_state.processed_conversations,
-        "lexical rebuild authoritative equivalence evidence"
-    );
-    persist_lexical_rebuild_equivalence_evidence(index_path, equivalence_evidence)?;
-
+) -> lexical_generation::LexicalGenerationManifest {
     let manifest_now_ms = lexical_generation::now_ms();
-    let generation_fingerprint_head = rebuild_state
-        .db
-        .storage_fingerprint
+    let generation_fingerprint_head = source_db_fingerprint
         .get(..16)
-        .unwrap_or(rebuild_state.db.storage_fingerprint.as_str());
+        .unwrap_or(source_db_fingerprint);
     let generation_id = format!("gen-{manifest_now_ms:016x}-{generation_fingerprint_head}");
     let attempt_id = format!("attempt-{manifest_now_ms:016x}");
     let mut generation_manifest = lexical_generation::LexicalGenerationManifest::new_scratch(
-        generation_id.clone(),
-        attempt_id.clone(),
-        rebuild_state.db.storage_fingerprint.clone(),
+        generation_id,
+        attempt_id,
+        source_db_fingerprint.to_string(),
         manifest_now_ms,
     );
     generation_manifest.conversation_count = u64::try_from(total_conversations).unwrap_or(u64::MAX);
@@ -3837,16 +3817,16 @@ fn persist_lexical_rebuild_publish_artifacts(
         lexical_generation::LexicalGenerationPublishState::Published,
         manifest_now_ms,
     );
-    lexical_generation::store_manifest(index_path, &generation_manifest).with_context(|| {
-        format!(
-            "persisting lexical generation manifest for published generation {} at {}",
-            generation_id,
-            index_path.display()
-        )
-    })?;
+    generation_manifest
+}
+
+fn log_lexical_generation_manifest_published(
+    generation_manifest: &lexical_generation::LexicalGenerationManifest,
+    equivalence_evidence: &LexicalRebuildEquivalenceEvidence,
+) {
     tracing::info!(
-        generation_id = generation_id.as_str(),
-        attempt_id = attempt_id.as_str(),
+        generation_id = generation_manifest.generation_id.as_str(),
+        attempt_id = generation_manifest.attempt_id.as_str(),
         conversation_count = generation_manifest.conversation_count,
         message_count = generation_manifest.message_count,
         indexed_doc_count = generation_manifest.indexed_doc_count,
@@ -3854,6 +3834,48 @@ fn persist_lexical_rebuild_publish_artifacts(
         equivalence_manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
         "lexical generation manifest published"
     );
+}
+
+fn persist_lexical_rebuild_generation_artifacts(
+    generation_dir: &Path,
+    source_db_fingerprint: &str,
+    processed_conversations: usize,
+    total_conversations: usize,
+    final_observed_messages: usize,
+    indexed_docs: usize,
+    equivalence_evidence: &LexicalRebuildEquivalenceEvidence,
+) -> Result<()> {
+    tracing::info!(
+        document_count = equivalence_evidence.document_count,
+        manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
+        golden_query_digest = equivalence_evidence.golden_query_digest.as_str(),
+        golden_probe_count = equivalence_evidence.golden_query_hit_counts.len(),
+        golden_query_hit_total = equivalence_evidence
+            .golden_query_hit_counts
+            .iter()
+            .map(|hit| hit.hit_count)
+            .sum::<u64>(),
+        indexed_docs,
+        total_conversations,
+        processed_conversations,
+        "lexical rebuild authoritative equivalence evidence"
+    );
+    persist_lexical_rebuild_equivalence_evidence(generation_dir, equivalence_evidence)?;
+
+    let generation_manifest = build_lexical_rebuild_generation_manifest(
+        source_db_fingerprint,
+        total_conversations,
+        final_observed_messages,
+        indexed_docs,
+        equivalence_evidence,
+    );
+    lexical_generation::store_manifest(generation_dir, &generation_manifest).with_context(|| {
+        format!(
+            "persisting lexical generation manifest for published generation {} at {}",
+            generation_manifest.generation_id,
+            generation_dir.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -24543,6 +24565,233 @@ mod tests {
              implemented retention — update the assertion and the bead \
              together. If you see it fail with MORE, the in-progress-backup \
              recovery path is double-counting and that's a separate bug."
+        );
+    }
+
+    /// Staged path must exist before `publish_staged_lexical_index` is
+    /// called. Calling it with a missing staged tree must return Err
+    /// without mutating the live index — a partial-mutation leak here
+    /// would silently roll the live surface backward.
+    #[test]
+    fn publish_staged_lexical_index_errors_cleanly_when_staged_path_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        // Populate the live index so we can assert it stays intact if the
+        // publish call errors.
+        let seed = norm_conv(
+            Some("missing-staged-sentinel"),
+            vec![norm_msg(0, 1_700_000_700_000)],
+        );
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&seed, &seed.messages, Some(700))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+        let live_docs_before = crate::search::tantivy::searchable_index_summary(&index_path)
+            .unwrap()
+            .unwrap()
+            .docs;
+
+        let nonexistent_staged = data_dir.parent().unwrap().join("definitely-not-staged");
+        assert!(
+            !nonexistent_staged.exists(),
+            "precondition: staged path must be missing"
+        );
+
+        let result = publish_staged_lexical_index(&nonexistent_staged, &index_path);
+        assert!(
+            result.is_err(),
+            "publish with missing staged path must return Err, got {result:?}"
+        );
+
+        // Live index must be untouched: docs preserved, path still a
+        // directory, no partial `.publish-in-progress.bak` sidecar left
+        // behind.
+        let live_docs_after = crate::search::tantivy::searchable_index_summary(&index_path)
+            .unwrap()
+            .unwrap()
+            .docs;
+        assert_eq!(
+            live_docs_after, live_docs_before,
+            "live index must not regress after a missing-staged publish error"
+        );
+        let in_progress = lexical_publish_in_progress_backup_path(&index_path);
+        assert!(
+            !in_progress.exists(),
+            "no stale .publish-in-progress.bak should be left behind when publish errors early"
+        );
+    }
+
+    /// `recover_or_finalize_interrupted_lexical_publish_backup` is the
+    /// entry point every publish calls before touching the live surface.
+    /// It must be idempotent: calling it on a fully-recovered state
+    /// (live present, no in-progress backup, no retained backups) MUST
+    /// be a pure no-op — no fs::rename attempts, no backup directory
+    /// churn, no spurious log events.
+    #[test]
+    fn recover_or_finalize_interrupted_lexical_publish_backup_is_idempotent_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let seed = norm_conv(
+            Some("idempotent-recovery"),
+            vec![norm_msg(0, 1_700_000_800_000)],
+        );
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&seed, &seed.messages, Some(800))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        // No in-progress backup exists — function should early-return Ok
+        // without creating the backups directory or otherwise mutating
+        // the filesystem.
+        assert!(
+            !lexical_publish_in_progress_backup_path(&index_path).exists(),
+            "precondition: no in-progress backup sidecar"
+        );
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        assert!(
+            !backups_dir.exists(),
+            "precondition: no retained-backup dir yet"
+        );
+
+        for call in 0..3 {
+            recover_or_finalize_interrupted_lexical_publish_backup(&index_path).unwrap_or_else(
+                |err| panic!("idempotent recovery call {call} must not error; got {err:#}"),
+            );
+        }
+
+        // Live index untouched.
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "live index doc count must not change across no-op recovery calls"
+        );
+        // Backups dir must NOT have been created by the no-op path —
+        // `ensure_lexical_publish_backups_dir` is only called when there
+        // is actual work to do, so idempotent recovery must not leave
+        // empty `.lexical-publish-backups/` directories for garbage
+        // collection to clean up later.
+        assert!(
+            !backups_dir.exists(),
+            "no-op recovery must NOT create an empty backups directory; \
+             found {backups_dir:?}"
+        );
+    }
+
+    /// Rollback-during-publish crash model (non-Linux path, shared with
+    /// the Linux recovery flow): if the rename that parks the prior
+    /// live index into `.publish-in-progress.bak` succeeded but the
+    /// process crashed before the staged → live rename, a restart must
+    /// observe:
+    ///   - live index path missing (rename took effect)
+    ///   - in-progress backup sidecar populated with the prior content
+    /// The next call to `publish_staged_lexical_index` must restore the
+    /// prior live index from the sidecar AND land the staged publish on
+    /// top, producing one retained backup holding the old prior-live
+    /// content. This is the "crash between park and swap" rollback
+    /// contract that complements the two existing recovery tests from
+    /// b757d822.
+    #[test]
+    fn publish_staged_lexical_index_recovers_from_crash_between_park_and_swap() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        // Build the prior live index.
+        let prior_conv = norm_conv(
+            Some("crash-prior"),
+            vec![
+                norm_msg(0, 1_700_000_900_000),
+                norm_msg(1, 1_700_000_900_100),
+                norm_msg(2, 1_700_000_900_200),
+            ],
+        );
+        let mut prior_live = TantivyIndex::open_or_create(&index_path).unwrap();
+        prior_live
+            .add_messages_with_conversation_id(&prior_conv, &prior_conv.messages, Some(900))
+            .unwrap();
+        prior_live.commit().unwrap();
+        drop(prior_live);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "precondition: prior-live index has 3 docs"
+        );
+
+        // Simulate the crash exactly between the two renames: park the
+        // live index as the in-progress sidecar, then DON'T perform the
+        // staged-to-live rename. This matches the non-Linux crash
+        // window and also corresponds to the Linux path's retain-rename
+        // failure mode (atomic_exchange succeeded, fs::rename(staged,
+        // retained) was never reached).
+        let in_progress_backup_path = lexical_publish_in_progress_backup_path(&index_path);
+        fs::rename(&index_path, &in_progress_backup_path).unwrap();
+        assert!(!index_path.exists());
+        assert!(in_progress_backup_path.exists());
+
+        // Now the next cass invocation stages a new index and calls
+        // publish. Recovery must restore prior-live under index_path
+        // before the new staged publish lands on top.
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-crash-recovery-stage.")
+            .tempdir_in(data_dir.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(Some("crash-new"), vec![norm_msg(0, 1_700_000_910_000)]);
+        let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(901))
+            .unwrap();
+        staged.commit().unwrap();
+        drop(staged);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        // Live = new staged (1 doc).
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "post-recovery live must be the new staged publish (1 doc)"
+        );
+        // In-progress sidecar consumed.
+        assert!(
+            !in_progress_backup_path.exists(),
+            "crash-window sidecar must be consumed by recovery"
+        );
+        // Exactly one retained backup holding the original 3-doc
+        // prior-live content.
+        let backups_dir = lexical_publish_backups_dir(&index_path);
+        let retained: Vec<_> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&retained[0])
+                .unwrap()
+                .unwrap()
+                .docs,
+            3,
+            "retained backup must preserve the prior-live artifact recovered from the crash sidecar"
         );
     }
 
