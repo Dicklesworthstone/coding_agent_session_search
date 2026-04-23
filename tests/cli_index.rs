@@ -57,7 +57,7 @@ fn index_help_prints_usage() {
 }
 
 #[test]
-fn index_parses_semantic_flags() {
+fn index_parses_semantic_flags() -> Result<(), String> {
     let cli = parse_cli_ok(
         ["cass", "index", "--semantic", "--embedder", "fastembed"],
         "parse index flags",
@@ -69,20 +69,22 @@ fn index_parses_semantic_flags() {
         }) => {
             assert!(semantic, "semantic flag should be true");
             assert_eq!(embedder, "fastembed");
+            Ok(())
         }
-        other => panic!("expected index command, got {other:?}"),
+        other => Err(format!("expected index command, got {other:?}")),
     }
 }
 
 #[test]
-fn index_default_embedder_is_fastembed() {
+fn index_default_embedder_is_fastembed() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
             assert_eq!(embedder, "fastembed");
+            Ok(())
         }
-        other => panic!("expected index command, got {other:?}"),
+        other => Err(format!("expected index command, got {other:?}")),
     }
 }
 
@@ -147,6 +149,52 @@ fn index_watch_once_triggers() {
     ]);
 
     cmd.assert().success();
+}
+
+#[test]
+fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> Result<(), String> {
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "index",
+            "--data-dir",
+            "/cass/custom-data",
+            "--full",
+            "--force-rebuild",
+            "--semantic",
+            "--build-hnsw",
+            "--watch-once",
+            "/sessions/one.jsonl,/sessions/two.jsonl",
+            "--json",
+        ],
+        "parse scoped refresh controls",
+    );
+
+    match cli.command {
+        Some(Commands::Index {
+            data_dir: Some(data_dir),
+            full: true,
+            force_rebuild: true,
+            semantic: true,
+            build_hnsw: true,
+            watch_once: Some(paths),
+            json: true,
+            ..
+        }) => {
+            assert_eq!(data_dir, std::path::PathBuf::from("/cass/custom-data"));
+            assert_eq!(
+                paths,
+                vec![
+                    std::path::PathBuf::from("/sessions/one.jsonl"),
+                    std::path::PathBuf::from("/sessions/two.jsonl"),
+                ]
+            );
+            Ok(())
+        }
+        other => Err(format!(
+            "expected data-dir scoped index refresh controls, got {other:?}"
+        )),
+    }
 }
 
 #[test]
