@@ -1309,7 +1309,7 @@ fn capabilities_features_and_connectors_contain_no_duplicates() {
             "capabilities.{field} contains duplicate entries: {names:?} vs unique {unique:?}"
         );
         assert!(
-            names.len() > 0,
+            !names.is_empty(),
             "capabilities.{field} must not be empty — sanity check"
         );
     }
@@ -1434,7 +1434,7 @@ fn index_readiness_exposes_stale_refresh_config() {
         .as_i64()
         .expect("state.index.stale_threshold_seconds must be an integer");
     assert!(
-        stale >= 60 && stale <= 86_400,
+        (60..=86_400).contains(&stale),
         "stale_threshold_seconds={stale} is outside sane bounds [60, 86400]"
     );
 

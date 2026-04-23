@@ -15178,17 +15178,11 @@ pub mod persist {
             // upper edge the user could type; the expected post-clamp value is
             // the constant cap.
             {
-                let _guard = set_env(
-                    "CASS_INDEXER_BEGIN_CONCURRENT_RETRIES",
-                    "1000000000",
-                );
+                let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES", "1000000000");
                 assert_eq!(begin_concurrent_retry_limit(), BEGIN_CONCURRENT_RETRY_MAX);
             }
             {
-                let _guard = set_env(
-                    "CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE",
-                    "1000000000",
-                );
+                let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1000000000");
                 assert_eq!(
                     begin_concurrent_chunk_size(),
                     BEGIN_CONCURRENT_CHUNK_SIZE_MAX
@@ -15207,10 +15201,7 @@ pub mod persist {
             // Negative or zero inputs still fall through to the existing
             // default path (not clamp-to-max).
             {
-                let _guard = set_env(
-                    "CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB",
-                    "-42",
-                );
+                let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "-42");
                 assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
             }
         }
@@ -15779,8 +15770,7 @@ pub mod persist {
             let json = match serde_json::to_value(&*stats) {
                 Ok(json) => json,
                 Err(err) => {
-                    assert!(false, "indexing stats should serialize: {err}");
-                    serde_json::Value::Null
+                    panic!("indexing stats should serialize: {err}");
                 }
             };
             assert_eq!(
