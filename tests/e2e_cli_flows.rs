@@ -216,21 +216,34 @@ fn search_returns_hits_with_expected_fields() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
 
-    // Check structure - should have hits or results
+    // Bead 7k7pl: pin hits/results as a JSON array, not just
+    // "field present". Follow-up `.as_array()` would silently turn a
+    // regression (null/scalar) into `None` and skip the inner block
+    // — upgrade forces the regression to surface here.
     let hits = json.get("hits").or_else(|| json.get("results"));
-    assert!(hits.is_some(), "Should have hits/results. JSON: {}", json);
+    let hits_array = hits
+        .and_then(|h| h.as_array())
+        .unwrap_or_else(|| panic!("hits/results must be an array. JSON: {}", json));
 
-    if let Some(hits_array) = hits.and_then(|h| h.as_array()).filter(|a| !a.is_empty()) {
+    if !hits_array.is_empty() {
         let first_hit = &hits_array[0];
-        // Verify expected fields exist
+        // Bead 7k7pl: pin TYPE on the hit-schema fields —
+        // source_path/path must be a string, agent must be a string.
+        // A null-or-numeric regression would slip past `.is_some()`
+        // while breaking JSON consumers that call `.as_str()`.
+        let source_path = first_hit
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| first_hit.get("path").and_then(|v| v.as_str()));
         assert!(
-            first_hit.get("source_path").is_some() || first_hit.get("path").is_some(),
-            "Hit should have source_path. Hit: {}",
+            source_path.is_some(),
+            "Hit must have string `source_path` or `path`. Hit: {}",
             first_hit
         );
         assert!(
-            first_hit.get("agent").is_some(),
-            "Hit should have agent field"
+            first_hit.get("agent").and_then(|v| v.as_str()).is_some(),
+            "Hit must have a string `agent` field. Hit: {}",
+            first_hit
         );
     }
 }

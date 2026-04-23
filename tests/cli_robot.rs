@@ -179,7 +179,16 @@ fn introspect_includes_contract_and_globals() {
     assert_eq!(json["api_version"], 1);
     assert_eq!(json["contract_version"], "1");
     let globals = json["global_flags"].as_array().expect("global_flags array");
-    assert!(!globals.is_empty(), "global_flags should list shared flags");
+    // Bead 7k7pl: pin that the well-known shared flags are present.
+    // `introspect` promises a stable contract for automation; a
+    // regression that shrank global_flags to a single sentinel (or
+    // dropped `--data-dir`, which is the primary global) would slip
+    // past `!is_empty()` while breaking every automation client
+    // that scripts against the flag list.
+    assert!(
+        globals.iter().any(|g| g["name"] == "--data-dir"),
+        "global_flags must include `--data-dir`; got {globals:?}"
+    );
     let commands = json["commands"].as_array().expect("commands array");
     assert!(
         commands.iter().any(|c| c["name"] == "api-version"),
@@ -568,8 +577,22 @@ fn search_cursor_jsonl_and_compact() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let first_line = stdout.lines().next().expect("meta line present");
     let meta: Value = serde_json::from_str(first_line).expect("valid jsonl meta");
-    assert!(meta.get("_meta").is_some());
-    assert!(meta["_meta"].get("next_cursor").is_some());
+    // Bead 7k7pl: pin `_meta` as a JSON object and `next_cursor` as
+    // a non-empty string — the robot-meta contract promises both
+    // shapes. A regression that emitted a scalar or null would slip
+    // past `.is_some()` while breaking cursor-based pagination.
+    assert!(
+        meta.get("_meta").and_then(|v| v.as_object()).is_some(),
+        "_meta must be a JSON object; got {meta}"
+    );
+    let next_cursor = meta["_meta"]
+        .get("next_cursor")
+        .and_then(|v| v.as_str())
+        .expect("next_cursor must be a string");
+    assert!(
+        !next_cursor.is_empty(),
+        "next_cursor must be a non-empty string; got {meta}"
+    );
 
     // Compact still returns cursor in payload
     let mut compact = base_cmd();
@@ -586,7 +609,17 @@ fn search_cursor_jsonl_and_compact() {
     ]);
     let compact_out = compact.assert().success().get_output().clone();
     let json: Value = serde_json::from_slice(&compact_out.stdout).expect("compact json payload");
-    assert!(json["_meta"].get("next_cursor").is_some());
+    // Bead 7k7pl: pin next_cursor as a non-empty string in the
+    // compact-format payload too — both robot formats share the
+    // same cursor contract.
+    let next_cursor = json["_meta"]
+        .get("next_cursor")
+        .and_then(|v| v.as_str())
+        .expect("next_cursor must be a string in compact payload");
+    assert!(
+        !next_cursor.is_empty(),
+        "next_cursor must be non-empty in compact payload; got {json}"
+    );
 }
 
 #[test]
@@ -1021,10 +1054,22 @@ fn search_missing_index_returns_json_error_contract() {
         err.get("kind").and_then(|k| k.as_str()).is_some(),
         "error kind should be present"
     );
-    assert!(err.get("message").is_some(), "message should be included");
+    // Bead 7k7pl: pin TYPE on the error contract — `message` must be
+    // a non-empty string and `retryable` must be a boolean. A
+    // regression that emitted `null` message or numeric retryable
+    // would slip past `.is_some()` while breaking every CLI client
+    // that branches on the retryable bool.
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .expect("message must be a string");
     assert!(
-        err.get("retryable").is_some(),
-        "retryable flag should be included"
+        !message.is_empty(),
+        "error message must be non-empty; got {err:?}"
+    );
+    assert!(
+        err.get("retryable").and_then(|r| r.as_bool()).is_some(),
+        "retryable must be a boolean; got {err:?}"
     );
 }
 
