@@ -198,6 +198,45 @@ fn index_refresh_data_dir_scopes_rebuild_semantic_and_watch_once_controls() -> R
 }
 
 #[test]
+fn index_refresh_progress_controls_remain_scoped_to_data_dir() -> Result<(), String> {
+    let cli = parse_cli_ok(
+        [
+            "cass",
+            "index",
+            "--data-dir",
+            "/cass/refresh-data",
+            "--full",
+            "--idempotency-key",
+            "refresh-window-42",
+            "--progress-interval-ms",
+            "125",
+            "--no-progress-events",
+            "--json",
+        ],
+        "parse data-dir scoped refresh progress controls",
+    );
+
+    match cli.command {
+        Some(Commands::Index {
+            data_dir: Some(data_dir),
+            full: true,
+            idempotency_key: Some(idempotency_key),
+            progress_interval_ms: 125,
+            no_progress_events: true,
+            json: true,
+            ..
+        }) => {
+            assert_eq!(data_dir, std::path::PathBuf::from("/cass/refresh-data"));
+            assert_eq!(idempotency_key, "refresh-window-42");
+            Ok(())
+        }
+        other => Err(format!(
+            "expected data-dir scoped refresh progress controls, got {other:?}"
+        )),
+    }
+}
+
+#[test]
 fn index_json_reports_entrypoint_contract_for_incremental_and_watch_once()
 -> Result<(), Box<dyn std::error::Error>> {
     let tmp = TempDir::new()?;
