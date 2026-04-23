@@ -254,13 +254,7 @@ impl RefreshLedger {
             time_to_lexical_ready_ms: self
                 .successful_duration_through(RefreshPhase::LexicalRebuild),
             time_to_search_ready_ms: self.successful_duration_through(RefreshPhase::Publish),
-            time_to_full_settled_ms: self.all_phases_succeeded().then(|| {
-                if self.total_duration_ms > 0 {
-                    self.total_duration_ms
-                } else {
-                    self.sum_phase_durations()
-                }
-            }),
+            time_to_full_settled_ms: self.full_settlement_duration_ms(),
             failed_phase: self
                 .failed_phases()
                 .first()
@@ -293,6 +287,18 @@ impl RefreshLedger {
             .iter()
             .map(|phase| phase.duration_ms)
             .fold(0u64, u64::saturating_add)
+    }
+
+    fn full_settlement_duration_ms(&self) -> Option<u64> {
+        (self.all_phases_succeeded()
+            && self.search_readiness_state() == RefreshSearchReadinessState::Published)
+            .then(|| {
+                if self.total_duration_ms > 0 {
+                    self.total_duration_ms
+                } else {
+                    self.sum_phase_durations()
+                }
+            })
     }
 
     fn search_readiness_state(&self) -> RefreshSearchReadinessState {
@@ -779,6 +785,7 @@ mod tests {
 
         assert_eq!(unpublished_milestones.time_to_lexical_ready_ms, Some(60));
         assert_eq!(unpublished_milestones.time_to_search_ready_ms, None);
+        assert_eq!(unpublished_milestones.time_to_full_settled_ms, None);
         assert_eq!(unpublished_milestones.failed_phase, None);
         assert_eq!(
             unpublished_milestones.search_readiness_state,
@@ -799,6 +806,7 @@ mod tests {
 
         assert_eq!(publish_failed_milestones.time_to_lexical_ready_ms, Some(60));
         assert_eq!(publish_failed_milestones.time_to_search_ready_ms, None);
+        assert_eq!(publish_failed_milestones.time_to_full_settled_ms, None);
         assert_eq!(
             publish_failed_milestones.failed_phase.as_deref(),
             Some("publish")
@@ -806,6 +814,37 @@ mod tests {
         assert_eq!(
             publish_failed_milestones.search_readiness_state,
             RefreshSearchReadinessState::PublishFailed
+        );
+    }
+
+    #[test]
+    fn readiness_milestones_do_not_report_full_settlement_before_publish() {
+        let empty = RefreshLedger::default().readiness_milestones();
+
+        assert_eq!(empty.time_to_lexical_ready_ms, None);
+        assert_eq!(empty.time_to_search_ready_ms, None);
+        assert_eq!(empty.time_to_full_settled_ms, None);
+        assert_eq!(
+            empty.search_readiness_state,
+            RefreshSearchReadinessState::WaitingForPublish
+        );
+
+        let partial = RefreshLedger {
+            total_duration_ms: 42,
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+            ],
+            ..Default::default()
+        }
+        .readiness_milestones();
+
+        assert_eq!(partial.time_to_lexical_ready_ms, None);
+        assert_eq!(partial.time_to_search_ready_ms, None);
+        assert_eq!(partial.time_to_full_settled_ms, None);
+        assert_eq!(
+            partial.search_readiness_state,
+            RefreshSearchReadinessState::WaitingForPublish
         );
     }
 
