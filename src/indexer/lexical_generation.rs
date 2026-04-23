@@ -443,6 +443,8 @@ pub(crate) struct LexicalCleanupApplyGate {
     #[serde(default)]
     pub protected_generation_ids: Vec<String>,
     pub protected_retained_bytes: u64,
+    #[serde(default)]
+    pub inspection_previews: Vec<LexicalCleanupInspectionItem>,
     pub inspection_required_count: usize,
     pub inspection_required_retained_bytes: u64,
     pub inspection_required_generation_ids: Vec<String>,
@@ -567,6 +569,7 @@ impl LexicalCleanupDryRunPlan {
             active_generation_ids: self.active_generation_ids.clone(),
             protected_generation_ids: self.protected_generation_ids.clone(),
             protected_retained_bytes: self.protected_retained_bytes,
+            inspection_previews: self.inspection_items.clone(),
             inspection_required_count: self.inspection_items.len(),
             inspection_required_retained_bytes,
             inspection_required_generation_ids,
@@ -2483,6 +2486,16 @@ mod tests {
             blocked.inspection_required_generation_ids,
             vec!["gen-quarantined".to_string()]
         );
+        assert_eq!(
+            blocked.inspection_previews,
+            vec![LexicalCleanupInspectionItem {
+                generation_id: "gen-quarantined".to_string(),
+                shard_id: Some("shard-bad".to_string()),
+                disposition: LexicalCleanupDisposition::QuarantinedRetained,
+                reason: "checksum mismatch".to_string(),
+                retained_bytes: 512,
+            }]
+        );
         assert_eq!(blocked.inspection_required_count, 1);
         assert_eq!(blocked.inspection_required_retained_bytes, 512);
         assert_eq!(
@@ -2590,6 +2603,7 @@ mod tests {
         assert_eq!(allowed_json["protected_retained_bytes"], 0);
         assert_eq!(allowed_json["inspection_required_count"], 0);
         assert_eq!(allowed_json["inspection_required_retained_bytes"], 0);
+        assert_eq!(allowed_json["inspection_previews"], serde_json::json!([]));
         assert_eq!(
             allowed_json["candidate_previews"][0]["generation_id"],
             "gen-old"
@@ -2642,6 +2656,16 @@ mod tests {
         assert_eq!(no_candidates.protected_retained_bytes, 512);
         assert_eq!(no_candidates.inspection_required_count, 1);
         assert_eq!(no_candidates.inspection_required_retained_bytes, 512);
+        let no_candidates_json =
+            serde_json::to_value(&no_candidates).expect("serialize no-candidate apply gate");
+        assert_eq!(
+            no_candidates_json["inspection_previews"][0]["generation_id"],
+            "gen-quarantined"
+        );
+        assert_eq!(
+            no_candidates_json["inspection_previews"][0]["retained_bytes"],
+            512
+        );
     }
 
     #[test]
