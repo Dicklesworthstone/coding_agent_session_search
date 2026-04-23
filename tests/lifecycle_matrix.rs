@@ -1635,3 +1635,76 @@ fn diag_connector_entries_have_uniform_shape() {
         // (bool) regardless of which connector happens to fire.
     }
 }
+
+#[test]
+fn db_and_index_surface_flags_match_actual_filesystem() {
+    // ibuuh.19 retention-ground-truth row. Both health.db.exists and
+    // diag.database.exists claim to report on-disk artifact presence.
+    // Verify those reports match the ACTUAL filesystem — if a surface
+    // caches a stale exists=true while the file is gone (or claims
+    // exists=false when the file is still on disk), retention/GC
+    // operates on fiction and either deletes real data or leaks
+    // orphaned artifacts.
+    //
+    // Under the isolated empty HOME we know the filesystem truth
+    // (no db, no index). Pin both surfaces to that truth.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn cass_json(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let diag = cass_json(test_home.path(), &["diag", "--json"]);
+    let health = cass_json(test_home.path(), &["health", "--json"]);
+
+    let db_path = diag["paths"]["db_path"]
+        .as_str()
+        .expect("paths.db_path is string");
+    let index_path = diag["paths"]["index_path"]
+        .as_str()
+        .expect("paths.index_path is string");
+
+    let db_fs_exists = Path::new(db_path).exists();
+    let index_fs_exists = Path::new(index_path).exists();
+
+    let diag_db = diag["database"]["exists"].as_bool().unwrap();
+    let diag_idx = diag["index"]["exists"].as_bool().unwrap();
+    let health_db = health["db"]["exists"].as_bool().unwrap();
+    let health_idx = health["state"]["index"]["exists"].as_bool().unwrap();
+
+    // Three-way agreement: filesystem ↔ diag ↔ health.
+    assert_eq!(
+        db_fs_exists, diag_db,
+        "diag.database.exists ({diag_db}) disagrees with filesystem ({db_fs_exists}) at {db_path}"
+    );
+    assert_eq!(
+        db_fs_exists, health_db,
+        "health.db.exists ({health_db}) disagrees with filesystem ({db_fs_exists}) at {db_path}"
+    );
+    assert_eq!(
+        index_fs_exists, diag_idx,
+        "diag.index.exists ({diag_idx}) disagrees with filesystem ({index_fs_exists}) at {index_path}"
+    );
+    assert_eq!(
+        index_fs_exists, health_idx,
+        "health.state.index.exists ({health_idx}) disagrees with filesystem ({index_fs_exists}) at {index_path}"
+    );
+
+    // And — the isolated-empty-HOME invariant: both should actually
+    // be absent on disk so the three-way agreement isn't trivially
+    // satisfied by two matching lies.
+    assert!(!db_fs_exists, "isolated empty HOME still has DB on disk at {db_path}");
+    assert!(
+        !index_fs_exists,
+        "isolated empty HOME still has index on disk at {index_path}"
+    );
+}
