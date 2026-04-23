@@ -424,6 +424,17 @@ pub struct ConnectorStats {
     pub error: Option<String>,
 }
 
+/// Structured lexical repair metadata for JSON output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LexicalRepairStats {
+    pub kind: String,
+    pub reason: String,
+    pub canonical_conversations: usize,
+    pub canonical_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_tantivy_docs: Option<usize>,
+}
+
 /// Aggregate indexing statistics for JSON output (T7.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
@@ -447,6 +458,9 @@ pub struct IndexingStats {
     /// Why the lexical population strategy was chosen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical_strategy_reason: Option<String>,
+    /// Automatic lexical repair/catch-up performed before normal indexing work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_repair: Option<LexicalRepairStats>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -844,6 +858,25 @@ fn record_lexical_population_strategy_if_unset(
     {
         stats.lexical_strategy = Some(strategy.as_str().to_string());
         stats.lexical_strategy_reason = Some(reason.to_string());
+    }
+}
+
+fn record_incremental_canonical_lexical_repair(
+    progress: Option<&Arc<IndexingProgress>>,
+    plan: &IncrementalCanonicalLexicalRepairPlan,
+    canonical_conversations: usize,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut stats) = progress.stats.lock() {
+        stats.lexical_repair = Some(LexicalRepairStats {
+            kind: "authoritative_canonical_db_rebuild".to_string(),
+            reason: plan.reason.to_string(),
+            canonical_conversations,
+            canonical_messages: plan.canonical_messages,
+            observed_tantivy_docs: plan.observed_tantivy_docs,
+        });
     }
 }
 
@@ -8536,6 +8569,11 @@ pub fn run_index(
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                     repair_plan.reason,
                 );
+                record_incremental_canonical_lexical_repair(
+                    opts.progress.as_ref(),
+                    &repair_plan,
+                    canonical_sessions_before_salvage,
+                );
                 tracing::info!(
                     strategy = LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild.as_str(),
                     reason = repair_plan.reason,
@@ -15613,6 +15651,50 @@ pub mod persist {
                     reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
                 })
             );
+        }
+
+        #[test]
+        fn incremental_canonical_lexical_repair_progress_records_authoritative_repair_stats() {
+            let progress = std::sync::Arc::new(crate::indexer::IndexingProgress::default());
+            let plan = crate::indexer::IncrementalCanonicalLexicalRepairPlan {
+                canonical_messages: 42,
+                observed_tantivy_docs: Some(3),
+                reason: "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+            };
+
+            crate::indexer::record_incremental_canonical_lexical_repair(Some(&progress), &plan, 7);
+
+            let stats = match progress.stats.lock() {
+                Ok(stats) => stats,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                stats.lexical_repair,
+                Some(crate::indexer::LexicalRepairStats {
+                    kind: "authoritative_canonical_db_rebuild".to_string(),
+                    reason:
+                        "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan"
+                            .to_string(),
+                    canonical_conversations: 7,
+                    canonical_messages: 42,
+                    observed_tantivy_docs: Some(3),
+                })
+            );
+
+            let json = match serde_json::to_value(&*stats) {
+                Ok(json) => json,
+                Err(err) => {
+                    assert!(false, "indexing stats should serialize: {err}");
+                    serde_json::Value::Null
+                }
+            };
+            assert_eq!(
+                json["lexical_repair"]["kind"],
+                "authoritative_canonical_db_rebuild"
+            );
+            assert_eq!(json["lexical_repair"]["canonical_conversations"], 7);
+            assert_eq!(json["lexical_repair"]["canonical_messages"], 42);
+            assert_eq!(json["lexical_repair"]["observed_tantivy_docs"], 3);
         }
 
         #[test]
