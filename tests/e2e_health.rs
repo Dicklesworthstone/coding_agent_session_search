@@ -116,6 +116,7 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
     let stdout = String::from_utf8(out.stdout).expect("utf8");
     let payload: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let runtime = &payload["state"]["rebuild"]["pipeline"]["runtime"];
+    let rebuild_progress = &payload["rebuild_progress"];
 
     assert_eq!(runtime["queue_depth"].as_u64(), Some(3));
     assert_eq!(runtime["queue_capacity"].as_u64(), Some(5));
@@ -128,5 +129,35 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
     assert_eq!(
         runtime["inflight_message_bytes_headroom"].as_u64(),
         Some(65_536)
+    );
+    assert_eq!(rebuild_progress["active"].as_bool(), Some(true));
+    assert_eq!(
+        rebuild_progress["processed_conversations"].as_u64(),
+        Some(4)
+    );
+    assert_eq!(rebuild_progress["total_conversations"].as_u64(), Some(10));
+    assert_eq!(
+        rebuild_progress["remaining_conversations"].as_u64(),
+        Some(6)
+    );
+    assert_eq!(rebuild_progress["completion_ratio"].as_f64(), Some(0.4));
+    assert_eq!(rebuild_progress["queue_depth"].as_u64(), Some(3));
+    assert_eq!(rebuild_progress["queue_capacity"].as_u64(), Some(5));
+    assert_eq!(rebuild_progress["queue_headroom"].as_u64(), Some(2));
+    assert_eq!(
+        rebuild_progress["inflight_message_bytes"].as_u64(),
+        Some(65_536)
+    );
+    assert_eq!(
+        rebuild_progress["inflight_message_bytes_headroom"].as_u64(),
+        Some(65_536)
+    );
+    assert_eq!(
+        rebuild_progress["controller_mode"].as_str(),
+        Some("pressure_limited")
+    );
+    assert_eq!(
+        rebuild_progress["controller_reason"].as_str(),
+        Some("queue_depth_3_reached_pipeline_capacity_3")
     );
 }

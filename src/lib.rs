@@ -5953,6 +5953,63 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "pending_sessions": pending.and_then(|p| p.get("sessions"))
     }))
 }
+
+fn rebuild_progress_summary_json(state: &serde_json::Value) -> serde_json::Value {
+    let rebuild = state.get("rebuild").unwrap_or(&serde_json::Value::Null);
+    let runtime = rebuild
+        .get("pipeline")
+        .and_then(|pipeline| pipeline.get("runtime"))
+        .unwrap_or(&serde_json::Value::Null);
+    let value_or_null =
+        |value: Option<&serde_json::Value>| value.cloned().unwrap_or(serde_json::Value::Null);
+
+    let active = rebuild
+        .get("active")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let processed = rebuild
+        .get("processed_conversations")
+        .and_then(|value| value.as_u64());
+    let total = rebuild
+        .get("total_conversations")
+        .and_then(|value| value.as_u64());
+    let remaining = total.map(|count| count.saturating_sub(processed.unwrap_or(0)));
+    let completion_ratio = match (processed, total) {
+        (Some(done), Some(total_conversations)) if total_conversations > 0 => {
+            Some((done as f64 / total_conversations as f64).clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+    let updated_at = runtime
+        .get("updated_at")
+        .cloned()
+        .or_else(|| rebuild.get("updated_at").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "active": active,
+        "mode": value_or_null(rebuild.get("mode")),
+        "phase": value_or_null(rebuild.get("phase")),
+        "processed_conversations": processed,
+        "total_conversations": total,
+        "remaining_conversations": remaining,
+        "completion_ratio": completion_ratio,
+        "indexed_docs": value_or_null(rebuild.get("indexed_docs")),
+        "runtime_available": runtime.is_object(),
+        "queue_depth": value_or_null(runtime.get("queue_depth")),
+        "queue_capacity": value_or_null(runtime.get("queue_capacity")),
+        "queue_headroom": value_or_null(runtime.get("queue_headroom")),
+        "pending_batch_conversations": value_or_null(runtime.get("pending_batch_conversations")),
+        "pending_batch_message_bytes": value_or_null(runtime.get("pending_batch_message_bytes")),
+        "inflight_message_bytes": value_or_null(runtime.get("inflight_message_bytes")),
+        "max_message_bytes_in_flight": value_or_null(runtime.get("max_message_bytes_in_flight")),
+        "inflight_message_bytes_headroom": value_or_null(runtime.get("inflight_message_bytes_headroom")),
+        "controller_mode": value_or_null(runtime.get("controller_mode")),
+        "controller_reason": value_or_null(runtime.get("controller_reason")),
+        "updated_at": updated_at,
+    })
+}
+
 fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
     if counts_skipped {
         serde_json::Value::Null
@@ -11236,6 +11293,7 @@ fn run_status(
             }),
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
+            "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "quarantine": {
                 "summary": quarantine_summary,
@@ -11532,6 +11590,7 @@ fn run_health(
             "recommended_action": recommended_action,
             "errors": errors,
             "latency_ms": latency_ms,
+            "rebuild_progress": rebuild_progress_summary_json(&state),
             "db": {
                 "exists": db_exists,
                 "opened": db_opened,
