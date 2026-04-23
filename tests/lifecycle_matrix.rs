@@ -1702,7 +1702,10 @@ fn db_and_index_surface_flags_match_actual_filesystem() {
     // And — the isolated-empty-HOME invariant: both should actually
     // be absent on disk so the three-way agreement isn't trivially
     // satisfied by two matching lies.
-    assert!(!db_fs_exists, "isolated empty HOME still has DB on disk at {db_path}");
+    assert!(
+        !db_fs_exists,
+        "isolated empty HOME still has DB on disk at {db_path}"
+    );
     assert!(
         !index_fs_exists,
         "isolated empty HOME still has index on disk at {index_path}"
@@ -1769,10 +1772,7 @@ fn index_checkpoint_and_fingerprint_blocks_have_stable_shape() {
     // nullable when no fingerprint exists yet.
     let fp = &idx["fingerprint"];
     assert!(fp.is_object(), "state.index.fingerprint must be an object");
-    for key in [
-        "current_db_fingerprint",
-        "checkpoint_fingerprint",
-    ] {
+    for key in ["current_db_fingerprint", "checkpoint_fingerprint"] {
         let v = &fp[key];
         assert!(
             v.is_string() || v.is_null(),
@@ -1783,5 +1783,93 @@ fn index_checkpoint_and_fingerprint_blocks_have_stable_shape() {
     assert!(
         matches_v.is_boolean() || matches_v.is_null(),
         "state.index.fingerprint.matches_current_db_fingerprint must be bool or null; got {matches_v:?}"
+    );
+}
+
+#[test]
+fn diag_paths_use_canonical_filename_and_index_parent() {
+    // ibuuh.19 retention-layout row. The existing
+    // diag_artifact_paths_nest_inside_data_dir_for_safe_gc row pins the
+    // jurisdiction invariant (artifacts stay inside data_dir) but does
+    // not pin the *shape* of the layout inside data_dir. Retention/GC
+    // code and external ops scripts both rely on two conventions:
+    //
+    //   1. db_path ends with the canonical file name `agent_search.db`.
+    //      Several tools, migrations, and backup recipes reference this
+    //      name directly; a silent rename would break them even though
+    //      the nest-check would still pass.
+    //   2. index_path lives under a directory literally named `index/`
+    //      inside data_dir. This is what the GC policy uses to find
+    //      superseded lexical generations, scratch rebuild dirs, etc.
+    //      A flat layout would still nest, but would invalidate the
+    //      "everything under data_dir/index/ is index-owned" rule.
+    //
+    // Pin both so accidental layout refactors fail loudly.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(out.status.success(), "cass diag --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let diag: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    let data_dir = diag["paths"]["data_dir"]
+        .as_str()
+        .expect("paths.data_dir must be a string");
+    let db_path = diag["paths"]["db_path"]
+        .as_str()
+        .expect("paths.db_path must be a string");
+    let index_path = diag["paths"]["index_path"]
+        .as_str()
+        .expect("paths.index_path must be a string");
+
+    let data_dir_p = Path::new(data_dir);
+    let db_p = Path::new(db_path);
+    let index_p = Path::new(index_path);
+
+    // Convention 1: canonical DB filename. Referenced by name in
+    // backup/migration/retention recipes — rename detection.
+    let db_file_name = db_p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("db_path must have a UTF-8 filename component");
+    assert_eq!(
+        db_file_name, "agent_search.db",
+        "db_path filename ({db_file_name}) diverged from canonical 'agent_search.db'; \
+         retention and backup recipes that reference this name will silently break"
+    );
+
+    // Convention 2: index dir lives under `<data_dir>/index/...`.
+    // Walk up from index_path until the immediate parent equals
+    // `<data_dir>/index`. We allow arbitrary versioned subdirs (e.g.
+    // `v7`, future `v8`) but require the `index` parent layer to
+    // preserve the GC ownership rule.
+    let expected_index_root = data_dir_p.join("index");
+    let index_root_found = index_p
+        .ancestors()
+        .any(|ancestor| ancestor == expected_index_root);
+    assert!(
+        index_root_found,
+        "index_path ({}) does not live under the canonical '{}' layer; \
+         retention rules that sweep `<data_dir>/index/` for superseded \
+         generations will lose track of this artifact",
+        index_p.display(),
+        expected_index_root.display()
+    );
+
+    // And the index subtree must be strictly below that `index/`
+    // directory (not equal to it) — a degenerate layout where
+    // index_path == data_dir/index would leak generation management
+    // into the root index folder itself.
+    assert!(
+        index_p.starts_with(&expected_index_root) && index_p != expected_index_root.as_path(),
+        "index_path ({}) must be a strict descendant of '{}', not the directory itself",
+        index_p.display(),
+        expected_index_root.display()
     );
 }
