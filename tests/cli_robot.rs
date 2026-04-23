@@ -419,8 +419,7 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
         "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
         "updated_at_ms": 1_733_000_124_000_i64
     });
-    let _lock_file =
-        hold_active_lexical_rebuild_lock(data_dir, &db_path, Some(expected_runtime));
+    let _lock_file = hold_active_lexical_rebuild_lock(data_dir, &db_path, Some(expected_runtime));
 
     let run = |subcommand: &str| -> Value {
         let mut cmd = base_cmd();
@@ -449,10 +448,19 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
 
     assert_eq!(state_runtime, status_runtime);
     assert_eq!(state_runtime["queue_depth"].as_u64(), Some(3));
-    assert_eq!(state_runtime["inflight_message_bytes"].as_u64(), Some(65_536));
-    assert_eq!(state_runtime["producer_budget_wait_count"].as_u64(), Some(2));
+    assert_eq!(
+        state_runtime["inflight_message_bytes"].as_u64(),
+        Some(65_536)
+    );
+    assert_eq!(
+        state_runtime["producer_budget_wait_count"].as_u64(),
+        Some(2)
+    );
     assert_eq!(state_runtime["producer_budget_wait_ms"].as_u64(), Some(17));
-    assert_eq!(state_runtime["producer_handoff_wait_count"].as_u64(), Some(1));
+    assert_eq!(
+        state_runtime["producer_handoff_wait_count"].as_u64(),
+        Some(1)
+    );
     assert_eq!(state_runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
     assert_eq!(state_runtime["host_loadavg_1m"].as_f64(), Some(7.25));
     assert_eq!(
@@ -464,7 +472,10 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
         Some("queue_depth_3_reached_pipeline_capacity_3")
     );
     assert_eq!(state_runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
-    assert_eq!(state_runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
+    assert_eq!(
+        state_runtime["staged_shard_build_pending_jobs"].as_u64(),
+        Some(2)
+    );
     assert_eq!(
         state_runtime["updated_at"].as_str(),
         Some("2024-11-30T20:55:24+00:00")
