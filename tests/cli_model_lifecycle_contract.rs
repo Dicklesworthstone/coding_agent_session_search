@@ -22,6 +22,42 @@ where
 }
 
 #[test]
+fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "models",
+            "install",
+            "--model",
+            "all-minilm-l6-v2",
+            "--from-file",
+            "/seeded/models/all-minilm-l6-v2",
+            "--data-dir",
+            "/cass/models",
+            "--yes",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Install {
+                model,
+                mirror: None,
+                from_file: Some(from_file),
+                yes: true,
+                data_dir: Some(data_dir),
+            })) if model == "all-minilm-l6-v2"
+                && from_file.display().to_string() == "/seeded/models/all-minilm-l6-v2"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected local model acquisition controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn models_verify_repair_controls_remain_data_dir_scoped() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
