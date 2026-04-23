@@ -248,6 +248,142 @@ fn contention_plan_records_per_actor_traces_and_outcomes() {
 }
 
 #[test]
+fn rollout_gate_verdict_persists_thresholds_and_recovery_evidence() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "rollout_gate_thresholds_and_crash_resume",
+        LoadScript::new(vec![
+            LoadSample::idle("search_ready_build"),
+            LoadSample::busy("foreground_query"),
+            LoadSample::loaded("publish_pressure"),
+            LoadSample::idle("restart_recovery"),
+        ]),
+    );
+    harness.install_failpoint_once(
+        FailpointId::Publish(PublishCrashWindow::SwapPublishedGeneration),
+        FailpointEffect::CrashOnce,
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "build_to_search_ready")
+        .turn(SimulationActor::ForegroundSearch, "query_while_repairing")
+        .turn(SimulationActor::LexicalRepair, "swap_publish_crash")
+        .turn(SimulationActor::LexicalRepair, "restart_verdict");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "build_to_search_ready") => {
+                sim.phase(
+                    "rollout_gate",
+                    "search-ready generation prepared within rollout threshold",
+                );
+                sim.snapshot_json(
+                    "search_ready_gate",
+                    &json!({
+                        "gate": "search_ready_ms",
+                        "observed_ms": 1_200,
+                        "threshold_ms": 5_000,
+                        "status": "pass",
+                        "generation_state": "search_ready"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "query_while_repairing") => {
+                sim.phase(
+                    "foreground_search",
+                    "foreground query fails open to old-good generation during repair",
+                );
+                sim.snapshot_json(
+                    "fail_open_during_repair",
+                    &json!({
+                        "requested_search_mode": "hybrid",
+                        "realized_search_mode": "lexical",
+                        "visible_generation": "old_good",
+                        "blocked_wait_ms": 0,
+                        "max_blocked_wait_ms": 250,
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "swap_publish_crash") => {
+                sim.phase(
+                    "publish",
+                    "simulating crash while swapping the published generation",
+                );
+                sim.snapshot_json(
+                    "pre_swap_crash",
+                    &json!({
+                        "candidate_generation": "lexical-gen-003",
+                        "published_before_crash": "old_good",
+                        "crash_window": "swap_published_generation"
+                    }),
+                );
+                sim.trigger_failpoint(FailpointId::Publish(
+                    PublishCrashWindow::SwapPublishedGeneration,
+                ))
+            }
+            (SimulationActor::LexicalRepair, "restart_verdict") => {
+                sim.phase(
+                    "rollout_gate",
+                    "restart selects old-good generation and preserves crash evidence",
+                );
+                sim.snapshot_json(
+                    "rollout_verdict",
+                    &json!({
+                        "verdict": "pass",
+                        "selected_generation_after_restart": "old_good",
+                        "crash_evidence_retained": true,
+                        "gates": {
+                            "search_ready_ms": "pass",
+                            "fail_open_wait": "pass",
+                            "old_good_after_crash": "pass"
+                        }
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic rollout-gate turn"),
+        });
+
+    assert_eq!(results.len(), 4);
+    assert!(results[0].is_ok());
+    assert!(results[1].is_ok());
+    assert!(matches!(
+        &results[2],
+        Err(SimulationFailure::Crash { failpoint })
+            if *failpoint == FailpointId::Publish(PublishCrashWindow::SwapPublishedGeneration)
+    ));
+    assert!(results[3].is_ok());
+
+    let artifacts = harness.write_artifacts().expect("write rollout artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.failpoints_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("rollout_gate"),
+        "phase log should preserve rollout-gate phases"
+    );
+
+    let verdict_path = artifacts.snapshot_dir.join("004-rollout_verdict.json");
+    let verdict: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict_path).expect("read rollout verdict snapshot"),
+    )
+    .expect("rollout verdict JSON");
+    assert_eq!(verdict["verdict"], "pass");
+    assert_eq!(
+        verdict["selected_generation_after_restart"], "old_good",
+        "restart must preserve old-good searchability after a swap crash"
+    );
+    assert_eq!(verdict["crash_evidence_retained"], true);
+    assert_eq!(verdict["gates"]["search_ready_ms"], "pass");
+    assert_eq!(verdict["gates"]["fail_open_wait"], "pass");
+    assert_eq!(verdict["gates"]["old_good_after_crash"], "pass");
+}
+
+#[test]
 fn robot_style_demo_is_deterministic_and_persists_artifacts() {
     let (first_summary, first_artifacts, first_results) = run_robot_style_demo();
     let (second_summary, second_artifacts, second_results) = run_robot_style_demo();
