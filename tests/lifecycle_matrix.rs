@@ -608,3 +608,62 @@ fn capabilities_and_diag_connectors_enumerate_the_same_set() {
          a connector landed in one surface but not the other"
     );
 }
+
+#[test]
+fn health_and_diag_agree_on_db_and_index_presence() {
+    // Cross-surface invariant: cass health --json and cass diag --json
+    // both report whether the DB and lexical index are present on disk.
+    // When a fresh isolated HOME has neither, both surfaces MUST report
+    // exists=false in their respective fields. If the two surfaces
+    // disagree, one of them is reading stale or cached state — a class
+    // of bug that otherwise only surfaces after operators run
+    // contradictory diagnostic commands and can't tell which to trust.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn cass_stdout_json(home: &Path, args: &[&str]) -> (serde_json::Value, std::process::ExitStatus) {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+        (parsed, out.status)
+    }
+
+    let (health, _) = cass_stdout_json(test_home.path(), &["health", "--json"]);
+    let (diag, diag_status) = cass_stdout_json(test_home.path(), &["diag", "--json"]);
+    assert!(diag_status.success(), "cass diag --json must succeed");
+
+    let health_db_exists = health["db"]["exists"]
+        .as_bool()
+        .expect("health.db.exists is bool");
+    let diag_db_exists = diag["database"]["exists"]
+        .as_bool()
+        .expect("diag.database.exists is bool");
+    assert_eq!(
+        health_db_exists, diag_db_exists,
+        "health.db.exists ({health_db_exists}) disagrees with diag.database.exists ({diag_db_exists})"
+    );
+
+    let health_index_exists = health["state"]["index"]["exists"]
+        .as_bool()
+        .expect("health.state.index.exists is bool");
+    let diag_index_exists = diag["index"]["exists"]
+        .as_bool()
+        .expect("diag.index.exists is bool");
+    assert_eq!(
+        health_index_exists, diag_index_exists,
+        "health.state.index.exists ({health_index_exists}) disagrees with diag.index.exists ({diag_index_exists})"
+    );
+
+    // In the isolated-empty-HOME shape both surfaces must report false
+    // (the DB/index genuinely do not exist on disk).
+    assert!(
+        !health_db_exists && !health_index_exists,
+        "isolated empty HOME should report DB and index as absent; got db={health_db_exists}, index={health_index_exists}"
+    );
+}
