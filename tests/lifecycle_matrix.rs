@@ -1494,22 +1494,32 @@ fn diag_artifact_paths_nest_inside_data_dir_for_safe_gc() {
         .as_str()
         .expect("paths.index_path must be a string");
 
-    // Retention invariant: both derivative artifact paths must live
-    // inside the declared data_dir so GC can reason about them.
+    let data_dir_path = Path::new(data_dir);
+    let db_path = Path::new(db_path);
+    let index_path = Path::new(index_path);
+
+    // Retention invariant: both artifact paths must live inside the
+    // declared data_dir so GC can reason about them without relying on
+    // fragile string-prefix checks.
     assert!(
-        db_path.starts_with(data_dir),
-        "db_path ({db_path}) escapes data_dir ({data_dir}) — GC jurisdiction leak"
+        db_path.starts_with(data_dir_path),
+        "db_path ({}) escapes data_dir ({}) - GC jurisdiction leak",
+        db_path.display(),
+        data_dir_path.display()
     );
     assert!(
-        index_path.starts_with(data_dir),
-        "index_path ({index_path}) escapes data_dir ({data_dir}) — GC jurisdiction leak"
+        index_path.starts_with(data_dir_path),
+        "index_path ({}) escapes data_dir ({}) - GC jurisdiction leak",
+        index_path.display(),
+        data_dir_path.display()
     );
 
     // And data_dir itself must live inside the isolated test HOME
     // so the retention sandbox is honored.
-    let home = test_home.path().to_string_lossy().into_owned();
     assert!(
-        data_dir.starts_with(&home),
-        "data_dir ({data_dir}) escapes test HOME ({home}) — XDG_DATA_HOME/HOME pin bypassed"
+        data_dir_path.starts_with(test_home.path()),
+        "data_dir ({}) escapes test HOME ({}) - XDG_DATA_HOME/HOME pin bypassed",
+        data_dir_path.display(),
+        test_home.path().display()
     );
 }
