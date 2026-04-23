@@ -11163,6 +11163,99 @@ fn spawn_lexical_rebuild_packet_producer(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LexicalPublishRenameSite {
+    FirstPublish,
+    LinuxParkPriorLiveToCanonicalSidecar,
+    LinuxRetainCanonicalSidecar,
+    NonLinuxParkPriorLive,
+    NonLinuxPublishStagedLive,
+    NonLinuxRetainPriorLive,
+    RecoverRetainStaleInProgress,
+    RecoverRestorePriorLive,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LexicalPublishInjectedRenameFailure {
+    site: LexicalPublishRenameSite,
+    remaining_hits: usize,
+    raw_os_error: i32,
+}
+
+#[cfg(test)]
+static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE:
+    std::sync::Mutex<Option<LexicalPublishInjectedRenameFailure>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+struct LexicalPublishInjectedRenameFailureGuard {
+    previous: Option<LexicalPublishInjectedRenameFailure>,
+}
+
+#[cfg(test)]
+impl Drop for LexicalPublishInjectedRenameFailureGuard {
+    fn drop(&mut self) {
+        let mut guard = LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE
+            .lock()
+            .expect("lexical publish rename fault injection lock");
+        *guard = self.previous;
+    }
+}
+
+#[cfg(test)]
+fn inject_lexical_publish_rename_failure_once(
+    site: LexicalPublishRenameSite,
+    raw_os_error: i32,
+) -> LexicalPublishInjectedRenameFailureGuard {
+    let mut guard = LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE
+        .lock()
+        .expect("lexical publish rename fault injection lock");
+    let previous = *guard;
+    *guard = Some(LexicalPublishInjectedRenameFailure {
+        site,
+        remaining_hits: 1,
+        raw_os_error,
+    });
+    LexicalPublishInjectedRenameFailureGuard { previous }
+}
+
+#[cfg(test)]
+fn maybe_inject_lexical_publish_rename_failure(
+    site: LexicalPublishRenameSite,
+) -> std::io::Result<()> {
+    let mut guard = LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE
+        .lock()
+        .expect("lexical publish rename fault injection lock");
+    let Some(state) = *guard else {
+        return Ok(());
+    };
+    if state.site != site || state.remaining_hits == 0 {
+        return Ok(());
+    }
+
+    if state.remaining_hits == 1 {
+        *guard = None;
+    } else {
+        *guard = Some(LexicalPublishInjectedRenameFailure {
+            remaining_hits: state.remaining_hits - 1,
+            ..state
+        });
+    }
+    Err(std::io::Error::from_raw_os_error(state.raw_os_error))
+}
+
+fn rename_lexical_publish_path(
+    src: &Path,
+    dst: &Path,
+    site: LexicalPublishRenameSite,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    maybe_inject_lexical_publish_rename_failure(site)?;
+    #[cfg(not(test))]
+    let _ = site;
+    fs::rename(src, dst)
+}
+
 fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> Result<()> {
     if let Some(parent) = index_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -11176,7 +11269,12 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
     ensure_lexical_publish_backups_dir(index_path)?;
 
     if !index_path.exists() {
-        fs::rename(staged_index_path, index_path).with_context(|| {
+        rename_lexical_publish_path(
+            staged_index_path,
+            index_path,
+            LexicalPublishRenameSite::FirstPublish,
+        )
+        .with_context(|| {
             format!(
                 "publishing first staged lexical index {} -> {}",
                 staged_index_path.display(),
@@ -11213,7 +11311,11 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         // finds the canonical sidecar and moves it into
         // `.lexical-publish-backups/` automatically.
         let canonical_sidecar = lexical_publish_in_progress_backup_path(index_path);
-        if let Err(park_err) = fs::rename(staged_index_path, &canonical_sidecar) {
+        if let Err(park_err) = rename_lexical_publish_path(
+            staged_index_path,
+            &canonical_sidecar,
+            LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
+        ) {
             // A.5 failed: staged_index_path still holds OLD (inside the
             // merge tempdir). Roll the atomic swap back so live returns
             // to OLD and the NEW content goes back into the tempdir
@@ -11245,7 +11347,11 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
         // intentionally do NOT roll the swap back here because (a) rolling
         // back would discard the validated NEW publish, and (b) recovery
         // is idempotent.
-        if let Err(retain_err) = fs::rename(&canonical_sidecar, &retained_backup_path) {
+        if let Err(retain_err) = rename_lexical_publish_path(
+            &canonical_sidecar,
+            &retained_backup_path,
+            LexicalPublishRenameSite::LinuxRetainCanonicalSidecar,
+        ) {
             tracing::warn!(
                 error = %retain_err,
                 canonical_sidecar = %canonical_sidecar.display(),
@@ -11258,14 +11364,27 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
     #[cfg(not(target_os = "linux"))]
     {
         let in_progress_backup_path = lexical_publish_in_progress_backup_path(index_path);
-        fs::rename(index_path, &in_progress_backup_path).with_context(|| {
+        rename_lexical_publish_path(
+            index_path,
+            &in_progress_backup_path,
+            LexicalPublishRenameSite::NonLinuxParkPriorLive,
+        )
+        .with_context(|| {
             format!(
                 "parking prior lexical index at {} before staged publish",
                 in_progress_backup_path.display()
             )
         })?;
-        if let Err(publish_err) = fs::rename(staged_index_path, index_path) {
-            match fs::rename(&in_progress_backup_path, index_path) {
+        if let Err(publish_err) = rename_lexical_publish_path(
+            staged_index_path,
+            index_path,
+            LexicalPublishRenameSite::NonLinuxPublishStagedLive,
+        ) {
+            match rename_lexical_publish_path(
+                &in_progress_backup_path,
+                index_path,
+                LexicalPublishRenameSite::RecoverRestorePriorLive,
+            ) {
                 Ok(()) => {
                     return Err(publish_err).with_context(|| {
                         format!(
@@ -11285,7 +11404,11 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
                 }
             }
         }
-        if let Err(retain_err) = fs::rename(&in_progress_backup_path, &retained_backup_path) {
+        if let Err(retain_err) = rename_lexical_publish_path(
+            &in_progress_backup_path,
+            &retained_backup_path,
+            LexicalPublishRenameSite::NonLinuxRetainPriorLive,
+        ) {
             tracing::warn!(
                 error = %retain_err,
                 backup_path = %in_progress_backup_path.display(),
@@ -11493,7 +11616,12 @@ fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> 
     if index_path.exists() {
         ensure_lexical_publish_backups_dir(index_path)?;
         let retained_backup_path = unique_lexical_publish_backup_path(index_path);
-        fs::rename(&in_progress_backup_path, &retained_backup_path).with_context(|| {
+        rename_lexical_publish_path(
+            &in_progress_backup_path,
+            &retained_backup_path,
+            LexicalPublishRenameSite::RecoverRetainStaleInProgress,
+        )
+        .with_context(|| {
             format!(
                 "moving stale in-progress lexical publish backup {} into retained backup storage {}",
                 in_progress_backup_path.display(),
@@ -11517,7 +11645,12 @@ fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> 
             )
         })?;
     }
-    fs::rename(&in_progress_backup_path, index_path).with_context(|| {
+    rename_lexical_publish_path(
+        &in_progress_backup_path,
+        index_path,
+        LexicalPublishRenameSite::RecoverRestorePriorLive,
+    )
+    .with_context(|| {
         format!(
             "restoring prior published lexical index from interrupted publish backup {} -> {}",
             in_progress_backup_path.display(),
@@ -25250,6 +25383,117 @@ mod tests {
 
     #[test]
     #[serial]
+    fn rebuild_tantivy_from_db_exposes_active_pipeline_runtime_to_attachers() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        let conversation_count = 24usize;
+        let messages_per_conversation = 24usize;
+        let expected_docs = conversation_count * messages_per_conversation;
+        let convs = (0..conversation_count)
+            .map(|idx| {
+                large_startup_conv(
+                    "codex",
+                    "attach-active-runtime",
+                    idx,
+                    messages_per_conversation,
+                    8 * 1024,
+                    1_700_000_000_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        ingest_batch(
+            &storage,
+            None,
+            &convs,
+            &None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )
+        .unwrap();
+        drop(storage);
+
+        let _fetch_conversations = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1");
+        let _startup_fetch_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        );
+        let _progress_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_CONVERSATIONS",
+            "1",
+        );
+        let _progress_ms = set_env("CASS_TANTIVY_REBUILD_PROGRESS_HEARTBEAT_EVERY_MS", "1");
+        let _commit_conversations =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "4096");
+        let _startup_commit_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "4096",
+        );
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "6");
+        let _writer_threads = set_env("CASS_TANTIVY_MAX_WRITER_THREADS", "2");
+        let _pipeline_channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "1");
+        let _page_prep_workers = set_env("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", "1");
+
+        let db_path_for_thread = db_path.clone();
+        let data_dir_for_thread = data_dir.clone();
+        let rebuild_handle = std::thread::spawn(move || {
+            rebuild_tantivy_from_db_with_options(
+                &db_path_for_thread,
+                &data_dir_for_thread,
+                2,
+                None,
+                LexicalRebuildStartupOptions {
+                    defer_initial_content_fingerprint: true,
+                },
+            )
+        });
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let active_runtime = loop {
+            if let Some(runtime) =
+                load_active_lexical_rebuild_pipeline_runtime(&index_path, &db_path).unwrap()
+                && runtime.is_observed()
+            {
+                break runtime;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for active rebuild pipeline runtime to become attach-visible"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+
+        assert!(
+            active_runtime.updated_at_ms > 0,
+            "attach-visible active runtime should include an update timestamp"
+        );
+        assert!(
+            active_runtime.page_prep_workers > 0
+                || active_runtime.pending_batch_conversations > 0
+                || active_runtime.queue_depth > 0
+                || active_runtime.staged_shard_build_workers_max > 0,
+            "attach-visible runtime should expose concrete pipeline activity: {active_runtime:?}"
+        );
+
+        let rebuild = rebuild_handle.join().unwrap().unwrap();
+        assert_eq!(rebuild.indexed_docs, expected_docs);
+        assert_eq!(rebuild.observed_messages, Some(expected_docs));
+        assert!(
+            load_active_lexical_rebuild_pipeline_runtime(&index_path, &db_path)
+                .unwrap()
+                .is_none(),
+            "completed rebuild should stop advertising active pipeline runtime"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn rebuild_tantivy_from_db_deferred_startup_fingerprint_persists_exact_completed_fingerprint() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -26521,8 +26765,8 @@ mod tests {
     /// able to restore the prior live index from the stranded sidecar
     /// without requiring a new staged publish to complete first.
     #[test]
-    fn recover_or_finalize_interrupted_lexical_publish_backup_restores_live_index_without_new_publish(
-    ) {
+    fn recover_or_finalize_interrupted_lexical_publish_backup_restores_live_index_without_new_publish()
+     {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -26759,7 +27003,13 @@ mod tests {
                 drop(index);
             };
 
-        build_generation(&index_path, "retained-reader-seed", 1, 1_100, 1_700_011_000_000);
+        build_generation(
+            &index_path,
+            "retained-reader-seed",
+            1,
+            1_100,
+            1_700_011_000_000,
+        );
 
         let (oldest_backup_path, oldest_backup_reader) = {
             let _retention_two = set_env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "2");
@@ -26796,7 +27046,10 @@ mod tests {
                 .collect();
             retained_with_docs.sort_by_key(|(docs, _path)| *docs);
             assert_eq!(
-                retained_with_docs.iter().map(|(docs, _)| *docs).collect::<Vec<_>>(),
+                retained_with_docs
+                    .iter()
+                    .map(|(docs, _)| *docs)
+                    .collect::<Vec<_>>(),
                 vec![1, 2],
                 "retention=2 should retain the oldest two prior-live generations before pruning is tightened"
             );
