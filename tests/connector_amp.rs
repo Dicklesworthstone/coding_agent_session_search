@@ -29,8 +29,25 @@ fn amp_parses_minimal_cache() {
     assert!(!convs.is_empty(), "expected at least one conversation");
     let c = &convs[0];
     assert_eq!(c.agent_slug, "amp");
-    assert!(c.external_id.is_some());
-    assert!(!c.messages.is_empty());
+    // Bead 7k7pl: pin the external_id's SHAPE (UUID-like non-empty
+    // string) rather than mere presence. The amp connector derives
+    // external_id from the session file's uuid; a regression that
+    // stored `Some(String::new())` or `Some("null")` would pass
+    // `.is_some()` while quietly breaking downstream dedup keyed on
+    // external_id.
+    let external_id = c
+        .external_id
+        .as_deref()
+        .expect("amp connector must populate external_id");
+    assert!(
+        !external_id.is_empty(),
+        "amp external_id must be non-empty; got {external_id:?}"
+    );
+    assert!(
+        external_id.len() >= 8,
+        "amp external_id must be at least 8 chars (UUID-like); got {external_id:?}"
+    );
+    assert!(!c.messages.is_empty(), "amp conversation must have messages");
 }
 
 /// since_ts controls file-level filtering (via file mtime), NOT message-level filtering.

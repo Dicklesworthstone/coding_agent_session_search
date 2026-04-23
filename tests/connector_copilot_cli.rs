@@ -63,10 +63,31 @@ fn scan_parses_chronicle_nested_data_content() {
     assert!(conv.messages[2].content.contains("exports"));
     assert_eq!(conv.messages[3].role, "assistant");
     assert!(conv.messages[3].content.contains("Factory registry"));
-    // Timestamps parsed from ISO8601 strings.
-    assert!(conv.started_at.is_some());
-    assert!(conv.ended_at.is_some());
-    assert!(conv.started_at.unwrap() <= conv.ended_at.unwrap());
+    // Bead 7k7pl: pin timestamp presence + ordering + per-message
+    // containment in one block. Each of the 4 fixture messages
+    // (user/assistant alternation above) should carry a timestamp
+    // that falls inside [started_at, ended_at]; a parser regression
+    // that assigned epoch-0 or clock-now() fallbacks would slip past
+    // bare presence checks but fires against this window assertion.
+    let started = conv
+        .started_at
+        .expect("conversation started_at must be parsed from ISO8601");
+    let ended = conv
+        .ended_at
+        .expect("conversation ended_at must be parsed from ISO8601");
+    assert!(
+        started <= ended,
+        "started_at ({started}) must precede or equal ended_at ({ended})"
+    );
+    for (idx, msg) in conv.messages.iter().enumerate() {
+        if let Some(created) = msg.created_at {
+            assert!(
+                (started..=ended).contains(&created),
+                "copilot-cli message #{idx} created_at ({created}) must fall within \
+                 [started_at={started}, ended_at={ended}]"
+            );
+        }
+    }
 }
 
 /// When the Chronicle event log contains no `sessionId` anywhere, we must

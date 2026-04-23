@@ -77,9 +77,27 @@ fn gemini_parses_timestamps() {
     assert!(!convs.is_empty());
 
     let c = &convs[0];
-    assert!(c.started_at.is_some());
-    assert!(c.ended_at.is_some());
-    assert!(c.messages[0].created_at.is_some());
+    // Bead 7k7pl: upgrade presence-only `.is_some()` to pin the
+    // timestamp ORDERING that defines a valid conversation: started_at
+    // must come before ended_at, and the first message's created_at
+    // must fall inside [started_at, ended_at]. A regression that
+    // parsed the wrong timestamp field (e.g., swapped started/ended or
+    // used epoch 0 as a fallback) would slip past bare presence
+    // checks but fires here.
+    let started = c.started_at.expect("conversation started_at must be populated");
+    let ended = c.ended_at.expect("conversation ended_at must be populated");
+    assert!(
+        started <= ended,
+        "conversation started_at ({started}) must precede or equal ended_at ({ended})"
+    );
+    let first_msg_created = c.messages[0]
+        .created_at
+        .expect("first message created_at must be populated");
+    assert!(
+        (started..=ended).contains(&first_msg_created),
+        "first message created_at ({first_msg_created}) must fall within the \
+         conversation's [started_at={started}, ended_at={ended}] window"
+    );
 }
 
 /// Test detection when directory exists

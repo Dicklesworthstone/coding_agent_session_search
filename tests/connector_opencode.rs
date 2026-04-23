@@ -851,8 +851,22 @@ fn opencode_handles_partial_session_data() {
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
-    // Title should fall back to first message content
-    assert!(c.title.is_some());
+    // Bead 7k7pl: assert the TITLE FALLBACK content, not just its
+    // presence. The test name (`..._falls_back_to_first_message...`)
+    // + the inline comment state a clear contract: title equals a
+    // prefix of the first message content when no explicit title is
+    // set. A regression that fell back to a placeholder like
+    // `"(untitled)"` or empty-string would slip past `.is_some()`
+    // but fires here.
+    let title = c
+        .title
+        .as_deref()
+        .expect("opencode must fall back to first-message content as title");
+    assert!(
+        title.contains("Hello from partial session"),
+        "title should contain (a prefix of) the first message content; \
+         got title={title:?}"
+    );
     // Workspace should be None since directory wasn't provided
     assert!(c.workspace.is_none());
     assert_eq!(c.messages.len(), 1);

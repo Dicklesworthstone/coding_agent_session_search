@@ -515,10 +515,34 @@ fn claude_connector_parses_timestamps() {
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
-    assert!(c.started_at.is_some());
-    assert!(c.ended_at.is_some());
-    // started_at should be earlier than ended_at
-    assert!(c.started_at.unwrap() < c.ended_at.unwrap());
+    // Bead 7k7pl: collapse presence + ordering into a single
+    // `.expect()`-based contract so a regression produces a clear
+    // per-field diagnostic instead of an anonymous `.unwrap()`
+    // panic. ALSO assert each message's created_at falls inside
+    // [started_at, ended_at] — a regression that extracted a
+    // message timestamp from the wrong field would slip past the
+    // bare presence checks but fires here.
+    let started = c
+        .started_at
+        .expect("conversation started_at must be populated after scan");
+    let ended = c
+        .ended_at
+        .expect("conversation ended_at must be populated after scan");
+    assert!(
+        started < ended,
+        "conversation started_at ({started}) must strictly precede ended_at \
+         ({ended}); equal timestamps indicate a single-message conversation \
+         that the claude parser should still report with distinct bounds"
+    );
+    for (idx, msg) in c.messages.iter().enumerate() {
+        if let Some(created) = msg.created_at {
+            assert!(
+                (started..=ended).contains(&created),
+                "message #{idx} created_at ({created}) must fall within \
+                 conversation [started_at={started}, ended_at={ended}]"
+            );
+        }
+    }
 }
 
 /// Test long title is truncated
