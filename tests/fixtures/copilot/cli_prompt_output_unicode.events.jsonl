@@ -1,0 +1,2 @@
+{"session_id":"cli-session-001","cwd":"/workspaces/demo-unicode","type":"user.message","prompt":"How should Copilot handle cafe\u0301 ✅ and emoji?","timestamp":1700001000000}
+{"session_id":"cli-session-001","type":"assistant.message","output":"Keep Unicode intact: cafe\u0301 ✅ should round-trip.","timestamp":1700001001000}

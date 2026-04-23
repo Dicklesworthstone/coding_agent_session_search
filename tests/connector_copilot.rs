@@ -17,6 +17,16 @@ fn write_json(dir: &Path, filename: &str, content: &str) -> std::path::PathBuf {
     path
 }
 
+fn load_fixture(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("copilot")
+        .join(name);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read copilot fixture {}: {err}", path.display()))
+}
+
 // ============================================================================
 // Detection tests
 // ============================================================================
@@ -213,4 +223,96 @@ fn scan_with_scan_roots() {
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].external_id.as_deref(), Some("remote-001"));
+}
+
+#[test]
+fn scan_parses_cli_jsonl_prompt_output_unicode_fixture() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join(".copilot/session-state");
+    fs::create_dir_all(&root).unwrap();
+
+    write_json(
+        &root,
+        "cli-session-001/events.jsonl",
+        &load_fixture("cli_prompt_output_unicode.events.jsonl"),
+    );
+
+    let connector = CopilotConnector::new();
+    let ctx = ScanContext::local_default(root, None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.external_id.as_deref(), Some("cli-session-001"));
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/workspaces/demo-unicode"))
+    );
+    assert_eq!(conv.messages.len(), 2);
+    assert_eq!(conv.messages[0].role, "user");
+    assert_eq!(
+        conv.messages[0].content,
+        "How should Copilot handle cafe\u{301} ✅ and emoji?"
+    );
+    assert_eq!(conv.messages[1].role, "assistant");
+    assert_eq!(
+        conv.messages[1].content,
+        "Keep Unicode intact: cafe\u{301} ✅ should round-trip."
+    );
+}
+
+#[test]
+fn scan_cli_jsonl_skips_truncated_line_and_keeps_valid_messages() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join(".copilot/session-state");
+    fs::create_dir_all(&root).unwrap();
+
+    write_json(
+        &root,
+        "cli-session-truncated/events.jsonl",
+        &load_fixture("cli_truncated_resume.events.jsonl"),
+    );
+
+    let connector = CopilotConnector::new();
+    let ctx = ScanContext::local_default(root, None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.external_id.as_deref(), Some("cli-session-truncated"));
+    assert_eq!(conv.messages.len(), 2);
+    assert_eq!(conv.messages[0].role, "user");
+    assert_eq!(conv.messages[1].role, "assistant");
+    assert_eq!(conv.messages[1].content, "Recovered after truncation.");
+    assert_eq!(conv.started_at, Some(1_700_002_000_000));
+    assert_eq!(conv.ended_at, Some(1_700_002_002_000));
+}
+
+#[test]
+fn scan_parses_cli_history_json_with_human_role_and_file_stem_id() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join(".copilot/history-session-state");
+    fs::create_dir_all(&root).unwrap();
+
+    write_json(
+        &root,
+        "legacy-human.json",
+        &load_fixture("legacy_history_human.json"),
+    );
+
+    let connector = CopilotConnector::new();
+    let ctx = ScanContext::local_default(root, None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.external_id.as_deref(), Some("legacy-human"));
+    assert_eq!(conv.title.as_deref(), Some("Summarize unicode Ω handling 🚀"));
+    assert_eq!(conv.messages.len(), 2);
+    assert_eq!(conv.messages[0].role, "user");
+    assert_eq!(conv.messages[1].role, "assistant");
+    assert_eq!(
+        conv.messages[1].content,
+        "Unicode stays normalized and searchable."
+    );
 }

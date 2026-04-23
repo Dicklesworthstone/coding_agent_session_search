@@ -1,0 +1,15 @@
+{
+  "history": [
+    {
+      "role": "human",
+      "content": "Summarize unicode Ω handling 🚀",
+      "time": 1700003000000
+    },
+    {
+      "role": "assistant",
+      "result": "Unicode stays normalized and searchable.",
+      "time": 1700003001000
+    }
+  ],
+  "workspacePath": "/workspaces/legacy-copilot"
+}

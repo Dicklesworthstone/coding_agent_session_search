@@ -1,0 +1,3 @@
+{"session_id":"cli-session-truncated","cwd":"/workspaces/recovery","type":"userpromptsubmitted","prompt":"Recover after truncated line","timestamp":1700002000000}
+{"type":"assistantresponse","result":"This line is intentionally truncated"
+{"session_id":"cli-session-truncated","type":"assistantresponse","result":"Recovered after truncation.","timestamp":1700002002000}
