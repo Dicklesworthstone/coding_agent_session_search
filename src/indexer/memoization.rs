@@ -104,6 +104,18 @@ pub(crate) enum MemoCacheEvent {
     Invalidate,
 }
 
+/// Stable operation label carried alongside [`MemoCacheEvent`] in audit
+/// records so downstream logs can distinguish a lookup that merely
+/// observed quarantine from a producer-side mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoCacheOperation {
+    Lookup,
+    Insert,
+    Invalidate,
+    Quarantine,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemoEvictReason {
@@ -125,6 +137,20 @@ pub(crate) struct MemoCacheStats {
     pub invalidations: u64,
     pub quarantined: u64,
     pub live_entries: u64,
+}
+
+/// Structured operator-facing audit record for a single memo cache
+/// decision. Wiring sites can serialize this directly into
+/// refresh/rebuild traces once the packet dataflow is fully migrated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MemoCacheAuditRecord {
+    pub operation: MemoCacheOperation,
+    pub key: MemoKey,
+    pub event: MemoCacheEvent,
+    pub changed: bool,
+    pub entry_capacity: usize,
+    pub quarantined_entries: usize,
+    pub stats: MemoCacheStats,
 }
 
 /// Stable operator-facing inspection row for a quarantined memo entry.
@@ -169,37 +195,74 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
     }
 
     pub(crate) fn get(&mut self, key: &MemoKey) -> MemoLookup<V> {
+        self.get_with_audit(key).0
+    }
+
+    pub(crate) fn get_with_audit(
+        &mut self,
+        key: &MemoKey,
+    ) -> (MemoLookup<V>, MemoCacheAuditRecord) {
         if let Some(reason) = self.quarantined.get(key) {
-            return MemoLookup::Quarantined {
+            let lookup = MemoLookup::Quarantined {
                 reason: reason.clone(),
             };
+            let audit = self.audit_record(
+                MemoCacheOperation::Lookup,
+                key.clone(),
+                MemoCacheEvent::Quarantine {
+                    reason: reason.clone(),
+                },
+                false,
+            );
+            return (lookup, audit);
         }
         match self.entries.get(key) {
             Some(value) => {
                 let v = value.clone();
                 self.touch(key);
                 self.stats.hits = self.stats.hits.saturating_add(1);
-                MemoLookup::Hit { value: v }
+                let lookup = MemoLookup::Hit { value: v };
+                let audit = self.audit_record(
+                    MemoCacheOperation::Lookup,
+                    key.clone(),
+                    MemoCacheEvent::Hit,
+                    false,
+                );
+                (lookup, audit)
             }
             None => {
                 self.stats.misses = self.stats.misses.saturating_add(1);
-                MemoLookup::Miss
+                let audit = self.audit_record(
+                    MemoCacheOperation::Lookup,
+                    key.clone(),
+                    MemoCacheEvent::Miss,
+                    false,
+                );
+                (MemoLookup::Miss, audit)
             }
         }
     }
 
     pub(crate) fn insert(&mut self, key: MemoKey, value: V) -> MemoCacheEvent {
+        self.insert_with_audit(key, value).event
+    }
+
+    pub(crate) fn insert_with_audit(&mut self, key: MemoKey, value: V) -> MemoCacheAuditRecord {
         if self.quarantined.contains_key(&key) {
             // Insertion silently downgraded to noop: never overwrite a
             // quarantined entry. The caller should lift the quarantine
             // explicitly before re-inserting.
-            return MemoCacheEvent::Quarantine {
-                reason: self
-                    .quarantined
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_else(|| "quarantined".to_owned()),
-            };
+            let reason = self
+                .quarantined
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| "quarantined".to_owned());
+            return self.audit_record(
+                MemoCacheOperation::Insert,
+                key,
+                MemoCacheEvent::Quarantine { reason },
+                false,
+            );
         }
         let mut evicted = false;
         if !self.entries.contains_key(&key)
@@ -215,36 +278,68 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         self.entries.insert(key, value);
         self.stats.inserts = self.stats.inserts.saturating_add(1);
         self.stats.live_entries = self.entries.len() as u64;
-        if evicted {
+        let event = if evicted {
             self.stats.evictions_capacity = self.stats.evictions_capacity.saturating_add(1);
             MemoCacheEvent::Evict {
                 reason: MemoEvictReason::CapacityLru,
             }
         } else {
             MemoCacheEvent::Insert
-        }
+        };
+        let inserted_key = self
+            .lru
+            .back()
+            .cloned()
+            .unwrap_or_else(|| unreachable!("inserted key must exist in LRU"));
+        self.audit_record(MemoCacheOperation::Insert, inserted_key, event, true)
     }
 
     pub(crate) fn invalidate(&mut self, key: &MemoKey) -> bool {
+        self.invalidate_with_audit(key).changed
+    }
+
+    pub(crate) fn invalidate_with_audit(&mut self, key: &MemoKey) -> MemoCacheAuditRecord {
         let removed = self.entries.remove(key).is_some();
         self.lru.retain(|existing| existing != key);
         if removed {
             self.stats.invalidations = self.stats.invalidations.saturating_add(1);
             self.stats.live_entries = self.entries.len() as u64;
         }
-        removed
+        self.audit_record(
+            MemoCacheOperation::Invalidate,
+            key.clone(),
+            MemoCacheEvent::Invalidate,
+            removed,
+        )
     }
 
     pub(crate) fn quarantine(&mut self, key: MemoKey, reason: impl Into<String>) {
+        let _ = self.quarantine_with_audit(key, reason);
+    }
+
+    pub(crate) fn quarantine_with_audit(
+        &mut self,
+        key: MemoKey,
+        reason: impl Into<String>,
+    ) -> MemoCacheAuditRecord {
         let reason = reason.into();
+        let previous_reason = self.quarantined.get(&key).cloned();
+        let had_entry = self.entries.contains_key(&key);
         self.entries.remove(&key);
         self.lru.retain(|existing| existing != &key);
         let newly_quarantined = !self.quarantined.contains_key(&key);
-        self.quarantined.insert(key, reason);
+        self.quarantined.insert(key.clone(), reason.clone());
         if newly_quarantined {
             self.stats.quarantined = self.stats.quarantined.saturating_add(1);
         }
         self.stats.live_entries = self.entries.len() as u64;
+        let changed = had_entry || previous_reason.as_deref() != Some(reason.as_str());
+        self.audit_record(
+            MemoCacheOperation::Quarantine,
+            key,
+            MemoCacheEvent::Quarantine { reason },
+            changed,
+        )
     }
 
     pub(crate) fn stats(&self) -> &MemoCacheStats {
@@ -368,6 +463,24 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             self.lru.push_back(key.clone());
         }
     }
+
+    fn audit_record(
+        &self,
+        operation: MemoCacheOperation,
+        key: MemoKey,
+        event: MemoCacheEvent,
+        changed: bool,
+    ) -> MemoCacheAuditRecord {
+        MemoCacheAuditRecord {
+            operation,
+            key,
+            event,
+            changed,
+            entry_capacity: self.max_entries,
+            quarantined_entries: self.quarantined.len(),
+            stats: self.stats.clone(),
+        }
+    }
 }
 
 fn sort_quarantine_inspection_items(items: &mut [MemoQuarantineInspectionItem]) {
@@ -426,12 +539,52 @@ mod tests {
         ]
     }
 
+    fn memo_operation_strategy() -> impl Strategy<Value = MemoCacheOperation> {
+        prop_oneof![
+            Just(MemoCacheOperation::Lookup),
+            Just(MemoCacheOperation::Insert),
+            Just(MemoCacheOperation::Invalidate),
+            Just(MemoCacheOperation::Quarantine),
+        ]
+    }
+
     fn memo_lookup_strategy() -> impl Strategy<Value = MemoLookup<String>> {
         prop_oneof![
             ".{0,128}".prop_map(|value| MemoLookup::Hit { value }),
             Just(MemoLookup::Miss),
             ".{0,96}".prop_map(|reason| MemoLookup::Quarantined { reason }),
         ]
+    }
+
+    fn memo_stats_strategy() -> impl Strategy<Value = MemoCacheStats> {
+        (
+            0u64..10_000,
+            0u64..10_000,
+            0u64..10_000,
+            0u64..10_000,
+            0u64..10_000,
+            0u64..10_000,
+            0u64..10_000,
+        )
+            .prop_map(
+                |(
+                    hits,
+                    misses,
+                    inserts,
+                    evictions_capacity,
+                    invalidations,
+                    quarantined,
+                    live_entries,
+                )| MemoCacheStats {
+                    hits,
+                    misses,
+                    inserts,
+                    evictions_capacity,
+                    invalidations,
+                    quarantined,
+                    live_entries,
+                },
+            )
     }
 
     fn quarantine_item_strategy() -> impl Strategy<Value = MemoQuarantineInspectionItem> {
@@ -450,6 +603,31 @@ mod tests {
                     quarantined_entries,
                     reasons,
                     algorithms,
+                },
+            )
+    }
+
+    fn memo_audit_record_strategy() -> impl Strategy<Value = MemoCacheAuditRecord> {
+        (
+            memo_operation_strategy(),
+            memo_key_strategy(),
+            memo_event_strategy(),
+            any::<bool>(),
+            1usize..256,
+            0usize..256,
+            memo_stats_strategy(),
+        )
+            .prop_map(
+                |(operation, key, event, changed, entry_capacity, quarantined_entries, stats)| {
+                    MemoCacheAuditRecord {
+                        operation,
+                        key,
+                        event,
+                        changed,
+                        entry_capacity,
+                        quarantined_entries,
+                        stats,
+                    }
                 },
             )
     }
@@ -490,6 +668,15 @@ mod tests {
             let summary_bytes = serde_json::to_vec(&summary)?;
             let parsed_summary: MemoQuarantineSummary = serde_json::from_slice(&summary_bytes)?;
             prop_assert_eq!(parsed_summary, summary);
+        }
+
+        #[test]
+        fn memo_audit_record_json_round_trips_for_random_payloads(
+            record in memo_audit_record_strategy(),
+        ) {
+            let bytes = serde_json::to_vec(&record)?;
+            let parsed: MemoCacheAuditRecord = serde_json::from_slice(&bytes)?;
+            prop_assert_eq!(parsed, record);
         }
     }
 
@@ -842,5 +1029,105 @@ mod tests {
         assert!(json.contains("\"live_entries\":2"));
         assert!(json.contains("\"inserts\":2"));
         assert!(json.contains("\"hits\":0"));
+    }
+
+    #[test]
+    fn get_with_audit_reports_lookup_event_and_capacity() -> Result<(), String> {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(2);
+        let key = key(b"hit", "lexical-normalize", "v1");
+        cache.insert(key.clone(), "derived".into());
+
+        let (lookup, audit) = cache.get_with_audit(&key);
+        match lookup {
+            MemoLookup::Hit { value } => assert_eq!(value, "derived"),
+            other => return Err(format!("expected hit lookup, got {other:?}")),
+        }
+        assert_eq!(audit.operation, MemoCacheOperation::Lookup);
+        assert_eq!(audit.key, key);
+        assert_eq!(audit.event, MemoCacheEvent::Hit);
+        assert!(!audit.changed);
+        assert_eq!(audit.entry_capacity, 2);
+        assert_eq!(audit.quarantined_entries, 0);
+        assert_eq!(audit.stats.hits, 1);
+        assert_eq!(audit.stats.live_entries, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn insert_with_audit_reports_quarantine_noop_and_json_shape() -> Result<(), String> {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(2);
+        let key = key(b"blocked", "semantic-embed", "v2");
+        cache.quarantine(key.clone(), "checksum mismatch");
+
+        let audit = cache.insert_with_audit(key.clone(), "replacement".into());
+        assert_eq!(audit.operation, MemoCacheOperation::Insert);
+        assert_eq!(audit.key, key);
+        assert_eq!(
+            audit.event,
+            MemoCacheEvent::Quarantine {
+                reason: "checksum mismatch".to_string()
+            }
+        );
+        assert!(!audit.changed);
+        assert_eq!(audit.quarantined_entries, 1);
+        let json = serde_json::to_value(&audit).map_err(|err| err.to_string())?;
+        assert_eq!(json["operation"], "insert");
+        assert_eq!(json["event"]["kind"], "quarantine");
+        assert_eq!(json["event"]["reason"], "checksum mismatch");
+        assert_eq!(json["changed"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn invalidate_with_audit_reports_removed_state() {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(2);
+        let present = key(b"present", "lex", "v1");
+        let missing = key(b"missing", "lex", "v1");
+        cache.insert(present.clone(), "value".into());
+
+        let removed = cache.invalidate_with_audit(&present);
+        assert_eq!(removed.operation, MemoCacheOperation::Invalidate);
+        assert_eq!(removed.key, present);
+        assert_eq!(removed.event, MemoCacheEvent::Invalidate);
+        assert!(removed.changed);
+        assert_eq!(removed.stats.invalidations, 1);
+        assert_eq!(removed.stats.live_entries, 0);
+
+        let noop = cache.invalidate_with_audit(&missing);
+        assert_eq!(noop.operation, MemoCacheOperation::Invalidate);
+        assert_eq!(noop.key, missing);
+        assert_eq!(noop.event, MemoCacheEvent::Invalidate);
+        assert!(!noop.changed);
+        assert_eq!(noop.stats.invalidations, 1);
+        assert_eq!(noop.stats.live_entries, 0);
+    }
+
+    #[test]
+    fn quarantine_with_audit_reports_current_quarantine_state() -> Result<(), String> {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(3);
+        let key = key(b"memo", "lexical-normalize", "v1");
+        cache.insert(key.clone(), "derived".into());
+
+        let audit = cache.quarantine_with_audit(key.clone(), "normalizer panic replay");
+        assert_eq!(audit.operation, MemoCacheOperation::Quarantine);
+        assert_eq!(audit.key, key);
+        assert_eq!(
+            audit.event,
+            MemoCacheEvent::Quarantine {
+                reason: "normalizer panic replay".to_string()
+            }
+        );
+        assert!(audit.changed);
+        assert_eq!(audit.quarantined_entries, 1);
+        assert_eq!(audit.stats.quarantined, 1);
+        assert_eq!(audit.stats.live_entries, 0);
+        let json = serde_json::to_string(&audit).map_err(|err| err.to_string())?;
+        assert!(json.contains("\"operation\":\"quarantine\""));
+        assert!(json.contains("\"entry_capacity\":3"));
+        Ok(())
     }
 }
