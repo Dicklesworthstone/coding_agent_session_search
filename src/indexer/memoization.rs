@@ -257,19 +257,7 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
                 reason: reason.clone(),
             })
             .collect();
-        items.sort_by(|left, right| {
-            left.key
-                .algorithm
-                .cmp(&right.key.algorithm)
-                .then_with(|| left.key.algorithm_version.cmp(&right.key.algorithm_version))
-                .then_with(|| {
-                    left.key
-                        .content_hash
-                        .as_bytes()
-                        .cmp(right.key.content_hash.as_bytes())
-                })
-                .then_with(|| left.reason.cmp(&right.reason))
-        });
+        sort_quarantine_inspection_items(&mut items);
         items
     }
 
@@ -300,12 +288,48 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
             })
     }
 
+    /// Remove every inspected quarantine tombstone for an algorithm and
+    /// return a deterministic audit list of what was collected.
+    pub(crate) fn garbage_collect_quarantined_algorithm(
+        &mut self,
+        algorithm: &str,
+    ) -> Vec<MemoQuarantineInspectionItem> {
+        let keys: Vec<_> = self
+            .quarantined
+            .keys()
+            .filter(|key| key.algorithm == algorithm)
+            .cloned()
+            .collect();
+        let mut collected: Vec<_> = keys
+            .into_iter()
+            .filter_map(|key| self.garbage_collect_quarantined(&key))
+            .collect();
+        sort_quarantine_inspection_items(&mut collected);
+        collected
+    }
+
     fn touch(&mut self, key: &MemoKey) {
         if let Some(pos) = self.lru.iter().position(|existing| existing == key) {
             self.lru.remove(pos);
             self.lru.push_back(key.clone());
         }
     }
+}
+
+fn sort_quarantine_inspection_items(items: &mut [MemoQuarantineInspectionItem]) {
+    items.sort_by(|left, right| {
+        left.key
+            .algorithm
+            .cmp(&right.key.algorithm)
+            .then_with(|| left.key.algorithm_version.cmp(&right.key.algorithm_version))
+            .then_with(|| {
+                left.key
+                    .content_hash
+                    .as_bytes()
+                    .cmp(right.key.content_hash.as_bytes())
+            })
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
 }
 
 #[cfg(test)]
@@ -537,6 +561,43 @@ mod tests {
             other => return Err(format!("expected reinsertion hit, got {other:?}")),
         }
         Ok(())
+    }
+
+    #[test]
+    fn garbage_collect_quarantined_algorithm_returns_stable_audit_items() {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(6);
+        let lexical_b = key(b"lex-b", "lexical-normalize", "v1");
+        let lexical_a = key(b"lex-a", "lexical-normalize", "v1");
+        let semantic = key(b"semantic", "semantic-embed", "v2");
+
+        cache.insert(lexical_b.clone(), "lexical-b".into());
+        cache.insert(semantic.clone(), "semantic".into());
+        cache.insert(lexical_a.clone(), "lexical-a".into());
+        cache.quarantine(lexical_b, "normalizer panic replay");
+        cache.quarantine(semantic.clone(), "embedding checksum mismatch");
+        cache.quarantine(lexical_a, "invalid unicode boundary");
+
+        let removed = cache.garbage_collect_quarantined_algorithm("lexical-normalize");
+        assert_eq!(removed.len(), 2);
+        assert_eq!(removed[0].key, key(b"lex-a", "lexical-normalize", "v1"));
+        assert_eq!(removed[0].reason, "invalid unicode boundary");
+        assert_eq!(removed[1].key, key(b"lex-b", "lexical-normalize", "v1"));
+        assert_eq!(removed[1].reason, "normalizer panic replay");
+
+        let summary = cache.quarantine_summary();
+        assert_eq!(summary.quarantined_entries, 1);
+        assert_eq!(summary.algorithms.get("semantic-embed"), Some(&1));
+        assert_eq!(summary.algorithms.get("lexical-normalize"), None);
+        assert!(matches!(
+            cache.get(&semantic),
+            MemoLookup::Quarantined { .. }
+        ));
+        assert!(
+            cache
+                .garbage_collect_quarantined_algorithm("lexical-normalize")
+                .is_empty()
+        );
     }
 
     #[test]
