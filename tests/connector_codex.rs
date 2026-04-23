@@ -5,6 +5,10 @@ use tempfile::TempDir;
 use coding_agent_search::connectors::{Connector, ScanContext, codex::CodexConnector};
 use serial_test::serial;
 
+fn codex_real_fixture_home() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_real")
+}
+
 #[test]
 #[serial]
 fn codex_connector_reads_modern_envelope_jsonl() {
@@ -109,6 +113,88 @@ fn codex_connector_includes_agent_reasoning() {
             .pointer("/cass/token_usage/output_tokens")
             .and_then(|v| v.as_i64()),
         Some(200)
+    );
+}
+
+#[test]
+#[serial]
+fn codex_connector_parses_real_tool_call_fixture() {
+    let fixture_home = codex_real_fixture_home();
+    let expected_path = fixture_home.join("sessions/2025/11/26/rollout-tool-call.jsonl");
+
+    unsafe {
+        std::env::set_var("CODEX_HOME", &fixture_home);
+    }
+
+    let connector = CodexConnector::new();
+    let ctx = ScanContext {
+        data_dir: fixture_home.clone(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+    };
+    let convs = connector.scan(&ctx).unwrap();
+    let conv = convs
+        .into_iter()
+        .find(|conv| conv.source_path == expected_path)
+        .expect("real Codex tool-call fixture should be discoverable");
+
+    assert_eq!(conv.agent_slug, "codex");
+    assert_eq!(conv.workspace, Some(PathBuf::from("/test/soldier/project")));
+    assert_eq!(
+        conv.external_id,
+        Some("2025/11/26/rollout-tool-call".to_string())
+    );
+    assert_eq!(
+        conv.title,
+        Some(
+            "Please trace the tool_call branch in the Codex connector and confirm invocation extraction."
+                .to_string()
+        )
+    );
+    assert_eq!(conv.messages.len(), 3);
+
+    let tool_msg = &conv.messages[1];
+    assert_eq!(tool_msg.idx, 1);
+    assert_eq!(tool_msg.role, "assistant");
+    assert_eq!(tool_msg.author, None);
+    assert_eq!(tool_msg.content, "[Tool: bash]");
+    assert_eq!(tool_msg.invocations.len(), 1);
+    assert!(tool_msg.extra.get("payload").is_some());
+
+    let invocation = &tool_msg.invocations[0];
+    assert_eq!(invocation.kind, "tool");
+    assert_eq!(invocation.name, "bash");
+    assert_eq!(invocation.call_id.as_deref(), Some("call_codex_tool_001"));
+    assert_eq!(
+        invocation
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("cmd"))
+            .and_then(|value| value.as_str()),
+        Some("rg -n tool_call src/connectors/codex.rs")
+    );
+    assert!(
+        tool_msg.extra.pointer("/cass/token_usage").is_none(),
+        "token usage should attach to the later assistant turn, not the tool_call message"
+    );
+
+    let assistant = &conv.messages[2];
+    assert_eq!(assistant.idx, 2);
+    assert_eq!(assistant.role, "assistant");
+    assert!(assistant.content.contains("invocation is emitted"));
+    assert_eq!(
+        assistant
+            .extra
+            .pointer("/cass/token_usage/input_tokens")
+            .and_then(|v| v.as_i64()),
+        Some(120)
+    );
+    assert_eq!(
+        assistant
+            .extra
+            .pointer("/cass/token_usage/output_tokens")
+            .and_then(|v| v.as_i64()),
+        Some(45)
     );
 }
 

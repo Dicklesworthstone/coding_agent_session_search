@@ -1,0 +1,5 @@
+{"timestamp":"2025-09-30T15:42:34.559Z","type":"session_meta","payload":{"id":"tool-call-session-id","cwd":"/test/soldier/project","cli_version":"0.42.0","git":{"branch":"main"}}}
+{"timestamp":"2025-09-30T15:42:36.190Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please trace the tool_call branch in the Codex connector and confirm invocation extraction."}]}}
+{"timestamp":"2025-09-30T15:42:40.000Z","type":"event_msg","payload":{"type":"tool_call","name":"bash","call_id":"call_codex_tool_001","input":{"cmd":"rg -n tool_call src/connectors/codex.rs","cwd":"/test/soldier/project"}}}
+{"timestamp":"2025-09-30T15:42:43.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"I traced the tool_call branch and confirmed the invocation is emitted from event_msg payloads."}]}}
+{"timestamp":"2025-09-30T15:42:45.000Z","type":"event_msg","payload":{"type":"token_count","input_tokens":120,"output_tokens":45}}
