@@ -149,6 +149,31 @@ fn models_verify_repair_controls_remain_data_dir_scoped() -> Result<(), String> 
 }
 
 #[test]
+fn models_verify_defaults_to_inspection_without_repair() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&[
+            "cass",
+            "models",
+            "verify",
+            "--data-dir",
+            "/cass/models",
+            "--json",
+        ])?;
+
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Verify {
+                repair: false,
+                data_dir: Some(data_dir),
+                json: true,
+            })) if data_dir.display().to_string() == "/cass/models" => Ok(()),
+            other => Err(format!(
+                "expected model verification to default to inspect-only mode: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
 fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
