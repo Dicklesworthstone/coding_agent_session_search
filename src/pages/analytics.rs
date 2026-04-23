@@ -29,7 +29,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use frankensqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 use tracing::info;
@@ -54,8 +54,13 @@ pub struct Statistics {
     pub total_conversations: usize,
     pub total_messages: usize,
     pub total_characters: usize,
-    pub agents: HashMap<String, AgentStats>,
-    pub roles: HashMap<String, usize>,
+    // BTreeMap so statistics.json serialization is byte-deterministic
+    // across runs. `pub write_to_dir` emits these via
+    // `serde_json::to_string_pretty`; a HashMap here would make every
+    // regenerate emit a diff even when the data is unchanged, breaking
+    // reproducible builds, git hygiene, and any content-hash checks.
+    pub agents: BTreeMap<String, AgentStats>,
+    pub roles: BTreeMap<String, usize>,
     pub time_range: TimeRange,
     /// RFC3339 timestamp
     pub computed_at: String,
@@ -83,7 +88,9 @@ pub struct Timeline {
     pub daily: Vec<DailyEntry>,
     pub weekly: Vec<WeeklyEntry>,
     pub monthly: Vec<MonthlyEntry>,
-    pub by_agent: HashMap<String, AgentTimeline>,
+    // BTreeMap for deterministic timeline.json serialization (see
+    // Statistics.agents comment for rationale).
+    pub by_agent: BTreeMap<String, AgentTimeline>,
 }
 
 /// Agent-specific timeline.
@@ -276,7 +283,7 @@ impl<'a> AnalyticsGenerator<'a> {
             .unwrap_or(0);
 
         // Per-agent stats
-        let mut agents: HashMap<String, AgentStats> = HashMap::new();
+        let mut agents: BTreeMap<String, AgentStats> = BTreeMap::new();
         let agent_conv_rows: Vec<(String, i64)> = self.db.query_map_collect(
             "SELECT agent, COUNT(*) as conv_count FROM conversations GROUP BY agent",
             &[],
@@ -307,7 +314,7 @@ impl<'a> AnalyticsGenerator<'a> {
         }
 
         // Per-role counts
-        let mut roles: HashMap<String, usize> = HashMap::new();
+        let mut roles: BTreeMap<String, usize> = BTreeMap::new();
         let role_rows: Vec<(String, i64)> = self.db.query_map_collect(
             "SELECT role, COUNT(*) FROM messages GROUP BY role",
             &[],
@@ -398,7 +405,7 @@ impl<'a> AnalyticsGenerator<'a> {
         let monthly = aggregate_to_monthly(&daily);
 
         // Per-agent timeline
-        let mut by_agent: HashMap<String, AgentTimeline> = HashMap::new();
+        let mut by_agent: BTreeMap<String, AgentTimeline> = BTreeMap::new();
         let mut agent_daily_map: HashMap<String, HashMap<String, DailyEntry>> = HashMap::new();
         let mut agent_daily_conv_ids: HashMap<String, HashMap<String, HashSet<i64>>> =
             HashMap::new();
