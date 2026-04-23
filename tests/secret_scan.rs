@@ -533,7 +533,25 @@ mod tests {
                 && f.location
                     == coding_agent_search::pages::secret_scan::SecretLocation::ConversationTitle
         });
-        assert!(title_finding.is_some(), "should detect secret in title");
+        // Bead 7k7pl: pin SEVERITY + REDACTION on the found secret,
+        // not just "finding present". openai_key is a high-severity
+        // secret and the scanner must redact the payload. A
+        // regression that down-graded severity to Low or left
+        // match_redacted empty would slip past `.is_some()` while
+        // breaking the security contract.
+        let finding = title_finding.expect("should detect secret in title");
+        assert!(
+            matches!(
+                finding.severity,
+                SecretSeverity::Critical | SecretSeverity::High
+            ),
+            "openai_key in title must be Critical or High severity; got {:?}",
+            finding.severity
+        );
+        assert!(
+            !finding.match_redacted.is_empty(),
+            "redacted match must be non-empty"
+        );
         Ok(())
     }
 
@@ -558,7 +576,22 @@ mod tests {
                 && f.location
                     == coding_agent_search::pages::secret_scan::SecretLocation::ConversationMetadata
         });
-        assert!(meta_finding.is_some(), "should detect secret in metadata");
+        // Bead 7k7pl: pin SEVERITY + REDACTION, not just "finding
+        // present" (see detects_secret_in_title for the same
+        // rationale).
+        let finding = meta_finding.expect("should detect secret in metadata");
+        assert!(
+            matches!(
+                finding.severity,
+                SecretSeverity::Critical | SecretSeverity::High
+            ),
+            "openai_key in metadata must be Critical or High severity; got {:?}",
+            finding.severity
+        );
+        assert!(
+            !finding.match_redacted.is_empty(),
+            "redacted match must be non-empty"
+        );
         Ok(())
     }
 
@@ -930,8 +963,27 @@ mod tests {
         let finding = &report.findings[0];
         assert_eq!(finding.agent.as_deref(), Some("gemini"));
         assert_eq!(finding.workspace.as_deref(), Some("/home/user/myproject"));
-        assert!(finding.source_path.is_some());
-        assert!(finding.conversation_id.is_some());
+        // Bead 7k7pl: pin the SHAPE of source_path (non-empty string)
+        // and conversation_id (positive i64). A regression that
+        // emitted None-wrapped-empty or i64::MIN would slip past
+        // `.is_some()` while breaking the link to a real row.
+        let source_path = finding
+            .source_path
+            .as_deref()
+            .expect("source_path must be set for a finding rooted in a stored session");
+        assert!(
+            !source_path.is_empty(),
+            "source_path must be a non-empty string; got {:?}",
+            finding.source_path
+        );
+        let conversation_id = finding
+            .conversation_id
+            .expect("conversation_id must be set for a finding rooted in a stored session");
+        assert!(
+            conversation_id > 0,
+            "conversation_id must be a positive row id; got {}",
+            conversation_id
+        );
         Ok(())
     }
 

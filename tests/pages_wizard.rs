@@ -91,7 +91,11 @@ fn test_wizard_state_with_custom_config() {
     assert_eq!(state.agents.len(), 2);
     assert_eq!(state.time_range.as_deref(), Some("last_week"));
     assert_eq!(state.workspaces.as_ref().unwrap().len(), 1);
-    assert!(state.password.is_some());
+    // Bead 7k7pl: pin the EXACT password the test seeds (not just
+    // "password present"). A regression that zeroed or replaced the
+    // password with a default would slip past `.is_some()` while
+    // silently breaking encryption behavior.
+    assert_eq!(state.password.as_deref(), Some("test-password-123"));
     assert_eq!(state.password_entropy_bits, 48.0);
     assert_eq!(state.title, "My Archive");
     assert!(matches!(state.target, DeployTarget::GitHubPages));
@@ -331,10 +335,13 @@ fn test_wizard_state_final_site_dir_tracking() {
     assert!(state.final_site_dir.is_none());
 
     // After bundle creation, final_site_dir is set
-    state.final_site_dir = Some(tmp.path().join("site"));
+    let expected = tmp.path().join("site");
+    state.final_site_dir = Some(expected.clone());
 
-    assert!(state.final_site_dir.is_some());
-    assert!(state.final_site_dir.as_ref().unwrap().ends_with("site"));
+    // Bead 7k7pl: pin the EXACT site dir that was assigned (not just
+    // "any Some + ends_with site"). Catches a regression that
+    // silently dropped the tmp prefix or swapped to a default path.
+    assert_eq!(state.final_site_dir.as_ref(), Some(&expected));
 }
 
 // =============================================================================
