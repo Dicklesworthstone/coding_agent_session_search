@@ -395,9 +395,10 @@ pub(crate) struct LexicalCleanupGenerationDispositionSummary {
     pub retained_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LexicalCleanupApprovalFingerprintStatus {
+    #[default]
     NotRequested,
     Missing,
     Matched,
@@ -419,12 +420,19 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub apply_allowed: bool,
     pub dry_run: bool,
     pub explicit_operator_approval: bool,
+    #[serde(default)]
     pub approval_fingerprint: String,
+    #[serde(default)]
     pub provided_approval_fingerprint: Option<String>,
+    #[serde(default)]
     pub approval_fingerprint_status: LexicalCleanupApprovalFingerprintStatus,
+    #[serde(default)]
     pub approval_fingerprint_matches: bool,
+    #[serde(default)]
     pub generation_count: usize,
+    #[serde(default)]
     pub total_artifact_bytes: u64,
+    #[serde(default)]
     pub total_retained_bytes: u64,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
@@ -608,7 +616,7 @@ impl LexicalCleanupDryRunPlan {
     }
 
     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {
-        self.generation_count += 1;
+        self.generation_count = self.generation_count.saturating_add(1);
         self.total_artifact_bytes = self
             .total_artifact_bytes
             .saturating_add(inventory.artifact_bytes);
@@ -745,6 +753,9 @@ impl LexicalCleanupDryRunPlan {
     }
 
     fn compute_approval_fingerprint(&self) -> String {
+        // Deterministic: hash over sorted snapshots so the fingerprint is
+        // invariant under manifest/shard iteration order (filesystem scans,
+        // HashMap-backed callers, etc.). BTreeMaps already iterate in order.
         let mut hasher = blake3::Hasher::new();
         hash_str(&mut hasher, "cass.lexical_cleanup_approval.v1");
         hash_usize(&mut hasher, self.generation_count);
@@ -753,7 +764,13 @@ impl LexicalCleanupDryRunPlan {
         hash_u64(&mut hasher, self.total_retained_bytes);
         hash_u64(&mut hasher, self.protected_retained_bytes);
 
-        for candidate in &self.reclaim_candidates {
+        let mut candidates: Vec<&LexicalCleanupReclaimCandidate> =
+            self.reclaim_candidates.iter().collect();
+        candidates.sort_by(|a, b| {
+            (&a.generation_id, &a.shard_id, a.disposition.as_str())
+                .cmp(&(&b.generation_id, &b.shard_id, b.disposition.as_str()))
+        });
+        for candidate in candidates {
             hash_str(&mut hasher, &candidate.generation_id);
             hash_str(&mut hasher, &candidate.shard_id);
             hash_str(&mut hasher, candidate.disposition.as_str());
@@ -761,7 +778,21 @@ impl LexicalCleanupDryRunPlan {
             hash_u64(&mut hasher, candidate.reclaimable_bytes);
         }
 
-        for item in &self.inspection_items {
+        let mut inspections: Vec<&LexicalCleanupInspectionItem> =
+            self.inspection_items.iter().collect();
+        inspections.sort_by(|a, b| {
+            (
+                &a.generation_id,
+                a.shard_id.as_deref().unwrap_or(""),
+                a.disposition.as_str(),
+            )
+                .cmp(&(
+                    &b.generation_id,
+                    b.shard_id.as_deref().unwrap_or(""),
+                    b.disposition.as_str(),
+                ))
+        });
+        for item in inspections {
             hash_str(&mut hasher, &item.generation_id);
             hash_str(&mut hasher, item.shard_id.as_deref().unwrap_or(""));
             hash_str(&mut hasher, item.disposition.as_str());
@@ -769,10 +800,14 @@ impl LexicalCleanupDryRunPlan {
             hash_u64(&mut hasher, item.retained_bytes);
         }
 
-        for generation_id in &self.active_generation_ids {
+        let mut active: Vec<&String> = self.active_generation_ids.iter().collect();
+        active.sort();
+        for generation_id in active {
             hash_str(&mut hasher, generation_id);
         }
-        for generation_id in &self.protected_generation_ids {
+        let mut protected: Vec<&String> = self.protected_generation_ids.iter().collect();
+        protected.sort();
+        for generation_id in protected {
             hash_str(&mut hasher, generation_id);
         }
         for (disposition, count) in &self.disposition_counts {

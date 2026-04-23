@@ -153,6 +153,7 @@ pub(crate) struct ReadinessSnapshot {
     /// Optional: the refinement level the most recent completed
     /// search actually achieved. `None` when no search has run since
     /// startup.
+    #[serde(default)]
     pub last_search_refinement: Option<SearchRefinementLevel>,
 }
 

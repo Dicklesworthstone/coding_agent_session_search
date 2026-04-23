@@ -239,8 +239,11 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
         let reason = reason.into();
         self.entries.remove(&key);
         self.lru.retain(|existing| existing != &key);
+        let newly_quarantined = !self.quarantined.contains_key(&key);
         self.quarantined.insert(key, reason);
-        self.stats.quarantined = self.stats.quarantined.saturating_add(1);
+        if newly_quarantined {
+            self.stats.quarantined = self.stats.quarantined.saturating_add(1);
+        }
         self.stats.live_entries = self.entries.len() as u64;
     }
 

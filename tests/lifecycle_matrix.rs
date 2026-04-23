@@ -3417,10 +3417,7 @@ fn idle_rebuild_block_collapses_metadata_and_has_actionable_recommendation() {
     let healthy = status["healthy"]
         .as_bool()
         .expect("status.healthy must be a bool");
-    assert!(
-        !healthy,
-        "isolated HOME unexpectedly reports healthy=true"
-    );
+    assert!(!healthy, "isolated HOME unexpectedly reports healthy=true");
     let rec = status["recommended_action"]
         .as_str()
         .expect("status.recommended_action must be a string when healthy=false");
