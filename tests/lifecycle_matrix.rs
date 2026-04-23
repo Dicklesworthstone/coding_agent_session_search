@@ -1774,14 +1774,20 @@ fn diag_quarantine_gc_flags_match_retention_and_cleanup_policy() {
     assert_eq!(retained.len(), 2, "expected two retained publish backups");
     assert!(
         retained.iter().any(|entry| {
-            entry["path"].as_str().unwrap_or_default().contains("prior-live-older")
+            entry["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("prior-live-older")
                 && entry["safe_to_gc"].as_bool() == Some(true)
         }),
         "older retained publish backup must become GC-eligible once it falls outside the retention cap"
     );
     assert!(
         retained.iter().any(|entry| {
-            entry["path"].as_str().unwrap_or_default().contains("prior-live-newer")
+            entry["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("prior-live-newer")
                 && entry["safe_to_gc"].as_bool() == Some(false)
         }),
         "newest retained publish backup must stay protected by the retention cap"
@@ -1800,7 +1806,11 @@ fn diag_quarantine_gc_flags_match_retention_and_cleanup_policy() {
     let lexical = quarantine["lexical_generations"]
         .as_array()
         .expect("lexical generations array");
-    assert_eq!(lexical.len(), 1, "expected one quarantined lexical generation");
+    assert_eq!(
+        lexical.len(),
+        1,
+        "expected one quarantined lexical generation"
+    );
     assert_eq!(lexical[0]["reclaimable_bytes"], 0);
     assert_eq!(lexical[0]["inspection_required"], true);
     assert_eq!(lexical[0]["safe_to_gc"], false);

@@ -6895,8 +6895,18 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             let mut lines: Vec<String> = vec!["paths:".to_string()];
             lines.push(format!("  data dir default: {}", default_data_dir().display()));
             lines.push(format!("  db path default: {}", default_db_path().display()));
-            lines.push("  log path: <data-dir>/cass.log (daily rolling)".to_string());
-            lines.push("  trace: user-provided path (JSONL).".to_string());
+            lines.push(
+                "  log path (cass tui only): <data-dir>/cass.log.YYYY-MM-DD \
+                 (daily rolling). Non-TUI subcommands emit to stderr; \
+                 redirect with `2> /path/to/cass.log` or use -v / \
+                 CASS_TRACE_FILE=<path> for a persistent artifact."
+                    .to_string(),
+            );
+            lines.push(
+                "  trace: CASS_TRACE_FILE=<path> or --trace-file <path> (JSONL, \
+                 available on every subcommand)."
+                    .to_string(),
+            );
             lines
         }
         RobotTopic::Guide => vec![
@@ -14155,6 +14165,7 @@ fn run_doctor(
     });
 
     if let Some(fmt) = structured_format {
+        let quarantine_report = collect_diag_quarantine_report(&data_dir, &index_path);
         let payload = serde_json::json!({
             "status": doctor_status,
             "healthy": healthy,
@@ -14169,6 +14180,7 @@ fn run_doctor(
             "auto_fix_applied": auto_fix_applied,
             "auto_fix_actions": auto_fix_actions,
             "checks": checks,
+            "quarantine": quarantine_report,
             "_meta": {
                 "elapsed_ms": elapsed_ms,
                 "data_dir": data_dir.display().to_string(),
@@ -14260,7 +14272,12 @@ fn run_doctor(
             kind: "doctor",
             message: format!("{} failure(s) remain", fail_count),
             hint: Some(
-                "Automatic safe repairs were attempted. Run 'cass index --full' to rebuild from source sessions or check cass.log for details."
+                "Automatic safe repairs were attempted. Run 'cass index --full' \
+                 to rebuild from source sessions. Re-run `cass doctor -v` or \
+                 with CASS_TRACE_FILE=<path> for detailed logs — cass doctor \
+                 does not produce a cass.log file itself (the rolling \
+                 cass.log.YYYY-MM-DD appender is installed only for `cass \
+                 tui`)."
                     .to_string(),
             ),
             retryable: true,
