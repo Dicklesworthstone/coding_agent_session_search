@@ -1,0 +1,50 @@
+{
+  "surface": "health",
+  "recommended_action": "Lexical search is ready; semantic assets are still catching up. Continue with lexical results or wait for hybrid refinement to finish.",
+  "semantic": {
+    "fast_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "quality_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "backlog": {
+      "total_conversations": 20,
+      "fast_tier_processed": 0,
+      "fast_tier_remaining": 20,
+      "quality_tier_processed": 3,
+      "quality_tier_remaining": 17,
+      "pending_work": true,
+      "current_db_matches": false,
+      "computed_at": "[TIMESTAMP]"
+    },
+    "checkpoint": {
+      "active": true,
+      "tier": "fast",
+      "current_db_matches": false,
+      "completed": false,
+      "conversations_processed": 3,
+      "total_conversations": 20,
+      "progress_pct": 15,
+      "docs_embedded": 66,
+      "last_offset": 77,
+      "saved_at": "[TIMESTAMP]"
+    }
+  }
+}

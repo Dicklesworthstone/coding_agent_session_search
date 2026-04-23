@@ -1,0 +1,50 @@
+{
+  "surface": "health",
+  "recommended_action": null,
+  "semantic": {
+    "fast_tier": {
+      "present": true,
+      "ready": true,
+      "current_db_matches": false,
+      "conversation_count": 12,
+      "doc_count": 120,
+      "embedder_id": "hash",
+      "model_revision": "hash",
+      "completed_at": "[TIMESTAMP]",
+      "size_bytes": 4096
+    },
+    "quality_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "backlog": {
+      "total_conversations": 20,
+      "fast_tier_processed": 12,
+      "fast_tier_remaining": 8,
+      "quality_tier_processed": 3,
+      "quality_tier_remaining": 17,
+      "pending_work": true,
+      "current_db_matches": false,
+      "computed_at": "[TIMESTAMP]"
+    },
+    "checkpoint": {
+      "active": true,
+      "tier": "quality",
+      "current_db_matches": false,
+      "completed": false,
+      "conversations_processed": 3,
+      "total_conversations": 20,
+      "progress_pct": 15,
+      "docs_embedded": 66,
+      "last_offset": 77,
+      "saved_at": "[TIMESTAMP]"
+    }
+  }
+}
