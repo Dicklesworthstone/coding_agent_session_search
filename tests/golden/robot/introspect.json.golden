@@ -162,6 +162,17 @@
           "arg_type": "option",
           "value_type": "path",
           "required": false
+        },
+        {
+          "name": "refresh",
+          "description": "Run an incremental `cass index` pass before launching the TUI so new conversations created since the last index are searchable. No-op when the index is already current; indexing errors are logged and the TUI opens on the existing index (non-fatal)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         }
       ],
       "has_json_output": false
@@ -683,6 +694,17 @@
         {
           "name": "quality-only",
           "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "refresh",
+          "description": "Run an incremental `cass index` pass before the search so new conversations created since the last index are matched. No-op when the index is already current; indexing errors are logged and the search runs against the existing index (non-fatal)",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -2293,18 +2315,7 @@
               "type": "boolean",
               "description": "True when CASS_RESPONSIVENESS_DISABLE pins capacity at 100%."
             },
-            "last_snapshot": {
-              "type": [
-                "object",
-                "null"
-              ],
-              "properties": {
-                "load_per_core": {
-                  "type": [
-                    "number",
-                    "null"
-                  ]
-                },
+            "last_snapshot": "[LIVE_SAMPLE]",
                 "psi_cpu_some_avg10": {
                   "type": [
                     "number",
