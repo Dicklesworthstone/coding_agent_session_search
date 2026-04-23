@@ -10371,28 +10371,67 @@ fn run_diag(
             "  Total retained bytes: {}",
             report.summary.total_retained_bytes
         );
+        println!(
+            "  Retained publish backup cap: {}",
+            report.summary.retained_publish_backup_retention_limit
+        );
+        println!(
+            "  GC-eligible assets: {}",
+            report.summary.gc_eligible_asset_count
+        );
+        println!("  GC-eligible bytes: {}", report.summary.gc_eligible_bytes);
+        println!(
+            "  Inspection-required assets: {}",
+            report.summary.inspection_required_asset_count
+        );
+        println!(
+            "  Inspection-required bytes: {}",
+            report.summary.inspection_required_bytes
+        );
         if !report.failed_seed_bundle_files.is_empty() {
             println!("  Failed seed bundle files:");
             for artifact in &report.failed_seed_bundle_files {
-                println!("    - {} ({} bytes)", artifact.path, artifact.size_bytes);
+                println!(
+                    "    - {} ({} bytes, age_s={}, last_read_ms={}, gc={}, reason={})",
+                    artifact.path,
+                    artifact.size_bytes,
+                    format_optional_u64(artifact.age_seconds),
+                    format_optional_i64(artifact.last_read_at_ms),
+                    artifact.safe_to_gc,
+                    artifact.gc_reason
+                );
             }
         }
         if !report.retained_publish_backups.is_empty() {
             println!("  Retained publish backups:");
             for artifact in &report.retained_publish_backups {
-                println!("    - {} ({} bytes)", artifact.path, artifact.size_bytes);
+                println!(
+                    "    - {} ({} bytes, age_s={}, last_read_ms={}, gc={}, reason={})",
+                    artifact.path,
+                    artifact.size_bytes,
+                    format_optional_u64(artifact.age_seconds),
+                    format_optional_i64(artifact.last_read_at_ms),
+                    artifact.safe_to_gc,
+                    artifact.gc_reason
+                );
             }
         }
         if !report.lexical_generations.is_empty() {
             println!("  Quarantined lexical generations:");
             for generation in &report.lexical_generations {
                 println!(
-                    "    - {} [{}] shards={}/{} bytes={}",
+                    "    - {} [{}] shards={}/{} bytes={} age_s={} last_read_ms={} reclaimable_bytes={} inspection_required={} gc={} reason={}",
                     generation.path,
                     generation.publish_state,
                     generation.quarantined_shards,
                     generation.total_shards,
-                    generation.artifact_bytes
+                    generation.artifact_bytes,
+                    format_optional_u64(generation.age_seconds),
+                    format_optional_i64(generation.last_read_at_ms),
+                    generation.reclaimable_bytes,
+                    generation.inspection_required,
+                    generation.safe_to_gc,
+                    generation.gc_reason
                 );
             }
         }
@@ -10411,6 +10450,10 @@ fn run_diag(
 struct DiagQuarantineArtifact {
     path: String,
     size_bytes: u64,
+    age_seconds: Option<u64>,
+    last_read_at_ms: Option<i64>,
+    safe_to_gc: bool,
+    gc_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10422,15 +10465,26 @@ struct DiagQuarantinedGeneration {
     total_shards: usize,
     artifact_bytes: u64,
     updated_at_ms: i64,
+    age_seconds: Option<u64>,
+    last_read_at_ms: Option<i64>,
+    reclaimable_bytes: u64,
+    inspection_required: bool,
+    safe_to_gc: bool,
+    gc_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct DiagQuarantineSummary {
     failed_seed_bundle_count: usize,
     retained_publish_backup_count: usize,
+    retained_publish_backup_retention_limit: usize,
     lexical_quarantined_generation_count: usize,
     lexical_quarantined_shard_count: usize,
     total_retained_bytes: u64,
+    gc_eligible_asset_count: usize,
+    gc_eligible_bytes: u64,
+    inspection_required_asset_count: usize,
+    inspection_required_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -10442,13 +10496,30 @@ struct DiagQuarantineReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DiagPathObservation {
+    size_bytes: u64,
+    age_seconds: Option<u64>,
+    last_read_at_ms: Option<i64>,
+    modified_at: Option<std::time::SystemTime>,
+}
+
 fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQuarantineReport {
     use crate::indexer::lexical_generation::{
-        LEXICAL_GENERATION_MANIFEST_FILE, LexicalGenerationPublishState,
+        LEXICAL_GENERATION_MANIFEST_FILE, LexicalCleanupDryRunPlan, LexicalGenerationPublishState,
         LexicalShardLifecycleState, load_manifest,
     };
 
+    #[derive(Debug)]
+    struct LexicalManifestEntry {
+        path: PathBuf,
+        manifest: crate::indexer::lexical_generation::LexicalGenerationManifest,
+        observation: DiagPathObservation,
+        quarantined_shards: usize,
+    }
+
     let mut report = DiagQuarantineReport::default();
+    let now = std::time::SystemTime::now();
 
     let backups_dir = data_dir.join("backups");
     match std::fs::read_dir(&backups_dir) {
@@ -10461,11 +10532,17 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                 if !name.contains(".failed-baseline-seed.bak") {
                     continue;
                 }
+                let observation = observe_diag_path(&path, now, &mut report.warnings);
                 report
                     .failed_seed_bundle_files
                     .push(DiagQuarantineArtifact {
                         path: path.display().to_string(),
-                        size_bytes: fs_dir_size(&path),
+                        size_bytes: observation.size_bytes,
+                        age_seconds: observation.age_seconds,
+                        last_read_at_ms: observation.last_read_at_ms,
+                        safe_to_gc: false,
+                        gc_reason: "failed baseline seed quarantine requires operator inspection"
+                            .to_string(),
                     });
             }
         }
@@ -10480,15 +10557,51 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         .parent()
         .unwrap_or(index_path)
         .join(".lexical-publish-backups");
+    let retention_limit = diag_retained_publish_backup_limit();
+    report.summary.retained_publish_backup_retention_limit = retention_limit;
     match std::fs::read_dir(&retained_publish_dir) {
         Ok(entries) => {
+            let mut retained_entries: Vec<(PathBuf, DiagPathObservation)> = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
+                retained_entries.push((
+                    path.clone(),
+                    observe_diag_path(&path, now, &mut report.warnings),
+                ));
+            }
+            retained_entries.sort_by(|left, right| {
+                right
+                    .1
+                    .modified_at
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .cmp(
+                        &left
+                            .1
+                            .modified_at
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    )
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            for (index, (path, observation)) in retained_entries.into_iter().enumerate() {
+                let safe_to_gc = index >= retention_limit;
+                let gc_reason = if safe_to_gc {
+                    format!(
+                        "retained lexical publish backup falls outside retention cap ({retention_limit})"
+                    )
+                } else {
+                    format!(
+                        "retained lexical publish backup is still protected by retention cap ({retention_limit})"
+                    )
+                };
                 report
                     .retained_publish_backups
                     .push(DiagQuarantineArtifact {
                         path: path.display().to_string(),
-                        size_bytes: fs_dir_size(&path),
+                        size_bytes: observation.size_bytes,
+                        age_seconds: observation.age_seconds,
+                        last_read_at_ms: observation.last_read_at_ms,
+                        safe_to_gc,
+                        gc_reason,
                     });
             }
         }
@@ -10499,6 +10612,7 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         )),
     }
 
+    let mut lexical_manifest_entries = Vec::new();
     for entry in walkdir::WalkDir::new(data_dir).follow_links(false) {
         let entry = match entry {
             Ok(entry) => entry,
@@ -10531,14 +10645,11 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     LexicalGenerationPublishState::Quarantined
                 ) || quarantined_shards > 0
                 {
-                    report.lexical_generations.push(DiagQuarantinedGeneration {
-                        path: generation_dir.display().to_string(),
-                        generation_id: manifest.generation_id,
-                        publish_state: lexical_publish_state_label(manifest.publish_state),
+                    lexical_manifest_entries.push(LexicalManifestEntry {
+                        path: generation_dir.to_path_buf(),
+                        observation: observe_diag_path(generation_dir, now, &mut report.warnings),
+                        manifest,
                         quarantined_shards,
-                        total_shards: manifest.shards.len(),
-                        artifact_bytes: fs_dir_size(generation_dir),
-                        updated_at_ms: manifest.updated_at_ms,
                     });
                 }
             }
@@ -10550,11 +10661,65 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         }
     }
 
+    let lexical_cleanup_plan = LexicalCleanupDryRunPlan::from_manifests(
+        lexical_manifest_entries.iter().map(|entry| &entry.manifest),
+    );
+    let inspection_required_ids: HashSet<String> = lexical_cleanup_plan
+        .inspection_required_generation_ids()
+        .into_iter()
+        .collect();
+    let lexical_inventory_by_generation: HashMap<_, _> = lexical_cleanup_plan
+        .inventories
+        .into_iter()
+        .map(|inventory| (inventory.generation_id.clone(), inventory))
+        .collect();
+
+    for entry in lexical_manifest_entries {
+        let inventory = lexical_inventory_by_generation.get(&entry.manifest.generation_id);
+        let reclaimable_bytes = inventory
+            .map(|inventory| inventory.reclaimable_bytes)
+            .unwrap_or(0);
+        let inspection_required = inspection_required_ids.contains(&entry.manifest.generation_id);
+        let safe_to_gc = reclaimable_bytes > 0
+            && inventory
+                .map(|inventory| inventory.reclaimable_bytes >= inventory.artifact_bytes)
+                .unwrap_or(false)
+            && !inspection_required;
+        let gc_reason = if safe_to_gc {
+            format!(
+                "cleanup dry-run marks the full retained generation reclaimable ({} bytes)",
+                reclaimable_bytes
+            )
+        } else if inspection_required {
+            "cleanup dry-run requires inspection before garbage collection".to_string()
+        } else if reclaimable_bytes == 0 {
+            "cleanup dry-run exposes no reclaimable bytes for this quarantined generation"
+                .to_string()
+        } else {
+            format!(
+                "cleanup dry-run only marks {} of {} bytes reclaimable",
+                reclaimable_bytes, entry.observation.size_bytes
+            )
+        };
+        report.lexical_generations.push(DiagQuarantinedGeneration {
+            path: entry.path.display().to_string(),
+            generation_id: entry.manifest.generation_id,
+            publish_state: lexical_publish_state_label(entry.manifest.publish_state),
+            quarantined_shards: entry.quarantined_shards,
+            total_shards: entry.manifest.shards.len(),
+            artifact_bytes: entry.observation.size_bytes,
+            updated_at_ms: entry.manifest.updated_at_ms,
+            age_seconds: entry.observation.age_seconds,
+            last_read_at_ms: entry.observation.last_read_at_ms,
+            reclaimable_bytes,
+            inspection_required,
+            safe_to_gc,
+            gc_reason,
+        });
+    }
+
     report
         .failed_seed_bundle_files
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    report
-        .retained_publish_backups
         .sort_by(|left, right| left.path.cmp(&right.path));
     report
         .lexical_generations
@@ -10583,8 +10748,121 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
             .iter()
             .map(|generation| generation.artifact_bytes)
             .sum::<u64>();
+    report.summary.gc_eligible_asset_count = report
+        .failed_seed_bundle_files
+        .iter()
+        .filter(|artifact| artifact.safe_to_gc)
+        .count()
+        + report
+            .retained_publish_backups
+            .iter()
+            .filter(|artifact| artifact.safe_to_gc)
+            .count()
+        + report
+            .lexical_generations
+            .iter()
+            .filter(|generation| generation.safe_to_gc)
+            .count();
+    report.summary.gc_eligible_bytes = report
+        .failed_seed_bundle_files
+        .iter()
+        .filter(|artifact| artifact.safe_to_gc)
+        .map(|artifact| artifact.size_bytes)
+        .sum::<u64>()
+        + report
+            .retained_publish_backups
+            .iter()
+            .filter(|artifact| artifact.safe_to_gc)
+            .map(|artifact| artifact.size_bytes)
+            .sum::<u64>()
+        + report
+            .lexical_generations
+            .iter()
+            .filter(|generation| generation.safe_to_gc)
+            .map(|generation| generation.artifact_bytes)
+            .sum::<u64>();
+    report.summary.inspection_required_asset_count = report.failed_seed_bundle_files.len()
+        + report
+            .lexical_generations
+            .iter()
+            .filter(|generation| generation.inspection_required)
+            .count();
+    report.summary.inspection_required_bytes = report
+        .failed_seed_bundle_files
+        .iter()
+        .map(|artifact| artifact.size_bytes)
+        .sum::<u64>()
+        + report
+            .lexical_generations
+            .iter()
+            .filter(|generation| generation.inspection_required)
+            .map(|generation| generation.artifact_bytes)
+            .sum::<u64>();
 
     report
+}
+
+fn diag_retained_publish_backup_limit() -> usize {
+    const DEFAULT_RETENTION: usize = 1;
+
+    dotenvy::var("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RETENTION)
+}
+
+fn observe_diag_path(
+    path: &Path,
+    now: std::time::SystemTime,
+    warnings: &mut Vec<String>,
+) -> DiagPathObservation {
+    let size_bytes = fs_dir_size(path);
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warnings.push(format!(
+                "failed to read metadata for quarantine artifact {}: {err}",
+                path.display()
+            ));
+            return DiagPathObservation {
+                size_bytes,
+                ..DiagPathObservation::default()
+            };
+        }
+    };
+    let modified_at = metadata.modified().ok();
+    let age_seconds = modified_at.and_then(|modified| {
+        now.duration_since(modified)
+            .ok()
+            .map(|duration| duration.as_secs())
+    });
+    let last_read_at_ms = metadata.accessed().ok().and_then(system_time_to_unix_ms);
+
+    DiagPathObservation {
+        size_bytes,
+        age_seconds,
+        last_read_at_ms,
+        modified_at,
+    }
+}
+
+fn system_time_to_unix_ms(timestamp: std::time::SystemTime) -> Option<i64> {
+    timestamp
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn lexical_publish_state_label(

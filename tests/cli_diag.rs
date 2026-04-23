@@ -3,6 +3,7 @@ use coding_agent_search::search::tantivy::expected_index_dir;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 fn write_quarantined_manifest(generation_dir: &Path) {
     fs::create_dir_all(generation_dir).expect("create generation dir");
@@ -81,11 +82,15 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         .expect("index parent")
         .join(".lexical-publish-backups");
     fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
-    fs::write(
-        retained_publish_dir.join("prior-live-segment"),
-        b"retained-live-segment",
-    )
-    .expect("write retained publish backup");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained publish backup");
 
     let generation_dir = index_path
         .parent()
@@ -108,6 +113,7 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         ])
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
         .env("XDG_DATA_HOME", test_home.path())
         .env("XDG_CONFIG_HOME", test_home.path())
         .env("HOME", test_home.path())
@@ -129,8 +135,13 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
     );
     assert_eq!(
         quarantine["summary"]["retained_publish_backup_count"].as_u64(),
-        Some(1),
+        Some(2),
         "retained publish backup count should surface derivative lexical backups"
+    );
+    assert_eq!(
+        quarantine["summary"]["retained_publish_backup_retention_limit"].as_u64(),
+        Some(1),
+        "summary should expose the active lexical publish backup retention cap"
     );
     assert_eq!(
         quarantine["summary"]["lexical_quarantined_generation_count"].as_u64(),
@@ -149,16 +160,66 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
             > 0,
         "quarantine surface should include retained bytes"
     );
+    assert_eq!(
+        quarantine["summary"]["gc_eligible_asset_count"].as_u64(),
+        Some(1),
+        "only the older retained publish backup should be immediately GC-eligible"
+    );
+    assert!(
+        quarantine["summary"]["gc_eligible_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "GC-eligible byte accounting should be non-zero when a retained backup falls outside cap"
+    );
+    assert_eq!(
+        quarantine["summary"]["inspection_required_asset_count"].as_u64(),
+        Some(3),
+        "failed seed bundle files and quarantined lexical generation remain inspection-only"
+    );
 
     let failed_seed_entries = quarantine["failed_seed_bundle_files"]
         .as_array()
         .expect("failed seed bundle files array");
+    assert!(
+        failed_seed_entries
+            .iter()
+            .all(|entry| entry["safe_to_gc"].as_bool() == Some(false)),
+        "failed baseline seed quarantine must not be auto-GCable"
+    );
+    assert!(
+        failed_seed_entries.iter().all(|entry| {
+            entry.get("age_seconds").is_some() && entry.get("last_read_at_ms").is_some()
+        }),
+        "failed seed bundle entries should expose age and last-read fields"
+    );
     assert!(
         failed_seed_entries.iter().any(|entry| entry["path"]
             .as_str()
             .unwrap_or_default()
             .contains(".failed-baseline-seed.bak")),
         "failed seed bundle inventory should preserve the quarantine naming pattern"
+    );
+
+    let retained_backups = quarantine["retained_publish_backups"]
+        .as_array()
+        .expect("retained publish backups array");
+    assert_eq!(
+        retained_backups.len(),
+        2,
+        "expected two retained publish backups"
+    );
+    assert!(
+        retained_backups
+            .iter()
+            .any(|entry| entry["safe_to_gc"].as_bool() == Some(true)),
+        "one retained publish backup should be outside the retention cap"
+    );
+    assert!(
+        retained_backups
+            .iter()
+            .any(|entry| entry["safe_to_gc"].as_bool() == Some(false)),
+        "the newest retained publish backup should remain protected by retention"
     );
 
     let generations = quarantine["lexical_generations"]
@@ -174,4 +235,12 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         Some("quarantined")
     );
     assert_eq!(generations[0]["quarantined_shards"].as_u64(), Some(1));
+    assert_eq!(generations[0]["inspection_required"].as_bool(), Some(true));
+    assert_eq!(generations[0]["safe_to_gc"].as_bool(), Some(false));
+    assert_eq!(generations[0]["reclaimable_bytes"].as_u64(), Some(0));
+    assert!(
+        generations[0].get("age_seconds").is_some()
+            && generations[0].get("last_read_at_ms").is_some(),
+        "lexical generation entries should expose age and last-read fields"
+    );
 }

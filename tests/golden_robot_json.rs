@@ -24,7 +24,10 @@
 //! schema change that requires human review before it ships.
 
 use assert_cmd::Command;
+use coding_agent_search::search::tantivy::expected_index_dir;
+use serde_json::json;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Build a `cass` binary invocation with the env knobs required for
 /// deterministic test output (no update check, no ambient data-dir surprise).
@@ -36,6 +39,106 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         .env("HOME", test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd
+}
+
+fn write_quarantined_manifest(generation_dir: &std::path::Path) {
+    std::fs::create_dir_all(generation_dir).expect("create generation dir");
+    std::fs::write(
+        generation_dir.join("lexical-generation-manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 1,
+            "generation_id": "gen-quarantined",
+            "attempt_id": "attempt-1",
+            "created_at_ms": 1_733_000_000_000_i64,
+            "updated_at_ms": 1_733_000_000_321_i64,
+            "source_db_fingerprint": "fp-test",
+            "conversation_count": 3,
+            "message_count": 9,
+            "indexed_doc_count": 9,
+            "equivalence_manifest_fingerprint": null,
+            "shard_plan": null,
+            "build_budget": null,
+            "shards": [{
+                "shard_id": "shard-a",
+                "shard_ordinal": 0,
+                "state": "quarantined",
+                "updated_at_ms": 1_733_000_000_222_i64,
+                "indexed_doc_count": 9,
+                "message_count": 9,
+                "artifact_bytes": 512,
+                "stable_hash": "stable-hash-a",
+                "reclaimable": false,
+                "pinned": false,
+                "recovery_reason": null,
+                "quarantine_reason": "validation_failed"
+            }],
+            "merge_debt": {
+                "state": "none",
+                "updated_at_ms": null,
+                "pending_shard_count": 0,
+                "pending_artifact_bytes": 0,
+                "reason": null,
+                "controller_reason": null
+            },
+            "build_state": "failed",
+            "publish_state": "quarantined",
+            "failure_history": []
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("write manifest");
+}
+
+fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
+    let data_dir = test_home.join("cass-data");
+    let backups_dir = data_dir.join("backups");
+    std::fs::create_dir_all(&backups_dir).expect("create backups dir");
+
+    let failed_seed_root =
+        backups_dir.join("agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak");
+    std::fs::write(&failed_seed_root, b"seed-backup").expect("write failed seed bundle");
+    std::fs::write(
+        failed_seed_root.with_file_name(format!(
+            "{}-wal",
+            failed_seed_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("file name")
+        )),
+        b"seed-wal",
+    )
+    .expect("write failed seed wal");
+
+    let index_path = expected_index_dir(&data_dir);
+    std::fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    std::fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    std::fs::create_dir_all(&older_backup).expect("create older retained backup");
+    std::fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    std::fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    std::fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained publish backup");
+
+    let generation_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_manifest(&generation_dir);
+    std::fs::write(
+        generation_dir.join("segment-a"),
+        b"quarantined-generation-bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    data_dir
 }
 
 /// Strip non-deterministic values from a robot-mode JSON payload so the
@@ -145,6 +248,16 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
     out = last_reason_re
         .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
+        .to_string();
+
+    let age_seconds_re = regex::Regex::new(r#""age_seconds"\s*:\s*(\d+|null)"#).unwrap();
+    out = age_seconds_re
+        .replace_all(&out, r#""age_seconds": "[AGE_SECONDS]""#)
+        .to_string();
+
+    let last_read_re = regex::Regex::new(r#""last_read_at_ms"\s*:\s*(\d+|null)"#).unwrap();
+    out = last_read_re
+        .replace_all(&out, r#""last_read_at_ms": "[LAST_READ_MS]""#)
         .to_string();
 
     out
@@ -298,6 +411,37 @@ fn diag_json_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let scrubbed = capture_robot_json(test_home.path(), &["diag", "--json"], ExpectStatus::ExitOk);
     assert_golden("robot/diag.json.golden", &scrubbed);
+}
+
+#[test]
+fn diag_quarantine_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = seed_diag_quarantine_fixture(test_home.path());
+    let output = cass_cmd(test_home.path())
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+        .args([
+            "diag",
+            "--json",
+            "--quarantine",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass diag --json --quarantine");
+    assert!(
+        output.status.success(),
+        "cass diag --json --quarantine exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+        panic!("diag --quarantine stdout is not JSON: {err}\nstdout:\n{stdout}")
+    });
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/diag_quarantine.json.golden", &scrubbed);
 }
 
 #[test]

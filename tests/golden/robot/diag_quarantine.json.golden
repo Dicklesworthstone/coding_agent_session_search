@@ -1,0 +1,187 @@
+{
+  "version": "0.3.7",
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64"
+  },
+  "paths": {
+    "data_dir": "[TEST_HOME]/cass-data",
+    "db_path": "[TEST_HOME]/cass-data/agent_search.db",
+    "index_path": "[TEST_HOME]/cass-data/index/v7"
+  },
+  "database": {
+    "exists": false,
+    "size_bytes": 0,
+    "conversations": 0,
+    "messages": 0
+  },
+  "index": {
+    "exists": false,
+    "size_bytes": 0
+  },
+  "connectors": [
+    {
+      "name": "codex",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "claude_code",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "gemini",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "clawdbot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "vibe",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "opencode",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "amp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "cline",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "aider",
+      "path": "/data/projects/coding_agent_session_search/.aider.chat.history.md",
+      "found": true
+    },
+    {
+      "name": "cursor",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "chatgpt",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "pi_agent",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "factory",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "openclaw",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "kimi",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "copilot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "copilot_cli",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "qwen",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "crush",
+      "path": "(not detected)",
+      "found": false
+    }
+  ],
+  "quarantine": {
+    "summary": {
+      "failed_seed_bundle_count": 2,
+      "retained_publish_backup_count": 2,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_quarantined_generation_count": 1,
+      "lexical_quarantined_shard_count": 1,
+      "total_retained_bytes": 1138,
+      "gc_eligible_asset_count": 1,
+      "gc_eligible_bytes": 25,
+      "inspection_required_asset_count": 3,
+      "inspection_required_bytes": 1088
+    },
+    "failed_seed_bundle_files": [
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+        "size_bytes": 11,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal",
+        "size_bytes": 8,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      }
+    ],
+    "retained_publish_backups": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-newer",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "retained lexical publish backup is still protected by retention cap (1)"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-older",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": true,
+        "gc_reason": "retained lexical publish backup falls outside retention cap (1)"
+      }
+    ],
+    "lexical_generations": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "publish_state": "quarantined",
+        "quarantined_shards": 1,
+        "total_shards": 1,
+        "artifact_bytes": 1069,
+        "updated_at_ms": 1733000000321,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "reclaimable_bytes": 0,
+        "inspection_required": true,
+        "safe_to_gc": false,
+        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
+      }
+    ],
+    "warnings": []
+  }
+}
