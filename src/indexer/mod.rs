@@ -1631,8 +1631,26 @@ fn heartbeat_index_run_lock_with_lock(
         refreshed.push('\n');
     }
 
-    fs::write(&lock_path, refreshed)
-        .with_context(|| format!("writing index-run lock heartbeat {}", lock_path.display()))
+    write_index_run_lock_heartbeat_atomically(&lock_path, &refreshed)
+}
+
+fn write_index_run_lock_heartbeat_atomically(lock_path: &Path, refreshed: &str) -> Result<()> {
+    let tmp_path = unique_atomic_temp_path(lock_path);
+    {
+        let file = File::create(&tmp_path)
+            .with_context(|| format!("creating heartbeat temp file {}", tmp_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(refreshed.as_bytes())
+            .with_context(|| format!("writing heartbeat temp file {}", tmp_path.display()))?;
+        writer.flush()?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("syncing heartbeat temp file {}", tmp_path.display()))?;
+    }
+    replace_file_from_temp(&tmp_path, lock_path)
+        .with_context(|| format!("replacing index-run lock heartbeat {}", lock_path.display()))
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -11185,8 +11203,9 @@ struct LexicalPublishInjectedRenameFailure {
 }
 
 #[cfg(test)]
-static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE:
-    std::sync::Mutex<Option<LexicalPublishInjectedRenameFailure>> = std::sync::Mutex::new(None);
+static LEXICAL_PUBLISH_INJECTED_RENAME_FAILURE: std::sync::Mutex<
+    Option<LexicalPublishInjectedRenameFailure>,
+> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 struct LexicalPublishInjectedRenameFailureGuard {
@@ -11262,11 +11281,10 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
     index_path: &Path,
     canonical_sidecar: &Path,
 ) -> Result<()> {
-    let sentinel_path =
-        match dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL") {
-            Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
-            _ => return Ok(()),
-        };
+    let sentinel_path = match dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => return Ok(()),
+    };
     let sleep_ms = dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
@@ -14652,10 +14670,14 @@ fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Res
         map: state.clone(),
     };
     let json = serde_json::to_vec(&watch_state)?;
-    // Atomic write: write to temp file then rename, so a crash mid-write
-    // cannot leave a truncated/corrupt watch_state.json.
     let tmp_path = unique_atomic_temp_path(&path);
-    fs::write(&tmp_path, json)?;
+    {
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&json)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+    }
     replace_file_from_temp(&tmp_path, &path)?;
     Ok(())
 }
@@ -18393,18 +18415,63 @@ mod tests {
         .unwrap();
 
         heartbeat_index_run_lock(tmp.path()).unwrap();
+        heartbeat_index_run_lock(tmp.path()).unwrap();
 
         let refreshed = std::fs::read_to_string(&lock_path).unwrap();
         assert!(refreshed.contains("pid=123"));
         assert!(refreshed.contains("started_at_ms=111"));
         assert!(refreshed.contains("db_path=/tmp/db.sqlite"));
         assert!(refreshed.contains("job_id=lexical_refresh-123"));
-        let updated_at_ms = refreshed
+        let updated_at_values: Vec<i64> = refreshed
             .lines()
-            .find_map(|line| line.strip_prefix("updated_at_ms="))
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap();
-        assert!(updated_at_ms >= 222);
+            .filter_map(|line| line.strip_prefix("updated_at_ms="))
+            .map(|value| value.parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(
+            updated_at_values.len(),
+            1,
+            "heartbeat refresh should replace the existing updated_at_ms line"
+        );
+        assert!(updated_at_values[0] >= 222);
+
+        let temp_artifacts: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".index-run.lock.tmp."))
+            .collect();
+        assert!(
+            temp_artifacts.is_empty(),
+            "successful heartbeat refresh should not leave temp files: {temp_artifacts:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_index_run_lock_surfaces_atomic_temp_create_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("index-run.lock");
+        let original =
+            "pid=123\nstarted_at_ms=111\nupdated_at_ms=222\ndb_path=/tmp/db.sqlite\nmode=index\n";
+        std::fs::write(&lock_path, original).unwrap();
+
+        let original_permissions = std::fs::metadata(tmp.path()).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_mode(0o500);
+        std::fs::set_permissions(tmp.path(), read_only_permissions).unwrap();
+
+        let result = heartbeat_index_run_lock(tmp.path());
+
+        std::fs::set_permissions(tmp.path(), original_permissions).unwrap();
+        let err = result.expect_err("read-only data dir should fail before replacing heartbeat");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("creating heartbeat temp file"),
+            "unexpected heartbeat error: {err_text}"
+        );
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), original);
     }
 
     #[test]
@@ -26898,7 +26965,10 @@ mod tests {
             .tempdir_in(data_dir.parent().unwrap())
             .unwrap();
         let staged_index_path = stage_root.path().join("staged");
-        let new_conv = norm_conv(Some("enospc-park-new"), vec![norm_msg(0, 1_700_012_001_000)]);
+        let new_conv = norm_conv(
+            Some("enospc-park-new"),
+            vec![norm_msg(0, 1_700_012_001_000)],
+        );
         let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
         staged
             .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(1_201))
@@ -26984,8 +27054,10 @@ mod tests {
             .tempdir_in(data_dir.parent().unwrap())
             .unwrap();
         let staged_index_path = stage_root.path().join("staged");
-        let new_conv =
-            norm_conv(Some("enospc-retain-new"), vec![norm_msg(0, 1_700_012_101_000)]);
+        let new_conv = norm_conv(
+            Some("enospc-retain-new"),
+            vec![norm_msg(0, 1_700_012_101_000)],
+        );
         let mut staged = TantivyIndex::open_or_create(&staged_index_path).unwrap();
         staged
             .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(1_211))
