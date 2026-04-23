@@ -90,7 +90,7 @@ fn flow_snapshot(app: &CassApp, flow: &str, keys: &str) -> String {
         .map(|find| find.query.as_str())
         .unwrap_or("<none>");
     format!(
-        "flow: {flow}\nkeys: {keys}\nstate: query={:?} detail_open={} detail_tab={:?} find_query={:?} palette_visible={} theme_dark={} status={:?}\n--- frame ---\n{}",
+        "FLOW: {flow}\n-----\nKEYS: {keys}\nSTATE: query={:?} detail_open={} detail_tab={:?} find_query={:?} palette_visible={} theme_dark={} status={:?}\nFINAL_FRAME:\n{}",
         app.query,
         app.show_detail_modal,
         app.detail_tab,

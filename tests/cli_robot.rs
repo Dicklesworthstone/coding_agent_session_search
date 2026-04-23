@@ -61,6 +61,63 @@ fn isolated_search_demo_data() -> TempDir {
     tmp
 }
 
+fn hold_active_lexical_rebuild_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    runtime: Option<Value>,
+) -> fs::File {
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    fs::create_dir_all(&index_path).expect("create index dir");
+
+    let mut rebuild_state = serde_json::json!({
+        "version": 2,
+        "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
+        "db": {
+            "db_path": db_path.display().to_string(),
+            "total_conversations": 10,
+            "total_messages": 20,
+            "storage_fingerprint": "10:20:0:0"
+        },
+        "page_size": 1000,
+        "committed_offset": 4,
+        "committed_conversation_id": 4,
+        "processed_conversations": 4,
+        "indexed_docs": 8,
+        "committed_meta_fingerprint": null,
+        "pending": null,
+        "completed": false,
+        "updated_at_ms": 1_733_000_123_000_i64
+    });
+    if let Some(runtime) = runtime {
+        rebuild_state["runtime"] = runtime;
+    }
+    fs::write(
+        index_path.join(".lexical-rebuild-state.json"),
+        serde_json::to_vec_pretty(&rebuild_state).expect("serialize rebuild state"),
+    )
+    .expect("write rebuild state");
+
+    let lock_path = data_dir.join("index-run.lock");
+    let mut lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    lock_file.try_lock_exclusive().expect("hold index lock");
+    writeln!(
+        lock_file,
+        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
+        std::process::id(),
+        1_733_001_444_000_i64,
+        db_path.display()
+    )
+    .expect("write lock metadata");
+    lock_file.flush().expect("flush lock metadata");
+    lock_file
+}
+
 #[test]
 fn robot_help_prints_contract() {
     let mut cmd = base_cmd();
@@ -307,51 +364,7 @@ fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
     let fixture = isolated_search_demo_data();
     let data_dir = fixture.path();
     let db_path = data_dir.join("agent_search.db");
-    let index_path = data_dir.join("index");
-
-    fs::write(
-        index_path.join(".lexical-rebuild-state.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 2,
-            "schema_hash": coding_agent_search::search::tantivy::SCHEMA_HASH,
-            "db": {
-                "db_path": db_path.display().to_string(),
-                "total_conversations": 10,
-                "total_messages": 20,
-                "storage_fingerprint": "10:20:0:0"
-            },
-            "page_size": 1000,
-            "committed_offset": 4,
-            "committed_conversation_id": 4,
-            "processed_conversations": 4,
-            "indexed_docs": 8,
-            "committed_meta_fingerprint": null,
-            "pending": null,
-            "completed": false,
-            "updated_at_ms": 1_733_000_123_000_i64
-        }))
-        .expect("serialize rebuild state"),
-    )
-    .expect("write rebuild state");
-
-    let lock_path = data_dir.join("index-run.lock");
-    let mut lock_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .expect("open lock file");
-    lock_file.try_lock_exclusive().expect("hold index lock");
-    writeln!(
-        lock_file,
-        "pid={}\nstarted_at_ms={}\ndb_path={}\nmode=index\njob_kind=lexical_refresh\nphase=rebuilding",
-        std::process::id(),
-        1_733_001_444_000_i64,
-        db_path.display()
-    )
-    .expect("write lock metadata");
-    lock_file.flush().expect("flush lock metadata");
+    let _lock_file = hold_active_lexical_rebuild_lock(data_dir, &db_path, None);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -370,6 +383,92 @@ fn state_hides_empty_active_rebuild_pipeline_runtime_before_first_heartbeat() {
     assert_eq!(json["index"]["rebuilding"], Value::Bool(true));
     assert_eq!(json["rebuild"]["active"], Value::Bool(true));
     assert_eq!(json["rebuild"]["pipeline"]["runtime"], Value::Null);
+}
+
+#[test]
+fn state_and_status_report_active_rebuild_pipeline_runtime() {
+    let fixture = isolated_search_demo_data();
+    let data_dir = fixture.path();
+    let db_path = data_dir.join("agent_search.db");
+    let expected_runtime = serde_json::json!({
+        "queue_depth": 3,
+        "inflight_message_bytes": 65_536,
+        "pending_batch_conversations": 9,
+        "pending_batch_message_bytes": 131_072,
+        "page_prep_workers": 6,
+        "active_page_prep_jobs": 2,
+        "ordered_buffered_pages": 4,
+        "budget_generation": 1,
+        "producer_budget_wait_count": 2,
+        "producer_budget_wait_ms": 17,
+        "producer_handoff_wait_count": 1,
+        "producer_handoff_wait_ms": 9,
+        "host_loadavg_1m_milli": 7_250,
+        "controller_mode": "pressure_limited",
+        "controller_reason": "queue_depth_3_reached_pipeline_capacity_3",
+        "staged_merge_workers_max": 3,
+        "staged_merge_allowed_jobs": 1,
+        "staged_merge_active_jobs": 1,
+        "staged_merge_ready_artifacts": 5,
+        "staged_merge_ready_groups": 1,
+        "staged_merge_controller_reason": "page_prep_workers_saturated_6_of_6",
+        "staged_shard_build_workers_max": 6,
+        "staged_shard_build_allowed_jobs": 5,
+        "staged_shard_build_active_jobs": 4,
+        "staged_shard_build_pending_jobs": 2,
+        "staged_shard_build_controller_reason": "reserving_1_slots_for_staged_merge_active_jobs_1_ready_groups_1",
+        "updated_at_ms": 1_733_000_124_000_i64
+    });
+    let _lock_file =
+        hold_active_lexical_rebuild_lock(data_dir, &db_path, Some(expected_runtime));
+
+    let run = |subcommand: &str| -> Value {
+        let mut cmd = base_cmd();
+        cmd.args([
+            subcommand,
+            "--json",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ]);
+        let output = cmd.assert().success().get_output().clone();
+        serde_json::from_slice(&output.stdout).expect("valid robot json")
+    };
+
+    let state_json = run("state");
+    let status_json = run("status");
+
+    for json in [&state_json, &status_json] {
+        assert_eq!(json["index"]["rebuilding"], Value::Bool(true));
+        assert_eq!(json["rebuild"]["active"], Value::Bool(true));
+    }
+
+    let state_runtime = &state_json["rebuild"]["pipeline"]["runtime"];
+    let status_runtime = &status_json["rebuild"]["pipeline"]["runtime"];
+
+    assert_eq!(state_runtime, status_runtime);
+    assert_eq!(state_runtime["queue_depth"].as_u64(), Some(3));
+    assert_eq!(state_runtime["inflight_message_bytes"].as_u64(), Some(65_536));
+    assert_eq!(state_runtime["producer_budget_wait_count"].as_u64(), Some(2));
+    assert_eq!(state_runtime["producer_budget_wait_ms"].as_u64(), Some(17));
+    assert_eq!(state_runtime["producer_handoff_wait_count"].as_u64(), Some(1));
+    assert_eq!(state_runtime["producer_handoff_wait_ms"].as_u64(), Some(9));
+    assert_eq!(state_runtime["host_loadavg_1m"].as_f64(), Some(7.25));
+    assert_eq!(
+        state_runtime["controller_mode"].as_str(),
+        Some("pressure_limited")
+    );
+    assert_eq!(
+        state_runtime["controller_reason"].as_str(),
+        Some("queue_depth_3_reached_pipeline_capacity_3")
+    );
+    assert_eq!(state_runtime["staged_merge_allowed_jobs"].as_u64(), Some(1));
+    assert_eq!(state_runtime["staged_shard_build_pending_jobs"].as_u64(), Some(2));
+    assert_eq!(
+        state_runtime["updated_at"].as_str(),
+        Some("2024-11-30T20:55:24+00:00")
+    );
 }
 
 #[test]
