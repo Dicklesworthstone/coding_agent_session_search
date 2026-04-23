@@ -4819,6 +4819,47 @@ fn run_analytics_validate(
                         }));
                     }
                 }
+                analytics::validate::RepairKind::RebuildTrackB => {
+                    // Bead m7xrw: repair Track B rollup drift by replaying
+                    // the intact `token_usage` ledger into fresh
+                    // `token_daily_stats` rows. Transactional inside
+                    // rebuild_token_daily_stats.
+                    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+                        code: 9,
+                        kind: "db-error",
+                        message: format!(
+                            "Failed to open database for Track B analytics repair: {e}"
+                        ),
+                        hint: None,
+                        retryable: false,
+                    })?;
+                    match storage.rebuild_token_daily_stats() {
+                        Ok(rows_created) => {
+                            applied_repairs.push(serde_json::json!({
+                                "kind": "rebuild_track_b",
+                                "check_ids": decision.check_ids,
+                                "reason": decision.reason,
+                                "result": {
+                                    "token_daily_stats_rows": rows_created,
+                                },
+                            }));
+                        }
+                        Err(e) => {
+                            // Rebuild failed — defer and surface the
+                            // error, but do NOT propagate so other
+                            // repair decisions still get a chance to
+                            // run (matches Track A's shape).
+                            deferred_check_ids.extend(decision.check_ids.iter().cloned());
+                            skipped_repairs.push(serde_json::json!({
+                                "kind": "rebuild_track_b_failed",
+                                "check_ids": decision.check_ids,
+                                "reason": format!(
+                                    "rebuild_token_daily_stats returned error: {e}. The token_usage ledger may itself be corrupt — try 'cass index --full --force-rebuild'."
+                                ),
+                            }));
+                        }
+                    }
+                }
                 analytics::validate::RepairKind::TrackAllRebuildUnavailable => {
                     deferred_check_ids.extend(decision.check_ids.iter().cloned());
                     skipped_repairs.push(serde_json::json!({
@@ -4899,11 +4940,26 @@ fn run_analytics_validate(
     }
 
     let fix_json = fix.then(|| {
+        // Bead m7xrw: emit `tracks_rebuilt` so downstream consumers can
+        // tell at a glance which rebuild paths actually ran
+        // (previously only inferable from the per-repair entries).
+        let tracks_rebuilt: Vec<&str> = applied_repairs
+            .iter()
+            .filter_map(|entry| entry.get("kind").and_then(|v| v.as_str()))
+            .filter_map(|kind| match kind {
+                "rebuild_track_a" => Some("a"),
+                "rebuild_track_b" => Some("b"),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         serde_json::json!({
             "requested": true,
             "validation_mode": report._meta.sampling.mode.clone(),
             "attempted": repair_plan.as_ref().is_some_and(|plan| !plan.decisions.is_empty()),
             "changed": !applied_repairs.is_empty(),
+            "tracks_rebuilt": tracks_rebuilt,
             "pre_fix_summary": pre_summary.clone(),
             "post_fix_summary": summary.clone(),
             "applied_repairs": applied_repairs,

@@ -103,6 +103,17 @@ impl ValidationReport {
 #[serde(rename_all = "snake_case")]
 pub enum RepairKind {
     RebuildTrackA,
+    /// Track B (`token_daily_stats`) rollup mismatch where the
+    /// underlying `token_usage` ledger is intact. Repairable by
+    /// calling `FrankenStorage::rebuild_token_daily_stats()` — it
+    /// replays the ledger into fresh `token_daily_stats` rows
+    /// transactionally. Bead m7xrw.
+    RebuildTrackB,
+    /// Neither Track A nor Track B rebuild can fix this failure —
+    /// e.g. token_usage ledger itself is missing or corrupt, agents
+    /// table is gone, or the validation query failed to execute.
+    /// Only a full canonical replay (ibuuh.29 / z9fse.13 class work)
+    /// would recover this.
     TrackAllRebuildUnavailable,
     ManualReview,
 }
@@ -120,6 +131,10 @@ pub struct RepairDecision {
 #[derive(Debug, Clone, Serialize)]
 pub struct RepairPlan {
     pub apply_track_a_rebuild: bool,
+    /// Whether any Track B check can be repaired by replaying the
+    /// `token_usage` ledger into fresh `token_daily_stats` via
+    /// `rebuild_token_daily_stats`. Bead m7xrw.
+    pub apply_track_b_rebuild: bool,
     pub decisions: Vec<RepairDecision>,
 }
 
@@ -137,7 +152,10 @@ pub fn build_repair_plan(report: &ValidationReport) -> RepairPlan {
         .map(|(kind, mut check_ids)| {
             check_ids.sort();
             RepairDecision {
-                fixable: matches!(kind, RepairKind::RebuildTrackA),
+                fixable: matches!(
+                    kind,
+                    RepairKind::RebuildTrackA | RepairKind::RebuildTrackB
+                ),
                 reason: repair_reason(kind).into(),
                 kind,
                 check_ids,
@@ -148,9 +166,13 @@ pub fn build_repair_plan(report: &ValidationReport) -> RepairPlan {
     let apply_track_a_rebuild = decisions
         .iter()
         .any(|decision| decision.kind == RepairKind::RebuildTrackA);
+    let apply_track_b_rebuild = decisions
+        .iter()
+        .any(|decision| decision.kind == RepairKind::RebuildTrackB);
 
     RepairPlan {
         apply_track_a_rebuild,
+        apply_track_b_rebuild,
         decisions,
     }
 }
@@ -171,10 +193,32 @@ fn classify_repair_kind(check: &Check, report: &ValidationReport) -> RepairKind 
     }
 
     if check.id.starts_with("track_b.") {
-        return RepairKind::TrackAllRebuildUnavailable;
+        // Bead m7xrw: Track B failures where the `token_usage` ledger
+        // is intact are repairable by replaying the ledger into fresh
+        // `token_daily_stats` rows via
+        // `FrankenStorage::rebuild_token_daily_stats()`. Only when the
+        // ledger itself is missing/corrupt or the infrastructure
+        // preconditions fail do we fall back to
+        // `TrackAllRebuildUnavailable` (that would need a full
+        // canonical replay from messages, which is the larger z9fse.13
+        // class of work and is NOT what this repair path provides).
+        match check.id.as_str() {
+            // Infrastructure-level failures that rebuild_token_daily_stats
+            // cannot repair on its own: either the ledger is gone, or a
+            // required joined table is missing, or the query itself
+            // couldn't execute.
+            "track_b.tables_exist"
+            | "track_b.agents_table_missing"
+            | "track_b.query_exec" => RepairKind::TrackAllRebuildUnavailable,
+            // Every other Track B check ("has_data", "grand_total_match",
+            // "tool_calls_match", "non_negative_counters", and any future
+            // same-shape checks) describes a state rebuild_token_daily_stats
+            // will fix by replaying the intact ledger.
+            _ => RepairKind::RebuildTrackB,
+        }
+    } else {
+        RepairKind::ManualReview
     }
-
-    RepairKind::ManualReview
 }
 
 fn repair_reason(kind: RepairKind) -> &'static str {
@@ -182,8 +226,11 @@ fn repair_reason(kind: RepairKind) -> &'static str {
         RepairKind::RebuildTrackA => {
             "Track A rollups are derivable from raw messages and can be rebuilt safely."
         }
+        RepairKind::RebuildTrackB => {
+            "Track B rollups are derivable from the intact token_usage ledger and can be rebuilt safely via rebuild_token_daily_stats()."
+        }
         RepairKind::TrackAllRebuildUnavailable => {
-            "Track B or cross-track repair needs a track-all rebuild path that is not implemented yet."
+            "Track B ledger or cross-track precondition is missing; a full canonical replay is required and is not implemented by --fix. Rebuild manually from source sessions via 'cass index --full --force-rebuild'."
         }
         RepairKind::ManualReview => {
             "This validation failure does not have a proven automatic repair path."
@@ -1627,9 +1674,41 @@ mod tests {
     }
 
     #[test]
-    fn repair_plan_marks_track_b_failures_as_unavailable() {
+    fn repair_plan_marks_track_b_data_drift_as_rebuild_track_b() {
+        // Bead m7xrw: Track B rollup drift with an intact token_usage
+        // ledger is now repairable via `rebuild_token_daily_stats()`,
+        // not deferred as TrackAllRebuildUnavailable. Deleting only the
+        // `token_daily_stats` rows (keeping token_usage intact) is the
+        // textbook repairable scenario.
         let conn = setup_both_tracks_fixture();
         conn.execute("DELETE FROM token_daily_stats").unwrap();
+
+        let report = run_validation(&conn, &ValidateConfig::deep());
+        let plan = build_repair_plan(&report);
+
+        let rebuild_b = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.kind == RepairKind::RebuildTrackB)
+            .expect("track-b rebuild decision");
+        assert!(!plan.apply_track_a_rebuild);
+        assert!(plan.apply_track_b_rebuild);
+        assert!(rebuild_b.fixable);
+        assert!(
+            rebuild_b
+                .check_ids
+                .contains(&"track_b.has_data".to_string())
+        );
+    }
+
+    #[test]
+    fn repair_plan_marks_track_b_tables_missing_as_unavailable() {
+        // Bead m7xrw: when the `token_usage` ledger itself is missing
+        // (not just empty rollups), `rebuild_token_daily_stats()`
+        // cannot recover — fall through to TrackAllRebuildUnavailable
+        // which tells the operator to do a full canonical replay.
+        let conn = setup_both_tracks_fixture();
+        conn.execute("DROP TABLE token_usage").unwrap();
 
         let report = run_validation(&conn, &ValidateConfig::deep());
         let plan = build_repair_plan(&report);
@@ -1638,13 +1717,14 @@ mod tests {
             .decisions
             .iter()
             .find(|decision| decision.kind == RepairKind::TrackAllRebuildUnavailable)
-            .expect("track-all unavailable decision");
+            .expect("track-all unavailable decision when ledger missing");
         assert!(!plan.apply_track_a_rebuild);
+        assert!(!plan.apply_track_b_rebuild);
         assert!(!unavailable.fixable);
         assert!(
             unavailable
                 .check_ids
-                .contains(&"track_b.has_data".to_string())
+                .contains(&"track_b.tables_exist".to_string())
         );
     }
 
