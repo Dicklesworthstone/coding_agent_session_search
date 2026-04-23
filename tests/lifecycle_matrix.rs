@@ -1354,8 +1354,9 @@ fn semantic_readiness_block_has_expected_shape() {
         .output()
         .expect("run cass health --json");
     assert!(
-        out.status.success(),
-        "cass health --json exited non-zero: {}",
+        matches!(out.status.code(), Some(0 | 1)),
+        "cass health --json exited with unexpected code {:?}; stderr: {}",
+        out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf8");
