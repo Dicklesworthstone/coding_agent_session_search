@@ -2112,42 +2112,44 @@ mod tests {
     #[test]
     fn semantic_state_reports_backfill_when_manifest_only_has_stale_assets() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut manifest = SemanticManifest::default();
-        manifest.fast_tier = Some(ArtifactRecord {
-            tier: crate::search::semantic_manifest::TierKind::Fast,
-            embedder_id: HashEmbedder::default().id().to_string(),
-            model_revision: "hash".to_string(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            dimension: 256,
-            doc_count: 12,
-            conversation_count: 3,
-            db_fingerprint: "stale-db".to_string(),
-            index_path: "vector_index/vector.fast.idx".to_string(),
-            size_bytes: 4096,
-            started_at_ms: 1_733_100_000_000,
-            completed_at_ms: 1_733_100_100_000,
-            ready: true,
-        });
-        manifest.backlog = crate::search::semantic_manifest::BacklogLedger {
-            total_conversations: 20,
-            fast_tier_processed: 3,
-            quality_tier_processed: 0,
-            db_fingerprint: "current-db".to_string(),
-            computed_at_ms: 1_733_100_200_000,
+        let mut manifest = SemanticManifest {
+            fast_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Fast,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 12,
+                conversation_count: 3,
+                db_fingerprint: "stale-db".to_string(),
+                index_path: "vector_index/vector.fast.idx".to_string(),
+                size_bytes: 4096,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            backlog: crate::search::semantic_manifest::BacklogLedger {
+                total_conversations: 20,
+                fast_tier_processed: 3,
+                quality_tier_processed: 0,
+                db_fingerprint: "current-db".to_string(),
+                computed_at_ms: 1_733_100_200_000,
+            },
+            checkpoint: Some(BuildCheckpoint {
+                tier: crate::search::semantic_manifest::TierKind::Fast,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                last_offset: 77,
+                docs_embedded: 66,
+                conversations_processed: 3,
+                total_conversations: 20,
+                db_fingerprint: "current-db".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                saved_at_ms: 1_733_100_300_000,
+            }),
+            ..Default::default()
         };
-        manifest.checkpoint = Some(BuildCheckpoint {
-            tier: crate::search::semantic_manifest::TierKind::Fast,
-            embedder_id: HashEmbedder::default().id().to_string(),
-            last_offset: 77,
-            docs_embedded: 66,
-            conversations_processed: 3,
-            total_conversations: 20,
-            db_fingerprint: "current-db".to_string(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            saved_at_ms: 1_733_100_300_000,
-        });
         manifest.save(temp.path()).expect("save semantic manifest");
 
         let state = semantic_state_from_availability(
@@ -2173,23 +2175,25 @@ mod tests {
     #[test]
     fn semantic_state_prefers_current_hash_tier_over_missing_model() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let mut manifest = SemanticManifest::default();
-        manifest.fast_tier = Some(ArtifactRecord {
-            tier: crate::search::semantic_manifest::TierKind::Fast,
-            embedder_id: HashEmbedder::default().id().to_string(),
-            model_revision: "hash".to_string(),
-            schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
-            chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
-            dimension: 256,
-            doc_count: 12,
-            conversation_count: 3,
-            db_fingerprint: "current-db".to_string(),
-            index_path: "vector_index/vector.fast.idx".to_string(),
-            size_bytes: 4096,
-            started_at_ms: 1_733_100_000_000,
-            completed_at_ms: 1_733_100_100_000,
-            ready: true,
-        });
+        let mut manifest = SemanticManifest {
+            fast_tier: Some(ArtifactRecord {
+                tier: crate::search::semantic_manifest::TierKind::Fast,
+                embedder_id: HashEmbedder::default().id().to_string(),
+                model_revision: "hash".to_string(),
+                schema_version: crate::search::policy::SEMANTIC_SCHEMA_VERSION,
+                chunking_version: crate::search::policy::CHUNKING_STRATEGY_VERSION,
+                dimension: 256,
+                doc_count: 12,
+                conversation_count: 3,
+                db_fingerprint: "current-db".to_string(),
+                index_path: "vector_index/vector.fast.idx".to_string(),
+                size_bytes: 4096,
+                started_at_ms: 1_733_100_000_000,
+                completed_at_ms: 1_733_100_100_000,
+                ready: true,
+            }),
+            ..Default::default()
+        };
         manifest.save(temp.path()).expect("save semantic manifest");
         let vector_path = vector_index_path(temp.path(), HashEmbedder::default().id());
         std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
