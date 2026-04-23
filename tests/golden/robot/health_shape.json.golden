@@ -25,6 +25,71 @@
     "latency_ms": {
       "type": "integer"
     },
+    "rebuild_progress": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "null"
+        },
+        "phase": {
+          "type": "null"
+        },
+        "processed_conversations": {
+          "type": "null"
+        },
+        "total_conversations": {
+          "type": "null"
+        },
+        "remaining_conversations": {
+          "type": "null"
+        },
+        "completion_ratio": {
+          "type": "null"
+        },
+        "indexed_docs": {
+          "type": "null"
+        },
+        "runtime_available": {
+          "type": "boolean"
+        },
+        "queue_depth": {
+          "type": "null"
+        },
+        "queue_capacity": {
+          "type": "null"
+        },
+        "queue_headroom": {
+          "type": "null"
+        },
+        "pending_batch_conversations": {
+          "type": "null"
+        },
+        "pending_batch_message_bytes": {
+          "type": "null"
+        },
+        "inflight_message_bytes": {
+          "type": "null"
+        },
+        "max_message_bytes_in_flight": {
+          "type": "null"
+        },
+        "inflight_message_bytes_headroom": {
+          "type": "null"
+        },
+        "controller_mode": {
+          "type": "null"
+        },
+        "controller_reason": {
+          "type": "null"
+        },
+        "updated_at": {
+          "type": "null"
+        }
+      }
+    },
     "db": {
       "type": "object",
       "properties": {
