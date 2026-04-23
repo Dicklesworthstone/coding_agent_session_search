@@ -981,9 +981,9 @@ impl SemanticIndexer {
         if complete {
             let db_fingerprint = plan.db_fingerprint.clone();
             if staged_index.wal_record_count() > 0 {
-                staged_index
-                    .compact()
-                    .map_err(|err| anyhow::anyhow!("compact staged semantic index failed: {err}"))?;
+                staged_index.compact().map_err(|err| {
+                    anyhow::anyhow!("compact staged semantic index failed: {err}")
+                })?;
             }
             drop(staged_index);
             fs::rename(&staging_path, &final_path).with_context(|| {
@@ -1551,6 +1551,63 @@ mod tests {
         let loaded = SemanticManifest::load(temp.path()).unwrap().unwrap();
         assert!(loaded.checkpoint.is_none());
         assert!(loaded.fast_tier.as_ref().is_some_and(|record| record.ready));
+    }
+
+    #[test]
+    fn backfill_publish_compacts_resumed_wal_before_rename() {
+        let temp = tempdir().unwrap();
+        let mut manifest = SemanticManifest::default();
+        let indexer = SemanticIndexer::new("hash", None).unwrap();
+        let db_fingerprint = "db-fp-backfill-small-resume";
+        let first: Vec<EmbeddingInput> = (0..20)
+            .map(|idx| EmbeddingInput::new(100 + idx, format!("first batch message {idx}")))
+            .collect();
+
+        let first_outcome = indexer
+            .run_backfill_batch(
+                &first,
+                temp.path(),
+                &mut manifest,
+                SemanticBackfillBatchPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.to_string(),
+                    model_revision: "hash".to_string(),
+                    total_conversations: 2,
+                    conversations_in_batch: 1,
+                    last_offset: 1,
+                },
+            )
+            .unwrap();
+        assert!(first_outcome.checkpoint_saved);
+
+        let second = vec![EmbeddingInput::new(200, "small final resume batch")];
+        let second_outcome = indexer
+            .run_backfill_batch(
+                &second,
+                temp.path(),
+                &mut manifest,
+                SemanticBackfillBatchPlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: db_fingerprint.to_string(),
+                    model_revision: "hash".to_string(),
+                    total_conversations: 2,
+                    conversations_in_batch: 1,
+                    last_offset: 2,
+                },
+            )
+            .unwrap();
+
+        assert!(second_outcome.published);
+        let final_path = vector_index_path(temp.path(), indexer.embedder_id());
+        let mut final_wal_path = final_path.as_os_str().to_os_string();
+        final_wal_path.push(".wal");
+        assert!(!PathBuf::from(final_wal_path).exists());
+
+        let published_index = FsVectorIndex::open(&final_path).unwrap();
+        assert_eq!(published_index.record_count(), 21);
+        let artifact = manifest.fast_tier.as_ref().expect("published fast tier");
+        assert_eq!(artifact.doc_count, 21);
+        assert_eq!(artifact.conversation_count, 2);
     }
 
     #[test]
