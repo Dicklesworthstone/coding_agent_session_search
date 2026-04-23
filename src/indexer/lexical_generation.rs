@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1518,18 +1519,57 @@ pub(crate) fn store_manifest(
     ));
     let serialized =
         serde_json::to_vec_pretty(manifest).context("serializing lexical generation manifest")?;
-    fs::write(&tmp_path, &serialized).with_context(|| {
-        format!(
-            "writing scratch lexical generation manifest at {}",
-            tmp_path.display()
-        )
-    })?;
+    {
+        let file = fs::File::create(&tmp_path).with_context(|| {
+            format!(
+                "creating scratch lexical generation manifest at {}",
+                tmp_path.display()
+            )
+        })?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&serialized).with_context(|| {
+            format!(
+                "writing scratch lexical generation manifest at {}",
+                tmp_path.display()
+            )
+        })?;
+        writer.flush().with_context(|| {
+            format!(
+                "flushing scratch lexical generation manifest at {}",
+                tmp_path.display()
+            )
+        })?;
+        writer.get_ref().sync_all().with_context(|| {
+            format!(
+                "syncing scratch lexical generation manifest at {}",
+                tmp_path.display()
+            )
+        })?;
+    }
     fs::rename(&tmp_path, &final_path).with_context(|| {
         format!(
             "atomically publishing lexical generation manifest to {}",
             final_path.display()
         )
     })?;
+    sync_parent_directory(&final_path)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = fs::File::open(parent)
+        .with_context(|| format!("opening parent directory {} for sync", parent.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("syncing parent directory {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
