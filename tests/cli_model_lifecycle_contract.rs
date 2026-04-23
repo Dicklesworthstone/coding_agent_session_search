@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use coding_agent_search::{Cli, Commands, ModelsCommand};
 
 fn parse(args: &[&str]) -> Result<Cli, String> {
@@ -52,6 +52,35 @@ fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), St
             }
             other => Err(format!(
                 "expected local model acquisition controls to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn models_install_rejects_ambiguous_mirror_and_from_file_sources() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let result = Cli::try_parse_from([
+            "cass",
+            "models",
+            "install",
+            "--mirror",
+            "https://mirror.example/models",
+            "--from-file",
+            "/seeded/models/all-minilm-l6-v2",
+            "--data-dir",
+            "/cass/models",
+            "--yes",
+        ]);
+
+        match result {
+            Err(err) if err.kind() == ErrorKind::ArgumentConflict => Ok(()),
+            Err(err) => Err(format!(
+                "expected mirror/from-file acquisition conflict, got {:?}: {err}",
+                err.kind()
+            )),
+            Ok(cli) => Err(format!(
+                "expected mirror/from-file acquisition conflict, parsed: {cli:?}"
             )),
         }
     })
