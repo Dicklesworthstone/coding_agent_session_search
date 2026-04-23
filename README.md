@@ -707,18 +707,17 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 
 | What you type | What `cass` understands | Correction note |
 |---------------|------------------------|-----------------|
-| `cass serach "error"` | `cass search "error"` | "Did you mean 'search'?" |
-| `cass -robot -limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
+| `cass -robot --limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
 | `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
-| `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` |
+| `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` via alias table |
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
-| `cass search --limt 5` | `cass search --limit 5` | Levenshtein distance ≤2 corrected |
+| `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
-1. **Typo correction**: Flags within edit distance 2 are auto-corrected
+1. **Flag typo correction**: Long flag names within Levenshtein distance 2 are auto-corrected (e.g. `--limt` → `--limit`). *Subcommand typos are NOT fuzzy-corrected* — use one of the documented aliases instead (see layer 4 below). A typo that isn't a known alias will produce a clap usage error with the canonical form in the hint.
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-4. **Subcommand aliases**: `find`/`query`/`q` → `search`, `ls`/`list` → `stats`
+4. **Subcommand aliases**: `find`/`query`/`q`/`grep`/`lookup` → `search`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 5. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
