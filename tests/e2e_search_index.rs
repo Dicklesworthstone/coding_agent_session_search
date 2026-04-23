@@ -19,6 +19,8 @@ use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection as RusqliteConnection;
 use std::fs;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -253,6 +255,64 @@ fn force_federated_publish_env(cmd: &mut assert_cmd::Command) {
     cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "2");
     cmd.env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
     cmd.env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES", "4096");
+}
+
+#[cfg(target_os = "linux")]
+fn cass_std_cmd(home: &Path, codex_home: &Path) -> StdCommand {
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.current_dir(home);
+    cmd.env("CODEX_HOME", codex_home);
+    cmd.env("HOME", home);
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    cmd
+}
+
+#[cfg(target_os = "linux")]
+fn lexical_publish_in_progress_backup_path(index_path: &Path) -> std::path::PathBuf {
+    let file_name = index_path
+        .file_name()
+        .expect("live index path should have a file name")
+        .to_string_lossy();
+    index_path.with_file_name(format!(".{file_name}.publish-in-progress.bak"))
+}
+
+#[cfg(target_os = "linux")]
+fn lexical_publish_backups_dir(index_path: &Path) -> std::path::PathBuf {
+    index_path
+        .parent()
+        .expect("live index path should have a parent directory")
+        .join(".lexical-publish-backups")
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_publish_kill_relaunch_sentinel(
+    path: &Path,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read(path) {
+            Ok(bytes) => {
+                return serde_json::from_slice(&bytes)
+                    .expect("parse lexical publish kill-relaunch sentinel json");
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                panic!(
+                    "expected lexical publish kill-relaunch sentinel at {}: {err}",
+                    path.display()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for lexical publish kill-relaunch sentinel at {}",
+            path.display()
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1655,6 +1715,293 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
                 "federated_shard_count",
                 baseline_federated_reader_count as u64,
             ),
+    );
+    tracker.complete();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() {
+    let tracker =
+        tracker_for("force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain");
+    let _trace_guard = tracker.trace_env_guard();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.to_path_buf();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    const QUERY: &str = "killrelaunchpublishanchor";
+
+    tracker.phase(
+        "seed_and_index_single_shard_fixture",
+        "Create a minimal fixture and build the baseline lexical index",
+        || {
+            make_codex_session(
+                &codex_home,
+                "2024/11/24",
+                "rollout-kill-relaunch.jsonl",
+                QUERY,
+                1_732_320_000_000,
+            );
+
+            cargo_bin_cmd!("cass")
+                .args(["index", "--full", "--json", "--data-dir"])
+                .arg(&data_dir)
+                .current_dir(&home)
+                .env("CODEX_HOME", &codex_home)
+                .env("HOME", &home)
+                .timeout(Duration::from_secs(30))
+                .assert()
+                .success();
+        },
+    );
+
+    let live_index_path = index_dir(&data_dir).expect("resolve live Tantivy index path");
+    let canonical_sidecar = lexical_publish_in_progress_backup_path(&live_index_path);
+    let backups_dir = lexical_publish_backups_dir(&live_index_path);
+    let before_summary = searchable_index_summary(&live_index_path)
+        .expect("read baseline searchable index summary")
+        .expect("baseline index should exist");
+    let before_docs = before_summary.docs;
+    assert!(before_docs > 0, "baseline index should contain at least one doc");
+
+    let baseline_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            QUERY,
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run baseline lexical search");
+    assert!(
+        baseline_search.status.success(),
+        "baseline lexical search should succeed before kill/relaunch test\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline_search.stdout),
+        String::from_utf8_lossy(&baseline_search.stderr)
+    );
+    let baseline_total_matches = total_matches_from_search_output(&baseline_search.stdout);
+    assert!(
+        baseline_total_matches > 0,
+        "baseline lexical search should return at least one hit before kill/relaunch"
+    );
+
+    let sentinel_path = home.join("publish-kill-relaunch-sentinel.json");
+    let rebuild_start = tracker.start(
+        "sigkill_force_rebuild_in_linux_publish_window",
+        Some(
+            "Spawn cass index --full --force-rebuild, pause after NEW is live and OLD is parked, then SIGKILL the process",
+        ),
+    );
+    let mut child = cass_std_cmd(&home, &codex_home);
+    child.env(
+        "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+        &sentinel_path,
+    );
+    child.env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "30000");
+    child.args(["index", "--full", "--force-rebuild", "--json", "--data-dir"]);
+    child.arg(&data_dir);
+    let mut child = child.spawn().expect("spawn force rebuild child process");
+
+    let sentinel =
+        wait_for_publish_kill_relaunch_sentinel(&sentinel_path, Duration::from_secs(20));
+    assert_eq!(
+        sentinel.get("stage").and_then(|value| value.as_str()),
+        Some("linux_swap_committed_prior_live_parked"),
+        "sentinel must prove the child paused after NEW went live and OLD was parked"
+    );
+    assert_eq!(
+        sentinel.get("live_index_path").and_then(|value| value.as_str()),
+        Some(live_index_path.to_string_lossy().as_ref()),
+        "sentinel should describe the live index path under test"
+    );
+    assert_eq!(
+        sentinel
+            .get("canonical_sidecar_path")
+            .and_then(|value| value.as_str()),
+        Some(canonical_sidecar.to_string_lossy().as_ref()),
+        "sentinel should describe the canonical sidecar path under test"
+    );
+
+    assert!(
+        live_index_path.exists(),
+        "live lexical index must still exist while the child is paused in the publish window"
+    );
+    assert!(
+        canonical_sidecar.exists(),
+        "prior live generation must be parked at the canonical sidecar before SIGKILL"
+    );
+    let paused_summary = searchable_index_summary(&live_index_path)
+        .expect("read live summary while child is paused")
+        .expect("live index should remain readable while paused");
+    assert_eq!(
+        paused_summary.docs, before_docs,
+        "paused publish window must still expose the stable live doc count"
+    );
+
+    let paused_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            QUERY,
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run lexical search while child is paused");
+    assert!(
+        paused_search.status.success(),
+        "lexical search should still succeed while the child is paused in the publish window\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&paused_search.stdout),
+        String::from_utf8_lossy(&paused_search.stderr)
+    );
+    assert_eq!(
+        total_matches_from_search_output(&paused_search.stdout),
+        baseline_total_matches,
+        "paused publish window must preserve stable search results"
+    );
+
+    child.kill().expect("send SIGKILL to paused rebuild child");
+    let child_status = child.wait().expect("wait for killed rebuild child");
+    tracker.end(
+        "sigkill_force_rebuild_in_linux_publish_window",
+        Some(
+            "Spawn cass index --full --force-rebuild, pause after NEW is live and OLD is parked, then SIGKILL the process",
+        ),
+        rebuild_start,
+    );
+    assert!(
+        !child_status.success(),
+        "SIGKILLed rebuild child must not report success"
+    );
+    assert!(
+        live_index_path.exists(),
+        "live lexical index must still exist immediately after SIGKILL"
+    );
+    assert!(
+        canonical_sidecar.exists(),
+        "SIGKILL should strand the canonical sidecar for restart recovery"
+    );
+
+    let relaunch_start = tracker.start(
+        "relaunch_force_rebuild_and_recover_sidecar",
+        Some(
+            "Relaunch cass index --full --force-rebuild and prove recovery finalizes the stranded sidecar cleanly",
+        ),
+    );
+    let relaunch_output = cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .expect("relaunch force rebuild after SIGKILL");
+    tracker.end(
+        "relaunch_force_rebuild_and_recover_sidecar",
+        Some(
+            "Relaunch cass index --full --force-rebuild and prove recovery finalizes the stranded sidecar cleanly",
+        ),
+        relaunch_start,
+    );
+    assert!(
+        relaunch_output.status.success(),
+        "relaunch after SIGKILL should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&relaunch_output.stdout),
+        String::from_utf8_lossy(&relaunch_output.stderr)
+    );
+    let relaunch_json: serde_json::Value =
+        serde_json::from_slice(&relaunch_output.stdout).expect("parse relaunch index json");
+    assert_eq!(
+        relaunch_json.get("success").and_then(|value| value.as_bool()),
+        Some(true),
+        "relaunch force rebuild should report success in --json output"
+    );
+
+    assert!(
+        !canonical_sidecar.exists(),
+        "relaunch recovery must consume the stranded canonical sidecar"
+    );
+    let retained_backup_count = fs::read_dir(&backups_dir)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert!(
+        retained_backup_count >= 1,
+        "relaunch recovery should retain at least one prior-live artifact after cleaning the stranded sidecar"
+    );
+
+    let after_summary = searchable_index_summary(&live_index_path)
+        .expect("read live summary after relaunch recovery")
+        .expect("live index should remain readable after relaunch recovery");
+    assert_eq!(
+        after_summary.docs, before_docs,
+        "relaunch recovery must preserve the stable live doc count"
+    );
+
+    let after_search = cargo_bin_cmd!("cass")
+        .args([
+            "search",
+            QUERY,
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .current_dir(&home)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run lexical search after relaunch recovery");
+    assert!(
+        after_search.status.success(),
+        "lexical search should succeed after relaunch recovery\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&after_search.stdout),
+        String::from_utf8_lossy(&after_search.stderr)
+    );
+    assert_eq!(
+        total_matches_from_search_output(&after_search.stdout),
+        baseline_total_matches,
+        "relaunch recovery must preserve stable lexical search results"
+    );
+
+    tracker.metrics(
+        "kill_relaunch_publish_recovery",
+        &E2ePerformanceMetrics::new()
+            .with_custom("stable_doc_count", before_docs as u64)
+            .with_custom("stable_total_matches", baseline_total_matches)
+            .with_custom("retained_backup_count_after_relaunch", retained_backup_count as u64),
     );
     tracker.complete();
 }

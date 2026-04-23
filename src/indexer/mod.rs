@@ -11257,6 +11257,37 @@ fn rename_lexical_publish_path(
     fs::rename(src, dst)
 }
 
+#[cfg(target_os = "linux")]
+fn maybe_pause_lexical_publish_for_kill_relaunch(
+    index_path: &Path,
+    canonical_sidecar: &Path,
+) -> Result<()> {
+    let sentinel_path =
+        match dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL") {
+            Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+            _ => return Ok(()),
+        };
+    let sleep_ms = dotenvy::var("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    let payload = serde_json::json!({
+        "stage": "linux_swap_committed_prior_live_parked",
+        "pid": std::process::id(),
+        "live_index_path": index_path.display().to_string(),
+        "canonical_sidecar_path": canonical_sidecar.display().to_string(),
+    });
+    write_json_pretty_atomically(&sentinel_path, &payload).with_context(|| {
+        format!(
+            "writing lexical publish kill-relaunch sentinel {}",
+            sentinel_path.display()
+        )
+    })?;
+    thread::sleep(Duration::from_millis(sleep_ms));
+    Ok(())
+}
+
 fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> Result<()> {
     if let Some(parent) = index_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
@@ -11339,6 +11370,14 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
                 }
             }
         }
+
+        maybe_pause_lexical_publish_for_kill_relaunch(index_path, &canonical_sidecar)
+            .with_context(|| {
+                format!(
+                    "pausing lexical publish after parking prior live generation at {}",
+                    canonical_sidecar.display()
+                )
+            })?;
 
         // B: move canonical sidecar into `.lexical-publish-backups/` under
         // a unique dated name. Failure here is recoverable without rollback:
