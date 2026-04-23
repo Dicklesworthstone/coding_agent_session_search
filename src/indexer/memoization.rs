@@ -32,8 +32,7 @@
 //! - Evictions are driven only by a bounded entry budget. Callers pick
 //!   the budget; no hidden global cache exists.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -133,6 +132,15 @@ pub(crate) struct MemoCacheStats {
 pub(crate) struct MemoQuarantineInspectionItem {
     pub key: MemoKey,
     pub reason: String,
+}
+
+/// Aggregated operator-facing quarantine counts. BTreeMap keeps JSON
+/// output stable for robot consumers and lifecycle proofs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MemoQuarantineSummary {
+    pub quarantined_entries: usize,
+    pub reasons: BTreeMap<String, usize>,
+    pub algorithms: BTreeMap<String, usize>,
 }
 
 /// Bounded in-memory content-addressed cache. Keyed on `MemoKey` and
@@ -263,6 +271,18 @@ impl<V: Clone> ContentAddressedMemoCache<V> {
                 .then_with(|| left.reason.cmp(&right.reason))
         });
         items
+    }
+
+    pub(crate) fn quarantine_summary(&self) -> MemoQuarantineSummary {
+        let mut summary = MemoQuarantineSummary {
+            quarantined_entries: self.quarantined.len(),
+            ..MemoQuarantineSummary::default()
+        };
+        for (key, reason) in &self.quarantined {
+            *summary.reasons.entry(reason.clone()).or_insert(0) += 1;
+            *summary.algorithms.entry(key.algorithm.clone()).or_insert(0) += 1;
+        }
+        summary
     }
 
     fn touch(&mut self, key: &MemoKey) {
@@ -439,6 +459,35 @@ mod tests {
         assert_eq!(json[0]["key"]["algorithm"], "lexical-normalize");
         assert_eq!(json[0]["reason"], "invalid unicode boundary");
         assert_eq!(json[2]["key"]["algorithm"], "semantic-embed");
+    }
+
+    #[test]
+    fn quarantine_summary_groups_by_reason_and_algorithm() -> Result<(), serde_json::Error> {
+        let mut cache: ContentAddressedMemoCache<String> =
+            ContentAddressedMemoCache::with_capacity(4);
+        let lexical_a = key(b"lex-a", "lexical-normalize", "v1");
+        let lexical_b = key(b"lex-b", "lexical-normalize", "v1");
+        let semantic = key(b"semantic", "semantic-embed", "v2");
+
+        cache.insert(lexical_a.clone(), "lexical-a".into());
+        cache.insert(lexical_b.clone(), "lexical-b".into());
+        cache.insert(semantic.clone(), "semantic".into());
+        cache.quarantine(lexical_a, "checksum mismatch");
+        cache.quarantine(lexical_b, "checksum mismatch");
+        cache.quarantine(semantic, "schema drift");
+
+        let summary = cache.quarantine_summary();
+        assert_eq!(summary.quarantined_entries, 3);
+        assert_eq!(summary.reasons.get("checksum mismatch"), Some(&2));
+        assert_eq!(summary.reasons.get("schema drift"), Some(&1));
+        assert_eq!(summary.algorithms.get("lexical-normalize"), Some(&2));
+        assert_eq!(summary.algorithms.get("semantic-embed"), Some(&1));
+
+        let json = serde_json::to_value(&summary)?;
+        assert_eq!(json["quarantined_entries"], 3);
+        assert_eq!(json["reasons"]["checksum mismatch"], 2);
+        assert_eq!(json["algorithms"]["semantic-embed"], 1);
+        Ok(())
     }
 
     #[test]
