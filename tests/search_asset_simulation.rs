@@ -384,6 +384,213 @@ fn rollout_gate_verdict_persists_thresholds_and_recovery_evidence() {
 }
 
 #[test]
+fn many_core_responsiveness_gate_persists_phase_utilization_evidence() {
+    let mut harness = SearchAssetSimulationHarness::new(
+        "many_core_phase_utilization_responsiveness_gate",
+        LoadScript::new(vec![
+            LoadSample::idle("legacy_serial_baseline"),
+            LoadSample::idle("segment_farm_build"),
+            LoadSample::busy("foreground_probe"),
+            LoadSample::loaded("settle_pressure"),
+            LoadSample::idle("fully_settled"),
+        ]),
+    );
+
+    let plan = ContentionPlan::new()
+        .turn(SimulationActor::LexicalRepair, "record_serial_baseline")
+        .turn(SimulationActor::LexicalRepair, "record_segment_farm")
+        .turn(SimulationActor::ForegroundSearch, "probe_responsiveness")
+        .turn(
+            SimulationActor::LexicalRepair,
+            "pause_settle_under_pressure",
+        )
+        .turn(SimulationActor::LexicalRepair, "rollout_verdict");
+
+    let results =
+        harness.run_contention_plan(&plan, |turn, sim| match (turn.actor, turn.label.as_str()) {
+            (SimulationActor::LexicalRepair, "record_serial_baseline") => {
+                sim.phase(
+                    "many_core_baseline",
+                    "recording legacy serial replay utilization for comparison",
+                );
+                sim.snapshot_json(
+                    "phase_utilization_baseline",
+                    &json!({
+                        "phase": "legacy_serial_replay",
+                        "available_cores": 32,
+                        "active_workers": 1,
+                        "reserved_cores": 4,
+                        "cpu_core_utilization_pct": 3.1,
+                        "queue_depth": 0,
+                        "search_ready_ms": 14_500,
+                        "measurement": "deterministic_harness_fixture"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "record_segment_farm") => {
+                sim.phase(
+                    "many_core_segment_farm",
+                    "recording phase utilization for the shard-farm build",
+                );
+                sim.snapshot_json(
+                    "phase_utilization_segment_farm",
+                    &json!({
+                        "phase": "segment_farm_build",
+                        "available_cores": 32,
+                        "active_workers": 24,
+                        "reserved_cores": 4,
+                        "cpu_core_utilization_pct": 81.0,
+                        "queue_depth": 14,
+                        "search_ready_ms": 3_800,
+                        "search_ready_threshold_ms": 8_000,
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::ForegroundSearch, "probe_responsiveness") => {
+                sim.phase(
+                    "foreground_responsiveness",
+                    "foreground probe stays within the interactive latency gate",
+                );
+                sim.snapshot_json(
+                    "foreground_responsiveness_gate",
+                    &json!({
+                        "p95_interactive_latency_ms": 48,
+                        "latency_threshold_ms": 100,
+                        "blocked_wait_ms": 0,
+                        "max_blocked_wait_ms": 250,
+                        "visible_generation": "old_good",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "pause_settle_under_pressure") => {
+                sim.phase(
+                    "controller_limited_settle",
+                    "controller pauses non-critical settling while the machine is loaded",
+                );
+                sim.snapshot_json(
+                    "settle_pressure_gate",
+                    &json!({
+                        "controller_decision": "pause_deferred_compaction",
+                        "reason": "machine_pressure",
+                        "search_ready": true,
+                        "fully_settled": false,
+                        "merge_debt_state": "paused",
+                        "status": "pass"
+                    }),
+                );
+                Ok(())
+            }
+            (SimulationActor::LexicalRepair, "rollout_verdict") => {
+                sim.phase(
+                    "many_core_rollout_gate",
+                    "rollout verdict records utilization and responsiveness gates",
+                );
+                sim.snapshot_json(
+                    "many_core_rollout_verdict",
+                    &json!({
+                        "verdict": "pass",
+                        "phase_gates": {
+                            "segment_farm_uses_many_cores": "pass",
+                            "search_ready_time_improved": "pass",
+                            "interactive_latency_preserved": "pass",
+                            "deferred_settle_is_controller_limited": "pass"
+                        },
+                        "search_ready_improvement_ratio": 3.81,
+                        "fully_settled_after_resume": true
+                    }),
+                );
+                Ok(())
+            }
+            _ => unreachable!("unexpected deterministic many-core rollout turn"),
+        });
+
+    assert!(
+        results.iter().all(Result::is_ok),
+        "many-core rollout gate should not inject failures: {results:?}"
+    );
+
+    let summary = harness.summary();
+    assert_eq!(summary.actor_traces.len(), 5);
+    assert_eq!(summary.actor_traces[0].load.label, "legacy_serial_baseline");
+    assert_eq!(summary.actor_traces[1].load.label, "segment_farm_build");
+    assert_eq!(summary.actor_traces[2].load.label, "foreground_probe");
+    assert!(summary.actor_traces[2].load.user_active);
+    assert_eq!(summary.actor_traces[3].load.label, "settle_pressure");
+    assert_eq!(summary.actor_traces[4].load.label, "fully_settled");
+
+    for expected in [
+        "001-phase_utilization_baseline.json",
+        "002-phase_utilization_segment_farm.json",
+        "003-foreground_responsiveness_gate.json",
+        "004-settle_pressure_gate.json",
+        "005-many_core_rollout_verdict.json",
+    ] {
+        assert!(
+            summary.snapshot_digests.contains_key(expected),
+            "missing many-core rollout snapshot digest for {expected}"
+        );
+    }
+
+    let artifacts = harness
+        .write_artifacts()
+        .expect("write many-core rollout artifacts");
+    assert!(artifacts.phase_log_path.exists());
+    assert!(artifacts.actor_traces_path.exists());
+    assert!(artifacts.summary_path.exists());
+
+    let phase_log = fs::read_to_string(&artifacts.phase_log_path).expect("read phase log");
+    assert!(
+        phase_log.contains("many_core_segment_farm"),
+        "phase log should preserve the segment-farm utilization phase"
+    );
+    assert!(
+        phase_log.contains("foreground_responsiveness"),
+        "phase log should preserve the foreground responsiveness phase"
+    );
+
+    let farm_path = artifacts
+        .snapshot_dir
+        .join("002-phase_utilization_segment_farm.json");
+    let farm_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&farm_path).expect("read farm snapshot"))
+            .expect("farm snapshot JSON");
+    assert_eq!(farm_json["status"], "pass");
+    assert_eq!(farm_json["active_workers"], 24);
+    assert_eq!(farm_json["reserved_cores"], 4);
+
+    let responsiveness_path = artifacts
+        .snapshot_dir
+        .join("003-foreground_responsiveness_gate.json");
+    let responsiveness_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&responsiveness_path).expect("read responsiveness snapshot"),
+    )
+    .expect("responsiveness snapshot JSON");
+    assert_eq!(responsiveness_json["status"], "pass");
+    assert_eq!(responsiveness_json["blocked_wait_ms"], 0);
+
+    let verdict_path = artifacts
+        .snapshot_dir
+        .join("005-many_core_rollout_verdict.json");
+    let verdict_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&verdict_path).expect("read rollout verdict"))
+            .expect("rollout verdict JSON");
+    assert_eq!(verdict_json["verdict"], "pass");
+    assert_eq!(
+        verdict_json["phase_gates"]["segment_farm_uses_many_cores"],
+        "pass"
+    );
+    assert_eq!(
+        verdict_json["phase_gates"]["interactive_latency_preserved"],
+        "pass"
+    );
+}
+
+#[test]
 fn robot_style_demo_is_deterministic_and_persists_artifacts() {
     let (first_summary, first_artifacts, first_results) = run_robot_style_demo();
     let (second_summary, second_artifacts, second_results) = run_robot_style_demo();
