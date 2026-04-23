@@ -397,6 +397,15 @@ pub(crate) struct LexicalCleanupGenerationDispositionSummary {
     pub retained_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LexicalCleanupApprovalFingerprintStatus {
+    NotRequested,
+    Missing,
+    Matched,
+    Mismatched,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LexicalCleanupApplyGate {
     pub apply_allowed: bool,
@@ -404,6 +413,7 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub explicit_operator_approval: bool,
     pub approval_fingerprint: String,
     pub provided_approval_fingerprint: Option<String>,
+    pub approval_fingerprint_status: LexicalCleanupApprovalFingerprintStatus,
     pub approval_fingerprint_matches: bool,
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
@@ -470,18 +480,27 @@ impl LexicalCleanupDryRunPlan {
                 "destructive cleanup requires explicit operator approval after dry-run".to_string(),
             );
         }
+        let approval_fingerprint_status =
+            match (explicit_operator_approval, provided_approval_fingerprint) {
+                (false, _) => LexicalCleanupApprovalFingerprintStatus::NotRequested,
+                (true, Some(fingerprint)) if fingerprint == self.approval_fingerprint => {
+                    LexicalCleanupApprovalFingerprintStatus::Matched
+                }
+                (true, Some(_)) => LexicalCleanupApprovalFingerprintStatus::Mismatched,
+                (true, None) => LexicalCleanupApprovalFingerprintStatus::Missing,
+            };
         let approval_fingerprint_matches =
-            provided_approval_fingerprint == Some(self.approval_fingerprint.as_str());
-        if explicit_operator_approval && !approval_fingerprint_matches {
-            match provided_approval_fingerprint {
-                Some(_) => blocked_reasons.push(
-                    "provided cleanup approval fingerprint does not match dry-run plan".to_string(),
-                ),
-                None => blocked_reasons.push(format!(
-                    "cleanup apply requires confirming approval fingerprint {}",
-                    self.approval_fingerprint
-                )),
-            }
+            approval_fingerprint_status == LexicalCleanupApprovalFingerprintStatus::Matched;
+        match approval_fingerprint_status {
+            LexicalCleanupApprovalFingerprintStatus::Mismatched => blocked_reasons.push(
+                "provided cleanup approval fingerprint does not match dry-run plan".to_string(),
+            ),
+            LexicalCleanupApprovalFingerprintStatus::Missing => blocked_reasons.push(format!(
+                "cleanup apply requires confirming approval fingerprint {}",
+                self.approval_fingerprint
+            )),
+            LexicalCleanupApprovalFingerprintStatus::NotRequested
+            | LexicalCleanupApprovalFingerprintStatus::Matched => {}
         }
         if !self.active_generation_ids.is_empty() {
             blocked_reasons.push(format!(
@@ -496,6 +515,7 @@ impl LexicalCleanupDryRunPlan {
             explicit_operator_approval,
             approval_fingerprint: self.approval_fingerprint.clone(),
             provided_approval_fingerprint: provided_approval_fingerprint.map(str::to_owned),
+            approval_fingerprint_status,
             approval_fingerprint_matches,
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
@@ -2320,6 +2340,10 @@ mod tests {
         assert!(!blocked.apply_allowed);
         assert!(blocked.dry_run);
         assert!(!blocked.explicit_operator_approval);
+        assert_eq!(
+            blocked.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::NotRequested
+        );
         assert_eq!(blocked.candidate_count, 1);
         assert_eq!(blocked.reclaimable_bytes, 4096);
         assert_eq!(
@@ -2357,6 +2381,10 @@ mod tests {
         let active_still_blocks = plan.apply_gate(true);
         assert!(!active_still_blocks.apply_allowed);
         assert!(active_still_blocks.explicit_operator_approval);
+        assert_eq!(
+            active_still_blocks.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::Missing
+        );
         assert!(!active_still_blocks.approval_fingerprint_matches);
         assert!(
             active_still_blocks
@@ -2370,6 +2398,10 @@ mod tests {
         let active_fingerprint_still_blocks =
             plan.apply_gate_with_fingerprint(true, Some(&plan.approval_fingerprint));
         assert!(!active_fingerprint_still_blocks.apply_allowed);
+        assert_eq!(
+            active_fingerprint_still_blocks.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::Matched
+        );
         assert!(active_fingerprint_still_blocks.approval_fingerprint_matches);
         assert_eq!(active_fingerprint_still_blocks.blocked_reasons.len(), 1);
 
@@ -2378,6 +2410,10 @@ mod tests {
             safe_plan.apply_gate_with_fingerprint(true, Some(&safe_plan.approval_fingerprint));
         assert!(allowed.apply_allowed);
         assert!(allowed.blocked_reasons.is_empty());
+        assert_eq!(
+            allowed.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::Matched
+        );
         assert!(allowed.approval_fingerprint_matches);
         assert_eq!(
             allowed.provided_approval_fingerprint.as_deref(),
@@ -2392,6 +2428,7 @@ mod tests {
             safe_plan.approval_fingerprint
         );
         assert_eq!(allowed_json["approval_fingerprint_matches"], true);
+        assert_eq!(allowed_json["approval_fingerprint_status"], "matched");
         assert_eq!(
             allowed_json["candidate_previews"][0]["generation_id"],
             "gen-old"
@@ -2408,6 +2445,10 @@ mod tests {
         let stale_fingerprint =
             safe_plan.apply_gate_with_fingerprint(true, Some("cleanup-v1-stale"));
         assert!(!stale_fingerprint.apply_allowed);
+        assert_eq!(
+            stale_fingerprint.approval_fingerprint_status,
+            LexicalCleanupApprovalFingerprintStatus::Mismatched
+        );
         assert!(!stale_fingerprint.approval_fingerprint_matches);
         assert!(
             stale_fingerprint
