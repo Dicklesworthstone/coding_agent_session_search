@@ -7221,14 +7221,13 @@ mod tests {
     /// circuit the undecidable empty case.
     #[test]
     fn hit_is_noise_still_suppresses_real_tool_invocation_noise_when_content_present() {
-        let mut hit = projected_minimal_fields_search_hit(
-            "Tool ping",
-            "/tmp/sessions/tool-ping.jsonl",
-        );
+        let mut hit =
+            projected_minimal_fields_search_hit("Tool ping", "/tmp/sessions/tool-ping.jsonl");
         // A synthetic tool-invocation-style payload; the specific classifier
         // heuristics live in `is_tool_invocation_noise`. Keep content short
         // and recognizably tool-shaped so the classifier trips.
-        hit.content = "[tool_call]: {\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}".into();
+        hit.content =
+            "[tool_call]: {\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}".into();
         let classified_as_noise_on_real_content =
             hit_is_noise(&hit, "ls") || hit_is_noise(&hit, "bash");
         // Defensive: we only assert the NON-empty content path is exercised
