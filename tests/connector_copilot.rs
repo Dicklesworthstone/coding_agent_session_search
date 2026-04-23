@@ -307,12 +307,20 @@ fn scan_parses_cli_history_json_with_human_role_and_file_stem_id() {
     assert_eq!(convs.len(), 1);
     let conv = &convs[0];
     assert_eq!(conv.external_id.as_deref(), Some("legacy-human"));
-    assert_eq!(conv.title.as_deref(), Some("Summarize unicode Ω handling 🚀"));
+    assert_eq!(
+        conv.title.as_deref(),
+        Some("Summarize unicode Ω handling 🚀")
+    );
     assert_eq!(conv.messages.len(), 2);
     assert_eq!(conv.messages[0].role, "user");
     assert_eq!(conv.messages[1].role, "assistant");
     assert_eq!(
         conv.messages[1].content,
         "Unicode stays normalized and searchable."
+    );
+    assert_eq!(
+        conv.workspace.as_deref(),
+        Some(Path::new("/workspaces/legacy-copilot")),
+        "workspacePath must be extracted from legacy history JSON"
     );
 }
