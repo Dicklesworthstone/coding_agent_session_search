@@ -1669,7 +1669,10 @@ impl PagesWizard {
                 "warning": "UNENCRYPTED - All content is publicly readable"
             });
             let config_path = encrypted_dir.join("config.json");
-            std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+            crate::pages::write_file_durably(
+                &config_path,
+                serde_json::to_string_pretty(&config)?.as_bytes(),
+            )?;
         } else {
             let pb2 = ProgressBar::new_spinner();
             let spinner_style = ProgressStyle::default_spinner()

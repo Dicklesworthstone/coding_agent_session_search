@@ -185,32 +185,36 @@ impl AnalyticsBundle {
         let stats_path = dir.join("statistics.json");
         let stats_json = serde_json::to_string_pretty(&self.statistics)
             .context("Failed to serialize statistics")?;
-        std::fs::write(&stats_path, stats_json).context("Failed to write statistics.json")?;
+        crate::pages::write_file_durably(&stats_path, stats_json.as_bytes())
+            .context("Failed to write statistics.json")?;
 
         // Write timeline.json
         let timeline_path = dir.join("timeline.json");
         let timeline_json =
             serde_json::to_string_pretty(&self.timeline).context("Failed to serialize timeline")?;
-        std::fs::write(&timeline_path, timeline_json).context("Failed to write timeline.json")?;
+        crate::pages::write_file_durably(&timeline_path, timeline_json.as_bytes())
+            .context("Failed to write timeline.json")?;
 
         // Write workspace_summary.json
         let workspace_path = dir.join("workspace_summary.json");
         let workspace_json = serde_json::to_string_pretty(&self.workspace_summary)
             .context("Failed to serialize workspace_summary")?;
-        std::fs::write(&workspace_path, workspace_json)
+        crate::pages::write_file_durably(&workspace_path, workspace_json.as_bytes())
             .context("Failed to write workspace_summary.json")?;
 
         // Write agent_summary.json
         let agent_path = dir.join("agent_summary.json");
         let agent_json = serde_json::to_string_pretty(&self.agent_summary)
             .context("Failed to serialize agent_summary")?;
-        std::fs::write(&agent_path, agent_json).context("Failed to write agent_summary.json")?;
+        crate::pages::write_file_durably(&agent_path, agent_json.as_bytes())
+            .context("Failed to write agent_summary.json")?;
 
         // Write top_terms.json
         let terms_path = dir.join("top_terms.json");
         let terms_json = serde_json::to_string_pretty(&self.top_terms)
             .context("Failed to serialize top_terms")?;
-        std::fs::write(&terms_path, terms_json).context("Failed to write top_terms.json")?;
+        crate::pages::write_file_durably(&terms_path, terms_json.as_bytes())
+            .context("Failed to write top_terms.json")?;
 
         info!(
             "Analytics written to {:?}: statistics.json, timeline.json, workspace_summary.json, agent_summary.json, top_terms.json",

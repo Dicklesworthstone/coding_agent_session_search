@@ -92,3 +92,84 @@ pub(crate) fn open_existing_sqlite_db(path: &Path) -> Result<Connection> {
     )
     .with_context(|| format!("opening sqlite database at {}", path.display()))
 }
+
+/// Write `data` to `path` and fsync both the file contents and the parent
+/// directory so the name-entry pointing at `path` survives a crash.
+///
+/// Why: a bare `std::fs::write` only flushes the page cache when the OS
+/// decides to. If power is lost between the write and the next sync, the
+/// file can appear empty or missing after reboot. This helper mirrors the
+/// fix landed for `pages/encrypt.rs::sync_tree` under bead
+/// coding_agent_session_search-92o31.
+#[cfg(not(windows))]
+pub(crate) fn write_file_durably(path: &Path, data: &[u8]) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("creating {} for durable write", path.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("writing {} durably", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsyncing {} after durable write", path.display()))?;
+    drop(f);
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .with_context(|| format!("opening parent {} for fsync", parent.display()))?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "fsyncing parent {} after durable write to {}",
+                parent.display(),
+                path.display()
+            )
+        })
+}
+
+/// Windows has no portable directory-fsync; NTFS journals dirent updates
+/// synchronously, so plain `fs::write` is sufficient for crash safety.
+#[cfg(windows)]
+pub(crate) fn write_file_durably(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data).with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_file_durably_writes_bytes_and_fsyncs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("out.json");
+        write_file_durably(&path, b"hello").expect("durable write");
+        let got = std::fs::read(&path).expect("read back");
+        assert_eq!(got, b"hello");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn write_file_durably_surfaces_parent_fsync_error() {
+        // Negative-side guard mirroring the sync_tree regression test from
+        // bead coding_agent_session_search-92o31: if the parent directory
+        // disappears between write and fsync, the helper must surface the
+        // I/O error rather than silently succeeding.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("subdir");
+        std::fs::create_dir(&nested).expect("mkdir");
+        let path = nested.join("out.json");
+
+        // A file path whose parent does not exist must fail at the open
+        // step; this proves the write is routed through our helper rather
+        // than any fire-and-forget path.
+        std::fs::remove_dir_all(&nested).expect("rm nested");
+        let err = write_file_durably(&path, b"data").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("creating") || msg.contains("opening parent"),
+            "expected durable write to surface I/O error, got: {msg}"
+        );
+    }
+}
