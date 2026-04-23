@@ -1,0 +1,22 @@
+{
+  "id": "chatgpt-multipart-001",
+  "title": "Multipart Fixture",
+  "mapping": {
+    "node-1": {
+      "parent": null,
+      "message": {
+        "author": {
+          "role": "user"
+        },
+        "content": {
+          "parts": [
+            "First paragraph.",
+            "Second paragraph.",
+            "```rust\nfn main() {}\n```"
+          ]
+        },
+        "create_time": 1701000100.0
+      }
+    }
+  }
+}

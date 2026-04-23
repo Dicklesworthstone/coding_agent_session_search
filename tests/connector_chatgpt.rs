@@ -17,6 +17,10 @@ fn write_json(dir: &Path, rel_path: &str, content: &str) -> std::path::PathBuf {
     path
 }
 
+fn chatgpt_real_fixture_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chatgpt_real")
+}
+
 // ============================================================================
 // Detection tests
 // ============================================================================
@@ -262,6 +266,32 @@ fn scan_extracts_id_from_filename_when_missing() {
 }
 
 #[test]
+fn scan_extracts_conversation_id_from_real_fixture() {
+    let root = chatgpt_real_fixture_root();
+    let expected_path = root.join("conversations-real/conv-conversation-id.json");
+
+    let connector = ChatGptConnector::new();
+    let ctx = ScanContext::local_default(root.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+    let conv = convs
+        .into_iter()
+        .find(|conv| conv.source_path == expected_path)
+        .expect("conversation_id fixture should be discovered");
+
+    assert_eq!(
+        conv.external_id.as_deref(),
+        Some("chatgpt-desktop-conv-alt-001")
+    );
+    assert_eq!(conv.title.as_deref(), Some("Conversation ID Fixture"));
+    assert_eq!(conv.messages.len(), 2);
+    assert_eq!(
+        conv.messages[0].content,
+        "Use conversation_id as the stable external id."
+    );
+    assert_eq!(conv.messages[1].author.as_deref(), Some("gpt-4o"));
+}
+
+#[test]
 fn scan_handles_content_text_field() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -291,6 +321,28 @@ fn scan_handles_content_text_field() {
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].messages[0].content, "Via text field");
+}
+
+#[test]
+fn scan_joins_multipart_content_from_real_fixture() {
+    let root = chatgpt_real_fixture_root();
+    let expected_path = root.join("conversations-real/conv-multipart.json");
+
+    let connector = ChatGptConnector::new();
+    let ctx = ScanContext::local_default(root.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+    let conv = convs
+        .into_iter()
+        .find(|conv| conv.source_path == expected_path)
+        .expect("multipart fixture should be discovered");
+
+    assert_eq!(conv.external_id.as_deref(), Some("chatgpt-multipart-001"));
+    assert_eq!(conv.messages.len(), 1);
+    assert_eq!(
+        conv.messages[0].content,
+        "First paragraph.\nSecond paragraph.\n```rust\nfn main() {}\n```"
+    );
+    assert_eq!(conv.messages[0].role, "user");
 }
 
 // ============================================================================

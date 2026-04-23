@@ -1,0 +1,38 @@
+{
+  "conversation_id": "chatgpt-desktop-conv-alt-001",
+  "title": "Conversation ID Fixture",
+  "mapping": {
+    "node-user": {
+      "parent": null,
+      "message": {
+        "author": {
+          "role": "user"
+        },
+        "content": {
+          "parts": [
+            "Use conversation_id as the stable external id."
+          ]
+        },
+        "create_time": 1701000000.25
+      }
+    },
+    "node-assistant": {
+      "parent": "node-user",
+      "message": {
+        "author": {
+          "role": "assistant"
+        },
+        "content": {
+          "parts": [
+            "Confirmed.",
+            "The connector should prefer conversation_id when id is absent."
+          ]
+        },
+        "create_time": 1701000001.75,
+        "metadata": {
+          "model_slug": "gpt-4o"
+        }
+      }
+    }
+  }
+}
