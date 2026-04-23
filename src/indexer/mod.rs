@@ -24137,6 +24137,15 @@ mod tests {
             assert_eq!(rebuild.indexed_docs, 4);
         });
 
+        // Bead 9752r: commit 9e6c0ef7 (9ct8r) routes restart_from_zero
+        // rebuilds with total_conversations > 0 through
+        // `rebuild_tantivy_from_db_via_staged_shards`, which builds in
+        // a scratch tmpdir and publishes atomically via
+        // `publish_staged_lexical_index`. That path never opens a
+        // Tantivy writer against the live index, so the in-place-only
+        // steps `open_tantivy` and `ready_to_index` are no longer
+        // emitted for this scenario. The staged path's analogue is
+        // `persist_initial_checkpoint` (which already appears below).
         for needle in [
             "lexical rebuild prep profile",
             r#"component="main""#,
@@ -24145,9 +24154,7 @@ mod tests {
             r#"step="load_checkpoint_state""#,
             r#"step="start_packet_producer""#,
             r#"step="plan_lexical_shards""#,
-            r#"step="open_tantivy""#,
             r#"step="persist_initial_checkpoint""#,
-            r#"step="ready_to_index""#,
             r#"component="producer""#,
             r#"step="load_sources""#,
             r#"step="build_lookups""#,
@@ -24161,22 +24168,28 @@ mod tests {
             );
         }
 
+        // Ordering invariant: deterministic shard planning must
+        // complete before the producer starts up, and the producer
+        // startup must complete before the initial checkpoint is
+        // persisted (the staged-path analogue of the old
+        // "producer-before-open_tantivy" overlap contract).
         let start_packet_producer = logs
             .find(r#"step="start_packet_producer""#)
             .expect("start_packet_producer log position");
         let plan_lexical_shards = logs
             .find(r#"step="plan_lexical_shards""#)
             .expect("plan_lexical_shards log position");
-        let open_tantivy = logs
-            .find(r#"step="open_tantivy""#)
-            .expect("open_tantivy log position");
+        let persist_initial_checkpoint = logs
+            .find(r#"step="persist_initial_checkpoint""#)
+            .expect("persist_initial_checkpoint log position");
         assert!(
             plan_lexical_shards < start_packet_producer,
             "fresh rebuild should finish deterministic shard planning before producer startup overlap: {logs}"
         );
         assert!(
-            start_packet_producer < open_tantivy,
-            "fresh rebuild should overlap producer startup before Tantivy open: {logs}"
+            start_packet_producer < persist_initial_checkpoint,
+            "fresh staged rebuild should start the packet producer before \
+             persisting the initial checkpoint (producer-handoff overlap): {logs}"
         );
     }
 
@@ -24260,6 +24273,16 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_logs_streamed_batch_stats() {
+        // Bead 9752r: after 9e6c0ef7 (9ct8r) routes restart_from_zero
+        // rebuilds with total_conversations > 0 through the
+        // staged-shards path, the in-place streaming `flushed a
+        // streamed conversation batch` + `chunk_*` logs no longer
+        // fire for this scenario. The staged path's equivalent
+        // page-level diagnostic is `lexical rebuild prepared bounded
+        // page` (already emitted) plus `built lexical rebuild shard
+        // index` as the commit-phase analogue. The bounded-page
+        // budget fields and the overall indexed_docs assertion below
+        // are preserved because they're path-agnostic contracts.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -24275,12 +24298,11 @@ mod tests {
             let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
             assert_eq!(rebuild.indexed_docs, 4);
             assert_eq!(rebuild.observed_messages, Some(4));
-            assert!(rebuild.exact_checkpoint_persisted);
         });
 
         assert!(
-            logs.contains("lexical rebuild flushed a streamed conversation batch"),
-            "expected streamed batch log, got:
+            logs.contains("running fresh authoritative lexical rebuild via staged shard-build path"),
+            "expected staged-shards rebuild banner after 9ct8r routing, got:
 {logs}"
         );
         assert!(
@@ -24296,23 +24318,18 @@ mod tests {
 {logs}"
         );
         assert!(
-            logs.contains("page_size=1024"),
-            "expected page_size in logs, got:
+            logs.contains("page_messages=4") && logs.contains("page_conversations=2"),
+            "expected per-page conversation + message counts matching the fixture (2 convs / 4 msgs), got:
 {logs}"
         );
         assert!(
-            logs.contains("chunk_conversations=2"),
-            "expected chunk_conversations in logs, got:
+            logs.contains("built lexical rebuild shard index"),
+            "expected staged-shards commit-phase diagnostic, got:
 {logs}"
         );
         assert!(
-            logs.contains("chunk_messages=4"),
-            "expected chunk_messages in logs, got:
-{logs}"
-        );
-        assert!(
-            logs.contains("chunk_message_bytes="),
-            "expected chunk_message_bytes in logs, got:
+            logs.contains("indexed_docs=4") && logs.contains("shard_conversations=2"),
+            "expected shard-build completion counts (4 docs / 2 convs) in staged output, got:
 {logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
@@ -24921,15 +24938,22 @@ mod tests {
             !logs.contains(r#"step="compute_db_state_fingerprint""#),
             "deferred startup should skip exact startup fingerprinting: {logs}"
         );
+        // Bead 9752r: after 9ct8r, restart_from_zero rebuilds go
+        // through the staged-shards path which does not open a live
+        // Tantivy writer (no `open_tantivy` step). The staged-path
+        // analogue for producer-handoff ordering is
+        // `persist_initial_checkpoint`: the producer must start up
+        // before the initial checkpoint is written.
         let start_packet_producer = logs
             .find(r#"step="start_packet_producer""#)
             .expect("start_packet_producer log position");
-        let open_tantivy = logs
-            .find(r#"step="open_tantivy""#)
-            .expect("open_tantivy log position");
+        let persist_initial_checkpoint = logs
+            .find(r#"step="persist_initial_checkpoint""#)
+            .expect("persist_initial_checkpoint log position");
         assert!(
-            start_packet_producer < open_tantivy,
-            "deferred fresh rebuild should overlap producer startup before Tantivy open: {logs}"
+            start_packet_producer < persist_initial_checkpoint,
+            "deferred fresh staged rebuild should start the packet producer before \
+             persisting the initial checkpoint (producer-handoff overlap): {logs}"
         );
     }
 
@@ -26533,9 +26557,17 @@ mod tests {
         let first_batch_handoff = logs
             .find(r#"step="first_batch_handoff""#)
             .expect("first_batch_handoff log position");
+        // Bead 9752r: commit 9e6c0ef7 (9ct8r) moved shard planning
+        // BEFORE the restart-from-zero reset — the reset now needs to
+        // know whether a staged shard plan exists so it can skip the
+        // live-index pre-wipe when the staged-shards path will
+        // atomically publish instead. Planning still completes before
+        // producer startup and initial-checkpoint persistence, which
+        // is the load-bearing handoff invariant.
         assert!(
-            restart_from_zero_reset < plan_lexical_shards,
-            "restart-from-zero rebuild should clear stale checkpoint state before replanning staged shards: {logs}"
+            plan_lexical_shards < restart_from_zero_reset,
+            "9ct8r: staged shard planning must run BEFORE the restart-from-zero \
+             reset so the reset can decide whether to skip the pre-wipe: {logs}"
         );
         assert!(
             plan_lexical_shards < start_packet_producer,
