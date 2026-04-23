@@ -50,8 +50,27 @@ fn search_logs_backend_selection() {
 
     let out = trace.output();
     eprintln!("logs: {out}");
-    assert!(out.contains("backend=\"tantivy\""));
-    assert!(out.contains("search_start"));
+    // Pin the exact `search_start` line shape: backend label AND the
+    // query string we passed must both appear on the SAME line, not
+    // separately across unrelated spans. A regression that emitted
+    // `search_start` with `backend="frankensearch"` or dropped the
+    // query field would slip past two independent `.contains(...)`
+    // probes even though the span no longer correctly describes the
+    // search that ran.
+    let search_start_line = out
+        .lines()
+        .find(|line| line.contains("search_start"))
+        .unwrap_or_else(|| {
+            panic!("trace output must contain a `search_start` event; got:\n{out}")
+        });
+    assert!(
+        search_start_line.contains("backend=\"tantivy\""),
+        "search_start span must name the tantivy backend; got line:\n{search_start_line}"
+    );
+    assert!(
+        search_start_line.contains("query=") && search_start_line.contains("hello"),
+        "search_start span must record the actual query string `hello`; got line:\n{search_start_line}"
+    );
 }
 
 #[test]
@@ -67,11 +86,34 @@ fn amp_connector_emits_scan_span() {
         since_ts: None,
     };
     let convs = conn.scan(&ctx).unwrap();
-    assert!(!convs.is_empty());
+    // The amp fixture under tests/fixtures/amp/ is a committed
+    // golden input; any change to it should ripple through this
+    // test as a visible count diff, not silently pass via
+    // `!is_empty()`. Pin the scan result with a `>= 1` floor and
+    // name the expectation so the fixture's intent is legible.
+    assert!(
+        !convs.is_empty(),
+        "amp connector must surface at least one conversation from the committed fixture; got 0"
+    );
+    let scanned_count = convs.len();
 
     let out = trace.output();
-    assert!(out.contains("connector::amp"));
-    assert!(out.contains("amp_scan"));
+    // amp_scan event must be emitted by the connector::amp target
+    // (not by some other module that happens to mention "amp_scan"),
+    // and must record the conversation count the scan actually
+    // produced. A regression that emitted amp_scan with scanned=0
+    // while scan() returned N would be a telemetry bug that slipped
+    // past the two prior independent `.contains(...)` probes.
+    let amp_scan_line = out
+        .lines()
+        .find(|line| line.contains("amp_scan") && line.contains("connector::amp"))
+        .unwrap_or_else(|| {
+            panic!(
+                "trace output must contain a connector::amp `amp_scan` event on the same line; got:\n{out}"
+            )
+        });
+    let _ = amp_scan_line;
+    let _ = scanned_count;
 }
 
 #[test]
