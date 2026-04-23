@@ -175,7 +175,20 @@ fn semantic_index_builds_vector_file() {
         "Vector index directory should contain .fsvi files"
     );
     let metadata = fs::metadata(vector_files[0].path()).unwrap();
-    assert!(metadata.len() > 0, "Vector index file should not be empty");
+    // A real .fsvi vector index file for a hash-embedder corpus will be
+    // at least a few KiB (vector headers + padding + embedding rows for
+    // the seeded messages). A 1-byte file would pass `> 0` while
+    // clearly indicating the file was created but never populated —
+    // exactly the regression a presence-only check fails to catch.
+    let file_bytes = metadata.len();
+    assert!(
+        file_bytes >= 1024,
+        "vector index file at {} must be at least 1 KiB to carry a \
+         meaningful set of embeddings; got {} bytes (presence-only \
+         `> 0` check would have missed this)",
+        vector_files[0].path().display(),
+        file_bytes
+    );
     tracker.end(
         "verify_vector_index",
         Some("Check vector index file exists"),
