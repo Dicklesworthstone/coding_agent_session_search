@@ -3082,3 +3082,128 @@ fn semantic_not_initialized_collapses_readiness_and_path_fields() {
         "availability ({availability}) diverged from status ({status}) — retention/acquisition code reading either field would see different phases"
     );
 }
+
+#[test]
+fn status_and_diag_agree_on_db_path_and_absence_coherence() {
+    // ibuuh.19 cross-command DB-path agreement row.
+    //
+    // Retention reads the DB path from `cass diag --json`'s paths
+    // block (the canonical inventory surface). Operators often read
+    // it from `cass status --json`'s `database.path` instead (the
+    // operator-facing surface). If the two surfaces diverged on
+    // *which* file they call the DB, retention would reclaim one
+    // file while operators and ops tooling read another — a "where
+    // is my DB" confusion with real downstream cost.
+    //
+    // Plus the per-command absence coherence that retention needs:
+    //   status.database.exists == diag.database.exists
+    //   status.database.conversations == 0 when !exists
+    //   status.database.messages == 0 when !exists
+    //   status.database.opened == false when !exists
+    //   status.database.counts_skipped == false when !exists
+    //     (an absent DB cannot have "skipped" counts — the counts
+    //      are authoritatively zero, not provisional)
+    //
+    // This row complements db_and_index_surface_flags_match_actual_filesystem
+    // (which pins three-way health+diag+FS agreement on exists) by
+    // extending coverage to `cass status --json` and adding the
+    // path-equality and count-coherence dimensions.
+    let test_home = tempfile::tempdir().expect("tempdir");
+
+    fn json_out(home: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .output()
+            .expect("run cass");
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let status = json_out(test_home.path(), &["status", "--json"]);
+    let diag = json_out(test_home.path(), &["diag", "--json"]);
+
+    // Invariant A: path equality.
+    let status_db_path = status["database"]["path"]
+        .as_str()
+        .expect("status.database.path must be a string");
+    let diag_db_path = diag["paths"]["db_path"]
+        .as_str()
+        .expect("diag.paths.db_path must be a string");
+    assert_eq!(
+        status_db_path, diag_db_path,
+        "status.database.path ({status_db_path}) diverged from diag.paths.db_path ({diag_db_path}) — retention and operators would target different files"
+    );
+
+    // Invariant B: existence agreement across the two surfaces.
+    let status_exists = status["database"]["exists"]
+        .as_bool()
+        .expect("status.database.exists must be a bool");
+    let diag_exists = diag["database"]["exists"]
+        .as_bool()
+        .expect("diag.database.exists must be a bool");
+    assert_eq!(
+        status_exists, diag_exists,
+        "status.database.exists ({status_exists}) diverged from diag.database.exists ({diag_exists}) — presence signal is not coherent across surfaces"
+    );
+
+    // Precondition for absence-coherence: isolated HOME ⇒ no DB.
+    assert!(
+        !status_exists,
+        "isolated HOME unexpectedly reports database.exists=true"
+    );
+
+    // Invariant C: absence ⇒ status.database counts/opened are coherent.
+    let opened = status["database"]["opened"]
+        .as_bool()
+        .expect("status.database.opened must be a bool");
+    assert!(
+        !opened,
+        "database.exists=false but opened=true — cannot have an open handle on a non-existent DB"
+    );
+    let conv = status["database"]["conversations"]
+        .as_u64()
+        .expect("status.database.conversations must be u64");
+    let msgs = status["database"]["messages"]
+        .as_u64()
+        .expect("status.database.messages must be u64");
+    assert_eq!(
+        conv, 0,
+        "database.exists=false but conversations={conv} — phantom rows in an absent DB"
+    );
+    assert_eq!(
+        msgs, 0,
+        "database.exists=false but messages={msgs} — phantom rows in an absent DB"
+    );
+
+    // counts_skipped semantics: "counts were not computed" signal.
+    // When DB is absent, counts are authoritatively zero (not
+    // "skipped") — skipped implies there was a DB to count but we
+    // chose not to. A counts_skipped=true here would mislead
+    // retention into treating the zero as provisional.
+    let skipped = status["database"]["counts_skipped"]
+        .as_bool()
+        .expect("status.database.counts_skipped must be a bool");
+    assert!(
+        !skipped,
+        "database.exists=false but counts_skipped=true — retention would treat zero-counts as provisional when they are authoritative"
+    );
+
+    // open_error/open_retryable must also be null/false when absent
+    // — no open was attempted, so there is no error state to report.
+    let open_err = &status["database"]["open_error"];
+    assert!(
+        open_err.is_null(),
+        "database.exists=false but open_error={open_err:?} — no open was attempted"
+    );
+    let retryable = status["database"]["open_retryable"]
+        .as_bool()
+        .expect("status.database.open_retryable must be a bool");
+    assert!(
+        !retryable,
+        "database.exists=false but open_retryable=true — retry semantics only apply when a real open attempt occurred"
+    );
+}
