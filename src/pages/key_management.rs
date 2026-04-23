@@ -29,10 +29,8 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
-use hkdf::Hkdf;
 use rand::Rng;
 use serde::Serialize;
-use sha2::Sha256;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
@@ -470,11 +468,12 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing
 
 /// Derive KEK from recovery secret using HKDF-SHA256
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-    let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
-    hkdf.expand(b"cass-pages-kek-v2", kek.as_mut())
-        .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
-    Ok(kek)
+    let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let kek: [u8; 32] = kek
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("HKDF expansion produced invalid KEK length"))?;
+    Ok(zeroize::Zeroizing::new(kek))
 }
 
 /// Unwrap DEK with KEK

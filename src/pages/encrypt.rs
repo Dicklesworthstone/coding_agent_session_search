@@ -18,10 +18,8 @@ use argon2::{
 };
 use base64::prelude::*;
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
-use hkdf::Hkdf;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -572,10 +570,11 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<SecretKey> {
 
 /// Derive KEK from recovery secret using HKDF-SHA256
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<SecretKey> {
-    let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
-    let mut kek = [0u8; 32];
-    hkdf.expand(b"cass-pages-kek-v2", &mut kek)
-        .map_err(|_| anyhow::anyhow!("HKDF expansion failed"))?;
+    let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let kek: [u8; 32] = kek
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("HKDF expansion produced invalid KEK length"))?;
     Ok(SecretKey::from_bytes(kek))
 }
 

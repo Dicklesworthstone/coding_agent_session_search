@@ -79,14 +79,19 @@ bloomfilter = "*"  # Probabilistic membership testing for P2 Opt 3.3: Workspace 
 hnsw_rs = "*"  # Opt 9: Approximate Nearest Neighbor with HNSW
 ouroboros = "*"  # Safe self-referential wrapper for HNSW loader lifetime
 
-# Crypto for ChatGPT encrypted conversations and HTML export encryption
-aes-gcm = "*"
+# Crypto for ChatGPT encrypted conversations and HTML export encryption.
+# The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
+# majors: aes-gcm 0.10 uses digest 0.10, which is what sha2 0.10 / hmac 0.12 /
+# hkdf 0.12 export. Leaving these as wildcards lets cargo upgrade hkdf + hmac
+# to 0.13 (digest 0.11), which fails to satisfy aes-gcm's KeyInit bound and
+# breaks the encryption.rs build with ~29 trait-bound errors.
+aes-gcm = "0.10"
 ring = "*"
 url = "*"
 pbkdf2 = "*"  # PBKDF2 key derivation for Web Crypto compatible HTML export encryption
 
 # SHA256 hashing for model verification
-sha2 = "*"
+sha2 = "0.10"
 hex = "*"
 
 # Interactive terminal prompts for setup wizard
@@ -97,7 +102,7 @@ ssh2 = "*"
 # Statically link OpenSSL so release binaries don't require system libssl.so.3
 openssl = { version = "*", features = ["vendored"] }
 argon2 = "*"
-hkdf = "*"
+hkdf = "0.12"  # Must match hmac 0.12 / sha2 0.10 / aes-gcm 0.10 digest family; see comment above.
 zeroize = { version = "*", features = ["derive"] }
 flate2 = "*"
 rand = "0.10"

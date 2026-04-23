@@ -406,14 +406,10 @@ fn compute_sha256_hex(data: &[u8]) -> String {
 
 /// Derive a unique 12-byte nonce from a blob identifier using HKDF
 fn derive_blob_nonce(identifier: &str) -> [u8; 12] {
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-
-    let hkdf = Hkdf::<Sha256>::new(Some(BLOB_NONCE_DOMAIN), identifier.as_bytes());
-    let mut nonce = [0u8; 12];
-    hkdf.expand(b"nonce", &mut nonce)
-        .expect("HKDF expansion should never fail for 12 bytes");
-    nonce
+    crate::encryption::hkdf_extract_expand(identifier.as_bytes(), BLOB_NONCE_DOMAIN, b"nonce", 12)
+        .expect("HKDF expansion should never fail for 12 bytes")
+        .try_into()
+        .expect("HKDF expansion should return the requested nonce length")
 }
 
 /// Decrypt a blob given the DEK, export_id, and hash

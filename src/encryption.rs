@@ -1,13 +1,23 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use hkdf::Hkdf;
-use sha2::Sha256;
+use ring::{
+    hkdf::{self as ring_hkdf, KeyType},
+    hmac,
+};
 
 pub use argon2::Params as Argon2Params;
 
 const AES_GCM_KEY_LEN: usize = 32;
 const AES_GCM_NONCE_LEN: usize = 12;
 const AES_GCM_TAG_LEN: usize = 16;
+
+struct HkdfOutputLen(usize);
+
+impl KeyType for HkdfOutputLen {
+    fn len(&self) -> usize {
+        self.0
+    }
+}
 
 fn validate_length(label: &str, actual: usize, expected: usize) -> Result<(), String> {
     if actual == expected {
@@ -108,16 +118,20 @@ pub fn hkdf_extract_expand(
     info: &[u8],
     len: usize,
 ) -> Result<Vec<u8>, String> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut okm = vec![0u8; len];
-    hk.expand(info, &mut okm)
-        .map_err(|e| format!("hkdf expand failed: {}", e))?;
-    Ok(okm)
+    let salt = ring_hkdf::Salt::new(ring_hkdf::HKDF_SHA256, salt);
+    let prk = salt.extract(ikm);
+    let okm = prk
+        .expand(&[info], HkdfOutputLen(len))
+        .map_err(|_| "hkdf expand failed: invalid output length".to_string())?;
+    let mut output = vec![0u8; len];
+    okm.fill(&mut output)
+        .map_err(|_| "hkdf expand failed: unable to fill output buffer".to_string())?;
+    Ok(output)
 }
 
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
-    let (prk, _) = Hkdf::<Sha256>::extract(Some(salt), ikm);
-    prk.to_vec()
+    let key = hmac::Key::new(hmac::HMAC_SHA256, salt);
+    hmac::sign(&key, ikm).as_ref().to_vec()
 }
 
 // =============================================================================
