@@ -77,3 +77,10 @@ path = "fuzz_targets/fuzz_cli_argv.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_html_export_renderer"
+path = "fuzz_targets/fuzz_html_export_renderer.rs"
+test = false
+doc = false
+bench = false
