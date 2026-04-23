@@ -730,8 +730,10 @@ Every command supports machine-readable output:
 # Pretty-printed JSON (default robot mode)
 cass search "error" --robot
 
-# Streaming JSONL: header line with _meta, then one hit per line
-cass search "error" --robot-format jsonl
+# Streaming JSONL: one hit per line. Add --robot-meta to prepend a
+# _meta header line (elapsed_ms, next_cursor, state, index_freshness).
+cass search "error" --robot-format jsonl               # hits only
+cass search "error" --robot-format jsonl --robot-meta  # 1 _meta header + hits
 
 # Compact single-line JSON (minimal bytes)
 cass search "error" --robot-format compact
