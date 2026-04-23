@@ -569,20 +569,46 @@ fn incremental_index_on_large_base() {
 
     tracker.metrics("incremental_index_large_base", &metrics);
 
-    // Incremental should be faster than full
-    assert!(
-        incremental_duration_ms < full_duration_ms,
-        "Incremental index ({} ms) should be faster than full index ({} ms)",
-        incremental_duration_ms,
-        full_duration_ms
+    // Bead yeq49: the previous strict `incremental_duration_ms <
+    // full_duration_ms` wall-clock assertion flaked under multi-agent
+    // cargo+rustc load on shared workers (this repo is routinely
+    // exercised by 6+ concurrent cargo processes across test panes).
+    // OS scheduler noise inverts the inequality even though
+    // incremental is doing strictly less work than full.
+    //
+    // The test's INTENT is correctness of the incremental indexing
+    // path — it must pick up exactly one new Codex session (one user
+    // + one assistant message = 2 canonical messages) without
+    // reprocessing the 1000-session base. That contract is
+    // deterministic and verifiable without a wall-clock.
+    // Performance-side coverage lives in benches/integration_regression.rs
+    // where statistical treatment replaces the single-run timing
+    // check. Timing is still emitted as a `tracker.metrics` custom
+    // for observability (not an assertion).
+    //
+    // Keep a very loose performance tripwire (`incremental < full *
+    // 10`) so a genuine order-of-magnitude regression — incremental
+    // somehow re-scanning the entire base — still fires the test.
+    let added_messages = final_msg_count - initial_msg_count;
+    assert_eq!(
+        added_messages, 2,
+        "Incremental index must pick up exactly one new Codex session \
+         (one user + one assistant message = 2 canonical messages); \
+         got {added_messages} new messages (initial={initial_msg_count}, \
+         final={final_msg_count}). A different count means the \
+         connector mis-counted the rollout-new.jsonl payload or the \
+         incremental run reprocessed base data."
     );
 
-    // Verify new messages were added
+    let timing_ceiling_ms = full_duration_ms.saturating_mul(10);
     assert!(
-        final_msg_count > initial_msg_count,
-        "Should have added new messages: {} -> {}",
-        initial_msg_count,
-        final_msg_count
+        incremental_duration_ms <= timing_ceiling_ms,
+        "Incremental index is catastrophically slow: {} ms vs full {} ms \
+         (>10x regression threshold). Metric regression, not scheduler \
+         noise. Timing ceiling = {} ms.",
+        incremental_duration_ms,
+        full_duration_ms,
+        timing_ceiling_ms
     );
 
     tracker.flush();
