@@ -520,6 +520,10 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
 
+        /// Include quarantine and retained-asset inspection details
+        #[arg(long, default_value_t = false)]
+        quarantine: bool,
+
         /// Include verbose information (file sizes, timestamps)
         #[arg(long, short)]
         verbose: bool,
@@ -3297,10 +3301,17 @@ async fn execute_cli(
                 Commands::Diag {
                     data_dir,
                     json,
+                    quarantine,
                     verbose,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_diag(&data_dir, cli.db.clone(), structured_format, verbose)?;
+                    run_diag(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        quarantine,
+                        verbose,
+                    )?;
                 }
                 Commands::Status {
                     data_dir,
@@ -10141,6 +10152,7 @@ fn run_diag(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
+    quarantine: bool,
     verbose: bool,
 ) -> CliResult<()> {
     use frankensqlite::compat::RowExt;
@@ -10252,6 +10264,8 @@ fn run_diag(
 
     let platform = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
+    let quarantine_report =
+        quarantine.then(|| collect_diag_quarantine_report(&data_dir, &index_path));
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -10262,7 +10276,7 @@ fn run_diag(
     });
 
     if let Some(fmt) = structured_format {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "version": version,
             "platform": { "os": platform, "arch": arch },
             "paths": {
@@ -10288,6 +10302,9 @@ fn run_diag(
                 })
             }).collect::<Vec<_>>(),
         });
+        if let Some(report) = quarantine_report.as_ref() {
+            payload["quarantine"] = serde_json::json!(report);
+        }
         return output_structured_value(payload, fmt);
     }
 
@@ -10331,8 +10348,256 @@ fn run_diag(
         let status = if *found { "✓" } else { "✗" };
         println!("  {} {}: {}", status, name, path);
     }
+    if let Some(report) = quarantine_report.as_ref() {
+        println!();
+        println!("Quarantine:");
+        println!(
+            "  Failed seed bundles: {}",
+            report.summary.failed_seed_bundle_count
+        );
+        println!(
+            "  Retained publish backups: {}",
+            report.summary.retained_publish_backup_count
+        );
+        println!(
+            "  Quarantined lexical generations: {}",
+            report.summary.lexical_quarantined_generation_count
+        );
+        println!(
+            "  Quarantined lexical shards: {}",
+            report.summary.lexical_quarantined_shard_count
+        );
+        println!(
+            "  Total retained bytes: {}",
+            report.summary.total_retained_bytes
+        );
+        if !report.failed_seed_bundle_files.is_empty() {
+            println!("  Failed seed bundle files:");
+            for artifact in &report.failed_seed_bundle_files {
+                println!("    - {} ({} bytes)", artifact.path, artifact.size_bytes);
+            }
+        }
+        if !report.retained_publish_backups.is_empty() {
+            println!("  Retained publish backups:");
+            for artifact in &report.retained_publish_backups {
+                println!("    - {} ({} bytes)", artifact.path, artifact.size_bytes);
+            }
+        }
+        if !report.lexical_generations.is_empty() {
+            println!("  Quarantined lexical generations:");
+            for generation in &report.lexical_generations {
+                println!(
+                    "    - {} [{}] shards={}/{} bytes={}",
+                    generation.path,
+                    generation.publish_state,
+                    generation.quarantined_shards,
+                    generation.total_shards,
+                    generation.artifact_bytes
+                );
+            }
+        }
+        if verbose && !report.warnings.is_empty() {
+            println!("  Scan warnings:");
+            for warning in &report.warnings {
+                println!("    - {warning}");
+            }
+        }
+    }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagQuarantineArtifact {
+    path: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagQuarantinedGeneration {
+    path: String,
+    generation_id: String,
+    publish_state: &'static str,
+    quarantined_shards: usize,
+    total_shards: usize,
+    artifact_bytes: u64,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DiagQuarantineSummary {
+    failed_seed_bundle_count: usize,
+    retained_publish_backup_count: usize,
+    lexical_quarantined_generation_count: usize,
+    lexical_quarantined_shard_count: usize,
+    total_retained_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DiagQuarantineReport {
+    summary: DiagQuarantineSummary,
+    failed_seed_bundle_files: Vec<DiagQuarantineArtifact>,
+    retained_publish_backups: Vec<DiagQuarantineArtifact>,
+    lexical_generations: Vec<DiagQuarantinedGeneration>,
+    warnings: Vec<String>,
+}
+
+fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQuarantineReport {
+    use crate::indexer::lexical_generation::{
+        LEXICAL_GENERATION_MANIFEST_FILE, LexicalGenerationPublishState,
+        LexicalShardLifecycleState, load_manifest,
+    };
+
+    let mut report = DiagQuarantineReport::default();
+
+    let backups_dir = data_dir.join("backups");
+    match std::fs::read_dir(&backups_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !name.contains(".failed-baseline-seed.bak") {
+                    continue;
+                }
+                report
+                    .failed_seed_bundle_files
+                    .push(DiagQuarantineArtifact {
+                        path: path.display().to_string(),
+                        size_bytes: fs_dir_size(&path),
+                    });
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => report.warnings.push(format!(
+            "failed to read backup quarantine directory {}: {err}",
+            backups_dir.display()
+        )),
+    }
+
+    let retained_publish_dir = index_path
+        .parent()
+        .unwrap_or(index_path)
+        .join(".lexical-publish-backups");
+    match std::fs::read_dir(&retained_publish_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                report
+                    .retained_publish_backups
+                    .push(DiagQuarantineArtifact {
+                        path: path.display().to_string(),
+                        size_bytes: fs_dir_size(&path),
+                    });
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => report.warnings.push(format!(
+            "failed to read retained publish backups at {}: {err}",
+            retained_publish_dir.display()
+        )),
+    }
+
+    for entry in walkdir::WalkDir::new(data_dir).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                report.warnings.push(format!(
+                    "failed to walk quarantine roots under {}: {err}",
+                    data_dir.display()
+                ));
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy() != LEXICAL_GENERATION_MANIFEST_FILE {
+            continue;
+        }
+        let Some(generation_dir) = entry.path().parent() else {
+            continue;
+        };
+        match load_manifest(generation_dir) {
+            Ok(Some(manifest)) => {
+                let quarantined_shards = manifest
+                    .shards
+                    .iter()
+                    .filter(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
+                    .count();
+                if matches!(
+                    manifest.publish_state,
+                    LexicalGenerationPublishState::Quarantined
+                ) || quarantined_shards > 0
+                {
+                    report.lexical_generations.push(DiagQuarantinedGeneration {
+                        path: generation_dir.display().to_string(),
+                        generation_id: manifest.generation_id,
+                        publish_state: lexical_publish_state_label(manifest.publish_state),
+                        quarantined_shards,
+                        total_shards: manifest.shards.len(),
+                        artifact_bytes: fs_dir_size(generation_dir),
+                        updated_at_ms: manifest.updated_at_ms,
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(err) => report.warnings.push(format!(
+                "failed to load lexical quarantine manifest at {}: {err}",
+                entry.path().display()
+            )),
+        }
+    }
+
+    report
+        .failed_seed_bundle_files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    report
+        .retained_publish_backups
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    report
+        .lexical_generations
+        .sort_by(|left, right| left.path.cmp(&right.path));
+
+    report.summary.failed_seed_bundle_count = report.failed_seed_bundle_files.len();
+    report.summary.retained_publish_backup_count = report.retained_publish_backups.len();
+    report.summary.lexical_quarantined_generation_count = report.lexical_generations.len();
+    report.summary.lexical_quarantined_shard_count = report
+        .lexical_generations
+        .iter()
+        .map(|generation| generation.quarantined_shards)
+        .sum();
+    report.summary.total_retained_bytes = report
+        .failed_seed_bundle_files
+        .iter()
+        .map(|artifact| artifact.size_bytes)
+        .sum::<u64>()
+        + report
+            .retained_publish_backups
+            .iter()
+            .map(|artifact| artifact.size_bytes)
+            .sum::<u64>()
+        + report
+            .lexical_generations
+            .iter()
+            .map(|generation| generation.artifact_bytes)
+            .sum::<u64>();
+
+    report
+}
+
+fn lexical_publish_state_label(
+    state: crate::indexer::lexical_generation::LexicalGenerationPublishState,
+) -> &'static str {
+    use crate::indexer::lexical_generation::LexicalGenerationPublishState;
+
+    match state {
+        LexicalGenerationPublishState::Staged => "staged",
+        LexicalGenerationPublishState::Published => "published",
+        LexicalGenerationPublishState::Superseded => "superseded",
+        LexicalGenerationPublishState::Quarantined => "quarantined",
+    }
 }
 
 fn fs_dir_size(path: &std::path::Path) -> u64 {
