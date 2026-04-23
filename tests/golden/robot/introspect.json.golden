@@ -2287,6 +2287,38 @@
         "latency_ms": {
           "type": "integer"
         },
+        "db": {
+          "type": "object",
+          "properties": {
+            "exists": {
+              "type": "boolean"
+            },
+            "opened": {
+              "type": "boolean"
+            },
+            "conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "messages": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "open_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "counts_skipped": {
+              "type": "boolean"
+            }
+          }
+        },
         "responsiveness": {
           "type": "object",
           "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
@@ -2371,6 +2403,332 @@
             }
           }
         },
+        "state": {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "object",
+              "properties": {
+                "exists": {
+                  "type": "boolean"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
+                "last_indexed_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "age_seconds": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "stale": {
+                  "type": "boolean"
+                },
+                "stale_threshold_seconds": {
+                  "type": "integer"
+                },
+                "rebuilding": {
+                  "type": "boolean"
+                },
+                "activity_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "empty_with_messages": {
+                  "type": "boolean"
+                },
+                "fingerprint": {
+                  "type": "object",
+                  "properties": {
+                    "current_db_fingerprint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "checkpoint_fingerprint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "matches_current_db_fingerprint": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "checkpoint": {
+                  "type": "object",
+                  "properties": {
+                    "present": {
+                      "type": "boolean"
+                    },
+                    "completed": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "db_matches": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "schema_matches": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "page_size_matches": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "page_size_compatible": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "database": {
+              "type": "object",
+              "properties": {
+                "exists": {
+                  "type": "boolean"
+                },
+                "opened": {
+                  "type": "boolean"
+                },
+                "conversations": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "messages": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "open_error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "open_retryable": {
+                  "type": "boolean"
+                },
+                "counts_skipped": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "pending": {
+              "type": "object",
+              "properties": {
+                "sessions": {
+                  "type": "integer"
+                },
+                "watch_active": {
+                  "type": "boolean"
+                },
+                "orphaned": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "rebuild": {
+              "type": "object",
+              "properties": {
+                "active": {
+                  "type": "boolean"
+                },
+                "orphaned": {
+                  "type": "boolean"
+                },
+                "pid": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "mode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "job_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "job_kind": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "phase": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "processed_conversations": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "total_conversations": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "indexed_docs": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "pipeline": {
+                  "type": "object",
+                  "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
+                  "additionalProperties": true
+                }
+              }
+            },
+            "semantic": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string"
+                },
+                "availability": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "available": {
+                  "type": "boolean"
+                },
+                "can_search": {
+                  "type": "boolean"
+                },
+                "fallback_mode": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "preferred_backend": {
+                  "type": "string"
+                },
+                "embedder_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "vector_index_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "model_dir": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "hnsw_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "hnsw_ready": {
+                  "type": "boolean"
+                },
+                "progressive_ready": {
+                  "type": "boolean"
+                },
+                "hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "_meta": {
+              "type": "object",
+              "properties": {
+                "timestamp": {
+                  "type": "string"
+                },
+                "data_dir": {
+                  "type": "string"
+                },
+                "db_path": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "parallel_wal_shadow": {
           "type": "object",
           "description": "Parallel-WAL shadow observer (Card 1, shadow-only phase). Activates under CASS_INDEXER_PARALLEL_WAL=shadow. Records per-chunk wall-clock on begin-concurrent writes so operators can assess what an epoch-ordered group-commit coordinator would have decided. NEVER changes commit semantics.",
@@ -2412,82 +2770,6 @@
                   "succeeded": {
                     "type": "boolean"
                   }
-                }
-              }
-            }
-          }
-        },
-        "state": {
-          "type": "object",
-          "properties": {
-            "_meta": {
-              "type": "object",
-              "properties": {
-                "data_dir": {
-                  "type": "string"
-                },
-                "db_path": {
-                  "type": "string"
-                },
-                "timestamp": {
-                  "type": "string"
-                }
-              }
-            },
-            "database": {
-              "type": "object",
-              "properties": {
-                "exists": {
-                  "type": "boolean"
-                },
-                "conversations": {
-                  "type": "integer"
-                },
-                "messages": {
-                  "type": "integer"
-                }
-              }
-            },
-            "index": {
-              "type": "object",
-              "properties": {
-                "exists": {
-                  "type": "boolean"
-                },
-                "fresh": {
-                  "type": "boolean"
-                },
-                "last_indexed_at": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "age_seconds": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
-                "stale": {
-                  "type": "boolean"
-                },
-                "stale_threshold_seconds": {
-                  "type": "integer"
-                }
-              }
-            },
-            "pending": {
-              "type": "object",
-              "properties": {
-                "sessions": {
-                  "type": "integer"
-                },
-                "watch_active": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
                 }
               }
             }
@@ -2838,6 +3120,42 @@
             "elapsed_ms": {
               "type": "integer"
             },
+            "search_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "requested_search_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mode_defaulted": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "fallback_tier": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "semantic_refinement": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "wildcard_fallback": {
               "type": "boolean"
             },
@@ -2851,6 +3169,20 @@
                   "type": "integer"
                 },
                 "shortfall": {
+                  "type": "integer"
+                }
+              }
+            },
+            "timing": {
+              "type": "object",
+              "properties": {
+                "search_ms": {
+                  "type": "integer"
+                },
+                "rerank_ms": {
+                  "type": "integer"
+                },
+                "other_ms": {
                   "type": "integer"
                 }
               }
@@ -2891,6 +3223,15 @@
                     "exists": {
                       "type": "boolean"
                     },
+                    "status": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "fresh": {
                       "type": "boolean"
                     },
@@ -2911,6 +3252,85 @@
                     },
                     "stale_threshold_seconds": {
                       "type": "integer"
+                    },
+                    "rebuilding": {
+                      "type": "boolean"
+                    },
+                    "activity_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "documents": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "empty_with_messages": {
+                      "type": "boolean"
+                    },
+                    "fingerprint": {
+                      "type": "object",
+                      "properties": {
+                        "current_db_fingerprint": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "checkpoint_fingerprint": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "matches_current_db_fingerprint": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        }
+                      }
+                    },
+                    "checkpoint": {
+                      "type": "object",
+                      "properties": {
+                        "present": {
+                          "type": "boolean"
+                        },
+                        "completed": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "db_matches": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "schema_matches": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "page_size_matches": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        },
+                        "page_size_compatible": {
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        }
+                      }
                     }
                   }
                 },
@@ -2920,11 +3340,201 @@
                     "exists": {
                       "type": "boolean"
                     },
+                    "opened": {
+                      "type": "boolean"
+                    },
                     "conversations": {
-                      "type": "integer"
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     },
                     "messages": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "open_error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "open_retryable": {
+                      "type": "boolean"
+                    },
+                    "counts_skipped": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "pending": {
+                  "type": "object",
+                  "properties": {
+                    "sessions": {
                       "type": "integer"
+                    },
+                    "watch_active": {
+                      "type": "boolean"
+                    },
+                    "orphaned": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "rebuild": {
+                  "type": "object",
+                  "properties": {
+                    "active": {
+                      "type": "boolean"
+                    },
+                    "orphaned": {
+                      "type": "boolean"
+                    },
+                    "pid": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "mode": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "job_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "job_kind": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "phase": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "started_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "updated_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "processed_conversations": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "total_conversations": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "indexed_docs": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "pipeline": {
+                      "type": "object",
+                      "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "semantic": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "availability": {
+                      "type": "string"
+                    },
+                    "summary": {
+                      "type": "string"
+                    },
+                    "available": {
+                      "type": "boolean"
+                    },
+                    "can_search": {
+                      "type": "boolean"
+                    },
+                    "fallback_mode": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "preferred_backend": {
+                      "type": "string"
+                    },
+                    "embedder_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "vector_index_path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "model_dir": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hnsw_path": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "hnsw_ready": {
+                      "type": "boolean"
+                    },
+                    "progressive_ready": {
+                      "type": "boolean"
+                    },
+                    "hint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "_meta": {
+                  "type": "object",
+                  "properties": {
+                    "timestamp": {
+                      "type": "string"
+                    },
+                    "data_dir": {
+                      "type": "string"
+                    },
+                    "db_path": {
+                      "type": "string"
                     }
                   }
                 }
@@ -2933,6 +3543,21 @@
             "index_freshness": {
               "type": "object",
               "properties": {
+                "exists": {
+                  "type": "boolean"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "fresh": {
+                  "type": "boolean"
+                },
                 "last_indexed_at": {
                   "type": [
                     "string",
@@ -2948,15 +3573,63 @@
                 "stale": {
                   "type": "boolean"
                 },
-                "pending_sessions": {
+                "stale_threshold_seconds": {
                   "type": "integer"
                 },
-                "fresh": {
+                "rebuilding": {
                   "type": "boolean"
+                },
+                "pending_sessions": {
+                  "type": "integer"
                 }
               }
+            },
+            "timeout_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "timed_out": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "partial_results": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "ann_stats": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": true
             }
           }
+        },
+        "suggestions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "explanation": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "_timeout": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
         }
       }
     },
@@ -3058,6 +3731,15 @@
             "exists": {
               "type": "boolean"
             },
+            "status": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "fresh": {
               "type": "boolean"
             },
@@ -3078,6 +3760,85 @@
             },
             "stale_threshold_seconds": {
               "type": "integer"
+            },
+            "rebuilding": {
+              "type": "boolean"
+            },
+            "activity_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "empty_with_messages": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "object",
+              "properties": {
+                "current_db_fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "checkpoint_fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "matches_current_db_fingerprint": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "checkpoint": {
+              "type": "object",
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "completed": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "schema_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "page_size_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "page_size_compatible": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -3087,11 +3848,32 @@
             "exists": {
               "type": "boolean"
             },
+            "opened": {
+              "type": "boolean"
+            },
             "conversations": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "messages": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "open_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "open_retryable": {
+              "type": "boolean"
+            },
+            "counts_skipped": {
+              "type": "boolean"
             },
             "path": {
               "type": "string"
@@ -3105,8 +3887,149 @@
               "type": "integer"
             },
             "watch_active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            }
+          }
+        },
+        "rebuild": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            },
+            "pid": {
               "type": [
-                "boolean",
+                "integer",
+                "null"
+              ]
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processed_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "indexed_docs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pipeline": {
+              "type": "object",
+              "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
+              "additionalProperties": true
+            }
+          }
+        },
+        "semantic": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "availability": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "available": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "fallback_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preferred_backend": {
+              "type": "string"
+            },
+            "embedder_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vector_index_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_dir": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hnsw_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hnsw_ready": {
+              "type": "boolean"
+            },
+            "progressive_ready": {
+              "type": "boolean"
+            },
+            "hint": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -3217,6 +4140,15 @@
             "exists": {
               "type": "boolean"
             },
+            "status": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "fresh": {
               "type": "boolean"
             },
@@ -3237,6 +4169,85 @@
             },
             "stale_threshold_seconds": {
               "type": "integer"
+            },
+            "rebuilding": {
+              "type": "boolean"
+            },
+            "activity_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "empty_with_messages": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "object",
+              "properties": {
+                "current_db_fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "checkpoint_fingerprint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "matches_current_db_fingerprint": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "checkpoint": {
+              "type": "object",
+              "properties": {
+                "present": {
+                  "type": "boolean"
+                },
+                "completed": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "db_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "schema_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "page_size_matches": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
+                "page_size_compatible": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              }
             }
           }
         },
@@ -3246,11 +4257,32 @@
             "exists": {
               "type": "boolean"
             },
+            "opened": {
+              "type": "boolean"
+            },
             "conversations": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "messages": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "open_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "open_retryable": {
+              "type": "boolean"
+            },
+            "counts_skipped": {
+              "type": "boolean"
             },
             "path": {
               "type": "string"
@@ -3264,8 +4296,149 @@
               "type": "integer"
             },
             "watch_active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            }
+          }
+        },
+        "rebuild": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "orphaned": {
+              "type": "boolean"
+            },
+            "pid": {
               "type": [
-                "boolean",
+                "integer",
+                "null"
+              ]
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job_kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processed_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "indexed_docs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pipeline": {
+              "type": "object",
+              "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
+              "additionalProperties": true
+            }
+          }
+        },
+        "semantic": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "availability": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "available": {
+              "type": "boolean"
+            },
+            "can_search": {
+              "type": "boolean"
+            },
+            "fallback_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "preferred_backend": {
+              "type": "string"
+            },
+            "embedder_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "vector_index_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model_dir": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hnsw_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hnsw_ready": {
+              "type": "boolean"
+            },
+            "progressive_ready": {
+              "type": "boolean"
+            },
+            "hint": {
+              "type": [
+                "string",
                 "null"
               ]
             }

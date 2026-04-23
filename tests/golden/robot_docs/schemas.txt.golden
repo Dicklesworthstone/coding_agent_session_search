@@ -33,6 +33,13 @@ schemas: (auto-generated from contract)
       - os: string
     - version: string
   health:
+    - db: object
+      - conversations: ?
+      - counts_skipped: boolean
+      - exists: boolean
+      - messages: ?
+      - open_error: ?
+      - opened: boolean
     - errors: array
     - explanation: ?
     - healthy: boolean
@@ -63,19 +70,61 @@ schemas: (auto-generated from contract)
         - db_path: string
         - timestamp: string
       - database: object
-        - conversations: integer
+        - conversations: ?
+        - counts_skipped: boolean
         - exists: boolean
-        - messages: integer
+        - messages: ?
+        - open_error: ?
+        - open_retryable: boolean
+        - opened: boolean
       - index: object
+        - activity_at: ?
         - age_seconds: ?
+        - checkpoint: object
+        - documents: ?
+        - empty_with_messages: boolean
         - exists: boolean
+        - fingerprint: object
         - fresh: boolean
         - last_indexed_at: ?
+        - reason: ?
+        - rebuilding: boolean
         - stale: boolean
         - stale_threshold_seconds: integer
+        - status: string
       - pending: object
+        - orphaned: boolean
         - sessions: integer
-        - watch_active: ?
+        - watch_active: boolean
+      - rebuild: object
+        - active: boolean
+        - indexed_docs: ?
+        - job_id: ?
+        - job_kind: ?
+        - mode: ?
+        - orphaned: boolean
+        - phase: ?
+        - pid: ?
+        - pipeline: object
+        - processed_conversations: ?
+        - started_at: ?
+        - total_conversations: ?
+        - updated_at: ?
+      - semantic: object
+        - availability: string
+        - available: boolean
+        - can_search: boolean
+        - embedder_id: ?
+        - fallback_mode: ?
+        - hint: ?
+        - hnsw_path: ?
+        - hnsw_ready: boolean
+        - model_dir: ?
+        - preferred_backend: string
+        - progressive_ready: boolean
+        - status: string
+        - summary: string
+        - vector_index_path: ?
     - status: string
   index:
     - conversations: ?
@@ -95,30 +144,55 @@ schemas: (auto-generated from contract)
     - response_schemas: object
   search:
     - _meta: object
+      - ann_stats: ?
       - cache_stats: object
         - hits: integer
         - misses: integer
         - shortfall: integer
       - elapsed_ms: integer
+      - fallback_reason: ?
+      - fallback_tier: ?
       - hits_clamped: boolean
       - index_freshness: object
         - age_seconds: ?
+        - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
         - pending_sessions: integer
+        - reason: ?
+        - rebuilding: boolean
         - stale: boolean
+        - stale_threshold_seconds: integer
+        - status: string
       - max_tokens: ?
+      - mode_defaulted: ?
       - next_cursor: ?
+      - partial_results: ?
       - request_id: ?
+      - requested_search_mode: ?
+      - search_mode: ?
+      - semantic_refinement: ?
       - state: object
+        - _meta: object
         - database: object
         - index: object
+        - pending: object
+        - rebuild: object
+        - semantic: object
+      - timed_out: ?
+      - timeout_ms: ?
+      - timing: object
+        - other_ms: integer
+        - rerank_ms: integer
+        - search_ms: integer
       - tokens_estimated: ?
       - wildcard_fallback: boolean
+    - _timeout: ?
     - _warning: ?
     - aggregations: ?
     - count: integer
     - cursor: ?
+    - explanation: ?
     - hits: array
     - hits_clamped: boolean
     - limit: integer
@@ -126,6 +200,7 @@ schemas: (auto-generated from contract)
     - offset: integer
     - query: string
     - request_id: ?
+    - suggestions: array
     - total_matches: integer
   sessions:
     - sessions: array
@@ -135,24 +210,75 @@ schemas: (auto-generated from contract)
       - db_path: string
       - timestamp: string
     - database: object
-      - conversations: integer
+      - conversations: ?
+      - counts_skipped: boolean
       - exists: boolean
-      - messages: integer
+      - messages: ?
+      - open_error: ?
+      - open_retryable: boolean
+      - opened: boolean
       - path: string
     - explanation: ?
     - healthy: boolean
     - index: object
+      - activity_at: ?
       - age_seconds: ?
+      - checkpoint: object
+        - completed: ?
+        - db_matches: ?
+        - page_size_compatible: ?
+        - page_size_matches: ?
+        - present: boolean
+        - schema_matches: ?
+      - documents: ?
+      - empty_with_messages: boolean
       - exists: boolean
+      - fingerprint: object
+        - checkpoint_fingerprint: ?
+        - current_db_fingerprint: ?
+        - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - reason: ?
+      - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - status: string
     - initialized: boolean
     - pending: object
+      - orphaned: boolean
       - sessions: integer
-      - watch_active: ?
+      - watch_active: boolean
+    - rebuild: object
+      - active: boolean
+      - indexed_docs: ?
+      - job_id: ?
+      - job_kind: ?
+      - mode: ?
+      - orphaned: boolean
+      - phase: ?
+      - pid: ?
+      - pipeline: object
+      - processed_conversations: ?
+      - started_at: ?
+      - total_conversations: ?
+      - updated_at: ?
     - recommended_action: ?
+    - semantic: object
+      - availability: string
+      - available: boolean
+      - can_search: boolean
+      - embedder_id: ?
+      - fallback_mode: ?
+      - hint: ?
+      - hnsw_path: ?
+      - hnsw_ready: boolean
+      - model_dir: ?
+      - preferred_backend: string
+      - progressive_ready: boolean
+      - status: string
+      - summary: string
+      - vector_index_path: ?
     - status: string
   stats:
     - by_agent: array
@@ -169,24 +295,75 @@ schemas: (auto-generated from contract)
       - db_path: string
       - timestamp: string
     - database: object
-      - conversations: integer
+      - conversations: ?
+      - counts_skipped: boolean
       - exists: boolean
-      - messages: integer
+      - messages: ?
+      - open_error: ?
+      - open_retryable: boolean
+      - opened: boolean
       - path: string
     - explanation: ?
     - healthy: boolean
     - index: object
+      - activity_at: ?
       - age_seconds: ?
+      - checkpoint: object
+        - completed: ?
+        - db_matches: ?
+        - page_size_compatible: ?
+        - page_size_matches: ?
+        - present: boolean
+        - schema_matches: ?
+      - documents: ?
+      - empty_with_messages: boolean
       - exists: boolean
+      - fingerprint: object
+        - checkpoint_fingerprint: ?
+        - current_db_fingerprint: ?
+        - matches_current_db_fingerprint: ?
       - fresh: boolean
       - last_indexed_at: ?
+      - reason: ?
+      - rebuilding: boolean
       - stale: boolean
       - stale_threshold_seconds: integer
+      - status: string
     - initialized: boolean
     - pending: object
+      - orphaned: boolean
       - sessions: integer
-      - watch_active: ?
+      - watch_active: boolean
+    - rebuild: object
+      - active: boolean
+      - indexed_docs: ?
+      - job_id: ?
+      - job_kind: ?
+      - mode: ?
+      - orphaned: boolean
+      - phase: ?
+      - pid: ?
+      - pipeline: object
+      - processed_conversations: ?
+      - started_at: ?
+      - total_conversations: ?
+      - updated_at: ?
     - recommended_action: ?
+    - semantic: object
+      - availability: string
+      - available: boolean
+      - can_search: boolean
+      - embedder_id: ?
+      - fallback_mode: ?
+      - hint: ?
+      - hnsw_path: ?
+      - hnsw_ready: boolean
+      - model_dir: ?
+      - preferred_backend: string
+      - progressive_ready: boolean
+      - status: string
+      - summary: string
+      - vector_index_path: ?
     - status: string
   view:
     - end_line: integer
