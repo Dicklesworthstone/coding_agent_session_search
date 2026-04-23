@@ -1,0 +1,168 @@
+{
+  "status": "not_initialized",
+  "healthy": false,
+  "initialized": false,
+  "explanation": "No cass database or search index exists in [TEST_HOME]/cass-data yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+  "index": {
+    "exists": false,
+    "status": "missing",
+    "reason": "lexical Tantivy metadata missing",
+    "fresh": false,
+    "last_indexed_at": null,
+    "age_seconds": "[AGE_SECONDS]",
+    "stale": false,
+    "stale_threshold_seconds": 1800,
+    "rebuilding": false,
+    "activity_at": null,
+    "documents": null,
+    "empty_with_messages": false,
+    "fingerprint": {
+      "current_db_fingerprint": null,
+      "checkpoint_fingerprint": null,
+      "matches_current_db_fingerprint": null
+    },
+    "checkpoint": {
+      "present": false,
+      "completed": null,
+      "db_matches": null,
+      "schema_matches": null,
+      "page_size_matches": null,
+      "page_size_compatible": null
+    }
+  },
+  "database": {
+    "exists": false,
+    "opened": false,
+    "conversations": 0,
+    "messages": 0,
+    "path": "[TEST_HOME]/cass-data/agent_search.db",
+    "open_error": null,
+    "open_retryable": false,
+    "counts_skipped": false
+  },
+  "pending": {
+    "sessions": 0,
+    "watch_active": false,
+    "orphaned": false
+  },
+  "rebuild": {
+    "active": false,
+    "orphaned": false,
+    "pid": null,
+    "mode": null,
+    "job_id": null,
+    "job_kind": null,
+    "phase": null,
+    "started_at": null,
+    "updated_at": null,
+    "processed_conversations": null,
+    "total_conversations": null,
+    "indexed_docs": null,
+    "pipeline": {
+      "workers": 64,
+      "available_parallelism": 128,
+      "reserved_cores": 8,
+      "tantivy_writer_threads": 26,
+      "staged_shard_builders": 8,
+      "staged_merge_workers": 4,
+      "controller_mode": "auto",
+      "controller_restore_clear_samples": 3,
+      "controller_restore_hold_ms": 5000,
+      "pipeline_max_message_bytes_in_flight": 402653184,
+      "page_prep_workers": 16,
+      "page_size": 1024,
+      "steady_batch_fetch_conversations": 1024,
+      "startup_batch_fetch_conversations": 32,
+      "steady_commit_every_conversations": 10000,
+      "startup_commit_every_conversations": 2048,
+      "steady_commit_every_messages": 800000,
+      "startup_commit_every_messages": 800000,
+      "steady_commit_every_message_bytes": 536870912,
+      "startup_commit_every_message_bytes": 134217728,
+      "pipeline_channel_size": 2,
+      "controller_loadavg_high_watermark_1m": 121.0,
+      "controller_loadavg_low_watermark_1m": 120.0,
+      "runtime": null
+    }
+  },
+  "semantic": {
+    "status": "not_initialized",
+    "availability": "not_initialized",
+    "summary": "semantic search is optional and has not been initialized yet",
+    "available": false,
+    "can_search": false,
+    "fallback_mode": "lexical",
+    "preferred_backend": "fastembed",
+    "embedder_id": null,
+    "vector_index_path": null,
+    "model_dir": null,
+    "hnsw_path": null,
+    "hnsw_ready": false,
+    "progressive_ready": false,
+    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical.",
+    "fast_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "quality_tier": {
+      "present": false,
+      "ready": false,
+      "current_db_matches": null,
+      "conversation_count": null,
+      "doc_count": null,
+      "embedder_id": null,
+      "model_revision": null,
+      "completed_at": null,
+      "size_bytes": null
+    },
+    "backlog": {
+      "total_conversations": 0,
+      "fast_tier_processed": 0,
+      "fast_tier_remaining": 0,
+      "quality_tier_processed": 0,
+      "quality_tier_remaining": 0,
+      "pending_work": false,
+      "current_db_matches": null,
+      "computed_at": null
+    },
+    "checkpoint": {
+      "active": false,
+      "tier": null,
+      "current_db_matches": null,
+      "completed": null,
+      "conversations_processed": null,
+      "total_conversations": null,
+      "progress_pct": null,
+      "docs_embedded": null,
+      "last_offset": null,
+      "saved_at": null
+    }
+  },
+  "quarantine": {
+    "summary": {
+      "failed_seed_bundle_count": 2,
+      "retained_publish_backup_count": 2,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_quarantined_generation_count": 1,
+      "lexical_quarantined_shard_count": 1,
+      "total_retained_bytes": 1138,
+      "gc_eligible_asset_count": 1,
+      "gc_eligible_bytes": 25,
+      "inspection_required_asset_count": 3,
+      "inspection_required_bytes": 1088
+    }
+  },
+  "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+  "_meta": {
+    "timestamp": "[TIMESTAMP]",
+    "data_dir": "[TEST_HOME]/cass-data",
+    "db_path": "[TEST_HOME]/cass-data/agent_search.db"
+  }
+}

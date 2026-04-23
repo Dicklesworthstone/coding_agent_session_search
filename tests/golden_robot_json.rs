@@ -628,6 +628,35 @@ fn status_quarantine_json_matches_golden() {
 }
 
 #[test]
+fn status_quarantine_full_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = seed_diag_quarantine_fixture(test_home.path());
+    let output = cass_cmd(test_home.path())
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        output.status.success(),
+        "cass status --json exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("status stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/status_quarantine_full.json.golden", &scrubbed);
+}
+
+#[test]
 fn quarantine_summary_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");
     let data_dir = seed_diag_quarantine_fixture(test_home.path());
