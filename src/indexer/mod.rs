@@ -8,8 +8,12 @@ pub mod semantic;
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Seek, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -63,6 +67,24 @@ type BatchClassificationMap =
     HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
+
+#[cfg(target_os = "linux")]
+mod linux_publish_swap {
+    use std::ffi::{c_char, c_int, c_uint};
+
+    pub const AT_FDCWD: c_int = -100;
+    pub const RENAME_EXCHANGE: c_uint = 0x2;
+
+    unsafe extern "C" {
+        pub fn renameat2(
+            olddirfd: c_int,
+            oldpath: *const c_char,
+            newdirfd: c_int,
+            newpath: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+    }
+}
 
 type LexicalRebuildMessageBatch = Vec<LexicalRebuildConversationPacket>;
 
@@ -10698,23 +10720,215 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
             )
         })?;
     }
-    if index_path.exists() {
-        fs::remove_dir_all(index_path).with_context(|| {
+    recover_or_finalize_interrupted_lexical_publish_backup(index_path)?;
+    ensure_lexical_publish_backups_dir(index_path)?;
+
+    if !index_path.exists() {
+        fs::rename(staged_index_path, index_path).with_context(|| {
             format!(
-                "removing prior lexical index directory before staged publish {}",
+                "publishing first staged lexical index {} -> {}",
+                staged_index_path.display(),
                 index_path.display()
             )
         })?;
+        sync_parent_directory(index_path)?;
+        return Ok(());
     }
-    fs::rename(staged_index_path, index_path).with_context(|| {
+
+    let retained_backup_path = unique_lexical_publish_backup_path(index_path);
+
+    #[cfg(target_os = "linux")]
+    {
+        atomic_exchange_paths(index_path, staged_index_path)?;
+        if let Err(retain_err) = fs::rename(staged_index_path, &retained_backup_path) {
+            match atomic_exchange_paths(index_path, staged_index_path) {
+                Ok(()) => {
+                    return Err(retain_err).with_context(|| {
+                        format!(
+                            "retaining prior published lexical index at {} after atomic swap publish failed; rolled back to keep previous live index at {}",
+                            retained_backup_path.display(),
+                            index_path.display()
+                        )
+                    });
+                }
+                Err(rollback_err) => {
+                    return Err(anyhow::anyhow!(
+                        "retaining prior published lexical index at {} after atomic swap publish failed: {retain_err:#}; rollback also failed: {rollback_err:#}",
+                        retained_backup_path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let in_progress_backup_path = lexical_publish_in_progress_backup_path(index_path);
+        fs::rename(index_path, &in_progress_backup_path).with_context(|| {
+            format!(
+                "parking prior lexical index at {} before staged publish",
+                in_progress_backup_path.display()
+            )
+        })?;
+        if let Err(publish_err) = fs::rename(staged_index_path, index_path) {
+            match fs::rename(&in_progress_backup_path, index_path) {
+                Ok(()) => {
+                    return Err(publish_err).with_context(|| {
+                        format!(
+                            "publishing staged lexical index {} -> {} failed after parking the prior live index; restored the previous live index",
+                            staged_index_path.display(),
+                            index_path.display()
+                        )
+                    });
+                }
+                Err(rollback_err) => {
+                    return Err(anyhow::anyhow!(
+                        "publishing staged lexical index {} -> {} failed after parking the prior live index at {}: {publish_err:#}; rollback also failed: {rollback_err:#}",
+                        staged_index_path.display(),
+                        index_path.display(),
+                        in_progress_backup_path.display()
+                    ));
+                }
+            }
+        }
+        if let Err(retain_err) = fs::rename(&in_progress_backup_path, &retained_backup_path) {
+            tracing::warn!(
+                error = %retain_err,
+                backup_path = %in_progress_backup_path.display(),
+                retained_backup_path = %retained_backup_path.display(),
+                "published staged lexical index but could not move the prior live artifact into retained backup storage"
+            );
+        }
+    }
+
+    sync_parent_directory(index_path)?;
+    sync_parent_directory(&retained_backup_path)?;
+    tracing::info!(
+        retained_backup_path = %retained_backup_path.display(),
+        live_index_path = %index_path.display(),
+        "published staged lexical index and retained the prior live artifact as a backup"
+    );
+    Ok(())
+}
+
+fn lexical_publish_backups_dir(index_path: &Path) -> PathBuf {
+    index_path
+        .parent()
+        .unwrap_or(index_path)
+        .join(".lexical-publish-backups")
+}
+
+fn lexical_publish_in_progress_backup_path(index_path: &Path) -> PathBuf {
+    let file_name = index_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index");
+    index_path.with_file_name(format!(".{file_name}.publish-in-progress.bak"))
+}
+
+fn unique_lexical_publish_backup_path(index_path: &Path) -> PathBuf {
+    let file_name = index_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index");
+    let backup_seed = lexical_publish_backups_dir(index_path).join(file_name);
+    unique_atomic_sidecar_path(&backup_seed, "published-bak", "index")
+}
+
+fn ensure_lexical_publish_backups_dir(index_path: &Path) -> Result<()> {
+    let backups_dir = lexical_publish_backups_dir(index_path);
+    fs::create_dir_all(&backups_dir).with_context(|| {
         format!(
-            "publishing staged lexical index {} -> {}",
-            staged_index_path.display(),
+            "creating retained lexical publish backup directory {}",
+            backups_dir.display()
+        )
+    })?;
+    sync_parent_directory(&backups_dir)?;
+    Ok(())
+}
+
+fn recover_or_finalize_interrupted_lexical_publish_backup(index_path: &Path) -> Result<()> {
+    let in_progress_backup_path = lexical_publish_in_progress_backup_path(index_path);
+    if !in_progress_backup_path.exists() {
+        return Ok(());
+    }
+
+    if index_path.exists() {
+        ensure_lexical_publish_backups_dir(index_path)?;
+        let retained_backup_path = unique_lexical_publish_backup_path(index_path);
+        fs::rename(&in_progress_backup_path, &retained_backup_path).with_context(|| {
+            format!(
+                "moving stale in-progress lexical publish backup {} into retained backup storage {}",
+                in_progress_backup_path.display(),
+                retained_backup_path.display()
+            )
+        })?;
+        sync_parent_directory(&retained_backup_path)?;
+        tracing::info!(
+            backup_path = %retained_backup_path.display(),
+            live_index_path = %index_path.display(),
+            "retained a stale in-progress lexical publish backup because the live index was already present"
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating parent directory for interrupted lexical publish recovery {}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::rename(&in_progress_backup_path, index_path).with_context(|| {
+        format!(
+            "restoring prior published lexical index from interrupted publish backup {} -> {}",
+            in_progress_backup_path.display(),
             index_path.display()
         )
     })?;
     sync_parent_directory(index_path)?;
+    tracing::warn!(
+        recovered_backup_path = %index_path.display(),
+        "restored the prior published lexical index from an interrupted staged publish backup"
+    );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).with_context(|| {
+        format!(
+            "encoding filesystem path for Linux atomic lexical publish swap: {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
+    let left_c = path_to_cstring(left)?;
+    let right_c = path_to_cstring(right)?;
+    let result = unsafe {
+        linux_publish_swap::renameat2(
+            linux_publish_swap::AT_FDCWD,
+            left_c.as_ptr(),
+            linux_publish_swap::AT_FDCWD,
+            right_c.as_ptr(),
+            linux_publish_swap::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+
+    Err(std::io::Error::last_os_error()).with_context(|| {
+        format!(
+            "atomically exchanging lexical publish paths {} <-> {}",
+            left.display(),
+            right.display()
+        )
+    })
 }
 
 struct LexicalRebuildFinalMergeArtifact {
@@ -23924,6 +24138,150 @@ mod tests {
             "published staged rebuild should report the three preserved final shard segments"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 6);
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_replaces_live_index_and_retains_prior_backup() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let old_conv = norm_conv(Some("publish-old"), vec![norm_msg(0, 1_700_000_000_000)]);
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&old_conv, &old_conv.messages, Some(1))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-stage.")
+            .tempdir_in(index_path.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(
+            Some("publish-new"),
+            vec![norm_msg(0, 1_700_000_001_000), norm_msg(1, 1_700_000_001_100)],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(2))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&staged_index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            2
+        );
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            2,
+            "the live lexical index should expose the new staged publish"
+        );
+        assert!(
+            !staged_index_path.exists(),
+            "the staged publish path should be consumed into the retained backup flow"
+        );
+
+        let retained_backups = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_backups.len(), 1);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&retained_backups[0])
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "the retained backup should preserve the previously published live index"
+        );
+    }
+
+    #[test]
+    fn publish_staged_lexical_index_recovers_interrupted_backup_before_replacing_live_index() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let old_conv = norm_conv(
+            Some("interrupted-old"),
+            vec![norm_msg(0, 1_700_000_010_000), norm_msg(1, 1_700_000_010_100)],
+        );
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&old_conv, &old_conv.messages, Some(10))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        let in_progress_backup_path = lexical_publish_in_progress_backup_path(&index_path);
+        fs::rename(&index_path, &in_progress_backup_path).unwrap();
+        assert!(
+            !index_path.exists(),
+            "the live path should be missing to simulate an interrupted publish after parking the old index"
+        );
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-recovery.")
+            .tempdir_in(in_progress_backup_path.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(Some("interrupted-new"), vec![norm_msg(0, 1_700_000_020_000)]);
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(11))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        assert!(
+            !in_progress_backup_path.exists(),
+            "successful publish should consume the interrupted in-progress backup"
+        );
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&index_path)
+                .unwrap()
+                .unwrap()
+                .docs,
+            1,
+            "the new staged publish should become live after interrupted-backup recovery"
+        );
+
+        let retained_backups = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_backups.len(), 1);
+        assert_eq!(
+            crate::search::tantivy::searchable_index_summary(&retained_backups[0])
+                .unwrap()
+                .unwrap()
+                .docs,
+            2,
+            "the retained backup should still preserve the old live publish recovered from the interrupted swap"
+        );
     }
 
     #[test]
