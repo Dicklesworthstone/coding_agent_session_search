@@ -20,7 +20,7 @@
 //!                                                          └──────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -87,7 +87,7 @@ pub struct PhaseRecord {
     /// Errors encountered (non-fatal).
     pub errors: u64,
     /// Phase-specific counters (e.g., "bytes_written", "connectors_scanned").
-    pub counters: HashMap<String, u64>,
+    pub counters: BTreeMap<String, u64>,
     /// Whether this phase completed successfully.
     pub success: bool,
     /// Error message if the phase failed.
@@ -102,7 +102,7 @@ impl PhaseRecord {
             items_processed: 0,
             items_skipped: 0,
             errors: 0,
-            counters: HashMap::new(),
+            counters: BTreeMap::new(),
             success: true,
             error_message: None,
         }
@@ -159,7 +159,7 @@ pub struct RefreshLedger {
     /// Correctness artifacts captured after the refresh.
     pub equivalence: EquivalenceArtifacts,
     /// Free-form tags for filtering and grouping.
-    pub tags: HashMap<String, String>,
+    pub tags: BTreeMap<String, String>,
 }
 
 /// User-facing readiness timing summary derived from a refresh ledger.
@@ -203,7 +203,7 @@ impl Default for RefreshLedger {
             corpus_family: "default".to_owned(),
             phases: Vec::new(),
             equivalence: EquivalenceArtifacts::default(),
-            tags: HashMap::new(),
+            tags: BTreeMap::new(),
         }
     }
 }
@@ -240,7 +240,7 @@ impl RefreshLedger {
     }
 
     /// Duration breakdown: phase name → ms.
-    pub fn duration_breakdown(&self) -> HashMap<String, u64> {
+    pub fn duration_breakdown(&self) -> BTreeMap<String, u64> {
         self.phases
             .iter()
             .map(|p| (p.phase.as_str().to_owned(), p.duration_ms))
@@ -1000,7 +1000,7 @@ mod tests {
             items_processed: 0,
             items_skipped: 0,
             errors: u64::from(!success),
-            counters: HashMap::new(),
+            counters: BTreeMap::new(),
             success,
             error_message: (!success).then(|| format!("failed {}", phase.as_str())),
         }

@@ -6,6 +6,10 @@ pub mod refresh_ledger;
 pub(crate) mod responsiveness;
 pub mod semantic;
 
+use self::refresh_ledger::{
+    EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger, RefreshPhase,
+};
+
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(target_os = "linux")]
@@ -3789,6 +3793,10 @@ fn lexical_rebuild_equivalence_evidence_path(index_path: &Path) -> PathBuf {
     index_path.join(".lexical-rebuild-equivalence.json")
 }
 
+fn lexical_refresh_ledger_path(index_path: &Path) -> PathBuf {
+    index_path.join(".lexical-refresh-ledger.json")
+}
+
 fn persist_lexical_rebuild_equivalence_evidence(
     index_path: &Path,
     evidence: &LexicalRebuildEquivalenceEvidence,
@@ -3808,6 +3816,134 @@ fn persist_lexical_rebuild_equivalence_evidence(
             path.display()
         )
     })
+}
+
+fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> Result<()> {
+    let path = lexical_refresh_ledger_path(index_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating lexical refresh ledger parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    write_json_pretty_atomically(&path, ledger).with_context(|| {
+        format!(
+            "persisting lexical refresh ledger to {}",
+            path.display()
+        )
+    })
+}
+
+struct AuthoritativeLexicalRefreshLedgerInput<'a> {
+    publish_mode: &'static str,
+    lexical_duration: Duration,
+    publish_duration: Duration,
+    processed_conversations: usize,
+    total_conversations: usize,
+    final_observed_messages: usize,
+    indexed_docs: usize,
+    equivalence_evidence: &'a LexicalRebuildEquivalenceEvidence,
+}
+
+fn build_authoritative_lexical_refresh_ledger(
+    input: AuthoritativeLexicalRefreshLedgerInput<'_>,
+) -> RefreshLedger {
+    let AuthoritativeLexicalRefreshLedgerInput {
+        publish_mode,
+        lexical_duration,
+        publish_duration,
+        processed_conversations,
+        total_conversations,
+        final_observed_messages,
+        indexed_docs,
+        equivalence_evidence,
+    } = input;
+    let lexical_duration_ms = u64::try_from(lexical_duration.as_millis()).unwrap_or(u64::MAX);
+    let publish_duration_ms = u64::try_from(publish_duration.as_millis()).unwrap_or(u64::MAX);
+    let total_duration_ms = lexical_duration_ms.saturating_add(publish_duration_ms);
+    let completed_at_ms = FrankenStorage::now_millis();
+    let started_at_ms =
+        completed_at_ms.saturating_sub(i64::try_from(total_duration_ms).unwrap_or(i64::MAX));
+    let processed_conversations_u64 =
+        u64::try_from(processed_conversations).unwrap_or(u64::MAX);
+    let total_conversations_u64 = u64::try_from(total_conversations).unwrap_or(u64::MAX);
+    let final_observed_messages_u64 =
+        u64::try_from(final_observed_messages).unwrap_or(u64::MAX);
+    let indexed_docs_u64 = u64::try_from(indexed_docs).unwrap_or(u64::MAX);
+    let equivalence_probe_count =
+        u64::try_from(equivalence_evidence.golden_query_hit_counts.len()).unwrap_or(u64::MAX);
+
+    RefreshLedger {
+        version: 1,
+        started_at_ms,
+        completed_at_ms,
+        total_duration_ms,
+        full_rebuild: false,
+        corpus_family: "authoritative_canonical_packet_replay".to_string(),
+        phases: vec![
+            PhaseRecord {
+                phase: RefreshPhase::LexicalRebuild,
+                duration_ms: lexical_duration_ms,
+                items_processed: processed_conversations_u64,
+                items_skipped: total_conversations_u64.saturating_sub(processed_conversations_u64),
+                errors: 0,
+                counters: BTreeMap::from([
+                    ("indexed_docs".to_string(), indexed_docs_u64),
+                    ("observed_messages".to_string(), final_observed_messages_u64),
+                    ("total_conversations".to_string(), total_conversations_u64),
+                    ("equivalence_probe_count".to_string(), equivalence_probe_count),
+                ]),
+                success: true,
+                error_message: None,
+            },
+            PhaseRecord {
+                phase: RefreshPhase::Publish,
+                duration_ms: publish_duration_ms,
+                items_processed: 1,
+                items_skipped: 0,
+                errors: 0,
+                counters: BTreeMap::from([
+                    ("indexed_docs".to_string(), indexed_docs_u64),
+                    ("observed_messages".to_string(), final_observed_messages_u64),
+                    ("published_generations".to_string(), 1),
+                ]),
+                success: true,
+                error_message: None,
+            },
+        ],
+        equivalence: RefreshEquivalenceArtifacts {
+            conversation_count: total_conversations_u64,
+            message_count: final_observed_messages_u64,
+            lexical_doc_count: indexed_docs_u64,
+            lexical_fingerprint: None,
+            semantic_manifest_fingerprint: None,
+            search_hit_digest: Some(equivalence_evidence.golden_query_digest.clone()),
+            peak_rss_bytes: None,
+            db_size_bytes: None,
+            lexical_index_size_bytes: None,
+        },
+        tags: BTreeMap::from([
+            ("dataflow".to_string(), "conversation_packet".to_string()),
+            ("publish_mode".to_string(), publish_mode.to_string()),
+            ("source".to_string(), "canonical_db".to_string()),
+        ]),
+    }
+}
+
+fn log_lexical_refresh_ledger_published(ledger: &RefreshLedger) {
+    let milestones = ledger.readiness_milestones();
+    tracing::info!(
+        corpus_family = ledger.corpus_family.as_str(),
+        total_duration_ms = ledger.total_duration_ms,
+        time_to_lexical_ready_ms = milestones.time_to_lexical_ready_ms,
+        time_to_search_ready_ms = milestones.time_to_search_ready_ms,
+        time_to_full_settled_ms = milestones.time_to_full_settled_ms,
+        failed_phase = milestones.failed_phase.as_deref().unwrap_or(""),
+        search_readiness_state = ?milestones.search_readiness_state,
+        "lexical refresh ledger published"
+    );
 }
 
 fn build_lexical_rebuild_generation_manifest(
@@ -11415,6 +11551,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             .store(rebuild_state.processed_conversations, Ordering::Relaxed);
         p.discovered_agents.store(0, Ordering::Relaxed);
     }
+    let lexical_rebuild_started = Instant::now();
 
     let stage_parent = index_path.parent().unwrap_or(index_path);
     let shard_stage_root = TempDirBuilder::new()
@@ -12272,6 +12409,8 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         rebuild_state.db.storage_fingerprint.clone()
     };
     let final_observed_messages = observed_messages.max(indexed_docs);
+    let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
+    let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = persist_lexical_rebuild_generation_artifacts(
         &final_merge_artifact.publish_path,
@@ -12296,6 +12435,20 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             observed_tantivy_docs
         ));
     }
+    let refresh_ledger = build_authoritative_lexical_refresh_ledger(
+        AuthoritativeLexicalRefreshLedgerInput {
+            publish_mode: "atomic_staged_swap",
+            lexical_duration: lexical_rebuild_duration,
+            publish_duration: publish_started.elapsed(),
+            processed_conversations,
+            total_conversations,
+            final_observed_messages,
+            indexed_docs,
+            equivalence_evidence: &equivalence_evidence,
+        },
+    );
+    persist_lexical_refresh_ledger(index_path, &refresh_ledger)?;
+    log_lexical_refresh_ledger_published(&refresh_ledger);
 
     storage.close_without_checkpoint().with_context(|| {
         format!(
@@ -12809,6 +12962,7 @@ fn rebuild_tantivy_from_db_with_options(
             "lexical rebuild startup complete, entering consumer loop"
         );
     }
+    let lexical_rebuild_started = Instant::now();
     let mut max_conversation_id = 0i64;
     let mut max_message_id = 0i64;
     let mut equivalence_accumulator = LexicalRebuildEquivalenceAccumulator::new();
@@ -13289,6 +13443,8 @@ fn rebuild_tantivy_from_db_with_options(
         profile.log_summary();
     }
 
+    let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
+    let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = persist_lexical_rebuild_generation_artifacts(
         &index_path,
@@ -13300,6 +13456,20 @@ fn rebuild_tantivy_from_db_with_options(
         &equivalence_evidence,
     )?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
+    let refresh_ledger = build_authoritative_lexical_refresh_ledger(
+        AuthoritativeLexicalRefreshLedgerInput {
+            publish_mode: "direct_live_commit",
+            lexical_duration: lexical_rebuild_duration,
+            publish_duration: publish_started.elapsed(),
+            processed_conversations: rebuild_state.processed_conversations,
+            total_conversations,
+            final_observed_messages,
+            indexed_docs,
+            equivalence_evidence: &equivalence_evidence,
+        },
+    );
+    persist_lexical_refresh_ledger(&index_path, &refresh_ledger)?;
+    log_lexical_refresh_ledger_published(&refresh_ledger);
 
     Ok(LexicalRebuildOutcome {
         indexed_docs,
@@ -24318,6 +24488,71 @@ mod tests {
             logs.contains("generation_id=") && logs.contains("attempt_id="),
             "expected generation_id + attempt_id fields in publish log, got:
 {logs}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tantivy_from_db_persists_packet_refresh_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        let logs = capture_logs(|| {
+            let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+            let evidence = rebuild
+                .equivalence
+                .as_ref()
+                .expect("authoritative rebuild must emit equivalence evidence");
+
+            let index_path = index_dir(&data_dir).unwrap();
+            let raw = std::fs::read_to_string(lexical_refresh_ledger_path(&index_path))
+                .expect("refresh ledger should be persisted for the packet-driven rebuild");
+            let ledger: refresh_ledger::RefreshLedger =
+                serde_json::from_str(&raw).expect("refresh ledger must be valid JSON");
+            let milestones = ledger.readiness_milestones();
+
+            assert_eq!(
+                milestones.search_readiness_state,
+                refresh_ledger::RefreshSearchReadinessState::Published
+            );
+            assert!(
+                milestones.time_to_lexical_ready_ms.is_some(),
+                "packet rebuild should record a lexical-ready milestone"
+            );
+            assert!(
+                milestones.time_to_search_ready_ms.is_some(),
+                "packet rebuild should record a search-ready milestone"
+            );
+            assert_eq!(
+                ledger.tags.get("dataflow").map(String::as_str),
+                Some("conversation_packet")
+            );
+            assert_eq!(
+                ledger.tags.get("publish_mode").map(String::as_str),
+                Some("atomic_staged_swap")
+            );
+            assert_eq!(
+                ledger
+                    .phase(refresh_ledger::RefreshPhase::LexicalRebuild)
+                    .and_then(|phase| phase.counters.get("indexed_docs"))
+                    .copied(),
+                Some(u64::try_from(rebuild.indexed_docs).unwrap_or(u64::MAX))
+            );
+            assert_eq!(
+                ledger.equivalence.search_hit_digest.as_deref(),
+                Some(evidence.golden_query_digest.as_str())
+            );
+        });
+
+        assert!(
+            logs.contains("lexical refresh ledger published"),
+            "expected refresh ledger publish log, got:\n{logs}"
         );
     }
 
