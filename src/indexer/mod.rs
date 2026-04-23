@@ -27,7 +27,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
+use frankensqlite::compat::{
+    ConnectionExt, ParamValue, RowExt, Transaction as FrankenTransaction,
+    TransactionExt as FrankenTransactionExt,
+};
 use fs2::FileExt;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher, recommended_watcher};
@@ -58,8 +61,8 @@ use crate::sources::config::{Platform, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome, MigrationError,
-    seed_canonical_from_best_historical_bundle,
+    DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
+    MigrationError, StatsAggregator, StatsDelta, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -3828,12 +3831,8 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
             )
         })?;
     }
-    write_json_pretty_atomically(&path, ledger).with_context(|| {
-        format!(
-            "persisting lexical refresh ledger to {}",
-            path.display()
-        )
-    })
+    write_json_pretty_atomically(&path, ledger)
+        .with_context(|| format!("persisting lexical refresh ledger to {}", path.display()))
 }
 
 struct AuthoritativeLexicalRefreshLedgerInput<'a> {
@@ -3866,11 +3865,9 @@ fn build_authoritative_lexical_refresh_ledger(
     let completed_at_ms = FrankenStorage::now_millis();
     let started_at_ms =
         completed_at_ms.saturating_sub(i64::try_from(total_duration_ms).unwrap_or(i64::MAX));
-    let processed_conversations_u64 =
-        u64::try_from(processed_conversations).unwrap_or(u64::MAX);
+    let processed_conversations_u64 = u64::try_from(processed_conversations).unwrap_or(u64::MAX);
     let total_conversations_u64 = u64::try_from(total_conversations).unwrap_or(u64::MAX);
-    let final_observed_messages_u64 =
-        u64::try_from(final_observed_messages).unwrap_or(u64::MAX);
+    let final_observed_messages_u64 = u64::try_from(final_observed_messages).unwrap_or(u64::MAX);
     let indexed_docs_u64 = u64::try_from(indexed_docs).unwrap_or(u64::MAX);
     let equivalence_probe_count =
         u64::try_from(equivalence_evidence.golden_query_hit_counts.len()).unwrap_or(u64::MAX);
@@ -3893,7 +3890,10 @@ fn build_authoritative_lexical_refresh_ledger(
                     ("indexed_docs".to_string(), indexed_docs_u64),
                     ("observed_messages".to_string(), final_observed_messages_u64),
                     ("total_conversations".to_string(), total_conversations_u64),
-                    ("equivalence_probe_count".to_string(), equivalence_probe_count),
+                    (
+                        "equivalence_probe_count".to_string(),
+                        equivalence_probe_count,
+                    ),
                 ]),
                 success: true,
                 error_message: None,
@@ -6940,12 +6940,13 @@ fn repair_daily_stats_if_drifted(
         "daily_stats is missing or drifted; rebuilding from canonical conversations"
     );
 
-    let rebuilt = storage.rebuild_daily_stats().with_context(|| {
-        format!(
-            "rebuilding daily_stats before index planning for {}",
-            db_path.display()
-        )
-    })?;
+    let rebuilt =
+        rebuild_daily_stats_from_conversation_packets(storage, db_path).with_context(|| {
+            format!(
+                "rebuilding daily_stats before index planning for {}",
+                db_path.display()
+            )
+        })?;
 
     tracing::info!(
         db_path = %db_path.display(),
@@ -6961,6 +6962,228 @@ fn repair_daily_stats_if_drifted(
     Ok(DailyStatsRepairOutcome::Rebuilt {
         rows_created: rebuilt.rows_created,
         total_sessions: rebuilt.total_sessions,
+    })
+}
+
+const PACKET_DAILY_STATS_REBUILD_BATCH_SIZE: i64 = 256;
+
+fn packet_daily_stats_provenance(
+    conversation: &crate::storage::sqlite::LexicalRebuildConversationRow,
+) -> LexicalRebuildPacketProvenance {
+    let source_kind = if conversation.source_id == LOCAL_SOURCE_ID {
+        SourceKind::Local
+    } else {
+        SourceKind::Ssh
+    };
+    LexicalRebuildPacketProvenance {
+        source_id: conversation.source_id.clone(),
+        origin_kind: source_kind.as_str().to_string(),
+        origin_host: conversation.origin_host.clone(),
+    }
+}
+
+fn packet_daily_stats_message_count(projections: &ConversationPacketSinkProjections) -> i64 {
+    let analytics = &projections.analytics;
+    i64::try_from(
+        analytics.user_messages
+            + analytics.assistant_messages
+            + analytics.tool_messages
+            + analytics.system_messages
+            + analytics.other_messages,
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn packet_daily_stats_total_chars(projections: &ConversationPacketSinkProjections) -> i64 {
+    i64::try_from(projections.lexical.total_content_bytes).unwrap_or(i64::MAX)
+}
+
+fn packet_update_daily_stats_batched_in_tx(
+    tx: &FrankenTransaction<'_>,
+    entries: &[(i64, String, String, StatsDelta)],
+) -> Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let now = FrankenStorage::now_millis();
+    let mut total_affected = 0usize;
+    for (day_id, agent_slug, source_id, delta) in entries {
+        total_affected += tx.execute_compat(
+            "INSERT INTO daily_stats (day_id, agent_slug, source_id, session_count, message_count, total_chars, last_updated)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(day_id, agent_slug, source_id) DO UPDATE SET
+                 session_count = session_count + excluded.session_count,
+                 message_count = message_count + excluded.message_count,
+                 total_chars = total_chars + excluded.total_chars,
+                 last_updated = excluded.last_updated",
+            &[
+                ParamValue::from(*day_id),
+                ParamValue::from(agent_slug.as_str()),
+                ParamValue::from(source_id.as_str()),
+                ParamValue::from(delta.session_count_delta),
+                ParamValue::from(delta.message_count_delta),
+                ParamValue::from(delta.total_chars_delta),
+                ParamValue::from(now),
+            ],
+        )?;
+    }
+
+    Ok(total_affected)
+}
+
+fn rebuild_daily_stats_from_conversation_packets(
+    storage: &FrankenStorage,
+    db_path: &Path,
+) -> Result<DailyStatsRebuildResult> {
+    let (agent_slugs, workspace_paths) = storage
+        .build_lexical_rebuild_lookups()
+        .with_context(|| format!("building packet rebuild lookups for {}", db_path.display()))?;
+    let mut tx = storage.raw().transaction().with_context(|| {
+        format!(
+            "opening packet daily_stats rebuild transaction for {}",
+            db_path.display()
+        )
+    })?;
+    tx.execute("DELETE FROM daily_stats").with_context(|| {
+        format!(
+            "clearing daily_stats before packet rebuild for {}",
+            db_path.display()
+        )
+    })?;
+
+    let mut last_conversation_id = 0_i64;
+    let mut conversation_batches = 0usize;
+    let mut conversations_processed = 0usize;
+    let mut messages_projected = 0usize;
+    let mut raw_entries_flushed = 0usize;
+    let mut expanded_entries_flushed = 0usize;
+
+    loop {
+        let conversation_rows = storage
+            .list_conversations_for_lexical_rebuild_after_id(
+                PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                last_conversation_id,
+                &agent_slugs,
+                &workspace_paths,
+            )
+            .with_context(|| {
+                format!(
+                    "listing canonical conversations for packet daily_stats rebuild after id {}",
+                    last_conversation_id
+                )
+            })?;
+        if conversation_rows.is_empty() {
+            break;
+        }
+
+        let conversation_ids = conversation_rows
+            .iter()
+            .map(|conversation| {
+                conversation.id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "packet daily_stats rebuild encountered conversation without id after {}",
+                        last_conversation_id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut grouped_messages = storage
+            .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+            .with_context(|| {
+                format!(
+                    "fetching canonical message batch for packet daily_stats rebuild after id {}",
+                    last_conversation_id
+                )
+            })?;
+
+        let mut aggregate = StatsAggregator::new();
+        for conversation in conversation_rows {
+            let conversation_id = conversation.id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "packet daily_stats rebuild encountered conversation without id after {}",
+                    last_conversation_id
+                )
+            })?;
+            last_conversation_id = conversation_id;
+
+            let canonical_messages = grouped_messages
+                .remove(&conversation_id)
+                .unwrap_or_default();
+            let provenance = packet_daily_stats_provenance(&conversation);
+            let packet = lexical_rebuild_contract_from_canonical_messages(
+                &conversation,
+                &provenance,
+                canonical_messages,
+            );
+            let message_count = packet_daily_stats_message_count(&packet.projections);
+            let total_chars = packet_daily_stats_total_chars(&packet.projections);
+            let day_id = conversation
+                .started_at
+                .map(FrankenStorage::day_id_from_millis)
+                .unwrap_or(0);
+            aggregate.record(
+                &conversation.agent_slug,
+                &conversation.source_id,
+                day_id,
+                message_count,
+                total_chars,
+            );
+            conversations_processed += 1;
+            messages_projected = messages_projected.saturating_add(message_count.max(0) as usize);
+        }
+
+        conversation_batches += 1;
+        raw_entries_flushed += aggregate.raw_entry_count();
+        let entries = aggregate.expand();
+        expanded_entries_flushed += entries.len();
+        if !entries.is_empty() {
+            packet_update_daily_stats_batched_in_tx(&tx, &entries)?;
+        }
+
+        if conversation_batches.is_multiple_of(25) {
+            tracing::info!(
+                target: "cass::perf::daily_stats",
+                conversation_batches,
+                batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+                last_conversation_id,
+                conversations_processed,
+                messages_projected,
+                "packet daily_stats rebuild progress"
+            );
+        }
+    }
+
+    let rows_created: i64 = tx.query_row_map(
+        "SELECT COUNT(*) FROM daily_stats",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+    let total_sessions: i64 = tx.query_row_map(
+        "SELECT COALESCE(SUM(session_count), 0) FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'",
+        &[] as &[ParamValue],
+        |row| row.get_typed(0),
+    )?;
+
+    tx.commit()?;
+
+    tracing::info!(
+        target: "cass::perf::daily_stats",
+        db_path = %db_path.display(),
+        rows_created,
+        total_sessions,
+        conversation_batches,
+        batch_size = PACKET_DAILY_STATS_REBUILD_BATCH_SIZE,
+        conversations_processed,
+        messages_projected,
+        raw_entries_flushed,
+        expanded_entries_flushed,
+        "daily_stats rebuilt from canonical ConversationPacket projections"
+    );
+
+    Ok(DailyStatsRebuildResult {
+        rows_created,
+        total_sessions,
     })
 }
 
@@ -12435,8 +12658,8 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             observed_tantivy_docs
         ));
     }
-    let refresh_ledger = build_authoritative_lexical_refresh_ledger(
-        AuthoritativeLexicalRefreshLedgerInput {
+    let refresh_ledger =
+        build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "atomic_staged_swap",
             lexical_duration: lexical_rebuild_duration,
             publish_duration: publish_started.elapsed(),
@@ -12445,8 +12668,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             final_observed_messages,
             indexed_docs,
             equivalence_evidence: &equivalence_evidence,
-        },
-    );
+        });
     persist_lexical_refresh_ledger(index_path, &refresh_ledger)?;
     log_lexical_refresh_ledger_published(&refresh_ledger);
 
@@ -13456,8 +13678,8 @@ fn rebuild_tantivy_from_db_with_options(
         &equivalence_evidence,
     )?;
     log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
-    let refresh_ledger = build_authoritative_lexical_refresh_ledger(
-        AuthoritativeLexicalRefreshLedgerInput {
+    let refresh_ledger =
+        build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "direct_live_commit",
             lexical_duration: lexical_rebuild_duration,
             publish_duration: publish_started.elapsed(),
@@ -13466,8 +13688,7 @@ fn rebuild_tantivy_from_db_with_options(
             final_observed_messages,
             indexed_docs,
             equivalence_evidence: &equivalence_evidence,
-        },
-    );
+        });
     persist_lexical_refresh_ledger(&index_path, &refresh_ledger)?;
     log_lexical_refresh_ledger_published(&refresh_ledger);
 
@@ -23628,6 +23849,169 @@ mod tests {
     }
 
     #[test]
+    fn repair_daily_stats_if_drifted_packet_rebuild_matches_legacy_storage_rebuild() {
+        fn load_daily_stats_rows(
+            storage: &FrankenStorage,
+        ) -> Vec<(i64, String, String, i64, i64, i64)> {
+            storage
+                .raw()
+                .query_map_collect(
+                    "SELECT day_id, agent_slug, source_id, session_count, message_count, total_chars
+                     FROM daily_stats
+                     ORDER BY day_id, agent_slug, source_id",
+                    &[] as &[ParamValue],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                            row.get_typed(4)?,
+                            row.get_typed(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+
+        let tester = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let reviewer = crate::model::types::Agent {
+            id: None,
+            slug: "reviewer".into(),
+            name: "Reviewer".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let tester_id = storage.ensure_agent(&tester).unwrap();
+        let reviewer_id = storage.ensure_agent(&reviewer).unwrap();
+
+        let conv_local = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace-local")),
+            external_id: Some("daily-stats-local".into()),
+            title: Some("local".into()),
+            source_path: std::path::PathBuf::from("/tmp/local.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_500),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                crate::model::types::Message {
+                    id: None,
+                    idx: 0,
+                    role: crate::model::types::MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: "hello".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::MessageRole::Tool,
+                    author: None,
+                    created_at: Some(1_700_000_000_100),
+                    content: String::new(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 2,
+                    role: crate::model::types::MessageRole::Agent,
+                    author: None,
+                    created_at: Some(1_700_000_000_200),
+                    content: "done".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let conv_remote = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "reviewer".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace-remote")),
+            external_id: Some("daily-stats-remote".into()),
+            title: Some("remote".into()),
+            source_path: std::path::PathBuf::from("/tmp/remote.jsonl"),
+            started_at: Some(1_700_086_400_000),
+            ended_at: Some(1_700_086_400_800),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                crate::model::types::Message {
+                    id: None,
+                    idx: 0,
+                    role: crate::model::types::MessageRole::System,
+                    author: None,
+                    created_at: Some(1_700_086_400_000),
+                    content: "prep".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 1,
+                    role: crate::model::types::MessageRole::Other("narrator".into()),
+                    author: None,
+                    created_at: Some(1_700_086_400_050),
+                    content: "note".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                crate::model::types::Message {
+                    id: None,
+                    idx: 2,
+                    role: crate::model::types::MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_086_400_100),
+                    content: "go".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "builder.example.com".into(),
+            origin_host: Some("builder.example.com".into()),
+        };
+
+        storage
+            .insert_conversations_batched(&[
+                (tester_id, None, &conv_local),
+                (reviewer_id, None, &conv_remote),
+            ])
+            .unwrap();
+
+        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        let expected_rebuild = storage.rebuild_daily_stats().unwrap();
+        let expected_rows = load_daily_stats_rows(&storage);
+
+        storage.raw().execute("DELETE FROM daily_stats").unwrap();
+        assert_eq!(
+            repair_daily_stats_if_drifted(&storage, &db_path, None).unwrap(),
+            DailyStatsRepairOutcome::Rebuilt {
+                rows_created: expected_rebuild.rows_created,
+                total_sessions: expected_rebuild.total_sessions,
+            }
+        );
+        assert_eq!(load_daily_stats_rows(&storage), expected_rows);
+    }
+
+    #[test]
     fn repair_daily_stats_if_drifted_skips_known_healthy_archive_fingerprint() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
@@ -24301,7 +24685,9 @@ mod tests {
         });
 
         assert!(
-            logs.contains("running fresh authoritative lexical rebuild via staged shard-build path"),
+            logs.contains(
+                "running fresh authoritative lexical rebuild via staged shard-build path"
+            ),
             "expected staged-shards rebuild banner after 9ct8r routing, got:
 {logs}"
         );
