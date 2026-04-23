@@ -162,6 +162,19 @@ pub struct RefreshLedger {
     pub tags: HashMap<String, String>,
 }
 
+/// User-facing readiness timing summary derived from a refresh ledger.
+///
+/// `time_to_lexical_ready_ms` means the lexical build phase finished
+/// successfully; `time_to_search_ready_ms` means the publish phase finished
+/// successfully and the refreshed lexical asset is visible to ordinary search.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshReadinessMilestones {
+    pub time_to_lexical_ready_ms: Option<u64>,
+    pub time_to_search_ready_ms: Option<u64>,
+    pub time_to_full_settled_ms: Option<u64>,
+    pub failed_phase: Option<String>,
+}
+
 impl Default for RefreshLedger {
     fn default() -> Self {
         Self {
@@ -217,9 +230,51 @@ impl RefreshLedger {
             .collect()
     }
 
+    /// Derive the user-facing stale-refresh readiness milestones that robot
+    /// surfaces and benchmark gates need to compare across runs.
+    pub fn readiness_milestones(&self) -> RefreshReadinessMilestones {
+        RefreshReadinessMilestones {
+            time_to_lexical_ready_ms: self
+                .successful_duration_through(RefreshPhase::LexicalRebuild),
+            time_to_search_ready_ms: self.successful_duration_through(RefreshPhase::Publish),
+            time_to_full_settled_ms: self.all_phases_succeeded().then(|| {
+                if self.total_duration_ms > 0 {
+                    self.total_duration_ms
+                } else {
+                    self.sum_phase_durations()
+                }
+            }),
+            failed_phase: self
+                .failed_phases()
+                .first()
+                .map(|phase| phase.phase.as_str().to_owned()),
+        }
+    }
+
     /// Serialize to pretty JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    fn successful_duration_through(&self, target: RefreshPhase) -> Option<u64> {
+        let mut elapsed_ms = 0u64;
+        for phase in &self.phases {
+            elapsed_ms = elapsed_ms.saturating_add(phase.duration_ms);
+            if !phase.success {
+                return None;
+            }
+            if phase.phase == target {
+                return Some(elapsed_ms);
+            }
+        }
+        None
+    }
+
+    fn sum_phase_durations(&self) -> u64 {
+        self.phases
+            .iter()
+            .map(|phase| phase.duration_ms)
+            .fold(0u64, u64::saturating_add)
     }
 }
 
@@ -617,6 +672,55 @@ mod tests {
     }
 
     #[test]
+    fn readiness_milestones_measure_lexical_search_and_settled_times() {
+        let ledger = RefreshLedger {
+            total_duration_ms: 90,
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+                phase_record(RefreshPhase::LexicalRebuild, 30, true),
+                phase_record(RefreshPhase::Publish, 5, true),
+                phase_record(RefreshPhase::Analytics, 7, true),
+                phase_record(RefreshPhase::Semantic, 8, true),
+            ],
+            ..Default::default()
+        };
+
+        let milestones = ledger.readiness_milestones();
+
+        assert_eq!(milestones.time_to_lexical_ready_ms, Some(60));
+        assert_eq!(milestones.time_to_search_ready_ms, Some(65));
+        assert_eq!(milestones.time_to_full_settled_ms, Some(90));
+        assert_eq!(milestones.failed_phase, None);
+
+        let json = serde_json::to_value(&milestones).unwrap();
+        assert_eq!(json["time_to_lexical_ready_ms"], 60);
+        assert_eq!(json["time_to_search_ready_ms"], 65);
+        assert_eq!(json["time_to_full_settled_ms"], 90);
+    }
+
+    #[test]
+    fn readiness_milestones_stop_at_first_failed_phase() {
+        let ledger = RefreshLedger {
+            total_duration_ms: 75,
+            phases: vec![
+                phase_record(RefreshPhase::Scan, 10, true),
+                phase_record(RefreshPhase::Persist, 20, true),
+                phase_record(RefreshPhase::LexicalRebuild, 30, false),
+                phase_record(RefreshPhase::Publish, 5, true),
+            ],
+            ..Default::default()
+        };
+
+        let milestones = ledger.readiness_milestones();
+
+        assert_eq!(milestones.time_to_lexical_ready_ms, None);
+        assert_eq!(milestones.time_to_search_ready_ms, None);
+        assert_eq!(milestones.time_to_full_settled_ms, None);
+        assert_eq!(milestones.failed_phase.as_deref(), Some("lexical_rebuild"));
+    }
+
+    #[test]
     fn ledger_tags() {
         let mut builder = RefreshLedger::start("medium", false);
         builder.tag("run_id", "bench-2026-04-01");
@@ -716,6 +820,19 @@ mod tests {
                 "{} has invalid duplicate fraction",
                 cfg.family
             );
+        }
+    }
+
+    fn phase_record(phase: RefreshPhase, duration_ms: u64, success: bool) -> PhaseRecord {
+        PhaseRecord {
+            phase,
+            duration_ms,
+            items_processed: 0,
+            items_skipped: 0,
+            errors: u64::from(!success),
+            counters: HashMap::new(),
+            success,
+            error_message: (!success).then(|| format!("failed {}", phase.as_str())),
         }
     }
 }
