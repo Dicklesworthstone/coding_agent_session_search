@@ -65,12 +65,10 @@ fn load_cursor_fixture(name: &str) -> CursorFixture {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/cursor")
         .join(name);
-    let body = fs::read_to_string(&path).unwrap_or_else(|err| {
-        panic!("failed to read cursor fixture {}: {err}", path.display())
-    });
-    serde_json::from_str(&body).unwrap_or_else(|err| {
-        panic!("failed to parse cursor fixture {}: {err}", path.display())
-    })
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read cursor fixture {}: {err}", path.display()));
+    serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("failed to parse cursor fixture {}: {err}", path.display()))
 }
 
 fn scan_cursor_fixture(name: &str) -> NormalizedConversation {
@@ -94,7 +92,11 @@ fn scan_cursor_fixture(name: &str) -> NormalizedConversation {
     let connector = CursorConnector::new();
     let ctx = ScanContext::local_default(tmp.path().to_path_buf(), None);
     let mut convs = connector.scan(&ctx).unwrap();
-    assert_eq!(convs.len(), 1, "expected one conversation from fixture {name}");
+    assert_eq!(
+        convs.len(),
+        1,
+        "expected one conversation from fixture {name}"
+    );
     let conv = convs.remove(0);
 
     if let Some(expected_workspace) = fixture.expected_workspace {

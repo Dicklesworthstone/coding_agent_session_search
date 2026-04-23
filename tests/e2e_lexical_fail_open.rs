@@ -130,8 +130,9 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
          assets are absent.\nstdout: {search_stdout}\nstderr: {search_stderr}"
     );
 
-    let payload: Value = serde_json::from_str(search_stdout.trim())
-        .unwrap_or_else(|err| panic!("cass search --json output is not valid JSON: {err}\nstdout: {search_stdout}"));
+    let payload: Value = serde_json::from_str(search_stdout.trim()).unwrap_or_else(|err| {
+        panic!("cass search --json output is not valid JSON: {err}\nstdout: {search_stdout}")
+    });
     let meta = payload
         .get("_meta")
         .and_then(Value::as_object)
