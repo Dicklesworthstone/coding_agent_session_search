@@ -169,7 +169,6 @@ fn test_pages_config_validate_cli() {
   "bundle": {
     "title": "Test Archive",
     "description": "CLI config validation test",
-    "include_pwa": false,
     "hide_metadata": false
   },
   "deployment": {

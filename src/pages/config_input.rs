@@ -24,7 +24,6 @@
 //!   "bundle": {
 //!     "title": "Team Archive",
 //!     "description": "Encrypted cass export",
-//!     "include_pwa": false,
 //!     "hide_metadata": false
 //!   },
 //!   "deployment": {
@@ -117,7 +116,6 @@ pub struct ResolvedEncryption {
 pub struct ResolvedBundle {
     pub title: String,
     pub description: String,
-    pub include_pwa: bool,
     pub hide_metadata: bool,
 }
 
@@ -235,10 +233,6 @@ pub struct BundleConfig {
     #[serde(default = "default_description")]
     pub description: String,
 
-    /// Include PWA support (service worker, offline mode).
-    #[serde(default)]
-    pub include_pwa: bool,
-
     /// Hide workspace/agent metadata in UI.
     #[serde(default)]
     pub hide_metadata: bool,
@@ -249,7 +243,6 @@ impl Default for BundleConfig {
         Self {
             title: default_title(),
             description: default_description(),
-            include_pwa: false,
             hide_metadata: false,
         }
     }
@@ -571,7 +564,6 @@ impl PagesConfig {
             bundle: ResolvedBundle {
                 title: self.bundle.title.clone(),
                 description: self.bundle.description.clone(),
-                include_pwa: self.bundle.include_pwa,
                 hide_metadata: self.bundle.hide_metadata,
             },
             deployment: ResolvedDeployment {
@@ -689,7 +681,6 @@ pub fn example_config() -> &'static str {
   "bundle": {
     "title": "My Archive",
     "description": "Encrypted cass export",
-    "include_pwa": false,
     "hide_metadata": false
   },
   "deployment": {
