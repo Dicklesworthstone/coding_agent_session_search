@@ -21025,24 +21025,38 @@ mod tests {
         };
         assert_eq!(first_batch.packets.len(), 1);
 
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            rx.len(),
-            1,
-            "a stalled consumer should saturate the bounded handoff queue under burst load"
-        );
+        let mut held_batches = vec![first_batch];
+        for observed_pause_round in 0..3 {
+            thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                rx.len(),
+                1,
+                "slow-consumer round {observed_pause_round} should leave the bounded handoff queue saturated"
+            );
+            assert!(
+                !handle.is_finished(),
+                "producer should still be blocked on bounded handoff in round {observed_pause_round}"
+            );
+            let queued_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                LexicalRebuildPipelineMessage::Batch(batch) => batch,
+                other => panic!(
+                    "expected queued burst batch in round {observed_pause_round}, got {other:?}"
+                ),
+            };
+            held_batches.push(queued_batch);
+        }
 
-        let second_batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-            LexicalRebuildPipelineMessage::Batch(batch) => batch,
-            other => panic!("expected second burst batch, got {other:?}"),
-        };
-        release_lexical_rebuild_prepared_page_reservation(&first_batch, flow_limiter.as_ref());
-        release_lexical_rebuild_prepared_page_reservation(&second_batch, flow_limiter.as_ref());
+        for batch in &held_batches {
+            release_lexical_rebuild_prepared_page_reservation(batch, flow_limiter.as_ref());
+        }
 
         loop {
             match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 LexicalRebuildPipelineMessage::Batch(batch) => {
-                    release_lexical_rebuild_prepared_page_reservation(&batch, flow_limiter.as_ref());
+                    release_lexical_rebuild_prepared_page_reservation(
+                        &batch,
+                        flow_limiter.as_ref(),
+                    );
                 }
                 LexicalRebuildPipelineMessage::Done => break,
                 LexicalRebuildPipelineMessage::Error(error) => {
@@ -21054,8 +21068,8 @@ mod tests {
 
         let telemetry = producer_telemetry.snapshot();
         assert!(
-            telemetry.handoff_wait_count >= 1,
-            "producer should observe at least one bounded handoff stall when the consumer is slower than the burst"
+            telemetry.handoff_wait_count >= held_batches.len().saturating_sub(1),
+            "producer should accumulate one bounded handoff stall per sustained slow-consumer round"
         );
         assert!(
             telemetry.handoff_wait_ms > 0,
