@@ -429,6 +429,14 @@ pub(crate) struct LexicalCleanupApplyGate {
     pub candidate_count: usize,
     pub reclaimable_bytes: u64,
     #[serde(default)]
+    pub disposition_counts: BTreeMap<LexicalCleanupDisposition, usize>,
+    #[serde(default)]
+    pub generation_disposition_summaries:
+        BTreeMap<LexicalCleanupDisposition, LexicalCleanupGenerationDispositionSummary>,
+    #[serde(default)]
+    pub shard_disposition_summaries:
+        BTreeMap<LexicalCleanupDisposition, LexicalCleanupDispositionSummary>,
+    #[serde(default)]
     pub candidate_previews: Vec<LexicalCleanupReclaimCandidate>,
     #[serde(default)]
     pub reclaimable_generation_ids: Vec<String>,
@@ -564,6 +572,9 @@ impl LexicalCleanupDryRunPlan {
             total_retained_bytes: self.total_retained_bytes,
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
+            disposition_counts: self.disposition_counts.clone(),
+            generation_disposition_summaries: self.generation_disposition_summaries.clone(),
+            shard_disposition_summaries: self.shard_disposition_summaries.clone(),
             candidate_previews: self.reclaim_candidates.clone(),
             reclaimable_generation_ids: self.reclaimable_generation_ids.clone(),
             fully_retained_generation_ids: self.fully_retained_generation_ids.clone(),
@@ -2473,6 +2484,26 @@ mod tests {
         assert_eq!(blocked.total_artifact_bytes, 6656);
         assert_eq!(blocked.total_retained_bytes, 2560);
         assert_eq!(
+            blocked
+                .disposition_counts
+                .get(&LexicalCleanupDisposition::SupersededReclaimable),
+            Some(&1)
+        );
+        assert_eq!(
+            blocked
+                .generation_disposition_summaries
+                .get(&LexicalCleanupDisposition::ActiveWork)
+                .map(|summary| summary.retained_bytes),
+            Some(2048)
+        );
+        assert_eq!(
+            blocked
+                .shard_disposition_summaries
+                .get(&LexicalCleanupDisposition::QuarantinedRetained)
+                .map(|summary| summary.retained_bytes),
+            Some(512)
+        );
+        assert_eq!(
             blocked.blocker_codes,
             vec![
                 LexicalCleanupApplyBlocker::OperatorApprovalRequired,
@@ -2610,6 +2641,12 @@ mod tests {
         assert_eq!(allowed.generation_count, 1);
         assert_eq!(allowed.total_artifact_bytes, 4096);
         assert_eq!(allowed.total_retained_bytes, 0);
+        assert_eq!(
+            allowed
+                .disposition_counts
+                .get(&LexicalCleanupDisposition::SupersededReclaimable),
+            Some(&1)
+        );
         assert_eq!(allowed.candidate_count, 1);
         assert_eq!(allowed.reclaimable_bytes, 4096);
         let allowed_json =
@@ -2637,6 +2674,18 @@ mod tests {
         assert_eq!(allowed_json["generation_count"], 1);
         assert_eq!(allowed_json["total_artifact_bytes"], 4096);
         assert_eq!(allowed_json["total_retained_bytes"], 0);
+        assert_eq!(
+            allowed_json["disposition_counts"]["superseded_reclaimable"],
+            1
+        );
+        assert_eq!(
+            allowed_json["generation_disposition_summaries"]["superseded_reclaimable"]["reclaimable_bytes"],
+            4096
+        );
+        assert_eq!(
+            allowed_json["shard_disposition_summaries"]["superseded_reclaimable"]["shard_count"],
+            1
+        );
         assert_eq!(
             allowed_json["protected_generation_ids"],
             serde_json::json!([])
