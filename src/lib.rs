@@ -75,6 +75,54 @@ fn resolve_watch_once_paths(watch: bool, watch_once: Option<Vec<PathBuf>>) -> Op
     resolve_watch_once_paths_from_sources(watch, watch_once, read_watch_once_paths_env())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct IndexEntrypointDiagnostics {
+    kind: &'static str,
+    full: bool,
+    force_rebuild: bool,
+    watch: bool,
+    watch_once_path_count: usize,
+    semantic: bool,
+    build_hnsw: bool,
+    migration_state: &'static str,
+}
+
+fn index_entrypoint_diagnostics(
+    full: bool,
+    force_rebuild: bool,
+    watch: bool,
+    watch_once_path_count: usize,
+    semantic: bool,
+    build_hnsw: bool,
+) -> IndexEntrypointDiagnostics {
+    let kind = if watch_once_path_count > 0 {
+        if watch { "watch_cycle" } else { "watch_once" }
+    } else if watch {
+        "watch"
+    } else if full {
+        "full_rebuild"
+    } else if force_rebuild {
+        "force_rebuild"
+    } else if semantic && build_hnsw {
+        "semantic_hnsw"
+    } else if semantic {
+        "semantic_backfill"
+    } else {
+        "incremental"
+    };
+
+    IndexEntrypointDiagnostics {
+        kind,
+        full,
+        force_rebuild,
+        watch,
+        watch_once_path_count,
+        semantic,
+        build_hnsw,
+        migration_state: "tin8o_entrypoint_observed",
+    }
+}
+
 fn with_frankensqlite_connection<T, F>(
     db_path: &Path,
     context: &str,
@@ -15993,6 +16041,17 @@ fn run_index_with_data(
     }
 
     let watch_once_paths = resolve_watch_once_paths(watch, watch_once);
+    let entrypoint = index_entrypoint_diagnostics(
+        full,
+        force_rebuild,
+        watch,
+        watch_once_paths
+            .as_ref()
+            .map(std::vec::Vec::len)
+            .unwrap_or_default(),
+        semantic,
+        build_hnsw,
+    );
 
     // Decide whether to emit NDJSON progress events on stderr (structured output only).
     // Respect both the CLI flag and the CASS_INDEX_NO_PROGRESS_EVENTS env var.
@@ -16027,6 +16086,7 @@ fn run_index_with_data(
             "full": full,
             "force_rebuild": force_rebuild,
             "watch": watch,
+            "entrypoint": entrypoint.kind,
             "semantic": semantic,
             "build_hnsw": build_hnsw,
             "embedder": embedder,
@@ -16426,6 +16486,7 @@ fn run_index_with_data(
             "elapsed_ms": elapsed_ms,
             "full": full,
             "force_rebuild": force_rebuild,
+            "entrypoint": entrypoint,
             "data_dir": data_dir.display().to_string(),
             "db_path": db_path.display().to_string(),
             "conversations": conversations,

@@ -150,6 +150,65 @@ fn index_watch_once_triggers() {
 }
 
 #[test]
+fn index_json_reports_entrypoint_contract_for_incremental_and_watch_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+
+    let mut incremental = base_cmd(tmp.path());
+    incremental.args([
+        "index",
+        "--data-dir",
+        data_dir.to_string_lossy().as_ref(),
+        "--json",
+    ]);
+    let incremental_output = incremental.output()?;
+    let incremental_stdout = String::from_utf8_lossy(&incremental_output.stdout);
+    let incremental_stderr = String::from_utf8_lossy(&incremental_output.stderr);
+    assert!(
+        incremental_output.status.success(),
+        "incremental index should succeed. stdout: {incremental_stdout}, stderr: {incremental_stderr}"
+    );
+    let incremental_payload: serde_json::Value =
+        serde_json::from_slice(&incremental_output.stdout)?;
+    assert_eq!(incremental_payload["entrypoint"]["kind"], "incremental");
+    assert_eq!(
+        incremental_payload["entrypoint"]["migration_state"],
+        "tin8o_entrypoint_observed"
+    );
+    assert_eq!(
+        incremental_payload["entrypoint"]["watch_once_path_count"],
+        0
+    );
+
+    let dummy_path = data_dir.join("entrypoint-watch-once.txt");
+    fs::write(&dummy_path, "watch once entrypoint")?;
+    let mut watch_once = base_cmd(tmp.path());
+    watch_once.args([
+        "index",
+        "--watch-once",
+        dummy_path.to_string_lossy().as_ref(),
+        "--data-dir",
+        data_dir.to_string_lossy().as_ref(),
+        "--json",
+    ]);
+    let watch_once_output = watch_once.output()?;
+    let watch_stdout = String::from_utf8_lossy(&watch_once_output.stdout);
+    let watch_stderr = String::from_utf8_lossy(&watch_once_output.stderr);
+    assert!(
+        watch_once_output.status.success(),
+        "watch-once index should succeed. stdout: {watch_stdout}, stderr: {watch_stderr}"
+    );
+    let watch_once_payload: serde_json::Value = serde_json::from_slice(&watch_once_output.stdout)?;
+    assert_eq!(watch_once_payload["entrypoint"]["kind"], "watch_once");
+    assert_eq!(watch_once_payload["entrypoint"]["watch_once_path_count"], 1);
+    assert_eq!(watch_once_payload["entrypoint"]["watch"], false);
+
+    Ok(())
+}
+
+#[test]
 fn index_force_rebuild_flag() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
