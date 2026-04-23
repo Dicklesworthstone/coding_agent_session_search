@@ -378,7 +378,29 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Lexical search is required and self-healing.** Missing, stale, schema-drifted, or corrupt lexical assets should rebuild from SQLite through scratch-build and atomic-publish semantics.
 - **Hybrid is the default search intent.** Semantic refinement joins when ready; default hybrid search must fail open to lexical with truthful robot metadata when semantic assets are unavailable.
 - **Semantic enrichment is opportunistic.** Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, missing model files, or vector catch-up.
+- **Semantic model acquisition is opt-in.** `cass models install` downloads the MiniLM model (~90 MB) on explicit operator request. cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, `fallback_mode="lexical"` is reported in health/status and queries silently degrade to lexical-only.
 - **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
+
+### Lexical Publish Durability (Atomic-Swap)
+
+- Every lexical publish is a **single atomic swap**: on Linux `renameat2(RENAME_EXCHANGE)` exchanges the staged and live index trees in one syscall; non-Linux platforms use a parked-rename + restore-on-failure dance. Readers never see a half-torn index — either the old or the new generation is visible, never a mix.
+- The **prior-live generation is retained** under `<data_dir>/index/.lexical-publish-backups/<dated>/` for a bounded retention window. Default cap: `1` (one-step rollback). Override via `CASS_LEXICAL_PUBLISH_BACKUP_RETENTION` env var: `0` disables retention, `N` keeps the N most-recent backups. Pruning runs after every successful publish and emits `tracing::info!` with `freed_bytes`+`retention_limit`.
+- **Crash recovery is automatic.** If cass crashes between the atomic swap and the retain-rename, the next startup's `recover_or_finalize_interrupted_lexical_publish_backup` finds the canonical sidecar (`.<name>.publish-in-progress.bak`) and completes the retain step before the next publish. See src/indexer/mod.rs::publish_staged_lexical_index.
+- **Do not handwrite "rebuild lexical" recipes.** Call `cass index --full` or trust stale-refresh; the publish + atomic-swap + retention pipeline is the only blessed path. Anything that removes `<data_dir>/index/` directly outside publish is off-contract.
+
+### Quarantine, GC, and Doctor
+
+- Corrupt or failed-validation assets are **quarantined, not deleted**. Failed seed bundles, quarantined lexical generations, and superseded retained publish backups persist on disk until explicitly reclaimed.
+- `cass diag --json --quarantine` enumerates every quarantined artifact with `{path, size_bytes, age_seconds, last_read_at_ms, safe_to_gc, gc_reason}`. The `safe_to_gc` flag is **advisory only** — it reports retention-policy + cleanup-dry-run eligibility; no automatic deletion path consumes it.
+- `cass doctor --json` surfaces the same quarantine summary plus `checks[]` for every diagnostic. Without `--fix` doctor is read-only: `auto_fix_applied=false`, `auto_fix_actions=[]`, `issues_fixed=0`. With `--fix` it applies only repairs whose dry-run plans are proven safe — currently Track A analytics rebuild and Track B rollup rebuild via `rebuild_token_daily_stats` (when the `token_usage` ledger is intact; see bead m7xrw).
+- **Agents should not race doctor.** Running `cass doctor --fix` against an in-flight rebuild is safe (cass uses an advisory file lock), but concurrent `--fix` from two processes is undefined. Prefer `cass health --json` for pre-flight checks and `cass doctor --json` (no `--fix`) for inspection.
+
+### Schema Stability and Golden-Freeze Gates
+
+- Every JSON contract surface is pinned by golden-file regression tests under `tests/golden/robot/` (JSON) and `tests/golden/robot_docs/` (plain-text docs topics). The full set: capabilities, health, status, diag, diag_quarantine, models_status, models_verify, models_check_update, introspect, doctor, doctor_quarantine, api_version, stats (missing-db error envelope), robot_docs topics (paths, env, exit-codes, schemas, guide, robot_help).
+- **If you add a new field or change a type**, run `UPDATE_GOLDENS=1 cargo test --test golden_robot_json --test golden_robot_docs`, review the diff via `git diff tests/golden/`, and commit both the code + golden in one change. Do not regenerate goldens without reviewing — every diff is either an intentional schema change or a bug.
+- `cass introspect --json`'s `response_schemas` is `BTreeMap`-backed so the serialized key order is alphabetical and deterministic (bead 8sl73).
+- Error envelopes use **kebab-case `err.kind`** values. For codes 0-9 the numeric code is sufficient; for codes ≥ 10 the code is ambiguous (e.g. 10 covers both `config` and `timeout`) — always branch on `err.kind`. Full taxonomy in src/lib.rs `CliError` literals + the Exit Codes table below (bead wan21).
 
 ### Project Structure
 
