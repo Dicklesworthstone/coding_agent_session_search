@@ -3844,7 +3844,7 @@ fn persist_lexical_rebuild_generation_artifacts(
     final_observed_messages: usize,
     indexed_docs: usize,
     equivalence_evidence: &LexicalRebuildEquivalenceEvidence,
-) -> Result<()> {
+) -> Result<lexical_generation::LexicalGenerationManifest> {
     tracing::info!(
         document_count = equivalence_evidence.document_count,
         manifest_fingerprint = equivalence_evidence.manifest_fingerprint.as_str(),
@@ -3869,14 +3869,16 @@ fn persist_lexical_rebuild_generation_artifacts(
         indexed_docs,
         equivalence_evidence,
     );
-    lexical_generation::store_manifest(generation_dir, &generation_manifest).with_context(|| {
-        format!(
-            "persisting lexical generation manifest for published generation {} at {}",
-            generation_manifest.generation_id,
-            generation_dir.display()
-        )
-    })?;
-    Ok(())
+    lexical_generation::store_manifest(generation_dir, &generation_manifest).with_context(
+        || {
+            format!(
+                "persisting lexical generation manifest for published generation {} at {}",
+                generation_manifest.generation_id,
+                generation_dir.display()
+            )
+        },
+    )?;
+    Ok(generation_manifest)
 }
 
 // Lexical-rebuild batching defaults are tuned for cold rebuilds over tens of
@@ -11999,9 +12001,30 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             indexed_docs
         ));
     }
+    let final_storage_fingerprint = if options.defer_initial_content_fingerprint {
+        lexical_rebuild_content_fingerprint_value(
+            total_conversations,
+            max_conversation_id,
+            max_message_id,
+        )
+    } else {
+        rebuild_state.db.storage_fingerprint.clone()
+    };
+    let final_observed_messages = observed_messages.max(indexed_docs);
+    let equivalence_evidence = equivalence_accumulator.finalize();
+    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
+        &final_merge_artifact.publish_path,
+        &final_storage_fingerprint,
+        processed_conversations,
+        total_conversations,
+        final_observed_messages,
+        indexed_docs,
+        &equivalence_evidence,
+    )?;
     let staged_published_meta_fingerprint =
         index_meta_fingerprint(&final_merge_artifact.publish_path)?;
     publish_staged_lexical_index(&final_merge_artifact.publish_path, index_path)?;
+    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
     if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
         && observed_tantivy_docs != indexed_docs
@@ -12019,14 +12042,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             db_path.display()
         )
     })?;
-    if options.defer_initial_content_fingerprint {
-        rebuild_state.db.storage_fingerprint = lexical_rebuild_content_fingerprint_value(
-            total_conversations,
-            max_conversation_id,
-            max_message_id,
-        );
-    }
-    let final_observed_messages = observed_messages.max(indexed_docs);
+    rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
     rebuild_state.db.total_messages = final_observed_messages;
     rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
@@ -12046,16 +12062,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         }
         profile.log_summary();
     }
-
-    let equivalence_evidence = equivalence_accumulator.finalize();
-    persist_lexical_rebuild_publish_artifacts(
-        index_path,
-        &rebuild_state,
-        total_conversations,
-        final_observed_messages,
-        indexed_docs,
-        &equivalence_evidence,
-    )?;
 
     Ok(LexicalRebuildOutcome {
         indexed_docs,
@@ -12997,14 +13003,16 @@ fn rebuild_tantivy_from_db_with_options(
     }
 
     let equivalence_evidence = equivalence_accumulator.finalize();
-    persist_lexical_rebuild_publish_artifacts(
+    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
         &index_path,
-        &rebuild_state,
+        &rebuild_state.db.storage_fingerprint,
+        rebuild_state.processed_conversations,
         total_conversations,
         final_observed_messages,
         indexed_docs,
         &equivalence_evidence,
     )?;
+    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
     Ok(LexicalRebuildOutcome {
         indexed_docs,
@@ -24242,6 +24250,119 @@ mod tests {
     }
 
     #[test]
+    fn publish_staged_lexical_index_moves_generation_audit_files_with_the_staged_directory() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let index_path = index_dir(&data_dir).unwrap();
+
+        let old_conv = norm_conv(Some("audit-old"), vec![norm_msg(0, 1_700_000_030_000)]);
+        let mut live_index = TantivyIndex::open_or_create(&index_path).unwrap();
+        live_index
+            .add_messages_with_conversation_id(&old_conv, &old_conv.messages, Some(30))
+            .unwrap();
+        live_index.commit().unwrap();
+        drop(live_index);
+
+        let old_evidence = super::LexicalRebuildEquivalenceEvidence {
+            document_count: 1,
+            manifest_fingerprint: "old-manifest-fingerprint".to_string(),
+            golden_query_digest: "old-golden-digest".to_string(),
+            golden_query_hit_counts: vec![super::LexicalRebuildEquivalenceGoldenHit {
+                probe: "audit-old".to_string(),
+                hit_count: 1,
+            }],
+        };
+        let old_manifest = persist_lexical_rebuild_generation_artifacts(
+            &index_path,
+            "content-v1:old-fingerprint",
+            1,
+            1,
+            1,
+            1,
+            &old_evidence,
+        )
+        .unwrap();
+
+        let stage_root = TempDirBuilder::new()
+            .prefix("cass-test-publish-audit-stage.")
+            .tempdir_in(index_path.parent().unwrap())
+            .unwrap();
+        let staged_index_path = stage_root.path().join("staged");
+        let new_conv = norm_conv(
+            Some("audit-new"),
+            vec![
+                norm_msg(0, 1_700_000_040_000),
+                norm_msg(1, 1_700_000_040_100),
+            ],
+        );
+        let mut staged_index = TantivyIndex::open_or_create(&staged_index_path).unwrap();
+        staged_index
+            .add_messages_with_conversation_id(&new_conv, &new_conv.messages, Some(40))
+            .unwrap();
+        staged_index.commit().unwrap();
+        drop(staged_index);
+
+        let new_evidence = super::LexicalRebuildEquivalenceEvidence {
+            document_count: 2,
+            manifest_fingerprint: "new-manifest-fingerprint".to_string(),
+            golden_query_digest: "new-golden-digest".to_string(),
+            golden_query_hit_counts: vec![super::LexicalRebuildEquivalenceGoldenHit {
+                probe: "audit-new".to_string(),
+                hit_count: 2,
+            }],
+        };
+        let new_manifest = persist_lexical_rebuild_generation_artifacts(
+            &staged_index_path,
+            "content-v1:new-fingerprint",
+            2,
+            1,
+            2,
+            2,
+            &new_evidence,
+        )
+        .unwrap();
+
+        publish_staged_lexical_index(&staged_index_path, &index_path).unwrap();
+
+        let live_manifest = lexical_generation::load_manifest(&index_path)
+            .unwrap()
+            .expect("live manifest after staged publish");
+        assert_eq!(live_manifest.generation_id, new_manifest.generation_id);
+        assert_eq!(
+            live_manifest.equivalence_manifest_fingerprint.as_deref(),
+            Some(new_evidence.manifest_fingerprint.as_str())
+        );
+        let live_evidence: super::LexicalRebuildEquivalenceEvidence = serde_json::from_slice(
+            &fs::read(lexical_rebuild_equivalence_evidence_path(&index_path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(live_evidence, new_evidence);
+
+        let retained_backups = fs::read_dir(lexical_publish_backups_dir(&index_path))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_backups.len(), 1);
+        let backup_manifest = lexical_generation::load_manifest(&retained_backups[0])
+            .unwrap()
+            .expect("retained backup manifest");
+        assert_eq!(backup_manifest.generation_id, old_manifest.generation_id);
+        assert_eq!(
+            backup_manifest.equivalence_manifest_fingerprint.as_deref(),
+            Some(old_evidence.manifest_fingerprint.as_str())
+        );
+        let backup_evidence: super::LexicalRebuildEquivalenceEvidence = serde_json::from_slice(
+            &fs::read(lexical_rebuild_equivalence_evidence_path(
+                &retained_backups[0],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup_evidence, old_evidence);
+    }
+
+    #[test]
     fn publish_staged_lexical_index_recovers_interrupted_backup_before_replacing_live_index() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -24697,6 +24818,7 @@ mod tests {
     /// observe:
     ///   - live index path missing (rename took effect)
     ///   - in-progress backup sidecar populated with the prior content
+    ///
     /// The next call to `publish_staged_lexical_index` must restore the
     /// prior live index from the sidecar AND land the staged publish on
     /// top, producing one retained backup holding the old prior-live
