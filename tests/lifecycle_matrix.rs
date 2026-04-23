@@ -1570,3 +1570,68 @@ fn index_subcommand_exposes_all_entrypoint_flags() {
         "cass index --help dropped the --force alias for --force-rebuild"
     );
 }
+
+#[test]
+fn diag_connector_entries_have_uniform_shape() {
+    // ibuuh.19 connector-inventory contract row. cass diag --json
+    // reports per-connector detection status as an array of
+    // {name, path, found} objects. Every entry must have all three
+    // keys with the expected types — a missing or mis-typed field in
+    // one entry silently skews retention / GC logic that enumerates
+    // connector outputs. The empty-HOME shape gives us 19 entries all
+    // with found=false and path="(not detected)", making this a strong
+    // stable invariant check.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass diag --json");
+    assert!(out.status.success(), "cass diag --json exited non-zero");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    let diag: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let connectors = diag["connectors"]
+        .as_array()
+        .expect("diag.connectors is an array");
+
+    assert!(
+        !connectors.is_empty(),
+        "diag.connectors must not be empty — sanity check"
+    );
+
+    for (i, entry) in connectors.iter().enumerate() {
+        assert!(
+            entry.is_object(),
+            "diag.connectors[{i}] must be an object; got {entry:?}"
+        );
+        let name = entry["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("diag.connectors[{i}].name must be a string"));
+        assert!(
+            !name.is_empty(),
+            "diag.connectors[{i}].name must be non-empty"
+        );
+        let path = entry["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("diag.connectors[{i}].path must be a string"));
+        assert!(
+            !path.is_empty(),
+            "diag.connectors[{i}].path must be non-empty (use \"(not detected)\" for absent)"
+        );
+        let _found = entry["found"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("diag.connectors[{i}].found must be a bool"));
+        // NB: we intentionally DO NOT assert !found here. Some connector
+        // detectors scan the CWD (e.g. aider looks at
+        // ./.aider.chat.history.md) in addition to HOME, so an isolated
+        // XDG_DATA_HOME/HOME pin can still see CWD-rooted hits. The
+        // shape/type invariants above are the stable part of the
+        // contract ibuuh.19's retention / GC depends on — an agent
+        // enumerating connectors must be able to trust every entry has
+        // name (non-empty string) + path (non-empty string) + found
+        // (bool) regardless of which connector happens to fire.
+    }
+}
