@@ -3162,9 +3162,6 @@ async fn execute_cli(
                     quality_only,
                     refresh,
                 } => {
-                    if refresh {
-                        refresh_index_inline(cli.db.clone(), data_dir.clone());
-                    }
                     // Validate mutually exclusive two-tier flags
                     let tier_count = [two_tier, fast_only, quality_only]
                         .iter()
@@ -3196,6 +3193,14 @@ async fn execute_cli(
                         eprintln!(
                             "Warning: --reranker specified but --rerank not enabled; reranker will be ignored"
                         );
+                    }
+
+                    // --refresh runs *after* flag validation so an invocation
+                    // like `cass search --refresh --two-tier --fast-only`
+                    // rejects fast on the bad flag combo instead of burning a
+                    // ~30s incremental index before failing usage.
+                    if refresh {
+                        refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
 
                     // Build semantic options from new flags
@@ -15925,9 +15930,12 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     // move the whole opts struct (it contains the shared progress handle).
     let index_handle = std::thread::spawn(move || indexer::run_index(opts, None));
 
+    // Sentinels are `usize::MAX` so the first observed atomic values always
+    // differ and trigger the first print. Using `0` for `last_total` would
+    // collide with the legitimate "haven't set total yet" state.
     let mut last_phase = usize::MAX;
     let mut last_current = usize::MAX;
-    let mut last_total = 0usize;
+    let mut last_total = usize::MAX;
     while !index_handle.is_finished() {
         let phase = progress.phase.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
@@ -15975,9 +15983,21 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
             eprintln!("Warning: --refresh indexing failed: {e}. Continuing with existing index.");
             tracing::warn!(error = %e, "refresh_index_inline failed; proceeding with stale index");
         }
-        Err(_panic) => {
-            eprintln!("Warning: --refresh indexing panicked. Continuing with existing index.");
+        Err(panic_payload) => {
+            // Try to recover a useful panic message so the user (and logs)
+            // actually see what broke. `std::panic::catch_unwind`-style
+            // payloads are most commonly `String` or `&'static str`; anything
+            // else falls back to a placeholder.
+            let msg = panic_payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic_payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            eprintln!(
+                "Warning: --refresh indexing panicked: {msg}. Continuing with existing index."
+            );
             tracing::warn!(
+                panic = msg,
                 "refresh_index_inline indexer thread panicked; proceeding with stale index"
             );
         }
