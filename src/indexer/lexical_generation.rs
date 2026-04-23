@@ -145,10 +145,11 @@ pub(crate) struct LexicalGenerationBuildBudget {
 /// Search-ready and fully consolidated are intentionally separate states: a
 /// published generation can be safe to query while still carrying background
 /// merge debt that cleanup/compaction workers may handle later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LexicalGenerationMergeDebtState {
     /// No deferred consolidation work is known for this generation.
+    #[default]
     None,
     /// Consolidation is required but intentionally kept off the publish path.
     Pending,
@@ -162,12 +163,6 @@ pub(crate) enum LexicalGenerationMergeDebtState {
     Complete,
     /// Work was cancelled without invalidating the published generation.
     Cancelled,
-}
-
-impl Default for LexicalGenerationMergeDebtState {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Durable merge-debt accounting surfaced through the generation manifest.
@@ -436,6 +431,12 @@ pub(crate) struct LexicalCleanupApplyGate {
     #[serde(default)]
     pub candidate_previews: Vec<LexicalCleanupReclaimCandidate>,
     #[serde(default)]
+    pub reclaimable_generation_ids: Vec<String>,
+    #[serde(default)]
+    pub fully_retained_generation_ids: Vec<String>,
+    #[serde(default)]
+    pub quarantined_generation_ids: Vec<String>,
+    #[serde(default)]
     pub blocker_codes: Vec<LexicalCleanupApplyBlocker>,
     pub blocked_reasons: Vec<String>,
     #[serde(default)]
@@ -564,6 +565,9 @@ impl LexicalCleanupDryRunPlan {
             candidate_count: self.reclaim_candidates.len(),
             reclaimable_bytes: self.total_reclaimable_bytes,
             candidate_previews: self.reclaim_candidates.clone(),
+            reclaimable_generation_ids: self.reclaimable_generation_ids.clone(),
+            fully_retained_generation_ids: self.fully_retained_generation_ids.clone(),
+            quarantined_generation_ids: self.quarantined_generation_ids.clone(),
             blocker_codes,
             blocked_reasons,
             active_generation_ids: self.active_generation_ids.clone(),
@@ -642,7 +646,6 @@ impl LexicalCleanupDryRunPlan {
         }
         let mut has_protected_retention =
             Self::is_protected_retention(inventory.disposition) && inventory.retained_bytes > 0;
-        let mut protected_retained_bytes_from_shards = 0u64;
         let inventory_requires_inspection = Self::requires_inspection(inventory.disposition);
         let mut shard_inspection_items = 0usize;
         for shard in &inventory.shards {
@@ -658,8 +661,6 @@ impl LexicalCleanupDryRunPlan {
             summary.retained_bytes = summary.retained_bytes.saturating_add(shard.retained_bytes);
             if Self::is_protected_retention(shard.disposition) && shard.retained_bytes > 0 {
                 has_protected_retention = true;
-                protected_retained_bytes_from_shards =
-                    protected_retained_bytes_from_shards.saturating_add(shard.retained_bytes);
             }
 
             if Self::requires_inspection(shard.disposition) {
@@ -704,14 +705,9 @@ impl LexicalCleanupDryRunPlan {
                 self.protected_generation_ids
                     .push(inventory.generation_id.clone());
             }
-            let protected_retained_bytes = if protected_retained_bytes_from_shards > 0 {
-                protected_retained_bytes_from_shards
-            } else {
-                inventory.retained_bytes
-            };
             self.protected_retained_bytes = self
                 .protected_retained_bytes
-                .saturating_add(protected_retained_bytes);
+                .saturating_add(inventory.retained_bytes);
         }
 
         self.inventories.push(inventory);
@@ -2090,6 +2086,21 @@ mod tests {
         assert_eq!(inventory.reclaimable_bytes, 0);
         assert_eq!(inventory.retained_bytes, 3072);
         assert!(inventory.reason.contains("active"));
+
+        let plan = LexicalCleanupDryRunPlan::from_manifests([&manifest]);
+        assert_eq!(plan.total_retained_bytes, 3072);
+        assert_eq!(plan.protected_retained_bytes, 3072);
+        assert_eq!(
+            plan.protected_generation_ids,
+            vec!["gen-debt-active".to_string()]
+        );
+
+        let gate = plan.apply_gate_with_fingerprint(true, Some(&plan.approval_fingerprint));
+        assert_eq!(gate.protected_retained_bytes, 3072);
+        assert_eq!(
+            gate.protected_generation_ids,
+            vec!["gen-debt-active".to_string()]
+        );
     }
 
     #[test]
@@ -2469,6 +2480,15 @@ mod tests {
             ]
         );
         assert_eq!(blocked.active_generation_ids, vec!["gen-active"]);
+        assert_eq!(
+            blocked.reclaimable_generation_ids,
+            vec!["gen-old".to_string()]
+        );
+        assert!(blocked.fully_retained_generation_ids.is_empty());
+        assert_eq!(
+            blocked.quarantined_generation_ids,
+            vec!["gen-quarantined".to_string()]
+        );
         assert_eq!(blocked.candidate_count, 1);
         assert_eq!(blocked.reclaimable_bytes, 4096);
         assert_eq!(
@@ -2565,6 +2585,12 @@ mod tests {
         assert!(allowed.blocker_codes.is_empty());
         assert!(allowed.active_generation_ids.is_empty());
         assert!(allowed.protected_generation_ids.is_empty());
+        assert_eq!(
+            allowed.reclaimable_generation_ids,
+            vec!["gen-old".to_string()]
+        );
+        assert!(allowed.fully_retained_generation_ids.is_empty());
+        assert!(allowed.quarantined_generation_ids.is_empty());
         assert_eq!(allowed.protected_retained_bytes, 0);
         assert_eq!(allowed.inspection_required_count, 0);
         assert_eq!(allowed.inspection_required_retained_bytes, 0);
@@ -2593,6 +2619,18 @@ mod tests {
         assert_eq!(allowed_json["approval_fingerprint_status"], "matched");
         assert_eq!(allowed_json["blocker_codes"], serde_json::json!([]));
         assert_eq!(allowed_json["active_generation_ids"], serde_json::json!([]));
+        assert_eq!(
+            allowed_json["reclaimable_generation_ids"],
+            serde_json::json!(["gen-old"])
+        );
+        assert_eq!(
+            allowed_json["fully_retained_generation_ids"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            allowed_json["quarantined_generation_ids"],
+            serde_json::json!([])
+        );
         assert_eq!(allowed_json["generation_count"], 1);
         assert_eq!(allowed_json["total_artifact_bytes"], 4096);
         assert_eq!(allowed_json["total_retained_bytes"], 0);
@@ -2649,6 +2687,15 @@ mod tests {
         assert_eq!(no_candidates.generation_count, 1);
         assert_eq!(no_candidates.total_artifact_bytes, 512);
         assert_eq!(no_candidates.total_retained_bytes, 512);
+        assert!(no_candidates.reclaimable_generation_ids.is_empty());
+        assert_eq!(
+            no_candidates.fully_retained_generation_ids,
+            vec!["gen-quarantined".to_string()]
+        );
+        assert_eq!(
+            no_candidates.quarantined_generation_ids,
+            vec!["gen-quarantined".to_string()]
+        );
         assert_eq!(
             no_candidates.protected_generation_ids,
             vec!["gen-quarantined".to_string()]
