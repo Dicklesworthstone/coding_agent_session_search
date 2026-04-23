@@ -760,19 +760,21 @@ Truncated fields include a `*_truncated: true` indicator so agents know when the
 
 ### Error Handling for Agents
 
-Errors are structured, actionable, and include recovery hints:
+Errors are structured, actionable, and include recovery hints. A real sample from `cass search foo --robot` against a fresh data dir:
 
 ```json
 {
- "error": {
- "code": 3,
- "kind": "index_missing",
- "message": "Search index not found",
- "hint": "Run 'cass index --full' to build the index",
- "retryable": false
- }
+  "error": {
+    "code": 3,
+    "kind": "missing-index",
+    "message": "cass has not been initialized in <data_dir> yet, so search cannot run until the first index completes.",
+    "hint": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+    "retryable": true
+  }
 }
 ```
+
+**Kind names** are kebab-case (e.g. `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`). Agents that branch on `err.kind` should treat them as stable identifiers. The full set (~50 kinds as of 0.3.x) is defined in `src/lib.rs`; the canonical way to discover a kind programmatically is to trigger the condition and inspect `err.kind` from the JSON envelope.
 
 **Exit codes** follow a semantic convention:
 | Code | Meaning | Typical action |
@@ -780,13 +782,15 @@ Errors are structured, actionable, and include recovery hints:
 | 0 | Success | Parse stdout |
 | 1 | Health check failed | Run `cass index --full` |
 | 2 | Usage error | Fix syntax (hint provided) |
-| 3 | Index/DB missing | Run `cass index --full` |
+| 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
 | 4 | Network error | Check connectivity |
 | 5 | Data corruption | Run `cass index --full --force-rebuild` |
 | 6 | Incompatible version | Update cass |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result | Increase `--timeout` or reduce scope |
 | 9 | Unknown error | Check `retryable` flag |
+
+Codes ≥ 10 cover domain-specific failures (semantic tier unavailable, analytics validation, export errors, etc.). Consult `err.kind` in the JSON envelope for the canonical identifier when `err.code ≥ 10`.
 
 The `retryable` field tells agents whether a retry might succeed (e.g., transient I/O) vs. guaranteed failure (e.g., invalid path).
 
