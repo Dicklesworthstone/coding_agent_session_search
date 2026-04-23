@@ -66,7 +66,7 @@
       "reason": "lexical Tantivy metadata missing",
       "fresh": false,
       "last_indexed_at": null,
-      "age_seconds": null,
+      "age_seconds": "[AGE_SECONDS]",
       "stale": false,
       "stale_threshold_seconds": 300,
       "rebuilding": false,
@@ -155,7 +155,51 @@
       "hnsw_path": null,
       "hnsw_ready": false,
       "progressive_ready": false,
-      "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical."
+      "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical.",
+      "fast_tier": {
+        "present": false,
+        "ready": false,
+        "current_db_matches": null,
+        "conversation_count": null,
+        "doc_count": null,
+        "embedder_id": null,
+        "model_revision": null,
+        "completed_at": null,
+        "size_bytes": null
+      },
+      "quality_tier": {
+        "present": false,
+        "ready": false,
+        "current_db_matches": null,
+        "conversation_count": null,
+        "doc_count": null,
+        "embedder_id": null,
+        "model_revision": null,
+        "completed_at": null,
+        "size_bytes": null
+      },
+      "backlog": {
+        "total_conversations": 0,
+        "fast_tier_processed": 0,
+        "fast_tier_remaining": 0,
+        "quality_tier_processed": 0,
+        "quality_tier_remaining": 0,
+        "pending_work": false,
+        "current_db_matches": null,
+        "computed_at": null
+      },
+      "checkpoint": {
+        "active": false,
+        "tier": null,
+        "current_db_matches": null,
+        "completed": null,
+        "conversations_processed": null,
+        "total_conversations": null,
+        "progress_pct": null,
+        "docs_embedded": null,
+        "last_offset": null,
+        "saved_at": null
+      }
     },
     "_meta": {
       "timestamp": "[TIMESTAMP]",
