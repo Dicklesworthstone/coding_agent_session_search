@@ -97,6 +97,61 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .to_string();
     }
 
+    // 7. Watchdog sampler counters in health --json. These tick each time
+    // the responsiveness sampler fires; the test can race with that timer
+    // (0 ticks before the first sample, 1+ ticks after). Scrub the integer
+    // to a placeholder so the golden locks the *shape* of the counter
+    // surface without chasing sampler-timing drift.
+    for key in [
+        "healthy_streak",
+        "ticks_total",
+        "load_window_len",
+        "psi_window_len",
+        "observations_total",
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "[LIVE_COUNTER]""#).as_str())
+            .to_string();
+    }
+
+    // 8. `last_snapshot` + `last_reason` in health --json vary between
+    // `null` (sampler has not yet fired) and a populated object/string
+    // (sampler has fired at least once) depending on timing. The content
+    // of the populated form already has its inner floats scrubbed by
+    // rule 6; the remaining difference is whether the sampler fired. Fold
+    // both forms to a single sentinel so the golden does not race the
+    // sampler timer. We match `null`, a string value, or a `{...}` object
+    // by consuming everything up to the next unescaped `"..."` key at the
+    // same indentation — kept narrow so the scrub only fires on the
+    // health watchdog block.
+    //
+    // The object form is multi-line pretty-printed JSON; `(?s)` enables
+    // `.` to match newlines. Non-greedy match `.*?` stops at the first
+    // closing `}` on its own line at the correct indent. We rely on the
+    // outer scrub-then-compare discipline: any false-positive collapse
+    // would still fail the golden because the sentinel would differ
+    // between runs — the goal is deterministic scrubbing, not semantic
+    // parsing.
+    let last_snapshot_obj_re = regex::Regex::new(
+        r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#,
+    )
+    .unwrap();
+    out = last_snapshot_obj_re
+        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
+        .to_string();
+    let last_snapshot_null_re =
+        regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
+    out = last_snapshot_null_re
+        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
+        .to_string();
+
+    let last_reason_re =
+        regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
+    out = last_reason_re
+        .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
+        .to_string();
+
     out
 }
 
