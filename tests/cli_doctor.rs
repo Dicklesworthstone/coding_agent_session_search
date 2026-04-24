@@ -510,6 +510,91 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+
+    let external_target = test_home.path().join("external-backup-target");
+    fs::create_dir_all(&external_target).expect("create external symlink target");
+    let external_sentinel = external_target.join("sentinel");
+    fs::write(&external_sentinel, b"must remain outside cleanup roots")
+        .expect("write external sentinel");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    std::os::unix::fs::symlink(&external_target, &older_backup)
+        .expect("create symlinked retained backup");
+
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"new backup bytes")
+        .expect("write newer retained publish backup");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+        .output()
+        .expect("run cass doctor --json --fix");
+    assert!(
+        out.status.success(),
+        "cass doctor --json --fix failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        external_sentinel.exists(),
+        "cleanup must never follow a symlink outside the retained backup root"
+    );
+    assert!(
+        fs::symlink_metadata(&older_backup)
+            .expect("symlinked backup metadata")
+            .file_type()
+            .is_symlink(),
+        "unsafe symlinked backup should remain for operator inspection"
+    );
+    assert!(
+        newer_backup.exists(),
+        "newest retained publish backup should remain protected"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let cleanup = &payload["cleanup_apply"];
+    assert_eq!(cleanup["applied"].as_bool(), Some(false));
+    assert_eq!(cleanup["pruned_asset_count"].as_u64(), Some(0));
+    let actions = cleanup["actions"].as_array().expect("cleanup actions");
+    assert!(
+        actions.iter().any(|action| {
+            action["artifact_kind"].as_str() == Some("retained_publish_backup")
+                && action["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("prior-live-older")
+                && action["skipped"].as_bool() == Some(true)
+                && action["skip_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("unsafe cleanup target")
+        }),
+        "doctor --fix should report symlinked retained backups as unsafe cleanup targets"
+    );
+}
+
 #[test]
 fn doctor_fix_preserves_reclaimable_generations_when_active_work_exists() {
     let test_home = tempfile::tempdir().expect("tempdir");

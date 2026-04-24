@@ -11367,6 +11367,12 @@ fn cleanup_target_path_is_safe(
     db_path: &Path,
     index_path: &Path,
 ) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
     if !path.starts_with(data_dir) || path == data_dir || path == db_path || path == index_path {
         return false;
     }
