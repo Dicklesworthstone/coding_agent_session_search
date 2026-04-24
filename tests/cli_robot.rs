@@ -5241,3 +5241,238 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
         "error message must be a non-empty diagnostic string; got: {err:?}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-1dd5u (child of ibuuh.10):
+// Metamorphic invariants for `cass search` query handling.
+//
+// Existing search tests pin specific-query regressions against a
+// curated fixture. This trio pins the CROSS-QUERY invariants the
+// documentation implies but no test currently enforces:
+//
+//   1. Case-insensitivity — search "FOO" must return the same hit set
+//      (same source_path+line_number keys in the same order) as
+//      search "foo". Tantivy's default tokenizer lowercases terms at
+//      index-and-query time; a refactor that swapped it for a
+//      case-sensitive tokenizer or removed the lowercase step would
+//      silently break this invariant and no current test notices.
+//
+//   2. Whitespace-trim — search "  foo  " must return the same hit
+//      set as search "foo". The query-normalization path trims
+//      leading/trailing whitespace; a refactor that trusted the
+//      operator to pre-trim would silently regress this surface.
+//
+//   3. Limit monotonicity — the top-N hits of `search X --limit N`
+//      must be a prefix of the top-M hits of `search X --limit M` for
+//      M > N. This is the deterministic-ordering property the pager
+//      and `--cursor` paths rely on; a regression that applied the
+//      limit BEFORE ranking would trip this test immediately.
+//
+// All three use the `seed_codex_session_s0cmk` + `isolated_cass_cmd`
+// helpers already defined above so no new test fixture is introduced.
+// ========================================================================
+
+fn search_hits_as_keys(payload: &Value) -> Vec<(String, i64)> {
+    // Panic-on-null matches the jogco review fixup (bd-7qtn5 sibling
+    // work): silently defaulting null fields would let two malformed
+    // responses compare equal and mask a real regression.
+    payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|h| {
+            let path = h
+                .get("source_path")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("hit.source_path must be a non-null string; hit: {h}"))
+                .to_string();
+            let line = h
+                .get("line_number")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| panic!("hit.line_number must be a non-null integer; hit: {h}"));
+            (path, line)
+        })
+        .collect()
+}
+
+fn run_search_returning_payload(home: &std::path::Path, data_dir: &std::path::Path, args: &[&str]) -> Value {
+    let mut cmd = isolated_cass_cmd(home);
+    cmd.args(args).arg(data_dir);
+    let out = cmd.output().expect("run cass search");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "cass search invocation must succeed (args={args:?}); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("search stdout must be valid JSON: {err}; stdout: {stdout}"))
+}
+
+/// Common setup: seed 3 Codex rollouts, run cass index --full, return
+/// (tempdir, home path, data_dir path) so each metamorphic test can
+/// drop straight into invoking cass search against the known corpus.
+fn seed_metamorphic_corpus() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    for idx in 1..=3 {
+        let name = format!("rollout-meta-{idx:02}.jsonl");
+        seed_codex_session_s0cmk(&codex_home, &name, "metamorphprobe");
+    }
+    let mut index = isolated_cass_cmd(&home);
+    index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let out = index.output().expect("run cass index --full");
+    assert!(
+        out.status.success(),
+        "seed index --full must succeed; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (tmp, home, data_dir)
+}
+
+#[test]
+fn search_is_case_insensitive_for_ascii_queries() {
+    let (_tmp, home, data_dir) = seed_metamorphic_corpus();
+
+    let lower = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+    );
+    let upper = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "METAMORPHPROBE", "--json", "--limit", "20", "--data-dir"],
+    );
+    let mixed = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "MetaMorphProbe", "--json", "--limit", "20", "--data-dir"],
+    );
+
+    let lower_keys = search_hits_as_keys(&lower);
+    assert!(
+        !lower_keys.is_empty(),
+        "precondition: lower-case search must return hits for the seeded keyword; \
+         payload: {lower}"
+    );
+    assert_eq!(
+        lower_keys,
+        search_hits_as_keys(&upper),
+        "search must be case-insensitive: lower-case and upper-case queries \
+         must return identical hit keys in identical order"
+    );
+    assert_eq!(
+        lower_keys,
+        search_hits_as_keys(&mixed),
+        "search must be case-insensitive: lower-case and mixed-case queries \
+         must return identical hit keys in identical order"
+    );
+    // total_matches must also match — catches a regression where the
+    // lower/upper paths returned the same hits but reported a
+    // different count (would leak via pagination UIs).
+    assert_eq!(
+        lower.get("total_matches"),
+        upper.get("total_matches"),
+        "total_matches must agree across case variants; lower: {lower}\nupper: {upper}"
+    );
+}
+
+#[test]
+fn search_trims_leading_and_trailing_whitespace_from_query() {
+    let (_tmp, home, data_dir) = seed_metamorphic_corpus();
+
+    let bare = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+    );
+    let padded = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "  metamorphprobe  ", "--json", "--limit", "20", "--data-dir"],
+    );
+    let tabs_and_newlines = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "\tmetamorphprobe\n", "--json", "--limit", "20", "--data-dir"],
+    );
+
+    let bare_keys = search_hits_as_keys(&bare);
+    assert!(
+        !bare_keys.is_empty(),
+        "precondition: unpadded search must return hits; payload: {bare}"
+    );
+    assert_eq!(
+        bare_keys,
+        search_hits_as_keys(&padded),
+        "search must trim leading/trailing spaces: bare and space-padded queries \
+         must return identical hit keys in identical order"
+    );
+    assert_eq!(
+        bare_keys,
+        search_hits_as_keys(&tabs_and_newlines),
+        "search must trim leading/trailing whitespace (tabs + newlines too): \
+         bare and whitespace-padded queries must return identical hit keys"
+    );
+}
+
+#[test]
+fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
+    let (_tmp, home, data_dir) = seed_metamorphic_corpus();
+
+    let small = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "metamorphprobe", "--json", "--limit", "2", "--data-dir"],
+    );
+    let large = run_search_returning_payload(
+        &home,
+        &data_dir,
+        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+    );
+
+    let small_keys = search_hits_as_keys(&small);
+    let large_keys = search_hits_as_keys(&large);
+
+    assert!(
+        !small_keys.is_empty(),
+        "precondition: small-limit search must return at least one hit; \
+         small: {small}"
+    );
+    assert!(
+        large_keys.len() >= small_keys.len(),
+        "larger --limit must return at least as many hits as a smaller one; \
+         small.len()={}, large.len()={}",
+        small_keys.len(),
+        large_keys.len(),
+    );
+
+    // The prefix property: every key returned at --limit 2 must be
+    // present in the same position at --limit 20. This is what the
+    // pager's `--cursor`/`--offset` path relies on.
+    assert_eq!(
+        &large_keys[..small_keys.len()],
+        small_keys.as_slice(),
+        "--limit N hits must be a prefix of --limit M hits (M > N); \
+         small.keys={small_keys:?}\nlarge.keys (prefix)={:?}",
+        &large_keys[..small_keys.len().min(large_keys.len())],
+    );
+
+    // Also pin that total_matches is invariant under --limit — the
+    // limit only clamps how MANY we return, not the reported universe
+    // size.
+    assert_eq!(
+        small.get("total_matches"),
+        large.get("total_matches"),
+        "total_matches must be invariant across --limit; small: {small}\nlarge: {large}"
+    );
+}
