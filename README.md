@@ -2384,6 +2384,15 @@ cass completions bash > ~/.bash_completion.d/cass
 | `sources` | Manage remote sources: add/list/remove/doctor/sync/mappings |
 | `doctor` | Diagnose and repair installation issues (safe, never deletes data) |
 
+### Specialized Validation and Recording Tools
+
+| Tool | Purpose |
+|------|---------|
+| `cass tui --asciicast FILE` | Record TUI output as an asciicast v2 artifact; there is no separate `cass cast` subcommand |
+| `scripts/bakeoff/cass_validation_e2e.sh` | Run the bake-off validation harness for lexical, semantic, hybrid, and reranked search scenarios |
+| `scripts/bakeoff/cass_embedder_e2e.sh` | Exercise embedder bake-off flows against a generated validation corpus |
+| `scripts/bakeoff/cass_rerank_e2e.sh` | Exercise reranker bake-off flows and append results to the bake-off log |
+
 ### Diagnostic Commands
 
 Commands for troubleshooting, debugging, and understanding system state:
