@@ -2159,6 +2159,36 @@ mod tests {
     }
 
     #[test]
+    fn test_path_to_safe_dirname_strips_traversal_components() {
+        let res = path_to_safe_dirname("../../etc/passwd");
+
+        assert!(res.starts_with("etc_passwd_"));
+        assert!(!res.contains(".."));
+        assert!(!res.contains('/'));
+        assert!(!res.contains('\\'));
+    }
+
+    #[test]
+    fn test_get_remote_home_rejects_unsafe_hosts_before_ssh() {
+        let temp = TempDir::new().unwrap();
+        let engine = SyncEngine::new(temp.path());
+
+        for host in [
+            "work-mac;touch /tmp/cass-owned",
+            "work mac",
+            "work-mac\nhostname",
+            "work-mac`hostname`",
+            "work-mac/../../secret",
+        ] {
+            let err = engine.get_remote_home(host).unwrap_err();
+            assert!(
+                matches!(err, SyncError::SshFailed(ref message) if message.contains("Invalid characters in host")),
+                "expected invalid-host rejection for {host:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_remote_find_regular_files_command_uses_physical_traversal() {
         assert_eq!(
             remote_find_regular_files_command("/tmp/has space"),
