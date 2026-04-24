@@ -25424,6 +25424,14 @@ mod tests {
             "64",
         );
         let _channel_size = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "1");
+        let _controller_loadavg_high = set_env(
+            "CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_HIGH_WATERMARK_1M",
+            "1000000",
+        );
+        let _controller_loadavg_low = set_env(
+            "CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_LOW_WATERMARK_1M",
+            "999999",
+        );
 
         let logs = capture_logs(|| {
             let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, 4, None).unwrap();
