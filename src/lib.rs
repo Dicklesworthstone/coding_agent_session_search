@@ -5200,6 +5200,12 @@ struct StateDbSnapshot {
     open_error: Option<String>,
     open_retryable: bool,
     counts_skipped: bool,
+    /// `coding_agent_session_search-gi4oy`: true when state_meta_json
+    /// elided the FrankenStorage open (health fast path). `opened`
+    /// is set to true based on `db_path.exists()` alone in that case;
+    /// callers needing the actual open-success signal use
+    /// `cass status` / `cass diag` which always perform the open.
+    open_skipped: bool,
 }
 
 fn probe_state_db(
@@ -5527,6 +5533,73 @@ fn state_meta_json(
     state_meta_json_with_counts(data_dir, db_path, stale_threshold, allow_db_open, None)
 }
 
+/// `coding_agent_session_search-gi4oy` follow-up to d0rmo: the
+/// COUNT(*) skip got cass health from p50=296ms to p50=132ms, but
+/// the documented `<50ms` budget still demanded another ~80ms cut.
+/// Profiling pointed at the second cold-path cost: opening the
+/// FrankenStorage canonical DB twice per probe (once via
+/// probe_state_db for `last_indexed_at`, once via
+/// inspect_semantic_assets when a model is installed). Health's
+/// readiness verdict only needs `db_exists` — corrupt-DB detection
+/// is `cass doctor`'s job, not the fast-surface probe's.
+///
+/// `skip_db_open`: when true, probe_state_db is replaced with a
+/// pure-fs StateDbSnapshot that reports `opened=true` if the file
+/// exists (assumed-good) and surfaces the new `opened_skipped=true`
+/// flag in the database envelope so callers know the open was
+/// elided. status / diag pass false (they explicitly want the
+/// open-success signal as a degraded-state diagnostic).
+fn state_meta_json_with_counts(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+    allow_db_open: bool,
+    include_counts_override: Option<bool>,
+) -> serde_json::Value {
+    state_meta_json_full(
+        data_dir,
+        db_path,
+        stale_threshold,
+        allow_db_open,
+        include_counts_override,
+        false,
+    )
+}
+
+/// `coding_agent_session_search-gi4oy`: most-general state_meta_json
+/// variant exposing both the include_counts override (d0rmo) AND
+/// the skip_db_open elision (gi4oy). Callers that already use
+/// state_meta_json_with_counts keep working unchanged; new callers
+/// (currently just run_health) opt in via state_meta_json_for_health.
+fn state_meta_json_full(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+    allow_db_open: bool,
+    include_counts_override: Option<bool>,
+    skip_db_open: bool,
+) -> serde_json::Value {
+    state_meta_json_inner(
+        data_dir,
+        db_path,
+        stale_threshold,
+        allow_db_open,
+        include_counts_override,
+        skip_db_open,
+    )
+}
+
+/// Convenience wrapper for run_health: skip COUNT(*) AND skip the
+/// DB open. The two together drop p50 from 296ms (pre-d0rmo)
+/// through ~132ms (post-d0rmo) toward the <50ms budget.
+fn state_meta_json_for_health(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+) -> serde_json::Value {
+    state_meta_json_full(data_dir, db_path, stale_threshold, true, Some(false), true)
+}
+
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
 /// that lets the caller force-skip the COUNT(*) queries on the
 /// canonical DB. Pre-fix the size-based heuristic (≤256 MB → run
@@ -5545,12 +5618,13 @@ fn state_meta_json(
 ///   - `Some(true)`   → unconditionally run counts (no caller uses
 ///                      this today; reserved for future paths that
 ///                      MUST have totals regardless of cost).
-fn state_meta_json_with_counts(
+fn state_meta_json_inner(
     data_dir: &Path,
     db_path: &Path,
     stale_threshold: u64,
     allow_db_open: bool,
     include_counts_override: Option<bool>,
+    skip_db_open: bool,
 ) -> serde_json::Value {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5569,7 +5643,20 @@ fn state_meta_json_with_counts(
             .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
             .unwrap_or(false)
     });
-    let db_snapshot = if allow_db_open && db_exists {
+    // [coding_agent_session_search-gi4oy] Skip-open path: when
+    // skip_db_open is true and the DB file exists, synthesize a
+    // StateDbSnapshot that reports opened=true (assumed-good) +
+    // open_skipped=true. The expensive FrankenStorage open is
+    // elided; callers reading the JSON envelope branch on the new
+    // flag if they need to know the open was assumed.
+    let db_snapshot = if skip_db_open && db_exists {
+        StateDbSnapshot {
+            opened: true,
+            counts_skipped: !include_counts,
+            open_skipped: true,
+            ..StateDbSnapshot::default()
+        }
+    } else if allow_db_open && db_exists {
         probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
     } else {
         StateDbSnapshot::default()
@@ -5581,6 +5668,7 @@ fn state_meta_json_with_counts(
     let db_open_error = db_snapshot.open_error;
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
+    let open_skipped = db_snapshot.open_skipped;
 
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     let lexical_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
@@ -5851,7 +5939,8 @@ fn state_meta_json_with_counts(
             "messages": state_db_count_json(message_count, counts_skipped),
             "open_error": db_open_error,
             "open_retryable": db_open_retryable,
-            "counts_skipped": counts_skipped
+            "counts_skipped": counts_skipped,
+            "open_skipped": open_skipped
         },
         "pending": {
             "sessions": lexical.pending_sessions,
@@ -12515,14 +12604,14 @@ fn run_health(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    // [coding_agent_session_search-d0rmo] health is the documented
-    // <50ms fast surface; force-skip the canonical-DB COUNT(*)
-    // queries that dominate runtime on real corpora. Counts in the
-    // envelope become 0 with counts_skipped=true; status / diag
-    // (which surface totals as a primary signal) keep the existing
-    // size-based default.
-    let state =
-        state_meta_json_with_counts(&data_dir, &db_path, stale_threshold, true, Some(false));
+    // [coding_agent_session_search-d0rmo + gi4oy] health is the
+    // documented <50ms fast surface; force-skip BOTH the canonical-DB
+    // COUNT(*) (d0rmo) AND the FrankenStorage open (gi4oy). The
+    // health verdict only needs db_path.exists() — actual integrity
+    // detection is `cass doctor`'s responsibility, not the
+    // fast-surface probe's. Envelope reports counts_skipped=true +
+    // open_skipped=true so callers know both elisions happened.
+    let state = state_meta_json_for_health(&data_dir, &db_path, stale_threshold);
 
     let index_exists = state
         .get("index")

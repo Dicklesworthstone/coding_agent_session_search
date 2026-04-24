@@ -506,7 +506,6 @@ fn seed_large_health_latency_db(data_dir: &Path) {
 /// p99 across CI runners). The 50ms ceiling has substantial headroom
 /// over the typical sub-20ms warmed measurement on a 4-core CI box.
 #[test]
-#[ignore = "coding_agent_session_search-gi4oy: COUNT(*) skip (d0rmo) shaved 296→132ms but still 2.6× over budget; un-ignore when gi4oy lands the next ~80ms reduction (likely inspect_search_assets path)"]
 fn health_json_large_seeded_db_p50_stays_under_50ms() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path();
@@ -561,6 +560,20 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
             Some(true),
             "health MUST report counts_skipped=true post-d0rmo so callers know the \
              0 counts are intentional, not a missing-data signal"
+        );
+        // [coding_agent_session_search-gi4oy] Health also skips the
+        // FrankenStorage open to honor the <50ms budget. Verify the
+        // open_skipped flag so a regression that re-introduces the
+        // open path trips this AND the latency assertion below.
+        assert_eq!(
+            payload
+                .get("state")
+                .and_then(|s| s.get("database"))
+                .and_then(|db| db.get("open_skipped"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "health MUST report open_skipped=true post-gi4oy so callers know the \
+             opened=true is assumed-good, not a real open-success signal"
         );
         assert!(
             payload
