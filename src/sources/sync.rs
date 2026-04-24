@@ -36,7 +36,7 @@ use super::{
     host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
     strict_ssh_command_for_rsync,
 };
-use ssh2::{Session, Sftp};
+use ssh2::{FileStat, Session, Sftp};
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{Shutdown, TcpStream};
 
@@ -128,6 +128,49 @@ fn remote_spec_for_rsync(host: &str, remote_path: &str, protect_args_supported: 
         // Without it (e.g. openrsync), we must manually quote for the remote shell
         remote_spec_for_shell_bound_copy(host, remote_path)
     }
+}
+
+fn remote_find_regular_files_command(remote_path: &str) -> String {
+    format!(
+        "find -P {} -type f -print0",
+        quote_remote_shell_path(remote_path)
+    )
+}
+
+fn parse_null_terminated_utf8_paths(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn remote_file_to_safe_local_path(
+    remote_root: &Path,
+    remote_file: &Path,
+    local_container: &Path,
+    leaf_name: &str,
+) -> Option<PathBuf> {
+    let mut local_path = local_container.join(leaf_name);
+    if remote_file == remote_root {
+        return Some(local_path);
+    }
+
+    let relative = remote_file.strip_prefix(remote_root).ok()?;
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => local_path.push(name),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+
+    Some(local_path)
+}
+
+fn sftp_file_stat_is_symlink(stat: &FileStat) -> bool {
+    stat.file_type().is_symlink()
 }
 
 /// Errors that can occur during sync operations.
@@ -625,7 +668,7 @@ impl SyncEngine {
 
         let timeout_str = self.transfer_timeout.to_string();
         let mut cmd = Command::new("rsync");
-        cmd.args(["-avz", "--stats", "--partial"]);
+        cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
         if let Some(flag) = arg_protection.flag() {
             cmd.arg(flag);
         }
@@ -787,7 +830,14 @@ impl SyncEngine {
         let timeout_str = self.transfer_timeout.to_string();
 
         let mut cmd = Command::new("wsl");
-        cmd.args(["rsync", "-avz", "--stats", "--partial"]);
+        cmd.args([
+            "rsync",
+            "-avz",
+            "--links",
+            "--safe-links",
+            "--stats",
+            "--partial",
+        ]);
         // WSL rsync is the real rsync (not openrsync), so --protect-args is safe.
         cmd.arg("--protect-args");
         cmd.args([
@@ -880,7 +930,7 @@ impl SyncEngine {
         }
     }
 
-    /// Sync a single path using SCP (system `scp -r`).
+    /// Sync a single path using SCP after a physical `find -P` regular-file listing.
     ///
     /// This method delegates all authentication to the native system `scp`/`ssh`
     /// binary, which correctly reads `~/.ssh/config`, the OpenSSH agent (including
@@ -928,71 +978,39 @@ impl SyncEngine {
             };
         }
 
-        let local_path_str = match local_path.to_str() {
-            Some(s) => s,
-            None => {
-                return PathSyncResult {
-                    remote_path: remote_path.to_string(),
-                    local_path,
-                    success: false,
-                    error: Some("Local path contains invalid UTF-8".to_string()),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    ..Default::default()
-                };
-            }
-        };
-
-        // Build the scp command.
-        // -r: recursive copy
-        // -B: batch mode (non-interactive, same as ssh -o BatchMode=yes)
-        // -o: pass through SSH options
-        // The remote source is "host:path"; the local destination is the mirror dir.
+        // `scp -r` follows symlinks on some OpenSSH paths. Enumerate only regular
+        // files with physical traversal first, then copy those files individually.
         let connect_timeout = self.connection_timeout.to_string();
-        // Modern OpenSSH scp uses SFTP by default, so the remote path is not
-        // parsed by a remote shell unless the caller forces legacy `-O` mode.
-        let remote_spec = remote_spec_for_scp(host, &expanded_path);
-
-        let mut cmd = Command::new("scp");
-        cmd.args([
-            "-r",
-            "-B",
-            "-o",
-            &format!("ConnectTimeout={}", connect_timeout),
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "--",
-            &remote_spec,
-            local_path_str,
-        ]);
+        let find_command = remote_find_regular_files_command(&expanded_path);
 
         tracing::debug!(
             host = %host,
             remote_path = %expanded_path,
             local_path = %local_path.display(),
-            "starting scp sync"
+            "listing regular files for scp sync"
         );
 
-        let output = match cmd.output() {
+        let output = match Command::new("ssh")
+            .args(strict_ssh_cli_tokens(self.connection_timeout))
+            .arg("--")
+            .arg(host)
+            .arg(&find_command)
+            .output()
+        {
             Ok(o) => o,
             Err(e) => {
                 return PathSyncResult {
                     remote_path: remote_path.to_string(),
                     local_path,
                     success: false,
-                    error: Some(format!("Failed to execute scp: {}", e)),
+                    error: Some(format!("Failed to execute ssh file listing: {}", e)),
                     duration_ms: start.elapsed().as_millis() as u64,
                     ..Default::default()
                 };
             }
         };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
         let stderr = String::from_utf8_lossy(&output.stderr);
-
         if !output.status.success() {
             let error_msg = if stderr.contains("Connection refused")
                 || stderr.contains("Connection timed out")
@@ -1005,14 +1023,14 @@ impl SyncEngine {
             } else if stderr.contains("Permission denied") {
                 format!("Permission denied: {}", stderr.trim())
             } else {
-                format!("scp failed: {}", stderr.trim())
+                format!("Remote file listing failed: {}", stderr.trim())
             };
 
             tracing::warn!(
                 host = %host,
                 remote_path = %expanded_path,
                 error = %error_msg,
-                "scp failed"
+                "scp file listing failed"
             );
 
             return PathSyncResult {
@@ -1020,19 +1038,131 @@ impl SyncEngine {
                 local_path,
                 success: false,
                 error: Some(error_msg),
-                duration_ms,
+                duration_ms: start.elapsed().as_millis() as u64,
                 ..Default::default()
             };
         }
 
-        // scp does not emit machine-readable stats; count transferred files from the
-        // local directory to give a best-effort count.
-        let files_transferred = count_files_in_dir(&local_path).unwrap_or(0);
+        let remote_files = parse_null_terminated_utf8_paths(&output.stdout);
+        let remote_root = Path::new(&expanded_path);
+        let leaf_name = Path::new(remote_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("remote");
+        let mut files_transferred = 0u64;
+        let mut bytes_transferred = 0u64;
+
+        for remote_file in remote_files {
+            let remote_file_path = Path::new(&remote_file);
+            let Some(local_file) = remote_file_to_safe_local_path(
+                remote_root,
+                remote_file_path,
+                &local_path,
+                leaf_name,
+            ) else {
+                tracing::warn!(
+                    remote_path = %remote_file,
+                    root = %expanded_path,
+                    "skipping scp file outside listed root"
+                );
+                continue;
+            };
+
+            if let Some(parent) = local_file.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!("Failed to create {}: {}", parent.display(), e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+
+            let Some(local_file_str) = local_file.to_str() else {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some("Local path contains invalid UTF-8".to_string()),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            };
+
+            let remote_spec = remote_spec_for_scp(host, &remote_file);
+            let mut cmd = Command::new("scp");
+            cmd.args([
+                "-B",
+                "-o",
+                &format!("ConnectTimeout={}", connect_timeout),
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "--",
+                &remote_spec,
+                local_file_str,
+            ]);
+
+            let output = match cmd.output() {
+                Ok(o) => o,
+                Err(e) => {
+                    return PathSyncResult {
+                        remote_path: remote_path.to_string(),
+                        local_path,
+                        success: false,
+                        error: Some(format!("Failed to execute scp: {}", e)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        ..Default::default()
+                    };
+                }
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let error_msg = if is_host_key_verification_failure(&stderr) {
+                    host_key_verification_error(host)
+                } else if stderr.contains("Permission denied") {
+                    format!("Permission denied: {}", stderr.trim())
+                } else {
+                    format!("scp failed: {}", stderr.trim())
+                };
+
+                tracing::warn!(
+                    host = %host,
+                    remote_path = %remote_file,
+                    error = %error_msg,
+                    "scp file transfer failed"
+                );
+
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(error_msg),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+
+            files_transferred += 1;
+            if let Ok(metadata) = std::fs::metadata(&local_file) {
+                bytes_transferred = bytes_transferred.saturating_add(metadata.len());
+            }
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
 
         tracing::info!(
             host = %host,
             remote_path = %expanded_path,
             files = files_transferred,
+            bytes = bytes_transferred,
             duration_ms,
             "scp sync completed"
         );
@@ -1041,7 +1171,7 @@ impl SyncEngine {
             remote_path: remote_path.to_string(),
             local_path,
             files_transferred,
-            bytes_transferred: 0, // scp does not report bytes
+            bytes_transferred,
             success: true,
             error: None,
             duration_ms,
@@ -1396,10 +1526,19 @@ impl SyncEngine {
         files_transferred: &mut u64,
         bytes_transferred: &mut u64,
     ) -> Result<(), String> {
-        // Check if remote path is a directory or file
+        // Use lstat so a remote symlink is classified as a symlink rather than
+        // followed to a file or directory outside the configured source root.
         let stat = sftp
-            .stat(remote_path)
-            .map_err(|e| format!("Failed to stat {}: {}", remote_path.display(), e))?;
+            .lstat(remote_path)
+            .map_err(|e| format!("Failed to lstat {}: {}", remote_path.display(), e))?;
+
+        if sftp_file_stat_is_symlink(&stat) {
+            tracing::warn!(
+                path = %remote_path.display(),
+                "Skipping remote symlink during SFTP sync"
+            );
+            return Ok(());
+        }
 
         if stat.is_dir() {
             // Create local directory for this directory item
@@ -1411,10 +1550,21 @@ impl SyncEngine {
                 .readdir(remote_path)
                 .map_err(|e| format!("Failed to list {}: {}", remote_path.display(), e))?;
 
-            for (entry_path, entry_stat) in entries {
+            for (entry_path, _entry_stat) in entries {
                 let Some(file_name) = sftp_entry_file_name(&entry_path, remote_path) else {
                     continue;
                 };
+
+                let entry_stat = sftp
+                    .lstat(&entry_path)
+                    .map_err(|e| format!("Failed to lstat {}: {}", entry_path.display(), e))?;
+                if sftp_file_stat_is_symlink(&entry_stat) {
+                    tracing::warn!(
+                        path = %entry_path.display(),
+                        "Skipping remote symlink during SFTP sync"
+                    );
+                    continue;
+                }
 
                 let local_entry = local_path.join(file_name);
 
@@ -1429,8 +1579,14 @@ impl SyncEngine {
                     )?;
                 } else if entry_stat.is_file() {
                     // Download file
-                    self.sftp_download_file(sftp, &entry_path, &local_entry, bytes_transferred)?;
-                    *files_transferred += 1;
+                    if self.sftp_download_file(
+                        sftp,
+                        &entry_path,
+                        &local_entry,
+                        bytes_transferred,
+                    )? {
+                        *files_transferred += 1;
+                    }
                 }
                 // Skip symlinks and other types for safety
             }
@@ -1442,8 +1598,9 @@ impl SyncEngine {
                 })?;
             }
 
-            self.sftp_download_file(sftp, remote_path, local_path, bytes_transferred)?;
-            *files_transferred += 1;
+            if self.sftp_download_file(sftp, remote_path, local_path, bytes_transferred)? {
+                *files_transferred += 1;
+            }
         } else {
             // Not a regular file or directory (symlink, socket, etc.) - skip with warning
             tracing::warn!(
@@ -1462,8 +1619,25 @@ impl SyncEngine {
         remote_path: &Path,
         local_path: &Path,
         bytes_transferred: &mut u64,
-    ) -> Result<(), String> {
-        // Open remote file
+    ) -> Result<bool, String> {
+        let stat = sftp
+            .lstat(remote_path)
+            .map_err(|e| format!("Failed to lstat {}: {}", remote_path.display(), e))?;
+        if sftp_file_stat_is_symlink(&stat) {
+            tracing::warn!(
+                path = %remote_path.display(),
+                "Skipping remote symlink during SFTP sync"
+            );
+            return Ok(false);
+        }
+        if !stat.is_file() {
+            tracing::warn!(
+                path = %remote_path.display(),
+                "Skipping remote path: not a regular file"
+            );
+            return Ok(false);
+        }
+
         let mut remote_file = sftp
             .open(remote_path)
             .map_err(|e| format!("Failed to open {}: {}", remote_path.display(), e))?;
@@ -1496,7 +1670,7 @@ impl SyncEngine {
             "downloaded file"
         );
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1572,21 +1746,6 @@ fn windows_path_to_wsl(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-/// Count regular files recursively under `dir`.
-fn count_files_in_dir(dir: &Path) -> Result<u64, std::io::Error> {
-    let mut count = 0u64;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_file() {
-            count += 1;
-        } else if ft.is_dir() {
-            count += count_files_in_dir(&entry.path()).unwrap_or(0);
-        }
-    }
-    Ok(count)
 }
 
 /// Parse SSH host string into (optional_user, host).
@@ -1997,6 +2156,98 @@ mod tests {
 
         let res = path_to_safe_dirname("/");
         assert!(res.starts_with("root_"));
+    }
+
+    #[test]
+    fn test_remote_find_regular_files_command_uses_physical_traversal() {
+        assert_eq!(
+            remote_find_regular_files_command("/tmp/has space"),
+            "find -P '/tmp/has space' -type f -print0"
+        );
+        assert_eq!(
+            remote_find_regular_files_command("/tmp/that's all"),
+            "find -P '/tmp/that'\\''s all' -type f -print0"
+        );
+    }
+
+    #[test]
+    fn test_parse_null_terminated_utf8_paths_skips_invalid_entries() {
+        let paths = parse_null_terminated_utf8_paths(
+            b"/remote/sessions/a.jsonl\0bad-\xff-name\0/remote/sessions/b.jsonl\0",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "/remote/sessions/a.jsonl".to_string(),
+                "/remote/sessions/b.jsonl".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remote_file_to_safe_local_path_rejects_outside_root() {
+        let root = Path::new("/remote/sessions");
+        let local = Path::new("/mirror/root");
+
+        assert_eq!(
+            remote_file_to_safe_local_path(
+                root,
+                Path::new("/remote/sessions/a/b.jsonl"),
+                local,
+                "sessions"
+            ),
+            Some(PathBuf::from("/mirror/root/sessions/a/b.jsonl"))
+        );
+        assert_eq!(
+            remote_file_to_safe_local_path(
+                Path::new("/remote/session.jsonl"),
+                Path::new("/remote/session.jsonl"),
+                local,
+                "session.jsonl"
+            ),
+            Some(PathBuf::from("/mirror/root/session.jsonl"))
+        );
+        assert_eq!(
+            remote_file_to_safe_local_path(
+                root,
+                Path::new("/remote/sessions/../secret.txt"),
+                local,
+                "sessions"
+            ),
+            None
+        );
+        assert_eq!(
+            remote_file_to_safe_local_path(
+                root,
+                Path::new("/remote/other/secret.txt"),
+                local,
+                "sessions"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sftp_file_stat_is_symlink_detects_link_modes() {
+        let symlink = FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: Some(0o120000 | 0o777),
+            atime: None,
+            mtime: None,
+        };
+        let regular = FileStat {
+            size: None,
+            uid: None,
+            gid: None,
+            perm: Some(0o100000 | 0o644),
+            atime: None,
+            mtime: None,
+        };
+
+        assert!(sftp_file_stat_is_symlink(&symlink));
+        assert!(!sftp_file_stat_is_symlink(&regular));
     }
 
     #[test]
