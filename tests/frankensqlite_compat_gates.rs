@@ -15,6 +15,31 @@ use std::fmt::Write as _;
 
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
 
+#[test]
+fn rusqlite_is_dev_dependency_only() {
+    let manifest: toml::Table =
+        toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml dependencies table");
+    assert!(
+        !dependencies.contains_key("rusqlite"),
+        "rusqlite must not ship as a normal production dependency; \
+         keep C-SQLite interop coverage in dev-dependencies only"
+    );
+
+    let dev_dependencies = manifest
+        .get("dev-dependencies")
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml dev-dependencies table");
+    assert!(
+        dev_dependencies.contains_key("rusqlite"),
+        "rusqlite should remain available to tests that build legacy \
+         C-SQLite fixture databases"
+    );
+}
+
 // ============================================================================
 // GATE 1: FTS5 Compatibility
 // ============================================================================

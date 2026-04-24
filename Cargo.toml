@@ -111,9 +111,6 @@ rand = "0.10"
 qrcode = { version = "*", optional = true }
 image = { version = "*", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
-# rusqlite retained for historical bundle salvage: reading pre-migration databases
-# via the proven C-SQLite read path (HistoricalReadConnection, FTS schema scrub).
-rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 
 # macOS keychain access (optional, for ChatGPT decryption)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -144,6 +141,9 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "*"
 rand = "0.10"
 rand_chacha = "0.10"
+# rusqlite is retained only for C-SQLite interop fixtures in tests; production
+# storage and historical salvage paths use frankensqlite.
+rusqlite = { version = "*", features = ["bundled", "modern_sqlite"] }
 # frankensqlite compat gate tests (bead 3vvqa) — fsqlite-types needed for SqliteValue
 # enum variants in test assertions. The main fsqlite dep is available as `frankensqlite`.
 fsqlite-types = { version = "*", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "18a512b6", package = "fsqlite-types" }
