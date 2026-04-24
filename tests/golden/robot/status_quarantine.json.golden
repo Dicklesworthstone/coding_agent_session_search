@@ -172,6 +172,21 @@
       "failed_seed_bundle_count": 2,
       "retained_publish_backup_count": 2,
       "retained_publish_backup_retention_limit": 1,
+      "lexical_generation_count": 1,
+      "lexical_generation_build_state_counts": {
+        "building": 0,
+        "built": 0,
+        "failed": 1,
+        "scratch": 0,
+        "validated": 0,
+        "validating": 0
+      },
+      "lexical_generation_publish_state_counts": {
+        "published": 0,
+        "quarantined": 1,
+        "staged": 0,
+        "superseded": 0
+      },
       "lexical_quarantined_generation_count": 1,
       "lexical_quarantined_shard_count": 1,
       "total_retained_bytes": 1138,

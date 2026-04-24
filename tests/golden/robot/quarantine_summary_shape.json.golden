@@ -10,6 +10,49 @@
     "retained_publish_backup_retention_limit": {
       "type": "integer"
     },
+    "lexical_generation_count": {
+      "type": "integer"
+    },
+    "lexical_generation_build_state_counts": {
+      "type": "object",
+      "properties": {
+        "building": {
+          "type": "integer"
+        },
+        "built": {
+          "type": "integer"
+        },
+        "failed": {
+          "type": "integer"
+        },
+        "scratch": {
+          "type": "integer"
+        },
+        "validated": {
+          "type": "integer"
+        },
+        "validating": {
+          "type": "integer"
+        }
+      }
+    },
+    "lexical_generation_publish_state_counts": {
+      "type": "object",
+      "properties": {
+        "published": {
+          "type": "integer"
+        },
+        "quarantined": {
+          "type": "integer"
+        },
+        "staged": {
+          "type": "integer"
+        },
+        "superseded": {
+          "type": "integer"
+        }
+      }
+    },
     "lexical_quarantined_generation_count": {
       "type": "integer"
     },

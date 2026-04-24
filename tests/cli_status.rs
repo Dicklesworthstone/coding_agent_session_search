@@ -55,6 +55,67 @@ fn write_quarantined_manifest(generation_dir: &Path) {
     .expect("write manifest");
 }
 
+fn write_generation_manifest(
+    generation_dir: &Path,
+    generation_id: &str,
+    build_state: &str,
+    publish_state: &str,
+    shard_state: &str,
+    pinned: bool,
+    reclaimable: bool,
+) {
+    fs::create_dir_all(generation_dir).expect("create generation dir");
+    fs::write(
+        generation_dir.join("lexical-generation-manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 3,
+            "generation_id": generation_id,
+            "attempt_id": format!("{generation_id}-attempt"),
+            "created_at_ms": 1_733_000_010_000_i64,
+            "updated_at_ms": 1_733_000_010_321_i64,
+            "source_db_fingerprint": "fp-lifecycle-test",
+            "conversation_count": 4,
+            "message_count": 12,
+            "indexed_doc_count": 12,
+            "equivalence_manifest_fingerprint": "eq-lifecycle-test",
+            "shard_plan": null,
+            "build_budget": null,
+            "shards": [{
+                "shard_id": format!("{generation_id}-shard"),
+                "shard_ordinal": 0,
+                "state": shard_state,
+                "updated_at_ms": 1_733_000_010_222_i64,
+                "indexed_doc_count": 12,
+                "message_count": 12,
+                "artifact_bytes": 256,
+                "stable_hash": format!("{generation_id}-stable"),
+                "reclaimable": reclaimable,
+                "pinned": pinned,
+                "recovery_reason": null,
+                "quarantine_reason": if shard_state == "quarantined" { Some("validation_failed") } else { None::<&str> }
+            }],
+            "merge_debt": {
+                "state": "none",
+                "updated_at_ms": null,
+                "pending_shard_count": 0,
+                "pending_artifact_bytes": 0,
+                "reason": null,
+                "controller_reason": null
+            },
+            "build_state": build_state,
+            "publish_state": publish_state,
+            "failure_history": []
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    fs::write(
+        generation_dir.join("segment"),
+        format!("{generation_id}-artifact-bytes"),
+    )
+    .expect("write generation artifact");
+}
+
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     let db_path = data_dir.join("agent_search.db");
     let index_path = expected_index_dir(data_dir);
@@ -297,6 +358,118 @@ fn status_json_surfaces_quarantine_gc_summary() {
     );
     assert_eq!(
         summary["retained_publish_backup_retention_limit"].as_u64(),
+        Some(1)
+    );
+}
+
+#[test]
+fn status_json_surfaces_lexical_generation_lifecycle_inventory() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let generation_root = index_path.parent().expect("index parent");
+
+    write_generation_manifest(
+        &generation_root.join("generation-current"),
+        "gen-current",
+        "validated",
+        "published",
+        "published",
+        true,
+        false,
+    );
+    write_generation_manifest(
+        &generation_root.join("generation-staged"),
+        "gen-staged",
+        "built",
+        "staged",
+        "staged",
+        false,
+        true,
+    );
+    write_generation_manifest(
+        &generation_root.join("generation-failed"),
+        "gen-failed",
+        "failed",
+        "staged",
+        "abandoned",
+        false,
+        true,
+    );
+    write_generation_manifest(
+        &generation_root.join("generation-superseded"),
+        "gen-superseded",
+        "validated",
+        "superseded",
+        "published",
+        false,
+        true,
+    );
+    write_generation_manifest(
+        &generation_root.join("generation-quarantined"),
+        "gen-quarantined",
+        "failed",
+        "quarantined",
+        "quarantined",
+        false,
+        false,
+    );
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "status",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("XDG_CONFIG_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        out.status.success(),
+        "cass status --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let summary = &payload["quarantine"]["summary"];
+
+    assert_eq!(summary["lexical_generation_count"].as_u64(), Some(5));
+    assert_eq!(
+        summary["lexical_generation_publish_state_counts"]["published"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        summary["lexical_generation_publish_state_counts"]["staged"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        summary["lexical_generation_publish_state_counts"]["superseded"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        summary["lexical_generation_publish_state_counts"]["quarantined"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        summary["lexical_generation_build_state_counts"]["validated"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        summary["lexical_generation_build_state_counts"]["built"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        summary["lexical_generation_build_state_counts"]["failed"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        summary["lexical_quarantined_generation_count"].as_u64(),
         Some(1)
     );
 }

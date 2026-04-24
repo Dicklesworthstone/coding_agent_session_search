@@ -27,7 +27,7 @@ use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnu
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use indexer::IndexOptions;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -10580,6 +10580,9 @@ struct DiagQuarantineSummary {
     failed_seed_bundle_count: usize,
     retained_publish_backup_count: usize,
     retained_publish_backup_retention_limit: usize,
+    lexical_generation_count: usize,
+    lexical_generation_build_state_counts: BTreeMap<String, usize>,
+    lexical_generation_publish_state_counts: BTreeMap<String, usize>,
     lexical_quarantined_generation_count: usize,
     lexical_quarantined_shard_count: usize,
     total_retained_bytes: u64,
@@ -10621,6 +10624,10 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
     }
 
     let mut report = DiagQuarantineReport::default();
+    report.summary.lexical_generation_build_state_counts =
+        lexical_generation_build_state_zero_counts();
+    report.summary.lexical_generation_publish_state_counts =
+        lexical_generation_publish_state_zero_counts();
     let now = std::time::SystemTime::now();
 
     let backups_dir = data_dir.join("backups");
@@ -10742,18 +10749,24 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     .iter()
                     .filter(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
                     .count();
-                if matches!(
-                    manifest.publish_state,
-                    LexicalGenerationPublishState::Quarantined
-                ) || quarantined_shards > 0
-                {
-                    lexical_manifest_entries.push(LexicalManifestEntry {
-                        path: generation_dir.to_path_buf(),
-                        observation: observe_diag_path(generation_dir, now, &mut report.warnings),
-                        manifest,
-                        quarantined_shards,
-                    });
-                }
+                report.summary.lexical_generation_count =
+                    report.summary.lexical_generation_count.saturating_add(1);
+                *report
+                    .summary
+                    .lexical_generation_build_state_counts
+                    .entry(lexical_generation_build_state_label(manifest.build_state).to_string())
+                    .or_insert(0) += 1;
+                *report
+                    .summary
+                    .lexical_generation_publish_state_counts
+                    .entry(lexical_publish_state_label(manifest.publish_state).to_string())
+                    .or_insert(0) += 1;
+                lexical_manifest_entries.push(LexicalManifestEntry {
+                    path: generation_dir.to_path_buf(),
+                    observation: observe_diag_path(generation_dir, now, &mut report.warnings),
+                    manifest,
+                    quarantined_shards,
+                });
             }
             Ok(None) => {}
             Err(err) => report.warnings.push(format!(
@@ -10777,6 +10790,13 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         .collect();
 
     for entry in lexical_manifest_entries {
+        if !matches!(
+            entry.manifest.publish_state,
+            LexicalGenerationPublishState::Quarantined
+        ) && entry.quarantined_shards == 0
+        {
+            continue;
+        }
         let inventory = lexical_inventory_by_generation.get(&entry.manifest.generation_id);
         let reclaimable_bytes = inventory
             .map(|inventory| inventory.reclaimable_bytes)
@@ -10978,6 +10998,42 @@ fn lexical_publish_state_label(
         LexicalGenerationPublishState::Superseded => "superseded",
         LexicalGenerationPublishState::Quarantined => "quarantined",
     }
+}
+
+fn lexical_generation_build_state_label(
+    state: crate::indexer::lexical_generation::LexicalGenerationBuildState,
+) -> &'static str {
+    use crate::indexer::lexical_generation::LexicalGenerationBuildState;
+
+    match state {
+        LexicalGenerationBuildState::Scratch => "scratch",
+        LexicalGenerationBuildState::Building => "building",
+        LexicalGenerationBuildState::Built => "built",
+        LexicalGenerationBuildState::Validating => "validating",
+        LexicalGenerationBuildState::Validated => "validated",
+        LexicalGenerationBuildState::Failed => "failed",
+    }
+}
+
+fn lexical_generation_build_state_zero_counts() -> BTreeMap<String, usize> {
+    [
+        "scratch",
+        "building",
+        "built",
+        "validating",
+        "validated",
+        "failed",
+    ]
+    .into_iter()
+    .map(|state| (state.to_string(), 0))
+    .collect()
+}
+
+fn lexical_generation_publish_state_zero_counts() -> BTreeMap<String, usize> {
+    ["staged", "published", "superseded", "quarantined"]
+        .into_iter()
+        .map(|state| (state.to_string(), 0))
+        .collect()
 }
 
 fn fs_dir_size(path: &std::path::Path) -> u64 {
