@@ -22,14 +22,8 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
         let val_str: String = stripped.chars().take_while(|c| c.is_numeric()).collect();
         if let Ok(val) = val_str.parse::<i64>() {
             let unit = stripped.trim_start_matches(&val_str).trim();
-            let duration = match unit {
-                "d" | "day" | "days" => Duration::days(val),
-                "h" | "hr" | "hrs" | "hour" | "hours" => Duration::hours(val),
-                "m" | "min" | "mins" | "minute" | "minutes" => Duration::minutes(val),
-                "w" | "wk" | "wks" | "week" | "weeks" => Duration::weeks(val),
-                _ => return None,
-            };
-            return Some((now_utc - duration).timestamp_millis());
+            let duration = relative_duration(unit, val)?;
+            return subtract_duration_ms(now_utc, duration);
         }
     }
 
@@ -41,15 +35,9 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
             if !unit.is_empty()
                 && let Ok(val) = val_str.parse::<i64>()
             {
-                let duration = match unit {
-                    "d" | "day" | "days" => Some(Duration::days(val)),
-                    "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::hours(val)),
-                    "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::minutes(val)),
-                    "w" | "wk" | "wks" | "week" | "weeks" => Some(Duration::weeks(val)),
-                    _ => None,
-                };
+                let duration = relative_duration(unit, val);
                 if let Some(duration) = duration {
-                    return Some((now_utc - duration).timestamp_millis());
+                    return subtract_duration_ms(now_utc, duration);
                 }
             }
         }
@@ -62,30 +50,18 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
             && parts[2] == "ago"
             && let Ok(val) = parts[0].parse::<i64>()
         {
-            let duration = match parts[1] {
-                "d" | "day" | "days" => Some(Duration::days(val)),
-                "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::hours(val)),
-                "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::minutes(val)),
-                "w" | "wk" | "wks" | "week" | "weeks" => Some(Duration::weeks(val)),
-                _ => None,
-            };
+            let duration = relative_duration(parts[1], val);
             if let Some(duration) = duration {
-                return Some((now_utc - duration).timestamp_millis());
+                return subtract_duration_ms(now_utc, duration);
             }
         }
         if parts.len() == 2 && parts[1] == "ago" {
             let val_str: String = parts[0].chars().take_while(|c| c.is_numeric()).collect();
             if let Ok(val) = val_str.parse::<i64>() {
                 let unit = parts[0].trim_start_matches(&val_str);
-                let duration = match unit {
-                    "d" | "day" | "days" => Some(Duration::days(val)),
-                    "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::hours(val)),
-                    "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::minutes(val)),
-                    "w" | "wk" | "wks" | "week" | "weeks" => Some(Duration::weeks(val)),
-                    _ => None,
-                };
+                let duration = relative_duration(unit, val);
                 if let Some(duration) = duration {
-                    return Some((now_utc - duration).timestamp_millis());
+                    return subtract_duration_ms(now_utc, duration);
                 }
             }
         }
@@ -146,6 +122,22 @@ fn local_midnight_to_utc(date: NaiveDate) -> Option<i64> {
         }
     };
     Some(local.with_timezone(&Utc).timestamp_millis())
+}
+
+fn relative_duration(unit: &str, val: i64) -> Option<Duration> {
+    match unit {
+        "d" | "day" | "days" => Duration::try_days(val),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Duration::try_hours(val),
+        "m" | "min" | "mins" | "minute" | "minutes" => Duration::try_minutes(val),
+        "w" | "wk" | "wks" | "week" | "weeks" => Duration::try_weeks(val),
+        _ => None,
+    }
+}
+
+fn subtract_duration_ms(now_utc: chrono::DateTime<Utc>, duration: Duration) -> Option<i64> {
+    now_utc
+        .checked_sub_signed(duration)
+        .map(|value| value.timestamp_millis())
 }
 
 #[cfg(test)]
