@@ -238,12 +238,8 @@ mod tests {
         // `read_to_end` in drain_pipe_tail block for the full 30s.
         let mut cmd = Command::new("/bin/sleep");
         cmd.arg("30");
-        let _ = spawn_with_timeout_or_diag(
-            cmd,
-            "intentional_hang",
-            None,
-            Duration::from_millis(300),
-        );
+        let _ =
+            spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));
     }
 
     /// Proves the diagnostic dump includes the data_dir listing when
@@ -270,7 +266,9 @@ mod tests {
             "expected sub/ directory entry; got: {entries:?}"
         );
         assert!(
-            entries.iter().any(|e| e.starts_with("sub/b.bin (10 bytes)")),
+            entries
+                .iter()
+                .any(|e| e.starts_with("sub/b.bin (10 bytes)")),
             "expected nested file entry with size; got: {entries:?}"
         );
     }
