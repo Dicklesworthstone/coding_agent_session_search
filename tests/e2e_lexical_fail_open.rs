@@ -163,4 +163,27 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
         Some(false),
         "no semantic pass happened, so semantic_refinement must be false"
     );
+
+    // Bead 2hh1s: the `fallback_reason` field is the agent-diagnostic
+    // string populated by `SearchModeMeta::fall_back_to_lexical` in
+    // src/lib.rs. It must be present (not null) and non-empty on every
+    // fail-open path, otherwise agents consuming --robot-meta cannot tell
+    // WHY the planner demoted. The exact prefix depends on which branch
+    // fired (rejected, unavailable, hybrid execution unavailable, or
+    // semantic assets unavailable) — all of those are acceptable.
+    let fallback_reason = meta
+        .get("fallback_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("--robot-meta must populate `_meta.fallback_reason` on fail-open; meta: {meta:?}")
+        });
+    assert!(
+        !fallback_reason.is_empty(),
+        "fallback_reason must be a non-empty diagnostic string; got: {fallback_reason:?}"
+    );
+    assert!(
+        fallback_reason.contains("semantic") || fallback_reason.contains("hybrid"),
+        "fallback_reason should describe why the planner demoted (expected 'semantic'/'hybrid' \
+         in the reason string); got: {fallback_reason:?}"
+    );
 }
