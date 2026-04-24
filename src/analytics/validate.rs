@@ -330,6 +330,16 @@ fn query_executes(conn: &Connection, sql: &str) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
+fn query_exec_error_check(id: &str, details: String, suggested_action: &str) -> Check {
+    Check {
+        id: id.into(),
+        ok: false,
+        severity: Severity::Error,
+        details,
+        suggested_action: Some(suggested_action.into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Track A validation
 // ---------------------------------------------------------------------------
@@ -408,15 +418,11 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
 
     if total_buckets == 0 {
         if let Err(err) = query_executes(conn, &sql) {
-            checks.push(Check {
-                id: "track_a.query_exec".into(),
-                ok: false,
-                severity: Severity::Error,
-                details: format!("Track A invariant query failed: {err}"),
-                suggested_action: Some(
-                    "Run 'cass analytics rebuild --track a' or verify the analytics schema".into(),
-                ),
-            });
+            checks.push(query_exec_error_check(
+                "track_a.query_exec",
+                format!("Track A invariant query failed: {err}"),
+                "Run 'cass analytics rebuild --track a' or verify the analytics schema",
+            ));
             return (checks, 0, 0);
         }
 
@@ -452,15 +458,11 @@ fn validate_track_a(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     }) {
         Ok(rows) => rows,
         Err(err) => {
-            checks.push(Check {
-                id: "track_a.query_exec".into(),
-                ok: false,
-                severity: Severity::Error,
-                details: format!("Track A invariant query failed: {err}"),
-                suggested_action: Some(
-                    "Run 'cass analytics rebuild --track a' or verify the analytics schema".into(),
-                ),
-            });
+            checks.push(query_exec_error_check(
+                "track_a.query_exec",
+                format!("Track A invariant query failed: {err}"),
+                "Run 'cass analytics rebuild --track a' or verify the analytics schema",
+            ));
             return (checks, 0, total_buckets);
         }
     };
@@ -655,16 +657,11 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
 
     if total_buckets == 0 {
         if let Err(err) = query_executes(conn, &sql) {
-            checks.push(Check {
-                id: "track_b.query_exec".into(),
-                ok: false,
-                severity: Severity::Error,
-                details: format!("Track B invariant query failed: {err}"),
-                suggested_action: Some(
-                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
-                        .into(),
-                ),
-            });
+            checks.push(query_exec_error_check(
+                "track_b.query_exec",
+                format!("Track B invariant query failed: {err}"),
+                "Run 'cass analytics rebuild --track all' or verify the analytics schema",
+            ));
             return (checks, 0, 0);
         }
 
@@ -692,16 +689,11 @@ fn validate_track_b(conn: &Connection, config: &ValidateConfig) -> (Vec<Check>, 
     }) {
         Ok(rows) => rows,
         Err(err) => {
-            checks.push(Check {
-                id: "track_b.query_exec".into(),
-                ok: false,
-                severity: Severity::Error,
-                details: format!("Track B invariant query failed: {err}"),
-                suggested_action: Some(
-                    "Run 'cass analytics rebuild --track all' or verify the analytics schema"
-                        .into(),
-                ),
-            });
+            checks.push(query_exec_error_check(
+                "track_b.query_exec",
+                format!("Track B invariant query failed: {err}"),
+                "Run 'cass analytics rebuild --track all' or verify the analytics schema",
+            ));
             return (checks, 0, total_buckets);
         }
     };
