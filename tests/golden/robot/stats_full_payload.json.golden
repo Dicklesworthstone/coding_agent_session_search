@@ -1,0 +1,25 @@
+{
+  "conversations": 2,
+  "messages": 6,
+  "by_agent": [
+    {
+      "agent": "aider",
+      "count": 2
+    }
+  ],
+  "top_workspaces": [
+    {
+      "workspace": "/data/projects/coding_agent_session_search",
+      "count": 1
+    },
+    {
+      "workspace": "/data/projects/coding_agent_session_search/tests/fixtures/aider",
+      "count": 1
+    }
+  ],
+  "date_range": {
+    "oldest": "[TIMESTAMP]",
+    "newest": "[TIMESTAMP]"
+  },
+  "db_path": "[TEST_HOME]/search_demo_data/agent_search.db"
+}

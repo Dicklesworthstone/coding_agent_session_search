@@ -787,6 +787,66 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 }
 
 #[test]
+fn stats_json_happy_path_matches_golden() {
+    // `coding_agent_session_search-zefv4`: the error envelope has been
+    // pinned (stats_missing_db* goldens) but the success envelope had no
+    // freeze — regressions to a field name or a new mandatory key on
+    // the common-case happy-path would pass CI silently. Seeds the
+    // existing search_demo_data fixture (324 KB canonical DB with a
+    // known conversation/message count), invokes `cass stats --json`,
+    // and freezes the scrubbed envelope.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = isolated_search_demo_data(test_home.path());
+    let out = cass_cmd(test_home.path())
+        .args([
+            "stats",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass stats --json on fixture DB");
+    assert!(
+        out.status.success(),
+        "cass stats --json must succeed on fixture DB; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stats happy-path envelope is JSON");
+    let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+    assert_golden("robot/stats_full_payload.json.golden", &scrubbed);
+}
+
+#[test]
+fn stats_json_happy_path_shape_matches_golden() {
+    // Shape-only pin for the happy-path envelope so a future refactor
+    // of the scrubber (or drift in fixture contents) can't accidentally
+    // mask structural regressions. json_value_schema diff tolerates
+    // value changes; keys + types must hold.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let data_dir = isolated_search_demo_data(test_home.path());
+    let out = cass_cmd(test_home.path())
+        .args([
+            "stats",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass stats --json on fixture DB");
+    assert!(out.status.success(), "stats must succeed");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stats happy-path envelope is JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden("robot/stats_full_payload_shape.json.golden", &canonical);
+}
+
+#[test]
 fn stats_json_missing_db_error_envelope_shape_matches_golden() {
     // [coding_agent_session_search-hd89i] error envelope lives on
     // STDOUT post-fix (see sibling test for context).

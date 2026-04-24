@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "properties": {
+    "conversations": {
+      "type": "integer"
+    },
+    "messages": {
+      "type": "integer"
+    },
+    "by_agent": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "top_workspaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "workspace": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "date_range": {
+      "type": "object",
+      "properties": {
+        "oldest": {
+          "type": "string"
+        },
+        "newest": {
+          "type": "string"
+        }
+      }
+    },
+    "db_path": {
+      "type": "string"
+    }
+  }
+}
