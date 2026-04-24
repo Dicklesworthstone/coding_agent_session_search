@@ -154,6 +154,14 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+#[doc(hidden)]
+pub fn fuzz_redact_json_with_memoizing_redactor(
+    value: &serde_json::Value,
+    capacity: usize,
+) -> serde_json::Value {
+    MemoizingRedactor::with_capacity(capacity.clamp(1, 1024)).redact_json(value)
+}
+
 /// Returns true if redaction is enabled (default: true).
 ///
 /// Set `CASS_REDACT_SECRETS=0` or `CASS_REDACT_SECRETS=false` to disable.
