@@ -283,9 +283,7 @@ pub(crate) struct LexicalGenerationRecoveryDecision {
 /// can compare it against `LexicalCleanupDisposition::all_variants()`
 /// directly. Mirroring impl method calls through to this function
 /// keeps existing call sites unchanged.
-pub(crate) fn is_protected_retention_disposition(
-    disposition: LexicalCleanupDisposition,
-) -> bool {
+pub(crate) fn is_protected_retention_disposition(disposition: LexicalCleanupDisposition) -> bool {
     matches!(
         disposition,
         LexicalCleanupDisposition::CurrentPublished
@@ -3607,11 +3605,14 @@ mod tests {
                 }
                 let mut visitor = StringVisitor::default();
                 event.record(&mut visitor);
-                self.events.lock().expect("collector lock").push(CapturedEvent {
-                    level: event.metadata().level().to_string(),
-                    target: event.metadata().target().to_string(),
-                    fields: visitor.fields,
-                });
+                self.events
+                    .lock()
+                    .expect("collector lock")
+                    .push(CapturedEvent {
+                        level: event.metadata().level().to_string(),
+                        target: event.metadata().target().to_string(),
+                        fields: visitor.fields,
+                    });
             }
         }
 
@@ -3622,16 +3623,20 @@ mod tests {
 
         impl Visit for StringVisitor {
             fn record_str(&mut self, field: &Field, value: &str) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_u64(&mut self, field: &Field, value: u64) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_i64(&mut self, field: &Field, value: i64) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_bool(&mut self, field: &Field, value: bool) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 self.fields
@@ -3714,16 +3719,25 @@ mod tests {
         }
 
         // Invariant 4: field VALUES match the classification.
-        assert_eq!(event.fields.get("disposition"), Some(&"quarantined_retained".to_string()));
-        assert_eq!(event.fields.get("generation_id"), Some(&"gen-traced-quarantined".to_string()));
-        assert_eq!(event.fields.get("retained_bytes"), Some(&"4096".to_string()));
-        assert_eq!(event.fields.get("reclaimable_bytes"), Some(&"0".to_string()));
+        assert_eq!(
+            event.fields.get("disposition"),
+            Some(&"quarantined_retained".to_string())
+        );
+        assert_eq!(
+            event.fields.get("generation_id"),
+            Some(&"gen-traced-quarantined".to_string())
+        );
+        assert_eq!(
+            event.fields.get("retained_bytes"),
+            Some(&"4096".to_string())
+        );
+        assert_eq!(
+            event.fields.get("reclaimable_bytes"),
+            Some(&"0".to_string())
+        );
         // The reason string must explain WHY the generation is being
         // retained (operator inspection hold).
-        let reason = event
-            .fields
-            .get("reason")
-            .expect("reason field present");
+        let reason = event.fields.get("reason").expect("reason field present");
         assert!(
             reason.contains("operator inspection") || reason.contains("quarantined"),
             "reason field must explain the inspection hold; got {reason:?}"
@@ -3783,11 +3797,14 @@ mod tests {
                 }
                 let mut visitor = StringVisitor::default();
                 event.record(&mut visitor);
-                self.events.lock().expect("collector lock").push(CapturedEvent {
-                    level: event.metadata().level().to_string(),
-                    target: event.metadata().target().to_string(),
-                    fields: visitor.fields,
-                });
+                self.events
+                    .lock()
+                    .expect("collector lock")
+                    .push(CapturedEvent {
+                        level: event.metadata().level().to_string(),
+                        target: event.metadata().target().to_string(),
+                        fields: visitor.fields,
+                    });
             }
         }
 
@@ -3798,16 +3815,20 @@ mod tests {
 
         impl Visit for StringVisitor {
             fn record_str(&mut self, field: &Field, value: &str) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_u64(&mut self, field: &Field, value: u64) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_i64(&mut self, field: &Field, value: i64) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_bool(&mut self, field: &Field, value: bool) {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
             fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                 self.fields
@@ -3828,7 +3849,12 @@ mod tests {
                     // plan-count check is skipped, so a single shard
                     // is enough to make `is_serveable` true once
                     // build=Validated + publish=Published land.
-                    let shard = test_shard("shard-current", 0, LexicalShardLifecycleState::Validated, 128);
+                    let shard = test_shard(
+                        "shard-current",
+                        0,
+                        LexicalShardLifecycleState::Validated,
+                        128,
+                    );
                     m.set_shards(vec![shard], 2);
                     m.transition_build(LexicalGenerationBuildState::Validated, 3);
                     m.transition_publish(LexicalGenerationPublishState::Published, 4);
@@ -3837,33 +3863,46 @@ mod tests {
                     // Default new_scratch has build=Scratch → active.
                 }
                 LexicalCleanupDisposition::QuarantinedRetained => {
-                    let shard = test_shard("shard-q", 0, LexicalShardLifecycleState::Quarantined, 256);
+                    let shard =
+                        test_shard("shard-q", 0, LexicalShardLifecycleState::Quarantined, 256);
                     m.set_shards(vec![shard], 2);
                     m.transition_publish(LexicalGenerationPublishState::Quarantined, 3);
                 }
                 LexicalCleanupDisposition::SupersededReclaimable => {
                     // Planned shards are reclaimable=true per test_shard.
-                    let shard = test_shard("shard-s-r", 0, LexicalShardLifecycleState::Planned, 512);
+                    let shard =
+                        test_shard("shard-s-r", 0, LexicalShardLifecycleState::Planned, 512);
                     m.set_shards(vec![shard], 2);
                     m.transition_build(LexicalGenerationBuildState::Validated, 3);
                     m.transition_publish(LexicalGenerationPublishState::Superseded, 4);
                 }
                 LexicalCleanupDisposition::SupersededRetained => {
                     // Published shards are pinned=true, reclaimable=false.
-                    let shard = test_shard("shard-s-keep", 0, LexicalShardLifecycleState::Published, 512);
+                    let shard = test_shard(
+                        "shard-s-keep",
+                        0,
+                        LexicalShardLifecycleState::Published,
+                        512,
+                    );
                     m.set_shards(vec![shard], 2);
                     m.transition_build(LexicalGenerationBuildState::Validated, 3);
                     m.transition_publish(LexicalGenerationPublishState::Superseded, 4);
                 }
                 LexicalCleanupDisposition::FailedReclaimable => {
                     // Abandoned shards are reclaimable=true per test_shard.
-                    let shard = test_shard("shard-f-r", 0, LexicalShardLifecycleState::Abandoned, 1024);
+                    let shard =
+                        test_shard("shard-f-r", 0, LexicalShardLifecycleState::Abandoned, 1024);
                     m.set_shards(vec![shard], 2);
                     m.transition_build(LexicalGenerationBuildState::Failed, 3);
                 }
                 LexicalCleanupDisposition::FailedRetained => {
                     // Published shards are pinned=true, reclaimable=false.
-                    let shard = test_shard("shard-f-keep", 0, LexicalShardLifecycleState::Published, 1024);
+                    let shard = test_shard(
+                        "shard-f-keep",
+                        0,
+                        LexicalShardLifecycleState::Published,
+                        1024,
+                    );
                     m.set_shards(vec![shard], 2);
                     m.transition_build(LexicalGenerationBuildState::Failed, 3);
                 }
@@ -3878,7 +3917,10 @@ mod tests {
 
         // Table of (variant → expected severity tier).
         let cases: &[(LexicalCleanupDisposition, Level)] = &[
-            (LexicalCleanupDisposition::SupersededReclaimable, Level::DEBUG),
+            (
+                LexicalCleanupDisposition::SupersededReclaimable,
+                Level::DEBUG,
+            ),
             (LexicalCleanupDisposition::FailedReclaimable, Level::DEBUG),
             (LexicalCleanupDisposition::ActiveWork, Level::INFO),
             (LexicalCleanupDisposition::CurrentPublished, Level::INFO),
@@ -3910,8 +3952,7 @@ mod tests {
             // assertion below meaningful.
             let inventory_disposition = manifest.cleanup_inventory().disposition;
             assert_eq!(
-                inventory_disposition,
-                *variant,
+                inventory_disposition, *variant,
                 "fixture for variant {variant:?} must actually classify to {variant:?}, \
                  got {inventory_disposition:?}"
             );
@@ -3942,7 +3983,13 @@ mod tests {
                 Some(variant.as_str()),
                 "variant {variant:?}: disposition field must match the enum as_str"
             );
-            for required in ["generation_id", "reason", "reclaimable_bytes", "retained_bytes", "artifact_bytes"] {
+            for required in [
+                "generation_id",
+                "reason",
+                "reclaimable_bytes",
+                "retained_bytes",
+                "artifact_bytes",
+            ] {
                 assert!(
                     event.fields.contains_key(required),
                     "variant {variant:?}: field {required} must be present; got {:?}",
