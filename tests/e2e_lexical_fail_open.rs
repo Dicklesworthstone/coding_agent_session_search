@@ -189,3 +189,154 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
          in the reason string); got: {fallback_reason:?}"
     );
 }
+
+// Bead coding_agent_session_search-jogco (child of ibuuh.10, scenario C:
+// default-hybrid result quality in lexical-only state).
+//
+// The sibling test above pins the `_meta` truthfulness on the fail-open
+// path but never looks at the actual result set. ibuuh.10's AC calls
+// for "default-hybrid result quality across lexical-only, fast-tier,
+// and full-hybrid states" — this test covers the LEXICAL-ONLY slice
+// (no semantic model installed, which is the default cass install).
+//
+// Claim pinned: when semantic assets are absent, the default-hybrid
+// planner is expected to fail open to lexical AND produce exactly the
+// same hit list — same source_path+line_number keys in the same order
+// — as an explicit `--mode lexical` search. If a future refactor made
+// the default path silently rank differently, drop hits, or run a
+// reranker that lexical-mode doesn't, users see a quality regression
+// that pure _meta tests don't catch.
+fn hit_keys(hits: &[Value]) -> Vec<(String, i64)> {
+    hits.iter()
+        .map(|h| {
+            let path = h
+                .get("source_path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let line = h.get("line_number").and_then(Value::as_i64).unwrap_or(-1);
+            (path, line)
+        })
+        .collect()
+}
+
+#[test]
+fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Seed three rollouts so the corpus is large enough to give the
+    // planner real ranking work. Filenames start with `rollout-` per
+    // franken_agent_detection::CodexConnector::is_rollout_file (line
+    // ~77). Multiple conversations also sidesteps the single-conv
+    // shard-plan bug tracked in bead rx1ex.
+    for idx in 1..=3 {
+        let name = format!("rollout-equiv-{idx:02}.jsonl");
+        seed_codex_session(&codex_home, &name, "equivprobe");
+    }
+
+    let mut index = cass_cmd(home);
+    index
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let index_output = index.output().expect("run cass index --full");
+    assert!(
+        index_output.status.success(),
+        "cass index --full must succeed on the seeded corpus. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&index_output.stdout),
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+
+    // Search in DEFAULT mode (hybrid-preferred per AGENTS.md but
+    // failing open to lexical since no semantic model is installed).
+    let mut default_search = cass_cmd(home);
+    default_search
+        .args([
+            "search",
+            "equivprobe",
+            "--json",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir);
+    let default_out = default_search.output().expect("run default search");
+    assert!(
+        default_out.status.success(),
+        "default-mode search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&default_out.stdout),
+        String::from_utf8_lossy(&default_out.stderr)
+    );
+    let default_json: Value = serde_json::from_slice(&default_out.stdout)
+        .unwrap_or_else(|err| panic!("default search JSON parse failed: {err}"));
+    let default_hits = default_json
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Search with EXPLICIT --mode lexical on the same corpus.
+    let mut lexical_search = cass_cmd(home);
+    lexical_search
+        .args([
+            "search",
+            "equivprobe",
+            "--json",
+            "--mode",
+            "lexical",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir);
+    let lexical_out = lexical_search.output().expect("run lexical search");
+    assert!(
+        lexical_out.status.success(),
+        "--mode lexical search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&lexical_out.stdout),
+        String::from_utf8_lossy(&lexical_out.stderr)
+    );
+    let lexical_json: Value = serde_json::from_slice(&lexical_out.stdout)
+        .unwrap_or_else(|err| panic!("lexical search JSON parse failed: {err}"));
+    let lexical_hits = lexical_json
+        .get("hits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // Guard: there really should be hits for the seeded keyword. A
+    // zero-hit corpus would make the equivalence trivially true and
+    // hide real regressions.
+    assert!(
+        !default_hits.is_empty(),
+        "default search must return >=1 hit for the seeded keyword; \
+         payload: {default_json}"
+    );
+
+    // The actual contract pin: same hits in the same order.
+    let default_keys = hit_keys(&default_hits);
+    let lexical_keys = hit_keys(&lexical_hits);
+    assert_eq!(
+        default_keys, lexical_keys,
+        "default-mode hit list must equal --mode lexical hit list when \
+         semantic assets are absent.\ndefault: {default_keys:?}\nlexical: {lexical_keys:?}"
+    );
+
+    // Hit counts must also match — guards against a regression where
+    // the planner silently truncates or expands one of the paths.
+    assert_eq!(
+        default_json.get("count").and_then(Value::as_u64),
+        lexical_json.get("count").and_then(Value::as_u64),
+        "default and lexical `count` must match in lexical-only state. \
+         default: {default_json}\nlexical: {lexical_json}"
+    );
+    assert_eq!(
+        default_json.get("total_matches").and_then(Value::as_u64),
+        lexical_json.get("total_matches").and_then(Value::as_u64),
+        "default and lexical `total_matches` must match in lexical-only state. \
+         default: {default_json}\nlexical: {lexical_json}"
+    );
+}
