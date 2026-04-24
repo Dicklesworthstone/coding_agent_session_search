@@ -17,9 +17,27 @@ use coding_agent_search::parse_cli;
 use std::path::PathBuf;
 
 const SUBCOMMANDS: &[&str] = &[
-    "search", "find", "query", "q", "stats", "ls", "list", "index", "diag", "status", "doctor",
-    "daemon", "analytics", "robot-docs", "introspect", "api-version", "models", "detect", "pages",
-    "bakeoff", "setup",
+    "search",
+    "find",
+    "query",
+    "q",
+    "stats",
+    "ls",
+    "list",
+    "index",
+    "diag",
+    "status",
+    "doctor",
+    "daemon",
+    "analytics",
+    "robot-docs",
+    "introspect",
+    "api-version",
+    "models",
+    "detect",
+    "pages",
+    "bakeoff",
+    "setup",
 ];
 
 const LONG_FLAGS: &[&str] = &[

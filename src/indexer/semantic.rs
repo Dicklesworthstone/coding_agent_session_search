@@ -747,8 +747,7 @@ pub(crate) fn semantic_inputs_from_packets(
     }
     let mut inputs = Vec::new();
     for (packet, context) in packets.iter().zip(contexts.iter()) {
-        let source_id_hash =
-            crc32fast::hash(packet.payload.provenance.source_id.as_bytes());
+        let source_id_hash = crc32fast::hash(packet.payload.provenance.source_id.as_bytes());
         for &message_index in &packet.projections.semantic.message_indices {
             let Some(message) = packet.payload.messages.get(message_index) else {
                 anyhow::bail!(
@@ -3004,8 +3003,7 @@ mod tests {
             let provenance = canonical_embedding_packet_provenance(envelope);
             let canonical = canonical_embedding_conversation(envelope, &provenance, messages);
             packets.push(ConversationPacket::from_canonical_replay(
-                &canonical,
-                provenance,
+                &canonical, provenance,
             ));
             contexts.push(SemanticPacketContext {
                 conversation_id: envelope.conversation_id,
@@ -3040,9 +3038,7 @@ mod tests {
         );
         // Empty-content system message must NOT appear in the output.
         assert!(
-            packet_inputs
-                .iter()
-                .all(|input| !input.content.is_empty()),
+            packet_inputs.iter().all(|input| !input.content.is_empty()),
             "empty content must be filtered by the packet semantic projection"
         );
         // The remote-host source_id pins the cross-path provenance hash.
@@ -3050,7 +3046,9 @@ mod tests {
             normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
         let expected_hash = crc32fast::hash(normalized_source_id.as_bytes());
         assert!(
-            packet_inputs.iter().all(|input| input.source_id == expected_hash),
+            packet_inputs
+                .iter()
+                .all(|input| input.source_id == expected_hash),
             "every emitted EmbeddingInput must hash provenance via the packet's normalized source_id"
         );
 
