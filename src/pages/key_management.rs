@@ -17,18 +17,18 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
+    load_config, Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
-    Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
@@ -637,6 +637,14 @@ fn decrypt_all_chunks(
 
     let mut plaintext = Vec::new();
 
+    if config.payload.chunk_count != config.payload.files.len() {
+        bail!(
+            "Invalid config: payload chunk_count {} does not match file list length {}",
+            config.payload.chunk_count,
+            config.payload.files.len()
+        );
+    }
+
     for (chunk_index, chunk_file) in config.payload.files.iter().enumerate() {
         progress(chunk_index as f32 / config.payload.chunk_count as f32);
 
@@ -1178,11 +1186,12 @@ fn private_dir_for_archive(archive_dir: &Path) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::pages::attachments::{
-        AttachmentConfig, AttachmentData, AttachmentProcessor, decrypt_blob, decrypt_manifest,
+        decrypt_blob, decrypt_manifest, AttachmentConfig, AttachmentData, AttachmentProcessor,
     };
     use crate::pages::bundle::BundleBuilder;
-    use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine};
+    use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, PayloadMeta};
     use crate::pages::verify::verify_bundle;
+    use std::cell::Cell;
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -1261,6 +1270,40 @@ mod tests {
             .unwrap();
 
         (temp_dir, bundle_root)
+    }
+
+    #[test]
+    fn test_decrypt_all_chunks_rejects_mismatched_chunk_count_before_progress() {
+        let temp_dir = TempDir::new().unwrap();
+        let archive_dir = temp_dir.path();
+        let config = EncryptionConfig {
+            version: SCHEMA_VERSION,
+            export_id: BASE64_STANDARD.encode([0u8; 16]),
+            base_nonce: BASE64_STANDARD.encode([0u8; 12]),
+            compression: "deflate".to_string(),
+            kdf_defaults: Argon2Params::default(),
+            payload: PayloadMeta {
+                chunk_size: 1024,
+                chunk_count: 0,
+                total_compressed_size: 0,
+                total_plaintext_size: 0,
+                files: vec!["payload/chunk-00000.bin".to_string()],
+            },
+            key_slots: Vec::new(),
+        };
+        let progress_calls = Cell::new(0);
+
+        let err = decrypt_all_chunks(archive_dir, &[0u8; 32], &config, |progress| {
+            assert!(progress.is_finite(), "progress must be finite: {progress}");
+            progress_calls.set(progress_calls.get() + 1);
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("chunk_count 0"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(progress_calls.get(), 0);
     }
 
     #[test]
@@ -1465,12 +1508,10 @@ mod tests {
         key_add_password(&archive_dir, "test-password", "new-password").unwrap();
 
         assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
-        assert!(
-            std::fs::symlink_metadata(site_dir.join("viewer.js"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(site_dir.join("viewer.js"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
