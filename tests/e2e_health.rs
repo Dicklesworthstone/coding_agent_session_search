@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
 use fs2::FileExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -159,5 +159,299 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
     assert_eq!(
         rebuild_progress["controller_reason"].as_str(),
         Some("queue_depth_3_reached_pipeline_capacity_3")
+    );
+}
+
+// ========================================================================
+// Bead coding_agent_session_search-8qet9 (child of ibuuh.10, scenario A):
+// Cold-start readiness-surface progression.
+//
+// `cass health --json` is the authoritative readiness surface per
+// AGENTS.md's Search Asset Contract. The health JSON contract promises
+// that during a cold start (fresh data-dir, nothing indexed yet), cass
+// reports `status="not_initialized"`, `healthy=false`, and surfaces a
+// `recommended_action` that guides the operator to `cass index --full`.
+// After `cass index --full` completes, the same surface must flip to
+// `status="healthy"`, `healthy=true`, and — since the default install
+// does NOT download the ~90MB semantic model — `state.semantic.status`
+// must remain "missing" while `fallback_mode="lexical"` so robot clients
+// know hybrid is silently degrading to lexical.
+//
+// No existing test pins this transition. `health_json_surfaces_runtime_queue_
+// and_byte_budget_headroom` above only exercises the "rebuild in progress"
+// phase via a seeded rebuild-state file. The cold-start → lexical-ready
+// arc is a distinct slice of ibuuh.10's AC "cold-start lexical self-heal
+// + truthful readiness surfaces" requirement.
+//
+// Contract pinned here:
+//   1. Phase 1 (empty data-dir)
+//      - exit code 1
+//      - status == "not_initialized", healthy == false, initialized == false
+//      - errors[] names db / index not initialized
+//      - recommended_action names "cass index --full"
+//   2. Phase 2 (after cass index --full with seeded Codex session)
+//      - index --full exits 0
+//      - health: exit code 0, status == "healthy", healthy == true,
+//        initialized == true
+//      - state.semantic.status == "missing" (no models installed)
+//      - state.semantic.fallback_mode == "lexical"
+//      - state.database.exists == true, state.index.exists == true
+//   3. Phase 3 (search against lexical-only post-cold-start)
+//      - exit 0, ≥1 hit, stdout valid JSON
+// ========================================================================
+
+fn seed_codex_session_cold_start(
+    codex_home: &std::path::Path,
+    filename: &str,
+    keyword: &str,
+) {
+    let sessions = codex_home.join("sessions/2026/04/23");
+    fs::create_dir_all(&sessions).expect("create codex sessions dir");
+    let ts_ms = 1_714_000_000_000_u64;
+    let iso = |offset_ms: u64| -> String {
+        chrono::DateTime::from_timestamp_millis(
+            i64::try_from(ts_ms + offset_ms).unwrap_or(i64::MAX),
+        )
+        .unwrap()
+        .to_rfc3339()
+    };
+    let workspace = codex_home.to_string_lossy().into_owned();
+    let lines = [
+        json!({
+            "timestamp": iso(0),
+            "type": "session_meta",
+            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
+        }),
+        json!({
+            "timestamp": iso(1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": keyword }],
+            },
+        }),
+        json!({
+            "timestamp": iso(2_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{ "type": "text", "text": format!("{keyword} response") }],
+            },
+        }),
+    ];
+    let mut body = String::new();
+    for line in lines {
+        body.push_str(&serde_json::to_string(&line).unwrap());
+        body.push('\n');
+    }
+    fs::write(sessions.join(filename), body).expect("write codex session fixture");
+}
+
+fn isolated_cass_cmd(home: &Path) -> Command {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    cmd.env("HOME", home);
+    cmd.env("XDG_DATA_HOME", home.join(".local/share"));
+    cmd.env("XDG_CONFIG_HOME", home.join(".config"));
+    cmd.env("CODEX_HOME", home.join(".codex"));
+    cmd
+}
+
+#[test]
+fn cold_start_health_surface_transitions_from_not_initialized_to_lexical_only() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create empty data dir");
+
+    // PHASE 1 — empty data-dir, no index, no DB. Health must admit that
+    // truthfully and guide the operator to `cass index --full`.
+    let phase1 = isolated_cass_cmd(home)
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass health (phase 1)");
+    let phase1_code = phase1.status.code().expect("phase1 exit code");
+    let phase1_stdout = String::from_utf8_lossy(&phase1.stdout);
+    let phase1_stderr = String::from_utf8_lossy(&phase1.stderr);
+    assert_eq!(
+        phase1_code, 1,
+        "cold-start health must exit 1 (not ready). stdout: {phase1_stdout}\nstderr: {phase1_stderr}"
+    );
+    let phase1_json: Value = serde_json::from_str(phase1_stdout.trim()).unwrap_or_else(|err| {
+        panic!("phase1 health JSON parse failed: {err}; stdout: {phase1_stdout}")
+    });
+    assert_eq!(
+        phase1_json.get("status").and_then(Value::as_str),
+        Some("not_initialized"),
+        "phase1 status must be 'not_initialized' so agents can distinguish cold-start \
+         from rebuilding. payload: {phase1_json}"
+    );
+    assert_eq!(
+        phase1_json.get("healthy").and_then(Value::as_bool),
+        Some(false),
+        "phase1 healthy must be false"
+    );
+    assert_eq!(
+        phase1_json.get("initialized").and_then(Value::as_bool),
+        Some(false),
+        "phase1 initialized must be false"
+    );
+    let phase1_errors = phase1_json
+        .get("errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        phase1_errors.iter().any(|e| {
+            e.as_str()
+                .is_some_and(|s| s.contains("database not initialized"))
+        }),
+        "phase1 errors[] must mention 'database not initialized' so agents diagnose; \
+         got: {phase1_errors:?}"
+    );
+    assert!(
+        phase1_errors.iter().any(|e| {
+            e.as_str()
+                .is_some_and(|s| s.contains("index not initialized"))
+        }),
+        "phase1 errors[] must mention 'index not initialized' so agents diagnose; \
+         got: {phase1_errors:?}"
+    );
+    let phase1_action = phase1_json
+        .get("recommended_action")
+        .and_then(Value::as_str)
+        .expect("phase1 recommended_action must be a string");
+    assert!(
+        phase1_action.contains("cass index --full"),
+        "phase1 recommended_action must name the exact recovery command \
+         `cass index --full`; got: {phase1_action:?}"
+    );
+
+    // PHASE 2 — seed a Codex session, run `cass index --full`, re-ask
+    // health. It must flip to healthy + initialized, while surfacing
+    // the fallback_mode="lexical" truth for hybrid clients (no semantic
+    // model is installed in this test; default cass never auto-downloads).
+    // File name must start with `rollout-` to match the Codex rollout-
+    // file heuristic in franken_agent_detection (CodexConnector at
+    // codex.rs::is_rollout_file line ~77). Otherwise the connector
+    // silently ignores the fixture and search returns zero hits.
+    seed_codex_session_cold_start(&codex_home, "rollout-cold-start-01.jsonl", "coldstartprobe");
+
+    let idx_out = isolated_cass_cmd(home)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass index --full");
+    assert!(
+        idx_out.status.success(),
+        "cass index --full must succeed on a fresh seeded corpus. \
+         stdout: {} stderr: {}",
+        String::from_utf8_lossy(&idx_out.stdout),
+        String::from_utf8_lossy(&idx_out.stderr),
+    );
+
+    let phase2 = isolated_cass_cmd(home)
+        .args(["health", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass health (phase 2)");
+    let phase2_code = phase2.status.code().expect("phase2 exit code");
+    let phase2_stdout = String::from_utf8_lossy(&phase2.stdout);
+    let phase2_stderr = String::from_utf8_lossy(&phase2.stderr);
+    assert_eq!(
+        phase2_code, 0,
+        "post-index health must exit 0 (lexical-only is a healthy state when \
+         semantic is opt-in). stdout: {phase2_stdout}\nstderr: {phase2_stderr}"
+    );
+    let phase2_json: Value = serde_json::from_str(phase2_stdout.trim()).unwrap_or_else(|err| {
+        panic!("phase2 health JSON parse failed: {err}; stdout: {phase2_stdout}")
+    });
+    assert_eq!(
+        phase2_json.get("status").and_then(Value::as_str),
+        Some("healthy"),
+        "phase2 status must be 'healthy' after index --full. payload: {phase2_json}"
+    );
+    assert_eq!(
+        phase2_json.get("healthy").and_then(Value::as_bool),
+        Some(true),
+        "phase2 healthy must be true"
+    );
+    assert_eq!(
+        phase2_json.get("initialized").and_then(Value::as_bool),
+        Some(true),
+        "phase2 initialized must be true"
+    );
+    // Per AGENTS.md: "cass never auto-downloads" the ~90MB semantic
+    // model. Fresh cold start without `cass models install` must admit
+    // the semantic tier is missing AND that the realized fallback is
+    // lexical so hybrid clients don't silently think they have semantic.
+    let semantic = phase2_json
+        .get("state")
+        .and_then(|s| s.get("semantic"))
+        .and_then(Value::as_object)
+        .expect("phase2 state.semantic must be an object");
+    let semantic_status = semantic
+        .get("status")
+        .and_then(Value::as_str)
+        .expect("state.semantic.status must be a string");
+    assert!(
+        matches!(semantic_status, "missing" | "not_initialized"),
+        "phase2 state.semantic.status must be 'missing' or 'not_initialized' \
+         (no model installed); got: {semantic_status:?}"
+    );
+    assert_eq!(
+        semantic.get("fallback_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "phase2 state.semantic.fallback_mode must be 'lexical' so hybrid \
+         clients see the truthful realized tier. got: {semantic:?}"
+    );
+    assert_eq!(
+        phase2_json
+            .get("state")
+            .and_then(|s| s.get("database"))
+            .and_then(|db| db.get("exists"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "phase2 state.database.exists must be true after index"
+    );
+    assert_eq!(
+        phase2_json
+            .get("state")
+            .and_then(|s| s.get("index"))
+            .and_then(|i| i.get("exists"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "phase2 state.index.exists must be true after index"
+    );
+
+    // PHASE 3 — search works against the now-ready lexical-only system
+    // and returns ≥1 hit for the seeded keyword. This closes the
+    // cold-start arc: the same data-dir that was "not_initialized" a
+    // moment ago now serves user queries without any manual rebuild.
+    let search_out = isolated_cass_cmd(home)
+        .args(["search", "coldstartprobe", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("run cass search (phase 3)");
+    assert!(
+        search_out.status.success(),
+        "phase3 cass search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&search_out.stdout),
+        String::from_utf8_lossy(&search_out.stderr),
+    );
+    let search_stdout = String::from_utf8_lossy(&search_out.stdout);
+    let search_json: Value = serde_json::from_str(search_stdout.trim()).unwrap_or_else(|err| {
+        panic!("phase3 search JSON parse failed: {err}; stdout: {search_stdout}")
+    });
+    let hits = search_json
+        .get("hits")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("phase3 search must have hits[]; payload: {search_json}"));
+    assert!(
+        !hits.is_empty(),
+        "phase3 search must return ≥1 hit for the seeded keyword; payload: {search_json}"
     );
 }
