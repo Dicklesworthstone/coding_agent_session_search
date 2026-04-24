@@ -14208,6 +14208,211 @@ mod tests {
         );
     }
 
+    /// `coding_agent_session_search-k0e5p` (ibuuh.24.2 sub-bead):
+    /// E2E equivalence gate for the rank+hydrate FTS5 fallback split
+    /// landed in peer commit c91ea038. The peer's existing unit test
+    /// pins the rank-SQL SHAPE (no content columns referenced) but
+    /// nothing pins the user-facing RESULT-SET equivalence. A
+    /// regression where the hydrate phase silently re-orders, drops,
+    /// or re-filters hits would slip past the SQL-shape check and
+    /// produce user-visible quality changes.
+    ///
+    /// This test pins the prefix invariant (same pattern as bead
+    /// 1dd5u for the lexical search path): seed N ranked hits in the
+    /// FTS5 fallback DB, run search_sqlite_fts5 at limit=K and
+    /// limit=N, assert the smaller-limit result is a prefix of the
+    /// larger-limit result. A regression in either rank or hydrate
+    /// (re-order, drop, re-filter) trips immediately.
+    ///
+    /// Pins three invariants:
+    /// 1. Smaller-limit hits are a strict prefix of larger-limit hits.
+    /// 2. Limit=N returns exactly N matches when ≥N candidates exist.
+    /// 3. Limit=0 returns empty (boundary case the rank+hydrate
+    ///    split could break by hydrating before honoring the limit).
+    #[test]
+    fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant()
+    -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER,
+                idx INTEGER,
+                content TEXT,
+                created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE fts_messages USING fts5(
+                content,
+                title,
+                agent,
+                workspace,
+                source_path,
+                created_at UNINDEXED,
+                message_id UNINDEXED,
+                tokenize='porter'
+             );",
+        )?;
+        conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/tmp/k0e5p')")?;
+
+        // Seed N=6 messages all matching the same query token. Each
+        // gets a distinct message_id + content shape so the prefix
+        // assertion can pin specific ordering rather than just
+        // counts. The bm25 score depends on per-row term frequency;
+        // we vary `rankprobe` repetition (1×..6×) so the rank phase
+        // produces a deterministic descending order.
+        for (i, repeats) in (1..=6_i64).enumerate() {
+            let conv_id = i as i64 + 1;
+            let msg_id = (i as i64 + 1) * 10;
+            conn.execute_compat(
+                "INSERT INTO conversations(id, agent_id, workspace_id, source_id, \
+                 origin_host, title, source_path) \
+                 VALUES(?1, 1, 1, 'local', NULL, ?2, ?3)",
+                params![
+                    conv_id,
+                    format!("k0e5p-{}", i),
+                    format!("/tmp/k0e5p/{}.jsonl", i),
+                ],
+            )?;
+            let content = "rankprobe ".repeat(repeats as usize);
+            conn.execute_compat(
+                "INSERT INTO messages(id, conversation_id, idx, content, created_at) \
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![msg_id, conv_id, i as i64, content.as_str(), 1_700_000_000_i64 + i as i64],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, \
+                 source_path, created_at, message_id) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    msg_id,
+                    content.as_str(),
+                    format!("k0e5p-{}", i),
+                    "codex",
+                    "/tmp/k0e5p",
+                    format!("/tmp/k0e5p/{}.jsonl", i),
+                    1_700_000_000_i64 + i as i64,
+                    msg_id,
+                ],
+            )?;
+        }
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        // Hit-key tuple: (source_path, line_number) is the stable
+        // operator-visible identity. Two limits that share a prefix
+        // must produce hits with the same identities in the same
+        // order across that prefix.
+        fn hit_keys(hits: &[SearchHit]) -> Vec<(String, Option<usize>)> {
+            hits.iter()
+                .map(|h| (h.source_path.clone(), h.line_number))
+                .collect()
+        }
+
+        let large_hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "rankprobe",
+            SearchFilters::default(),
+            6,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(
+            large_hits.len(),
+            6,
+            "limit=N must return all N candidates when the corpus has exactly N matches"
+        );
+
+        let small_hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "rankprobe",
+            SearchFilters::default(),
+            3,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(small_hits.len(), 3, "limit=3 must return exactly 3 hits");
+
+        // Invariant 1: smaller-limit hits are a STRICT prefix of the
+        // larger-limit hits — same identity, same order.
+        let large_keys = hit_keys(&large_hits);
+        let small_keys = hit_keys(&small_hits);
+        assert_eq!(
+            small_keys,
+            large_keys[..3],
+            "limit=3 hit keys MUST be the first 3 of limit=6 hit keys (rank+hydrate \
+             split must not re-order or re-filter); small={small_keys:?} \
+             large_prefix={:?}",
+            &large_keys[..3]
+        );
+
+        // Invariant 2: hit content is also identical across the
+        // shared prefix — the hydrate phase preserves the content
+        // string the rank phase ranked. A regression where hydrate
+        // pulled from a different DB row than rank pointed at would
+        // trip this even if the keys aligned.
+        for (idx, (small, large)) in small_hits.iter().zip(large_hits.iter()).enumerate() {
+            assert_eq!(
+                small.content, large.content,
+                "hit[{idx}] content must agree across limit=3 and limit=6: \
+                 small={:?} large={:?}",
+                small.content, large.content
+            );
+            assert_eq!(
+                small.title, large.title,
+                "hit[{idx}] title must agree across limit=3 and limit=6"
+            );
+        }
+
+        // Invariant 3: limit=0 boundary. The rank+hydrate split could
+        // break this by hydrating before honoring the limit; pinning
+        // it directly catches that regression class.
+        let zero_hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "rankprobe",
+            SearchFilters::default(),
+            0,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(
+            zero_hits.is_empty(),
+            "limit=0 must return zero hits even though the rank phase has candidates; \
+             got {} hits",
+            zero_hits.len()
+        );
+
+        Ok(())
+    }
+
     // --- levenshtein_distance tests ---
 
     #[test]

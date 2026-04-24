@@ -198,6 +198,61 @@ fn models_verify_defaults_to_inspection_without_repair() -> Result<(), String> {
 }
 
 #[test]
+fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
+    use assert_cmd::cargo::cargo_bin;
+    use serde_json::Value;
+    use std::path::Path;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let output = std::process::Command::new(cargo_bin("cass"))
+        .args(["models", "verify", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .output()
+        .expect("run cass models verify --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "models verify --json should succeed with a fail-open lifecycle payload; stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("models verify emits JSON");
+    assert_eq!(payload["status"].as_str(), Some("not_acquired"));
+    assert_eq!(payload["lexical_fail_open"].as_bool(), Some(true));
+    assert_eq!(payload["all_valid"].as_bool(), Some(false));
+    assert_eq!(
+        payload["error"].as_str(),
+        Some("model directory does not exist")
+    );
+
+    let model_dir = payload["model_dir"]
+        .as_str()
+        .expect("models verify must expose model_dir");
+    assert!(
+        Path::new(model_dir).starts_with(&data_dir),
+        "model_dir must stay under the requested data_dir; got {model_dir}"
+    );
+    assert!(
+        !Path::new(model_dir).exists(),
+        "verify --json must inspect an absent cache without creating model_dir; got {model_dir}"
+    );
+
+    let lifecycle = &payload["cache_lifecycle"];
+    assert_eq!(lifecycle["model_dir"].as_str(), Some(model_dir));
+    assert_eq!(lifecycle["state"]["state"].as_str(), Some("not_acquired"));
+    assert_eq!(lifecycle["installed_size_bytes"].as_u64(), Some(0));
+}
+
+#[test]
 fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
@@ -402,8 +457,9 @@ fn models_install_from_file_nonexistent_path_emits_model_error_envelope() {
                  stdout: {stdout}\nstderr: {stderr}"
             )
         });
-    let envelope: Value = serde_json::from_str(envelope_line.trim())
-        .unwrap_or_else(|err| panic!("JSON parse of error envelope failed: {err}; line: {envelope_line}"));
+    let envelope: Value = serde_json::from_str(envelope_line.trim()).unwrap_or_else(|err| {
+        panic!("JSON parse of error envelope failed: {err}; line: {envelope_line}")
+    });
     let err_obj = envelope
         .get("error")
         .and_then(Value::as_object)
