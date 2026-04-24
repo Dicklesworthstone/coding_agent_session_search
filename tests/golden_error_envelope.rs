@@ -23,7 +23,9 @@ fn golden_path() -> PathBuf {
 }
 
 fn lib_rs_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src").join("lib.rs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("lib.rs")
 }
 
 fn extract_kind_literals() -> BTreeMap<String, Vec<usize>> {
@@ -52,8 +54,8 @@ fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
         if let Some(cap) = kind_re.captures(line) {
             let kind = cap[1].to_string();
             // Look backwards up to 10 lines for code: N
-            for j in i.saturating_sub(10)..=i {
-                if let Some(cm) = code_re.captures(lines[j]) {
+            for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)) {
+                if let Some(cm) = code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
                 }
@@ -70,10 +72,7 @@ fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
 fn build_golden_json(kinds: &BTreeMap<String, Vec<i32>>) -> serde_json::Value {
     let mut kinds_obj = serde_json::Map::new();
     for (kind, codes) in kinds {
-        kinds_obj.insert(
-            kind.clone(),
-            serde_json::json!({ "exit_codes": codes }),
-        );
+        kinds_obj.insert(kind.clone(), serde_json::json!({ "exit_codes": codes }));
     }
 
     serde_json::json!({

@@ -145,6 +145,10 @@ fn franken_query_rows_retry(
     }
 }
 
+fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
+    u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
+}
+
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, is_search_noise_text};
 use crate::search::embedder::Embedder;
 use crate::search::vector_index::{
@@ -4374,7 +4378,7 @@ impl SearchClient {
                     origin_host,
                 };
 
-                Ok((message_id as u64, hit))
+                Ok((semantic_message_id_from_db(message_id)?, hit))
             })?;
 
         let mut hits_by_id = HashMap::new();
@@ -6977,6 +6981,16 @@ mod tests {
             assert_eq!(optimized, repeated);
             assert_eq!(optimized, reference);
         }
+    }
+
+    #[test]
+    fn semantic_message_id_from_db_rejects_negative_values() {
+        let err = semantic_message_id_from_db(-1).expect_err("negative DB ids must be rejected");
+        assert!(
+            err.to_string().contains("negative message_id"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(semantic_message_id_from_db(42).expect("positive id"), 42);
     }
 
     #[test]
