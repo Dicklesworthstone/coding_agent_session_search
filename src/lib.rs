@@ -8899,16 +8899,12 @@ fn truncate_content(s: &str, max_len: usize) -> Option<String> {
     // this when the loop reaches the truncate_at index.
     let mut cut_byte: Option<usize> = if truncate_at == 0 { Some(0) } else { None };
     for n in 0..max_len {
-        let Some((byte_idx, _)) = chars.next() else {
-            return None;
-        };
+        let (byte_idx, _) = chars.next()?;
         if n == truncate_at {
             cut_byte = Some(byte_idx);
         }
     }
-    if chars.next().is_none() {
-        return None;
-    }
+    chars.next()?;
     let cut = cut_byte.unwrap_or(s.len());
     let mut out = String::with_capacity(cut + 3);
     out.push_str(&s[..cut]);
@@ -17213,6 +17209,23 @@ fn response_schema_object(
     )
 }
 
+fn response_schema_opaque_object() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
+fn response_schema_opaque_object_array() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": true
+        }
+    })
+}
+
 fn response_schema_search_hit() -> serde_json::Value {
     response_schema_object([
         ("source_path", serde_json::json!({ "type": "string" })),
@@ -17451,6 +17464,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "quarantine": response_schema_opaque_object(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -17506,6 +17520,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "rebuild": response_schema_rebuild_state(),
                 "rebuild_progress": response_schema_rebuild_progress(),
                 "semantic": response_schema_semantic_state(),
+                "quarantine": response_schema_opaque_object(),
                 "_meta": {
                     "type": "object",
                     "properties": {
@@ -17622,10 +17637,12 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "elapsed_ms": { "type": "integer" },
                 "full": { "type": ["boolean", "null"] },
                 "force_rebuild": { "type": ["boolean", "null"] },
+                "entrypoint": response_schema_opaque_object(),
                 "data_dir": { "type": ["string", "null"] },
                 "db_path": { "type": ["string", "null"] },
                 "conversations": { "type": ["integer", "null"] },
                 "messages": { "type": ["integer", "null"] },
+                "indexing_stats": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             }
         }),
@@ -17692,6 +17709,9 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "start_line": { "type": "integer" },
                 "end_line": { "type": "integer" },
                 "highlight_line": { "type": ["integer", "null"] },
+                "target_line": { "type": ["integer", "null"] },
+                "context": { "type": "integer" },
+                "total_lines": { "type": "integer" },
                 "lines": {
                     "type": "array",
                     "items": {
@@ -17857,6 +17877,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "needs_rebuild": { "type": "boolean" },
                 "auto_fix_applied": { "type": "boolean" },
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
+                "quarantine": response_schema_opaque_object(),
+                "_meta": response_schema_opaque_object(),
                 "checks": {
                     "type": "array",
                     "items": {
@@ -17898,7 +17920,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "cache_lifecycle": {
                     "type": "object",
                     "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
-                }
+                },
+                "files": response_schema_opaque_object_array()
             },
             "required": ["model_id", "model_dir", "installed", "state", "lexical_fail_open"]
         }),
@@ -27329,8 +27352,8 @@ fn run_models_install(
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
-        CliError {
+    let model_dir =
+        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
@@ -27339,15 +27362,11 @@ fn run_models_install(
             ),
             hint: None,
             retryable: false,
-        }
-    })?;
+        })?;
     let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
         code: 20,
         kind: CliErrorKind::Model.kind_str(),
-        message: format!(
-            "no manifest registered for embedder '{}'",
-            registry_name
-        ),
+        message: format!("no manifest registered for embedder '{}'", registry_name),
         hint: None,
         retryable: false,
     })?;
@@ -28094,8 +28113,8 @@ fn run_models_remove(
 
     let registry_name = resolve_cli_model_name(model_name)?;
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
-        CliError {
+    let model_dir =
+        FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| CliError {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
@@ -28104,8 +28123,7 @@ fn run_models_remove(
             ),
             hint: None,
             retryable: false,
-        }
-    })?;
+        })?;
 
     if !model_dir.is_dir() {
         println!("{} Model is not installed.", "✗".yellow());
@@ -29293,8 +29311,8 @@ mod cli_models_resolution_tests {
     /// must list all registered names so operators discover snowflake/nomic.
     #[test]
     fn resolve_cli_model_name_rejects_unknown_with_useful_hint() {
-        let err = resolve_cli_model_name("e5-large-v2")
-            .expect_err("unknown model must be rejected");
+        let err =
+            resolve_cli_model_name("e5-large-v2").expect_err("unknown model must be rejected");
         assert_eq!(err.code, 20);
         assert_eq!(err.kind, "model");
         assert!(
