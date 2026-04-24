@@ -5637,31 +5637,43 @@ fn state_meta_json_inner(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let db_size_bytes = fs::metadata(db_path).map(|m| m.len()).ok();
+    let db_metadata = fs::metadata(db_path).ok();
+    let db_size_bytes = db_metadata.as_ref().map(|m| m.len());
+    // [session-review-gi4oy] Capture is_file ALONGSIDE size from the
+    // single metadata call — the gi4oy skip-open path cannot trust
+    // db_path.exists() alone because exists() returns true for both
+    // regular files AND directories. The corrupt-DB regression test
+    // tests/cli_robot.rs:2725::health_json_reports_open_error_for_unopenable_db_path
+    // creates a DIRECTORY at the DB path; without this guard, the
+    // skip-open optimistic branch would report opened=true for a
+    // directory and the contract regression would ship silently.
+    let db_is_regular_file = db_metadata.as_ref().is_some_and(|m| m.is_file());
     let include_counts = include_counts_override.unwrap_or_else(|| {
         db_size_bytes
             .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
             .unwrap_or(false)
     });
-    // [coding_agent_session_search-gi4oy] Skip-open path: when
-    // skip_db_open is true and the DB file exists, synthesize a
-    // StateDbSnapshot that reports opened=true (assumed-good) +
-    // open_skipped=true. The expensive FrankenStorage open is
-    // elided; callers reading the JSON envelope branch on the new
-    // flag if they need to know the open was assumed.
+    // [coding_agent_session_search-gi4oy + session-review-gi4oy]
+    // Skip-open path: when skip_db_open is true AND the DB path is
+    // a regular file (not a directory, not a broken symlink),
+    // synthesize a StateDbSnapshot that reports opened=true
+    // (assumed-good) + open_skipped=true. The expensive
+    // FrankenStorage open is elided; callers reading the JSON
+    // envelope branch on the new flag if they need to know the open
+    // was assumed.
+    //
+    // If the DB path exists but is NOT a regular file (the corrupt-DB
+    // detection scenario), fall through to the actual probe_state_db
+    // — surfacing the open failure is more important than the perf
+    // win in that case. probe_state_db will return opened=false +
+    // open_error=Some(...) which downstream callers (run_health)
+    // turn into a degraded status.
     //
     // counts_skipped MUST be true here regardless of `include_counts`
     // — we never opened the DB so we never ran COUNT(*); the snapshot
     // counts come from `..default()` (i.e. zero). Reporting
     // counts_skipped=false alongside message_count=0 would be a lie.
-    // state_meta_json_for_health currently forces
-    // include_counts=Some(false) so `!include_counts` happened to
-    // yield true, but state_meta_json_full exposes both knobs and a
-    // future caller passing skip_db_open=true with
-    // include_counts=Some(true) (or None where the size heuristic
-    // returns true) would otherwise see `messages: 0,
-    // counts_skipped: false`.
-    let db_snapshot = if skip_db_open && db_exists {
+    let db_snapshot = if skip_db_open && db_exists && db_is_regular_file {
         StateDbSnapshot {
             opened: true,
             counts_skipped: true,
@@ -17120,7 +17132,8 @@ fn response_schema_state_database() -> serde_json::Value {
             "messages": { "type": ["integer", "null"] },
             "open_error": { "type": ["string", "null"] },
             "open_retryable": { "type": "boolean" },
-            "counts_skipped": { "type": "boolean" }
+            "counts_skipped": { "type": "boolean" },
+            "open_skipped": { "type": "boolean" }
         }
     })
 }
@@ -17553,10 +17566,7 @@ fn response_schema_search() -> serde_json::Value {
         ("_meta", response_schema_search_meta()),
         (
             "suggestions",
-            serde_json::json!({
-                "type": "array",
-                "items": { "type": "string" }
-            }),
+            response_schema_opaque_object_array(),
         ),
         (
             "explanation",
@@ -17725,7 +17735,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                             "value_type": { "type": ["string", "null"] },
                             "required": { "type": "boolean" },
                             "default": { "type": ["string", "null"] },
-                            "enum_values": { "type": ["array", "null"] },
+                            "enum_values": { "type": ["array", "null"], "items": { "type": "string" } },
                             "repeatable": { "type": ["boolean", "null"] }
                         }
                     }
@@ -17750,7 +17760,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                                         "value_type": { "type": ["string", "null"] },
                                         "required": { "type": "boolean" },
                                         "default": { "type": ["string", "null"] },
-                                        "enum_values": { "type": ["array", "null"] },
+                                        "enum_values": { "type": ["array", "null"], "items": { "type": "string" } },
                                         "repeatable": { "type": ["boolean", "null"] }
                                     }
                                 }
@@ -17926,6 +17936,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "description": "Machine-responsiveness governor telemetry. Explains why the indexer is running at reduced fan-out and what pressure triggered any recent shrinkage.",
                     "properties": {
                         "current_capacity_pct": { "type": "integer", "description": "Published capacity scalar in [min_capacity_pct, 100]. Fan-out knobs multiply their caller-requested values by this percentage." },
+                        "resource_policy": response_schema_opaque_object(),
                         "healthy_streak": { "type": "integer", "description": "Consecutive healthy ticks seen by the sampler; growth_ticks consecutive healthy ticks trigger a 25pp grow step." },
                         "shrink_count": { "type": "integer", "description": "Cumulative shrink events since governor startup." },
                         "grow_count": { "type": "integer", "description": "Cumulative grow events since governor startup." },
@@ -17939,6 +17950,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                             }
                         },
                         "last_reason": { "type": ["string", "null"], "description": "One of: disabled, severe, pressured, pressured_floor_hold, healthy_hold, healthy_grow, healthy_ceiling_hold." },
+                        "calibration": response_schema_opaque_object(),
                         "recent_decisions": {
                             "type": "array",
                             "description": "Ring buffer of capacity changes and pressure events, oldest → newest.",
@@ -18057,6 +18069,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "policy_source": { "type": "string" },
                 "cache_lifecycle": {
                     "type": "object",
+                    "additionalProperties": true,
                     "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
                 },
                 "files": response_schema_opaque_object_array()
@@ -18077,7 +18090,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "lexical_fail_open": { "type": "boolean" },
                 "model_dir": { "type": "string" },
                 "all_valid": { "type": "boolean" },
-                "cache_lifecycle": { "type": "object" },
+                "cache_lifecycle": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             },
             "required": ["status", "all_valid", "lexical_fail_open"]
