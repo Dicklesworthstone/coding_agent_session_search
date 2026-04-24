@@ -105,7 +105,7 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
     if let Ok(n) = input.parse::<i64>() {
         // Heuristic: timestamps < 10^11 (year 5138) are likely seconds.
         if n < 100_000_000_000 {
-            return Some(n * 1000);
+            return n.checked_mul(1000);
         }
         return Some(n);
     }
@@ -232,5 +232,6 @@ mod tests {
         let ms = 1700000000000;
         assert_eq!(parse_time_input("1700000000").unwrap(), ms);
         assert_eq!(parse_time_input("1700000000000").unwrap(), ms);
+        assert_eq!(parse_time_input(&i64::MIN.to_string()), None);
     }
 }
