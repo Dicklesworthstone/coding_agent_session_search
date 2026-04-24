@@ -2809,12 +2809,42 @@ fn force_rebuild_recreates_index() {
         .assert()
         .success();
 
-    // Get initial index file stats
+    // Bead cxhqb: capture a content-based fingerprint of the index
+    // tree before the force-rebuild. Previously this compared a single
+    // directory-mtime before/after with a 1-second sleep in between —
+    // fragile on filesystems with ≥2s mtime granularity (FAT32, some
+    // NFS setups) and wasteful wall-clock time on every test run.
+    // Listing every file under the index tree with its size is
+    // independent of filesystem mtime precision: a real rebuild writes
+    // new Tantivy segments (new UUIDs, different sizes), so the set is
+    // guaranteed to change even when mtime cannot.
+    fn index_fingerprint(root: &Path) -> Vec<(String, u64)> {
+        let mut entries: Vec<(String, u64)> = walkdir::WalkDir::new(root)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(e.path())
+                    .to_string_lossy()
+                    .into_owned();
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                (rel, len)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
     let index_dir = data_dir.join("index");
-    let initial_mtime = fs::metadata(&index_dir).and_then(|m| m.modified()).ok();
-
-    // Wait a bit
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    let initial_fingerprint = index_fingerprint(&index_dir);
+    assert!(
+        !initial_fingerprint.is_empty(),
+        "precondition: initial index tree at {} must contain files",
+        index_dir.display()
+    );
 
     // Force rebuild
     cargo_bin_cmd!("cass")
@@ -2825,12 +2855,17 @@ fn force_rebuild_recreates_index() {
         .assert()
         .success();
 
-    // Verify index was rebuilt (mtime changed)
-    let new_mtime = fs::metadata(&index_dir).and_then(|m| m.modified()).ok();
-
-    assert!(
-        initial_mtime != new_mtime,
-        "Index mtime should change after force-rebuild"
+    // Verify index was rebuilt: the set of files (names + sizes) under
+    // the index tree must differ from the pre-rebuild snapshot. A
+    // regression where --force-rebuild silently no-ops would leave the
+    // same Tantivy segments in place and this assertion would fire.
+    let new_fingerprint = index_fingerprint(&index_dir);
+    assert_ne!(
+        initial_fingerprint, new_fingerprint,
+        "index tree content must change after --force-rebuild; \
+         before ({} entries) == after ({} entries)",
+        initial_fingerprint.len(),
+        new_fingerprint.len()
     );
 
     // Verify content is still searchable

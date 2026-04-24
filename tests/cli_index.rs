@@ -565,16 +565,25 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
         .get("messages")
         .and_then(|value| value.as_i64())
         .expect("initial message count");
+    // Bead cxhqb: capture the checkpoint file's BYTES instead of its
+    // filesystem mtime. Comparing mtimes is fragile on filesystems
+    // with coarse (≥2s) granularity — the previous approach paired a
+    // 5ms sleep with a "same mtime" assertion, which was always a
+    // happy-path-only signal. The checkpoint JSON's own content (plus
+    // embedded updated_at_ms field) changes ONLY when cass rewrites
+    // the file, independent of filesystem mtime resolution, so a
+    // byte-for-byte comparison is both tighter and portable.
     let checkpoint_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
         .unwrap()
         .join(".lexical-rebuild-state.json");
-    let checkpoint_modified_before = fs::metadata(&checkpoint_path)
-        .expect("initial lexical checkpoint")
-        .modified()
-        .expect("initial checkpoint mtime");
+    let checkpoint_bytes_before =
+        fs::read(&checkpoint_path).expect("initial lexical checkpoint must be readable");
+    assert!(
+        !checkpoint_bytes_before.is_empty(),
+        "precondition: initial checkpoint must be non-empty"
+    );
 
     fs::rename(&codex_home, home.join(".codex_hidden")).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(5));
 
     let mut cmd = base_cmd(home);
     cmd.args(["index", "--full", "--json", "--data-dir"])
@@ -616,13 +625,13 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
         stats.get("total_messages").and_then(|value| value.as_i64()),
         Some(expected_messages)
     );
-    let checkpoint_modified_after = fs::metadata(&checkpoint_path)
-        .expect("preserved lexical checkpoint")
-        .modified()
-        .expect("preserved checkpoint mtime");
+    let checkpoint_bytes_after =
+        fs::read(&checkpoint_path).expect("preserved lexical checkpoint must be readable");
     assert_eq!(
-        checkpoint_modified_after, checkpoint_modified_before,
-        "repeat no-op full runs should preserve the matching lexical checkpoint instead of deleting and recreating it"
+        checkpoint_bytes_after, checkpoint_bytes_before,
+        "repeat no-op full runs should preserve the matching lexical checkpoint instead \
+         of deleting and recreating it (content byte-for-byte identical; file mtime is \
+         fragile on coarse-granularity filesystems, content is not)"
     );
 }
 
