@@ -556,3 +556,126 @@ fn cold_start_health_surface_transitions_from_not_initialized_to_lexical_only() 
         "phase3 search must return ≥1 hit for the seeded keyword; payload: {search_json}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-k9jb9 (child of ibuuh.10, scenario E:
+// stale index-run.lock detection + reaping, end-to-end).
+//
+// src/search/asset_state.rs::read_search_maintenance_snapshot promises
+// that a stale `index-run.lock` file — metadata persisted from a prior
+// cass invocation that crashed or was killed — gets reaped on read:
+// fs2 `try_lock_exclusive` succeeds (no live holder), the file is
+// truncated to 0 bytes, and every reader observes a clean default
+// snapshot (`active=false`, `orphaned=false`).
+//
+// That invariant exists specifically because issue #176 had stale locks
+// making the TUI and status consumers interpret the file as "rebuild
+// in progress, keep polling" forever — a user-visible hang that only
+// cleared on manual `rm index-run.lock`.
+//
+// The inner state_meta_json unit test at src/lib.rs::state_meta_json_reports_orphaned_lock_metadata
+// pins the library-level contract. This E2E test pins the USER-FACING
+// surface: does the `cass status --json` subprocess correctly:
+//   1. report rebuild.active=false on a stale-lock state?
+//   2. reap the lock file as a side-effect (so follow-up readers also
+//      see the clean state without racing)?
+// A regression where the reaping was skipped or gated by a kill(pid,0)
+// probe (which the source deliberately avoids — see the in-source
+// rationale around asset_state.rs:180) would leave every agent and TUI
+// stuck again.
+// ========================================================================
+
+#[test]
+fn cass_status_reaps_stale_index_run_lock_and_reports_not_active() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    // Create an empty canonical DB file at the path the lock metadata
+    // references. probe_index_run_lock will only consider a lock
+    // authoritative if its db_path matches the one cass is examining
+    // (src/lib.rs::probe_index_run_lock path_identities_match check).
+    let db_path = data_dir.join("agent_search.db");
+    fs::write(&db_path, b"").expect("create stub agent_search.db");
+
+    // Seed a stale index-run.lock shaped like a real one: PID of a
+    // process that is NOT currently holding an fcntl lock on the file.
+    // Using a random high PID keeps the intent obvious even if PID
+    // reuse happens to collide — the reaping path deliberately does
+    // NOT gate on kill(pid, 0) (see asset_state.rs:180 rationale). The
+    // only thing that matters is that we did NOT lock the file.
+    let lock_path = data_dir.join("index-run.lock");
+    let lock_body = format!(
+        "pid=4242\nstarted_at_ms=1733000888000\nupdated_at_ms=1733000999000\ndb_path={}\nmode=index\njob_id=lexical_refresh-1733000888000-4242\njob_kind=lexical_refresh\nphase=rebuilding\n",
+        db_path.display()
+    );
+    fs::write(&lock_path, lock_body.as_bytes()).expect("write stale lock metadata");
+    let original_lock_len = fs::metadata(&lock_path).expect("stat lock").len();
+    assert!(
+        original_lock_len > 0,
+        "precondition: stale lock metadata must be non-empty before the test \
+         runs; got len={original_lock_len}"
+    );
+
+    // Run cass status. This invokes read_search_maintenance_snapshot
+    // which should observe: "metadata present but no fcntl holder" =>
+    // reap the file AND return a clean default snapshot.
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "status",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass status --json");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let payload: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("status JSON parse failed: {err}; stdout: {stdout}\nstderr: {stderr}"));
+
+    // CONTRACT PIN 1: status reports rebuild.active=false. The whole
+    // point of issue #176 fix is that stale metadata must NOT be
+    // surfaced as active-rebuild to the user or their agents.
+    assert_eq!(
+        payload
+            .get("rebuild")
+            .and_then(|r| r.get("active"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "cass status must report rebuild.active=false for a stale index-run.lock \
+         (no fcntl holder). stderr: {stderr}\npayload: {payload}"
+    );
+
+    // CONTRACT PIN 2: status reports rebuild.orphaned=false. After
+    // reaping the metadata, the snapshot is a clean default — no
+    // "orphaned-forever" sticky state that historically caused the
+    // TUI to spin.
+    assert_eq!(
+        payload
+            .get("rebuild")
+            .and_then(|r| r.get("orphaned"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "cass status must report rebuild.orphaned=false after reaping (not \
+         sticky-orphaned); payload: {payload}"
+    );
+
+    // CONTRACT PIN 3: the lock file on disk is truncated as a side-
+    // effect of the read. A subsequent reader (next `cass status`,
+    // next TUI poll) must observe a clean state without having to
+    // re-do the reaping dance — otherwise concurrent consumers race.
+    let reaped_len = fs::metadata(&lock_path)
+        .expect("stat lock after cass status")
+        .len();
+    assert_eq!(
+        reaped_len, 0,
+        "index-run.lock must be truncated to 0 bytes after the read reaps stale \
+         metadata; was {original_lock_len} bytes before, {reaped_len} after"
+    );
+}
