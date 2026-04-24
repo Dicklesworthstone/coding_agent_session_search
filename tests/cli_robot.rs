@@ -5083,3 +5083,165 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
         )
     });
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-ibuuh.10 (sub-slice):
+//
+// Pins the truthful-fallback contract for `cass search --mode semantic`
+// when the embedder / semantic assets are absent. The default cass
+// install does NOT download the ~90MB MiniLM model (per AGENTS.md
+// "Search Asset Contract: Semantic model acquisition is opt-in"), so
+// every fresh install lands in this state.
+//
+// Two acceptable contract shapes for explicit-semantic-mode under that
+// state, codified in src/lib.rs::SearchMode::Semantic (around line 8111):
+//
+//   - Fail HARD with kind="semantic-unavailable", code=15, retryable=false,
+//     and a hint that names `--mode lexical` as the recovery path.
+//
+// The sibling tests already pin the default-hybrid + explicit-hybrid
+// fail-open path (e2e_lexical_fail_open.rs::
+// explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing
+// and default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent),
+// but explicit `--mode semantic` is intentionally STRICTER: when the
+// user explicitly asks for semantic, cass refuses to silently downgrade
+// because that would mask a misconfiguration. Pinning this contract
+// means a future refactor that "helpfully" added silent fail-open on
+// explicit-semantic-mode would trip immediately, signaling a quality
+// regression to operators who actually wanted the semantic tier.
+//
+// Invariants pinned here:
+//   1. Exit code is non-zero (the planner refused to fall back).
+//   2. The error envelope on stderr contains kind="semantic-unavailable"
+//      and code=15 (matches src/lib.rs Exit Codes table for kind 15).
+//   3. error.retryable=false (this is a missing-asset state, not a
+//      transient failure; retrying without installing the model is
+//      pointless and burns budget).
+//   4. error.hint names `--mode lexical` so the operator knows the
+//      cheap-fix recovery path without having to grep docs.
+//   5. error.message is non-empty (the contract pinned by 7k7pl for
+//      the missing-index family applies here too).
+// ========================================================================
+
+#[test]
+fn search_explicit_semantic_mode_errors_when_embedder_absent() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    // Seed a Codex session so the canonical DB and lexical index BOTH
+    // exist — we want to isolate "semantic assets are missing" from
+    // "everything is missing" (which would just trip the missing-index
+    // contract). Reuse the s0cmk fixture builder above.
+    seed_codex_session_s0cmk(
+        &codex_home,
+        "rollout-ibuuh10-explicit-semantic-01.jsonl",
+        "explicitsemanticprobe",
+    );
+
+    let mut idx = isolated_cass_cmd(home);
+    idx.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let idx_out = idx.output().expect("run cass index --full");
+    assert!(
+        idx_out.status.success(),
+        "initial index must succeed before we can probe semantic-mode behavior. \
+         stdout: {} stderr: {}",
+        String::from_utf8_lossy(&idx_out.stdout),
+        String::from_utf8_lossy(&idx_out.stderr),
+    );
+
+    // Now request explicit-semantic search. With no embedder model
+    // installed (default state), this MUST fail with semantic-unavailable
+    // rather than silently falling back to lexical.
+    let mut search = isolated_cass_cmd(home);
+    search
+        .args([
+            "search",
+            "explicitsemanticprobe",
+            "--json",
+            "--mode",
+            "semantic",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
+        .arg(&data_dir);
+    let out = search.output().expect("run cass search --mode semantic");
+    assert!(
+        !out.status.success(),
+        "cass search --mode semantic must NOT succeed when the embedder is absent — \
+         silent fallback would mask a misconfiguration. \
+         stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // The error envelope is the LAST non-empty line of stderr (matches
+    // the existing search_missing_index_returns_json_error_contract
+    // pattern which also has to skip stray warnings).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("stderr should contain a JSON error line; got: {stderr}"));
+    let payload: Value = serde_json::from_str(last_line.trim()).unwrap_or_else(|err| {
+        panic!("error envelope must be valid JSON: {err}; line: {last_line}")
+    });
+    let err = payload
+        .get("error")
+        .and_then(|e| e.as_object())
+        .unwrap_or_else(|| panic!("payload must contain an `error` object; got: {payload}"));
+
+    // Invariant 2: kebab-case kind + numeric code from src/lib.rs Exit
+    // Codes table. Pinning both the kind AND the code catches a
+    // regression in either direction (kind drift to "missing-embedder"
+    // or code drift to a different number).
+    assert_eq!(
+        err.get("kind").and_then(Value::as_str),
+        Some("semantic-unavailable"),
+        "explicit semantic mode without embedder must surface kind=semantic-unavailable; got: {err:?}"
+    );
+    assert_eq!(
+        err.get("code").and_then(Value::as_i64),
+        Some(15),
+        "explicit semantic mode without embedder must surface code=15 \
+         (per AGENTS.md Exit Codes table); got: {err:?}"
+    );
+
+    // Invariant 3: NOT retryable. A retry loop without installing the
+    // model would burn budget on the same error.
+    assert_eq!(
+        err.get("retryable").and_then(Value::as_bool),
+        Some(false),
+        "semantic-unavailable must be reported as non-retryable so agents don't loop; got: {err:?}"
+    );
+
+    // Invariant 4: hint names `--mode lexical` as the cheap recovery
+    // path. The exact hint text from src/lib.rs:8141 is
+    // "Run 'cass tui' and press Alt+S to set up semantic search, or use --mode lexical".
+    let hint = err
+        .get("hint")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("error must include a `hint` operator can act on; got: {err:?}"));
+    let hint_lower = hint.to_lowercase();
+    assert!(
+        hint_lower.contains("--mode lexical"),
+        "hint must name `--mode lexical` as the cheap recovery path so the operator can \
+         continue without installing the semantic model; got: {hint:?}"
+    );
+
+    // Invariant 5: non-empty message string (matches the 7k7pl contract
+    // already pinned on the missing-index family).
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("error must include a non-null message; got: {err:?}"));
+    assert!(
+        !message.is_empty(),
+        "error message must be a non-empty diagnostic string; got: {err:?}"
+    );
+}
