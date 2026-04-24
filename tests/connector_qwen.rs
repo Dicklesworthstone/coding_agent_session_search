@@ -26,6 +26,19 @@ fn write_session_file(storage: &Path, project_hash: &str, filename: &str, bytes:
     session_path
 }
 
+fn write_session_file_without_config(
+    storage: &Path,
+    project_hash: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> PathBuf {
+    let chats_dir = storage.join(project_hash).join("chats");
+    fs::create_dir_all(&chats_dir).unwrap();
+    let session_path = chats_dir.join(filename);
+    fs::write(&session_path, bytes).unwrap();
+    session_path
+}
+
 fn scan_storage(storage: &Path) -> Vec<coding_agent_search::connectors::NormalizedConversation> {
     let connector = QwenConnector::new();
     let ctx = ScanContext::with_roots(
@@ -114,6 +127,106 @@ fn qwen_malformed_json_returns_empty_result_without_panic() {
         "session-malformed.json",
         br#"{"sessionId":"bad","messages":[{"type":"user","content":"unterminated"}"#,
     );
+
+    assert!(scan_storage(&storage).is_empty());
+}
+
+#[test]
+fn qwen_truncated_session_json_returns_empty_result_without_panic() {
+    let tmp = TempDir::new().unwrap();
+    let storage = qwen_storage(&tmp);
+    write_session_file(
+        &storage,
+        "hash",
+        "session-truncated.json",
+        br#"{"sessionId":"truncated","projectHash":"hash","messages":[{"type":"user","content":"complete until tail"}"#,
+    );
+
+    assert!(scan_storage(&storage).is_empty());
+}
+
+#[test]
+fn qwen_missing_config_json_keeps_session_without_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let storage = qwen_storage(&tmp);
+    let session_json = r#"{
+        "sessionId": "qwen-no-config",
+        "projectHash": "project-without-config",
+        "startTime": "2025-11-08T23:19:10.138Z",
+        "lastUpdated": "2025-11-08T23:19:10.138Z",
+        "messages": [
+            {
+                "id": "msg-001",
+                "timestamp": "2025-11-08T23:19:10.138Z",
+                "type": "user",
+                "content": "Config file is absent"
+            }
+        ]
+    }"#;
+    let session_path = write_session_file_without_config(
+        &storage,
+        "project-without-config",
+        "session-1731107950138-no-config.json",
+        session_json.as_bytes(),
+    );
+
+    let convs = scan_storage(&storage);
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.external_id.as_deref(), Some("qwen-no-config"));
+    assert_eq!(conv.source_path, session_path);
+    assert_eq!(conv.workspace, None);
+}
+
+#[test]
+fn qwen_multiple_projects_remain_isolated_and_sorted() {
+    let tmp = TempDir::new().unwrap();
+    let storage = qwen_storage(&tmp);
+    let first = r#"{
+        "sessionId": "qwen-session-a",
+        "projectHash": "project-a",
+        "messages": [{"type": "user", "content": "first project content"}]
+    }"#;
+    let second = r#"{
+        "sessionId": "qwen-session-b",
+        "projectHash": "project-b",
+        "messages": [{"type": "user", "content": "second project content"}]
+    }"#;
+    write_session_file(
+        &storage,
+        "project-b",
+        "session-1731107950139-b.json",
+        second.as_bytes(),
+    );
+    write_session_file(
+        &storage,
+        "project-a",
+        "session-1731107950138-a.json",
+        first.as_bytes(),
+    );
+
+    let convs = scan_storage(&storage);
+    assert_eq!(convs.len(), 2);
+    assert_eq!(convs[0].external_id.as_deref(), Some("qwen-session-a"));
+    assert_eq!(convs[1].external_id.as_deref(), Some("qwen-session-b"));
+    assert_eq!(convs[0].metadata["projectHash"], "project-a");
+    assert_eq!(convs[1].metadata["projectHash"], "project-b");
+    assert!(convs[0].messages[0].content.contains("first project"));
+    assert!(convs[1].messages[0].content.contains("second project"));
+}
+
+#[test]
+fn qwen_ignores_non_session_json_files_and_empty_project_dirs() {
+    let tmp = TempDir::new().unwrap();
+    let storage = qwen_storage(&tmp);
+    let chats_dir = storage.join("hash").join("chats");
+    fs::create_dir_all(&chats_dir).unwrap();
+    fs::write(
+        chats_dir.join("conversation.json"),
+        br#"{"messages":[{"type":"user","content":"wrong file name"}]}"#,
+    )
+    .unwrap();
+    fs::write(chats_dir.join("session-not-json.txt"), b"ignored").unwrap();
 
     assert!(scan_storage(&storage).is_empty());
 }
