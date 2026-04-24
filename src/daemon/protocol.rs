@@ -259,27 +259,13 @@ pub fn decode_message<T: for<'de> Deserialize<'de>>(
     rmp_serde::from_slice(data).map_err(|e| DecodeError(e.to_string()))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("encode error: {0}")]
 pub struct EncodeError(pub String);
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "encode error: {}", self.0)
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("decode error: {0}")]
 pub struct DecodeError(pub String);
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "decode error: {}", self.0)
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
@@ -295,6 +281,17 @@ mod tests {
         assert_eq!(decoded.version, PROTOCOL_VERSION);
         assert_eq!(decoded.request_id, "req-1");
         assert!(matches!(decoded.payload, Request::Health));
+    }
+
+    #[test]
+    fn test_protocol_error_display_strings_are_preserved() {
+        let encode = EncodeError("bad payload".to_string());
+        assert_eq!(encode.to_string(), "encode error: bad payload");
+        assert!(std::error::Error::source(&encode).is_none());
+
+        let decode = DecodeError("bad frame".to_string());
+        assert_eq!(decode.to_string(), "decode error: bad frame");
+        assert!(std::error::Error::source(&decode).is_none());
     }
 
     #[test]
