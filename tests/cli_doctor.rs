@@ -855,22 +855,23 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
 
 /// `coding_agent_session_search-ibuuh.23` lifecycle invariant:
 /// `cass doctor --json --fix` is idempotent across consecutive
-/// invocations. The "do no harm" property — an operator running
+/// invocations. Once the first --fix has reclaimed every safe
+/// derivative artifact, the second --fix run on the same data dir
+/// MUST report no additional cleanup work — `auto_fix_actions`
+/// contains no `Pruned N derivative cleanup artifact(s)` line, the
+/// top-level `cleanup_apply` payload reports `pruned_asset_count: 0`,
+/// and `before_reclaim_candidate_count == 0` (matching the after-state
+/// of the first run).
+///
+/// This is the "do no harm" property of doctor --fix that the bead
+/// requires for long-running maintenance: an operator running
 /// `cass doctor --fix` on a cron schedule must not see spurious
 /// "fixed N issues" output every cycle when the disk is already
-/// clean.
+/// clean. Without this pin, a regression in cleanup state tracking
+/// (e.g., a re-discovery of already-pruned generations) could ship
+/// silently and pollute operator dashboards.
 ///
-/// **#[ignore] state**: this test currently fails on the first
-/// --fix assertion (`cleanup_apply: null` in the doctor envelope
-/// for our seed shape). The seed needs alignment with the
-/// `doctor_fix_prunes_safe_derivative_cleanup_candidates` fixture
-/// (likely needs a quarantined manifest seeded too) to drive the
-/// derivative_cleanup check into the apply branch on the first
-/// --fix. Filed as a follow-up under the same bead — the test
-/// scaffolding ships now so a future agent can rebalance the seed
-/// without re-deriving the assertion shape.
 #[test]
-#[ignore = "ibuuh.23 follow-up: seed needs alignment to drive derivative_cleanup.cleanup_apply on the first --fix; assertion shape is correct"]
 fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     let test_home = tempfile::tempdir().expect("tempdir");
     let data_dir = test_home.path().join("cass-data");
@@ -907,6 +908,17 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
         b"superseded generation bytes",
     )
     .expect("write superseded generation artifact");
+
+    let quarantined_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_manifest(&quarantined_dir);
+    fs::write(
+        quarantined_dir.join("segment-a"),
+        b"quarantined generation bytes",
+    )
+    .expect("write quarantined generation artifact");
 
     let invoke_doctor_fix = || -> Value {
         let out = cass_cmd(test_home.path())
@@ -951,13 +963,13 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
         Some(true),
         "first --fix MUST flip derivative_cleanup.fix_applied to true"
     );
+    let first_cleanup_apply = &first["cleanup_apply"];
     assert!(
-        first_cleanup["cleanup_apply"]["pruned_asset_count"]
+        first_cleanup_apply["pruned_asset_count"]
             .as_u64()
             .unwrap_or(0)
             >= 1,
-        "first --fix MUST prune ≥ 1 asset; cleanup_apply: {:#}",
-        first_cleanup["cleanup_apply"]
+        "first --fix MUST prune at least 1 asset; cleanup_apply: {first_cleanup_apply:#}"
     );
 
     // Second invocation: idempotent — no additional Pruned actions,
@@ -979,7 +991,12 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
         .iter()
         .find(|c| c["name"].as_str() == Some("derivative_cleanup"))
         .expect("derivative_cleanup check on second run");
-    let cleanup_apply = &second_cleanup["cleanup_apply"];
+    assert_eq!(
+        second_cleanup["fix_applied"].as_bool(),
+        Some(false),
+        "second --fix MUST leave derivative_cleanup.fix_applied false"
+    );
+    let cleanup_apply = &second["cleanup_apply"];
     assert_eq!(
         cleanup_apply["before_reclaim_candidate_count"]
             .as_u64()
@@ -989,7 +1006,9 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
          cleanup_apply: {cleanup_apply:#}"
     );
     assert_eq!(
-        cleanup_apply["pruned_asset_count"].as_u64().unwrap_or(u64::MAX),
+        cleanup_apply["pruned_asset_count"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
         0,
         "second --fix MUST prune zero additional assets; cleanup_apply: {cleanup_apply:#}"
     );
@@ -1013,6 +1032,10 @@ fn doctor_fix_is_idempotent_across_consecutive_invocations() {
     assert!(
         !superseded_dir.exists(),
         "superseded generation MUST stay pruned across consecutive --fix runs"
+    );
+    assert!(
+        quarantined_dir.exists(),
+        "quarantined generation MUST remain for inspection across consecutive --fix runs"
     );
 }
 
