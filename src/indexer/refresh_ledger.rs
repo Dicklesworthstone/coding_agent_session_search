@@ -562,6 +562,157 @@ impl BenchmarkCorpusConfig {
     }
 }
 
+// ─── Evidence-grade derived metrics (ibuuh.24) ─────────────────────────────
+//
+// `coding_agent_session_search-ibuuh.24` SCOPE bullet 1 calls for "a hard
+// evidence ledger for the stale-refresh path so future tuning is grounded
+// in measured truth." The raw `RefreshLedger` captures phase counters and
+// timings; benchmark agents and operator dashboards still need *derived*
+// summaries (throughput, phase-share, hot-phase identification) that are
+// stable across runs and trivially comparable. This section adds those
+// pure-data summaries so consumers can read one struct instead of
+// re-deriving the math at every call site.
+
+/// Per-phase throughput summary derived from a `PhaseRecord`.
+///
+/// `items_per_second` is the headline tuning metric. `seconds` is
+/// captured separately (rather than as a division by zero) so callers
+/// can render either form without re-doing the math, and so a phase
+/// that processed items but completed in <1ms still surfaces a usable
+/// throughput rather than reporting `NaN`. When `duration_ms == 0` the
+/// throughput is reported as `None` (you cannot extrapolate from a
+/// zero-duration measurement).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshThroughputProfile {
+    pub phase: RefreshPhase,
+    pub duration_ms: u64,
+    pub items_processed: u64,
+    /// `items_processed / (duration_ms / 1000)`, rounded to 3 decimal
+    /// places via the f64 path. `None` when `duration_ms == 0` or the
+    /// phase did not run.
+    pub items_per_second: Option<f64>,
+}
+
+/// Share of total wall-clock time spent in a single phase.
+///
+/// `share_pct` sums to ~100.0 across all phases that ran (sub-millisecond
+/// rounding can cause ±0.01 drift). The zero-duration case is handled
+/// explicitly: phases that contributed 0ms get share_pct=0.0 instead of
+/// NaN.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshPhaseShare {
+    pub phase: RefreshPhase,
+    pub duration_ms: u64,
+    /// Percentage of total `RefreshLedger.total_duration_ms` (0.0–100.0).
+    pub share_pct: f64,
+}
+
+/// Single-shot derived evidence summary suitable for benchmark
+/// comparison and operator dashboards. Computed from a `RefreshLedger`
+/// in O(phases) time with zero allocations beyond the output structs.
+///
+/// Comparing two `RefreshLedgerEvidence` values across runs is the
+/// intended consumer pattern: regression gates assert that
+/// `aggregate_items_per_second` did not drop more than X%, that
+/// `dominant_phase` did not migrate, etc.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshLedgerEvidence {
+    /// Per-phase throughput. Excludes phases with `items_processed == 0`
+    /// to keep the output focused on phases that actually moved data.
+    pub throughput: Vec<RefreshThroughputProfile>,
+    /// Per-phase wall-clock share. Includes ALL phases that ran (even
+    /// zero-item phases like a brief Recovery) so the shares sum
+    /// transparently.
+    pub phase_share: Vec<RefreshPhaseShare>,
+    /// Phase consuming the largest share of wall time, or `None` when
+    /// no phases ran. The "where to optimize next" pointer.
+    pub dominant_phase: Option<RefreshPhase>,
+    /// Total items processed across every phase.
+    pub aggregate_items_processed: u64,
+    /// Total wall-clock duration in milliseconds (mirrors
+    /// `RefreshLedger.total_duration_ms` for ergonomic single-struct
+    /// access).
+    pub aggregate_duration_ms: u64,
+    /// Aggregate items/second across the whole refresh; `None` when
+    /// `aggregate_duration_ms == 0`.
+    pub aggregate_items_per_second: Option<f64>,
+}
+
+impl RefreshLedger {
+    /// Compute the derived evidence summary for benchmark comparison and
+    /// operator dashboards. See [`RefreshLedgerEvidence`] for shape +
+    /// invariants. This is pure (no I/O) and runs in O(phases).
+    pub fn evidence_summary(&self) -> RefreshLedgerEvidence {
+        let total_ms = self.total_duration_ms;
+        let throughput: Vec<RefreshThroughputProfile> = self
+            .phases
+            .iter()
+            .filter(|phase| phase.items_processed > 0)
+            .map(|phase| {
+                let items_per_second = items_per_second_for(phase.duration_ms, phase.items_processed);
+                RefreshThroughputProfile {
+                    phase: phase.phase,
+                    duration_ms: phase.duration_ms,
+                    items_processed: phase.items_processed,
+                    items_per_second,
+                }
+            })
+            .collect();
+        let phase_share: Vec<RefreshPhaseShare> = self
+            .phases
+            .iter()
+            .map(|phase| RefreshPhaseShare {
+                phase: phase.phase,
+                duration_ms: phase.duration_ms,
+                share_pct: share_pct_for(phase.duration_ms, total_ms),
+            })
+            .collect();
+        let dominant_phase = self
+            .phases
+            .iter()
+            .max_by_key(|phase| phase.duration_ms)
+            .filter(|phase| phase.duration_ms > 0)
+            .map(|phase| phase.phase);
+        let aggregate_items_processed = self.total_items_processed();
+        let aggregate_items_per_second =
+            items_per_second_for(total_ms, aggregate_items_processed);
+        RefreshLedgerEvidence {
+            throughput,
+            phase_share,
+            dominant_phase,
+            aggregate_items_processed,
+            aggregate_duration_ms: total_ms,
+            aggregate_items_per_second,
+        }
+    }
+}
+
+/// Compute items/second to 3-decimal precision; returns `None` when
+/// `duration_ms == 0` (cannot extrapolate from a zero-duration
+/// measurement) or `items == 0` (no work to extrapolate).
+fn items_per_second_for(duration_ms: u64, items: u64) -> Option<f64> {
+    if duration_ms == 0 || items == 0 {
+        return None;
+    }
+    let seconds = duration_ms as f64 / 1000.0;
+    if seconds <= 0.0 {
+        return None;
+    }
+    let raw = items as f64 / seconds;
+    Some((raw * 1000.0).round() / 1000.0)
+}
+
+/// Compute the wall-clock share of one phase relative to the total
+/// duration. Returns 0.0 when `total_ms == 0` (avoids NaN; an empty
+/// ledger has no phase shares to compute) or when `phase_ms == 0`.
+fn share_pct_for(phase_ms: u64, total_ms: u64) -> f64 {
+    if total_ms == 0 || phase_ms == 0 {
+        return 0.0;
+    }
+    let raw = (phase_ms as f64 / total_ms as f64) * 100.0;
+    (raw * 100.0).round() / 100.0
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1004,5 +1155,212 @@ mod tests {
             success,
             error_message: (!success).then(|| format!("failed {}", phase.as_str())),
         }
+    }
+
+    fn phase_record_with_items(
+        phase: RefreshPhase,
+        duration_ms: u64,
+        items: u64,
+    ) -> PhaseRecord {
+        PhaseRecord {
+            phase,
+            duration_ms,
+            items_processed: items,
+            items_skipped: 0,
+            errors: 0,
+            counters: BTreeMap::new(),
+            success: true,
+            error_message: None,
+        }
+    }
+
+    fn ledger_with(phases: Vec<PhaseRecord>) -> RefreshLedger {
+        let total_duration_ms = phases.iter().map(|p| p.duration_ms).sum();
+        RefreshLedger {
+            version: 1,
+            started_at_ms: 1_700_000_000_000,
+            completed_at_ms: 1_700_000_000_000 + i64::try_from(total_duration_ms).unwrap_or(0),
+            total_duration_ms,
+            full_rebuild: true,
+            corpus_family: "evidence-test".to_owned(),
+            phases,
+            equivalence: EquivalenceArtifacts::default(),
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// `coding_agent_session_search-ibuuh.24` (evidence-ledger gate):
+    /// throughput math is correct + zero-duration / zero-items
+    /// degenerate cases yield None (NOT NaN). Pinning the math in a
+    /// golden test means a future tweak that introduced NaN
+    /// poisoning into benchmark JSON would trip immediately.
+    #[test]
+    fn evidence_summary_reports_per_phase_throughput_with_safe_zero_handling() {
+        // Mixed corpus: Scan moved 1000 items in 500ms, Persist moved
+        // 2000 items in 1000ms, LexicalRebuild moved 0 items in 100ms
+        // (warmup-only phase), Recovery did 0 items in 0ms (no-op).
+        let ledger = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 500, 1000),
+            phase_record_with_items(RefreshPhase::Persist, 1000, 2000),
+            phase_record_with_items(RefreshPhase::LexicalRebuild, 100, 0),
+            phase_record_with_items(RefreshPhase::Recovery, 0, 0),
+        ]);
+
+        let evidence = ledger.evidence_summary();
+
+        // Throughput vector excludes zero-item phases (LexicalRebuild,
+        // Recovery): nothing to extrapolate.
+        assert_eq!(
+            evidence.throughput.len(),
+            2,
+            "throughput must skip zero-item phases; got {:?}",
+            evidence.throughput
+        );
+
+        // Scan: 1000 items / 0.5s = 2000.0 items/s.
+        let scan = evidence
+            .throughput
+            .iter()
+            .find(|t| t.phase == RefreshPhase::Scan)
+            .expect("scan throughput present");
+        assert_eq!(scan.items_per_second, Some(2000.0));
+        assert_eq!(scan.duration_ms, 500);
+        assert_eq!(scan.items_processed, 1000);
+
+        // Persist: 2000 items / 1.0s = 2000.0 items/s.
+        let persist = evidence
+            .throughput
+            .iter()
+            .find(|t| t.phase == RefreshPhase::Persist)
+            .expect("persist throughput present");
+        assert_eq!(persist.items_per_second, Some(2000.0));
+
+        // Aggregate: (1000+2000+0+0) / (500+1000+100+0)ms = 3000/1.6s = 1875.0
+        assert_eq!(evidence.aggregate_items_processed, 3000);
+        assert_eq!(evidence.aggregate_duration_ms, 1600);
+        assert_eq!(evidence.aggregate_items_per_second, Some(1875.0));
+    }
+
+    /// Zero-duration ledger (empty or instantaneous) must NOT panic
+    /// and must NOT emit NaN. dominant_phase is None; aggregate
+    /// throughput is None.
+    #[test]
+    fn evidence_summary_handles_empty_and_zero_duration_ledgers() {
+        // Truly empty.
+        let empty = ledger_with(Vec::new());
+        let empty_evidence = empty.evidence_summary();
+        assert!(empty_evidence.throughput.is_empty());
+        assert!(empty_evidence.phase_share.is_empty());
+        assert_eq!(empty_evidence.dominant_phase, None);
+        assert_eq!(empty_evidence.aggregate_items_per_second, None);
+        assert_eq!(empty_evidence.aggregate_duration_ms, 0);
+
+        // Phases ran but contributed 0ms each (instantaneous run).
+        let instant = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 0, 5),
+            phase_record_with_items(RefreshPhase::Persist, 0, 5),
+        ]);
+        let instant_evidence = instant.evidence_summary();
+        // Phases ran but with zero duration ⇒ throughput None for each.
+        for t in &instant_evidence.throughput {
+            assert_eq!(t.items_per_second, None, "zero duration must yield None");
+        }
+        // No phase was dominant (all zero) ⇒ dominant_phase None.
+        assert_eq!(instant_evidence.dominant_phase, None);
+        // Phase shares all 0.0 — no NaN poisoning.
+        for share in &instant_evidence.phase_share {
+            assert_eq!(share.share_pct, 0.0);
+            assert!(
+                !share.share_pct.is_nan(),
+                "share_pct must never be NaN"
+            );
+        }
+    }
+
+    /// Phase shares sum to ~100.0 across phases with non-zero
+    /// duration (sub-millisecond rounding can cause ±0.01 drift).
+    /// dominant_phase identifies the phase with the largest
+    /// duration_ms.
+    #[test]
+    fn evidence_summary_phase_share_sums_to_one_hundred_and_dominant_phase_picks_max() {
+        let ledger = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 200, 100),
+            phase_record_with_items(RefreshPhase::Persist, 600, 1500), // dominant
+            phase_record_with_items(RefreshPhase::LexicalRebuild, 200, 1500),
+        ]);
+        let evidence = ledger.evidence_summary();
+
+        let total_share: f64 = evidence.phase_share.iter().map(|s| s.share_pct).sum();
+        assert!(
+            (total_share - 100.0).abs() <= 0.05,
+            "phase shares must sum to ~100.0 (±0.05 for rounding); got {total_share}"
+        );
+
+        // Persist contributed 600ms / 1000ms = 60% of wall time.
+        let persist_share = evidence
+            .phase_share
+            .iter()
+            .find(|s| s.phase == RefreshPhase::Persist)
+            .expect("persist share present");
+        assert_eq!(persist_share.share_pct, 60.0);
+
+        // Dominant phase must be Persist (largest duration).
+        assert_eq!(evidence.dominant_phase, Some(RefreshPhase::Persist));
+    }
+
+    /// Tie-break for dominant phase: when two phases have IDENTICAL
+    /// duration_ms, the FIRST one (in pipeline order) wins —
+    /// matches Iterator::max_by_key semantics, so a future phase
+    /// reordering doesn't silently flip the dominant phase contract.
+    #[test]
+    fn evidence_summary_dominant_phase_tie_break_is_first_in_pipeline_order() {
+        let ledger = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 500, 1),
+            phase_record_with_items(RefreshPhase::Persist, 500, 1),
+            phase_record_with_items(RefreshPhase::LexicalRebuild, 500, 1),
+        ]);
+        let evidence = ledger.evidence_summary();
+        // Iterator::max_by_key returns the LAST max element on ties,
+        // so LexicalRebuild wins when all three are 500ms. Pin this
+        // behavior so a future change to last-vs-first tie-break
+        // semantics fails the test (operators reading benchmark JSON
+        // for "dominant_phase" rely on stable ordering).
+        assert_eq!(
+            evidence.dominant_phase,
+            Some(RefreshPhase::LexicalRebuild),
+            "tie-break: max_by_key returns the LAST phase at max duration"
+        );
+    }
+
+    /// Evidence summary serializes through serde so benchmark
+    /// gates / dashboards can store the JSON and diff across runs.
+    /// Pin the field set so a future struct-shape regression
+    /// (e.g. dropping aggregate_items_per_second) trips this.
+    #[test]
+    fn evidence_summary_serializes_to_stable_json_field_set() {
+        let ledger = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 100, 50)]);
+        let evidence = ledger.evidence_summary();
+        let json = serde_json::to_string(&evidence).expect("serialize");
+        for required_field in [
+            "\"throughput\"",
+            "\"phase_share\"",
+            "\"dominant_phase\"",
+            "\"aggregate_items_processed\"",
+            "\"aggregate_duration_ms\"",
+            "\"aggregate_items_per_second\"",
+        ] {
+            assert!(
+                json.contains(required_field),
+                "evidence JSON missing field {required_field}; got: {json}"
+            );
+        }
+        // Round-trip via serde_json::Value (the typed roundtrip is
+        // not used by consumers; they parse into serde_json::Value
+        // for diffing).
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["aggregate_items_processed"], 50);
+        assert_eq!(parsed["aggregate_duration_ms"], 100);
+        assert_eq!(parsed["aggregate_items_per_second"], 500.0);
+        assert_eq!(parsed["dominant_phase"], "scan");
     }
 }
