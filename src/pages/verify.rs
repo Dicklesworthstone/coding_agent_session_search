@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::bundle::IntegrityManifest;
@@ -158,7 +158,7 @@ pub struct VerifyResult {
 /// `VerifyResult` with all check outcomes
 pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
     // Resolve to site/ directory
-    let site_dir = resolve_site_dir(path)?;
+    let site_dir = super::resolve_site_dir(path)?;
 
     if verbose {
         println!("Verifying bundle at: {}", site_dir.display());
@@ -234,11 +234,6 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         warnings,
         site_size_bytes,
     })
-}
-
-/// Resolve the site directory from a path
-fn resolve_site_dir(path: &Path) -> Result<PathBuf> {
-    super::resolve_site_dir(path)
 }
 
 /// Check that all required files exist
@@ -1394,6 +1389,7 @@ mod tests {
     use super::*;
     use crate::pages::bundle::IntegrityEntry;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Path to the pages_verify fixtures directory
@@ -1985,11 +1981,11 @@ mod tests {
         let site_dir = temp.path().join("site");
         fs::create_dir_all(&site_dir).unwrap();
 
-        let resolved = resolve_site_dir(temp.path()).unwrap();
+        let resolved = crate::pages::resolve_site_dir(temp.path()).unwrap();
         assert!(resolved.ends_with("site"));
 
         // Test with direct path
-        let resolved_direct = resolve_site_dir(&site_dir).unwrap();
+        let resolved_direct = crate::pages::resolve_site_dir(&site_dir).unwrap();
         assert_eq!(resolved_direct, site_dir);
     }
 
@@ -2005,12 +2001,12 @@ mod tests {
         fs::write(outside_site.join("index.html"), "<html></html>").unwrap();
         symlink(&outside_site, bundle_root.path().join("site")).unwrap();
 
-        let err = resolve_site_dir(bundle_root.path())
+        let err = crate::pages::resolve_site_dir(bundle_root.path())
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be a symlink"));
 
-        let direct_err = resolve_site_dir(&bundle_root.path().join("site"))
+        let direct_err = crate::pages::resolve_site_dir(&bundle_root.path().join("site"))
             .unwrap_err()
             .to_string();
         assert!(direct_err.contains("must not be a symlink"));
