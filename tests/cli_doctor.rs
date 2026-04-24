@@ -853,6 +853,169 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     );
 }
 
+/// `coding_agent_session_search-ibuuh.23` lifecycle invariant:
+/// `cass doctor --json --fix` is idempotent across consecutive
+/// invocations. Once the first --fix has reclaimed every safe
+/// derivative artifact, the second --fix run on the same data dir
+/// MUST report no additional cleanup work — `auto_fix_actions`
+/// contains no `Pruned N derivative cleanup artifact(s)` line, the
+/// `derivative_cleanup` check's apply payload reports
+/// `pruned_asset_count: 0`, and `before_reclaim_candidate_count == 0`
+/// (matching the after-state of the first run).
+///
+/// This is the "do no harm" property of doctor --fix that the bead
+/// requires for long-running maintenance: an operator running
+/// `cass doctor --fix` on a cron schedule must not see spurious
+/// "fixed N issues" output every cycle when the disk is already
+/// clean. Without this pin, a regression in cleanup state tracking
+/// (e.g., a re-discovery of already-pruned generations) could ship
+/// silently and pollute operator dashboards.
+#[test]
+fn doctor_fix_is_idempotent_across_consecutive_invocations() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+
+    // Seed: two retained publish backups (older outside cap=1 → reclaimable)
+    // + one superseded reclaimable lexical generation. After the FIRST
+    // --fix, both should be pruned; the SECOND --fix should observe
+    // a clean state and report no additional work.
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"old backup bytes")
+        .expect("write older retained publish backup");
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"new backup bytes")
+        .expect("write newer retained publish backup");
+
+    let superseded_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-superseded");
+    write_superseded_reclaimable_manifest(&superseded_dir, "gen-superseded");
+    fs::write(
+        superseded_dir.join("segment-old"),
+        b"superseded generation bytes",
+    )
+    .expect("write superseded generation artifact");
+
+    let invoke_doctor_fix = || -> Value {
+        let out = cass_cmd(test_home.path())
+            .args([
+                "doctor",
+                "--json",
+                "--fix",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+            .output()
+            .expect("run cass doctor --json --fix");
+        assert!(
+            out.status.success(),
+            "cass doctor --json --fix failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("doctor --fix --json emits JSON")
+    };
+
+    // First invocation: must DO work — at least 1 prune applied.
+    let first = invoke_doctor_fix();
+    let first_actions = first["auto_fix_actions"]
+        .as_array()
+        .expect("auto_fix_actions array on first run");
+    assert!(
+        first_actions
+            .iter()
+            .any(|a| a.as_str().unwrap_or_default().contains("Pruned ")),
+        "first --fix MUST report at least one Pruned action; payload: {first:#}"
+    );
+    let first_cleanup = first["checks"]
+        .as_array()
+        .expect("checks on first run")
+        .iter()
+        .find(|c| c["name"].as_str() == Some("derivative_cleanup"))
+        .expect("derivative_cleanup check on first run");
+    assert_eq!(
+        first_cleanup["fix_applied"].as_bool(),
+        Some(true),
+        "first --fix MUST flip derivative_cleanup.fix_applied to true"
+    );
+    assert!(
+        first_cleanup["cleanup_apply"]["pruned_asset_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "first --fix MUST prune ≥ 1 asset; cleanup_apply: {:#}",
+        first_cleanup["cleanup_apply"]
+    );
+
+    // Second invocation: idempotent — no additional Pruned actions,
+    // pruned_asset_count == 0, before_reclaim_candidate_count == 0.
+    let second = invoke_doctor_fix();
+    let second_actions = second["auto_fix_actions"]
+        .as_array()
+        .expect("auto_fix_actions array on second run");
+    assert!(
+        !second_actions
+            .iter()
+            .any(|a| a.as_str().unwrap_or_default().contains("Pruned ")),
+        "second --fix MUST be a no-op for pruning — no new Pruned action allowed; \
+         got actions: {second_actions:#?}\nfull payload: {second:#}"
+    );
+    let second_cleanup = second["checks"]
+        .as_array()
+        .expect("checks on second run")
+        .iter()
+        .find(|c| c["name"].as_str() == Some("derivative_cleanup"))
+        .expect("derivative_cleanup check on second run");
+    let cleanup_apply = &second_cleanup["cleanup_apply"];
+    assert_eq!(
+        cleanup_apply["before_reclaim_candidate_count"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+        0,
+        "second --fix MUST observe zero reclaim candidates after first run; \
+         cleanup_apply: {cleanup_apply:#}"
+    );
+    assert_eq!(
+        cleanup_apply["pruned_asset_count"].as_u64().unwrap_or(u64::MAX),
+        0,
+        "second --fix MUST prune zero additional assets; cleanup_apply: {cleanup_apply:#}"
+    );
+
+    // The cumulative issues_fixed counter is allowed to vary by
+    // implementation choice (some implementations return the same
+    // count, some return 0 on no-op). The HARD invariant is that
+    // the second run does NO additional work — pinned above by
+    // the actions array + pruned_asset_count assertions.
+
+    // Filesystem check: protected backup + freshly-pruned ones stay
+    // in their post-first-run state across the second invocation.
+    assert!(
+        !older_backup.exists(),
+        "older retained backup MUST stay pruned across consecutive --fix runs"
+    );
+    assert!(
+        newer_backup.exists(),
+        "protected newer retained backup MUST survive consecutive --fix runs"
+    );
+    assert!(
+        !superseded_dir.exists(),
+        "superseded generation MUST stay pruned across consecutive --fix runs"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_fix_refuses_symlinked_retained_publish_backup_targets() {
