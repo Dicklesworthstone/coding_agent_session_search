@@ -3,8 +3,8 @@ use crate::search::query::SearchHit;
 use crate::storage::sqlite::FrankenStorage;
 use crate::ui::components::theme::ThemePalette;
 use anyhow::Result;
-use frankensqlite::Row;
 use frankensqlite::compat::{ConnectionExt, RowExt};
+use frankensqlite::{FrankenError, Row};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -297,6 +297,49 @@ fn storage_cache_scope(storage: &FrankenStorage) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn ui_conversation_row_parts(
+    row: &Row,
+) -> std::result::Result<(i64, Conversation, Option<Workspace>), FrankenError> {
+    let convo_id: i64 = row.get_typed(0)?;
+    let workspace_path = row
+        .get_typed::<Option<String>>(3)?
+        .map(std::path::PathBuf::from);
+    let metadata_json = row
+        .get_typed::<Option<String>>(11)?
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .or_else(|| {
+            row.get_typed::<Option<Vec<u8>>>(14)
+                .ok()
+                .flatten()
+                .and_then(|b| rmp_serde::from_slice(&b).ok())
+        })
+        .unwrap_or_default();
+    let convo = Conversation {
+        id: Some(convo_id),
+        agent_slug: row.get_typed(1)?,
+        workspace: workspace_path.clone(),
+        external_id: row.get_typed(5)?,
+        title: row.get_typed(6)?,
+        source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
+        started_at: row.get_typed(8)?,
+        ended_at: row.get_typed(9)?,
+        approx_tokens: row.get_typed(10)?,
+        metadata_json,
+        messages: Vec::new(),
+        source_id: normalize_ui_source_id_parts(
+            row.get_typed::<Option<String>>(12)?.as_deref(),
+            row.get_typed::<Option<String>>(13)?.as_deref(),
+        ),
+        origin_host: row.get_typed(13)?,
+    };
+    let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
+        id: Some(id),
+        path: workspace_path.unwrap_or_default(),
+        display_name: row.get_typed(4).ok().flatten(),
+    });
+    Ok((convo_id, convo, workspace))
+}
+
 fn load_conversation_by_id_uncached(
     storage: &FrankenStorage,
     conversation_id: i64,
@@ -313,46 +356,7 @@ fn load_conversation_by_id_uncached(
          WHERE c.id = ?1
          LIMIT 1",
         frankensqlite::params![conversation_id],
-        |row: &Row| {
-            let convo_id: i64 = row.get_typed(0)?;
-            let workspace_path = row
-                .get_typed::<Option<String>>(3)?
-                .map(std::path::PathBuf::from);
-            let metadata_json = row
-                .get_typed::<Option<String>>(11)?
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .or_else(|| {
-                    row.get_typed::<Option<Vec<u8>>>(14)
-                        .ok()
-                        .flatten()
-                        .and_then(|b| rmp_serde::from_slice(&b).ok())
-                })
-                .unwrap_or_default();
-            let convo = Conversation {
-                id: Some(convo_id),
-                agent_slug: row.get_typed(1)?,
-                workspace: workspace_path.clone(),
-                external_id: row.get_typed(5)?,
-                title: row.get_typed(6)?,
-                source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
-                started_at: row.get_typed(8)?,
-                ended_at: row.get_typed(9)?,
-                approx_tokens: row.get_typed(10)?,
-                metadata_json,
-                messages: Vec::new(),
-                source_id: normalize_ui_source_id_parts(
-                    row.get_typed::<Option<String>>(12)?.as_deref(),
-                    row.get_typed::<Option<String>>(13)?.as_deref(),
-                ),
-                origin_host: row.get_typed(13)?,
-            };
-            let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
-                id: Some(id),
-                path: workspace_path.unwrap_or_default(),
-                display_name: row.get_typed(4).ok().flatten(),
-            });
-            Ok((convo_id, convo, workspace))
-        },
+        ui_conversation_row_parts,
     )?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
         let messages = storage.fetch_messages(convo_id)?;
@@ -410,46 +414,9 @@ pub(crate) fn load_conversation_uncached(
             frankensqlite::params![source_path],
         )
     };
-    let rows = storage.raw().query_map_collect(&sql, params, |row: &Row| {
-        let convo_id: i64 = row.get_typed(0)?;
-        let workspace_path = row
-            .get_typed::<Option<String>>(3)?
-            .map(std::path::PathBuf::from);
-        let metadata_json = row
-            .get_typed::<Option<String>>(11)?
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .or_else(|| {
-                row.get_typed::<Option<Vec<u8>>>(14)
-                    .ok()
-                    .flatten()
-                    .and_then(|b| rmp_serde::from_slice(&b).ok())
-            })
-            .unwrap_or_default();
-        let convo = Conversation {
-            id: Some(convo_id),
-            agent_slug: row.get_typed(1)?,
-            workspace: workspace_path.clone(),
-            external_id: row.get_typed(5)?,
-            title: row.get_typed(6)?,
-            source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
-            started_at: row.get_typed(8)?,
-            ended_at: row.get_typed(9)?,
-            approx_tokens: row.get_typed(10)?,
-            metadata_json,
-            messages: Vec::new(),
-            source_id: normalize_ui_source_id_parts(
-                row.get_typed::<Option<String>>(12)?.as_deref(),
-                row.get_typed::<Option<String>>(13)?.as_deref(),
-            ),
-            origin_host: row.get_typed(13)?,
-        };
-        let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
-            id: Some(id),
-            path: workspace_path.unwrap_or_default(),
-            display_name: row.get_typed(4).ok().flatten(),
-        });
-        Ok((convo_id, convo, workspace))
-    })?;
+    let rows = storage
+        .raw()
+        .query_map_collect(&sql, params, ui_conversation_row_parts)?;
     if let Some((convo_id, convo, workspace)) = rows.into_iter().next() {
         let messages = storage.fetch_messages(convo_id)?;
         return Ok(Some(ConversationView {
@@ -754,46 +721,7 @@ pub fn load_conversation_for_hit(
             fallback_hit.source_path.as_str(),
             normalize_ui_hit_source_id(&fallback_hit)
         ],
-        |row: &Row| {
-            let convo_id: i64 = row.get_typed(0)?;
-            let workspace_path = row
-                .get_typed::<Option<String>>(3)?
-                .map(std::path::PathBuf::from);
-            let metadata_json = row
-                .get_typed::<Option<String>>(11)?
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .or_else(|| {
-                    row.get_typed::<Option<Vec<u8>>>(14)
-                        .ok()
-                        .flatten()
-                        .and_then(|b| rmp_serde::from_slice(&b).ok())
-                })
-                .unwrap_or_default();
-            let convo = Conversation {
-                id: Some(convo_id),
-                agent_slug: row.get_typed(1)?,
-                workspace: workspace_path.clone(),
-                external_id: row.get_typed(5)?,
-                title: row.get_typed(6)?,
-                source_path: std::path::PathBuf::from(row.get_typed::<String>(7)?),
-                started_at: row.get_typed(8)?,
-                ended_at: row.get_typed(9)?,
-                approx_tokens: row.get_typed(10)?,
-                metadata_json,
-                messages: Vec::new(),
-                source_id: normalize_ui_source_id_parts(
-                    row.get_typed::<Option<String>>(12)?.as_deref(),
-                    row.get_typed::<Option<String>>(13)?.as_deref(),
-                ),
-                origin_host: row.get_typed(13)?,
-            };
-            let workspace = row.get_typed::<Option<i64>>(2)?.map(|id| Workspace {
-                id: Some(id),
-                path: workspace_path.unwrap_or_default(),
-                display_name: row.get_typed(4).ok().flatten(),
-            });
-            Ok((convo_id, convo, workspace))
-        },
+        ui_conversation_row_parts,
     )?;
 
     for (convo_id, convo, workspace) in rows {
