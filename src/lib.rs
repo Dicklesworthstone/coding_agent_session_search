@@ -11643,22 +11643,27 @@ mod cleanup_target_safety_tests {
         let db_path = data_dir.join("agent_search.db");
         std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
 
-        // Deeply nested, all plain directories (no symlinks
-        // anywhere), sibling of the live index — the canonical shape
-        // the doctor --fix reclaimer is actually supposed to act on.
-        let deep_candidate = data_dir
-            .join("index")
-            .join(".lexical-publish-backups")
-            .join("2026-04-24-120000-prior-live")
-            .join("segment-data");
-        std::fs::create_dir_all(&deep_candidate).expect("create deep candidate");
+        // All plain directories (no symlinks anywhere) — the
+        // canonical shape the doctor --fix reclaimer is actually
+        // supposed to act on. A retained publish backup lives
+        // ONE level under `<index_parent>/.lexical-publish-backups`
+        // (per src/lib.rs is_retained_publish_backup check, which
+        // asserts path.parent() == publish_backup_parent — the
+        // directory IS the retention candidate, not a file under it).
+        let publish_backup_parent = index_path
+            .parent()
+            .expect("index parent")
+            .join(".lexical-publish-backups");
+        std::fs::create_dir_all(&publish_backup_parent).expect("create backup parent");
+        let clean_candidate = publish_backup_parent.join("2026-04-24-120000-prior-live");
+        std::fs::create_dir_all(&clean_candidate).expect("create clean candidate");
 
         assert!(
-            cleanup_target_path_is_safe(&deep_candidate, &data_dir, &db_path, &index_path),
-            "cleanup must ACCEPT a legitimately deep-nested retention \
-             candidate that has no symlinks anywhere in its ancestor chain; \
-             otherwise the symlink-guard defenses have silently broken the \
-             happy path and doctor --fix can no longer reclaim anything"
+            cleanup_target_path_is_safe(&clean_candidate, &data_dir, &db_path, &index_path),
+            "cleanup must ACCEPT a legitimate retention candidate that has no \
+             symlinks anywhere in its ancestor chain; otherwise the symlink- \
+             guard defenses have silently broken the happy path and \
+             doctor --fix can no longer reclaim anything"
         );
     }
 }
