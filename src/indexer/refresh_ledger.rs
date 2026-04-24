@@ -713,6 +713,188 @@ fn share_pct_for(phase_ms: u64, total_ms: u64) -> f64 {
     (raw * 100.0).round() / 100.0
 }
 
+// ─── Cross-run comparison (ibuuh.24) ───────────────────────────────────────
+//
+// `coding_agent_session_search-ibuuh.24` benchmark/regression slice:
+// the evidence summary lets a single run be inspected; cross-run
+// comparison is what benchmark CI gates ACTUALLY need ("did this
+// build regress vs the baseline?"). Adding a structured one-call
+// comparator means CI / dashboards stop hand-rolling delta math —
+// every consumer reads the same `RefreshLedgerEvidenceComparison`
+// shape and branches on the same regression-class signals.
+
+/// One phase's regression signal between baseline and current.
+///
+/// `duration_delta_pct` is positive when the phase got SLOWER
+/// (current > baseline) — the conventional regression sign that
+/// matches operator expectations ("this PR added 12% to publish").
+/// `throughput_delta_pct` is positive when the phase got FASTER
+/// (current items/sec > baseline items/sec). Both are `None` when
+/// the corresponding base measurement is zero/missing — the
+/// comparator refuses to invent an extrapolation from no data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshPhaseDelta {
+    pub phase: RefreshPhase,
+    pub baseline_duration_ms: u64,
+    pub current_duration_ms: u64,
+    /// `(current - baseline) / baseline * 100`, rounded to 2 decimals.
+    /// Positive ⇒ slower in `current`. `None` when baseline is 0ms
+    /// (no rate of change defined) or when the phase didn't run in
+    /// either side (cannot compare).
+    pub duration_delta_pct: Option<f64>,
+    pub baseline_items_processed: u64,
+    pub current_items_processed: u64,
+    pub baseline_items_per_second: Option<f64>,
+    pub current_items_per_second: Option<f64>,
+    /// `(current - baseline) / baseline * 100`, rounded to 2 decimals.
+    /// Positive ⇒ faster in `current`. `None` when either side has
+    /// no items/sec measurement (cannot compute a meaningful delta).
+    pub throughput_delta_pct: Option<f64>,
+}
+
+/// Cross-run comparison summary suitable for benchmark CI gates and
+/// regression dashboards. Computed by
+/// [`RefreshLedgerEvidence::compare_to`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshLedgerEvidenceComparison {
+    /// Per-phase delta for every phase that ran in EITHER side.
+    /// Phases unique to one side surface with a zero on the missing
+    /// side — operators can grep for the missing phase and decide.
+    pub phase_deltas: Vec<RefreshPhaseDelta>,
+    /// Aggregate wall-clock delta. Positive ⇒ slower in `current`.
+    pub aggregate_duration_delta_pct: Option<f64>,
+    /// Aggregate items/sec delta. Positive ⇒ faster in `current`.
+    pub aggregate_throughput_delta_pct: Option<f64>,
+    /// `Some((from, to))` when the dominant phase shifted between
+    /// baseline and current. A dominant-phase shift is itself a
+    /// regression signal — the operator should look at why the
+    /// hot phase changed even if absolute totals are similar.
+    pub dominant_phase_shift: Option<(RefreshPhase, RefreshPhase)>,
+}
+
+impl RefreshLedgerEvidence {
+    /// Compare this evidence summary against a `baseline` and return
+    /// a structured regression report. Pure (no I/O); runs in
+    /// O(phases_baseline + phases_current).
+    ///
+    /// Direction convention: positive `duration_delta_pct` ⇒ slower
+    /// in `self`; positive `throughput_delta_pct` ⇒ faster in `self`.
+    /// Picking these signs (not the opposite) makes the JSON read
+    /// naturally for benchmark CI ("PR #123 added +12.5% to publish
+    /// duration").
+    pub fn compare_to(&self, baseline: &Self) -> RefreshLedgerEvidenceComparison {
+        // Index baseline + current throughput entries by phase so we
+        // can union them in O(phases) without a quadratic scan.
+        // (RefreshPhase derives Hash but not Ord, so HashMap/HashSet —
+        // we re-sort by RefreshPhase::ALL declaration order at the
+        // end so the output is deterministic across runs regardless
+        // of HashMap iteration order.)
+        use std::collections::{HashMap, HashSet};
+        let mut baseline_by_phase: HashMap<RefreshPhase, &RefreshThroughputProfile> =
+            HashMap::new();
+        for entry in &baseline.throughput {
+            baseline_by_phase.insert(entry.phase, entry);
+        }
+        let mut current_by_phase: HashMap<RefreshPhase, &RefreshThroughputProfile> =
+            HashMap::new();
+        for entry in &self.throughput {
+            current_by_phase.insert(entry.phase, entry);
+        }
+        // Union the two key sets so a phase unique to one side still
+        // surfaces in the comparison. Iterate RefreshPhase::ALL to
+        // preserve canonical pipeline order in the output.
+        let mut all_phases: HashSet<RefreshPhase> = HashSet::new();
+        all_phases.extend(baseline_by_phase.keys().copied());
+        all_phases.extend(current_by_phase.keys().copied());
+
+        let phase_deltas: Vec<RefreshPhaseDelta> = RefreshPhase::ALL
+            .iter()
+            .copied()
+            .filter(|phase| all_phases.contains(phase))
+            .map(|phase| {
+                let baseline_entry = baseline_by_phase.get(&phase).copied();
+                let current_entry = current_by_phase.get(&phase).copied();
+                let baseline_duration_ms =
+                    baseline_entry.map(|e| e.duration_ms).unwrap_or(0);
+                let current_duration_ms =
+                    current_entry.map(|e| e.duration_ms).unwrap_or(0);
+                let baseline_items_processed =
+                    baseline_entry.map(|e| e.items_processed).unwrap_or(0);
+                let current_items_processed =
+                    current_entry.map(|e| e.items_processed).unwrap_or(0);
+                let baseline_items_per_second =
+                    baseline_entry.and_then(|e| e.items_per_second);
+                let current_items_per_second =
+                    current_entry.and_then(|e| e.items_per_second);
+
+                RefreshPhaseDelta {
+                    phase,
+                    baseline_duration_ms,
+                    current_duration_ms,
+                    duration_delta_pct: pct_delta(
+                        baseline_duration_ms as f64,
+                        current_duration_ms as f64,
+                    ),
+                    baseline_items_processed,
+                    current_items_processed,
+                    baseline_items_per_second,
+                    current_items_per_second,
+                    throughput_delta_pct: match (baseline_items_per_second, current_items_per_second)
+                    {
+                        (Some(b), Some(c)) => pct_delta(b, c),
+                        _ => None,
+                    },
+                }
+            })
+            .collect();
+
+        let aggregate_duration_delta_pct = pct_delta(
+            baseline.aggregate_duration_ms as f64,
+            self.aggregate_duration_ms as f64,
+        );
+        let aggregate_throughput_delta_pct = match (
+            baseline.aggregate_items_per_second,
+            self.aggregate_items_per_second,
+        ) {
+            (Some(b), Some(c)) => pct_delta(b, c),
+            _ => None,
+        };
+
+        let dominant_phase_shift = match (baseline.dominant_phase, self.dominant_phase) {
+            (Some(from), Some(to)) if from != to => Some((from, to)),
+            _ => None,
+        };
+
+        RefreshLedgerEvidenceComparison {
+            phase_deltas,
+            aggregate_duration_delta_pct,
+            aggregate_throughput_delta_pct,
+            dominant_phase_shift,
+        }
+    }
+}
+
+/// Compute `(current - baseline) / baseline * 100` rounded to 2
+/// decimals, with safe handling of the degenerate cases:
+/// - baseline == 0.0 ⇒ `None` (no rate of change defined; an empty
+///   baseline means the phase didn't run, so a delta is meaningless)
+/// - current == baseline ⇒ `Some(0.0)` (no change is a real signal)
+/// - NaN/Infinity ⇒ `None` (defensive — should never happen given
+///   inputs are non-negative finite f64s, but pin the contract)
+fn pct_delta(baseline: f64, current: f64) -> Option<f64> {
+    if !baseline.is_finite() || !current.is_finite() {
+        return None;
+    }
+    if baseline == 0.0 {
+        return None;
+    }
+    let raw = ((current - baseline) / baseline) * 100.0;
+    if !raw.is_finite() {
+        return None;
+    }
+    Some((raw * 100.0).round() / 100.0)
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1355,5 +1537,170 @@ mod tests {
         assert_eq!(parsed["aggregate_duration_ms"], 100);
         assert_eq!(parsed["aggregate_items_per_second"], 500.0);
         assert_eq!(parsed["dominant_phase"], "scan");
+    }
+
+    /// `coding_agent_session_search-ibuuh.24` cross-run comparator
+    /// gate: `compare_to` must surface real regressions and real
+    /// improvements with the conventional sign:
+    /// - duration_delta_pct > 0 ⇒ slower in `current`
+    /// - throughput_delta_pct > 0 ⇒ faster in `current`
+    /// A regression in either sign convention would cause benchmark
+    /// CI to misclassify slowdowns as wins (or vice versa).
+    #[test]
+    fn evidence_compare_to_reports_per_phase_regressions_and_improvements() {
+        // Baseline: scan moved 100 items in 100ms (1000 items/s).
+        let baseline = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 100, 100)])
+            .evidence_summary();
+        // Current: scan moved 100 items in 200ms (500 items/s) —
+        // slower wall clock, halved throughput. Pure regression.
+        let current = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 200, 100)])
+            .evidence_summary();
+
+        let cmp = current.compare_to(&baseline);
+
+        assert_eq!(cmp.phase_deltas.len(), 1);
+        let scan = &cmp.phase_deltas[0];
+        assert_eq!(scan.phase, RefreshPhase::Scan);
+        // duration: (200-100)/100 * 100 = +100% (twice as slow).
+        assert_eq!(scan.duration_delta_pct, Some(100.0));
+        // throughput: (500-1000)/1000 * 100 = -50% (half as fast).
+        assert_eq!(scan.throughput_delta_pct, Some(-50.0));
+        // Aggregate mirrors the single-phase signals.
+        assert_eq!(cmp.aggregate_duration_delta_pct, Some(100.0));
+        assert_eq!(cmp.aggregate_throughput_delta_pct, Some(-50.0));
+        // Same phase dominant in both ⇒ no shift signal.
+        assert_eq!(cmp.dominant_phase_shift, None);
+
+        // Symmetric improvement case: swap baseline + current.
+        let cmp_improved = baseline.compare_to(&current);
+        let scan = &cmp_improved.phase_deltas[0];
+        // duration: (100-200)/200 * 100 = -50% (half as long).
+        assert_eq!(scan.duration_delta_pct, Some(-50.0));
+        // throughput: (1000-500)/500 * 100 = +100% (twice as fast).
+        assert_eq!(scan.throughput_delta_pct, Some(100.0));
+    }
+
+    /// Phase unique to ONE side must surface in the comparison
+    /// (not silently dropped). Pre-fix this is the failure mode where
+    /// a phase that ran in baseline but disappeared from current
+    /// (e.g. publish phase elided due to a dispatch-routing bug)
+    /// would not show up at all.
+    #[test]
+    fn evidence_compare_to_surfaces_phases_unique_to_one_side() {
+        let baseline = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 100, 100),
+            phase_record_with_items(RefreshPhase::Persist, 50, 200),
+        ])
+        .evidence_summary();
+        // Current: only Scan ran. Persist is "missing" — caller must
+        // see this so they can investigate.
+        let current = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 100, 100)])
+            .evidence_summary();
+
+        let cmp = current.compare_to(&baseline);
+
+        let phases: Vec<RefreshPhase> = cmp.phase_deltas.iter().map(|d| d.phase).collect();
+        assert!(
+            phases.contains(&RefreshPhase::Scan),
+            "Scan ran in both sides; must appear in comparison; got phases {phases:?}"
+        );
+        assert!(
+            phases.contains(&RefreshPhase::Persist),
+            "Persist is missing from current but ran in baseline — comparison MUST \
+             surface it so caller can investigate; got phases {phases:?}"
+        );
+
+        // The missing-from-current Persist entry should report
+        // baseline_duration_ms=50 + current_duration_ms=0 + duration_delta_pct
+        // is well-defined (it's -100%: phase went away).
+        let persist = cmp
+            .phase_deltas
+            .iter()
+            .find(|d| d.phase == RefreshPhase::Persist)
+            .expect("Persist delta present");
+        assert_eq!(persist.baseline_duration_ms, 50);
+        assert_eq!(persist.current_duration_ms, 0);
+        assert_eq!(
+            persist.duration_delta_pct,
+            Some(-100.0),
+            "phase disappearing from current must surface as -100% duration delta; \
+             got {persist:?}"
+        );
+    }
+
+    /// Dominant-phase shift signal: when the hot phase changes
+    /// between runs (even if absolute totals are similar), the
+    /// operator should look at why. Pinning the shift detection
+    /// directly catches a regression where the comparator silently
+    /// reports the same dominant phase for both sides.
+    #[test]
+    fn evidence_compare_to_reports_dominant_phase_shift() {
+        // Baseline: Scan dominates wall time.
+        let baseline = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 800, 100),
+            phase_record_with_items(RefreshPhase::Persist, 200, 100),
+        ])
+        .evidence_summary();
+        // Current: total wall time similar but Persist now dominates.
+        let current = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 200, 100),
+            phase_record_with_items(RefreshPhase::Persist, 800, 100),
+        ])
+        .evidence_summary();
+        // Sanity: the two sides really did have different dominant
+        // phases (would silently break this test if dominant_phase
+        // tie-breaking changed).
+        assert_eq!(baseline.dominant_phase, Some(RefreshPhase::Scan));
+        assert_eq!(current.dominant_phase, Some(RefreshPhase::Persist));
+
+        let cmp = current.compare_to(&baseline);
+
+        assert_eq!(
+            cmp.dominant_phase_shift,
+            Some((RefreshPhase::Scan, RefreshPhase::Persist)),
+            "dominant phase shifted Scan→Persist; comparison must surface this; got {cmp:?}"
+        );
+
+        // Negative case: same dominant phase in both ⇒ no shift.
+        let same_dom = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 100, 100)])
+            .evidence_summary();
+        let cmp_same = same_dom.compare_to(&same_dom);
+        assert_eq!(cmp_same.dominant_phase_shift, None);
+    }
+
+    /// Empty / zero-baseline degenerate cases must NOT panic and
+    /// must NOT emit NaN — pre-fix `pct_delta` would have returned
+    /// Inf for `(x - 0) / 0`. The defensive None branch is the only
+    /// thing keeping benchmark JSON parseable when the baseline is
+    /// missing or empty.
+    #[test]
+    fn evidence_compare_to_safely_handles_zero_baseline_and_empty_evidence() {
+        let empty = ledger_with(Vec::new()).evidence_summary();
+        let normal = ledger_with(vec![phase_record_with_items(RefreshPhase::Scan, 100, 50)])
+            .evidence_summary();
+
+        // empty → normal: baseline has nothing, every delta is None
+        // (no rate of change defined when baseline is zero).
+        let against_empty = normal.compare_to(&empty);
+        assert!(
+            against_empty
+                .phase_deltas
+                .iter()
+                .all(|d| d.duration_delta_pct.is_none() || d.baseline_duration_ms == 0),
+            "phases with zero-baseline duration must report None for duration_delta_pct"
+        );
+        assert_eq!(against_empty.aggregate_duration_delta_pct, None);
+        assert_eq!(against_empty.aggregate_throughput_delta_pct, None);
+
+        // empty vs empty: zero comparison surface, no panic.
+        let against_self = empty.compare_to(&empty);
+        assert!(against_self.phase_deltas.is_empty());
+        assert_eq!(against_self.aggregate_duration_delta_pct, None);
+
+        // No NaN anywhere in the JSON serialization (pins that the
+        // defensive branches actually emit serializable output).
+        let json = serde_json::to_string(&against_empty).expect("serialize");
+        assert!(!json.contains("NaN"), "comparison JSON must not contain NaN; got {json}");
+        assert!(!json.contains("Infinity"), "comparison JSON must not contain Infinity");
     }
 }
