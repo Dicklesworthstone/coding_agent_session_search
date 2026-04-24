@@ -108,8 +108,8 @@ fn export_html(
         let phrase = fixture_phrase();
         cmd.env("CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL", GOLDEN_BYTES_LABEL)
             .arg("--encrypt")
-            .arg("--password")
-            .arg(phrase);
+            .arg("--password-stdin")
+            .write_stdin(format!("{phrase}\n"));
     }
 
     let output = cmd.output().expect("run cass export-html");

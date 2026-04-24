@@ -337,7 +337,7 @@ Export conversations as styled, portable HTML files with optional encryption:
 cass export-html /path/to/session.jsonl
 
 # With encryption
-cass export-html /path/to/session.jsonl --encrypt --password "secret"
+printf '%s\n' "secret" | cass export-html /path/to/session.jsonl --encrypt --password-stdin
 
 # Custom output location
 cass export-html session.jsonl --output-dir ~/exports --filename "my-session"
@@ -839,7 +839,7 @@ cass export /path/to/session.jsonl --format json --include-tools
 
 # Export as self-contained HTML with encryption (recommended for sharing)
 cass export-html /path/to/session.jsonl                     # To Downloads folder
-cass export-html session.jsonl --encrypt --password "pwd"   # With password protection
+printf '%s\n' "pwd" | cass export-html session.jsonl --encrypt --password-stdin
 cass export-html session.jsonl --open --json                # Open in browser, JSON output
 
 # Common agent flow: find current session, then export it

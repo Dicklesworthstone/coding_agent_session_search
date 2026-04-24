@@ -1,4 +1,4 @@
-import { execSync, spawn } from 'child_process';
+import { execFileSync, execSync, spawn } from 'child_process';
 import { createWriteStream, existsSync, mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -84,7 +84,8 @@ async function globalSetup() {
     {
       name: 'test-encrypted',
       fixture: 'claude_code_auth_fix.jsonl',
-      args: ['--encrypt', '--password', 'test-password-123'],
+      args: ['--encrypt', '--password-stdin'],
+      stdin: 'test-password-123\n',
     },
     {
       name: 'test-tool-calls',
@@ -113,6 +114,7 @@ async function globalSetup() {
     fixture: string;
     outputPath: string;
     args: string[];
+    stdin?: boolean;
     command: string;
     success: boolean;
     durationMs: number;
@@ -127,7 +129,7 @@ async function globalSetup() {
     TEST_EXPORT_PASSWORD: 'test-password-123',
   };
 
-  for (const { name, fixture, args } of exports) {
+  for (const { name, fixture, args, stdin } of exports) {
     const fixturePath = path.join(fixturesDir, fixture);
     const outputPath = path.join(exportDir, `${name}.html`);
     const envKey = `TEST_EXPORT_${name.toUpperCase().replace(/-/g, '_')}`;
@@ -141,14 +143,14 @@ async function globalSetup() {
 
     console.log(`Generating ${name}.html from ${fixture}...`);
 
-    const cmd = [
-      cassPath,
+    const cmdArgs = [
       'export-html',
       fixturePath,
       '--output-dir', path.dirname(outputPath),
       '--filename', path.basename(outputPath),
       ...args,
-    ].join(' ');
+    ];
+    const cmd = [cassPath, ...cmdArgs].join(' ');
 
     const started = Date.now();
     let success = true;
@@ -158,7 +160,11 @@ async function globalSetup() {
 
     try {
       // Use the CLI to generate export
-      const output = execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
+      const output = execFileSync(cassPath, cmdArgs, {
+        cwd: projectRoot,
+        input: stdin,
+        stdio: 'pipe',
+      });
       stdout = output ? output.toString() : '';
       console.log(`  -> ${outputPath}`);
     } catch (err) {
@@ -182,6 +188,7 @@ async function globalSetup() {
       fixture,
       outputPath,
       args,
+      stdin: stdin ? true : undefined,
       command: cmd,
       success,
       durationMs,

@@ -752,10 +752,6 @@ pub enum Commands {
         #[arg(long)]
         encrypt: bool,
 
-        /// Password for encryption (required if --encrypt)
-        #[arg(long)]
-        password: Option<String>,
-
         /// Read password from stdin (secure, no echo)
         #[arg(long)]
         password_stdin: bool,
@@ -1887,7 +1883,6 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "output",
         "format",
         "encrypt",
-        "password",
         "theme",
         // Added flags
         "watch-once",
@@ -3997,7 +3992,6 @@ async fn execute_cli(
                     output_dir,
                     filename,
                     encrypt,
-                    password,
                     password_stdin,
                     include_tools,
                     show_timestamps,
@@ -4017,7 +4011,6 @@ async fn execute_cli(
                         output_dir.as_deref(),
                         filename.as_deref(),
                         encrypt,
-                        password.as_deref(),
                         password_stdin,
                         include_tools,
                         show_timestamps,
@@ -20216,7 +20209,6 @@ fn run_export_html(
     output_dir: Option<&Path>,
     filename: Option<&str>,
     encrypt: bool,
-    password: Option<&str>,
     password_stdin: bool,
     include_tools: bool,
     show_timestamps: bool,
@@ -20319,9 +20311,7 @@ fn run_export_html(
 
     // --- Get password if encryption requested ---
     let final_password: Option<String> = if encrypt {
-        if let Some(p) = password {
-            Some(p.to_string())
-        } else if password_stdin {
+        if password_stdin {
             let mut pwd = String::new();
             io::stdin().read_line(&mut pwd).map_err(|e| CliError {
                 code: 6,
@@ -20336,7 +20326,7 @@ fn run_export_html(
                 code: 6,
                 kind: "password-required",
                 message: "Password required for encryption".to_string(),
-                hint: Some("Use --password <pwd> or --password-stdin".to_string()),
+                hint: Some("Use --password-stdin".to_string()),
                 retryable: false,
             };
             let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -21569,7 +21559,6 @@ mod export_timestamp_tests {
             Some(temp.path()),
             Some("out.html"),
             false,
-            None,
             false,
             true,
             true,
@@ -21605,7 +21594,6 @@ mod export_timestamp_tests {
             Some(temp.path()),
             Some("out.html"),
             false,
-            None,
             false,
             true,
             true,
@@ -22553,7 +22541,6 @@ mod indexed_conversation_fallback_tests {
             Some(output_dir.as_path()),
             Some("export.html"),
             false,
-            None,
             false,
             false,
             true,
@@ -22604,7 +22591,6 @@ mod indexed_conversation_fallback_tests {
             Some(output_dir.as_path()),
             Some("export.html"),
             false,
-            None,
             false,
             false,
             true,
@@ -22655,7 +22641,6 @@ mod indexed_conversation_fallback_tests {
             Some(output_dir.as_path()),
             Some("export.html"),
             false,
-            None,
             false,
             false,
             true,
@@ -23160,7 +23145,6 @@ This should stay behind the indexed export.
             Some(output_dir.as_path()),
             Some("export.html"),
             false,
-            None,
             false,
             false,
             true,
@@ -23241,7 +23225,6 @@ This should stay behind the indexed html export.
             Some(output_dir.as_path()),
             Some("export.html"),
             false,
-            None,
             false,
             false,
             true,

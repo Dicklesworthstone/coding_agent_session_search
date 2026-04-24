@@ -82,6 +82,15 @@ fn parse_cli_ok<const N: usize>(
     })
 }
 
+fn parse_cli_err<const N: usize>(args: [&'static str; N], context: &'static str) -> clap::Error {
+    run_on_large_stack(move || {
+        match <coding_agent_search::Cli as clap::Parser>::try_parse_from(args) {
+            Ok(_) => panic!("{context}"),
+            Err(err) => err,
+        }
+    })
+}
+
 fn sample_agent(slug: &str, name: &str) -> Agent {
     Agent {
         id: None,
@@ -2271,6 +2280,24 @@ fn parse_export_html_with_encrypt() {
         }
         other => panic!("expected export-html command, got {other:?}"),
     }
+}
+
+#[test]
+fn parse_export_html_rejects_password_argv() {
+    let err = parse_cli_err(
+        [
+            "cass",
+            "export-html",
+            "/path/to/session.jsonl",
+            "--encrypt",
+            "--password",
+            "secret",
+        ],
+        "export-html should reject argv password input",
+    );
+
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(err.to_string().contains("--password"));
 }
 
 // =============================================================================

@@ -257,9 +257,9 @@ fn test_encrypted_export_flow() {
             tmp.path().to_str().unwrap(),
             "--robot",
             "--encrypt",
-            "--password",
-            password,
+            "--password-stdin",
         ])
+        .write_stdin(format!("{password}\n"))
         .output()
         .unwrap();
 
@@ -324,7 +324,7 @@ fn test_encrypted_export_requires_password() {
             tmp.path().to_str().unwrap(),
             "--robot",
             "--encrypt",
-            // Missing --password
+            // Missing --password-stdin
         ])
         .output()
         .unwrap();
