@@ -51,6 +51,27 @@ schemas: (auto-generated from contract)
       - chunks_observed: integer
       - cumulative_wall_micros: integer
       - recent_chunks: array
+    - rebuild_progress: object
+      - active: boolean
+      - completion_ratio: ?
+      - controller_mode: ?
+      - controller_reason: ?
+      - indexed_docs: ?
+      - inflight_message_bytes: ?
+      - inflight_message_bytes_headroom: ?
+      - max_message_bytes_in_flight: ?
+      - mode: ?
+      - pending_batch_conversations: ?
+      - pending_batch_message_bytes: ?
+      - phase: ?
+      - processed_conversations: ?
+      - queue_capacity: ?
+      - queue_depth: ?
+      - queue_headroom: ?
+      - remaining_conversations: ?
+      - runtime_available: boolean
+      - total_conversations: ?
+      - updated_at: ?
     - recommended_action: ?
     - responsiveness: object
       - current_capacity_pct: integer
@@ -267,6 +288,27 @@ schemas: (auto-generated from contract)
       - started_at: ?
       - total_conversations: ?
       - updated_at: ?
+    - rebuild_progress: object
+      - active: boolean
+      - completion_ratio: ?
+      - controller_mode: ?
+      - controller_reason: ?
+      - indexed_docs: ?
+      - inflight_message_bytes: ?
+      - inflight_message_bytes_headroom: ?
+      - max_message_bytes_in_flight: ?
+      - mode: ?
+      - pending_batch_conversations: ?
+      - pending_batch_message_bytes: ?
+      - phase: ?
+      - processed_conversations: ?
+      - queue_capacity: ?
+      - queue_depth: ?
+      - queue_headroom: ?
+      - remaining_conversations: ?
+      - runtime_available: boolean
+      - total_conversations: ?
+      - updated_at: ?
     - recommended_action: ?
     - semantic: object
       - availability: string
@@ -390,6 +432,27 @@ schemas: (auto-generated from contract)
       - pipeline: object
       - processed_conversations: ?
       - started_at: ?
+      - total_conversations: ?
+      - updated_at: ?
+    - rebuild_progress: object
+      - active: boolean
+      - completion_ratio: ?
+      - controller_mode: ?
+      - controller_reason: ?
+      - indexed_docs: ?
+      - inflight_message_bytes: ?
+      - inflight_message_bytes_headroom: ?
+      - max_message_bytes_in_flight: ?
+      - mode: ?
+      - pending_batch_conversations: ?
+      - pending_batch_message_bytes: ?
+      - phase: ?
+      - processed_conversations: ?
+      - queue_capacity: ?
+      - queue_depth: ?
+      - queue_headroom: ?
+      - remaining_conversations: ?
+      - runtime_available: boolean
       - total_conversations: ?
       - updated_at: ?
     - recommended_action: ?

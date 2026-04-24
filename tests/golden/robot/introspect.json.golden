@@ -2298,6 +2298,125 @@
         "latency_ms": {
           "type": "integer"
         },
+        "rebuild_progress": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processed_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "remaining_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "completion_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "indexed_docs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "runtime_available": {
+              "type": "boolean"
+            },
+            "queue_depth": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_capacity": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_message_bytes_in_flight": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "controller_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "controller_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
         "db": {
           "type": "object",
           "properties": {
@@ -4387,6 +4506,125 @@
             }
           }
         },
+        "rebuild_progress": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processed_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "remaining_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "completion_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "indexed_docs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "runtime_available": {
+              "type": "boolean"
+            },
+            "queue_depth": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_capacity": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_message_bytes_in_flight": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "controller_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "controller_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
         "semantic": {
           "type": "object",
           "properties": {
@@ -4996,6 +5234,125 @@
               "type": "object",
               "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
               "additionalProperties": true
+            }
+          }
+        },
+        "rebuild_progress": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "phase": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "processed_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "remaining_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "completion_ratio": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "indexed_docs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "runtime_available": {
+              "type": "boolean"
+            },
+            "queue_depth": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_capacity": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "queue_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_conversations": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pending_batch_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_message_bytes_in_flight": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inflight_message_bytes_headroom": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "controller_mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "controller_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         },
