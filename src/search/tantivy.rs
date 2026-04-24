@@ -75,13 +75,20 @@ pub(crate) fn normalized_index_origin_host(origin_host: Option<&str>) -> Option<
 }
 
 pub const SCHEMA_HASH: &str = CASS_SCHEMA_HASH;
+const ENV_TANTIVY_ADD_BATCH_MAX_CHARS: &str = "CASS_TANTIVY_ADD_BATCH_MAX_CHARS";
+const ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES: &str = "CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES";
+const ENV_TANTIVY_MAX_WRITER_THREADS: &str = "CASS_TANTIVY_MAX_WRITER_THREADS";
 const DEFAULT_TANTIVY_MAX_WRITER_THREADS: usize = 26;
 
-pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
-    let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
+fn positive_usize_env(name: &str) -> Option<usize> {
+    dotenvy::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+pub(crate) fn tantivy_writer_parallelism_hint_for_available(available_parallelism: usize) -> usize {
+    let max_threads = positive_usize_env(ENV_TANTIVY_MAX_WRITER_THREADS)
         .unwrap_or(DEFAULT_TANTIVY_MAX_WRITER_THREADS);
 
     available_parallelism.max(1).clamp(1, max_threads)
@@ -108,29 +115,18 @@ pub(crate) fn tantivy_writer_parallelism_hint() -> usize {
 }
 
 fn tantivy_add_batch_max_messages() -> usize {
-    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    positive_usize_env(ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES)
         .unwrap_or_else(|| 4_096.max(tantivy_writer_parallelism_hint().saturating_mul(512)))
 }
 
 fn tantivy_add_batch_max_chars() -> usize {
-    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_CHARS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or_else(|| {
-            (16 * 1024 * 1024)
-                .max(tantivy_writer_parallelism_hint().saturating_mul(2 * 1024 * 1024))
-        })
+    positive_usize_env(ENV_TANTIVY_ADD_BATCH_MAX_CHARS).unwrap_or_else(|| {
+        (16 * 1024 * 1024).max(tantivy_writer_parallelism_hint().saturating_mul(2 * 1024 * 1024))
+    })
 }
 
 fn tantivy_prebuilt_add_batch_max_messages() -> usize {
-    dotenvy::var("CASS_TANTIVY_ADD_BATCH_MAX_MESSAGES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    positive_usize_env(ENV_TANTIVY_ADD_BATCH_MAX_MESSAGES)
         .unwrap_or_else(|| 16_384.max(tantivy_writer_parallelism_hint().saturating_mul(512)))
 }
 
