@@ -403,6 +403,8 @@ pub(crate) struct LexicalCleanupDryRunPlan {
     #[serde(default)]
     pub inspection_items: Vec<LexicalCleanupInspectionItem>,
     #[serde(default)]
+    pub inspection_required_generation_ids: Vec<String>,
+    #[serde(default)]
     pub inspection_required_count: usize,
     #[serde(default)]
     pub inspection_required_retained_bytes: u64,
@@ -543,6 +545,7 @@ impl LexicalCleanupDryRunPlan {
             disposition_counts: BTreeMap::new(),
             generation_disposition_summaries: BTreeMap::new(),
             inspection_items: Vec::new(),
+            inspection_required_generation_ids: Vec::new(),
             inspection_required_count: 0,
             inspection_required_retained_bytes: 0,
             shard_disposition_summaries: BTreeMap::new(),
@@ -656,13 +659,7 @@ impl LexicalCleanupDryRunPlan {
     }
 
     pub(crate) fn inspection_required_generation_ids(&self) -> Vec<String> {
-        let mut generation_ids = Vec::new();
-        for item in &self.inspection_items {
-            if !generation_ids.contains(&item.generation_id) {
-                generation_ids.push(item.generation_id.clone());
-            }
-        }
-        generation_ids
+        self.inspection_required_generation_ids.clone()
     }
 
     pub(crate) fn inspection_required_retained_bytes(&self) -> u64 {
@@ -674,6 +671,13 @@ impl LexicalCleanupDryRunPlan {
         self.inspection_required_retained_bytes = self
             .inspection_required_retained_bytes
             .saturating_add(item.retained_bytes);
+        if !self
+            .inspection_required_generation_ids
+            .contains(&item.generation_id)
+        {
+            self.inspection_required_generation_ids
+                .push(item.generation_id.clone());
+        }
         self.inspection_items.push(item);
     }
 
@@ -2617,6 +2621,10 @@ mod tests {
         );
         assert_eq!(
             json["inspection_items"][0]["generation_id"],
+            "gen-quarantined"
+        );
+        assert_eq!(
+            json["inspection_required_generation_ids"][0],
             "gen-quarantined"
         );
         assert_eq!(json["inspection_required_count"], 1);
