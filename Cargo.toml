@@ -140,6 +140,7 @@ criterion = "*"
 once_cell = "*"
 serial_test = "*"
 proptest = "*"
+arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "*"
 rand = "0.10"
 rand_chacha = "0.10"
