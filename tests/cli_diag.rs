@@ -359,3 +359,158 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         "apply gate should make the approval blocker machine-readable"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-p1x0z (child of ibuuh.10,
+// /testing-metamorphic slice: cross-command quarantine consistency).
+//
+// `cass diag --json --quarantine` and `cass doctor --json` both expose
+// a `quarantine.summary` subtree. The two subtrees are sourced from
+// the same underlying state (lexical generations, retained publish
+// backups, failed seed bundles, cleanup dry-run approval gate), so
+// every shared field MUST agree — any divergence is a regression that
+// would mislead an operator polling either surface.
+//
+// The sibling test above pins the diag surface alone on a seeded-
+// quarantined-generation state. This test pins the CROSS-command
+// invariant on a clean empty data-dir: both surfaces must report
+// identical zero-valued summaries plus identical structural invariants
+// (e.g. retained_publish_backup_retention_limit derived from the env
+// var default).
+//
+// Deliberately narrow: only fields present in BOTH surfaces are
+// compared. If a future change adds a quarantine field to only one
+// command, that is a deliberate choice and this test will not trip
+// (because the field won't have a counterpart to diff against). The
+// invariant pinned is "overlap must agree", not "schemas must be
+// identical".
+// ========================================================================
+
+#[test]
+fn diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let data_dir = temp.path();
+
+    let diag_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["diag", "--json", "--quarantine", "--data-dir"])
+        .arg(data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", data_dir)
+        .env("XDG_DATA_HOME", data_dir.join(".local/share"))
+        .env("XDG_CONFIG_HOME", data_dir.join(".config"))
+        .output()
+        .expect("run cass diag");
+    assert!(
+        diag_out.status.success(),
+        "cass diag --json --quarantine must succeed on empty data-dir; stderr: {}",
+        String::from_utf8_lossy(&diag_out.stderr)
+    );
+    let diag_stdout = String::from_utf8_lossy(&diag_out.stdout);
+    let diag_json: Value = serde_json::from_str(&diag_stdout)
+        .unwrap_or_else(|err| panic!("diag JSON parse failed: {err}; stdout: {diag_stdout}"));
+
+    let doctor_out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["doctor", "--json", "--data-dir"])
+        .arg(data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", data_dir)
+        .env("XDG_DATA_HOME", data_dir.join(".local/share"))
+        .env("XDG_CONFIG_HOME", data_dir.join(".config"))
+        .output()
+        .expect("run cass doctor");
+    // doctor may exit non-zero on unhealthy state, but must still
+    // emit a parseable JSON envelope on stdout.
+    let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
+    let doctor_json: Value = serde_json::from_str(&doctor_stdout).unwrap_or_else(|err| {
+        panic!(
+            "doctor JSON parse failed: {err}; stdout: {doctor_stdout}\nstderr: {}",
+            String::from_utf8_lossy(&doctor_out.stderr)
+        )
+    });
+
+    let diag_summary = diag_json
+        .get("quarantine")
+        .and_then(|q| q.get("summary"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("diag.quarantine.summary must be an object; diag: {diag_json}")
+        });
+    let doctor_summary = doctor_json
+        .get("quarantine")
+        .and_then(|q| q.get("summary"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "doctor.quarantine.summary must be an object; doctor: {doctor_json}"
+            )
+        });
+
+    // The set of fields we pin cross-command. Intentionally specific:
+    // these are the fields an operator reads to decide whether any
+    // cleanup is needed. A regression on any of them silently
+    // mis-reports retained disk.
+    let shared_scalar_fields = [
+        "failed_seed_bundle_count",
+        "retained_publish_backup_count",
+        "retained_publish_backup_retention_limit",
+        "lexical_generation_count",
+        "lexical_quarantined_generation_count",
+        "lexical_quarantined_shard_count",
+        "total_retained_bytes",
+        "gc_eligible_asset_count",
+        "gc_eligible_bytes",
+        "inspection_required_asset_count",
+        "inspection_required_bytes",
+        "cleanup_dry_run_generation_count",
+        "cleanup_dry_run_reclaim_candidate_count",
+        "cleanup_dry_run_reclaimable_bytes",
+        "cleanup_dry_run_retained_bytes",
+        "cleanup_dry_run_protected_generation_count",
+        "cleanup_dry_run_active_generation_count",
+        "cleanup_dry_run_inspection_required_count",
+        "cleanup_dry_run_approval_fingerprint",
+        "cleanup_apply_allowed",
+    ];
+
+    for field in shared_scalar_fields {
+        let diag_val = diag_summary.get(field);
+        let doctor_val = doctor_summary.get(field);
+        assert_eq!(
+            diag_val, doctor_val,
+            "quarantine.summary.{field} must agree across diag and doctor; \
+             diag={diag_val:?} doctor={doctor_val:?}"
+        );
+    }
+
+    // Nested bundle: the build-state and publish-state counts sub-
+    // objects must also agree. These track the lexical generation
+    // lifecycle; a regression that updated one command's source of
+    // truth but not the other would mismatch here.
+    for bundle in ["lexical_generation_build_state_counts", "lexical_generation_publish_state_counts"] {
+        assert_eq!(
+            diag_summary.get(bundle),
+            doctor_summary.get(bundle),
+            "quarantine.summary.{bundle} must agree across diag and doctor; \
+             diag={:?} doctor={:?}",
+            diag_summary.get(bundle),
+            doctor_summary.get(bundle)
+        );
+    }
+
+    // Precondition sanity: on a fresh empty data-dir every counter is
+    // zero AND cleanup_apply_allowed is false. If the seeded state
+    // ever changes, update both halves together — catching the drift
+    // is the whole point.
+    assert_eq!(
+        diag_summary.get("lexical_generation_count").and_then(Value::as_u64),
+        Some(0),
+        "fresh data-dir must have zero lexical generations; diag: {diag_summary:?}"
+    );
+    assert_eq!(
+        diag_summary.get("cleanup_apply_allowed").and_then(Value::as_bool),
+        Some(false),
+        "fresh data-dir must have cleanup_apply_allowed=false; diag: {diag_summary:?}"
+    );
+}
