@@ -344,7 +344,8 @@ fn status_json_surfaces_quarantine_gc_summary() {
     );
 
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    let summary = &payload["quarantine"]["summary"];
+    let quarantine = &payload["quarantine"];
+    let summary = &quarantine["summary"];
 
     assert_eq!(summary["gc_eligible_asset_count"].as_u64(), Some(1));
     assert!(
@@ -359,6 +360,77 @@ fn status_json_surfaces_quarantine_gc_summary() {
     assert_eq!(
         summary["retained_publish_backup_retention_limit"].as_u64(),
         Some(1)
+    );
+
+    let failed_seed_entries = quarantine["failed_seed_bundle_files"]
+        .as_array()
+        .expect("status.quarantine must expose failed seed bundle entries");
+    assert_eq!(
+        failed_seed_entries.len(),
+        2,
+        "status.quarantine must preserve full failed seed bundle inventory, not only summary"
+    );
+    assert!(failed_seed_entries.iter().all(|entry| {
+        entry["path"]
+            .as_str()
+            .is_some_and(|path| path.contains(".failed-baseline-seed.bak"))
+            || entry["path"].as_str().is_some_and(|path| {
+                path.contains(".failed-baseline-seed.bak-wal")
+                    || path.ends_with(".failed-baseline-seed.bak-wal")
+            })
+    }));
+
+    let retained_backups = quarantine["retained_publish_backups"]
+        .as_array()
+        .expect("status.quarantine must expose retained publish backups");
+    assert_eq!(
+        retained_backups.len(),
+        2,
+        "status.quarantine must preserve retained publish backup details"
+    );
+    assert!(
+        retained_backups
+            .iter()
+            .any(|entry| entry["safe_to_gc"].as_bool() == Some(true)),
+        "one retained publish backup should be GC-eligible outside the cap"
+    );
+    assert!(
+        retained_backups
+            .iter()
+            .any(|entry| entry["safe_to_gc"].as_bool() == Some(false)),
+        "one retained publish backup should remain protected by the cap"
+    );
+
+    let lexical_generations = quarantine["lexical_generations"]
+        .as_array()
+        .expect("status.quarantine must expose lexical generation inventory");
+    assert_eq!(lexical_generations.len(), 1);
+    assert_eq!(
+        lexical_generations[0]["generation_id"].as_str(),
+        Some("gen-quarantined")
+    );
+    assert_eq!(
+        lexical_generations[0]["publish_state"].as_str(),
+        Some("quarantined")
+    );
+
+    let inspection_artifacts = quarantine["quarantined_artifacts"]
+        .as_array()
+        .expect("status.quarantine must expose flattened quarantined artifacts");
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("lexical_generation")
+                && entry["generation_id"].as_str() == Some("gen-quarantined")
+        }),
+        "status.quarantine must include the quarantined lexical generation artifact"
+    );
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("lexical_shard")
+                && entry["generation_id"].as_str() == Some("gen-quarantined")
+                && entry["shard_id"].as_str() == Some("shard-a")
+        }),
+        "status.quarantine must include the quarantined shard artifact"
     );
 }
 
