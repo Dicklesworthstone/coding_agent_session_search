@@ -27040,6 +27040,33 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
+/// Resolve a CLI-supplied semantic model name (or alias) to the canonical
+/// registry name used by `ModelManifest::for_embedder` and
+/// `FastEmbedder::model_dir_for`. Mirrors the alias map in
+/// `src/daemon/worker.rs::resolve_embedder_kind` so the CLI surface accepts
+/// the same names the daemon worker honors. Bead:
+/// `coding_agent_session_search-v3of1`.
+fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
+    match model_name.to_ascii_lowercase().as_str() {
+        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
+        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
+            Ok("snowflake-arctic-s")
+        }
+        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
+        _ => Err(CliError {
+            code: 20,
+            kind: "model",
+            message: format!(
+                "Unknown model '{}'. Supported: all-minilm-l6-v2 (alias minilm), \
+                 snowflake-arctic-s, nomic-embed.",
+                model_name
+            ),
+            hint: Some("Use 'cass models status' to see available models".into()),
+            retryable: false,
+        }),
+    }
+}
+
 /// Download and install the semantic search model
 fn run_models_install(
     model_name: &str,
@@ -27055,23 +27082,30 @@ fn run_models_install(
     use colored::Colorize;
     use indicatif::{ProgressBar, ProgressStyle};
 
-    // Only support the default model for now
-    if model_name != "all-minilm-l6-v2" {
-        return Err(CliError {
+    let registry_name = resolve_cli_model_name(model_name)?;
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
+        CliError {
             code: 20,
             kind: "model",
             message: format!(
-                "Unknown model '{}'. Only 'all-minilm-l6-v2' is supported.",
-                model_name
+                "no model directory mapping for registered embedder '{}'",
+                registry_name
             ),
-            hint: Some("Use 'cass models status' to see available models".into()),
+            hint: None,
             retryable: false,
-        });
-    }
-
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
+        }
+    })?;
+    let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
+        code: 20,
+        kind: "model",
+        message: format!(
+            "no manifest registered for embedder '{}'",
+            registry_name
+        ),
+        hint: None,
+        retryable: false,
+    })?;
     let mirror_base_url = mirror
         .map(normalize_mirror_base_url)
         .transpose()
@@ -27811,22 +27845,20 @@ fn run_models_remove(
     use crate::search::fastembed_embedder::FastEmbedder;
     use colored::Colorize;
 
-    // Only support the default model for now
-    if model_name != "all-minilm-l6-v2" {
-        return Err(CliError {
+    let registry_name = resolve_cli_model_name(model_name)?;
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
+        CliError {
             code: 20,
             kind: "model",
             message: format!(
-                "Unknown model '{}'. Only 'all-minilm-l6-v2' is supported.",
-                model_name
+                "no model directory mapping for registered embedder '{}'",
+                registry_name
             ),
-            hint: Some("Use 'cass models status' to see available models".into()),
+            hint: None,
             retryable: false,
-        });
-    }
-
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
+        }
+    })?;
 
     if !model_dir.is_dir() {
         println!("{} Model is not installed.", "✗".yellow());
@@ -28965,3 +28997,101 @@ mod subcommand_robot_output_tests {
 // but unimplemented and has been removed from the pages CLI surface
 // (bead adyyt). Any future attachment-bundling work will add a new
 // flag with end-to-end implementation + fresh tests at that time.
+
+#[cfg(test)]
+mod cli_models_resolution_tests {
+    use super::*;
+
+    /// `coding_agent_session_search-v3of1`: `cass models install` and
+    /// `cass models remove` previously hardcoded
+    /// `if model_name != "all-minilm-l6-v2"` (with comment "Only support
+    /// the default model for now"), rejecting all other registered
+    /// embedders even though `EmbedderRegistry`, `ModelManifest::for_embedder`,
+    /// `FastEmbedder::model_dir_for`, and the daemon worker
+    /// (commit cf85b403) all know about `snowflake-arctic-s` and
+    /// `nomic-embed`. This test pins the post-fix contract: every
+    /// registry-known name (including aliases honored by
+    /// `daemon::worker::resolve_embedder_kind`) must resolve to its
+    /// canonical registry name; only genuinely unknown names error.
+    #[test]
+    fn resolve_cli_model_name_accepts_every_registered_embedder_alias() {
+        for (alias, expected_canonical) in [
+            ("all-minilm-l6-v2", "minilm"),
+            ("minilm", "minilm"),
+            ("minilm-384", "minilm"),
+            ("fastembed", "minilm"),
+            ("MINILM", "minilm"),
+            ("snowflake-arctic-s", "snowflake-arctic-s"),
+            ("snowflake-arctic-s-384", "snowflake-arctic-s"),
+            ("snowflake-arctic-embed-s", "snowflake-arctic-s"),
+            ("Snowflake-Arctic-S", "snowflake-arctic-s"),
+            ("nomic-embed", "nomic-embed"),
+            ("nomic-embed-768", "nomic-embed"),
+            ("nomic-embed-text-v1.5", "nomic-embed"),
+            ("NOMIC-EMBED", "nomic-embed"),
+        ] {
+            assert_eq!(
+                resolve_cli_model_name(alias).expect("registered alias must resolve"),
+                expected_canonical,
+                "registered alias {alias:?} must resolve to canonical name {expected_canonical:?}"
+            );
+        }
+    }
+
+    /// `coding_agent_session_search-v3of1`: unknown names must be rejected
+    /// with code=20, kind="model", and a hint pointing at `cass models status`.
+    /// Pre-fix message was "Only 'all-minilm-l6-v2' is supported."; post-fix
+    /// must list all registered names so operators discover snowflake/nomic.
+    #[test]
+    fn resolve_cli_model_name_rejects_unknown_with_useful_hint() {
+        let err = resolve_cli_model_name("e5-large-v2")
+            .expect_err("unknown model must be rejected");
+        assert_eq!(err.code, 20);
+        assert_eq!(err.kind, "model");
+        assert!(
+            err.message.contains("Unknown model 'e5-large-v2'"),
+            "error must name the rejected input; got {message:?}",
+            message = err.message
+        );
+        assert!(
+            err.message.contains("snowflake-arctic-s")
+                && err.message.contains("nomic-embed")
+                && err.message.contains("all-minilm-l6-v2"),
+            "error must list all 3 supported models so operators discover non-default options; \
+             got {message:?}",
+            message = err.message
+        );
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("Use 'cass models status' to see available models")
+        );
+        assert!(!err.retryable);
+    }
+
+    /// `coding_agent_session_search-v3of1`: every name that
+    /// `resolve_cli_model_name` returns MUST be a name that both
+    /// `ModelManifest::for_embedder` and `FastEmbedder::model_dir_for`
+    /// accept. Otherwise install/remove would resolve the alias and
+    /// then crash at the manifest/dir lookup. This is the cross-module
+    /// contract that the original hardcoded `all-minilm-l6-v2` check
+    /// silently maintained — making it explicit prevents drift.
+    #[test]
+    fn every_resolved_canonical_name_has_manifest_and_dir_mapping() {
+        use crate::search::fastembed_embedder::FastEmbedder;
+        use crate::search::model_download::ModelManifest;
+
+        let probe_data_dir = std::path::Path::new("/tmp/cass-v3of1-probe");
+        for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed"] {
+            assert!(
+                ModelManifest::for_embedder(canonical).is_some(),
+                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
+                 ModelManifest registered"
+            );
+            assert!(
+                FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
+                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
+                 FastEmbedder::model_dir_for mapping"
+            );
+        }
+    }
+}
