@@ -798,6 +798,84 @@ impl LexicalCleanupDryRunPlan {
                 .saturating_add(inventory.retained_bytes);
         }
 
+        // [coding_agent_session_search-ibuuh.19] Emit a structured
+        // tracing event per generation classification so operators can
+        // trace from logs alone WHY each artifact was reclaimed or
+        // preserved (the bead's "structured logs that let a future
+        // agent understand exactly why disk was reclaimed or preserved"
+        // SCOPE bullet). Severity tiers match operator expectations:
+        //
+        // - SupersededReclaimable / FailedReclaimable -> debug
+        //   (routine cleanup eligibility — high volume on big corpora)
+        // - QuarantinedRetained / FailedRetained -> warn
+        //   (operator inspection required — surface in default logs)
+        // - ActiveWork / CurrentPublished / SupersededRetained /
+        //   PinnedRetained -> info (preserved by design, but worth
+        //   surfacing when the operator runs cleanup so they see WHY)
+        //
+        // Every event carries the disposition string + reason +
+        // generation_id + reclaimable/retained byte counts so a single
+        // log line answers "what got pruned?" and "why was X kept?"
+        // without grepping multiple sources.
+        let disposition_str = inventory.disposition.as_str();
+        match inventory.disposition {
+            LexicalCleanupDisposition::SupersededReclaimable
+            | LexicalCleanupDisposition::FailedReclaimable => {
+                tracing::debug!(
+                    target: "cass::indexer::lexical_cleanup",
+                    generation_id = %inventory.generation_id,
+                    disposition = disposition_str,
+                    reason = %inventory.reason,
+                    reclaimable_bytes = inventory.reclaimable_bytes,
+                    retained_bytes = inventory.retained_bytes,
+                    artifact_bytes = inventory.artifact_bytes,
+                    shard_count = inventory.shards.len(),
+                    inspection_required = inventory_requires_inspection,
+                    "lexical cleanup classified generation as reclaimable"
+                );
+            }
+            LexicalCleanupDisposition::QuarantinedRetained
+            | LexicalCleanupDisposition::FailedRetained => {
+                tracing::warn!(
+                    target: "cass::indexer::lexical_cleanup",
+                    generation_id = %inventory.generation_id,
+                    disposition = disposition_str,
+                    reason = %inventory.reason,
+                    reclaimable_bytes = inventory.reclaimable_bytes,
+                    retained_bytes = inventory.retained_bytes,
+                    artifact_bytes = inventory.artifact_bytes,
+                    shard_count = inventory.shards.len(),
+                    inspection_required = inventory_requires_inspection,
+                    "lexical cleanup retained generation pending operator inspection"
+                );
+            }
+            LexicalCleanupDisposition::ActiveWork
+            | LexicalCleanupDisposition::CurrentPublished
+            | LexicalCleanupDisposition::SupersededRetained
+            | LexicalCleanupDisposition::PinnedRetained => {
+                tracing::info!(
+                    target: "cass::indexer::lexical_cleanup",
+                    generation_id = %inventory.generation_id,
+                    disposition = disposition_str,
+                    reason = %inventory.reason,
+                    reclaimable_bytes = inventory.reclaimable_bytes,
+                    retained_bytes = inventory.retained_bytes,
+                    artifact_bytes = inventory.artifact_bytes,
+                    shard_count = inventory.shards.len(),
+                    inspection_required = inventory_requires_inspection,
+                    "lexical cleanup retained generation by policy"
+                );
+            }
+        }
+        // Suppress the "unused" lint for diagnostics-only locals so the
+        // compiler doesn't warn even if a future variant addition
+        // routes through a no-emission arm.
+        let _ = (
+            shard_inspection_items,
+            inventory_allows_reclaim_candidates,
+            has_protected_retention,
+        );
+
         self.inventories.push(inventory);
     }
 
@@ -3480,5 +3558,173 @@ mod tests {
                  parsed as {parsed:?}"
             );
         }
+    }
+
+    /// `coding_agent_session_search-ibuuh.19` structured-logs gate:
+    /// every cleanup classification MUST emit a tracing event whose
+    /// fields let an operator answer "what got pruned?" and "why was
+    /// X kept?" from logs alone — directly addressing the bead's
+    /// "structured logs that let a future agent understand exactly
+    /// why disk was reclaimed or preserved" SCOPE bullet. Pre-fix,
+    /// `record_inventory` had ZERO tracing emissions (verified via
+    /// grep -nE "tracing::" returning empty in this file). Post-fix,
+    /// every classification routes to debug/info/warn per severity
+    /// tier (reclaimable=debug, retained-by-policy=info,
+    /// quarantined/failed-retained=warn).
+    ///
+    /// This test pins:
+    /// 1. The QuarantinedRetained classification emits a `warn`
+    ///    event (operator must see it in default logs).
+    /// 2. The event carries `disposition`, `generation_id`,
+    ///    `reason`, and `retained_bytes` fields so a single log
+    ///    line is fully diagnostic.
+    /// 3. The event target is `cass::indexer::lexical_cleanup`
+    ///    (operators can grep / filter by target).
+    #[test]
+    fn record_inventory_emits_structured_classification_event_for_quarantined_generation() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Level, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct CapturedEvent {
+            level: String,
+            target: String,
+            fields: std::collections::HashMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct ClassificationCollector {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for ClassificationCollector {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "cass::indexer::lexical_cleanup" {
+                    return;
+                }
+                let mut visitor = StringVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().expect("collector lock").push(CapturedEvent {
+                    level: event.metadata().level().to_string(),
+                    target: event.metadata().target().to_string(),
+                    fields: visitor.fields,
+                });
+            }
+        }
+
+        #[derive(Default)]
+        struct StringVisitor {
+            fields: std::collections::HashMap<String, String>,
+        }
+
+        impl Visit for StringVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{:?}", value));
+            }
+        }
+
+        let collector = ClassificationCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+
+        // Build a quarantined fixture identical to the existing
+        // `cleanup_inventory_keeps_quarantined_artifacts_for_inspection`
+        // test (line ~2364) so the two tests share a factual basis.
+        let mut manifest =
+            LexicalGenerationManifest::new_scratch("gen-traced-quarantined", "attempt-1", "fp", 1);
+        let shard = test_shard(
+            "shard-bad",
+            0,
+            LexicalShardLifecycleState::Quarantined,
+            4096,
+        );
+        manifest.set_shards(vec![shard], 2);
+        assert!(manifest.transition_shard(
+            "shard-bad",
+            LexicalShardLifecycleState::Quarantined,
+            3,
+            Some("traced classification event regression".into()),
+        ));
+        manifest.transition_publish(LexicalGenerationPublishState::Quarantined, 4);
+
+        // Drive record_inventory under our collector subscriber.
+        tracing::subscriber::with_default(subscriber, || {
+            let mut plan = LexicalCleanupDryRunPlan::default();
+            plan.record_inventory(manifest.cleanup_inventory());
+        });
+
+        let captured = collector.events.lock().expect("collector lock").clone();
+        // Exactly one classification event for one generation.
+        assert_eq!(
+            captured.len(),
+            1,
+            "record_inventory must emit exactly one classification event per generation; \
+             got {captured:?}"
+        );
+        let event = &captured[0];
+
+        // Invariant 1: target.
+        assert_eq!(
+            event.target, "cass::indexer::lexical_cleanup",
+            "classification event must use the lexical_cleanup target so operators can \
+             grep/filter by it"
+        );
+
+        // Invariant 2: WARN severity for quarantined (must surface in
+        // default-level logs without dredging).
+        assert_eq!(
+            event.level,
+            Level::WARN.to_string(),
+            "QuarantinedRetained MUST emit at warn level so the inspection-required \
+             state shows up in default operator logs; got {event:?}"
+        );
+
+        // Invariant 3: every diagnostic field is present so a single
+        // log line answers "what got pruned?" and "why was X kept?"
+        for required in [
+            "disposition",
+            "generation_id",
+            "reason",
+            "reclaimable_bytes",
+            "retained_bytes",
+            "artifact_bytes",
+        ] {
+            assert!(
+                event.fields.contains_key(required),
+                "classification event MUST include {required} field; got fields {:?}",
+                event.fields.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // Invariant 4: field VALUES match the classification.
+        assert_eq!(event.fields.get("disposition"), Some(&"quarantined_retained".to_string()));
+        assert_eq!(event.fields.get("generation_id"), Some(&"gen-traced-quarantined".to_string()));
+        assert_eq!(event.fields.get("retained_bytes"), Some(&"4096".to_string()));
+        assert_eq!(event.fields.get("reclaimable_bytes"), Some(&"0".to_string()));
+        // The reason string must explain WHY the generation is being
+        // retained (operator inspection hold).
+        let reason = event
+            .fields
+            .get("reason")
+            .expect("reason field present");
+        assert!(
+            reason.contains("operator inspection") || reason.contains("quarantined"),
+            "reason field must explain the inspection hold; got {reason:?}"
+        );
     }
 }
