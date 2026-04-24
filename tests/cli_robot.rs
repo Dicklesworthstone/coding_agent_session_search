@@ -5297,7 +5297,11 @@ fn search_hits_as_keys(payload: &Value) -> Vec<(String, i64)> {
         .collect()
 }
 
-fn run_search_returning_payload(home: &std::path::Path, data_dir: &std::path::Path, args: &[&str]) -> Value {
+fn run_search_returning_payload(
+    home: &std::path::Path,
+    data_dir: &std::path::Path,
+    args: &[&str],
+) -> Value {
     let mut cmd = isolated_cass_cmd(home);
     cmd.args(args).arg(data_dir);
     let out = cmd.output().expect("run cass search");
@@ -5345,17 +5349,38 @@ fn search_is_case_insensitive_for_ascii_queries() {
     let lower = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "metamorphprobe",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
     let upper = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "METAMORPHPROBE", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "METAMORPHPROBE",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
     let mixed = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "MetaMorphProbe", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "MetaMorphProbe",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
 
     let lower_keys = search_hits_as_keys(&lower);
@@ -5393,17 +5418,38 @@ fn search_trims_leading_and_trailing_whitespace_from_query() {
     let bare = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "metamorphprobe",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
     let padded = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "  metamorphprobe  ", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "  metamorphprobe  ",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
     let tabs_and_newlines = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "\tmetamorphprobe\n", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "\tmetamorphprobe\n",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
 
     let bare_keys = search_hits_as_keys(&bare);
@@ -5432,12 +5478,26 @@ fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
     let small = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "metamorphprobe", "--json", "--limit", "2", "--data-dir"],
+        &[
+            "search",
+            "metamorphprobe",
+            "--json",
+            "--limit",
+            "2",
+            "--data-dir",
+        ],
     );
     let large = run_search_returning_payload(
         &home,
         &data_dir,
-        &["search", "metamorphprobe", "--json", "--limit", "20", "--data-dir"],
+        &[
+            "search",
+            "metamorphprobe",
+            "--json",
+            "--limit",
+            "20",
+            "--data-dir",
+        ],
     );
 
     let small_keys = search_hits_as_keys(&small);
@@ -5545,9 +5605,7 @@ fn stats_by_agent_counts_sum_to_total_conversations() {
     let total = stats
         .get("conversations")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| {
-            panic!("stats.conversations must be a non-null u64; stats: {stats}")
-        });
+        .unwrap_or_else(|| panic!("stats.conversations must be a non-null u64; stats: {stats}"));
     assert!(
         total >= 1,
         "precondition: seeded corpus must produce at least 1 conversation; \
@@ -5571,7 +5629,9 @@ fn stats_by_agent_counts_sum_to_total_conversations() {
         let count = entry
             .get("count")
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| panic!("by_agent entry must have non-null u64 `count`; entry: {entry}"));
+            .unwrap_or_else(|| {
+                panic!("by_agent entry must have non-null u64 `count`; entry: {entry}")
+            });
         agent_sum = agent_sum
             .checked_add(count)
             .unwrap_or_else(|| panic!("by_agent count overflow; accumulated {agent_sum}"));

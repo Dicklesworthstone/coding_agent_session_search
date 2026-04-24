@@ -3926,9 +3926,7 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
 /// Returns `None` on any failure (missing file, parse error, IO
 /// error) — a missing prior sidecar is the EXPECTED first-publish
 /// case, so failure here is non-fatal and logged at debug.
-fn load_prior_refresh_evidence_for_comparison(
-    index_path: &Path,
-) -> Option<RefreshLedgerEvidence> {
+fn load_prior_refresh_evidence_for_comparison(index_path: &Path) -> Option<RefreshLedgerEvidence> {
     let path = lexical_refresh_evidence_path(index_path);
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -18583,9 +18581,11 @@ pub mod persist {
         /// inserted_indices` — the new helper produces the same
         /// positional set so `add_messages_from_packet` emits the
         /// same messages the legacy `add_messages_with_conversation_id`
-        /// + filter loop did. A regression that mis-mapped idx → position
-        /// would silently drop or duplicate documents in the lexical
-        /// sink; this test catches that.
+        /// + filter loop did.
+        ///
+        /// A regression that mis-mapped idx → position would silently
+        /// drop or duplicate documents in the lexical sink; this test
+        /// catches that.
         #[test]
         fn positional_indices_for_inserted_maps_idx_values_to_packet_positions() {
             use serde_json::Value;
@@ -25781,6 +25781,7 @@ mod tests {
     /// 3. The values are internally consistent with the raw ledger
     ///    (aggregate_duration_ms == ledger.total_duration_ms,
     ///    aggregate_items_processed == ledger.total_items_processed()).
+    ///
     /// A regression that drops the sidecar OR breaks the ledger ↔
     /// evidence consistency invariant trips this test immediately.
     #[test]
@@ -25898,10 +25899,13 @@ mod tests {
                 if !visitor.message.contains("lexical refresh evidence") {
                     return;
                 }
-                self.events.lock().expect("collector lock").push(CapturedEvent {
-                    level: event.metadata().level().to_string(),
-                    message: visitor.message,
-                });
+                self.events
+                    .lock()
+                    .expect("collector lock")
+                    .push(CapturedEvent {
+                        level: event.metadata().level().to_string(),
+                        message: visitor.message,
+                    });
             }
         }
 

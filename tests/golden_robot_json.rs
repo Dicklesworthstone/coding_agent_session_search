@@ -963,8 +963,7 @@ fn export_html_shape_matches_golden() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let payload: Value =
-        serde_json::from_slice(&output.stdout).expect("export-html emits JSON");
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("export-html emits JSON");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&payload)).expect("pretty-print JSON");
     assert_golden("robot/export_html_shape.json.golden", &canonical);

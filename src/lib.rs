@@ -11394,12 +11394,11 @@ fn cleanup_target_path_is_safe(
     {
         return false;
     }
-    if let Ok(canonical_index_path) = std::fs::canonicalize(index_path) {
-        if canonical_path == canonical_index_path
-            || canonical_path.starts_with(&canonical_index_path)
-        {
-            return false;
-        }
+    if let Ok(canonical_index_path) = std::fs::canonicalize(index_path)
+        && (canonical_path == canonical_index_path
+            || canonical_path.starts_with(&canonical_index_path))
+    {
+        return false;
     }
     if path.starts_with(index_path) {
         return false;

@@ -829,7 +829,7 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
     // (not assert_cmd, which blocks until completion) so we can kill
     // it mid-rebuild.
     let cass = assert_cmd::cargo::cargo_bin!("cass");
-    let mut child = std::process::Command::new(&cass)
+    let mut child = std::process::Command::new(cass)
         .arg("index")
         .arg("--full")
         .arg("--json")
@@ -853,11 +853,11 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut caught_mid_run = false;
     while std::time::Instant::now() < deadline {
-        if let Ok(meta) = fs::metadata(&lock_path) {
-            if meta.len() > 0 {
-                caught_mid_run = true;
-                break;
-            }
+        if let Ok(meta) = fs::metadata(&lock_path)
+            && meta.len() > 0
+        {
+            caught_mid_run = true;
+            break;
         }
         if let Ok(Some(_)) = child.try_wait() {
             break;
@@ -878,7 +878,7 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
     // If the lock was held by the killed child, the reaper in
     // read_search_maintenance_snapshot must acquire flock (released
     // on process exit) and clean up in-place.
-    let status_out = Command::new(&cass)
+    let status_out = Command::new(cass)
         .args([
             "status",
             "--data-dir",
@@ -911,7 +911,7 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
 
     // CONTRACT PIN 2: a subsequent cass index --full must succeed
     // cleanly — no lock-stampede, no corruption bail-out.
-    let rerun = Command::new(&cass)
+    let rerun = Command::new(cass)
         .args(["index", "--full", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -933,7 +933,7 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
     // CONTRACT PIN 3: at least one seeded keyword is searchable post-
     // recovery. Proves the rerun actually populated the lexical
     // index, not just exited-success silently.
-    let search_out = Command::new(&cass)
+    let search_out = Command::new(cass)
         .args(["search", "yc4h7keyword-01", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")

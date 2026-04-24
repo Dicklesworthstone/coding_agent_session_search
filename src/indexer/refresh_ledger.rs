@@ -783,20 +783,31 @@ impl RefreshLedgerEvidence {
     /// naturally for benchmark CI ("PR #123 added +12.5% to publish
     /// duration").
     pub fn compare_to(&self, baseline: &Self) -> RefreshLedgerEvidenceComparison {
-        // Index baseline + current throughput entries by phase so we
-        // can union them in O(phases) without a quadratic scan.
+        // Index baseline + current phase-share entries by phase so
+        // zero-item phases still participate in the comparison. The
+        // throughput vectors intentionally skip zero-item phases, so
+        // using them as the "phase ran" source would hide publish or
+        // recovery work that consumed wall-clock time.
+        //
         // (RefreshPhase derives Hash but not Ord, so HashMap/HashSet —
         // we re-sort by RefreshPhase::ALL declaration order at the
         // end so the output is deterministic across runs regardless
         // of HashMap iteration order.)
         use std::collections::{HashMap, HashSet};
+        let mut baseline_share_by_phase: HashMap<RefreshPhase, &RefreshPhaseShare> = HashMap::new();
+        for entry in &baseline.phase_share {
+            baseline_share_by_phase.insert(entry.phase, entry);
+        }
+        let mut current_share_by_phase: HashMap<RefreshPhase, &RefreshPhaseShare> = HashMap::new();
+        for entry in &self.phase_share {
+            current_share_by_phase.insert(entry.phase, entry);
+        }
         let mut baseline_by_phase: HashMap<RefreshPhase, &RefreshThroughputProfile> =
             HashMap::new();
         for entry in &baseline.throughput {
             baseline_by_phase.insert(entry.phase, entry);
         }
-        let mut current_by_phase: HashMap<RefreshPhase, &RefreshThroughputProfile> =
-            HashMap::new();
+        let mut current_by_phase: HashMap<RefreshPhase, &RefreshThroughputProfile> = HashMap::new();
         for entry in &self.throughput {
             current_by_phase.insert(entry.phase, entry);
         }
@@ -804,6 +815,8 @@ impl RefreshLedgerEvidence {
         // surfaces in the comparison. Iterate RefreshPhase::ALL to
         // preserve canonical pipeline order in the output.
         let mut all_phases: HashSet<RefreshPhase> = HashSet::new();
+        all_phases.extend(baseline_share_by_phase.keys().copied());
+        all_phases.extend(current_share_by_phase.keys().copied());
         all_phases.extend(baseline_by_phase.keys().copied());
         all_phases.extend(current_by_phase.keys().copied());
 
@@ -814,18 +827,21 @@ impl RefreshLedgerEvidence {
             .map(|phase| {
                 let baseline_entry = baseline_by_phase.get(&phase).copied();
                 let current_entry = current_by_phase.get(&phase).copied();
-                let baseline_duration_ms =
-                    baseline_entry.map(|e| e.duration_ms).unwrap_or(0);
-                let current_duration_ms =
-                    current_entry.map(|e| e.duration_ms).unwrap_or(0);
+                let baseline_duration_ms = baseline_share_by_phase
+                    .get(&phase)
+                    .map(|e| e.duration_ms)
+                    .or_else(|| baseline_entry.map(|e| e.duration_ms))
+                    .unwrap_or(0);
+                let current_duration_ms = current_share_by_phase
+                    .get(&phase)
+                    .map(|e| e.duration_ms)
+                    .or_else(|| current_entry.map(|e| e.duration_ms))
+                    .unwrap_or(0);
                 let baseline_items_processed =
                     baseline_entry.map(|e| e.items_processed).unwrap_or(0);
-                let current_items_processed =
-                    current_entry.map(|e| e.items_processed).unwrap_or(0);
-                let baseline_items_per_second =
-                    baseline_entry.and_then(|e| e.items_per_second);
-                let current_items_per_second =
-                    current_entry.and_then(|e| e.items_per_second);
+                let current_items_processed = current_entry.map(|e| e.items_processed).unwrap_or(0);
+                let baseline_items_per_second = baseline_entry.and_then(|e| e.items_per_second);
+                let current_items_per_second = current_entry.and_then(|e| e.items_per_second);
 
                 RefreshPhaseDelta {
                     phase,
@@ -839,8 +855,10 @@ impl RefreshLedgerEvidence {
                     current_items_processed,
                     baseline_items_per_second,
                     current_items_per_second,
-                    throughput_delta_pct: match (baseline_items_per_second, current_items_per_second)
-                    {
+                    throughput_delta_pct: match (
+                        baseline_items_per_second,
+                        current_items_per_second,
+                    ) {
                         (Some(b), Some(c)) => pct_delta(b, c),
                         _ => None,
                     },
@@ -929,7 +947,10 @@ impl RegressionVerdictThresholds {
     /// Custom threshold pair. Returns `Err(&'static str)` when the
     /// configuration is internally inconsistent (warning >= failure
     /// would never raise a warning before the failure trips).
-    pub fn try_new(warning_duration_pct: f64, failure_duration_pct: f64) -> Result<Self, &'static str> {
+    pub fn try_new(
+        warning_duration_pct: f64,
+        failure_duration_pct: f64,
+    ) -> Result<Self, &'static str> {
         if !warning_duration_pct.is_finite() || !failure_duration_pct.is_finite() {
             return Err("regression thresholds must be finite f64s");
         }
@@ -1769,6 +1790,7 @@ mod tests {
     /// improvements with the conventional sign:
     /// - duration_delta_pct > 0 ⇒ slower in `current`
     /// - throughput_delta_pct > 0 ⇒ faster in `current`
+    ///
     /// A regression in either sign convention would cause benchmark
     /// CI to misclassify slowdowns as wins (or vice versa).
     #[test]
@@ -1853,6 +1875,49 @@ mod tests {
         );
     }
 
+    /// Zero-item phases still consume wall-clock time and must remain
+    /// visible to benchmark comparisons. Throughput summaries omit
+    /// them by design, so `compare_to` must derive phase presence
+    /// from phase-share data instead.
+    #[test]
+    fn evidence_compare_to_retains_zero_item_phases_with_duration() {
+        let baseline = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 100, 100),
+            phase_record_with_items(RefreshPhase::Publish, 40, 0),
+        ])
+        .evidence_summary();
+        let current = ledger_with(vec![
+            phase_record_with_items(RefreshPhase::Scan, 100, 100),
+            phase_record_with_items(RefreshPhase::Publish, 80, 0),
+        ])
+        .evidence_summary();
+
+        assert!(
+            baseline
+                .throughput
+                .iter()
+                .all(|entry| entry.phase != RefreshPhase::Publish),
+            "zero-item Publish must stay out of throughput: {:?}",
+            baseline.throughput
+        );
+
+        let cmp = current.compare_to(&baseline);
+        let publish = cmp
+            .phase_deltas
+            .iter()
+            .find(|delta| delta.phase == RefreshPhase::Publish)
+            .expect("zero-item Publish phase must remain in comparison");
+
+        assert_eq!(publish.baseline_duration_ms, 40);
+        assert_eq!(publish.current_duration_ms, 80);
+        assert_eq!(publish.duration_delta_pct, Some(100.0));
+        assert_eq!(publish.baseline_items_processed, 0);
+        assert_eq!(publish.current_items_processed, 0);
+        assert_eq!(publish.baseline_items_per_second, None);
+        assert_eq!(publish.current_items_per_second, None);
+        assert_eq!(publish.throughput_delta_pct, None);
+    }
+
     /// Dominant-phase shift signal: when the hot phase changes
     /// between runs (even if absolute totals are similar), the
     /// operator should look at why. Pinning the shift detection
@@ -1925,8 +1990,14 @@ mod tests {
         // No NaN anywhere in the JSON serialization (pins that the
         // defensive branches actually emit serializable output).
         let json = serde_json::to_string(&against_empty).expect("serialize");
-        assert!(!json.contains("NaN"), "comparison JSON must not contain NaN; got {json}");
-        assert!(!json.contains("Infinity"), "comparison JSON must not contain Infinity");
+        assert!(
+            !json.contains("NaN"),
+            "comparison JSON must not contain NaN; got {json}"
+        );
+        assert!(
+            !json.contains("Infinity"),
+            "comparison JSON must not contain Infinity"
+        );
     }
 
     /// `coding_agent_session_search-ibuuh.24` cross-run tracing
@@ -1947,7 +2018,6 @@ mod tests {
         #[derive(Debug, Clone, Default)]
         struct CapturedEvent {
             level: String,
-            target: String,
             message: String,
         }
 
@@ -1963,11 +2033,13 @@ mod tests {
                 }
                 let mut visitor = MessageVisitor::default();
                 event.record(&mut visitor);
-                self.events.lock().expect("collector lock").push(CapturedEvent {
-                    level: event.metadata().level().to_string(),
-                    target: event.metadata().target().to_string(),
-                    message: visitor.message,
-                });
+                self.events
+                    .lock()
+                    .expect("collector lock")
+                    .push(CapturedEvent {
+                        level: event.metadata().level().to_string(),
+                        message: visitor.message,
+                    });
             }
         }
 
@@ -2003,8 +2075,15 @@ mod tests {
             comparison_with_duration_pct(50.0).emit_tracing_summary();
         });
         let evs = collector.events.lock().expect("lock").clone();
-        assert_eq!(evs.len(), 1, "exactly one event per emit_tracing_summary call");
-        assert_eq!(evs[0].level, "WARN", "+50% slowdown must be warn; got {evs:?}");
+        assert_eq!(
+            evs.len(),
+            1,
+            "exactly one event per emit_tracing_summary call"
+        );
+        assert_eq!(
+            evs[0].level, "WARN",
+            "+50% slowdown must be warn; got {evs:?}"
+        );
         assert!(
             evs[0].message.contains("significant slowdown"),
             "warn message must name the slowdown; got {:?}",
@@ -2018,7 +2097,10 @@ mod tests {
             comparison_with_duration_pct(-25.0).emit_tracing_summary();
         });
         let evs = collector.events.lock().expect("lock").clone();
-        assert_eq!(evs[0].level, "INFO", "-25% improvement must be info; got {evs:?}");
+        assert_eq!(
+            evs[0].level, "INFO",
+            "-25% improvement must be info; got {evs:?}"
+        );
         assert!(
             evs[0].message.contains("notable improvement"),
             "info message must name the improvement; got {:?}",
@@ -2032,7 +2114,10 @@ mod tests {
             comparison_with_duration_pct(5.0).emit_tracing_summary();
         });
         let evs = collector.events.lock().expect("lock").clone();
-        assert_eq!(evs[0].level, "DEBUG", "+5% within steady-state must be debug; got {evs:?}");
+        assert_eq!(
+            evs[0].level, "DEBUG",
+            "+5% within steady-state must be debug; got {evs:?}"
+        );
         assert!(
             evs[0].message.contains("cross-run comparison"),
             "debug message must use the steady-state phrasing; got {:?}",
@@ -2115,11 +2200,14 @@ mod tests {
         // ─── Warning band ──────────────────────────────────────
         // At threshold (inclusive) ⇒ Warning.
         let warn_at = comparison_with_pct(Some(15.0)).regression_verdict(&thresholds);
-        assert!(matches!(
-            warn_at,
-            RegressionVerdict::Warning { duration_delta_pct, threshold_pct }
-                if (duration_delta_pct - 15.0).abs() < 0.01 && threshold_pct == 15.0
-        ), "+15% must trigger warn at the inclusive threshold; got {warn_at:?}");
+        assert!(
+            matches!(
+                warn_at,
+                RegressionVerdict::Warning { duration_delta_pct, threshold_pct }
+                    if (duration_delta_pct - 15.0).abs() < 0.01 && threshold_pct == 15.0
+            ),
+            "+15% must trigger warn at the inclusive threshold; got {warn_at:?}"
+        );
         assert!(!warn_at.should_fail_build());
 
         // Mid-band ⇒ Warning.
@@ -2130,12 +2218,18 @@ mod tests {
         // ─── Failure band ──────────────────────────────────────
         // At threshold (inclusive) ⇒ Failure.
         let fail_at = comparison_with_pct(Some(30.0)).regression_verdict(&thresholds);
-        assert!(matches!(
-            fail_at,
-            RegressionVerdict::Failure { duration_delta_pct, threshold_pct }
-                if (duration_delta_pct - 30.0).abs() < 0.01 && threshold_pct == 30.0
-        ), "+30% must trigger failure at the inclusive threshold; got {fail_at:?}");
-        assert!(fail_at.should_fail_build(), "Failure verdict MUST cause CI to exit non-zero");
+        assert!(
+            matches!(
+                fail_at,
+                RegressionVerdict::Failure { duration_delta_pct, threshold_pct }
+                    if (duration_delta_pct - 30.0).abs() < 0.01 && threshold_pct == 30.0
+            ),
+            "+30% must trigger failure at the inclusive threshold; got {fail_at:?}"
+        );
+        assert!(
+            fail_at.should_fail_build(),
+            "Failure verdict MUST cause CI to exit non-zero"
+        );
 
         // Far past failure ⇒ still Failure (capping behavior).
         let fail_far = comparison_with_pct(Some(150.0)).regression_verdict(&thresholds);
@@ -2153,7 +2247,8 @@ mod tests {
         // ─── None duration delta (no comparison data) ─────────
         let no_data = comparison_with_pct(None).regression_verdict(&thresholds);
         assert_eq!(
-            no_data, RegressionVerdict::Clean,
+            no_data,
+            RegressionVerdict::Clean,
             "missing comparison data MUST NOT cause a CI failure (no signal to gate on)"
         );
     }
