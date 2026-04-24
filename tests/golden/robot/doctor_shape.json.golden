@@ -1,0 +1,444 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "healthy": {
+      "type": "boolean"
+    },
+    "initialized": {
+      "type": "boolean"
+    },
+    "explanation": {
+      "type": "string"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "issues_found": {
+      "type": "integer"
+    },
+    "issues_fixed": {
+      "type": "integer"
+    },
+    "failures": {
+      "type": "integer"
+    },
+    "warnings": {
+      "type": "integer"
+    },
+    "needs_rebuild": {
+      "type": "boolean"
+    },
+    "auto_fix_applied": {
+      "type": "boolean"
+    },
+    "auto_fix_actions": {
+      "type": "array",
+      "items": {
+        "type": "unknown"
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "fix_available": {
+            "type": "boolean"
+          },
+          "fix_applied": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "quarantine": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "object",
+          "properties": {
+            "failed_seed_bundle_count": {
+              "type": "integer"
+            },
+            "retained_publish_backup_count": {
+              "type": "integer"
+            },
+            "retained_publish_backup_retention_limit": {
+              "type": "integer"
+            },
+            "lexical_generation_count": {
+              "type": "integer"
+            },
+            "lexical_generation_build_state_counts": {
+              "type": "object",
+              "properties": {
+                "building": {
+                  "type": "integer"
+                },
+                "built": {
+                  "type": "integer"
+                },
+                "failed": {
+                  "type": "integer"
+                },
+                "scratch": {
+                  "type": "integer"
+                },
+                "validated": {
+                  "type": "integer"
+                },
+                "validating": {
+                  "type": "integer"
+                }
+              }
+            },
+            "lexical_generation_publish_state_counts": {
+              "type": "object",
+              "properties": {
+                "published": {
+                  "type": "integer"
+                },
+                "quarantined": {
+                  "type": "integer"
+                },
+                "staged": {
+                  "type": "integer"
+                },
+                "superseded": {
+                  "type": "integer"
+                }
+              }
+            },
+            "lexical_quarantined_generation_count": {
+              "type": "integer"
+            },
+            "lexical_quarantined_shard_count": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "gc_eligible_asset_count": {
+              "type": "integer"
+            },
+            "gc_eligible_bytes": {
+              "type": "integer"
+            },
+            "inspection_required_asset_count": {
+              "type": "integer"
+            },
+            "inspection_required_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_reclaim_candidate_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_reclaimable_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_retained_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_protected_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_active_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_inspection_required_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_approval_fingerprint": {
+              "type": "string"
+            },
+            "cleanup_apply_allowed": {
+              "type": "boolean"
+            }
+          }
+        },
+        "quarantined_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "failed_seed_bundle_files": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "retained_publish_backups": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "lexical_generations": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "lexical_cleanup_dry_run": {
+          "type": "object",
+          "properties": {
+            "dry_run": {
+              "type": "boolean"
+            },
+            "approval_fingerprint": {
+              "type": "string"
+            },
+            "generation_count": {
+              "type": "integer"
+            },
+            "total_artifact_bytes": {
+              "type": "integer"
+            },
+            "total_reclaimable_bytes": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "reclaim_candidates": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "reclaimable_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "fully_retained_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_retained_bytes": {
+              "type": "integer"
+            },
+            "quarantined_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "active_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "disposition_counts": {
+              "type": "object",
+              "properties": {}
+            },
+            "generation_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "inspection_items": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_count": {
+              "type": "integer"
+            },
+            "inspection_required_retained_bytes": {
+              "type": "integer"
+            },
+            "shard_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "inventories": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "lexical_cleanup_apply_gate": {
+          "type": "object",
+          "properties": {
+            "apply_allowed": {
+              "type": "boolean"
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "explicit_operator_approval": {
+              "type": "boolean"
+            },
+            "approval_fingerprint": {
+              "type": "string"
+            },
+            "provided_approval_fingerprint": {
+              "type": "null"
+            },
+            "approval_fingerprint_status": {
+              "type": "string"
+            },
+            "approval_fingerprint_matches": {
+              "type": "boolean"
+            },
+            "generation_count": {
+              "type": "integer"
+            },
+            "total_artifact_bytes": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "candidate_count": {
+              "type": "integer"
+            },
+            "reclaimable_bytes": {
+              "type": "integer"
+            },
+            "disposition_counts": {
+              "type": "object",
+              "properties": {}
+            },
+            "generation_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "shard_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "candidate_previews": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "reclaimable_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "fully_retained_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "quarantined_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "blocker_codes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "blocked_reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "active_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_retained_bytes": {
+              "type": "integer"
+            },
+            "inspection_previews": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_count": {
+              "type": "integer"
+            },
+            "inspection_required_retained_bytes": {
+              "type": "integer"
+            },
+            "inspection_required_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "_meta": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "data_dir": {
+          "type": "string"
+        },
+        "db_path": {
+          "type": "string"
+        },
+        "fix_mode": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

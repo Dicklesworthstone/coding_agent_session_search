@@ -1,0 +1,873 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "healthy": {
+      "type": "boolean"
+    },
+    "initialized": {
+      "type": "boolean"
+    },
+    "explanation": {
+      "type": "string"
+    },
+    "index": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "last_indexed_at": {
+          "type": "null"
+        },
+        "age_seconds": {
+          "type": "null"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "stale_threshold_seconds": {
+          "type": "integer"
+        },
+        "rebuilding": {
+          "type": "boolean"
+        },
+        "activity_at": {
+          "type": "null"
+        },
+        "documents": {
+          "type": "null"
+        },
+        "empty_with_messages": {
+          "type": "boolean"
+        },
+        "fingerprint": {
+          "type": "object",
+          "properties": {
+            "current_db_fingerprint": {
+              "type": "null"
+            },
+            "checkpoint_fingerprint": {
+              "type": "null"
+            },
+            "matches_current_db_fingerprint": {
+              "type": "null"
+            }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "completed": {
+              "type": "null"
+            },
+            "db_matches": {
+              "type": "null"
+            },
+            "schema_matches": {
+              "type": "null"
+            },
+            "page_size_matches": {
+              "type": "null"
+            },
+            "page_size_compatible": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "opened": {
+          "type": "boolean"
+        },
+        "conversations": {
+          "type": "integer"
+        },
+        "messages": {
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        },
+        "open_error": {
+          "type": "null"
+        },
+        "open_retryable": {
+          "type": "boolean"
+        },
+        "counts_skipped": {
+          "type": "boolean"
+        }
+      }
+    },
+    "pending": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "integer"
+        },
+        "watch_active": {
+          "type": "boolean"
+        },
+        "orphaned": {
+          "type": "boolean"
+        }
+      }
+    },
+    "rebuild": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "orphaned": {
+          "type": "boolean"
+        },
+        "pid": {
+          "type": "null"
+        },
+        "mode": {
+          "type": "null"
+        },
+        "job_id": {
+          "type": "null"
+        },
+        "job_kind": {
+          "type": "null"
+        },
+        "phase": {
+          "type": "null"
+        },
+        "started_at": {
+          "type": "null"
+        },
+        "updated_at": {
+          "type": "null"
+        },
+        "processed_conversations": {
+          "type": "null"
+        },
+        "total_conversations": {
+          "type": "null"
+        },
+        "indexed_docs": {
+          "type": "null"
+        },
+        "pipeline": {
+          "type": "object",
+          "properties": {
+            "workers": {
+              "type": "integer"
+            },
+            "available_parallelism": {
+              "type": "integer"
+            },
+            "reserved_cores": {
+              "type": "integer"
+            },
+            "tantivy_writer_threads": {
+              "type": "integer"
+            },
+            "staged_shard_builders": {
+              "type": "integer"
+            },
+            "staged_merge_workers": {
+              "type": "integer"
+            },
+            "controller_mode": {
+              "type": "string"
+            },
+            "controller_restore_clear_samples": {
+              "type": "integer"
+            },
+            "controller_restore_hold_ms": {
+              "type": "integer"
+            },
+            "pipeline_max_message_bytes_in_flight": {
+              "type": "integer"
+            },
+            "page_prep_workers": {
+              "type": "integer"
+            },
+            "page_size": {
+              "type": "integer"
+            },
+            "steady_batch_fetch_conversations": {
+              "type": "integer"
+            },
+            "startup_batch_fetch_conversations": {
+              "type": "integer"
+            },
+            "steady_commit_every_conversations": {
+              "type": "integer"
+            },
+            "startup_commit_every_conversations": {
+              "type": "integer"
+            },
+            "steady_commit_every_messages": {
+              "type": "integer"
+            },
+            "startup_commit_every_messages": {
+              "type": "integer"
+            },
+            "steady_commit_every_message_bytes": {
+              "type": "integer"
+            },
+            "startup_commit_every_message_bytes": {
+              "type": "integer"
+            },
+            "pipeline_channel_size": {
+              "type": "integer"
+            },
+            "controller_loadavg_high_watermark_1m": {
+              "type": "number"
+            },
+            "controller_loadavg_low_watermark_1m": {
+              "type": "number"
+            },
+            "runtime": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "rebuild_progress": {
+      "type": "object",
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "null"
+        },
+        "phase": {
+          "type": "null"
+        },
+        "processed_conversations": {
+          "type": "null"
+        },
+        "total_conversations": {
+          "type": "null"
+        },
+        "remaining_conversations": {
+          "type": "null"
+        },
+        "completion_ratio": {
+          "type": "null"
+        },
+        "indexed_docs": {
+          "type": "null"
+        },
+        "runtime_available": {
+          "type": "boolean"
+        },
+        "queue_depth": {
+          "type": "null"
+        },
+        "queue_capacity": {
+          "type": "null"
+        },
+        "queue_headroom": {
+          "type": "null"
+        },
+        "pending_batch_conversations": {
+          "type": "null"
+        },
+        "pending_batch_message_bytes": {
+          "type": "null"
+        },
+        "inflight_message_bytes": {
+          "type": "null"
+        },
+        "max_message_bytes_in_flight": {
+          "type": "null"
+        },
+        "inflight_message_bytes_headroom": {
+          "type": "null"
+        },
+        "controller_mode": {
+          "type": "null"
+        },
+        "controller_reason": {
+          "type": "null"
+        },
+        "updated_at": {
+          "type": "null"
+        }
+      }
+    },
+    "semantic": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "availability": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "can_search": {
+          "type": "boolean"
+        },
+        "fallback_mode": {
+          "type": "string"
+        },
+        "preferred_backend": {
+          "type": "string"
+        },
+        "embedder_id": {
+          "type": "null"
+        },
+        "vector_index_path": {
+          "type": "null"
+        },
+        "model_dir": {
+          "type": "null"
+        },
+        "hnsw_path": {
+          "type": "null"
+        },
+        "hnsw_ready": {
+          "type": "boolean"
+        },
+        "progressive_ready": {
+          "type": "boolean"
+        },
+        "hint": {
+          "type": "string"
+        },
+        "fast_tier": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "conversation_count": {
+              "type": "null"
+            },
+            "doc_count": {
+              "type": "null"
+            },
+            "embedder_id": {
+              "type": "null"
+            },
+            "model_revision": {
+              "type": "null"
+            },
+            "completed_at": {
+              "type": "null"
+            },
+            "size_bytes": {
+              "type": "null"
+            }
+          }
+        },
+        "quality_tier": {
+          "type": "object",
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "ready": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "conversation_count": {
+              "type": "null"
+            },
+            "doc_count": {
+              "type": "null"
+            },
+            "embedder_id": {
+              "type": "null"
+            },
+            "model_revision": {
+              "type": "null"
+            },
+            "completed_at": {
+              "type": "null"
+            },
+            "size_bytes": {
+              "type": "null"
+            }
+          }
+        },
+        "backlog": {
+          "type": "object",
+          "properties": {
+            "total_conversations": {
+              "type": "integer"
+            },
+            "fast_tier_processed": {
+              "type": "integer"
+            },
+            "fast_tier_remaining": {
+              "type": "integer"
+            },
+            "quality_tier_processed": {
+              "type": "integer"
+            },
+            "quality_tier_remaining": {
+              "type": "integer"
+            },
+            "pending_work": {
+              "type": "boolean"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "computed_at": {
+              "type": "null"
+            }
+          }
+        },
+        "checkpoint": {
+          "type": "object",
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "tier": {
+              "type": "null"
+            },
+            "current_db_matches": {
+              "type": "null"
+            },
+            "completed": {
+              "type": "null"
+            },
+            "conversations_processed": {
+              "type": "null"
+            },
+            "total_conversations": {
+              "type": "null"
+            },
+            "progress_pct": {
+              "type": "null"
+            },
+            "docs_embedded": {
+              "type": "null"
+            },
+            "last_offset": {
+              "type": "null"
+            },
+            "saved_at": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    },
+    "quarantine": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "object",
+          "properties": {
+            "failed_seed_bundle_count": {
+              "type": "integer"
+            },
+            "retained_publish_backup_count": {
+              "type": "integer"
+            },
+            "retained_publish_backup_retention_limit": {
+              "type": "integer"
+            },
+            "lexical_generation_count": {
+              "type": "integer"
+            },
+            "lexical_generation_build_state_counts": {
+              "type": "object",
+              "properties": {
+                "building": {
+                  "type": "integer"
+                },
+                "built": {
+                  "type": "integer"
+                },
+                "failed": {
+                  "type": "integer"
+                },
+                "scratch": {
+                  "type": "integer"
+                },
+                "validated": {
+                  "type": "integer"
+                },
+                "validating": {
+                  "type": "integer"
+                }
+              }
+            },
+            "lexical_generation_publish_state_counts": {
+              "type": "object",
+              "properties": {
+                "published": {
+                  "type": "integer"
+                },
+                "quarantined": {
+                  "type": "integer"
+                },
+                "staged": {
+                  "type": "integer"
+                },
+                "superseded": {
+                  "type": "integer"
+                }
+              }
+            },
+            "lexical_quarantined_generation_count": {
+              "type": "integer"
+            },
+            "lexical_quarantined_shard_count": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "gc_eligible_asset_count": {
+              "type": "integer"
+            },
+            "gc_eligible_bytes": {
+              "type": "integer"
+            },
+            "inspection_required_asset_count": {
+              "type": "integer"
+            },
+            "inspection_required_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_reclaim_candidate_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_reclaimable_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_retained_bytes": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_protected_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_active_generation_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_inspection_required_count": {
+              "type": "integer"
+            },
+            "cleanup_dry_run_approval_fingerprint": {
+              "type": "string"
+            },
+            "cleanup_apply_allowed": {
+              "type": "boolean"
+            }
+          }
+        },
+        "quarantined_artifacts": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "failed_seed_bundle_files": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "retained_publish_backups": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "lexical_generations": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "lexical_cleanup_dry_run": {
+          "type": "object",
+          "properties": {
+            "dry_run": {
+              "type": "boolean"
+            },
+            "approval_fingerprint": {
+              "type": "string"
+            },
+            "generation_count": {
+              "type": "integer"
+            },
+            "total_artifact_bytes": {
+              "type": "integer"
+            },
+            "total_reclaimable_bytes": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "reclaim_candidates": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "reclaimable_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "fully_retained_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_retained_bytes": {
+              "type": "integer"
+            },
+            "quarantined_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "active_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "disposition_counts": {
+              "type": "object",
+              "properties": {}
+            },
+            "generation_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "inspection_items": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_count": {
+              "type": "integer"
+            },
+            "inspection_required_retained_bytes": {
+              "type": "integer"
+            },
+            "shard_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "inventories": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "lexical_cleanup_apply_gate": {
+          "type": "object",
+          "properties": {
+            "apply_allowed": {
+              "type": "boolean"
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "explicit_operator_approval": {
+              "type": "boolean"
+            },
+            "approval_fingerprint": {
+              "type": "string"
+            },
+            "provided_approval_fingerprint": {
+              "type": "null"
+            },
+            "approval_fingerprint_status": {
+              "type": "string"
+            },
+            "approval_fingerprint_matches": {
+              "type": "boolean"
+            },
+            "generation_count": {
+              "type": "integer"
+            },
+            "total_artifact_bytes": {
+              "type": "integer"
+            },
+            "total_retained_bytes": {
+              "type": "integer"
+            },
+            "candidate_count": {
+              "type": "integer"
+            },
+            "reclaimable_bytes": {
+              "type": "integer"
+            },
+            "disposition_counts": {
+              "type": "object",
+              "properties": {}
+            },
+            "generation_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "shard_disposition_summaries": {
+              "type": "object",
+              "properties": {}
+            },
+            "candidate_previews": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "reclaimable_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "fully_retained_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "quarantined_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "blocker_codes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "blocked_reasons": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "active_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "protected_retained_bytes": {
+              "type": "integer"
+            },
+            "inspection_previews": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            },
+            "inspection_required_count": {
+              "type": "integer"
+            },
+            "inspection_required_retained_bytes": {
+              "type": "integer"
+            },
+            "inspection_required_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "unknown"
+              }
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "_meta": {
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string"
+        },
+        "data_dir": {
+          "type": "string"
+        },
+        "db_path": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

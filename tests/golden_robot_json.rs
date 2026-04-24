@@ -981,6 +981,37 @@ fn export_html_shape_matches_golden() {
 // data_dir where the model is not yet acquired, so they reach the
 // stable `not_acquired` / `model_not_installed` branches.
 
+// `coding_agent_session_search-q931h`: status and doctor had only
+// variant-scoped goldens (status_quarantine{_full}, status_semantic_*,
+// doctor_quarantine). The base not-initialized envelopes emitted
+// for `cass status --json` / `cass doctor --json` against a fresh
+// empty data_dir — the most common shape agent harnesses see before
+// the first index — had no shape pin at all. A regression that
+// added, removed, or re-typed a field in the base envelope would
+// compile clean and pass the existing suite. The two tests below
+// close that gap via json_value_schema diffs (same pattern as
+// health_shape_matches_golden / diag_shape_matches_golden).
+
+#[test]
+fn status_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let status =
+        capture_robot_json_value(test_home.path(), &["status", "--json"], ExpectStatus::ExitOk);
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
+    assert_golden("robot/status_shape.json.golden", &canonical);
+}
+
+#[test]
+fn doctor_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let doctor =
+        capture_robot_json_value(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&doctor)).expect("pretty-print JSON");
+    assert_golden("robot/doctor_shape.json.golden", &canonical);
+}
+
 #[test]
 fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
     // Mirrors stats_json_missing_db_error_envelope_shape_matches_golden:
