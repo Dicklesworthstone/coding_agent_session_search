@@ -317,3 +317,218 @@ fn models_backfill_keeps_semantic_work_data_dir_and_db_scoped() -> Result<(), St
         }
     })
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-7hot1 (child of ibuuh.10, scenario G:
+// semantic model acquisition — air-gap entry point, error-envelope E2E).
+//
+// AGENTS.md's Search Asset Contract promises: "Semantic model acquisition
+// is opt-in... Air-gapped installs use `--from-file <dir>`." The existing
+// arg-parse contract tests above pin the CLI shape, but no test pins the
+// RUNTIME validation error surface emitted by src/lib.rs::run_models_install
+// at line ~26760. Three distinct validation errors can fire there —
+// not-a-directory, missing required file, and mirror/from-file conflict —
+// and all three are silently untested at the user-visible stderr boundary.
+//
+// A regression that changed err.kind from "model" to something else,
+// dropped the hint pointing operators at the expected file set, or
+// silently accepted a partial file set would not be caught by the
+// arg-parse tests above. This gap matters especially for agents
+// running air-gapped installs: they consume the JSON error envelope
+// to decide what to do next.
+//
+// Contract pinned here, for the two cases that don't need the real
+// ~90MB MiniLM model (which this test fixture deliberately avoids):
+//   1. --from-file <nonexistent-path>
+//      - exit 21, err.kind == "model", err.code == 21,
+//        err.retryable == false, hint names "directory" + expected
+//        model file examples.
+//   2. --from-file <empty-dir>
+//      - exit 21, err.kind == "model", err.code == 21,
+//        err.retryable == false, hint enumerates the required file set
+//        (model.onnx, tokenizer.json, config.json, ...).
+// ========================================================================
+
+#[test]
+fn models_install_from_file_nonexistent_path_emits_model_error_envelope() {
+    use assert_cmd::cargo::cargo_bin;
+    use serde_json::Value;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    let nonexistent = tmp.path().join("definitely-not-there");
+    assert!(
+        !nonexistent.exists(),
+        "precondition: target path must not exist"
+    );
+
+    let output = std::process::Command::new(cargo_bin("cass"))
+        .args(["models", "install", "--from-file"])
+        .arg(&nonexistent)
+        .args(["--yes", "--robot-format", "json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .output()
+        .expect("run cass models install");
+
+    let exit = output.status.code().expect("exit code present");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        exit, 21,
+        "--from-file pointing at a nonexistent path must exit 21 (model kind); \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Find the JSON error envelope — may be on stderr or stdout.
+    let envelope_line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .or_else(|| {
+            stdout
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with('{'))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected JSON error envelope on stderr or stdout; \
+                 stdout: {stdout}\nstderr: {stderr}"
+            )
+        });
+    let envelope: Value = serde_json::from_str(envelope_line.trim())
+        .unwrap_or_else(|err| panic!("JSON parse of error envelope failed: {err}; line: {envelope_line}"));
+    let err_obj = envelope
+        .get("error")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("error envelope must have `error` object; got: {envelope}"));
+
+    assert_eq!(
+        err_obj.get("kind").and_then(Value::as_str),
+        Some("model"),
+        "err.kind must be 'model' for --from-file validation failures; got: {err_obj:?}"
+    );
+    assert_eq!(
+        err_obj.get("code").and_then(Value::as_i64),
+        Some(21),
+        "err.code must be 21 (model acquisition) and match exit code; got: {err_obj:?}"
+    );
+    assert_eq!(
+        err_obj.get("retryable").and_then(Value::as_bool),
+        Some(false),
+        "err.retryable must be false for invalid-path validation; got: {err_obj:?}"
+    );
+
+    let message = err_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("message must be a string");
+    assert!(
+        message.contains("is not a directory"),
+        "message must name the not-a-directory condition so operators can diagnose; \
+         got: {message:?}"
+    );
+
+    let hint = err_obj
+        .get("hint")
+        .and_then(Value::as_str)
+        .expect("hint must be a string");
+    assert!(
+        hint.contains("directory"),
+        "hint must guide the operator toward providing a directory; got: {hint:?}"
+    );
+}
+
+#[test]
+fn models_install_from_file_empty_dir_emits_required_file_error() {
+    use assert_cmd::cargo::cargo_bin;
+    use serde_json::Value;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().join("cass-data");
+    let model_src = tmp.path().join("empty-model-source");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+    std::fs::create_dir_all(&model_src).expect("create empty model source dir");
+
+    let output = std::process::Command::new(cargo_bin("cass"))
+        .args(["models", "install", "--from-file"])
+        .arg(&model_src)
+        .args(["--yes", "--robot-format", "json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .output()
+        .expect("run cass models install");
+
+    let exit = output.status.code().expect("exit code present");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        exit, 21,
+        "--from-file pointing at an empty dir must exit 21 (model kind); \
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let envelope_line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .or_else(|| {
+            stdout
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with('{'))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected JSON error envelope on stderr or stdout; \
+                 stdout: {stdout}\nstderr: {stderr}"
+            )
+        });
+    let envelope: Value = serde_json::from_str(envelope_line.trim())
+        .unwrap_or_else(|err| panic!("JSON parse failed: {err}; line: {envelope_line}"));
+    let err_obj = envelope
+        .get("error")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("error envelope must have `error` object; got: {envelope}"));
+
+    assert_eq!(
+        err_obj.get("kind").and_then(Value::as_str),
+        Some("model"),
+        "err.kind must be 'model'; got: {err_obj:?}"
+    );
+
+    let message = err_obj
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("message must be a string");
+    assert!(
+        message.contains("Required file") && message.contains("not found"),
+        "message must name the 'Required file ... not found' condition; got: {message:?}"
+    );
+
+    let hint = err_obj
+        .get("hint")
+        .and_then(Value::as_str)
+        .expect("hint must be a string");
+    // Hint must enumerate the expected file set so operators can
+    // assemble the air-gap bundle correctly. At minimum it names
+    // model.onnx and tokenizer.json.
+    assert!(
+        hint.contains("model.onnx"),
+        "hint must name the required model.onnx file; got: {hint:?}"
+    );
+    assert!(
+        hint.contains("tokenizer.json"),
+        "hint must name the required tokenizer.json file; got: {hint:?}"
+    );
+}
