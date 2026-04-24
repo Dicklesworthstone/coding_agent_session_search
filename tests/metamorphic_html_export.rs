@@ -79,14 +79,49 @@ fn export_to(session_path: &Path, out_dir: &Path, filename: &str) -> PathBuf {
 fn scrub_transient(html: &str) -> String {
     let mut scrubbed = html.to_string();
     // ISO timestamps in `rendered_at` / `generated_at` meta tags.
-    let rendered_at = regex::Regex::new(
-        r#"(?P<key>(rendered|generated)_at)="[^"]*""#,
-    )
-    .expect("scrub regex compiles");
+    let rendered_at = regex::Regex::new(r#"(?P<key>(rendered|generated)_at)="[^"]*""#)
+        .expect("scrub regex compiles");
     scrubbed = rendered_at
         .replace_all(&scrubbed, "$key=\"[SCRUBBED]\"")
         .into_owned();
     scrubbed
+}
+
+fn clamp_down_to_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn clamp_up_to_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn diff_context_window(s: &str, idx: usize, radius: usize) -> &str {
+    let lo = clamp_down_to_char_boundary(s, idx.saturating_sub(radius));
+    let hi = clamp_up_to_char_boundary(s, idx.saturating_add(radius));
+    &s[lo..hi]
+}
+
+#[test]
+fn diff_context_window_handles_non_char_boundary_indices() {
+    let text = "prefix • unicode 🚀 suffix";
+    let non_boundary_idx = text.find('•').expect("bullet present") + 1;
+    assert!(
+        !text.is_char_boundary(non_boundary_idx),
+        "test setup must exercise a byte offset inside a multi-byte character"
+    );
+
+    for idx in 0..=text.len() {
+        let context = diff_context_window(text, idx, 4);
+        assert!(text.contains(context));
+    }
 }
 
 /// `coding_agent_session_search-afam7`: pin the equivalence MR
@@ -126,13 +161,11 @@ fn mr_html_export_byte_idempotent_for_same_source() {
             .position(|(a, b)| a != b);
         let context = first_diff
             .map(|idx| {
-                let lo = idx.saturating_sub(40);
-                let hi_a = (idx + 40).min(scrubbed_a.len());
-                let hi_b = (idx + 40).min(scrubbed_b.len());
+                let context_a = diff_context_window(&scrubbed_a, idx, 40);
+                let context_b = diff_context_window(&scrubbed_b, idx, 40);
                 format!(
                     "first divergence at byte {idx}:\n  a: {:?}\n  b: {:?}",
-                    &scrubbed_a[lo..hi_a],
-                    &scrubbed_b[lo..hi_b]
+                    context_a, context_b
                 )
             })
             .unwrap_or_else(|| {
