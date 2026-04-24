@@ -505,6 +505,51 @@ mod tests {
     }
 
     #[test]
+    fn test_search_treats_like_metacharacters_literally() {
+        let (store, _dir) = test_store();
+
+        store
+            .add(&Bookmark::new(
+                "Percent 100% complete",
+                "/percent.rs",
+                "a",
+                "/w",
+            ))
+            .unwrap();
+        store
+            .add(&Bookmark::new(
+                "Underscore auth_token",
+                "/underscore.rs",
+                "a",
+                "/w",
+            ))
+            .unwrap();
+        store
+            .add(&Bookmark::new(
+                "Backslash path C:\\tmp",
+                "/backslash.rs",
+                "a",
+                "/w",
+            ))
+            .unwrap();
+        store
+            .add(&Bookmark::new("Plain row", "/plain.rs", "a", "/w"))
+            .unwrap();
+
+        let percent_results = store.search("%").unwrap();
+        assert_eq!(percent_results.len(), 1);
+        assert_eq!(percent_results[0].source_path, "/percent.rs");
+
+        let underscore_results = store.search("_").unwrap();
+        assert_eq!(underscore_results.len(), 1);
+        assert_eq!(underscore_results[0].source_path, "/underscore.rs");
+
+        let backslash_results = store.search("\\").unwrap();
+        assert_eq!(backslash_results.len(), 1);
+        assert_eq!(backslash_results[0].source_path, "/backslash.rs");
+    }
+
+    #[test]
     fn test_is_bookmarked() {
         let (store, _dir) = test_store();
 
@@ -578,5 +623,21 @@ mod tests {
         let imported = store2.import_json(&json).unwrap();
         assert_eq!(imported, 2);
         assert_eq!(store2.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_import_deduplicates_null_and_specific_line_numbers_separately() {
+        let (store, _dir) = test_store();
+        let bookmarks = vec![
+            Bookmark::new("Whole file", "/same.rs", "agent", "/w"),
+            Bookmark::new("Specific line", "/same.rs", "agent", "/w").with_line(10),
+        ];
+        let json = serde_json::to_string(&bookmarks).unwrap();
+
+        assert_eq!(store.import_json(&json).unwrap(), 2);
+        assert_eq!(store.import_json(&json).unwrap(), 0);
+        assert_eq!(store.count().unwrap(), 2);
+        assert!(store.is_bookmarked("/same.rs", None).unwrap());
+        assert!(store.is_bookmarked("/same.rs", Some(10)).unwrap());
     }
 }
