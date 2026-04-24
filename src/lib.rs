@@ -10614,6 +10614,44 @@ struct DiagQuarantineReport {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+struct DiagCleanupApplyResult {
+    requested: bool,
+    applied: bool,
+    approval_fingerprint: String,
+    apply_allowed: bool,
+    blocked_reasons: Vec<String>,
+    blocker_codes: Vec<crate::indexer::lexical_generation::LexicalCleanupApplyBlocker>,
+    before_generation_count: usize,
+    before_reclaim_candidate_count: usize,
+    before_reclaimable_bytes: u64,
+    before_retained_bytes: u64,
+    after_generation_count: usize,
+    after_reclaim_candidate_count: usize,
+    after_reclaimable_bytes: u64,
+    after_retained_bytes: u64,
+    pruned_asset_count: usize,
+    skipped_asset_count: usize,
+    reclaimed_bytes: u64,
+    actions: Vec<DiagCleanupApplyAction>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagCleanupApplyAction {
+    artifact_kind: String,
+    path: String,
+    generation_id: Option<String>,
+    shard_id: Option<String>,
+    disposition: Option<crate::indexer::lexical_generation::LexicalCleanupDisposition>,
+    reason: String,
+    planned_reclaimable_bytes: u64,
+    reclaimed_bytes: u64,
+    applied: bool,
+    skipped: bool,
+    skip_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct DiagPathObservation {
     size_bytes: u64,
@@ -10622,19 +10660,18 @@ struct DiagPathObservation {
     modified_at: Option<std::time::SystemTime>,
 }
 
+#[derive(Debug, Clone)]
+struct DiagLexicalManifestEntry {
+    path: PathBuf,
+    manifest: crate::indexer::lexical_generation::LexicalGenerationManifest,
+    observation: DiagPathObservation,
+    quarantined_shards: usize,
+}
+
 fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQuarantineReport {
     use crate::indexer::lexical_generation::{
-        LEXICAL_GENERATION_MANIFEST_FILE, LexicalCleanupDryRunPlan, LexicalGenerationPublishState,
-        LexicalShardLifecycleState, load_manifest,
+        LexicalCleanupDryRunPlan, LexicalGenerationPublishState,
     };
-
-    #[derive(Debug)]
-    struct LexicalManifestEntry {
-        path: PathBuf,
-        manifest: crate::indexer::lexical_generation::LexicalGenerationManifest,
-        observation: DiagPathObservation,
-        quarantined_shards: usize,
-    }
 
     let mut report = DiagQuarantineReport::default();
     report.summary.lexical_generation_build_state_counts =
@@ -10734,60 +10771,12 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         )),
     }
 
-    let mut lexical_manifest_entries = Vec::new();
-    for entry in walkdir::WalkDir::new(data_dir).follow_links(false) {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                report.warnings.push(format!(
-                    "failed to walk quarantine roots under {}: {err}",
-                    data_dir.display()
-                ));
-                continue;
-            }
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry.file_name().to_string_lossy() != LEXICAL_GENERATION_MANIFEST_FILE {
-            continue;
-        }
-        let Some(generation_dir) = entry.path().parent() else {
-            continue;
-        };
-        match load_manifest(generation_dir) {
-            Ok(Some(manifest)) => {
-                let quarantined_shards = manifest
-                    .shards
-                    .iter()
-                    .filter(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
-                    .count();
-                report.summary.lexical_generation_count =
-                    report.summary.lexical_generation_count.saturating_add(1);
-                *report
-                    .summary
-                    .lexical_generation_build_state_counts
-                    .entry(lexical_generation_build_state_label(manifest.build_state).to_string())
-                    .or_insert(0) += 1;
-                *report
-                    .summary
-                    .lexical_generation_publish_state_counts
-                    .entry(lexical_publish_state_label(manifest.publish_state).to_string())
-                    .or_insert(0) += 1;
-                lexical_manifest_entries.push(LexicalManifestEntry {
-                    path: generation_dir.to_path_buf(),
-                    observation: observe_diag_path(generation_dir, now, &mut report.warnings),
-                    manifest,
-                    quarantined_shards,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => report.warnings.push(format!(
-                "failed to load lexical quarantine manifest at {}: {err}",
-                entry.path().display()
-            )),
-        }
-    }
+    let lexical_manifest_entries = collect_diag_lexical_manifest_entries(
+        data_dir,
+        now,
+        &mut report.warnings,
+        &mut report.summary,
+    );
 
     let lexical_cleanup_plan = LexicalCleanupDryRunPlan::from_manifests(
         lexical_manifest_entries.iter().map(|entry| &entry.manifest),
@@ -10956,6 +10945,373 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
     report.lexical_cleanup_dry_run = Some(lexical_cleanup_plan);
 
     report
+}
+
+fn collect_diag_lexical_manifest_entries(
+    data_dir: &Path,
+    now: std::time::SystemTime,
+    warnings: &mut Vec<String>,
+    summary: &mut DiagQuarantineSummary,
+) -> Vec<DiagLexicalManifestEntry> {
+    use crate::indexer::lexical_generation::{
+        LEXICAL_GENERATION_MANIFEST_FILE, LexicalShardLifecycleState, load_manifest,
+    };
+
+    let mut lexical_manifest_entries = Vec::new();
+    for entry in walkdir::WalkDir::new(data_dir).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warnings.push(format!(
+                    "failed to walk quarantine roots under {}: {err}",
+                    data_dir.display()
+                ));
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name().to_string_lossy() != LEXICAL_GENERATION_MANIFEST_FILE {
+            continue;
+        }
+        let Some(generation_dir) = entry.path().parent() else {
+            continue;
+        };
+        match load_manifest(generation_dir) {
+            Ok(Some(manifest)) => {
+                let quarantined_shards = manifest
+                    .shards
+                    .iter()
+                    .filter(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
+                    .count();
+                summary.lexical_generation_count =
+                    summary.lexical_generation_count.saturating_add(1);
+                *summary
+                    .lexical_generation_build_state_counts
+                    .entry(lexical_generation_build_state_label(manifest.build_state).to_string())
+                    .or_insert(0) += 1;
+                *summary
+                    .lexical_generation_publish_state_counts
+                    .entry(lexical_publish_state_label(manifest.publish_state).to_string())
+                    .or_insert(0) += 1;
+                lexical_manifest_entries.push(DiagLexicalManifestEntry {
+                    path: generation_dir.to_path_buf(),
+                    observation: observe_diag_path(generation_dir, now, warnings),
+                    manifest,
+                    quarantined_shards,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => warnings.push(format!(
+                "failed to load lexical quarantine manifest at {}: {err}",
+                entry.path().display()
+            )),
+        }
+    }
+
+    lexical_manifest_entries
+}
+
+fn apply_diag_quarantine_cleanup(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    rebuild_active: bool,
+) -> DiagCleanupApplyResult {
+    use crate::indexer::lexical_generation::LexicalCleanupDisposition;
+
+    let before = collect_diag_quarantine_report(data_dir, index_path);
+    let plan = before
+        .lexical_cleanup_dry_run
+        .clone()
+        .expect("quarantine collection always attaches a lexical cleanup dry-run plan");
+    let apply_gate =
+        plan.apply_gate_with_fingerprint(true, Some(plan.approval_fingerprint.as_str()));
+    let safe_retained_publish_backup_count = before
+        .retained_publish_backups
+        .iter()
+        .filter(|artifact| artifact.safe_to_gc)
+        .count();
+    let (blocked_reasons, blocker_codes) = if plan.has_reclaimable_artifacts() {
+        (
+            apply_gate.blocked_reasons.clone(),
+            apply_gate.blocker_codes.clone(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let mut result = DiagCleanupApplyResult {
+        requested: true,
+        approval_fingerprint: plan.approval_fingerprint.clone(),
+        apply_allowed: !rebuild_active
+            && (safe_retained_publish_backup_count > 0 || apply_gate.apply_allowed),
+        blocked_reasons,
+        blocker_codes,
+        before_generation_count: plan.generation_count,
+        before_reclaim_candidate_count: plan.reclaim_candidates.len(),
+        before_reclaimable_bytes: plan.total_reclaimable_bytes,
+        before_retained_bytes: plan.total_retained_bytes,
+        ..DiagCleanupApplyResult::default()
+    };
+
+    if rebuild_active {
+        result
+            .blocked_reasons
+            .push("active index rebuild lock prevents cleanup apply".to_string());
+        result
+            .warnings
+            .push("cleanup apply skipped because an index rebuild lock is active".to_string());
+    }
+
+    if rebuild_active {
+        let after = collect_diag_quarantine_report(data_dir, index_path);
+        fill_cleanup_after_summary(&mut result, &after);
+        return result;
+    }
+
+    for artifact in before
+        .retained_publish_backups
+        .iter()
+        .filter(|artifact| artifact.safe_to_gc)
+    {
+        let path = PathBuf::from(&artifact.path);
+        let mut action = DiagCleanupApplyAction {
+            artifact_kind: "retained_publish_backup".to_string(),
+            path: artifact.path.clone(),
+            generation_id: None,
+            shard_id: None,
+            disposition: None,
+            reason: artifact.gc_reason.clone(),
+            planned_reclaimable_bytes: artifact.size_bytes,
+            reclaimed_bytes: 0,
+            applied: false,
+            skipped: false,
+            skip_reason: None,
+        };
+
+        match prune_cleanup_target(&path, data_dir, db_path, index_path) {
+            Ok(reclaimed_bytes) => {
+                action.reclaimed_bytes = reclaimed_bytes;
+                action.applied = true;
+                result.pruned_asset_count = result.pruned_asset_count.saturating_add(1);
+                result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(reclaimed_bytes);
+                tracing::info!(
+                    target: "cass::doctor::cleanup",
+                    artifact_kind = "retained_publish_backup",
+                    path = %path.display(),
+                    reclaimed_bytes,
+                    "pruned retained lexical publish backup outside retention cap"
+                );
+            }
+            Err(err) => {
+                action.skipped = true;
+                action.skip_reason = Some(err.clone());
+                result.skipped_asset_count = result.skipped_asset_count.saturating_add(1);
+                result.warnings.push(err);
+            }
+        }
+
+        result.actions.push(action);
+    }
+
+    let mut scan_warnings = Vec::new();
+    let mut scan_summary = DiagQuarantineSummary {
+        lexical_generation_build_state_counts: lexical_generation_build_state_zero_counts(),
+        lexical_generation_publish_state_counts: lexical_generation_publish_state_zero_counts(),
+        ..DiagQuarantineSummary::default()
+    };
+    let lexical_manifest_entries = collect_diag_lexical_manifest_entries(
+        data_dir,
+        std::time::SystemTime::now(),
+        &mut scan_warnings,
+        &mut scan_summary,
+    );
+    result.warnings.extend(scan_warnings);
+
+    let inventories_by_generation: HashMap<_, _> = plan
+        .inventories
+        .iter()
+        .map(|inventory| (inventory.generation_id.clone(), inventory.clone()))
+        .collect();
+
+    if apply_gate.apply_allowed {
+        for entry in lexical_manifest_entries {
+            let Some(inventory) = inventories_by_generation.get(&entry.manifest.generation_id)
+            else {
+                continue;
+            };
+            if inventory.reclaimable_bytes == 0 {
+                continue;
+            }
+
+            let mut action = DiagCleanupApplyAction {
+                artifact_kind: "lexical_generation".to_string(),
+                path: entry.path.display().to_string(),
+                generation_id: Some(entry.manifest.generation_id.clone()),
+                shard_id: None,
+                disposition: Some(inventory.disposition),
+                reason: inventory.reason.clone(),
+                planned_reclaimable_bytes: inventory.reclaimable_bytes,
+                reclaimed_bytes: 0,
+                applied: false,
+                skipped: false,
+                skip_reason: None,
+            };
+
+            let generation_fully_reclaimable = inventory.retained_bytes == 0
+                && inventory.reclaimable_bytes >= inventory.artifact_bytes;
+            let generation_disposition_reclaimable = matches!(
+                inventory.disposition,
+                LexicalCleanupDisposition::SupersededReclaimable
+                    | LexicalCleanupDisposition::FailedReclaimable
+            );
+
+            if !generation_fully_reclaimable || !generation_disposition_reclaimable {
+                let reason = format!(
+                    "cleanup apply only prunes whole lexical generations in this slice; retained_bytes={} disposition={}",
+                    inventory.retained_bytes,
+                    lexical_cleanup_disposition_label(inventory.disposition)
+                );
+                action.skipped = true;
+                action.skip_reason = Some(reason.clone());
+                result.skipped_asset_count = result.skipped_asset_count.saturating_add(1);
+                result.warnings.push(reason);
+                result.actions.push(action);
+                continue;
+            }
+
+            match prune_cleanup_target(&entry.path, data_dir, db_path, index_path) {
+                Ok(reclaimed_bytes) => {
+                    action.reclaimed_bytes = reclaimed_bytes;
+                    action.applied = true;
+                    result.pruned_asset_count = result.pruned_asset_count.saturating_add(1);
+                    result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(reclaimed_bytes);
+                    tracing::info!(
+                        target: "cass::doctor::cleanup",
+                        artifact_kind = "lexical_generation",
+                        generation_id = %entry.manifest.generation_id,
+                        disposition = lexical_cleanup_disposition_label(inventory.disposition),
+                        path = %entry.path.display(),
+                        planned_reclaimable_bytes = inventory.reclaimable_bytes,
+                        reclaimed_bytes,
+                        "pruned reclaimable lexical generation"
+                    );
+                }
+                Err(err) => {
+                    action.skipped = true;
+                    action.skip_reason = Some(err.clone());
+                    result.skipped_asset_count = result.skipped_asset_count.saturating_add(1);
+                    result.warnings.push(err);
+                }
+            }
+
+            result.actions.push(action);
+        }
+    } else if plan.has_reclaimable_artifacts() {
+        result.warnings.push(format!(
+            "lexical cleanup apply skipped because dry-run gate blocked apply: {}",
+            apply_gate.blocked_reasons.join("; ")
+        ));
+    }
+
+    let after = collect_diag_quarantine_report(data_dir, index_path);
+    fill_cleanup_after_summary(&mut result, &after);
+    result.applied = result.pruned_asset_count > 0;
+    result
+}
+
+fn fill_cleanup_after_summary(result: &mut DiagCleanupApplyResult, after: &DiagQuarantineReport) {
+    if let Some(plan) = after.lexical_cleanup_dry_run.as_ref() {
+        result.after_generation_count = plan.generation_count;
+        result.after_reclaim_candidate_count = plan.reclaim_candidates.len();
+        result.after_reclaimable_bytes = plan.total_reclaimable_bytes;
+        result.after_retained_bytes = plan.total_retained_bytes;
+    }
+}
+
+fn prune_cleanup_target(
+    path: &Path,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) -> Result<u64, String> {
+    if !cleanup_target_path_is_safe(path, data_dir, db_path, index_path) {
+        return Err(format!(
+            "refusing to prune unsafe cleanup target {}",
+            path.display()
+        ));
+    }
+    let reclaimed_bytes = fs_dir_size(path);
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(|err| format!("failed to prune cleanup target {}: {err}", path.display()))?;
+    Ok(reclaimed_bytes)
+}
+
+fn cleanup_target_path_is_safe(
+    path: &Path,
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) -> bool {
+    if !path.starts_with(data_dir) || path == data_dir || path == db_path || path == index_path {
+        return false;
+    }
+    if path.starts_with(index_path) {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let publish_backup_parent = index_path
+        .parent()
+        .unwrap_or(index_path)
+        .join(".lexical-publish-backups");
+    let is_retained_publish_backup = path
+        .parent()
+        .map(|parent| parent == publish_backup_parent)
+        .unwrap_or(false);
+    let is_manifest_backed_generation = path
+        .join(crate::indexer::lexical_generation::LEXICAL_GENERATION_MANIFEST_FILE)
+        .is_file();
+    is_retained_publish_backup || is_manifest_backed_generation
+}
+
+fn lexical_cleanup_disposition_label(
+    disposition: crate::indexer::lexical_generation::LexicalCleanupDisposition,
+) -> &'static str {
+    match disposition {
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::CurrentPublished => {
+            "current_published"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::ActiveWork => "active_work",
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::QuarantinedRetained => {
+            "quarantined_retained"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::SupersededReclaimable => {
+            "superseded_reclaimable"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::SupersededRetained => {
+            "superseded_retained"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::FailedReclaimable => {
+            "failed_reclaimable"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::FailedRetained => {
+            "failed_retained"
+        }
+        crate::indexer::lexical_generation::LexicalCleanupDisposition::PinnedRetained => {
+            "pinned_retained"
+        }
+    }
 }
 
 fn diag_retained_publish_backup_limit() -> usize {
@@ -14290,6 +14646,54 @@ fn run_doctor(
         }
     }
 
+    let cleanup_apply_result = if fix {
+        let result =
+            apply_diag_quarantine_cleanup(&data_dir, &db_path, &index_path, rebuild_active);
+        let cleanup_status = if result.applied {
+            "pass"
+        } else if result.before_reclaim_candidate_count > 0
+            || result
+                .actions
+                .iter()
+                .any(|action| action.artifact_kind == "retained_publish_backup")
+        {
+            "warn"
+        } else {
+            "pass"
+        };
+        let cleanup_message = if result.applied {
+            format!(
+                "Pruned {} derivative cleanup artifact(s), reclaimed {} bytes",
+                result.pruned_asset_count, result.reclaimed_bytes
+            )
+        } else if !result.blocked_reasons.is_empty() {
+            format!(
+                "Derivative cleanup skipped: {}",
+                result.blocked_reasons.join("; ")
+            )
+        } else {
+            "No derivative cleanup artifacts were eligible for pruning".to_string()
+        };
+        checks.push(Check {
+            name: "derivative_cleanup".to_string(),
+            status: cleanup_status.to_string(),
+            message: cleanup_message.clone(),
+            fix_available: result.before_reclaim_candidate_count > 0
+                || result
+                    .actions
+                    .iter()
+                    .any(|action| action.artifact_kind == "retained_publish_backup"),
+            fix_applied: result.applied,
+        });
+        if result.applied {
+            auto_fix_actions.push(cleanup_message);
+            auto_fix_applied = true;
+        }
+        Some(result)
+    } else {
+        None
+    };
+
     // Count issues
     let fail_count = checks.iter().filter(|c| c.status == "fail").count();
     let warn_count = checks.iter().filter(|c| c.status == "warn").count();
@@ -14318,7 +14722,7 @@ fn run_doctor(
 
     if let Some(fmt) = structured_format {
         let quarantine_report = collect_diag_quarantine_report(&data_dir, &index_path);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "status": doctor_status,
             "healthy": healthy,
             "initialized": !not_initialized,
@@ -14340,6 +14744,9 @@ fn run_doctor(
                 "fix_mode": fix,
             }
         });
+        if let Some(result) = cleanup_apply_result.as_ref() {
+            payload["cleanup_apply"] = serde_json::json!(result);
+        }
         output_structured_value(payload, fmt)?;
     } else {
         // Human-readable output
