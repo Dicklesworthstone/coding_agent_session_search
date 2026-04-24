@@ -246,6 +246,9 @@
           "retained_bytes": 512
         }
       ],
+      "inspection_required_generation_ids": [
+        "gen-quarantined"
+      ],
       "inspection_required_count": 1,
       "inspection_required_retained_bytes": 512,
       "shard_disposition_summaries": {

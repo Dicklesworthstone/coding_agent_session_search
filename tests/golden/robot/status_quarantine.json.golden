@@ -203,7 +203,262 @@
       "cleanup_dry_run_inspection_required_count": 1,
       "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
       "cleanup_apply_allowed": false
-    }
+    },
+    "quarantined_artifacts": [
+      {
+        "artifact_kind": "failed_seed_bundle_file",
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+        "generation_id": null,
+        "shard_id": null,
+        "publish_state": null,
+        "shard_state": null,
+        "size_bytes": 11,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "artifact_kind": "failed_seed_bundle_file",
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal",
+        "generation_id": null,
+        "shard_id": null,
+        "publish_state": null,
+        "shard_state": null,
+        "size_bytes": 8,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "artifact_kind": "lexical_generation",
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "shard_id": null,
+        "publish_state": "quarantined",
+        "shard_state": null,
+        "size_bytes": 1069,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
+      },
+      {
+        "artifact_kind": "lexical_shard",
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "shard_id": "shard-a",
+        "publish_state": "quarantined",
+        "shard_state": "quarantined",
+        "size_bytes": 512,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "validation_failed"
+      }
+    ],
+    "failed_seed_bundle_files": [
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+        "size_bytes": 11,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal",
+        "size_bytes": 8,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      }
+    ],
+    "retained_publish_backups": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-newer",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "retained lexical publish backup is still protected by retention cap (1)"
+      },
+      {
+        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-older",
+        "size_bytes": 25,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": true,
+        "gc_reason": "retained lexical publish backup falls outside retention cap (1)"
+      }
+    ],
+    "lexical_generations": [
+      {
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "publish_state": "quarantined",
+        "quarantined_shards": 1,
+        "total_shards": 1,
+        "artifact_bytes": 1069,
+        "updated_at_ms": 1733000000321,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "reclaimable_bytes": 0,
+        "inspection_required": true,
+        "safe_to_gc": false,
+        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
+      }
+    ],
+    "lexical_cleanup_dry_run": {
+      "dry_run": true,
+      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "generation_count": 1,
+      "total_artifact_bytes": 512,
+      "total_reclaimable_bytes": 0,
+      "total_retained_bytes": 512,
+      "reclaim_candidates": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_retained_bytes": 512,
+      "quarantined_generation_ids": [
+        "gen-quarantined"
+      ],
+      "active_generation_ids": [],
+      "disposition_counts": {
+        "quarantined_retained": 1
+      },
+      "generation_disposition_summaries": {
+        "quarantined_retained": {
+          "generation_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "inspection_items": [
+        {
+          "generation_id": "gen-quarantined",
+          "shard_id": "shard-a",
+          "disposition": "quarantined_retained",
+          "reason": "validation_failed",
+          "retained_bytes": 512
+        }
+      ],
+      "inspection_required_generation_ids": [
+        "gen-quarantined"
+      ],
+      "inspection_required_count": 1,
+      "inspection_required_retained_bytes": 512,
+      "shard_disposition_summaries": {
+        "quarantined_retained": {
+          "shard_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "inventories": [
+        {
+          "generation_id": "gen-quarantined",
+          "build_state": "failed",
+          "publish_state": "quarantined",
+          "disposition": "quarantined_retained",
+          "reason": "quarantined lexical generation is retained for inspection",
+          "retain_until_ms": null,
+          "retention_reason": "quarantined generation is retained indefinitely until operator inspection clears it",
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512,
+          "shards": [
+            {
+              "shard_id": "shard-a",
+              "state": "quarantined",
+              "disposition": "quarantined_retained",
+              "reason": "validation_failed",
+              "artifact_bytes": 512,
+              "reclaimable_bytes": 0,
+              "retained_bytes": 512
+            }
+          ]
+        }
+      ]
+    },
+    "lexical_cleanup_apply_gate": {
+      "apply_allowed": false,
+      "dry_run": true,
+      "explicit_operator_approval": false,
+      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "provided_approval_fingerprint": null,
+      "approval_fingerprint_status": "not_requested",
+      "approval_fingerprint_matches": false,
+      "generation_count": 1,
+      "total_artifact_bytes": 512,
+      "total_retained_bytes": 512,
+      "candidate_count": 0,
+      "reclaimable_bytes": 0,
+      "disposition_counts": {
+        "quarantined_retained": 1
+      },
+      "generation_disposition_summaries": {
+        "quarantined_retained": {
+          "generation_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "shard_disposition_summaries": {
+        "quarantined_retained": {
+          "shard_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "candidate_previews": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-quarantined"
+      ],
+      "quarantined_generation_ids": [
+        "gen-quarantined"
+      ],
+      "blocker_codes": [
+        "no_reclaimable_candidates",
+        "operator_approval_required"
+      ],
+      "blocked_reasons": [
+        "no reclaimable cleanup candidates",
+        "destructive cleanup requires explicit operator approval after dry-run"
+      ],
+      "active_generation_ids": [],
+      "protected_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_retained_bytes": 512,
+      "inspection_previews": [
+        {
+          "generation_id": "gen-quarantined",
+          "shard_id": "shard-a",
+          "disposition": "quarantined_retained",
+          "reason": "validation_failed",
+          "retained_bytes": 512
+        }
+      ],
+      "inspection_required_count": 1,
+      "inspection_required_retained_bytes": 512,
+      "inspection_required_generation_ids": [
+        "gen-quarantined"
+      ]
+    },
+    "warnings": []
   },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
   "_meta": {
