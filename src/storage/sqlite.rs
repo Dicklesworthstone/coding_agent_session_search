@@ -2812,6 +2812,43 @@ pub struct FrankenStorage {
     conn: FrankenConnection,
 }
 
+const AUTOCOMMIT_RETAIN_OFF_PRAGMAS: [&str; 2] = [
+    "PRAGMA fsqlite.autocommit_retain = OFF;",
+    "PRAGMA autocommit_retain = OFF;",
+];
+
+fn disable_autocommit_retain<E>(
+    mut execute: impl FnMut(&'static str) -> std::result::Result<(), E>,
+) -> Result<&'static str>
+where
+    E: std::fmt::Display,
+{
+    let mut failures = Vec::new();
+    for pragma in AUTOCOMMIT_RETAIN_OFF_PRAGMAS {
+        match execute(pragma) {
+            Ok(()) => return Ok(pragma),
+            Err(err) => {
+                let error = err.to_string();
+                tracing::debug!(
+                    %pragma,
+                    error = %error,
+                    "autocommit_retain PRAGMA variant not supported"
+                );
+                failures.push(format!("{pragma}: {error}"));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to disable autocommit_retain on frankensqlite connection; \
+         refusing to keep a long-lived MVCC connection that may accumulate \
+         unbounded write snapshots. Upgrade frankensqlite to a version that \
+         supports one of these PRAGMAs or use a short-lived connection path. \
+         attempts: {}",
+        failures.join("; ")
+    ))
+}
+
 impl FrankenStorage {
     fn apply_open_stage_busy_timeout(&self) {
         if let Err(err) = self.conn.execute("PRAGMA busy_timeout = 5000;") {
@@ -2955,32 +2992,12 @@ impl FrankenStorage {
         // Log at warn level so the failure is visible instead of silently
         // swallowed, and set a flag for callers that need to periodically
         // recycle the connection.
-        let mut autocommit_retain_disabled = false;
-        for pragma in [
-            "PRAGMA fsqlite.autocommit_retain = OFF;",
-            "PRAGMA autocommit_retain = OFF;",
-        ] {
-            match self.conn.execute(pragma) {
-                Ok(_) => {
-                    autocommit_retain_disabled = true;
-                    break;
-                }
-                Err(err) => {
-                    tracing::debug!(
-                        %pragma,
-                        error = %err,
-                        "autocommit_retain PRAGMA variant not supported"
-                    );
-                }
-            }
-        }
-        if !autocommit_retain_disabled {
-            tracing::warn!(
-                "failed to disable autocommit_retain on frankensqlite connection; \
-                 long-lived connections may accumulate unbounded MVCC snapshots. \
-                 Upgrade frankensqlite to a version that supports this PRAGMA."
-            );
-        }
+        let autocommit_pragma =
+            disable_autocommit_retain(|pragma| self.conn.execute(pragma).map(|_| ()))?;
+        tracing::debug!(
+            pragma = autocommit_pragma,
+            "disabled frankensqlite autocommit_retain for storage connection"
+        );
 
         Ok(())
     }
@@ -10964,6 +10981,47 @@ fn agent_kind_str(kind: AgentKind) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn autocommit_retain_disable_tries_compat_then_canonical_pragma() {
+        let mut attempts = Vec::new();
+
+        let selected = disable_autocommit_retain(|pragma| {
+            attempts.push(pragma);
+            if pragma == "PRAGMA fsqlite.autocommit_retain = OFF;" {
+                Err("compat namespace unavailable")
+            } else {
+                Ok(())
+            }
+        })
+        .expect("canonical pragma should disable autocommit retain");
+
+        assert_eq!(selected, "PRAGMA autocommit_retain = OFF;");
+        assert_eq!(attempts, AUTOCOMMIT_RETAIN_OFF_PRAGMAS);
+    }
+
+    #[test]
+    fn autocommit_retain_disable_fails_closed_when_no_pragma_works() {
+        let mut attempts = Vec::new();
+
+        let err = disable_autocommit_retain(|pragma| {
+            attempts.push(pragma);
+            Err("unsupported pragma")
+        })
+        .expect_err("unsupported autocommit retain controls should fail closed");
+
+        assert_eq!(attempts, AUTOCOMMIT_RETAIN_OFF_PRAGMAS);
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to keep a long-lived MVCC connection"),
+            "error should force callers away from unbounded snapshot retention: {message}"
+        );
+        assert!(
+            message.contains("PRAGMA fsqlite.autocommit_retain = OFF;")
+                && message.contains("PRAGMA autocommit_retain = OFF;"),
+            "error should preserve attempted PRAGMAs for diagnostics: {message}"
+        );
+    }
 
     /// Open a rusqlite connection on `db_path` for the narrow purpose of
     /// injecting (or inspecting the raw projection of) sqlite_master
