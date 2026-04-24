@@ -14230,8 +14230,7 @@ mod tests {
     /// 3. Limit=0 returns empty (boundary case the rank+hydrate
     ///    split could break by hydrating before honoring the limit).
     #[test]
-    fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant()
-    -> Result<()> {
+    fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
         let conn = Connection::open(":memory:")?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14291,7 +14290,13 @@ mod tests {
             conn.execute_compat(
                 "INSERT INTO messages(id, conversation_id, idx, content, created_at) \
                  VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![msg_id, conv_id, i as i64, content.as_str(), 1_700_000_000_i64 + i as i64],
+                params![
+                    msg_id,
+                    conv_id,
+                    i as i64,
+                    content.as_str(),
+                    1_700_000_000_i64 + i as i64
+                ],
             )?;
             conn.execute_compat(
                 "INSERT INTO fts_messages(rowid, content, title, agent, workspace, \

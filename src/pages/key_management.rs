@@ -473,9 +473,7 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing
 /// Derive KEK from recovery secret using HKDF-SHA256
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
-        .map_err(|e| {
-            anyhow::anyhow!("HKDF extract+expand failed for recovery secret KEK: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("HKDF extract+expand failed for recovery secret KEK: {e}"))?;
     let actual_len = kek.len();
     let kek: [u8; 32] = kek.try_into().map_err(|_| {
         // [coding_agent_session_search-htiim] Capture actual_len BEFORE

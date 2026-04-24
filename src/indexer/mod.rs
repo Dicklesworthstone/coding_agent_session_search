@@ -15371,9 +15371,7 @@ pub mod persist {
     /// twice; this helper walks once and yields a slice of positional
     /// indices that `TantivyIndex::add_messages_from_packet` can use
     /// directly.
-    fn lexical_packet_for_persist(
-        conv: &NormalizedConversation,
-    ) -> ConversationPacket {
+    fn lexical_packet_for_persist(conv: &NormalizedConversation) -> ConversationPacket {
         ConversationPacket::from_normalized_conversation(
             conv,
             ConversationPacketProvenance::local(),
@@ -18602,8 +18600,7 @@ pub mod persist {
 
             // Inserted idx=0 and idx=7 (non-contiguous) ⇒ positions 0 and 2,
             // ordered by packet iteration (source order), NOT by inserted_indices order.
-            let positional_two_unordered =
-                positional_indices_for_inserted(&packet, &[7, 0]);
+            let positional_two_unordered = positional_indices_for_inserted(&packet, &[7, 0]);
             assert_eq!(
                 positional_two_unordered,
                 vec![0, 2],
@@ -18614,8 +18611,7 @@ pub mod persist {
             // Inserted_indices that don't match any message idx ⇒ empty.
             // (E.g. caller passed a stale/wrong list — silently emit nothing
             // rather than crash, matching the legacy filter behavior.)
-            let positional_unmatched =
-                positional_indices_for_inserted(&packet, &[99, 100]);
+            let positional_unmatched = positional_indices_for_inserted(&packet, &[99, 100]);
             assert_eq!(
                 positional_unmatched,
                 Vec::<usize>::new(),
@@ -25773,8 +25769,8 @@ mod tests {
         // (e.g. computed evidence from a different ledger snapshot)
         // would silently desync. Pinning the equality directly
         // surfaces that.
-        let ledger_raw = std::fs::read_to_string(&ledger_path)
-            .expect("raw ledger must also be persisted");
+        let ledger_raw =
+            std::fs::read_to_string(&ledger_path).expect("raw ledger must also be persisted");
         let ledger: refresh_ledger::RefreshLedger =
             serde_json::from_str(&ledger_raw).expect("raw ledger must be valid JSON");
         let computed_evidence = ledger.evidence_summary();

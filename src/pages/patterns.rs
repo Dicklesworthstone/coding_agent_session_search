@@ -456,9 +456,11 @@ mod tests {
     fn test_patterns_by_category() {
         let api_patterns = patterns_by_category(PatternCategory::ApiKeys);
         assert!(!api_patterns.is_empty());
-        assert!(api_patterns
-            .iter()
-            .all(|p| p.category == PatternCategory::ApiKeys));
+        assert!(
+            api_patterns
+                .iter()
+                .all(|p| p.category == PatternCategory::ApiKeys)
+        );
     }
 
     #[test]

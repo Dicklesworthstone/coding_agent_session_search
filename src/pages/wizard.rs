@@ -1,30 +1,30 @@
-use anyhow::{bail, Context, Result};
-use console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
+use anyhow::{Context, Result, bail};
+use console::{Term, style};
+use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::pages::bundle::{BundleBuilder, BundleConfig};
 use crate::pages::confirmation::{
-    unencrypted_warning_lines, validate_unencrypted_ack, ConfirmationConfig, ConfirmationFlow,
-    ConfirmationStep, PasswordStrengthAction, StepValidation, UNENCRYPTED_ACK_PHRASE,
+    ConfirmationConfig, ConfirmationFlow, ConfirmationStep, PasswordStrengthAction, StepValidation,
+    UNENCRYPTED_ACK_PHRASE, unencrypted_warning_lines, validate_unencrypted_ack,
 };
 use crate::pages::deploy_cloudflare::{CloudflareConfig, CloudflareDeployer};
 use crate::pages::deploy_github::GitHubDeployer;
 use crate::pages::docs::{DocConfig, DocumentationGenerator};
 use crate::pages::encrypt::EncryptionEngine;
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
-use crate::pages::password::{format_strength_inline, validate_password, PasswordStrength};
+use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
 use crate::pages::secret_scan::{
-    print_human_report, wizard_secret_scan, SecretScanConfig, SecretScanFilters,
+    SecretScanConfig, SecretScanFilters, print_human_report, wizard_secret_scan,
 };
 use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
-    format_size, ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator,
+    ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
 };
 use crate::storage::sqlite::FrankenStorage;
 use frankensqlite::Connection;

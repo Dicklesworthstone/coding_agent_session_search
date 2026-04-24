@@ -649,7 +649,8 @@ impl RefreshLedger {
             .iter()
             .filter(|phase| phase.items_processed > 0)
             .map(|phase| {
-                let items_per_second = items_per_second_for(phase.duration_ms, phase.items_processed);
+                let items_per_second =
+                    items_per_second_for(phase.duration_ms, phase.items_processed);
                 RefreshThroughputProfile {
                     phase: phase.phase,
                     duration_ms: phase.duration_ms,
@@ -674,8 +675,7 @@ impl RefreshLedger {
             .filter(|phase| phase.duration_ms > 0)
             .map(|phase| phase.phase);
         let aggregate_items_processed = self.total_items_processed();
-        let aggregate_items_per_second =
-            items_per_second_for(total_ms, aggregate_items_processed);
+        let aggregate_items_per_second = items_per_second_for(total_ms, aggregate_items_processed);
         RefreshLedgerEvidence {
             throughput,
             phase_share,
@@ -1157,11 +1157,7 @@ mod tests {
         }
     }
 
-    fn phase_record_with_items(
-        phase: RefreshPhase,
-        duration_ms: u64,
-        items: u64,
-    ) -> PhaseRecord {
+    fn phase_record_with_items(phase: RefreshPhase, duration_ms: u64, items: u64) -> PhaseRecord {
         PhaseRecord {
             phase,
             duration_ms,
@@ -1270,10 +1266,7 @@ mod tests {
         // Phase shares all 0.0 — no NaN poisoning.
         for share in &instant_evidence.phase_share {
             assert_eq!(share.share_pct, 0.0);
-            assert!(
-                !share.share_pct.is_nan(),
-                "share_pct must never be NaN"
-            );
+            assert!(!share.share_pct.is_nan(), "share_pct must never be NaN");
         }
     }
 

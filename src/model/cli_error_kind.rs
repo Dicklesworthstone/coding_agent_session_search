@@ -478,7 +478,8 @@ mod tests {
                 seen.insert(kind),
                 "duplicate kind_str detected: {:?} maps to {:?} which was already \
                  registered by an earlier variant",
-                variant, kind
+                variant,
+                kind
             );
         }
     }
