@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
+use crate::model::conversation_packet::{
+    ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
+};
 use crate::search::canonicalize::is_hard_message_noise;
 use crate::sources::provenance::LOCAL_SOURCE_ID;
 use anyhow::{Context, Error, Result};
@@ -219,6 +222,79 @@ fn push_cass_document_into_pending(
 ) {
     *pending_chars = pending_chars.saturating_add(doc.content.len());
     docs.push(doc);
+}
+
+/// Build the per-document context the lexical sink needs from a
+/// [`ConversationPacket`]. Packet builders (raw scan + canonical replay)
+/// already normalized identity, provenance, metadata, and timestamps, so
+/// the lexical builder no longer has to re-walk the raw connector
+/// payload (`coding_agent_session_search-ibuuh.32`). We still re-derive
+/// `source_id`/`origin_kind`/`origin_host` from `metadata.cass.origin`
+/// (rather than trusting `packet.payload.provenance` blindly) so the
+/// packet pipeline produces byte-identical CassDocuments to the legacy
+/// `cass_doc_context` path — that's the equivalence gate covered by
+/// `packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv`.
+fn cass_doc_context_from_packet(packet: &ConversationPacket) -> CassDocContext {
+    let payload = &packet.payload;
+    let metadata = &payload.metadata_json;
+    let cass_origin = metadata.get("cass").and_then(|c| c.get("origin"));
+    let raw_source_id = cass_origin
+        .and_then(|o| o.get("source_id"))
+        .and_then(|v| v.as_str());
+    let raw_origin_kind = cass_origin
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str());
+    let origin_host = normalized_index_origin_host(
+        cass_origin
+            .and_then(|o| o.get("host"))
+            .and_then(|v| v.as_str()),
+    );
+    let source_id =
+        normalized_index_source_id(raw_source_id, raw_origin_kind, origin_host.as_deref());
+    let origin_kind = normalized_index_origin_kind(&source_id, raw_origin_kind);
+
+    CassDocContext {
+        agent: payload.identity.agent_slug.clone(),
+        workspace: payload.identity.workspace.clone(),
+        workspace_original: metadata
+            .get("cass")
+            .and_then(|c| c.get("workspace_original"))
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned),
+        source_path: payload.identity.source_path.clone(),
+        title: payload.identity.title.clone(),
+        started_at_fallback: payload.timestamps.started_at,
+        source_id,
+        origin_kind,
+        origin_host,
+        conversation_id: payload.identity.conversation_id,
+    }
+}
+
+/// Build a single CassDocument from a packet message, matching the
+/// legacy `cass_document_for_message` filter and projection rules.
+fn cass_document_for_packet_message(
+    context: &CassDocContext,
+    msg: &ConversationPacketMessage,
+) -> Option<FsCassDocument> {
+    if is_hard_message_noise(Some(msg.role.as_str()), &msg.content) {
+        return None;
+    }
+
+    Some(FsCassDocument {
+        agent: context.agent.clone(),
+        workspace: context.workspace.clone(),
+        workspace_original: context.workspace_original.clone(),
+        source_path: context.source_path.clone(),
+        msg_idx: msg.idx.max(0) as u64,
+        created_at: msg.created_at.or(context.started_at_fallback),
+        title: context.title.clone(),
+        content: msg.content.clone(),
+        conversation_id: context.conversation_id,
+        source_id: context.source_id.clone(),
+        origin_kind: context.origin_kind.clone(),
+        origin_host: context.origin_host.clone(),
+    })
 }
 
 /// Returns true if the given stored hash matches the current schema hash.
@@ -566,7 +642,15 @@ impl TantivyIndex {
     }
 
     pub fn add_conversation(&mut self, conv: &NormalizedConversation) -> Result<()> {
-        self.add_messages(conv, &conv.messages)
+        // ibuuh.32 migration: route the in-tree convenience entrypoint
+        // through the packet-driven pipeline so the lexical sink stops
+        // re-deriving doc context from the raw NormalizedConversation
+        // separately. The legacy `add_messages_with_conversation_id`
+        // path remains for indexer/mod.rs callers until that file's
+        // exclusive lock is released and they can migrate too.
+        let provenance = ConversationPacketProvenance::local();
+        let packet = ConversationPacket::from_normalized_conversation(conv, provenance);
+        self.add_messages_from_packet(&packet, None, None, |_| Ok(()))
     }
 
     pub fn add_conversation_with_id(
@@ -574,7 +658,12 @@ impl TantivyIndex {
         conv: &NormalizedConversation,
         conversation_id: Option<i64>,
     ) -> Result<()> {
-        self.add_messages_with_conversation_id(conv, &conv.messages, conversation_id)
+        let provenance = ConversationPacketProvenance::local();
+        let mut packet = ConversationPacket::from_normalized_conversation(conv, provenance);
+        // Stamp the canonical id onto the packet identity so the lexical
+        // doc carries the same conversation_id the legacy path emitted.
+        packet.payload.identity.conversation_id = conversation_id;
+        self.add_messages_from_packet(&packet, None, conversation_id, |_| Ok(()))
     }
 
     pub fn delete_all(&mut self) -> Result<()> {
@@ -802,6 +891,83 @@ impl TantivyIndex {
 
         for msg in messages {
             let Some(doc) = cass_document_for_message(&context, msg) else {
+                continue;
+            };
+            push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
+            if docs.len() >= max_messages || pending_chars >= max_chars {
+                let flushed_docs = docs.len();
+                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                on_batch_flushed(flushed_docs)?;
+                docs.clear();
+                pending_chars = 0;
+            }
+        }
+
+        if docs.is_empty() {
+            Ok(())
+        } else {
+            let flushed_docs = docs.len();
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+            on_batch_flushed(flushed_docs)
+        }
+    }
+
+    /// Packet-driven counterpart to
+    /// [`Self::add_messages_with_conversation_id_and_batch_hook`].
+    ///
+    /// This is the entrypoint the ibuuh.32 migration uses to feed the
+    /// lexical sink straight from a normalized [`ConversationPacket`].
+    /// Callers that already hold a packet (e.g. the rebuild pipeline,
+    /// or the in-tree convenience entrypoints `add_conversation` and
+    /// `add_conversation_with_id`) avoid the second normalization pass
+    /// the legacy `cass_doc_context` path performed against the raw
+    /// `NormalizedConversation`.
+    ///
+    /// `message_indices` lets incremental callers project a subset of
+    /// the packet's messages (e.g. only newly inserted indices) without
+    /// rebuilding the packet — when `None`, every message is emitted.
+    /// `conversation_id_override` lets callers stamp a canonical id
+    /// without mutating the packet identity in place.
+    pub fn add_messages_from_packet<F>(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: Option<&[usize]>,
+        conversation_id_override: Option<i64>,
+        mut on_batch_flushed: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+
+        let max_messages = tantivy_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut docs: Vec<FsCassDocument> = Vec::new();
+        let mut pending_chars = 0usize;
+
+        let messages = &packet.payload.messages;
+        let total = messages.len();
+        let indices_owned;
+        let indices: &[usize] = match message_indices {
+            Some(slice) => slice,
+            None => {
+                indices_owned = (0..total).collect::<Vec<_>>();
+                &indices_owned
+            }
+        };
+
+        for &i in indices {
+            let Some(msg) = messages.get(i) else {
+                anyhow::bail!(
+                    "packet message index {} out of range for packet with {} messages",
+                    i,
+                    total
+                );
+            };
+            let Some(doc) = cass_document_for_packet_message(&context, msg) else {
                 continue;
             };
             push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
@@ -1611,6 +1777,226 @@ mod tests {
         assert!(
             !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
             "materialization should replace the federated bundle manifest"
+        );
+    }
+
+    /// Equivalence gate for `coding_agent_session_search-ibuuh.32`:
+    /// the packet-driven lexical pipeline (`add_messages_from_packet`)
+    /// must emit byte-identical CassDocuments to the legacy
+    /// `add_messages_with_conversation_id` path on the same input.
+    /// This proves the migration of `add_conversation*` is a true
+    /// no-op semantically while removing the duplicate normalization
+    /// pass, so future migration slices in indexer/mod.rs can adopt
+    /// `add_messages_from_packet` with confidence.
+    #[test]
+    fn packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv() {
+        use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
+
+        fn make_conv() -> NormalizedConversation {
+            NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some("packet-equivalence".to_string()),
+                title: Some("Packet Equivalence".to_string()),
+                workspace: Some(PathBuf::from("/work/eq")),
+                source_path: PathBuf::from("/work/eq/.codex/session.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_010_000),
+                metadata: serde_json::json!({
+                    "cass": {
+                        "origin": {
+                            "source_id": "remote-host",
+                            "kind": "ssh",
+                            "host": "ws-42.example",
+                        },
+                        "workspace_original": "/Users/dev/eq",
+                    },
+                    "model": "gpt-5",
+                }),
+                messages: vec![
+                    NormalizedMessage {
+                        idx: 0,
+                        role: "user".to_string(),
+                        author: Some("human".to_string()),
+                        created_at: Some(1_700_000_000_000),
+                        content: "explain the packet pipeline".to_string(),
+                        extra: serde_json::json!({"turn": 1}),
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 1,
+                        role: "assistant".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_001_000),
+                        content: "the pipeline normalizes once".to_string(),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 2,
+                        role: "tool".to_string(),
+                        author: Some("ripgrep".to_string()),
+                        created_at: Some(1_700_000_002_000),
+                        content: "matches: 3".to_string(),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                ],
+            }
+        }
+
+        let legacy_dir = TempDir::new().expect("legacy temp dir");
+        let mut legacy_idx = TantivyIndex::open_or_create(legacy_dir.path()).expect("legacy idx");
+        let conv = make_conv();
+        legacy_idx
+            .add_messages_with_conversation_id(&conv, &conv.messages, Some(99))
+            .expect("legacy add");
+        legacy_idx.commit().expect("legacy commit");
+        let legacy_reader = legacy_idx.reader().expect("legacy reader");
+        legacy_reader.reload().expect("legacy reload");
+        let legacy_searcher = legacy_reader.searcher();
+        let legacy_count = legacy_searcher.num_docs();
+
+        let packet_dir = TempDir::new().expect("packet temp dir");
+        let mut packet_idx = TantivyIndex::open_or_create(packet_dir.path()).expect("packet idx");
+        let packet = ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        );
+        packet_idx
+            .add_messages_from_packet(&packet, None, Some(99), |_| Ok(()))
+            .expect("packet add");
+        packet_idx.commit().expect("packet commit");
+        let packet_reader = packet_idx.reader().expect("packet reader");
+        packet_reader.reload().expect("packet reload");
+        let packet_searcher = packet_reader.searcher();
+        let packet_count = packet_searcher.num_docs();
+
+        assert_eq!(
+            legacy_count, packet_count,
+            "packet pipeline must emit the same number of docs as legacy: legacy={legacy_count} packet={packet_count}"
+        );
+        assert_eq!(
+            legacy_count,
+            conv.messages.len() as u64,
+            "all 3 fixture messages should land (none filter as hard noise)"
+        );
+
+        // Compare every stored field byte-for-byte by reconstructing the
+        // CassDocument list both pipelines fed into Tantivy. This sidesteps
+        // schema-coupled retrieval boilerplate and pins the property the
+        // bead acceptance gate cares about: same projection, same docs.
+        let legacy_context = cass_doc_context(&conv, Some(99));
+        let legacy_docs: Vec<FsCassDocument> = conv
+            .messages
+            .iter()
+            .filter_map(|m| cass_document_for_message(&legacy_context, m))
+            .collect();
+        let packet_context_owned = {
+            let mut ctx = cass_doc_context_from_packet(&packet);
+            ctx.conversation_id = Some(99);
+            ctx
+        };
+        let packet_docs: Vec<FsCassDocument> = packet
+            .payload
+            .messages
+            .iter()
+            .filter_map(|m| cass_document_for_packet_message(&packet_context_owned, m))
+            .collect();
+        assert_eq!(
+            legacy_docs.len(),
+            packet_docs.len(),
+            "packet doc list length should match legacy"
+        );
+        for (legacy_doc, packet_doc) in legacy_docs.iter().zip(packet_docs.iter()) {
+            assert_eq!(legacy_doc.agent, packet_doc.agent);
+            assert_eq!(legacy_doc.workspace, packet_doc.workspace);
+            assert_eq!(legacy_doc.workspace_original, packet_doc.workspace_original);
+            assert_eq!(legacy_doc.source_path, packet_doc.source_path);
+            assert_eq!(legacy_doc.msg_idx, packet_doc.msg_idx);
+            assert_eq!(legacy_doc.created_at, packet_doc.created_at);
+            assert_eq!(legacy_doc.title, packet_doc.title);
+            assert_eq!(legacy_doc.content, packet_doc.content);
+            assert_eq!(legacy_doc.conversation_id, packet_doc.conversation_id);
+            assert_eq!(
+                legacy_doc.source_id, packet_doc.source_id,
+                "source_id must match (remote-host normalization is the bead's tripwire)"
+            );
+            assert_eq!(legacy_doc.origin_kind, packet_doc.origin_kind);
+            assert_eq!(legacy_doc.origin_host, packet_doc.origin_host);
+        }
+        // Sanity check the remote-host provenance actually round-tripped:
+        // a regression in normalization on either side would silently
+        // pass the per-doc compare unless we pin the expected value too.
+        assert_eq!(
+            packet_docs[0].source_id, "remote-host",
+            "metadata.cass.origin.source_id must be the canonical value"
+        );
+        assert_eq!(
+            packet_docs[0].origin_host.as_deref(),
+            Some("ws-42.example"),
+            "metadata.cass.origin.host must surface as origin_host"
+        );
+    }
+
+    /// Pins the `add_conversation_with_id` migration: the convenience
+    /// entrypoint now routes through the packet pipeline, but operators
+    /// see no behavioral change. The doc count and conversation_id
+    /// stamping must match the legacy `add_messages_with_conversation_id`
+    /// path on the same fixture.
+    #[test]
+    fn add_conversation_with_id_packet_path_emits_expected_doc_count() {
+        fn fixture(id: i64) -> NormalizedConversation {
+            NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some(format!("conv-{id}")),
+                title: Some(format!("Conv {id}")),
+                workspace: None,
+                source_path: PathBuf::from(format!("/tmp/conv-{id}.jsonl")),
+                started_at: Some(1_700_000_000_000 + id),
+                ended_at: Some(1_700_000_001_000 + id),
+                metadata: Value::Null,
+                messages: vec![
+                    NormalizedMessage {
+                        idx: 0,
+                        role: "user".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + id),
+                        content: format!("hello-{id}"),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 1,
+                        role: "assistant".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_000_500 + id),
+                        content: format!("response-{id}"),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                ],
+            }
+        }
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut idx = TantivyIndex::open_or_create(dir.path()).expect("idx");
+        idx.add_conversation_with_id(&fixture(1), Some(101))
+            .expect("conv 1");
+        idx.add_conversation_with_id(&fixture(2), Some(102))
+            .expect("conv 2");
+        idx.commit().expect("commit");
+
+        let reader = idx.reader().expect("reader");
+        reader.reload().expect("reload");
+        assert_eq!(
+            reader.searcher().num_docs(),
+            4,
+            "two conversations × two messages each ⇒ four lexical docs"
         );
     }
 }
