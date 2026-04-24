@@ -15259,10 +15259,54 @@ pub mod persist {
     use crate::indexer::semantic::{
         EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
     };
+    use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
     use crate::search::tantivy::TantivyIndex;
     use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
+
+    /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
+    /// builds a [`ConversationPacket`] for the lexical sink AND the
+    /// positional message-index slice that maps `outcome.inserted_indices`
+    /// (which are message *idx* values, not array positions) onto the
+    /// packet's `payload.messages` Vec. The legacy
+    /// `add_messages_with_conversation_id` filter walks `conv.messages`
+    /// twice; this helper walks once and yields a slice of positional
+    /// indices that `TantivyIndex::add_messages_from_packet` can use
+    /// directly.
+    fn lexical_packet_for_persist(
+        conv: &NormalizedConversation,
+    ) -> ConversationPacket {
+        ConversationPacket::from_normalized_conversation(
+            conv,
+            ConversationPacketProvenance::local(),
+        )
+    }
+
+    /// Map `outcome.inserted_indices` (message idx values from
+    /// `InsertOutcome`) onto positional indices into the packet's
+    /// messages Vec. Preserves source ordering so the lexical sink
+    /// emits docs in the same order the legacy filter produced.
+    fn positional_indices_for_inserted(
+        packet: &ConversationPacket,
+        inserted_indices: &[i64],
+    ) -> Vec<usize> {
+        if inserted_indices.is_empty() {
+            return Vec::new();
+        }
+        // Small linear-search lookup is fine here: a single conversation's
+        // inserted_indices is bounded by message count (typically <100,
+        // rarely >>10k) and we only run this once per persist outcome.
+        let inserted: HashSet<i64> = inserted_indices.iter().copied().collect();
+        packet
+            .payload
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| inserted.contains(&message.idx))
+            .map(|(position, _)| position)
+            .collect()
+    }
 
     #[derive(Debug, Clone, Default)]
     pub(super) struct PersistBatchOutcome {
@@ -15980,34 +16024,41 @@ pub mod persist {
                 continue;
             }
 
+            // ibuuh.32 / 5b9p0: route the begin-concurrent lexical
+            // sink through the packet pipeline. Same shape as the
+            // serial batched path above; the regression test
+            // persist_packet_pipeline_matches_legacy_for_incremental_inline
+            // pins both paths produce identical CassDocuments.
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
+                    let packet = lexical_packet_for_persist(conv);
                     t_index
                         .as_deref_mut()
                         .expect("inline rebuild requires Tantivy writer")
-                        .add_messages_with_conversation_id(
-                            conv,
-                            &conv.messages,
+                        .add_messages_from_packet(
+                            &packet,
+                            None,
                             Some(outcome.conversation_id),
+                            |_| Ok(()),
                         )?;
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
                     if !outcome.inserted_indices.is_empty() {
-                        let new_msgs: Vec<_> = conv
-                            .messages
-                            .iter()
-                            .filter(|m| outcome.inserted_indices.contains(&m.idx))
-                            .cloned()
-                            .collect();
-                        t_index
-                            .as_deref_mut()
-                            .expect("incremental inline updates require Tantivy writer")
-                            .add_messages_with_conversation_id(
-                                conv,
-                                &new_msgs,
-                                Some(outcome.conversation_id),
-                            )?;
+                        let packet = lexical_packet_for_persist(conv);
+                        let positional =
+                            positional_indices_for_inserted(&packet, &outcome.inserted_indices);
+                        if !positional.is_empty() {
+                            t_index
+                                .as_deref_mut()
+                                .expect("incremental inline updates require Tantivy writer")
+                                .add_messages_from_packet(
+                                    &packet,
+                                    Some(&positional),
+                                    Some(outcome.conversation_id),
+                                    |_| Ok(()),
+                                )?;
+                        }
                     }
                 }
             }
@@ -16192,15 +16243,21 @@ pub mod persist {
             writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
         })?;
 
-        // Only add newly inserted messages to the Tantivy index (incremental)
+        // Only add newly inserted messages to the Tantivy index
+        // (incremental). Routed through the packet pipeline per
+        // ibuuh.32 sink migration; equivalence guaranteed by
+        // tests::persist_packet_pipeline_matches_legacy_for_incremental_inline.
         if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let new_msgs: Vec<_> = conv
-                .messages
-                .iter()
-                .filter(|m| inserted_indices.contains(&m.idx))
-                .cloned()
-                .collect();
-            t_index.add_messages_with_conversation_id(conv, &new_msgs, Some(conversation_id))?;
+            let packet = lexical_packet_for_persist(conv);
+            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
+            if !positional.is_empty() {
+                t_index.add_messages_from_packet(
+                    &packet,
+                    Some(&positional),
+                    Some(conversation_id),
+                    |_| Ok(()),
+                )?;
+            }
         }
         Ok(())
     }
@@ -16378,36 +16435,43 @@ pub mod persist {
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
         if !defer_lexical_updates {
+            // ibuuh.32 / 5b9p0: route the serial-batched lexical sink
+            // through the packet pipeline. Build each packet ONCE and
+            // reuse it for both InlineRebuildFromScan (full message
+            // set) and IncrementalInline (positional subset derived
+            // from outcome.inserted_indices).
             for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
                 batch_outcome.record_insert_outcome(outcome);
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
+                        let packet = lexical_packet_for_persist(conv);
                         t_index
                             .as_deref_mut()
                             .expect("inline rebuild requires Tantivy writer")
-                            .add_messages_with_conversation_id(
-                                conv,
-                                &conv.messages,
+                            .add_messages_from_packet(
+                                &packet,
+                                None,
                                 Some(outcome.conversation_id),
+                                |_| Ok(()),
                             )?;
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
                         if !outcome.inserted_indices.is_empty() {
-                            let new_msgs: Vec<_> = conv
-                                .messages
-                                .iter()
-                                .filter(|m| outcome.inserted_indices.contains(&m.idx))
-                                .cloned()
-                                .collect();
-                            t_index
-                                .as_deref_mut()
-                                .expect("incremental inline updates require Tantivy writer")
-                                .add_messages_with_conversation_id(
-                                    conv,
-                                    &new_msgs,
-                                    Some(outcome.conversation_id),
-                                )?;
+                            let packet = lexical_packet_for_persist(conv);
+                            let positional =
+                                positional_indices_for_inserted(&packet, &outcome.inserted_indices);
+                            if !positional.is_empty() {
+                                t_index
+                                    .as_deref_mut()
+                                    .expect("incremental inline updates require Tantivy writer")
+                                    .add_messages_from_packet(
+                                        &packet,
+                                        Some(&positional),
+                                        Some(outcome.conversation_id),
+                                        |_| Ok(()),
+                                    )?;
+                            }
                         }
                     }
                 }
@@ -18354,6 +18418,127 @@ pub mod persist {
 
             let _guard2 = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "false");
             assert!(!begin_concurrent_writes_enabled());
+        }
+
+        /// `coding_agent_session_search-5b9p0`: pin the new helper that
+        /// maps `outcome.inserted_indices` (message *idx* values) onto
+        /// positional indices into the packet's messages Vec. The
+        /// legacy filter walked `conv.messages` looking for `m.idx in
+        /// inserted_indices` — the new helper produces the same
+        /// positional set so `add_messages_from_packet` emits the
+        /// same messages the legacy `add_messages_with_conversation_id`
+        /// + filter loop did. A regression that mis-mapped idx → position
+        /// would silently drop or duplicate documents in the lexical
+        /// sink; this test catches that.
+        #[test]
+        fn positional_indices_for_inserted_maps_idx_values_to_packet_positions() {
+            use serde_json::Value;
+
+            // Fixture: a NormalizedConversation with msg.idx values
+            // that are NOT 0..N (gaps + non-monotonic). The packet
+            // builder preserves source order, so positional indices
+            // are 0..N regardless of idx values.
+            let conv = NormalizedConversation {
+                agent_slug: "codex".to_string(),
+                external_id: Some("idx-mapping".to_string()),
+                title: None,
+                workspace: None,
+                source_path: std::path::PathBuf::from("/tmp/idx-mapping.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_010_000),
+                metadata: Value::Null,
+                messages: vec![
+                    NormalizedMessage {
+                        idx: 0,
+                        role: "user".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: "first".to_string(),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                    // Idx jumps to 5: the legacy filter treated this
+                    // as the second message in the iteration order
+                    // because it walks .messages in source order.
+                    NormalizedMessage {
+                        idx: 5,
+                        role: "assistant".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_001_000),
+                        content: "second".to_string(),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                    NormalizedMessage {
+                        idx: 7,
+                        role: "tool".to_string(),
+                        author: None,
+                        created_at: Some(1_700_000_002_000),
+                        content: "third".to_string(),
+                        extra: Value::Null,
+                        snippets: Vec::new(),
+                        invocations: Vec::new(),
+                    },
+                ],
+            };
+
+            let packet = lexical_packet_for_persist(&conv);
+            assert_eq!(
+                packet.payload.messages.len(),
+                3,
+                "packet must preserve all conversation messages"
+            );
+
+            // Empty inserted_indices ⇒ empty positional set (no work).
+            let positional_empty = positional_indices_for_inserted(&packet, &[]);
+            assert_eq!(positional_empty, Vec::<usize>::new());
+
+            // Inserted only idx=5 ⇒ position 1.
+            let positional_one = positional_indices_for_inserted(&packet, &[5]);
+            assert_eq!(
+                positional_one,
+                vec![1],
+                "idx=5 must map to packet position 1, got {positional_one:?}"
+            );
+
+            // Inserted idx=0 and idx=7 (non-contiguous) ⇒ positions 0 and 2,
+            // ordered by packet iteration (source order), NOT by inserted_indices order.
+            let positional_two_unordered =
+                positional_indices_for_inserted(&packet, &[7, 0]);
+            assert_eq!(
+                positional_two_unordered,
+                vec![0, 2],
+                "result must be in source order (positions 0, 2) regardless of \
+                 inserted_indices ordering, got {positional_two_unordered:?}"
+            );
+
+            // Inserted_indices that don't match any message idx ⇒ empty.
+            // (E.g. caller passed a stale/wrong list — silently emit nothing
+            // rather than crash, matching the legacy filter behavior.)
+            let positional_unmatched =
+                positional_indices_for_inserted(&packet, &[99, 100]);
+            assert_eq!(
+                positional_unmatched,
+                Vec::<usize>::new(),
+                "unmatched idx values must produce an empty positional set"
+            );
+
+            // All three inserted ⇒ positions [0, 1, 2].
+            let positional_all = positional_indices_for_inserted(&packet, &[0, 5, 7]);
+            assert_eq!(positional_all, vec![0, 1, 2]);
+
+            // Duplicate idx values in inserted_indices ⇒ deduplicated by
+            // packet position (HashSet under the hood). Legacy filter
+            // would also have emitted each message once because
+            // `inserted_indices.contains(&m.idx)` is a contains check.
+            let positional_dupe = positional_indices_for_inserted(&packet, &[5, 5, 5]);
+            assert_eq!(
+                positional_dupe,
+                vec![1],
+                "duplicate idx values must collapse to a single position"
+            );
         }
     }
 }
