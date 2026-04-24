@@ -625,14 +625,15 @@ fn remove_stale_daemon_socket(socket_path: &std::path::Path) -> Result<(), Daemo
     use std::os::unix::fs::FileTypeExt;
 
     match std::fs::symlink_metadata(socket_path) {
-        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(socket_path)
-            .map_err(|error| {
+        Ok(metadata) if metadata.file_type().is_socket() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(socket_path).map_err(|error| {
                 DaemonError::Unavailable(format!(
                     "failed to remove stale daemon socket {}: {}",
                     socket_path.display(),
                     error
                 ))
-            }),
+            })
+        }
         Ok(metadata) => Err(DaemonError::Unavailable(format!(
             "refusing to remove non-socket daemon path {} (file type: {:?})",
             socket_path.display(),
@@ -735,6 +736,22 @@ mod tests {
         assert!(
             message.contains("refusing to remove non-socket daemon path"),
             "error should explain the protected path type; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn stale_socket_cleanup_removes_public_socket_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("cass-daemon.sock");
+        let stale_private_socket = dir.path().join(".cass-daemon.sock.runtime/daemon.sock");
+        std::os::unix::fs::symlink(&stale_private_socket, &socket_path)
+            .expect("create stale daemon public symlink");
+
+        remove_stale_daemon_socket(&socket_path).expect("stale public symlink is removable");
+
+        assert!(
+            !socket_path.exists(),
+            "stale daemon public symlink should be removed before auto-spawn"
         );
     }
 }
