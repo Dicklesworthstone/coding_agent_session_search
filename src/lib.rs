@@ -13676,7 +13676,7 @@ mode=index",
         assert_eq!(payload["success"].as_bool(), Some(false));
         assert_eq!(payload["elapsed_ms"].as_u64(), Some(1234));
         assert_eq!(payload["code"].as_i64(), Some(7));
-        assert_eq!(payload["kind"].as_str(), Some("index_busy"));
+        assert_eq!(payload["kind"].as_str(), Some("index-busy"));
         assert_eq!(payload["retryable"].as_bool(), Some(true));
     }
 
