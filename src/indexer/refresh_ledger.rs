@@ -1161,9 +1161,15 @@ impl RefreshLedgerEvidenceComparison {
             };
         }
         if duration_pct >= SLOWDOWN_WARN_THRESHOLD_PCT {
-            emit_tier!(warn, "lexical refresh evidence: significant slowdown vs previous publish");
+            emit_tier!(
+                warn,
+                "lexical refresh evidence: significant slowdown vs previous publish"
+            );
         } else if duration_pct <= IMPROVEMENT_INFO_THRESHOLD_PCT {
-            emit_tier!(info, "lexical refresh evidence: notable improvement vs previous publish");
+            emit_tier!(
+                info,
+                "lexical refresh evidence: notable improvement vs previous publish"
+            );
         } else {
             emit_tier!(debug, "lexical refresh evidence: cross-run comparison");
         }

@@ -23211,12 +23211,14 @@ mod tests {
             // parked.
             thread::yield_now();
             limiter.update_max_bytes_in_flight(64);
-            let woken = result_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|err| {
-                panic!(
-                    "iteration {iteration}: update_max_bytes_in_flight failed to wake parked \
+            let woken = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "iteration {iteration}: update_max_bytes_in_flight failed to wake parked \
                      waiter within 2s — lost-wakeup race regressed (wxsy8): {err}"
-                )
-            });
+                    )
+                });
             assert_eq!(woken, 16);
             limiter.release(first);
             waiter.join().unwrap();

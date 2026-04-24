@@ -853,11 +853,17 @@ impl LexicalCleanupDryRunPlan {
         match inventory.disposition {
             LexicalCleanupDisposition::SupersededReclaimable
             | LexicalCleanupDisposition::FailedReclaimable => {
-                emit_tier!(debug, "lexical cleanup classified generation as reclaimable");
+                emit_tier!(
+                    debug,
+                    "lexical cleanup classified generation as reclaimable"
+                );
             }
             LexicalCleanupDisposition::QuarantinedRetained
             | LexicalCleanupDisposition::FailedRetained => {
-                emit_tier!(warn, "lexical cleanup retained generation pending operator inspection");
+                emit_tier!(
+                    warn,
+                    "lexical cleanup retained generation pending operator inspection"
+                );
             }
             LexicalCleanupDisposition::ActiveWork
             | LexicalCleanupDisposition::CurrentPublished
