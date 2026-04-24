@@ -7543,6 +7543,26 @@ impl StreamingByteLimiter {
     }
 
     fn update_max_bytes_in_flight(&self, max_bytes_in_flight: usize) {
+        // [coding_agent_session_search-wxsy8] Acquire the same state
+        // lock that `acquire_with_wait` uses for its predicate
+        // evaluation BEFORE updating the budget and notifying. Without
+        // this, the standard condvar lost-wakeup race fires:
+        //
+        //   T1 (waiter) holds state-lock, reads max via load(Acquire),
+        //                evaluates predicate (no fit), drops lock,
+        //                ↘  notify_all here lands on zero subscribers
+        //   T2 (updater) stores new max atomically + notify_all
+        //                   (waiter not yet parked)
+        //   T1 enters cv.wait — parks indefinitely; the higher budget
+        //   would have admitted the request, but no one will notify
+        //   again until release().
+        //
+        // Standard correct condvar protocol requires the predicate
+        // update to happen INSIDE the lock that the waiter holds
+        // during predicate evaluation. The lock is released before
+        // the parked waiter is woken, so cost is bounded by the
+        // critical section (a single atomic store).
+        let _state_guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.max_bytes_in_flight
             .store(max_bytes_in_flight.max(1), Ordering::Release);
         self.cv.notify_all();
@@ -23143,6 +23163,64 @@ mod tests {
         assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 64);
         limiter.release(first);
         waiter.join().unwrap();
+    }
+
+    /// `coding_agent_session_search-wxsy8`: stress-pin the
+    /// capacity-shrink-then-grow lost-wakeup race that the fix
+    /// closed. Pre-fix, `update_max_bytes_in_flight` stored the new
+    /// max via `AtomicUsize::store` + `cv.notify_all` WITHOUT
+    /// acquiring the state lock the waiter held during predicate
+    /// evaluation. If the update fired in the gap between the
+    /// waiter's predicate check (line ~7513) and its `cv.wait` call
+    /// (line ~7524), the notification landed on zero subscribers
+    /// and the waiter parked indefinitely. Post-fix, the updater
+    /// MUST acquire `self.state` first — serializing with the
+    /// waiter's predicate check — so either (a) the update lands
+    /// before the waiter takes the lock and the waiter sees the new
+    /// max on its first predicate check, OR (b) the waiter is
+    /// already parked when the update fires and the notification
+    /// reaches it.
+    ///
+    /// The race is tight, so a single iteration can pass even with
+    /// the bug. This test runs 50 iterations of the same shrink-grow
+    /// pattern to maximize the chance of hitting the race window.
+    /// With the fix it always completes within a generous timeout;
+    /// without the fix at least one waiter would stall past the
+    /// per-iteration deadline under enough scheduling pressure.
+    #[test]
+    fn streaming_byte_limiter_update_does_not_lose_wakeup_under_repeated_shrink_grow() {
+        const ITERATIONS: usize = 50;
+        for iteration in 0..ITERATIONS {
+            let limiter = Arc::new(StreamingByteLimiter::new(16));
+            let first = limiter.acquire(16).unwrap();
+            let (ready_tx, ready_rx) = bounded(1);
+            let (result_tx, result_rx) = bounded(1);
+            let waiter = {
+                let limiter = limiter.clone();
+                thread::spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    let second = limiter.acquire(16).unwrap();
+                    result_tx.send(second).unwrap();
+                    limiter.release(second);
+                })
+            };
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // Hand off the scheduler immediately rather than sleeping —
+            // we WANT the update to race against the waiter's
+            // predicate-check window, not after it has comfortably
+            // parked.
+            thread::yield_now();
+            limiter.update_max_bytes_in_flight(64);
+            let woken = result_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|err| {
+                panic!(
+                    "iteration {iteration}: update_max_bytes_in_flight failed to wake parked \
+                     waiter within 2s — lost-wakeup race regressed (wxsy8): {err}"
+                )
+            });
+            assert_eq!(woken, 16);
+            limiter.release(first);
+            waiter.join().unwrap();
+        }
     }
 
     #[test]
