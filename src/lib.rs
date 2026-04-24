@@ -11376,6 +11376,31 @@ fn cleanup_target_path_is_safe(
     if !path.starts_with(data_dir) || path == data_dir || path == db_path || path == index_path {
         return false;
     }
+    if cleanup_path_has_symlink_below_root(path, data_dir) {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_data_dir) = std::fs::canonicalize(data_dir) else {
+        return false;
+    };
+    if !canonical_path.starts_with(&canonical_data_dir) || canonical_path == canonical_data_dir {
+        return false;
+    }
+    if std::fs::canonicalize(db_path)
+        .ok()
+        .is_some_and(|canonical_db_path| canonical_path == canonical_db_path)
+    {
+        return false;
+    }
+    if let Ok(canonical_index_path) = std::fs::canonicalize(index_path) {
+        if canonical_path == canonical_index_path
+            || canonical_path.starts_with(&canonical_index_path)
+        {
+            return false;
+        }
+    }
     if path.starts_with(index_path) {
         return false;
     }
@@ -11397,6 +11422,116 @@ fn cleanup_target_path_is_safe(
         .join(crate::indexer::lexical_generation::LEXICAL_GENERATION_MANIFEST_FILE)
         .is_file();
     is_retained_publish_backup || is_manifest_backed_generation
+}
+
+fn cleanup_path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
+    let mut current = path;
+    loop {
+        if current == root {
+            return false;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if parent == current {
+            return false;
+        }
+        current = parent;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cleanup_target_safety_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_target_safety_rejects_symlinked_publish_backup_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        let index_parent = index_path.parent().expect("index parent");
+        std::fs::create_dir_all(index_parent).expect("create index parent");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let external_backup_root = temp.path().join("outside-backups");
+        std::fs::create_dir_all(&external_backup_root).expect("create external backup root");
+
+        let publish_backup_parent = index_parent.join(".lexical-publish-backups");
+        std::os::unix::fs::symlink(&external_backup_root, &publish_backup_parent)
+            .expect("create symlinked retained publish backup parent");
+        let symlinked_candidate = publish_backup_parent.join("prior-live-older");
+        std::fs::create_dir_all(&symlinked_candidate).expect("create candidate via symlink parent");
+
+        assert!(
+            !cleanup_target_path_is_safe(&symlinked_candidate, &data_dir, &db_path, &index_path),
+            "cleanup must reject retained publish backups reached through a symlinked parent"
+        );
+
+        let normal_data_dir = temp.path().join("normal-cass-data");
+        let normal_index_path = normal_data_dir.join("index").join("live-generation");
+        let normal_index_parent = normal_index_path.parent().expect("normal index parent");
+        std::fs::create_dir_all(normal_index_parent).expect("create normal index parent");
+        std::fs::create_dir_all(&normal_index_path).expect("create normal live index");
+        let normal_db_path = normal_data_dir.join("agent_search.db");
+        std::fs::write(&normal_db_path, b"sqlite placeholder").expect("write normal db");
+        let normal_publish_backup_parent = normal_index_parent.join(".lexical-publish-backups");
+        std::fs::create_dir_all(&normal_publish_backup_parent)
+            .expect("create normal backup parent");
+        let normal_candidate = normal_publish_backup_parent.join("prior-live-older");
+        std::fs::create_dir_all(&normal_candidate).expect("create normal backup candidate");
+
+        assert!(
+            cleanup_target_path_is_safe(
+                &normal_candidate,
+                &normal_data_dir,
+                &normal_db_path,
+                &normal_index_path,
+            ),
+            "normal retained publish backups under data_dir must remain eligible for policy pruning"
+        );
+    }
+
+    #[test]
+    fn cleanup_target_safety_rejects_symlinked_manifest_generation_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let external_generation_root = temp.path().join("outside-generations");
+        std::fs::create_dir_all(&external_generation_root)
+            .expect("create external generation root");
+
+        let symlinked_generation_parent = data_dir.join("generations");
+        std::os::unix::fs::symlink(&external_generation_root, &symlinked_generation_parent)
+            .expect("create symlinked generation parent");
+        let symlinked_generation = symlinked_generation_parent.join("old-generation");
+        std::fs::create_dir_all(&symlinked_generation)
+            .expect("create generation candidate through symlink parent");
+        std::fs::write(
+            symlinked_generation
+                .join(crate::indexer::lexical_generation::LEXICAL_GENERATION_MANIFEST_FILE),
+            b"{}",
+        )
+        .expect("write manifest through symlink parent");
+
+        assert!(
+            !cleanup_target_path_is_safe(&symlinked_generation, &data_dir, &db_path, &index_path),
+            "cleanup must reject manifest-backed generations reached through a symlinked parent"
+        );
+    }
 }
 
 fn lexical_cleanup_disposition_label(
