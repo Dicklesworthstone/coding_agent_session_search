@@ -6,6 +6,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+mod util;
+
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
     let db_path = data_dir.join("agent_search.db");
     let index_path = expected_index_dir(data_dir);
@@ -392,46 +394,9 @@ fn health_recommended_action_during_active_rebuild_says_wait_not_reindex() {
 // ========================================================================
 
 fn seed_codex_session_cold_start(codex_home: &std::path::Path, filename: &str, keyword: &str) {
-    let sessions = codex_home.join("sessions/2026/04/23");
-    fs::create_dir_all(&sessions).expect("create codex sessions dir");
-    let ts_ms = 1_714_000_000_000_u64;
-    let iso = |offset_ms: u64| -> String {
-        chrono::DateTime::from_timestamp_millis(
-            i64::try_from(ts_ms + offset_ms).unwrap_or(i64::MAX),
-        )
-        .unwrap()
-        .to_rfc3339()
-    };
-    let workspace = codex_home.to_string_lossy().into_owned();
-    let lines = [
-        json!({
-            "timestamp": iso(0),
-            "type": "session_meta",
-            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
-        }),
-        json!({
-            "timestamp": iso(1_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "user",
-                "content": [{ "type": "input_text", "text": keyword }],
-            },
-        }),
-        json!({
-            "timestamp": iso(2_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "assistant",
-                "content": [{ "type": "text", "text": format!("{keyword} response") }],
-            },
-        }),
-    ];
-    let mut body = String::new();
-    for line in lines {
-        body.push_str(&serde_json::to_string(&line).unwrap());
-        body.push('\n');
-    }
-    fs::write(sessions.join(filename), body).expect("write codex session fixture");
+    // Cold-start fixture needs a full user + assistant exchange so the
+    // post-index search has content to match either turn.
+    util::seed_codex_session(codex_home, filename, keyword, true);
 }
 
 fn isolated_cass_cmd(home: &Path) -> Command {

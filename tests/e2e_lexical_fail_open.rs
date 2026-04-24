@@ -18,9 +18,11 @@
 //!     pick up the operator's real `~/.config/cass/sources.toml`.
 
 use assert_cmd::Command;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::fs;
 use tempfile::TempDir;
+
+mod util;
 
 fn cass_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
@@ -33,47 +35,10 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd
 }
 
-fn iso_ts(ts_ms: u64) -> String {
-    let ts_ms_i64 = i64::try_from(ts_ms).unwrap_or(i64::MAX);
-    chrono::DateTime::from_timestamp_millis(ts_ms_i64)
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339()
-}
-
 fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &str) {
-    let sessions = codex_home.join("sessions/2026/04/23");
-    fs::create_dir_all(&sessions).unwrap();
-    let ts = 1_714_000_000_000_u64;
-    let workspace = codex_home.to_string_lossy().into_owned();
-    let lines = [
-        json!({
-            "timestamp": iso_ts(ts),
-            "type": "session_meta",
-            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
-        }),
-        json!({
-            "timestamp": iso_ts(ts + 1_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "user",
-                "content": [{ "type": "input_text", "text": keyword }],
-            },
-        }),
-        json!({
-            "timestamp": iso_ts(ts + 2_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "assistant",
-                "content": [{ "type": "text", "text": format!("{keyword} response") }],
-            },
-        }),
-    ];
-    let mut body = String::new();
-    for line in lines {
-        body.push_str(&serde_json::to_string(&line).unwrap());
-        body.push('\n');
-    }
-    fs::write(sessions.join(filename), body).unwrap();
+    // Full user + assistant corpus so the post-index search has
+    // content to match on either turn.
+    util::seed_codex_session(codex_home, filename, keyword, true);
 }
 
 #[test]

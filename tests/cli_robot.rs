@@ -4921,39 +4921,9 @@ fn cass_output_format_takes_precedence() {
 // ========================================================================
 
 fn seed_codex_session_s0cmk(codex_home: &std::path::Path, filename: &str, keyword: &str) {
-    use serde_json::json;
-    let sessions = codex_home.join("sessions/2026/04/23");
-    fs::create_dir_all(&sessions).unwrap();
-    let ts_ms = 1_714_000_000_000_u64;
-    let iso = |offset_ms: u64| -> String {
-        chrono::DateTime::from_timestamp_millis(
-            i64::try_from(ts_ms + offset_ms).unwrap_or(i64::MAX),
-        )
-        .unwrap()
-        .to_rfc3339()
-    };
-    let workspace = codex_home.to_string_lossy().into_owned();
-    let lines = [
-        json!({
-            "timestamp": iso(0),
-            "type": "session_meta",
-            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
-        }),
-        json!({
-            "timestamp": iso(1_000),
-            "type": "response_item",
-            "payload": {
-                "type": "message", "role": "user",
-                "content": [{ "type": "input_text", "text": keyword }],
-            },
-        }),
-    ];
-    let mut body = String::new();
-    for line in lines {
-        body.push_str(&serde_json::to_string(&line).unwrap());
-        body.push('\n');
-    }
-    fs::write(sessions.join(filename), body).unwrap();
+    // User-only corpus (no assistant line) — the s0cmk scenario only
+    // needs the keyword to be present once from the user side.
+    util::seed_codex_session(codex_home, filename, keyword, false);
 }
 
 fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {

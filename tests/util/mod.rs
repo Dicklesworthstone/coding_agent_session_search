@@ -28,6 +28,77 @@ pub fn cass_bin() -> String {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
 
+/// Write a minimal Codex session JSONL fixture under
+/// `<codex_home>/sessions/2026/04/23/<filename>` containing a
+/// `session_meta` line and a user `input_text` carrying `keyword`.
+/// When `include_assistant` is true, appends a second `response_item`
+/// line with an assistant reply `"<keyword> response"`.
+///
+/// Mirrors the helper previously duplicated as `seed_codex_session` /
+/// `seed_codex_session_cold_start` / `seed_codex_session_s0cmk`
+/// across cli_robot.rs, e2e_health.rs, and e2e_lexical_fail_open.rs.
+/// Bead `coding_agent_session_search-t545x`.
+///
+/// Important: the `filename` MUST start with `rollout-` so
+/// franken_agent_detection's Codex connector actually ingests the
+/// fixture — otherwise the connector silently skips the file and
+/// `cass index --full` produces an empty DB. See
+/// `franken_agent_detection/src/connectors/codex.rs::is_rollout_file`.
+#[allow(dead_code)]
+pub fn seed_codex_session(
+    codex_home: &std::path::Path,
+    filename: &str,
+    keyword: &str,
+    include_assistant: bool,
+) {
+    use serde_json::json;
+    let sessions = codex_home.join("sessions/2026/04/23");
+    std::fs::create_dir_all(&sessions).expect("create codex sessions dir");
+
+    let ts_ms = 1_714_000_000_000_u64;
+    let iso = |offset_ms: u64| -> String {
+        chrono::DateTime::from_timestamp_millis(
+            i64::try_from(ts_ms + offset_ms).unwrap_or(i64::MAX),
+        )
+        .unwrap()
+        .to_rfc3339()
+    };
+    let workspace = codex_home.to_string_lossy().into_owned();
+
+    let mut lines = vec![
+        json!({
+            "timestamp": iso(0),
+            "type": "session_meta",
+            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
+        }),
+        json!({
+            "timestamp": iso(1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": keyword }],
+            },
+        }),
+    ];
+    if include_assistant {
+        lines.push(json!({
+            "timestamp": iso(2_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{ "type": "text", "text": format!("{keyword} response") }],
+            },
+        }));
+    }
+
+    let mut body = String::new();
+    for line in lines {
+        body.push_str(&serde_json::to_string(&line).expect("serialize session line"));
+        body.push('\n');
+    }
+    std::fs::write(sessions.join(filename), body).expect("write codex session fixture");
+}
+
 // =============================================================================
 // Verbose Logging Support
 // =============================================================================
