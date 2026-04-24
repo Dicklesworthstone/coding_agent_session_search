@@ -5341,13 +5341,41 @@ fn validate_lexical_rebuild_shard_build_result(
             observed_docs
         ));
     }
-    if observed_docs != result.shard.message_count {
+    // [coding_agent_session_search-rx1ex] The shard plan's `message_count`
+    // is the raw row count from SQLite (per
+    // `list_conversation_footprints_for_lexical_rebuild`), while
+    // `observed_docs` is the post-filter Tantivy doc count. The
+    // lexical sink legitimately drops messages via
+    // `is_hard_message_noise` (empty content, hard-noise roles).
+    // Pre-fix this check fired on any session where ANY message was
+    // filtered — including the trivial 1-conversation/2-message
+    // repro in bead rx1ex. The meaningful invariant is that the
+    // sink can never produce MORE docs than there were source
+    // messages; if it does, something is duplicating documents and
+    // a hard error is correct. If observed_docs <= message_count,
+    // the gap is filter-induced and we log the count for operator
+    // audit instead of failing the rebuild.
+    if observed_docs > result.shard.message_count {
         return Err(anyhow::anyhow!(
-            "built lexical rebuild shard {} indexed {} docs but its shard plan expected {} messages",
+            "built lexical rebuild shard {} indexed {} docs which EXCEEDS its shard plan's \
+             {} source messages — the lexical sink should never produce more docs than \
+             rows; investigate fan-out or duplicate-document bugs",
             result.shard.shard_index,
             observed_docs,
             result.shard.message_count
         ));
+    }
+    let filtered = result.shard.message_count.saturating_sub(observed_docs);
+    if filtered > 0 {
+        tracing::debug!(
+            target: "cass::indexer::lexical_rebuild",
+            shard_index = result.shard.shard_index,
+            observed_docs,
+            planned_message_count = result.shard.message_count,
+            filtered_messages = filtered,
+            "lexical rebuild shard indexed fewer docs than the shard plan's message count; \
+             gap is hard-noise/empty-content filtering applied by cass_document_for_message"
+        );
     }
 
     Ok(LexicalRebuildShardMergeArtifact {
@@ -5387,13 +5415,31 @@ fn validate_complete_lexical_rebuild_shard_artifacts(
                 artifact.index_path.display()
             )
         })?;
-        if observed_docs != expected.message_count {
+        // [coding_agent_session_search-rx1ex] Mirrors the relaxation in
+        // validate_lexical_rebuild_shard_build_result: tolerate
+        // filter-induced doc < message gaps; only fail on the
+        // impossible case where docs > raw messages. See the comment
+        // there for the full rationale.
+        if observed_docs > expected.message_count {
             return Err(anyhow::anyhow!(
-                "validated lexical rebuild shard {} has {} docs but its shard plan expected {} messages",
+                "validated lexical rebuild shard {} has {} docs which EXCEEDS its shard plan's \
+                 {} source messages — investigate fan-out or duplicate-document bugs",
                 expected.shard_index,
                 observed_docs,
                 expected.message_count
             ));
+        }
+        let filtered = expected.message_count.saturating_sub(observed_docs);
+        if filtered > 0 {
+            tracing::debug!(
+                target: "cass::indexer::lexical_rebuild",
+                shard_index = expected.shard_index,
+                observed_docs,
+                planned_message_count = expected.message_count,
+                filtered_messages = filtered,
+                "validated lexical rebuild shard has fewer docs than the shard plan's message \
+                 count; gap is hard-noise/empty-content filtering"
+            );
         }
     }
 
@@ -20018,6 +20064,191 @@ mod tests {
         assert!(
             err.contains("reported 1 docs but a fresh Tantivy reader sees 2"),
             "expected doc-count mismatch error, got {err}"
+        );
+    }
+
+    /// `coding_agent_session_search-rx1ex`: pre-fix,
+    /// `validate_lexical_rebuild_shard_build_result` failed any
+    /// rebuild where the post-filter Tantivy doc count was less
+    /// than the shard plan's raw `message_count`. The reproducer
+    /// in the bead (1 conversation × 2 messages) reliably tripped
+    /// this even though the lexical sink legitimately drops messages
+    /// via `is_hard_message_noise`. Post-fix, the validator tolerates
+    /// the filter-induced gap (only fails on the impossible
+    /// `observed_docs > message_count` "fan-out" case) and emits a
+    /// structured debug log naming the filtered count.
+    #[test]
+    fn shard_validate_tolerates_filter_induced_doc_lt_message_count_gap() {
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("filter-tolerance-shard");
+        // Build a single packet with 2 messages, both with content
+        // so the lexical sink emits 2 docs. We then construct a
+        // shard plan whose message_count claims 3 (simulating a
+        // filter that dropped 1 message after the planner was sized).
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
+            crate::storage::sqlite::LexicalRebuildConversationRow {
+                id: Some(80),
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("filter-gap".into()),
+                title: Some("filter gap".into()),
+                source_path: PathBuf::from("/tmp/filter-gap.jsonl"),
+                started_at: Some(1_700_000_940_000),
+                ended_at: Some(1_700_000_940_100),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+            vec![
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 0,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_940_010),
+                    content: "filter alpha".into(),
+                },
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 1,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_940_020),
+                    content: "filter beta".into(),
+                },
+            ]
+            .into_iter()
+            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
+            Some(80),
+            &HashMap::new(),
+        );
+        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
+        assert_eq!(
+            indexed_docs, 2,
+            "fixture must build exactly 2 docs (precondition)"
+        );
+
+        let shard = LexicalShardPlanShard {
+            shard_index: 0,
+            first_conversation_id: 80,
+            last_conversation_id: 80,
+            conversation_count: 1,
+            // Plan claims 3 messages — simulates the filter case
+            // where one source message was dropped via
+            // is_hard_message_noise but the planner sized for the
+            // raw row count from list_conversation_footprints_*.
+            message_count: 3,
+            message_bytes: "filter alpha".len() + "filter beta".len() + "dropped".len(),
+            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[80]),
+            oversized_single_conversation: false,
+        };
+        let result = LexicalRebuildShardBuildResult {
+            shard: shard.clone(),
+            indexed_docs,
+            shard_index_path: shard_path.clone(),
+        };
+
+        // Pre-fix this would have errored with "indexed 2 docs but
+        // its shard plan expected 3 messages"; post-fix it
+        // succeeds because the gap is filter-attributable.
+        let artifact = validate_lexical_rebuild_shard_build_result(&result)
+            .expect("filter-induced doc<message gap must NOT fail validation");
+        assert_eq!(artifact.first_shard_index, 0);
+        assert_eq!(artifact.last_shard_index, 0);
+        assert_eq!(artifact.index_path, shard_path);
+
+        // Same tolerance must also apply to
+        // validate_complete_lexical_rebuild_shard_artifacts so the
+        // plan-level validation matches the per-shard-build path.
+        validate_complete_lexical_rebuild_shard_artifacts(
+            &LexicalShardPlan {
+                planner_version: LEXICAL_SHARD_PLAN_VERSION,
+                plan_id: "filter-tolerance".into(),
+                budgets: LexicalShardPlannerBudgets {
+                    max_conversations_per_shard: 1,
+                    max_messages_per_shard: 3,
+                    max_message_bytes_per_shard: 10_000,
+                },
+                total_conversations: 1,
+                total_messages: 3,
+                total_message_bytes: shard.message_bytes,
+                oversized_conversation_ids: Vec::new(),
+                shards: vec![shard],
+            },
+            &[artifact],
+        )
+        .expect("plan-level validator must tolerate filter-induced gaps too");
+    }
+
+    /// Companion test for the inflation case: if the lexical sink
+    /// somehow emits MORE docs than the shard plan's raw message
+    /// count, that's the "fan-out / duplicate document" bug class
+    /// and validation MUST hard-error. Post-fix, the second check
+    /// continues to catch this.
+    #[test]
+    fn shard_validate_rejects_doc_count_exceeding_shard_plan_message_count() {
+        let tmp = TempDir::new().unwrap();
+        let shard_path = tmp.path().join("inflation-shard");
+        let packet = LexicalRebuildConversationPacket::from_canonical_replay(
+            crate::storage::sqlite::LexicalRebuildConversationRow {
+                id: Some(81),
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("inflation".into()),
+                title: Some("inflation".into()),
+                source_path: PathBuf::from("/tmp/inflation.jsonl"),
+                started_at: Some(1_700_000_950_000),
+                ended_at: Some(1_700_000_950_100),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            },
+            vec![
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 0,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_950_010),
+                    content: "inflation alpha".into(),
+                },
+                crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
+                    idx: 1,
+                    is_tool_role: false,
+                    created_at: Some(1_700_000_950_020),
+                    content: "inflation beta".into(),
+                },
+            ]
+            .into_iter()
+            .collect::<crate::storage::sqlite::LexicalRebuildGroupedMessageRows>(),
+            Some(81),
+            &HashMap::new(),
+        );
+        let indexed_docs = build_lexical_rebuild_shard_index(&shard_path, &[packet], None).unwrap();
+        assert_eq!(indexed_docs, 2);
+
+        // Construct a deliberately-undersized shard plan: claims
+        // only 1 message but actually 2 docs were emitted.
+        let shard = LexicalShardPlanShard {
+            shard_index: 0,
+            first_conversation_id: 81,
+            last_conversation_id: 81,
+            conversation_count: 1,
+            message_count: 1,
+            message_bytes: "inflation alpha".len(),
+            conversation_id_fingerprint: lexical_shard_conversation_ids_fingerprint(&[81]),
+            oversized_single_conversation: false,
+        };
+        let result = LexicalRebuildShardBuildResult {
+            shard: shard.clone(),
+            indexed_docs,
+            shard_index_path: shard_path.clone(),
+        };
+
+        let err = validate_lexical_rebuild_shard_build_result(&result)
+            .unwrap_err()
+            .to_string();
+        // Pin the exact "EXCEEDS" phrasing so a regression that
+        // softens this hard-error trips the test.
+        assert!(
+            err.contains("EXCEEDS"),
+            "expected inflation hard-error to use the explicit EXCEEDS phrasing; got: {err}"
+        );
+        assert!(
+            err.contains("2 docs") && err.contains("1 source messages"),
+            "error must name observed (2) and planned (1) counts; got: {err}"
         );
     }
 
