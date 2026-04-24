@@ -27487,8 +27487,10 @@ fn run_models_install(
         return Ok(());
     }
 
-    // Check current state
-    let state = check_model_installed(&model_dir);
+    // Check current state — pass the resolved manifest so the
+    // file-presence check matches the model the user asked to install
+    // (bead coding_agent_session_search-odbnh).
+    let state = check_model_installed(&model_dir, &manifest);
     if state.is_ready() {
         println!("{} Model is already installed and verified.", "✓".green());
         println!("  Location: {}", model_dir.display());
@@ -28177,7 +28179,9 @@ fn run_models_check_update(
     let model_dir = FastEmbedder::default_model_dir(&data_dir);
     let manifest = ModelManifest::minilm_v2();
 
-    let state = check_model_installed(&model_dir);
+    // bead coding_agent_session_search-odbnh: pass the resolved manifest
+    // so the file-presence check matches the installed model's layout.
+    let state = check_model_installed(&model_dir, &manifest);
 
     if !state.is_ready() {
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {

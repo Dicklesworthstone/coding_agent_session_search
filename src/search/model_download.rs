@@ -1743,8 +1743,16 @@ fn classify_model_cache_state(
     }
 }
 
-/// Check if a model is installed and verified.
-pub fn check_model_installed(model_dir: &Path) -> ModelState {
+/// Check if a model is installed and verified against the given manifest.
+///
+/// `coding_agent_session_search-odbnh`: pre-fix this function hardcoded
+/// `ModelManifest::minilm_v2()` to enumerate required files, so on a
+/// machine with a complete snowflake-arctic-s or nomic-embed install
+/// it always returned `NotInstalled` (minilm's filenames aren't a
+/// subset of those models' filenames). The caller passes the manifest
+/// they already resolved via `ModelManifest::for_embedder(name)` so
+/// the file-presence check aligns with the model that was installed.
+pub fn check_model_installed(model_dir: &Path, manifest: &ModelManifest) -> ModelState {
     if !model_dir.is_dir() {
         return ModelState::NotInstalled;
     }
@@ -1757,7 +1765,6 @@ pub fn check_model_installed(model_dir: &Path) -> ModelState {
     // Check if all required files exist. Accept either the canonical repo path
     // (for preseeded HuggingFace layouts) or the flat local name used by the
     // downloader and air-gap installer.
-    let manifest = ModelManifest::minilm_v2();
     for file in &manifest.files {
         if model_file_path(model_dir, file).is_none() {
             return ModelState::NotInstalled;
@@ -2382,7 +2389,10 @@ mod tests {
     fn test_check_model_installed_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let model_dir = tmp.path().join("nonexistent");
-        assert_eq!(check_model_installed(&model_dir), ModelState::NotInstalled);
+        assert_eq!(
+            check_model_installed(&model_dir, &ModelManifest::minilm_v2()),
+            ModelState::NotInstalled
+        );
     }
 
     #[test]
@@ -2393,7 +2403,10 @@ mod tests {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
         fs::create_dir_all(&model_dir).unwrap();
         fs::copy(fixture_dir.join("model.onnx"), model_dir.join("model.onnx")).unwrap();
-        assert_eq!(check_model_installed(&model_dir), ModelState::NotInstalled);
+        assert_eq!(
+            check_model_installed(&model_dir, &ModelManifest::minilm_v2()),
+            ModelState::NotInstalled
+        );
     }
 
     #[test]
@@ -2403,7 +2416,10 @@ mod tests {
         // Use fixture files instead of fake content
         copy_model_fixtures(&model_dir).unwrap();
         fs::write(model_dir.join(".verified"), "revision=test\n").unwrap();
-        assert_eq!(check_model_installed(&model_dir), ModelState::Ready);
+        assert_eq!(
+            check_model_installed(&model_dir, &ModelManifest::minilm_v2()),
+            ModelState::Ready
+        );
     }
 
     #[test]
