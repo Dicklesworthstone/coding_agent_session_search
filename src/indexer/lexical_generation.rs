@@ -3729,4 +3729,226 @@ mod tests {
             "reason field must explain the inspection hold; got {reason:?}"
         );
     }
+
+    /// Bead coding_agent_session_search-yv5fn: coverage gap in 7d3297c7.
+    /// The sibling test above exercises only `QuarantinedRetained`.
+    /// This table-driven companion asserts correct severity routing
+    /// for EVERY `LexicalCleanupDisposition` variant — 8 total across
+    /// 3 severity tiers (2 DEBUG / 4 INFO / 2 WARN). A future refactor
+    /// that re-routes any variant to the wrong tier, or drops emission
+    /// entirely for one specific variant, would trip this test where
+    /// the Quarantined-only test would have stayed green.
+    ///
+    /// Fixture shapes follow `classify_generation_for_cleanup` at
+    /// src/indexer/lexical_generation.rs:~1522:
+    ///   - `CurrentPublished`: build=Validated, publish=Published, a
+    ///     single Validated shard so `is_serveable` returns true.
+    ///   - `ActiveWork`: default `new_scratch` state (build=Scratch).
+    ///   - `QuarantinedRetained`: publish=Quarantined.
+    ///   - `SupersededReclaimable`: publish=Superseded with a Planned
+    ///     shard (reclaimable=true, artifact_bytes>0).
+    ///   - `SupersededRetained`: publish=Superseded with a Published
+    ///     shard (reclaimable=false via test_shard) — no reclaim
+    ///     bytes, so the classifier picks the retained variant.
+    ///   - `FailedReclaimable`: build=Failed with an Abandoned shard
+    ///     (reclaimable=true) carrying artifact_bytes>0.
+    ///   - `FailedRetained`: build=Failed with a Published shard
+    ///     (pinned=true, reclaimable=false).
+    ///   - `PinnedRetained`: build=Validated, publish=Staged, zero
+    ///     shards — classifier falls through to the pinned arm.
+    #[test]
+    fn record_inventory_emits_correct_severity_for_every_disposition_variant() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Level, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Debug, Clone, Default)]
+        struct CapturedEvent {
+            level: String,
+            target: String,
+            fields: std::collections::HashMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct ClassificationCollector {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for ClassificationCollector {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "cass::indexer::lexical_cleanup" {
+                    return;
+                }
+                let mut visitor = StringVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().expect("collector lock").push(CapturedEvent {
+                    level: event.metadata().level().to_string(),
+                    target: event.metadata().target().to_string(),
+                    fields: visitor.fields,
+                });
+            }
+        }
+
+        #[derive(Default)]
+        struct StringVisitor {
+            fields: std::collections::HashMap<String, String>,
+        }
+
+        impl Visit for StringVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{:?}", value));
+            }
+        }
+
+        // Build a manifest that classifies to the requested disposition.
+        fn fixture_for(
+            disposition: LexicalCleanupDisposition,
+            generation_id: &str,
+        ) -> LexicalGenerationManifest {
+            let mut m = LexicalGenerationManifest::new_scratch(generation_id, "attempt-1", "fp", 1);
+            match disposition {
+                LexicalCleanupDisposition::CurrentPublished => {
+                    // `all_shards_publish_ready` accepts Validated /
+                    // Published shards; with shard_plan=None the
+                    // plan-count check is skipped, so a single shard
+                    // is enough to make `is_serveable` true once
+                    // build=Validated + publish=Published land.
+                    let shard = test_shard("shard-current", 0, LexicalShardLifecycleState::Validated, 128);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_build(LexicalGenerationBuildState::Validated, 3);
+                    m.transition_publish(LexicalGenerationPublishState::Published, 4);
+                }
+                LexicalCleanupDisposition::ActiveWork => {
+                    // Default new_scratch has build=Scratch → active.
+                }
+                LexicalCleanupDisposition::QuarantinedRetained => {
+                    let shard = test_shard("shard-q", 0, LexicalShardLifecycleState::Quarantined, 256);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_publish(LexicalGenerationPublishState::Quarantined, 3);
+                }
+                LexicalCleanupDisposition::SupersededReclaimable => {
+                    // Planned shards are reclaimable=true per test_shard.
+                    let shard = test_shard("shard-s-r", 0, LexicalShardLifecycleState::Planned, 512);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_build(LexicalGenerationBuildState::Validated, 3);
+                    m.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+                }
+                LexicalCleanupDisposition::SupersededRetained => {
+                    // Published shards are pinned=true, reclaimable=false.
+                    let shard = test_shard("shard-s-keep", 0, LexicalShardLifecycleState::Published, 512);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_build(LexicalGenerationBuildState::Validated, 3);
+                    m.transition_publish(LexicalGenerationPublishState::Superseded, 4);
+                }
+                LexicalCleanupDisposition::FailedReclaimable => {
+                    // Abandoned shards are reclaimable=true per test_shard.
+                    let shard = test_shard("shard-f-r", 0, LexicalShardLifecycleState::Abandoned, 1024);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_build(LexicalGenerationBuildState::Failed, 3);
+                }
+                LexicalCleanupDisposition::FailedRetained => {
+                    // Published shards are pinned=true, reclaimable=false.
+                    let shard = test_shard("shard-f-keep", 0, LexicalShardLifecycleState::Published, 1024);
+                    m.set_shards(vec![shard], 2);
+                    m.transition_build(LexicalGenerationBuildState::Failed, 3);
+                }
+                LexicalCleanupDisposition::PinnedRetained => {
+                    // No shards, build=Validated, publish=Staged →
+                    // falls through every branch in the classifier.
+                    m.transition_build(LexicalGenerationBuildState::Validated, 2);
+                }
+            }
+            m
+        }
+
+        // Table of (variant → expected severity tier).
+        let cases: &[(LexicalCleanupDisposition, Level)] = &[
+            (LexicalCleanupDisposition::SupersededReclaimable, Level::DEBUG),
+            (LexicalCleanupDisposition::FailedReclaimable, Level::DEBUG),
+            (LexicalCleanupDisposition::ActiveWork, Level::INFO),
+            (LexicalCleanupDisposition::CurrentPublished, Level::INFO),
+            (LexicalCleanupDisposition::SupersededRetained, Level::INFO),
+            (LexicalCleanupDisposition::PinnedRetained, Level::INFO),
+            (LexicalCleanupDisposition::QuarantinedRetained, Level::WARN),
+            (LexicalCleanupDisposition::FailedRetained, Level::WARN),
+        ];
+
+        // Sanity: exactly 8 variants in the table — if a new variant is
+        // ever added, `LexicalCleanupDisposition::all_variants` would
+        // count higher than this table, so this assertion fires the
+        // update before the mismatched-severity scenarios can slip.
+        assert_eq!(
+            LexicalCleanupDisposition::all_variants().len(),
+            cases.len(),
+            "table must cover every LexicalCleanupDisposition variant; \
+             the classifier adds variants and this list must follow"
+        );
+
+        for (variant, expected_level) in cases {
+            let collector = ClassificationCollector::default();
+            let subscriber = Registry::default().with(collector.clone());
+            let manifest = fixture_for(*variant, &format!("gen-{}", variant.as_str()));
+
+            // Sanity: the fixture actually classifies to the variant
+            // we intended. A mismatch here points to a fixture bug,
+            // not to the tracing emission — keeps the severity
+            // assertion below meaningful.
+            let inventory_disposition = manifest.cleanup_inventory().disposition;
+            assert_eq!(
+                inventory_disposition,
+                *variant,
+                "fixture for variant {variant:?} must actually classify to {variant:?}, \
+                 got {inventory_disposition:?}"
+            );
+
+            tracing::subscriber::with_default(subscriber, || {
+                let _plan = LexicalCleanupDryRunPlan::from_manifests([&manifest]);
+            });
+
+            let captured = collector.events.lock().expect("collector lock").clone();
+            assert_eq!(
+                captured.len(),
+                1,
+                "variant {variant:?}: record_inventory must emit exactly one classification event; \
+                 got {captured:?}"
+            );
+            let event = &captured[0];
+            assert_eq!(
+                event.level,
+                expected_level.to_string(),
+                "variant {variant:?} must emit at {expected_level:?} tier; got {event:?}"
+            );
+            assert_eq!(
+                event.target, "cass::indexer::lexical_cleanup",
+                "variant {variant:?}: target must stay grep-stable"
+            );
+            assert_eq!(
+                event.fields.get("disposition").map(String::as_str),
+                Some(variant.as_str()),
+                "variant {variant:?}: disposition field must match the enum as_str"
+            );
+            for required in ["generation_id", "reason", "reclaimable_bytes", "retained_bytes", "artifact_bytes"] {
+                assert!(
+                    event.fields.contains_key(required),
+                    "variant {variant:?}: field {required} must be present; got {:?}",
+                    event.fields.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 }
