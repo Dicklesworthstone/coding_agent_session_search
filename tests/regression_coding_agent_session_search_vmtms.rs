@@ -70,10 +70,10 @@ fn parse_time_input_is_total_for_adversarial_inputs() {
         "7d\0",
         "\0now",
         // non-ASCII / unicode
-        "７ｄ",  // fullwidth digits/letters (ASCII-only parser should return None)
-        "🔥",    // emoji
+        "７ｄ", // fullwidth digits/letters (ASCII-only parser should return None)
+        "🔥",   // emoji
         "yesterday🕑",
-        "−1d",  // unicode minus (NOT hyphen-minus)
+        "−1d", // unicode minus (NOT hyphen-minus)
         // long strings (no panic)
         &"a".repeat(10_000),
         &"-1d".repeat(1_000),
@@ -123,9 +123,8 @@ fn parse_time_input_trims_leading_and_trailing_whitespace() {
         let b = parse_time_input(bare).unwrap_or_else(|| {
             panic!("bare {bare:?} must parse (precondition to trim-invariance test)")
         });
-        let p = parse_time_input(padded).unwrap_or_else(|| {
-            panic!("padded {padded:?} must parse — trim-invariance regression")
-        });
+        let p = parse_time_input(padded)
+            .unwrap_or_else(|| panic!("padded {padded:?} must parse — trim-invariance regression"));
         assert!(
             (b - p).abs() <= tolerance_ms,
             "trim-invariance violated: bare={bare:?}->{b}, padded={padded:?}->{p}, \
@@ -146,13 +145,14 @@ fn parse_time_input_keywords_are_case_insensitive() {
         ("today", &["TODAY", "Today", "tOdAy"][..]),
         ("yesterday", &["YESTERDAY", "Yesterday", "YeStErDaY"][..]),
     ] {
-        let c = parse_time_input(canonical).unwrap_or_else(|| {
-            panic!("canonical keyword {canonical:?} must parse")
-        });
+        let c = parse_time_input(canonical)
+            .unwrap_or_else(|| panic!("canonical keyword {canonical:?} must parse"));
         for variant in variants {
             let v = parse_time_input(variant).unwrap_or_else(|| {
-                panic!("case-variant keyword {variant:?} must parse — \
-                        case-insensitivity regression")
+                panic!(
+                    "case-variant keyword {variant:?} must parse — \
+                        case-insensitivity regression"
+                )
             });
             assert!(
                 (c - v).abs() <= tolerance_ms,
