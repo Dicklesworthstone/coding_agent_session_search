@@ -8,15 +8,40 @@
 //!
 //! Part of bead: coding_agent_session_search-9oyj (T4.4)
 
-use assert_cmd::cargo::cargo_bin_cmd;
+use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use frankensqlite::compat::{ConnectionExt, RowExt};
+use serial_test::serial;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 mod util;
 use util::EnvGuard;
 use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
+use util::timeout::spawn_with_timeout_or_diag;
+
+/// Retrofit helper (bead 2gypv): wraps `std::process::Command::new(cass_bin)`
+/// with the standard env-isolation this suite uses, then invokes the
+/// f2r5t timeout-with-diagnostic wrapper. Converts silent subprocess
+/// hangs into structured diagnostic dumps instead of leaving cargo-test
+/// waiting on a stalled child indefinitely.
+fn run_cass_with_timeout(
+    label: &str,
+    args: &[&str],
+    data_dir: &Path,
+    home: &Path,
+    codex_home: &Path,
+    timeout: Duration,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(cargo_bin("cass"));
+    cmd.args(args)
+        .arg(data_dir)
+        .current_dir(home)
+        .env("CODEX_HOME", codex_home)
+        .env("HOME", home);
+    spawn_with_timeout_or_diag(cmd, label, Some(data_dir), timeout)
+}
 
 // =============================================================================
 // E2E Logger Support
@@ -130,6 +155,7 @@ fn count_conversations(db_path: &Path) -> i64 {
 /// This tests the indexer's ability to handle a large number of messages
 /// in a single conversation without memory issues or performance degradation.
 #[test]
+#[serial]
 fn index_large_single_session() {
     let tracker = tracker_for("index_large_single_session");
     let _trace_guard = tracker.trace_env_guard();
@@ -158,14 +184,20 @@ fn index_large_single_session() {
 
     // Index the large session
     let phase_start = tracker.start("index_large", Some("Index large session"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "index_large_single_session",
+        &["index", "--full", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(300),
+    );
+    assert!(
+        out.status.success(),
+        "cass index --full must succeed on large single session. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let index_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end("index_large", Some("Index large session"), phase_start);
 
@@ -229,6 +261,7 @@ fn index_large_single_session() {
 /// This tests the indexer's ability to handle many separate conversations
 /// efficiently, including proper session boundary detection.
 #[test]
+#[serial]
 fn index_many_conversations() {
     let tracker = tracker_for("index_many_conversations");
     let _trace_guard = tracker.trace_env_guard();
@@ -257,14 +290,20 @@ fn index_many_conversations() {
 
     // Index all sessions
     let phase_start = tracker.start("index_many", Some("Index many conversations"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "index_many_conversations",
+        &["index", "--full", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(300),
+    );
+    assert!(
+        out.status.success(),
+        "cass index --full must succeed across many conversations. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let index_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end("index_many", Some("Index many conversations"), phase_start);
 
@@ -302,6 +341,7 @@ fn index_many_conversations() {
 /// Tests that search can handle queries that match many results
 /// without performance degradation.
 #[test]
+#[serial]
 fn search_large_result_set() {
     let tracker = tracker_for("search_large_result_set");
     let _trace_guard = tracker.trace_env_guard();
@@ -342,33 +382,45 @@ fn search_large_result_set() {
 
     // Index
     let phase_start = tracker.start("index", Some("Index searchable sessions"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "search_large_result_set:index",
+        &["index", "--full", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(300),
+    );
+    assert!(
+        out.status.success(),
+        "search_large_result_set: index --full must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     tracker.end("index", Some("Index searchable sessions"), phase_start);
 
     // Search with term that matches all messages
     let phase_start = tracker.start("search_large", Some("Execute broad search query"));
-    let search_output = cargo_bin_cmd!("cass")
-        .args([
+    let search_output = run_cass_with_timeout(
+        "search_large_result_set:search",
+        &[
             "search",
             "searchterm",
             "--json",
             "--limit",
             "1000",
             "--data-dir",
-        ])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+        ],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(30),
+    );
+    assert!(
+        search_output.status.success(),
+        "search_large_result_set: search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
+    );
     let search_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end(
         "search_large",
@@ -377,7 +429,7 @@ fn search_large_result_set() {
     );
 
     // Parse results - JSON format has "total_matches" field
-    let output_str = String::from_utf8_lossy(&search_output.get_output().stdout);
+    let output_str = String::from_utf8_lossy(&search_output.stdout);
     let hit_count: u64 = serde_json::from_str::<serde_json::Value>(&output_str)
         .ok()
         .and_then(|v| v.get("total_matches")?.as_u64())
@@ -414,6 +466,7 @@ fn search_large_result_set() {
 /// Verifies that memory usage doesn't grow unbounded during indexing,
 /// which would indicate a memory leak or inefficient buffering.
 #[test]
+#[serial]
 fn memory_bounded_during_index() {
     let tracker = tracker_for("memory_bounded_during_index");
     let _trace_guard = tracker.trace_env_guard();
@@ -441,14 +494,20 @@ fn memory_bounded_during_index() {
 
     // Index
     let phase_start = tracker.start("index", Some("Index with memory monitoring"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "memory_bounded_during_index",
+        &["index", "--full", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(300),
+    );
+    assert!(
+        out.status.success(),
+        "memory_bounded_during_index: cass index --full must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let index_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end("index", Some("Index with memory monitoring"), phase_start);
 
@@ -486,6 +545,7 @@ fn memory_bounded_during_index() {
 /// Tests that incremental indexing is efficient when adding
 /// small amounts of new data to a large existing index.
 #[test]
+#[serial]
 fn incremental_index_on_large_base() {
     let tracker = tracker_for("incremental_index_on_large_base");
     let _trace_guard = tracker.trace_env_guard();
@@ -510,14 +570,20 @@ fn incremental_index_on_large_base() {
 
     // Full index
     let phase_start = tracker.start("index_full", Some("Initial full index"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "incremental_index_on_large_base:full",
+        &["index", "--full", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(300),
+    );
+    assert!(
+        out.status.success(),
+        "incremental_index_on_large_base: initial full index must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let full_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end("index_full", Some("Initial full index"), phase_start);
 
@@ -543,14 +609,20 @@ fn incremental_index_on_large_base() {
 
     // Incremental index
     let phase_start = tracker.start("index_incremental", Some("Incremental index"));
-    cargo_bin_cmd!("cass")
-        .args(["index", "--data-dir"])
-        .arg(&data_dir)
-        .current_dir(home)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .assert()
-        .success();
+    let out = run_cass_with_timeout(
+        "incremental_index_on_large_base:incremental",
+        &["index", "--data-dir"],
+        &data_dir,
+        home,
+        &codex_home,
+        Duration::from_secs(120),
+    );
+    assert!(
+        out.status.success(),
+        "incremental_index_on_large_base: incremental index must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let incremental_duration_ms = phase_start.elapsed().as_millis() as u64;
     tracker.end("index_incremental", Some("Incremental index"), phase_start);
 
