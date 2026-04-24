@@ -11430,16 +11430,16 @@ fn cleanup_path_has_symlink_below_root(path: &Path, root: &Path) -> bool {
             return false;
         }
         let Ok(metadata) = std::fs::symlink_metadata(current) else {
-            return false;
+            return true;
         };
         if metadata.file_type().is_symlink() {
             return true;
         }
         let Some(parent) = current.parent() else {
-            return false;
+            return true;
         };
         if parent == current {
-            return false;
+            return true;
         }
         current = parent;
     }
@@ -11662,6 +11662,72 @@ mod cleanup_target_safety_tests {
              symlinks anywhere in its ancestor chain; otherwise the symlink- \
              guard defenses have silently broken the happy path and \
              doctor --fix can no longer reclaim anything"
+        );
+    }
+
+    // Bead coding_agent_session_search-xwzkm: the ancestor-walk helper
+    // must be fail-CLOSED in every unreachable-root arm. Before the
+    // fix, a symlink_metadata error, a None parent, or a parent==current
+    // hit made the helper return false ("no symlink, safe"), leaving
+    // the outer safety predicate to rely on canonicalize() alone. A
+    // future refactor that weakened canonicalize would expose a real
+    // symlink-escape path. The three tests below pin fail-closed
+    // semantics independent of the upstream starts_with / canonicalize
+    // checks by calling the helper directly.
+
+    #[test]
+    fn cleanup_helper_fails_closed_when_ancestor_metadata_read_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Candidate under temp that does not exist on disk. The walk's
+        // first symlink_metadata call returns Err(NotFound); pre-fix
+        // the helper returned false ("safe") and the caller had to
+        // catch the escape via canonicalize. Post-fix, the helper
+        // returns true ("has symlink") so the outer predicate rejects.
+        let nonexistent = temp.path().join("missing-ancestor").join("child");
+        let root = temp.path();
+
+        assert!(
+            cleanup_path_has_symlink_below_root(&nonexistent, root),
+            "helper must fail-closed when an ancestor's symlink_metadata \
+             read fails — canonicalize defense-in-depth can be removed \
+             in a future refactor and the helper must stand on its own"
+        );
+    }
+
+    #[test]
+    fn cleanup_helper_fails_closed_when_walk_exhausts_parents_past_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Walkable candidate exists on disk and none of its ancestors
+        // are symlinks, but `root` is a sibling path the walk will
+        // never reach — the walk bottoms out at the filesystem root
+        // (parent() returns None) without ever matching `root`.
+        // Pre-fix: returned false. Post-fix: returns true.
+        let candidate = temp.path().join("walkable-dir");
+        std::fs::create_dir_all(&candidate).expect("create walkable dir");
+        let foreign_root = temp.path().join("sibling-that-the-walk-never-reaches");
+
+        assert!(
+            cleanup_path_has_symlink_below_root(&candidate, &foreign_root),
+            "helper must fail-closed when the walk reaches filesystem root \
+             without hitting the configured root — the None parent arm is a \
+             safety failure, not a green light"
+        );
+    }
+
+    #[test]
+    fn cleanup_helper_still_reports_clean_walk_when_root_is_reached() {
+        // Happy-path pin: the fix must NOT flip clean walks to unsafe.
+        // A candidate that lives under `root` with no symlinks anywhere
+        // on the ancestor chain must still report false ("no symlink").
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("real-root");
+        let candidate = root.join("level1").join("level2");
+        std::fs::create_dir_all(&candidate).expect("create candidate");
+
+        assert!(
+            !cleanup_path_has_symlink_below_root(&candidate, &root),
+            "helper must still return false for clean walks that reach root \
+             — the fail-closed fix must not regress the happy path"
         );
     }
 }
