@@ -456,11 +456,9 @@ mod tests {
     fn test_patterns_by_category() {
         let api_patterns = patterns_by_category(PatternCategory::ApiKeys);
         assert!(!api_patterns.is_empty());
-        assert!(
-            api_patterns
-                .iter()
-                .all(|p| p.category == PatternCategory::ApiKeys)
-        );
+        assert!(api_patterns
+            .iter()
+            .all(|p| p.category == PatternCategory::ApiKeys));
     }
 
     #[test]
@@ -482,6 +480,16 @@ mod tests {
         let pattern = Regex::new(EMAIL_ADDRESS.pattern).unwrap();
         assert!(pattern.is_match("Contact user@example.com for help"));
         assert!(pattern.is_match("test.user+tag@sub.domain.org"));
+    }
+
+    #[test]
+    fn test_email_pattern_uses_ascii_letter_classes() {
+        let pattern = Regex::new(EMAIL_ADDRESS.pattern).unwrap();
+
+        assert!(pattern.is_match("Contact USER_123@example.COM"));
+        assert!(!pattern.is_match("Contact user@example.δοκιμή"));
+        assert!(EMAIL_ADDRESS.pattern.contains("[A-Za-z]"));
+        assert!(!EMAIL_ADDRESS.pattern.contains("\\p"));
     }
 
     #[test]
