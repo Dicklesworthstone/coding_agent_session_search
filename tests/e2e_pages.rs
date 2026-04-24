@@ -22,7 +22,7 @@ use coding_agent_search::pages::bundle::{BundleBuilder, BundleResult};
 use coding_agent_search::pages::encrypt::{DecryptionEngine, EncryptionEngine, load_config};
 use coding_agent_search::pages::export::{ExportEngine, ExportFilter, PathMode};
 use coding_agent_search::pages::verify::verify_bundle;
-use coding_agent_search::storage::sqlite::SqliteStorage;
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use frankensqlite::Connection;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
@@ -275,7 +275,7 @@ fn write_pages_config(path: &Path, output_dir: &Path) {
 fn setup_test_db(data_dir: &Path, conversation_count: usize) -> std::path::PathBuf {
     let db_path = data_dir.join("agent_search.db");
 
-    let storage = SqliteStorage::open(&db_path).expect("Failed to open storage");
+    let storage = FrankenStorage::open(&db_path).expect("Failed to open storage");
 
     // Create agent
     let agent = Agent {
@@ -1294,7 +1294,7 @@ fn test_summary_generation_multi_agent_fixtures() {
         Some("Create database with multiple agent types"),
     );
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     // Create multiple agents
     let agents = [
@@ -1409,7 +1409,7 @@ fn test_summary_with_agent_filter() {
 
     // Setup database with 2 agents
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     let claude_agent = Agent {
         id: None,
@@ -1511,7 +1511,7 @@ fn test_summary_with_workspace_exclusions() {
     // Setup database with 2 workspaces
     let phase_start = tracker.start("setup_database", Some("Create database with 2 workspaces"));
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     let agent = Agent {
         id: None,
@@ -1638,7 +1638,7 @@ fn test_export_filter_date_range() {
         Some("Create database with conversations across time range"),
     );
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     let agent = Agent {
         id: None,
@@ -1760,7 +1760,7 @@ fn test_exclusion_pattern_matching() {
         Some("Create database with varied conversation titles"),
     );
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     let agent = Agent {
         id: None,
@@ -1855,7 +1855,7 @@ fn test_prepublish_summary_render() {
     // Setup database
     let phase_start = tracker.start("setup_database", Some("Create test database"));
     let db_path = data_dir.join("agent_search.db");
-    let storage = SqliteStorage::open(&db_path).expect("open storage");
+    let storage = FrankenStorage::open(&db_path).expect("open storage");
 
     let agent = Agent {
         id: None,
