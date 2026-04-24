@@ -744,6 +744,52 @@ mod tests {
         );
     }
 
+    /// Repeated metadata / extra_json structures are common in salvage
+    /// replays and assistant boilerplate. The memoized JSON walker must
+    /// reuse repeated object keys and repeated scalar values instead of
+    /// re-running the regex set for every copy.
+    #[test]
+    fn memoizing_redactor_redact_json_reuses_repeated_keys_and_values() {
+        let repeated_secret =
+            "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+        let repeated_note = "same assistant boilerplate without secrets";
+        let value = json!({
+            "events": [
+                {"token": repeated_secret, "note": repeated_note},
+                {"token": repeated_secret, "note": repeated_note},
+                {"token": repeated_secret, "note": repeated_note},
+            ],
+            "footer": repeated_note,
+        });
+
+        let uncached = redact_json(&value);
+        let mut redactor = MemoizingRedactor::with_capacity(32);
+        let memoized = redactor.redact_json(&value);
+
+        assert_eq!(
+            uncached, memoized,
+            "memoized JSON redaction must preserve legacy output exactly"
+        );
+        assert!(
+            !memoized.to_string().contains("eyJhbGci"),
+            "memoized JSON redaction must still remove repeated secrets"
+        );
+
+        let stats = redactor.stats();
+        assert_eq!(
+            stats.misses, 6,
+            "first occurrences of root keys, repeated child keys, and scalar values should miss once"
+        );
+        assert_eq!(
+            stats.inserts, 6,
+            "each distinct JSON key/value string should be inserted once"
+        );
+        assert_eq!(
+            stats.hits, 9,
+            "repeated child keys and repeated scalar values should hit the memo cache"
+        );
+    }
+
     /// Emptiness fast-path: zero-length input must NOT increment the
     /// cache miss counter. Otherwise an ingestion run with thousands
     /// of empty system messages would burn cache slots for
