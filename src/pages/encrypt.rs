@@ -25,6 +25,17 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Debug)]
+struct AeadSourceError(aes_gcm::Error);
+
+impl std::fmt::Display for AeadSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AeadSourceError {}
+
 /// Default chunk size for streaming encryption (8 MiB)
 pub const DEFAULT_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -202,14 +213,13 @@ impl EncryptionEngine {
             anyhow::bail!("Password cannot be whitespace-only");
         }
 
-        let slot_id = u8::try_from(self.key_slots.len())
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "maximum of 256 key slots exceeded ({} slots already allocated): {}",
-                    self.key_slots.len(),
-                    err
-                )
-            })?;
+        let slot_id = u8::try_from(self.key_slots.len()).map_err(|err| {
+            anyhow::anyhow!(
+                "maximum of 256 key slots exceeded ({} slots already allocated): {}",
+                self.key_slots.len(),
+                err
+            )
+        })?;
 
         // Generate salt
         let salt = SaltString::generate(&mut PasswordHashOsRng);
@@ -236,14 +246,13 @@ impl EncryptionEngine {
 
     /// Add a recovery secret slot using HKDF-SHA256
     pub fn add_recovery_slot(&mut self, secret: &[u8]) -> Result<u8> {
-        let slot_id = u8::try_from(self.key_slots.len())
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "maximum of 256 key slots exceeded ({} slots already allocated): {}",
-                    self.key_slots.len(),
-                    err
-                )
-            })?;
+        let slot_id = u8::try_from(self.key_slots.len()).map_err(|err| {
+            anyhow::anyhow!(
+                "maximum of 256 key slots exceeded ({} slots already allocated): {}",
+                self.key_slots.len(),
+                err
+            )
+        })?;
 
         // Generate salt
         let mut salt = [0u8; 16];
@@ -594,12 +603,13 @@ impl DecryptionEngine {
                     // failed (timing-attack hardening), so we still don't
                     // leak that — but the source error type IS preserved
                     // in the chain for debug-mode inspection.
-                    anyhow::anyhow!(
+                    let context = format!(
                         "Decryption failed for chunk {} ({} bytes ciphertext): {}",
                         chunk_index,
                         ciphertext.len(),
                         err
-                    )
+                    );
+                    anyhow::Error::new(AeadSourceError(err)).context(context)
                 })?;
 
             // Decompress
@@ -723,7 +733,7 @@ fn unwrap_key(
             // came from the cipher layer vs a subsequent layer. Slot
             // id is included so operators can correlate with the
             // recovery / password slot they were attempting.
-            anyhow::anyhow!(
+            let context = format!(
                 "Key unwrapping failed for slot {} ({} bytes wrapped, {} bytes nonce, \
                  {} bytes aad): {}",
                 slot_id,
@@ -731,7 +741,8 @@ fn unwrap_key(
                 nonce.len(),
                 aad.len(),
                 err
-            )
+            );
+            anyhow::Error::new(AeadSourceError(err)).context(context)
         })?;
 
     let dek_len = dek.len();
@@ -1083,8 +1094,9 @@ mod tests {
     /// `TryFromSliceError`. Operators staring at "Decryption failed
     /// for chunk 42" had no way to tell whether the cipher layer or a
     /// downstream layer reported it. Post-fix, every site uses
-    /// `.map_err(|err| anyhow!("…: {err}"))` so the source error
-    /// formats into the message and survives an `{:?}` debug print.
+    /// `.map_err(|err| anyhow::Error::new(AeadSourceError(err)).context(…))`
+    /// so the source error formats into the message AND remains an
+    /// error-chain frame for structured inspection.
     ///
     /// The test below exercises ONE high-value path — `unwrap_key`
     /// against a wrapped DEK that has been tampered with — and asserts
@@ -1139,6 +1151,17 @@ mod tests {
             rendered.contains(": "),
             "unwrap error must include `: <source>` separator so the \
              aead source error survives in the chain; got: {rendered}"
+        );
+        let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+        assert!(
+            chain.len() >= 2,
+            "unwrap error must preserve the aead source as an anyhow chain frame; \
+             got chain: {chain:?}"
+        );
+        assert!(
+            chain.iter().skip(1).any(|frame| !frame.is_empty()),
+            "unwrap error source frame must be non-empty for debug inspection; \
+             got chain: {chain:?}"
         );
         // Sanity: legacy "Key unwrapping failed" text is preserved as
         // the human-facing prefix so existing operator runbooks /
