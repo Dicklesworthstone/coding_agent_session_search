@@ -253,10 +253,16 @@ fn status_recommended_action_during_active_rebuild_says_wait_not_reindex() {
         "recommended_action must NOT tell the operator to run `cass index --full` \
          while a rebuild is active (stampede advice); got: {recommended_action:?}"
     );
+    // Catch all three phrasings that recommend running another index
+    // command — quoted (single/back-tick) AND plain unquoted. An
+    // unquoted "Run cass index to rebuild..." would otherwise slip
+    // past the two quote-bearing checks and still be stampede advice.
     assert!(
-        !lower.contains("run 'cass index'") && !lower.contains("run `cass index`"),
-        "recommended_action must NOT tell the operator to run `cass index` of any \
-         form while a rebuild is active; got: {recommended_action:?}"
+        !lower.contains("run 'cass index'")
+            && !lower.contains("run `cass index`")
+            && !lower.contains("run cass index"),
+        "recommended_action must NOT tell the operator to run `cass index` in any \
+         form (quoted or unquoted) while a rebuild is active; got: {recommended_action:?}"
     );
 }
 // Cold-start readiness-surface progression.

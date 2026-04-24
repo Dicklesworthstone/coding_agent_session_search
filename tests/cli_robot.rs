@@ -4982,7 +4982,15 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    seed_codex_session_s0cmk(&codex_home, "s0cmk-fixture-01.jsonl", "dbexistsprobe");
+    // Filename MUST start with `rollout-` so franken_agent_detection's
+    // Codex connector actually ingests the fixture (see
+    // franken_agent_detection/src/connectors/codex.rs::is_rollout_file).
+    // Without the prefix the connector silently skips the file and
+    // `cass index --full` produces an empty DB — the test would still
+    // pass on its warning-text contract but the seeded keyword would
+    // never be visible to search, defeating future content-dependent
+    // assertions in this area.
+    seed_codex_session_s0cmk(&codex_home, "rollout-s0cmk-01.jsonl", "dbexistsprobe");
 
     // Full index to produce BOTH the canonical DB and the lexical tree.
     let mut idx = isolated_cass_cmd(home);
