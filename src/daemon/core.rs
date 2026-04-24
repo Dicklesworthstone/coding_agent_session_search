@@ -3,7 +3,10 @@
 //! This module provides the server that listens on a Unix Domain Socket
 //! and handles embedding/reranking requests using loaded models.
 
+use std::ffi::OsString;
+use std::fs::{self, DirBuilder};
 use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +26,114 @@ use super::protocol::{
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
+
+struct BoundDaemonSocket {
+    listener: UnixListener,
+    public_path: PathBuf,
+    bind_path: PathBuf,
+}
+
+fn create_owner_only_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn parent_dir_is_owner_only(path: &Path) -> std::io::Result<bool> {
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+
+    let metadata = fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket parent is not a directory: {}", parent.display()),
+        ));
+    }
+
+    Ok(metadata.permissions().mode() & 0o077 == 0)
+}
+
+fn private_runtime_dir_for_socket(socket_path: &Path) -> std::io::Result<PathBuf> {
+    let parent = socket_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = socket_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket path has no file name: {}", socket_path.display()),
+        )
+    })?;
+
+    let mut runtime_name = OsString::from(".");
+    runtime_name.push(file_name);
+    runtime_name.push(".runtime");
+    Ok(parent.join(runtime_name))
+}
+
+fn remove_stale_socket_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_socket() || file_type.is_symlink() {
+                fs::remove_file(path)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to remove non-socket daemon path: {}",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn bind_owner_only_unix_listener(socket_path: &Path) -> std::io::Result<BoundDaemonSocket> {
+    if let Some(parent) = socket_path.parent()
+        && !parent.exists()
+    {
+        create_owner_only_dir_all(parent)?;
+    }
+
+    let bind_path = if parent_dir_is_owner_only(socket_path)? {
+        socket_path.to_path_buf()
+    } else {
+        let runtime_dir = private_runtime_dir_for_socket(socket_path)?;
+        create_owner_only_dir_all(&runtime_dir)?;
+        runtime_dir.join("daemon.sock")
+    };
+
+    remove_stale_socket_path(&bind_path)?;
+    if bind_path != socket_path {
+        remove_stale_socket_path(socket_path)?;
+    }
+
+    let listener = UnixListener::bind(&bind_path)?;
+    fs::set_permissions(&bind_path, fs::Permissions::from_mode(0o600))?;
+
+    if bind_path != socket_path {
+        std::os::unix::fs::symlink(&bind_path, socket_path)?;
+    }
+
+    Ok(BoundDaemonSocket {
+        listener,
+        public_path: socket_path.to_path_buf(),
+        bind_path,
+    })
+}
+
+fn cleanup_bound_socket(public_path: &Path, bind_path: &Path) {
+    let _ = remove_stale_socket_path(public_path);
+    if bind_path != public_path {
+        let _ = remove_stale_socket_path(bind_path);
+    }
+}
 
 /// Configuration for the daemon server.
 #[derive(Debug, Clone)]
@@ -228,32 +339,16 @@ impl ModelDaemon {
             );
         }
 
-        // Remove stale socket if present (ignore NotFound — avoids TOCTOU race)
-        if let Err(e) = std::fs::remove_file(&self.config.socket_path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(e);
-        }
-
-        // Create parent directory if needed
-        if let Some(parent) = self.config.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let listener = UnixListener::bind(&self.config.socket_path)?;
-        // Restrict socket to owner-only access (prevent other local users from
-        // connecting and issuing Shutdown / SubmitEmbeddingJob with arbitrary paths).
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &self.config.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            )?;
-        }
+        let BoundDaemonSocket {
+            listener,
+            public_path,
+            bind_path,
+        } = bind_owner_only_unix_listener(&self.config.socket_path)?;
         listener.set_nonblocking(true)?;
 
         info!(
             socket = %self.config.socket_path.display(),
+            bound_socket = %bind_path.display(),
             max_connections = self.config.max_connections,
             "Daemon listening"
         );
@@ -341,9 +436,7 @@ impl ModelDaemon {
         }
 
         // Cleanup
-        if self.config.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.config.socket_path);
-        }
+        cleanup_bound_socket(&public_path, &bind_path);
 
         info!("Daemon stopped");
         Ok(())
@@ -632,6 +725,7 @@ impl ModelDaemon {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn test_data_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -701,5 +795,54 @@ mod tests {
             daemon_run_lock_path(&socket),
             PathBuf::from("/tmp/cass-semantic.spawnlock")
         );
+    }
+
+    #[test]
+    fn test_owner_only_bind_uses_private_runtime_dir_for_public_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let public_dir = temp_dir.path().join("public");
+        fs::create_dir(&public_dir).unwrap();
+        fs::set_permissions(&public_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let public_socket = public_dir.join("daemon.sock");
+
+        let BoundDaemonSocket {
+            listener,
+            public_path,
+            bind_path,
+        } = bind_owner_only_unix_listener(&public_socket).unwrap();
+
+        assert_eq!(public_path, public_socket);
+        assert_ne!(bind_path, public_socket);
+        assert!(
+            fs::symlink_metadata(&public_socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let runtime_dir = bind_path.parent().unwrap();
+        assert_eq!(
+            fs::symlink_metadata(runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(&bind_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let accept_thread = std::thread::spawn(move || listener.accept().map(|_| ()));
+        let client = UnixStream::connect(&public_socket).unwrap();
+        drop(client);
+        accept_thread.join().unwrap().unwrap();
+
+        cleanup_bound_socket(&public_path, &bind_path);
     }
 }
