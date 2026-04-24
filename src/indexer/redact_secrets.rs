@@ -481,6 +481,19 @@ mod tests {
     /// (cache-hit invariance) AND match the uncached result.
     #[test]
     fn memoizing_redactor_matches_uncached_for_arbitrary_input() {
+        // Diagnostic-message slice helper: MUST land on a UTF-8 char
+        // boundary so we can extend this fixture set with multi-byte
+        // inputs in the future without panicking on byte-slice
+        // boundary errors. (MEMORY.md flagged this exact pattern as
+        // a recurring footgun; this helper inoculates the test.)
+        fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+            let mut end = s.len().min(max_bytes);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            &s[..end]
+        }
+        let twenty_kib_unicode = "🔐abc".repeat(2_048);
         let inputs: &[&str] = &[
             "",
             "no secrets here, just prose",
@@ -488,6 +501,13 @@ mod tests {
             "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij followed by AKIAABCDEFGHIJKLMNOP",
             "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature",
             "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij and another ghp_ZYXWVUTSRQPONMLKJIHGFEDCBA0123456789",
+            // Multi-byte UTF-8 input: pins that the memoized path's
+            // hashing + cache key construction handles non-ASCII
+            // content (blake3 over .as_bytes() handles any byte
+            // sequence). Pre-fixup, the diagnostic prefix slice
+            // below would have panicked on this input.
+            "🔐 user pasted sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij from 测试",
+            &twenty_kib_unicode,
             &"a".repeat(10_000),
         ];
         let mut redactor = MemoizingRedactor::with_capacity(64);
@@ -496,14 +516,16 @@ mod tests {
             let memoized_first = redactor.redact_text(input);
             let memoized_second = redactor.redact_text(input);
             assert_eq!(
-                uncached, memoized_first,
+                uncached,
+                memoized_first,
                 "memoized first call must match legacy uncached redact_text for input prefix: {:?}",
-                &input[..input.len().min(64)]
+                safe_prefix(input, 64)
             );
             assert_eq!(
-                uncached, memoized_second,
+                uncached,
+                memoized_second,
                 "memoized second call must match legacy uncached for input prefix: {:?}",
-                &input[..input.len().min(64)]
+                safe_prefix(input, 64)
             );
         }
     }
@@ -524,7 +546,10 @@ mod tests {
         let _ = redactor.redact_text(payload);
         let stats = redactor.stats();
         assert_eq!(stats.misses, 1, "first call must be a cache miss");
-        assert_eq!(stats.hits, 2, "subsequent identical calls must be cache hits");
+        assert_eq!(
+            stats.hits, 2,
+            "subsequent identical calls must be cache hits"
+        );
         assert_eq!(stats.inserts, 1, "exactly one redacted result inserted");
     }
 
