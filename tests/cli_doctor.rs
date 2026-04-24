@@ -82,6 +82,54 @@ fn write_quarantined_manifest(generation_dir: &Path) {
     .expect("write manifest");
 }
 
+fn write_quarantined_reclaimable_shard_manifest(generation_dir: &Path) {
+    fs::create_dir_all(generation_dir).expect("create generation dir");
+    fs::write(
+        generation_dir.join("lexical-generation-manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "manifest_version": 1,
+            "generation_id": "gen-quarantined-reclaimable",
+            "attempt_id": "attempt-1",
+            "created_at_ms": 1_733_000_000_000_i64,
+            "updated_at_ms": 1_733_000_000_321_i64,
+            "source_db_fingerprint": "fp-test",
+            "conversation_count": 3,
+            "message_count": 9,
+            "indexed_doc_count": 9,
+            "equivalence_manifest_fingerprint": null,
+            "shard_plan": null,
+            "build_budget": null,
+            "shards": [{
+                "shard_id": "shard-abandoned",
+                "shard_ordinal": 0,
+                "state": "abandoned",
+                "updated_at_ms": 1_733_000_000_222_i64,
+                "indexed_doc_count": 9,
+                "message_count": 9,
+                "artifact_bytes": 512,
+                "stable_hash": "stable-hash-abandoned",
+                "reclaimable": true,
+                "pinned": false,
+                "recovery_reason": "validation abandoned before publish",
+                "quarantine_reason": null
+            }],
+            "merge_debt": {
+                "state": "none",
+                "updated_at_ms": null,
+                "pending_shard_count": 0,
+                "pending_artifact_bytes": 0,
+                "reason": null,
+                "controller_reason": null
+            },
+            "build_state": "failed",
+            "publish_state": "quarantined",
+            "failure_history": []
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("write manifest");
+}
+
 fn write_superseded_reclaimable_manifest(generation_dir: &Path, generation_id: &str) {
     fs::create_dir_all(generation_dir).expect("create superseded generation dir");
     fs::write(
@@ -334,6 +382,96 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
     assert_eq!(
         apply_gate["inspection_required_generation_ids"][0].as_str(),
         Some("gen-quarantined")
+    );
+}
+
+#[test]
+fn doctor_json_does_not_count_quarantined_artifacts_as_reclaimable() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+
+    let quarantined_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined-reclaimable");
+    write_quarantined_reclaimable_shard_manifest(&quarantined_dir);
+    fs::write(
+        quarantined_dir.join("segment-abandoned"),
+        b"quarantined abandoned generation bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    assert!(
+        out.status.success(),
+        "cass doctor --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let quarantine = &payload["quarantine"];
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_reclaimable_bytes"].as_u64(),
+        Some(0),
+        "quarantined generations should not contribute to dry-run reclaimable bytes"
+    );
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_reclaim_candidate_count"].as_u64(),
+        Some(0),
+        "quarantined generations should not create cleanup reclaim candidates"
+    );
+    assert_eq!(
+        quarantine["summary"]["gc_eligible_bytes"].as_u64(),
+        Some(0),
+        "quarantined generations requiring inspection are retained, not gc eligible"
+    );
+
+    let inventories = quarantine["lexical_cleanup_dry_run"]["inventories"]
+        .as_array()
+        .expect("cleanup inventories");
+    let inventory = inventories
+        .iter()
+        .find(|entry| entry["generation_id"].as_str() == Some("gen-quarantined-reclaimable"))
+        .expect("quarantined inventory");
+    assert_eq!(
+        inventory["disposition"].as_str(),
+        Some("quarantined_retained")
+    );
+    assert_eq!(inventory["reclaimable_bytes"].as_u64(), Some(0));
+    assert_eq!(inventory["retained_bytes"].as_u64(), Some(512));
+    assert_eq!(
+        inventory["shards"][0]["disposition"].as_str(),
+        Some("quarantined_retained"),
+        "shard-level dry-run JSON should also honor the generation quarantine hold"
+    );
+    assert_eq!(
+        inventory["shards"][0]["reclaimable_bytes"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(inventory["shards"][0]["retained_bytes"].as_u64(), Some(512));
+    assert_eq!(
+        quarantine["lexical_cleanup_dry_run"]["shard_disposition_summaries"]
+            ["quarantined_retained"]["reclaimable_bytes"]
+            .as_u64(),
+        Some(0),
+        "quarantined shard summaries should not expose reclaimable bytes"
+    );
+    assert!(
+        quarantine["lexical_cleanup_dry_run"]["shard_disposition_summaries"]["failed_reclaimable"]
+            .is_null(),
+        "quarantined shards must not leak into failed_reclaimable summaries"
     );
 }
 

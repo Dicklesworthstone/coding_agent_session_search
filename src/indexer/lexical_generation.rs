@@ -684,6 +684,11 @@ impl LexicalCleanupDryRunPlan {
         let mut has_protected_retention =
             Self::is_protected_retention(inventory.disposition) && inventory.retained_bytes > 0;
         let inventory_requires_inspection = Self::requires_inspection(inventory.disposition);
+        let inventory_allows_reclaim_candidates = matches!(
+            inventory.disposition,
+            LexicalCleanupDisposition::SupersededReclaimable
+                | LexicalCleanupDisposition::FailedReclaimable
+        );
         let mut shard_inspection_items = 0usize;
         for shard in &inventory.shards {
             let summary = self
@@ -711,7 +716,7 @@ impl LexicalCleanupDryRunPlan {
                 });
             }
 
-            if shard.reclaimable_bytes == 0 {
+            if shard.reclaimable_bytes == 0 || !inventory_allows_reclaim_candidates {
                 continue;
             }
             self.reclaim_candidates
@@ -1308,12 +1313,17 @@ impl LexicalGenerationManifest {
                     LexicalCleanupDisposition::PinnedRetained,
                     "shard is pinned by current retention policy".to_string(),
                 )
-            } else if matches!(shard.state, LexicalShardLifecycleState::Quarantined) {
+            } else if matches!(
+                self.publish_state,
+                LexicalGenerationPublishState::Quarantined
+            ) || matches!(shard.state, LexicalShardLifecycleState::Quarantined)
+            {
                 (
                     LexicalCleanupDisposition::QuarantinedRetained,
                     shard
                         .quarantine_reason
                         .clone()
+                        .or_else(|| shard.recovery_reason.clone())
                         .unwrap_or_else(|| "quarantined shard requires inspection".to_string()),
                 )
             } else if self.generation_has_active_work()
@@ -1507,6 +1517,16 @@ impl LexicalGenerationManifest {
     }
 
     fn generation_cleanup_allows_reclaim(&self) -> bool {
+        if matches!(
+            self.publish_state,
+            LexicalGenerationPublishState::Quarantined
+        ) || self
+            .shards
+            .iter()
+            .any(|shard| matches!(shard.state, LexicalShardLifecycleState::Quarantined))
+        {
+            return false;
+        }
         (matches!(
             self.publish_state,
             LexicalGenerationPublishState::Superseded
