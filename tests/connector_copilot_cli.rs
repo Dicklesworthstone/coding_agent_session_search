@@ -6,7 +6,7 @@
 //! a `data` object. Before the fix, these events yielded zero conversations.
 
 use coding_agent_search::connectors::copilot_cli::CopilotCliConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
+use coding_agent_search::connectors::{Connector, NormalizedConversation, ScanContext};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -18,6 +18,12 @@ fn write_file(dir: &Path, filename: &str, content: &str) -> PathBuf {
     }
     fs::write(&path, content).unwrap();
     path
+}
+
+fn scan_session_state(root: PathBuf) -> Vec<NormalizedConversation> {
+    let connector = CopilotCliConnector::new();
+    let ctx = ScanContext::local_default(root, None);
+    connector.scan(&ctx).unwrap()
 }
 
 /// Canonical reproduction of the shape reported in cass#187:
@@ -37,10 +43,8 @@ fn scan_parses_chronicle_nested_data_content() {
 
     write_file(&session_dir, "events.jsonl", events);
 
-    let connector = CopilotCliConnector::new();
     let root = tmp.path().join(".copilot/session-state");
-    let ctx = ScanContext::local_default(root, None);
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = scan_session_state(root);
 
     assert_eq!(
         convs.len(),
@@ -105,10 +109,8 @@ fn scan_chronicle_uses_directory_uuid_for_session_id() {
 "#;
     write_file(&session_dir, "events.jsonl", events);
 
-    let connector = CopilotCliConnector::new();
     let root = tmp.path().join(".copilot/session-state");
-    let ctx = ScanContext::local_default(root, None);
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = scan_session_state(root);
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].external_id.as_deref(), Some(uuid));
@@ -128,13 +130,128 @@ fn scan_handles_mixed_legacy_and_chronicle_events() {
 "#;
     write_file(&session_dir, "events.jsonl", events);
 
-    let connector = CopilotCliConnector::new();
     let root = tmp.path().join(".copilot/session-state");
-    let ctx = ScanContext::local_default(root, None);
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = scan_session_state(root);
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].messages.len(), 2);
     assert!(convs[0].messages[0].content.contains("legacy top-level"));
     assert!(convs[0].messages[1].content.contains("nested reply"));
+}
+
+#[test]
+fn scan_empty_session_state_returns_no_conversations() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join(".copilot/session-state");
+    fs::create_dir_all(root.join("empty-session")).unwrap();
+    write_file(
+        &root.join("only-control-events"),
+        "events.jsonl",
+        r#"{"type":"session.start","timestamp":"2026-03-01T10:00:00.000Z"}
+{"type":"session.end","timestamp":"2026-03-01T10:00:01.000Z"}
+"#,
+    );
+
+    let convs = scan_session_state(root);
+
+    assert!(
+        convs.is_empty(),
+        "empty directories and control-only logs must not synthesize conversations"
+    );
+}
+
+#[test]
+fn scan_skips_malformed_lines_without_losing_valid_messages() {
+    let tmp = TempDir::new().unwrap();
+    let session_dir = tmp.path().join(".copilot/session-state/malformed-lines");
+    fs::create_dir_all(&session_dir).unwrap();
+
+    let events = r#"not valid json
+{"type":"user.message","data":{"content":"valid before corrupt line"},"timestamp":"2026-03-01T10:00:00.000Z"}
+{"type":"assistant.message","data":{"content":
+{"type":"assistant.message","data":{"content":"valid after corrupt line"},"timestamp":"2026-03-01T10:00:02.000Z"}
+"#;
+    write_file(&session_dir, "events.jsonl", events);
+
+    let root = tmp.path().join(".copilot/session-state");
+    let convs = scan_session_state(root);
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].external_id.as_deref(), Some("malformed-lines"));
+    assert_eq!(convs[0].messages.len(), 2);
+    assert!(
+        convs[0].messages[0]
+            .content
+            .contains("valid before corrupt line")
+    );
+    assert!(
+        convs[0].messages[1]
+            .content
+            .contains("valid after corrupt line")
+    );
+}
+
+#[test]
+fn scan_truncated_session_without_complete_json_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let session_dir = tmp.path().join(".copilot/session-state/truncated-only");
+    fs::create_dir_all(&session_dir).unwrap();
+    write_file(
+        &session_dir,
+        "events.jsonl",
+        r#"{"type":"user.message","data":{"content":"unterminated message"},"#,
+    );
+
+    let root = tmp.path().join(".copilot/session-state");
+    let convs = scan_session_state(root);
+
+    assert!(
+        convs.is_empty(),
+        "fully truncated logs must be ignored rather than producing partial phantom sessions"
+    );
+}
+
+#[test]
+fn scan_large_chronicle_session_preserves_all_messages_in_order() {
+    let tmp = TempDir::new().unwrap();
+    let session_dir = tmp.path().join(".copilot/session-state/large-session");
+    fs::create_dir_all(&session_dir).unwrap();
+
+    let mut events = String::new();
+    events.push_str(
+        r#"{"type":"session.start","data":{"sessionId":"large-session","cwd":"/workspace/large"},"timestamp":"2026-03-01T10:00:00.000Z"}
+"#,
+    );
+    for idx in 0..512 {
+        let role = if idx % 2 == 0 {
+            "user.message"
+        } else {
+            "assistant.message"
+        };
+        events.push_str(&format!(
+            r#"{{"type":"{role}","data":{{"content":"message {idx:03}"}},"timestamp":"2026-03-01T10:00:01.000Z"}}
+"#
+        ));
+    }
+    write_file(&session_dir, "events.jsonl", &events);
+
+    let root = tmp.path().join(".copilot/session-state");
+    let convs = scan_session_state(root);
+
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.external_id.as_deref(), Some("large-session"));
+    assert_eq!(conv.workspace, Some(PathBuf::from("/workspace/large")));
+    assert_eq!(conv.messages.len(), 512);
+    assert_eq!(conv.messages[0].role, "user");
+    assert!(conv.messages[0].content.contains("message 000"));
+    assert_eq!(conv.messages[511].role, "assistant");
+    assert!(conv.messages[511].content.contains("message 511"));
+    for (idx, message) in conv.messages.iter().enumerate() {
+        assert_eq!(message.idx, i64::try_from(idx).unwrap());
+        assert!(
+            message.content.contains(&format!("message {idx:03}")),
+            "large session message order changed at index {idx}"
+        );
+    }
 }
