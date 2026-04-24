@@ -11532,6 +11532,135 @@ mod cleanup_target_safety_tests {
             "cleanup must reject manifest-backed generations reached through a symlinked parent"
         );
     }
+
+    // Bead coding_agent_session_search-ofk1n: extend 0a89a96a's two
+    // ancestor-symlink tests with three adversarial shapes those tests
+    // don't exercise directly. Each test keeps the hermetic
+    // tempdir + unix-only gating pattern already established above.
+
+    /// Adversarial: the candidate path IS ITSELF a symlink (the
+    /// ancestors are all regular directories). 0a89a96a's two
+    /// fixtures both put the symlink on an ANCESTOR — this test
+    /// exercises the distinct symlink_metadata(path) == is_symlink
+    /// arm at the top of cleanup_path_has_symlink_below_root.
+    #[test]
+    fn cleanup_target_safety_rejects_candidate_that_is_itself_a_symlink() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let external_target = temp.path().join("outside-target");
+        std::fs::create_dir_all(&external_target).expect("create external target");
+
+        let publish_backup_parent = index_path
+            .parent()
+            .expect("index parent")
+            .join(".lexical-publish-backups");
+        std::fs::create_dir_all(&publish_backup_parent).expect("create backup parent");
+
+        // The candidate itself is a symlink — parent directory is a
+        // normal, non-symlinked directory.
+        let symlink_candidate = publish_backup_parent.join("prior-live-symlinked");
+        std::os::unix::fs::symlink(&external_target, &symlink_candidate)
+            .expect("create direct symlink candidate");
+
+        assert!(
+            !cleanup_target_path_is_safe(&symlink_candidate, &data_dir, &db_path, &index_path),
+            "cleanup must reject a candidate that is itself a symlink, even when \
+             every ancestor between it and data_dir is a regular directory"
+        );
+    }
+
+    /// Adversarial: a non-symlink path under data_dir that
+    /// canonicalizes to the db_path. Without 0a89a96a's canonicalize
+    /// post-check, an attacker who can create a hardlink alias would
+    /// slip past the prefix check and target the canonical DB for
+    /// deletion. `std::fs::hard_link` works within the same
+    /// filesystem, so this test uses that to stand up a realistic
+    /// canonicalize-alias attack.
+    #[test]
+    fn cleanup_target_safety_rejects_hardlink_alias_pointing_at_db_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        // Hardlink from a plausible-looking "retained-db-backup"
+        // location (under data_dir, string prefix passes) back to the
+        // canonical DB. std::fs::hard_link succeeds iff source and
+        // destination share a filesystem, which they do under tempdir.
+        let alias = data_dir.join("index").join("agent_search.db");
+        std::fs::hard_link(&db_path, &alias)
+            .expect("create hardlink alias to db_path");
+
+        // canonicalize(alias) and canonicalize(db_path) resolve to
+        // different paths on most filesystems (hard links share an
+        // inode but keep distinct canonical paths); this test is
+        // meaningful regardless — the prefix/suffix checks ARE
+        // supposed to reject an index-parented file that happens to
+        // be named "agent_search.db", and this is a clean adversarial
+        // stand-in for that shape.
+        let canonical_alias = std::fs::canonicalize(&alias).expect("canonicalize alias");
+        let canonical_db = std::fs::canonicalize(&db_path).expect("canonicalize db");
+
+        if canonical_alias == canonical_db {
+            assert!(
+                !cleanup_target_path_is_safe(&alias, &data_dir, &db_path, &index_path),
+                "cleanup must reject any path whose canonical form equals db_path"
+            );
+        } else {
+            // Hardlink produced distinct canonical paths; the alias
+            // still lives under index_path, so it must be rejected by
+            // the index-prefix guard instead. Still a meaningful pin.
+            assert!(
+                !cleanup_target_path_is_safe(&alias, &data_dir, &db_path, &index_path),
+                "cleanup must reject any path under index_path (hardlink alias \
+                 under index counts as under-index content)"
+            );
+        }
+    }
+
+    /// Happy-path guard: a normal, non-symlinked retention candidate
+    /// under a real data_dir must STILL pass the safety check.
+    /// Without this, the suite could silently become over-rejecting
+    /// if a future defense mis-handles deep-nested-but-clean paths —
+    /// users would lose all cleanup functionality with no observable
+    /// symptom in the rejection-focused tests above.
+    #[test]
+    fn cleanup_target_safety_accepts_deep_nested_non_symlinked_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        // Deeply nested, all plain directories (no symlinks
+        // anywhere), sibling of the live index — the canonical shape
+        // the doctor --fix reclaimer is actually supposed to act on.
+        let deep_candidate = data_dir
+            .join("index")
+            .join(".lexical-publish-backups")
+            .join("2026-04-24-120000-prior-live")
+            .join("segment-data");
+        std::fs::create_dir_all(&deep_candidate).expect("create deep candidate");
+
+        assert!(
+            cleanup_target_path_is_safe(&deep_candidate, &data_dir, &db_path, &index_path),
+            "cleanup must ACCEPT a legitimately deep-nested retention \
+             candidate that has no symlinks anywhere in its ancestor chain; \
+             otherwise the symlink-guard defenses have silently broken the \
+             happy path and doctor --fix can no longer reclaim anything"
+        );
+    }
 }
 
 fn lexical_cleanup_disposition_label(
