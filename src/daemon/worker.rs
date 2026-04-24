@@ -567,6 +567,40 @@ mod tests {
         );
     }
 
+    /// `coding_agent_session_search-am69y`: pin the override-by-flag
+    /// short-circuit at the top of `resolve_embedder_kind`. The
+    /// `test_resolve_embedder_kind_hash_aliases` companion above
+    /// exercises ("hash", false), but "hash" matches BOTH the
+    /// `!use_semantic` branch AND the `eq_ignore_ascii_case("hash")`
+    /// branch — so a regression that broke only the `!use_semantic`
+    /// short-circuit would still be rescued by the name match and
+    /// silently pass. This test pins the flag-only contract by
+    /// passing semantic model names with `use_semantic=false`: every
+    /// registered FastEmbedder name MUST resolve to `Hash` purely
+    /// because the flag is false, regardless of name.
+    #[test]
+    fn test_resolve_embedder_kind_use_semantic_false_short_circuits_regardless_of_name() {
+        for semantic_name in [
+            "minilm",
+            "minilm-384",
+            "all-minilm-l6-v2",
+            "fastembed",
+            "snowflake-arctic-s",
+            "snowflake-arctic-embed-s",
+            "nomic-embed",
+            "nomic-embed-text-v1.5",
+            "MINILM",
+        ] {
+            assert_eq!(
+                resolve_embedder_kind(semantic_name, false).unwrap(),
+                WorkerEmbedderKind::Hash,
+                "use_semantic=false MUST short-circuit to Hash regardless of model_name; \
+                 regression on name {semantic_name:?} indicates the !use_semantic branch \
+                 was bypassed"
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_embedder_kind_semantic_aliases() {
         assert_eq!(
