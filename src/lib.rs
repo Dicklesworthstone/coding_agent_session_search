@@ -11597,8 +11597,7 @@ mod cleanup_target_safety_tests {
         // canonical DB. std::fs::hard_link succeeds iff source and
         // destination share a filesystem, which they do under tempdir.
         let alias = data_dir.join("index").join("agent_search.db");
-        std::fs::hard_link(&db_path, &alias)
-            .expect("create hardlink alias to db_path");
+        std::fs::hard_link(&db_path, &alias).expect("create hardlink alias to db_path");
 
         // canonicalize(alias) and canonicalize(db_path) resolve to
         // different paths on most filesystems (hard links share an
@@ -12116,11 +12115,10 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
-        let quarantine_summary = collect_diag_quarantine_report(
+        let quarantine_report = collect_diag_quarantine_report(
             &data_dir,
             &crate::search::tantivy::expected_index_dir(&data_dir),
-        )
-        .summary;
+        );
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -12141,9 +12139,7 @@ fn run_status(
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild_progress": rebuild_progress_summary_json(&state),
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
-            "quarantine": {
-                "summary": quarantine_summary,
-            },
+            "quarantine": quarantine_report,
             "recommended_action": recommended_action,
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
