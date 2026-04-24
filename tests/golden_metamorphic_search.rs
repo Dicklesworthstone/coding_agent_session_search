@@ -193,21 +193,27 @@ fn golden_limit_prefix_ordering() {
             .to_string()
     };
 
-    let extract = |hits: &[coding_agent_search::search::query::SearchHit]| -> Vec<serde_json::Value> {
-        let mut entries: Vec<_> = hits
-            .iter()
-            .map(|h| {
-                let rel = strip(&h.source_path);
-                (rel.clone(), h.agent.clone(), h.line_number, serde_json::json!({
-                    "source_path": rel,
-                    "agent": h.agent,
-                    "line_number": h.line_number,
-                }))
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-        entries.into_iter().map(|e| e.3).collect()
-    };
+    let extract =
+        |hits: &[coding_agent_search::search::query::SearchHit]| -> Vec<serde_json::Value> {
+            let mut entries: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    let rel = strip(&h.source_path);
+                    (
+                        rel.clone(),
+                        h.agent.clone(),
+                        h.line_number,
+                        serde_json::json!({
+                            "source_path": rel,
+                            "agent": h.agent,
+                            "line_number": h.line_number,
+                        }),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+            entries.into_iter().map(|e| e.3).collect()
+        };
 
     let snapshot = serde_json::json!({
         "query": "metamorphic_sentinel",
@@ -296,14 +302,18 @@ fn golden_days_filter_staircase() {
         .search(q, SearchFilters::default(), limit, 0, FieldMask::FULL)
         .unwrap();
 
-    let mut filters_30 = SearchFilters::default();
-    filters_30.created_from = Some(now - 30 * day_ms);
+    let filters_30 = SearchFilters {
+        created_from: Some(now - 30 * day_ms),
+        ..Default::default()
+    };
     let hits_30 = client
         .search(q, filters_30, limit, 0, FieldMask::FULL)
         .unwrap();
 
-    let mut filters_7 = SearchFilters::default();
-    filters_7.created_from = Some(now - 7 * day_ms);
+    let filters_7 = SearchFilters {
+        created_from: Some(now - 7 * day_ms),
+        ..Default::default()
+    };
     let hits_7 = client
         .search(q, filters_7, limit, 0, FieldMask::FULL)
         .unwrap();
