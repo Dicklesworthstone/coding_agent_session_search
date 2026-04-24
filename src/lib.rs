@@ -10575,6 +10575,21 @@ struct DiagQuarantinedGeneration {
     gc_reason: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DiagQuarantineInspectionArtifact {
+    artifact_kind: String,
+    path: String,
+    generation_id: Option<String>,
+    shard_id: Option<String>,
+    publish_state: Option<&'static str>,
+    shard_state: Option<&'static str>,
+    size_bytes: u64,
+    age_seconds: Option<u64>,
+    last_read_at_ms: Option<i64>,
+    safe_to_gc: bool,
+    gc_reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DiagQuarantineSummary {
     failed_seed_bundle_count: usize,
@@ -10604,6 +10619,7 @@ struct DiagQuarantineSummary {
 #[derive(Debug, Clone, Serialize, Default)]
 struct DiagQuarantineReport {
     summary: DiagQuarantineSummary,
+    quarantined_artifacts: Vec<DiagQuarantineInspectionArtifact>,
     failed_seed_bundle_files: Vec<DiagQuarantineArtifact>,
     retained_publish_backups: Vec<DiagQuarantineArtifact>,
     lexical_generations: Vec<DiagQuarantinedGeneration>,
@@ -10696,6 +10712,22 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                     .failed_seed_bundle_files
                     .push(DiagQuarantineArtifact {
                         path: path.display().to_string(),
+                        size_bytes: observation.size_bytes,
+                        age_seconds: observation.age_seconds,
+                        last_read_at_ms: observation.last_read_at_ms,
+                        safe_to_gc: false,
+                        gc_reason: "failed baseline seed quarantine requires operator inspection"
+                            .to_string(),
+                    });
+                report
+                    .quarantined_artifacts
+                    .push(DiagQuarantineInspectionArtifact {
+                        artifact_kind: "failed_seed_bundle_file".to_string(),
+                        path: path.display().to_string(),
+                        generation_id: None,
+                        shard_id: None,
+                        publish_state: None,
+                        shard_state: None,
                         size_bytes: observation.size_bytes,
                         age_seconds: observation.age_seconds,
                         last_read_at_ms: observation.last_read_at_ms,
@@ -10829,6 +10861,50 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
                 reclaimable_bytes, entry.observation.size_bytes
             )
         };
+        if matches!(
+            entry.manifest.publish_state,
+            LexicalGenerationPublishState::Quarantined
+        ) {
+            report
+                .quarantined_artifacts
+                .push(DiagQuarantineInspectionArtifact {
+                    artifact_kind: "lexical_generation".to_string(),
+                    path: entry.path.display().to_string(),
+                    generation_id: Some(entry.manifest.generation_id.clone()),
+                    shard_id: None,
+                    publish_state: Some(lexical_publish_state_label(entry.manifest.publish_state)),
+                    shard_state: None,
+                    size_bytes: entry.observation.size_bytes,
+                    age_seconds: entry.observation.age_seconds,
+                    last_read_at_ms: entry.observation.last_read_at_ms,
+                    safe_to_gc,
+                    gc_reason: gc_reason.clone(),
+                });
+        }
+        for shard in entry.manifest.shards.iter().filter(|shard| {
+            matches!(
+                shard.state,
+                crate::indexer::lexical_generation::LexicalShardLifecycleState::Quarantined
+            )
+        }) {
+            report
+                .quarantined_artifacts
+                .push(DiagQuarantineInspectionArtifact {
+                    artifact_kind: "lexical_shard".to_string(),
+                    path: entry.path.display().to_string(),
+                    generation_id: Some(entry.manifest.generation_id.clone()),
+                    shard_id: Some(shard.shard_id.clone()),
+                    publish_state: Some(lexical_publish_state_label(entry.manifest.publish_state)),
+                    shard_state: Some(lexical_shard_state_label(shard.state)),
+                    size_bytes: shard.artifact_bytes,
+                    age_seconds: entry.observation.age_seconds,
+                    last_read_at_ms: entry.observation.last_read_at_ms,
+                    safe_to_gc: false,
+                    gc_reason: shard.quarantine_reason.clone().unwrap_or_else(|| {
+                        "quarantined lexical shard requires operator inspection".to_string()
+                    }),
+                });
+        }
         report.lexical_generations.push(DiagQuarantinedGeneration {
             path: entry.path.display().to_string(),
             generation_id: entry.manifest.generation_id,
@@ -10852,6 +10928,13 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
     report
         .lexical_generations
         .sort_by(|left, right| left.path.cmp(&right.path));
+    report.quarantined_artifacts.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.artifact_kind.cmp(&right.artifact_kind))
+            .then_with(|| left.generation_id.cmp(&right.generation_id))
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+    });
 
     report.summary.failed_seed_bundle_count = report.failed_seed_bundle_files.len();
     report.summary.retained_publish_backup_count = report.retained_publish_backups.len();
@@ -11402,6 +11485,23 @@ fn lexical_generation_build_state_label(
         LexicalGenerationBuildState::Validating => "validating",
         LexicalGenerationBuildState::Validated => "validated",
         LexicalGenerationBuildState::Failed => "failed",
+    }
+}
+
+fn lexical_shard_state_label(
+    state: crate::indexer::lexical_generation::LexicalShardLifecycleState,
+) -> &'static str {
+    use crate::indexer::lexical_generation::LexicalShardLifecycleState;
+
+    match state {
+        LexicalShardLifecycleState::Planned => "planned",
+        LexicalShardLifecycleState::Building => "building",
+        LexicalShardLifecycleState::Staged => "staged",
+        LexicalShardLifecycleState::Validated => "validated",
+        LexicalShardLifecycleState::Published => "published",
+        LexicalShardLifecycleState::Resumable => "resumable",
+        LexicalShardLifecycleState::Quarantined => "quarantined",
+        LexicalShardLifecycleState::Abandoned => "abandoned",
     }
 }
 

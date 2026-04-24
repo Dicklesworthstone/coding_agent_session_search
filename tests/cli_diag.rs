@@ -222,6 +222,57 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
             .contains(".failed-baseline-seed.bak")),
         "failed seed bundle inventory should preserve the quarantine naming pattern"
     );
+    let inspection_artifacts = quarantine["quarantined_artifacts"]
+        .as_array()
+        .expect("flattened quarantined artifacts array");
+    assert_eq!(
+        inspection_artifacts.len(),
+        4,
+        "inspection API should enumerate failed seed bundle files, quarantined generations, and quarantined shards"
+    );
+    assert!(
+        inspection_artifacts.iter().all(|entry| {
+            entry["gc_reason"].as_str().is_some()
+                && entry["path"].as_str().is_some()
+                && entry.get("age_seconds").is_some()
+                && entry.get("last_read_at_ms").is_some()
+        }),
+        "every quarantined inspection artifact should carry path, age, last-read, and gc_reason"
+    );
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("failed_seed_bundle_file")
+                && entry["safe_to_gc"].as_bool() == Some(false)
+                && entry["gc_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("operator inspection")
+        }),
+        "failed seed bundle quarantine should appear in the flattened inspection API"
+    );
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("lexical_generation")
+                && entry["generation_id"].as_str() == Some("gen-quarantined")
+                && entry["publish_state"].as_str() == Some("quarantined")
+                && entry["safe_to_gc"].as_bool() == Some(false)
+                && entry["gc_reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("inspection")
+        }),
+        "quarantined lexical generations should appear in the flattened inspection API"
+    );
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("lexical_shard")
+                && entry["generation_id"].as_str() == Some("gen-quarantined")
+                && entry["shard_id"].as_str() == Some("shard-a")
+                && entry["shard_state"].as_str() == Some("quarantined")
+                && entry["gc_reason"].as_str() == Some("validation_failed")
+        }),
+        "quarantined shard artifacts should be individually inspectable with their gc reason"
+    );
 
     let retained_backups = quarantine["retained_publish_backups"]
         .as_array()

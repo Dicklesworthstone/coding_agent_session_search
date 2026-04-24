@@ -310,6 +310,18 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
             .contains("cleanup dry-run"),
         "doctor JSON should expose why quarantined lexical generations are held"
     );
+    let inspection_artifacts = quarantine["quarantined_artifacts"]
+        .as_array()
+        .expect("flattened quarantined artifacts array");
+    assert!(
+        inspection_artifacts.iter().any(|entry| {
+            entry["artifact_kind"].as_str() == Some("lexical_shard")
+                && entry["generation_id"].as_str() == Some("gen-quarantined")
+                && entry["shard_id"].as_str() == Some("shard-a")
+                && entry["gc_reason"].as_str() == Some("validation_failed")
+        }),
+        "doctor JSON should expose each quarantined shard with a gc reason"
+    );
 
     let dry_run = &quarantine["lexical_cleanup_dry_run"];
     assert_eq!(dry_run["dry_run"].as_bool(), Some(true));

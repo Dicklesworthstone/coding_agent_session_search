@@ -153,6 +153,60 @@
       "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
       "cleanup_apply_allowed": false
     },
+    "quarantined_artifacts": [
+      {
+        "artifact_kind": "failed_seed_bundle_file",
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
+        "generation_id": null,
+        "shard_id": null,
+        "publish_state": null,
+        "shard_state": null,
+        "size_bytes": 11,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "artifact_kind": "failed_seed_bundle_file",
+        "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal",
+        "generation_id": null,
+        "shard_id": null,
+        "publish_state": null,
+        "shard_state": null,
+        "size_bytes": 8,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "failed baseline seed quarantine requires operator inspection"
+      },
+      {
+        "artifact_kind": "lexical_generation",
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "shard_id": null,
+        "publish_state": "quarantined",
+        "shard_state": null,
+        "size_bytes": 1069,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
+      },
+      {
+        "artifact_kind": "lexical_shard",
+        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
+        "generation_id": "gen-quarantined",
+        "shard_id": "shard-a",
+        "publish_state": "quarantined",
+        "shard_state": "quarantined",
+        "size_bytes": 512,
+        "age_seconds": "[AGE_SECONDS]",
+        "last_read_at_ms": "[LAST_READ_MS]",
+        "safe_to_gc": false,
+        "gc_reason": "validation_failed"
+      }
+    ],
     "failed_seed_bundle_files": [
       {
         "path": "[TEST_HOME]/cass-data/backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak",
