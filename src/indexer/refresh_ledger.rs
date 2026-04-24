@@ -895,6 +895,96 @@ fn pct_delta(baseline: f64, current: f64) -> Option<f64> {
     Some((raw * 100.0).round() / 100.0)
 }
 
+impl RefreshLedgerEvidenceComparison {
+    /// Emit a single structured tracing event summarizing the
+    /// cross-run comparison. Operators see "this rebuild was N%
+    /// slower than the previous publish" in default-level logs
+    /// without running a benchmark harness.
+    ///
+    /// `coding_agent_session_search-ibuuh.24`: pure helper that any
+    /// caller (the publish path, a `cass status` summary surface,
+    /// CI bench gates) can invoke after `compare_to`. Severity is
+    /// chosen by the regression magnitude:
+    ///
+    /// - `aggregate_duration_delta_pct >= +25.0` ⇒ `warn`
+    ///   (significant slowdown — surface in default logs so the
+    ///   operator sees it without dredging)
+    /// - `aggregate_duration_delta_pct <= -10.0` ⇒ `info`
+    ///   (notable improvement — worth surfacing as a positive
+    ///   signal)
+    /// - otherwise ⇒ `debug` (steady state — high-volume noise on
+    ///   every publish; only visible at debug level)
+    ///
+    /// The thresholds (+25% slowdown / -10% improvement) are the
+    /// "operator should look" signal levels, NOT a hard regression
+    /// gate. CI hard gates compare against benchmark baselines with
+    /// project-specific thresholds; this helper is for ambient
+    /// operator visibility.
+    ///
+    /// `dominant_phase_shift` is reported on every emission
+    /// regardless of severity tier — a hot-phase change is itself
+    /// a regression signal worth surfacing even when the absolute
+    /// totals look similar.
+    pub fn emit_tracing_summary(&self) {
+        let dominant_shift_str = self
+            .dominant_phase_shift
+            .map(|(from, to)| format!("{}->{}", from.as_str(), to.as_str()))
+            .unwrap_or_else(|| "none".to_string());
+        let aggregate_duration_str = self
+            .aggregate_duration_delta_pct
+            .map(|pct| format!("{pct:+.2}%"))
+            .unwrap_or_else(|| "n/a".to_string());
+        let aggregate_throughput_str = self
+            .aggregate_throughput_delta_pct
+            .map(|pct| format!("{pct:+.2}%"))
+            .unwrap_or_else(|| "n/a".to_string());
+
+        // Severity tier from the duration delta. Throughput delta
+        // alone doesn't drive severity because items_per_second
+        // is None on zero-item phases; duration is the always-
+        // present signal.
+        const SLOWDOWN_WARN_THRESHOLD_PCT: f64 = 25.0;
+        const IMPROVEMENT_INFO_THRESHOLD_PCT: f64 = -10.0;
+        let duration_pct = self.aggregate_duration_delta_pct.unwrap_or(0.0);
+        let phase_count = self.phase_deltas.len();
+
+        if duration_pct >= SLOWDOWN_WARN_THRESHOLD_PCT {
+            tracing::warn!(
+                target: "cass::indexer::lexical_refresh",
+                aggregate_duration_delta_pct = duration_pct,
+                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
+                aggregate_duration = %aggregate_duration_str,
+                aggregate_throughput = %aggregate_throughput_str,
+                dominant_phase_shift = %dominant_shift_str,
+                phase_count,
+                "lexical refresh evidence: significant slowdown vs previous publish"
+            );
+        } else if duration_pct <= IMPROVEMENT_INFO_THRESHOLD_PCT {
+            tracing::info!(
+                target: "cass::indexer::lexical_refresh",
+                aggregate_duration_delta_pct = duration_pct,
+                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
+                aggregate_duration = %aggregate_duration_str,
+                aggregate_throughput = %aggregate_throughput_str,
+                dominant_phase_shift = %dominant_shift_str,
+                phase_count,
+                "lexical refresh evidence: notable improvement vs previous publish"
+            );
+        } else {
+            tracing::debug!(
+                target: "cass::indexer::lexical_refresh",
+                aggregate_duration_delta_pct = duration_pct,
+                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
+                aggregate_duration = %aggregate_duration_str,
+                aggregate_throughput = %aggregate_throughput_str,
+                dominant_phase_shift = %dominant_shift_str,
+                phase_count,
+                "lexical refresh evidence: cross-run comparison"
+            );
+        }
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1702,5 +1792,159 @@ mod tests {
         let json = serde_json::to_string(&against_empty).expect("serialize");
         assert!(!json.contains("NaN"), "comparison JSON must not contain NaN; got {json}");
         assert!(!json.contains("Infinity"), "comparison JSON must not contain Infinity");
+    }
+
+    /// `coding_agent_session_search-ibuuh.24` cross-run tracing
+    /// gate: emit_tracing_summary picks WARN for significant
+    /// slowdowns (>=+25%), INFO for notable improvements (<=-10%),
+    /// DEBUG for the steady-state range. Pre-fix this routing did
+    /// not exist; pinning the thresholds directly catches a
+    /// regression where a peer "tunes" the tier and accidentally
+    /// hides a slowdown signal in debug-level logs.
+    #[test]
+    fn evidence_comparison_emit_tracing_summary_uses_correct_severity_tier() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Debug, Clone, Default)]
+        struct CapturedEvent {
+            level: String,
+            target: String,
+            message: String,
+        }
+
+        #[derive(Clone, Default)]
+        struct LevelCollector {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for LevelCollector {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "cass::indexer::lexical_refresh" {
+                    return;
+                }
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().expect("collector lock").push(CapturedEvent {
+                    level: event.metadata().level().to_string(),
+                    target: event.metadata().target().to_string(),
+                    message: visitor.message,
+                });
+            }
+        }
+
+        #[derive(Default)]
+        struct MessageVisitor {
+            message: String,
+        }
+        impl Visit for MessageVisitor {
+            fn record_str(&mut self, _field: &Field, _value: &str) {}
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{:?}", value).trim_matches('"').to_string();
+                }
+            }
+        }
+
+        // Helper: build a comparison directly with a given duration
+        // delta so we exercise the tier routing without setting up
+        // full ledger fixtures.
+        fn comparison_with_duration_pct(pct: f64) -> RefreshLedgerEvidenceComparison {
+            RefreshLedgerEvidenceComparison {
+                phase_deltas: Vec::new(),
+                aggregate_duration_delta_pct: Some(pct),
+                aggregate_throughput_delta_pct: None,
+                dominant_phase_shift: None,
+            }
+        }
+
+        // Tier 1: significant slowdown ⇒ warn.
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            comparison_with_duration_pct(50.0).emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(evs.len(), 1, "exactly one event per emit_tracing_summary call");
+        assert_eq!(evs[0].level, "WARN", "+50% slowdown must be warn; got {evs:?}");
+        assert!(
+            evs[0].message.contains("significant slowdown"),
+            "warn message must name the slowdown; got {:?}",
+            evs[0].message
+        );
+
+        // Tier 2: notable improvement ⇒ info.
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            comparison_with_duration_pct(-25.0).emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(evs[0].level, "INFO", "-25% improvement must be info; got {evs:?}");
+        assert!(
+            evs[0].message.contains("notable improvement"),
+            "info message must name the improvement; got {:?}",
+            evs[0].message
+        );
+
+        // Tier 3: steady-state ⇒ debug.
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            comparison_with_duration_pct(5.0).emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(evs[0].level, "DEBUG", "+5% within steady-state must be debug; got {evs:?}");
+        assert!(
+            evs[0].message.contains("cross-run comparison"),
+            "debug message must use the steady-state phrasing; got {:?}",
+            evs[0].message
+        );
+
+        // Boundary: exactly +25.0 ⇒ warn (>= threshold).
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            comparison_with_duration_pct(25.0).emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(
+            evs[0].level, "WARN",
+            "exactly +25% must be warn (inclusive threshold); got {evs:?}"
+        );
+
+        // Boundary: exactly -10.0 ⇒ info (<= threshold).
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            comparison_with_duration_pct(-10.0).emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(
+            evs[0].level, "INFO",
+            "exactly -10% must be info (inclusive threshold); got {evs:?}"
+        );
+
+        // None duration delta (e.g. baseline missing) ⇒ debug
+        // (defaults to 0.0 which lands in steady-state).
+        let collector = LevelCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            RefreshLedgerEvidenceComparison {
+                phase_deltas: Vec::new(),
+                aggregate_duration_delta_pct: None,
+                aggregate_throughput_delta_pct: None,
+                dominant_phase_shift: None,
+            }
+            .emit_tracing_summary();
+        });
+        let evs = collector.events.lock().expect("lock").clone();
+        assert_eq!(
+            evs[0].level, "DEBUG",
+            "None duration delta defaults to steady-state (debug); got {evs:?}"
+        );
     }
 }

@@ -3436,7 +3436,7 @@ mod tests {
     /// - added a new variant without an `as_str()` arm,
     /// - drifted serde rename_all away from snake_case,
     /// - introduced a duplicate string,
-    /// would trip this immediately.
+    ///   would trip this immediately.
     #[test]
     fn cleanup_disposition_as_str_matches_serde_serialization_byte_for_byte() {
         use std::collections::HashSet;
