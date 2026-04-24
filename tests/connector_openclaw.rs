@@ -1,6 +1,6 @@
 use coding_agent_search::connectors::openclaw::OpenClawConnector;
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -14,6 +14,15 @@ fn write_jsonl(dir: &Path, rel_path: &str, lines: &[&str]) -> std::path::PathBuf
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(&path, lines.join("\n")).unwrap();
+    path
+}
+
+fn write_jsonl_bytes(dir: &Path, rel_path: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(rel_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&path, bytes).unwrap();
     path
 }
 
@@ -223,6 +232,108 @@ fn scan_skips_invalid_json_lines() {
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].messages[0].content, "Valid");
+}
+
+#[test]
+fn scan_empty_jsonl_file_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    write_jsonl_bytes(&sessions, "zero-byte.jsonl", b"");
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_truncated_tail_preserves_complete_messages() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    write_jsonl(
+        &sessions,
+        "truncated-tail.jsonl",
+        &[
+            r#"{"type":"message","timestamp":"2025-06-15T10:00:00.000Z","message":{"role":"user","content":"Complete before truncation"}}"#,
+            r#"{"type":"message","timestamp":"2025-06-15T10:00:01.000Z","message":{"role":"assistant","content":"unterminated tail"}"#,
+        ],
+    );
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].messages.len(), 1);
+    assert_eq!(convs[0].messages[0].content, "Complete before truncation");
+    assert_eq!(convs[0].started_at, Some(1_749_981_600_000));
+    assert_eq!(convs[0].ended_at, Some(1_749_981_600_000));
+}
+
+#[test]
+fn scan_non_utf8_jsonl_returns_empty_without_panic() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    write_jsonl_bytes(
+        &sessions,
+        "non-utf8.jsonl",
+        &[0xff, 0xfe, b'\n', 0xfd, 0x80],
+    );
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_oversized_sparse_jsonl_returns_empty_without_panic() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("huge.jsonl");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(101 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_ignores_non_jsonl_session_files() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/openclaw/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("transcript.txt"),
+        r#"{"type":"message","timestamp":"2025-06-15T10:00:00.000Z","message":{"role":"user","content":"wrong extension"}}"#,
+    )
+    .unwrap();
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
 }
 
 #[test]
