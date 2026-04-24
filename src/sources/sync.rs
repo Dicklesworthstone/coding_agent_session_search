@@ -1412,15 +1412,9 @@ impl SyncEngine {
                 .map_err(|e| format!("Failed to list {}: {}", remote_path.display(), e))?;
 
             for (entry_path, entry_stat) in entries {
-                let file_name = entry_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-
-                // Skip . and .. and empty/invalid filenames
-                if file_name.is_empty() || file_name == "." || file_name == ".." {
+                let Some(file_name) = sftp_entry_file_name(&entry_path, remote_path) else {
                     continue;
-                }
+                };
 
                 let local_entry = local_path.join(file_name);
 
@@ -1504,6 +1498,42 @@ impl SyncEngine {
 
         Ok(())
     }
+}
+
+/// Resolve an SFTP entry's basename for local mirroring.
+fn sftp_entry_file_name<'a>(entry_path: &'a Path, parent_path: &Path) -> Option<&'a str> {
+    let Some(file_name) = entry_path.file_name() else {
+        tracing::warn!(
+            parent = %parent_path.display(),
+            entry = ?entry_path,
+            "Skipping SFTP entry without a file name"
+        );
+        return None;
+    };
+
+    let Some(file_name) = file_name.to_str() else {
+        tracing::warn!(
+            parent = %parent_path.display(),
+            entry = ?entry_path,
+            "Skipping SFTP entry with non-UTF-8 file name"
+        );
+        return None;
+    };
+
+    if file_name.is_empty() {
+        tracing::warn!(
+            parent = %parent_path.display(),
+            entry = ?entry_path,
+            "Skipping SFTP entry with empty file name"
+        );
+        return None;
+    }
+
+    if file_name == "." || file_name == ".." {
+        return None;
+    }
+
+    Some(file_name)
 }
 
 /// Check whether the `scp` executable exists on this system.
@@ -1967,6 +1997,35 @@ mod tests {
 
         let res = path_to_safe_dirname("/");
         assert!(res.starts_with("root_"));
+    }
+
+    #[test]
+    fn test_sftp_entry_file_name_accepts_regular_names() {
+        let parent = Path::new("/remote");
+        let entry = parent.join("session.jsonl");
+
+        assert_eq!(sftp_entry_file_name(&entry, parent), Some("session.jsonl"));
+    }
+
+    #[test]
+    fn test_sftp_entry_file_name_skips_dot_entries() {
+        let parent = Path::new("/remote");
+
+        assert_eq!(sftp_entry_file_name(Path::new("."), parent), None);
+        assert_eq!(sftp_entry_file_name(Path::new(".."), parent), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sftp_entry_file_name_rejects_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = Path::new("/remote");
+        let bad_component = Path::new(OsStr::from_bytes(b"bad-\xff-name"));
+        let entry = parent.join(bad_component);
+
+        assert_eq!(sftp_entry_file_name(&entry, parent), None);
     }
 
     #[test]
