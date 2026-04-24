@@ -762,10 +762,12 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
     // silent drift in the error-envelope shape — important because agent
     // error-handling branches key on these exact fields.
     //
-    // Per the robot-mode convention (cass --robot-help):
-    //   "stdout=data only; stderr=warnings/errors only"
-    // — so the error envelope lands on stderr. We parse stderr as JSON
-    // and scrub the same way the stdout helper does.
+    // [coding_agent_session_search-hd89i] Post-fix: robot-mode JSON
+    // envelopes (data AND errors) ALWAYS emit on STDOUT to match the
+    // documented contract `stdout = data only; stderr = diagnostics
+    // only`. Pre-fix this test read out.stderr because the legacy
+    // routing in src/main.rs::handle_fatal_error sent JSON-shaped
+    // errors to stderr — fixing that routing is what hd89i closed.
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args([
@@ -776,9 +778,9 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
         ])
         .output()
         .expect("run cass stats --json");
-    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value =
-        serde_json::from_str(&stderr).expect("stats error envelope is JSON");
+        serde_json::from_str(&stdout).expect("stats error envelope is JSON on stdout");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/stats_missing_db.json.golden", &scrubbed);
@@ -786,6 +788,8 @@ fn stats_json_missing_db_error_envelope_matches_golden() {
 
 #[test]
 fn stats_json_missing_db_error_envelope_shape_matches_golden() {
+    // [coding_agent_session_search-hd89i] error envelope lives on
+    // STDOUT post-fix (see sibling test for context).
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args([
@@ -796,8 +800,8 @@ fn stats_json_missing_db_error_envelope_shape_matches_golden() {
         ])
         .output()
         .expect("run cass stats --json");
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&out.stderr).expect("stats error envelope is JSON");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("stats error envelope is JSON on stdout");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/stats_missing_db_shape.json.golden", &canonical);
@@ -1016,9 +1020,10 @@ fn doctor_shape_matches_golden() {
 fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
     // Mirrors stats_json_missing_db_error_envelope_shape_matches_golden:
     // no DB on a fresh data_dir ⇒ cass emits the `missing-db` error
-    // envelope on stderr with exit 3. Pinning the envelope shape lets
-    // agent harnesses branch on kind="missing-db" without worrying
-    // about silent contract drift.
+    // envelope on STDOUT (post-hd89i, JSON envelopes always land on
+    // stdout) with exit 3. Pinning the envelope shape lets agent
+    // harnesses branch on kind="missing-db" without worrying about
+    // silent contract drift.
     let test_home = tempfile::tempdir().expect("create temp home");
     let out = cass_cmd(test_home.path())
         .args([
@@ -1030,8 +1035,8 @@ fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
         ])
         .output()
         .expect("run cass sessions --current --json");
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stderr)
-        .expect("sessions error envelope is JSON on stderr");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .expect("sessions error envelope is JSON on stdout");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden(

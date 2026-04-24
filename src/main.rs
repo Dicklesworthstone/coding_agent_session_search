@@ -32,12 +32,23 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
         std::process::exit(err.code);
     }
 
-    // If the message looks like JSON, output it directly (it's a pre-formatted robot error).
-    // Also enforce JSON if robot mode flags were detected in raw args.
+    // [coding_agent_session_search-hd89i] Robot-mode JSON envelopes
+    // (`--json` / `--robot`) MUST land on STDOUT to match the
+    // documented robot-mode contract: `stdout = data only,
+    // stderr = diagnostics only`. Pre-fix this function emitted
+    // JSON-shaped errors on stderr for surfaces like `cass search`,
+    // `cass stats`, `cass sessions` whose error path bubbles up here
+    // unreported, while diag/doctor/status/health emitted their
+    // structured payloads on stdout via `output_structured_value`.
+    // That split made the basic agent pipeline `cass X --json | jq`
+    // silently produce empty input for the first group and confused
+    // every consumer reading the README contract literally. Human-
+    // readable text (the non-robot branch) still goes to stderr.
     if err.message.trim().starts_with('{') {
-        eprintln!("{}", err.message);
+        // Pre-formatted JSON error envelope from a robot-mode subcommand.
+        println!("{}", err.message);
     } else if is_robot_mode_args() {
-        // Wrap unstructured error for robot
+        // Wrap unstructured error for robot consumers.
         let payload = serde_json::json!({
             "error": {
                 "code": err.code,
@@ -47,9 +58,9 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
                 "retryable": err.retryable,
             }
         });
-        eprintln!("{payload}");
+        println!("{payload}");
     } else {
-        // Human-readable output
+        // Human-readable output stays on stderr per Unix convention.
         eprintln!("{}", err.message);
     }
     std::process::exit(err.code);
