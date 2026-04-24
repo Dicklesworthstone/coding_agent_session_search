@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::indexer::semantic::{EmbeddingInput, SemanticIndexer};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::vector_index::{
     VectorIndex, parse_semantic_doc_id, role_code_from_str, vector_index_path,
 };
@@ -96,10 +97,13 @@ fn saturating_u32_from_i64(raw: i64) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerEmbedderKind {
     Hash,
-    FastEmbed,
+    FastEmbed {
+        model_name: String,
+        embedder_id: String,
+    },
 }
 
 fn resolve_embedder_kind(
@@ -113,16 +117,26 @@ fn resolve_embedder_kind(
         return Ok(WorkerEmbedderKind::Hash);
     }
 
-    if model_name.eq_ignore_ascii_case("minilm")
-        || model_name.eq_ignore_ascii_case("minilm-384")
-        || model_name.eq_ignore_ascii_case("fastembed")
-    {
-        return Ok(WorkerEmbedderKind::FastEmbed);
-    }
+    let normalized_name = match model_name.to_ascii_lowercase().as_str() {
+        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => "minilm",
+        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
+            "snowflake-arctic-s"
+        }
+        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => "nomic-embed",
+        _ => {
+            anyhow::bail!(
+                "unsupported semantic model '{model_name}' for daemon embedding worker; supported: minilm, snowflake-arctic-s, nomic-embed"
+            );
+        }
+    };
 
-    anyhow::bail!(
-        "unsupported semantic model '{model_name}' for daemon embedding worker; supported: minilm"
-    );
+    let config = FastEmbedder::config_for(normalized_name).ok_or_else(|| {
+        anyhow::anyhow!("missing FastEmbedder config for registered model '{normalized_name}'")
+    })?;
+    Ok(WorkerEmbedderKind::FastEmbed {
+        model_name: normalized_name.to_string(),
+        embedder_id: config.embedder_id,
+    })
 }
 
 impl EmbeddingWorker {
@@ -280,7 +294,7 @@ impl EmbeddingWorker {
         let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
 
         // Load existing index to check for unchanged documents
-        let existing_hashes = self.load_existing_hashes(index_path, embedder_kind);
+        let existing_hashes = self.load_existing_hashes(index_path, &embedder_kind);
 
         // Prepare inputs, skipping unchanged documents
         let mut inputs: Vec<EmbeddingInput> = Vec::new();
@@ -363,7 +377,9 @@ impl EmbeddingWorker {
         // Create the appropriate embedder/indexer
         let indexer = match embedder_kind {
             WorkerEmbedderKind::Hash => SemanticIndexer::new("hash", None)?,
-            WorkerEmbedderKind::FastEmbed => SemanticIndexer::new("fastembed", Some(index_path))?,
+            WorkerEmbedderKind::FastEmbed { ref model_name, .. } => {
+                SemanticIndexer::new(model_name, Some(index_path))?
+            }
         };
 
         // Embed messages
@@ -398,11 +414,11 @@ impl EmbeddingWorker {
     fn load_existing_hashes(
         &self,
         index_path: &Path,
-        embedder_kind: WorkerEmbedderKind,
+        embedder_kind: &WorkerEmbedderKind,
     ) -> HashMap<u64, [u8; 32]> {
         let embedder_id = match embedder_kind {
             WorkerEmbedderKind::Hash => "fnv1a-384",
-            WorkerEmbedderKind::FastEmbed => "minilm-384",
+            WorkerEmbedderKind::FastEmbed { embedder_id, .. } => embedder_id.as_str(),
         };
 
         let fsvi_path = vector_index_path(index_path, embedder_id);
@@ -555,15 +571,42 @@ mod tests {
     fn test_resolve_embedder_kind_semantic_aliases() {
         assert_eq!(
             resolve_embedder_kind("minilm", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed
+            WorkerEmbedderKind::FastEmbed {
+                model_name: "minilm".to_string(),
+                embedder_id: "minilm-384".to_string()
+            }
         );
         assert_eq!(
             resolve_embedder_kind("MINILM-384", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed
+            WorkerEmbedderKind::FastEmbed {
+                model_name: "minilm".to_string(),
+                embedder_id: "minilm-384".to_string()
+            }
         );
         assert_eq!(
             resolve_embedder_kind("fastembed", true).unwrap(),
-            WorkerEmbedderKind::FastEmbed
+            WorkerEmbedderKind::FastEmbed {
+                model_name: "minilm".to_string(),
+                embedder_id: "minilm-384".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_embedder_kind_registered_fastembed_models() {
+        assert_eq!(
+            resolve_embedder_kind("snowflake-arctic-s", true).unwrap(),
+            WorkerEmbedderKind::FastEmbed {
+                model_name: "snowflake-arctic-s".to_string(),
+                embedder_id: "snowflake-arctic-s-384".to_string()
+            }
+        );
+        assert_eq!(
+            resolve_embedder_kind("nomic-embed-text-v1.5", true).unwrap(),
+            WorkerEmbedderKind::FastEmbed {
+                model_name: "nomic-embed".to_string(),
+                embedder_id: "nomic-embed-768".to_string()
+            }
         );
     }
 

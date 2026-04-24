@@ -1153,12 +1153,16 @@ pub struct SemanticIndexer {
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
         let embedder: Box<dyn Embedder> = match embedder_type {
-            "fastembed" => {
+            "fastembed" | "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
                 let dir = data_dir
                     .ok_or_else(|| anyhow::anyhow!("data_dir required for fastembed embedder"))?;
-                let model_dir = FastEmbedder::default_model_dir(dir);
+                let embedder_name = if embedder_type == "fastembed" {
+                    "minilm"
+                } else {
+                    embedder_type
+                };
                 Box::new(
-                    FastEmbedder::load_from_dir(&model_dir)
+                    FastEmbedder::load_by_name(dir, embedder_name)
                         .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
                 )
             }
