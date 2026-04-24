@@ -113,6 +113,66 @@ fn robot_docs_schemas_matches_golden() {
     assert_golden("robot_docs/schemas.txt.golden", &capture_docs("schemas"));
 }
 
+// `coding_agent_session_search-5fiqq`: pre-fix, only 4 of the 11
+// `RobotTopic` enum variants (src/lib.rs:1552) had frozen goldens —
+// exit-codes, env, paths, schemas. The other 7 surfaces (commands,
+// guide, examples, contracts, wrap, sources, analytics) emit bounded
+// plain text via `print_robot_docs` / `render_*_docs` helpers in
+// src/lib.rs but were unfrozen, so silent reword/reorder/drop
+// regressions on any of those surfaces would slip through CI.
+//
+// These 7 tests close that gap by freezing every remaining topic.
+// Together with the original 4 they pin the full LLM-facing
+// `robot-docs <topic>` contract (11/11) so any drift on a
+// machine-readable agent surface fails loudly.
+
+#[test]
+fn robot_docs_commands_matches_golden() {
+    assert_golden(
+        "robot_docs/commands.txt.golden",
+        &capture_docs("commands"),
+    );
+}
+
+#[test]
+fn robot_docs_guide_matches_golden() {
+    assert_golden("robot_docs/guide.txt.golden", &capture_docs("guide"));
+}
+
+#[test]
+fn robot_docs_examples_matches_golden() {
+    assert_golden(
+        "robot_docs/examples.txt.golden",
+        &capture_docs("examples"),
+    );
+}
+
+#[test]
+fn robot_docs_contracts_matches_golden() {
+    assert_golden(
+        "robot_docs/contracts.txt.golden",
+        &capture_docs("contracts"),
+    );
+}
+
+#[test]
+fn robot_docs_wrap_matches_golden() {
+    assert_golden("robot_docs/wrap.txt.golden", &capture_docs("wrap"));
+}
+
+#[test]
+fn robot_docs_sources_matches_golden() {
+    assert_golden("robot_docs/sources.txt.golden", &capture_docs("sources"));
+}
+
+#[test]
+fn robot_docs_analytics_matches_golden() {
+    assert_golden(
+        "robot_docs/analytics.txt.golden",
+        &capture_docs("analytics"),
+    );
+}
+
 /// Capture plain-text `--robot-help` output in an isolated home. The
 /// robot-help string is the top-level "start here" contract surface
 /// agents read on first contact; keeping it stable is load-bearing.

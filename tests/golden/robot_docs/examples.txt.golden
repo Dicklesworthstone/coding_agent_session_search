@@ -1,0 +1,67 @@
+examples:
+
+# Basic search with JSON output for agents
+  cass search "your query" --robot
+  # Default is hybrid-preferred; add --robot-meta to see realized mode and lexical fallback reasons.
+  cass search "your query" --robot --robot-meta
+# Token-budgeted search with cursor + request-id
+  cass search "error" --robot --max-tokens 200 --request-id run-1 --limit 2 --robot-meta
+  cass search "error" --robot --cursor <_meta.next_cursor> --request-id run-1b --robot-meta
+
+# Search with time filters
+  cass search "bug" --today                 # today only
+  cass search "api" --week                  # last 7 days
+  cass search "feature" --days 30           # last 30 days
+  cass search "fix" --since 2025-01-01      # since date
+  cass search "error" --robot --limit 5 --offset 5  # paginate robot output
+
+# Filter by agent or workspace
+  cass search "error" --agent codex         # codex sessions only
+  cass search "test" --workspace /myproject # specific project
+
+# Discover session files for follow-up actions
+  cass sessions --current --json             # best match for current cwd
+  cass sessions --workspace /myproject --json --limit 5
+
+# Follow up on search results
+  cass view /path/to/session.jsonl -n 42   # view line 42 with context
+  cass view /path/to/session.jsonl -n 42 -C 10  # 10 lines context
+
+# Get index statistics
+  cass stats --json                        # JSON stats
+  cass stats                               # Human-readable stats
+
+# Aggregation (overview queries - 99% token reduction)
+  cass search "error" --json --aggregate agent    # count by agent
+  cass search "*" --json --aggregate agent,workspace  # multi-field agg
+  cass search "bug" --json --aggregate date --week  # time distribution
+
+# Quick health check (ideal for agents)
+  cass status --json                       # health check JSON
+  cass health --json                       # fast readiness + recommended_action
+  cass status --stale-threshold 3600       # custom stale threshold (1hr)
+
+# Diagnostics
+  cass diag --json                         # JSON diagnostic info
+  cass diag --verbose                      # Human-readable with sizes
+
+# Persistently exclude a noisy harness from indexing
+  cass sources agents list --json         # inspect exclusions
+  cass sources agents exclude openclaw    # block future indexing, purge archived local data
+  cass sources agents exclude openclaw --keep-indexed-data  # block future indexing only
+  cass sources agents include openclaw    # re-enable indexing
+
+# Capabilities introspection (for agent self-configuration)
+  cass capabilities --json                 # JSON with version, features, limits
+  cass capabilities                        # Human-readable summary
+
+# Full workflow
+  cass index --full                        # index all sessions
+  cass search "cma-es" --robot             # search
+  cass view <source_path> -n <line>        # examine result
+
+# TUI drill-in quick reference
+  cass tui                                 # interactive mode
+  # Enter on selected result -> detail modal (Messages tab default)
+  # Enter with no selected hit -> query submit behavior
+  # In modal: / find, n/N next/prev, Esc exits find then closes modal, F8 opens in editor

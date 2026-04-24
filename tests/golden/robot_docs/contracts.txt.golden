@@ -1,0 +1,6 @@
+contracts:
+  stdout data-only; stderr diagnostics/progress.
+  No implicit TUI when automation flags set or stdout non-TTY.
+  Color auto off when non-TTY unless forced.
+  Use --quiet to silence info logs in robot runs.
+  JSON errors only to stderr.

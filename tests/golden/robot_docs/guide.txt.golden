@@ -1,0 +1,13 @@
+guide:
+  Robot-mode handbook: docs/ROBOT_MODE.md (automation quickstart)
+  Output: --robot/--json; formats via --robot-format json|jsonl|compact|toon
+  Logging: INFO auto-suppressed in robot mode; add -v to re-enable
+  Search contract: SQLite is source of truth; lexical is the required self-healing fast path; semantic is opportunistic enrichment.
+  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.
+  Readiness: cass health/status JSON recommended_action is authoritative; lexical-only fallback can be normal while semantic assets catch up.
+  Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure
+  Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions
+  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior
+  Detail modal shortcuts: / opens find, n/N cycles matches, Esc exits find then closes modal, F8 opens selected hit in $EDITOR
+  Safety: prefer --color=never in non-TTY; use --trace-file for spans; reset TUI via `cass tui --reset-state`
+  Quick refs: cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources

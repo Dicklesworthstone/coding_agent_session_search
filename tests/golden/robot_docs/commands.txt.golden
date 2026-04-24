@@ -1,0 +1,40 @@
+commands:
+  (global) --quiet / -q  Suppress info logs (auto-enabled in robot mode)
+  (global) --verbose/-v  Enable debug logs (overrides auto-quiet)
+  Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.
+  cass search <query> [OPTIONS]
+    --agent A         Filter by agent (codex, claude_code, gemini, vibe, opencode, amp, cline)
+    --workspace W     Filter by workspace path
+    --limit N         Max results (default: 0 = no limit)
+    --offset N        Pagination offset (default: 0)
+    --json | --robot  JSON output for automation
+    --fields F1,F2    Select specific fields in hits (reduces token usage)
+                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)
+                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host
+    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')
+                            Adds *_truncated: true indicator for each truncated field
+    --today           Filter to today only
+    --yesterday       Filter to yesterday only
+    --week            Filter to last 7 days
+    --days N          Filter to last N days
+    --since DATE      Filter from date (YYYY-MM-DD)
+    --until DATE      Filter to date (YYYY-MM-DD)
+    --aggregate F1,F2 Server-side aggregation by fields (agent,workspace,date,match_type)
+                      Returns buckets with counts. Reduces tokens by ~99% for overview queries
+    --mode lexical|semantic|hybrid  Search mode (default: hybrid; hybrid fails open to lexical when semantic assets are unavailable)
+    --robot-meta     Include readiness, requested/realized mode, semantic refinement, fallback tier/reason, cursor, and timing metadata
+  cass stats [--json] [--data-dir DIR]
+  cass status [--json] [--stale-threshold N] [--data-dir DIR]
+  cass diag [--json] [--verbose] [--data-dir DIR]
+  cass sessions [--workspace DIR] [--current] [--limit N] [--json]
+  cass view <path> [-n LINE] [-C CONTEXT] [--json]
+  cass index [--full] [--watch] [--json] [--data-dir DIR]
+                    In --json mode, NDJSON events stream on stderr:
+                      {event:started|phase|progress|completed|error, ...}
+                    Tune with --progress-interval-ms N (250..60000, default 2000),
+                    disable with --no-progress-events or CASS_INDEX_NO_PROGRESS_EVENTS=1.
+                    From another shell: `cass status --json` shows live progress.
+  cass tui [--once] [--data-dir DIR] [--reset-state] [--asciicast FILE]
+  cass capabilities [--json]
+  cass robot-docs <topic>
+  cass --robot-help

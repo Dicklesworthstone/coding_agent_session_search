@@ -1,0 +1,90 @@
+sources:
+
+# Persisted agent indexing exclusions
+Use this when you want cass to ignore a connector entirely even if
+the backing session files still exist on disk.
+
+  cass sources agents list
+  cass sources agents list --json
+  cass sources agents exclude openclaw
+  cass sources agents exclude openclaw --keep-indexed-data
+  cass sources agents include openclaw
+
+Configuration is persisted in ~/.config/cass/sources.toml as:
+  disabled_agents = ["openclaw"]
+By default, `exclude` also purges already archived local data for that agent
+and rebuilds lexical search from the remaining archive. Use
+`--keep-indexed-data` if you only want to block future indexing.
+Exclusions apply to future local scans, remote mirror scans, and watch mode.
+
+# cass sources setup - Interactive Remote Sources Wizard
+
+## Overview
+The setup wizard automates configuring cass to search across multiple machines.
+It discovers SSH hosts from ~/.ssh/config, checks their status, and handles
+installation, indexing, and configuration automatically.
+
+## Quick Start
+  cass sources setup                    # Interactive (recommended)
+  cass sources setup --hosts css,csd    # Configure specific hosts
+  cass sources setup --dry-run          # Preview without changes
+  cass sources setup --resume           # Resume interrupted setup
+
+## Workflow Phases
+  1. Discovery  - Parses ~/.ssh/config to find configured hosts
+  2. Probing    - Connects via SSH to check cass status and agent data
+  3. Selection  - Interactive selection of which hosts to configure
+  4. Install    - Installs cass on hosts without it (optional)
+  5. Indexing   - Runs `cass index` on remotes (optional)
+  6. Config     - Generates sources.toml entries
+  7. Sync       - Downloads session data to local machine (optional)
+
+## Flags Reference
+  --hosts <names>      Only configure these hosts (comma-separated SSH aliases)
+  --dry-run            Preview without making changes
+  --resume             Resume from ~/.cache/cass/setup_state.json
+  --non-interactive    Skip prompts, use auto-detected defaults
+  --skip-install       Don't install cass on remotes
+  --skip-index         Don't run remote indexing
+  --skip-sync          Don't sync after setup
+  --json               Output progress as JSON for scripting
+  --timeout <secs>     SSH connection timeout (default: 10)
+  --verbose            Show detailed progress
+
+## Non-Interactive Usage (Scripting)
+  cass sources setup --non-interactive --hosts css,csd
+  cass sources setup --non-interactive --hosts css --skip-install --skip-index
+  cass sources setup --json --hosts css  # JSON output for parsing
+
+## State and Resume
+State saved to ~/.cache/cass/setup_state.json on interruption.
+Resume with: cass sources setup --resume
+
+## Generated Configuration
+The wizard generates sources.toml entries like:
+  [[sources]]
+  name = "css"
+  type = "ssh"
+  host = "css"
+  paths = ["~/.claude/projects", "~/.codex/sessions"]
+  sync_schedule = "manual"
+  [[sources.path_mappings]]
+  from = "/data/projects"
+  to = "/Users/username/projects"
+
+## After Setup
+  cass search "query"       # Search across all sources
+  cass sources sync --all   # Sync latest data
+  cass sources list         # List configured sources
+
+## Troubleshooting
+  "Host unreachable": Verify SSH config with `ssh <host>` manually
+  "Permission denied": Load SSH key with `ssh-add ~/.ssh/id_rsa`
+  "cargo not found": Use --skip-install and install manually
+  "Index taking too long": Large histories take time; runs in background
+
+## Related Commands
+  cass sources list         List configured sources
+  cass sources sync         Sync data from sources
+  cass sources discover     Just discover hosts (no setup)
+  cass sources add          Manually add a source

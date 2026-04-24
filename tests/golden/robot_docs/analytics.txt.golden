@@ -1,0 +1,118 @@
+analytics:
+
+# cass analytics — Token, Tool, and Model Analytics
+
+## Subcommands
+  status    Row counts, freshness, coverage, drift warnings
+  tokens    Token usage over time with dimensional breakdowns
+  tools     Per-tool invocation counts and derived metrics
+  models    Top models by usage and coverage statistics
+  rebuild   Rebuild/backfill rollup tables with progress output
+  validate  Check rollup invariants and detect data drift
+
+## Shared Flags (all subcommands)
+  --since <ISO>        Filter from date (YYYY-MM-DD or full timestamp)
+  --until <ISO>        Filter to date
+  --days <N>           Filter to last N days
+  --agent <slug>       Filter by agent (repeatable)
+  --workspace <path>   Filter by workspace (repeatable)
+  --source <name>      Filter by source ('local', 'remote', hostname)
+  --json / --robot     Machine-readable JSON output
+  --data-dir <path>    Override data directory
+
+## Bucketed Subcommands (tokens, tools, models)
+  --group-by <bucket>  hour | day (default) | week | month
+
+## JSON Envelope (all subcommands)
+  { "command": "analytics/<sub>", "data": {...}, "_meta": {...} }
+  _meta: { elapsed_ms: u64, filters_applied: [string], data_dir: string|null }
+
+## Per-Subcommand JSON Schemas
+
+### analytics status
+  data.tables: [{ table, exists, row_count, min_day_id, max_day_id, last_updated }]
+  data.coverage: { total_messages, message_metrics_coverage_pct, api_token_coverage_pct,
+                   model_name_coverage_pct, estimate_only_pct }
+  data.drift: { signals: [{ signal, detail, severity }], track_a_fresh, track_b_fresh }
+  data.recommended_action: string
+
+### analytics tokens
+  data.buckets: [{ bucket: string, counts: {...}, content_tokens: {...},
+                   api_tokens: {...}, plan: {...}, derived: {...} }]
+  data.totals: <same shape as bucket>
+  data.source_table: string  ('usage_daily' | 'usage_hourly' | 'messages' | 'message_metrics')
+  data.granularity: string   ('hour' | 'day' | 'week' | 'month')
+  Bucket keys: counts.{message_count, user_message_count, assistant_message_count,
+    tool_call_count, plan_message_count}; api_tokens.{total, input, output,
+    cache_read, cache_creation, thinking}; derived.{api_coverage_pct,
+    avg_api_per_message, avg_content_per_message}
+
+### analytics tools
+  data.rows: [{ key: string, tool_call_count, message_count, api_tokens_total,
+               tool_calls_per_1k_api_tokens, tool_calls_per_1k_content_tokens }]
+  data.totals: { tool_call_count, message_count, api_tokens_total,
+                 overall_per_1k_api_tokens }
+  data.row_count: int
+  data._meta.source_table: ('usage_daily' | 'usage_hourly' | 'message_metrics')
+  --limit N (default 20): caps returned rows
+
+### analytics models
+  data.by_api_tokens: { dim, metric, rows: [{ key, value, message_count, ... }] }
+  data.timeseries: <same as analytics tokens>
+  data.by_api_tokens._meta.source_table: string  ('token_daily_stats' | 'token_usage')
+    Usually token_daily_stats; token_usage when filters require raw provenance recovery.
+  Models only available for connectors that report model names
+    (claude_code, codex, pi_agent, factory, opencode, cursor).
+
+### analytics rebuild
+  data.track: string ('a')
+  data.tracks_rebuilt: [string]
+  data.track_a: { message_metrics_rows, usage_hourly_rows, usage_daily_rows,
+                  usage_models_daily_rows, elapsed_ms, rows_per_sec }
+  data.overall_elapsed_ms: u64
+  --force: rebuild even when rollups appear fresh
+
+### analytics validate
+  data.summary: { errors, warnings, drift_entries, buckets_checked, buckets_total }
+  data.checks: [{ id, ok, severity, details, suggested_action? }]
+    Check IDs: track_a.tables_exist, track_a.{content_tokens,message_count,
+      api_tokens,api_coverage}_match, track_b.tables_exist,
+      track_b.{tokens,agents}_match, cross_track.drift, non_negative.counters
+  data.drift: [{ day_id, agent_slug, source_id, track_a_total,
+                 track_b_total, delta, delta_pct, likely_cause }]
+  data.perf: { timeseries: { elapsed_ms, budget_ms, within_budget, error?, details },
+              breakdown: { elapsed_ms, budget_ms, within_budget, error?, details } }
+  --fix: run deep validation, rebuild safe Track A rollups when possible, and report skipped non-fixable issues
+
+## Coverage & Uncertainty Semantics
+  - api_token_coverage_pct: % of messages with API token data (from Claude, Codex).
+  - estimate_only_pct: % of messages with content-estimated tokens only (chars/4 heuristic).
+  - When coverage is low, derived metrics are unreliable estimates, not ground truth.
+  - Content token estimates are always available (heuristic); API tokens are sparse.
+
+## Exit Codes
+  0  Success
+  2  Usage error (invalid flags, missing required args)
+  3  Missing database (run 'cass index --full' first)
+  9  Database error (corrupt, missing tables, query failure)
+
+## Retry Guidance
+  exit 9 + retryable=true: transient DB lock/busy — retry after 1s
+  exit 9 + retryable=false: schema or data issue — run 'cass analytics rebuild' first
+  exit 3: no database — run 'cass index --full' to create it
+  validate errors: use 'cass analytics validate --fix --json' for safe Track A repair, or 'cass analytics rebuild --force --json' for a manual rebuild loop
+
+## Common Workflows
+  # Quick health check
+  cass analytics status --json | jq '.data.coverage'
+
+  # Recent usage by agent for last 7 days
+  cass analytics tokens --days 7 --json | jq '.data.buckets'
+
+  # Tool usage top-10
+  cass analytics tools --limit 10 --json | jq '.data.rows'
+
+  # Validation + remediation loop
+  cass analytics validate --json | jq '.data.summary'
+  # If errors: rebuild then re-validate
+  cass analytics rebuild --force --json && cass analytics validate --json
