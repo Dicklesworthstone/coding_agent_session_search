@@ -3872,6 +3872,16 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
             )
         })?;
     }
+
+    // [coding_agent_session_search-ibuuh.24] BEFORE overwriting the
+    // sidecar, capture the prior persisted evidence (if any) so the
+    // post-write tracing emission can compare current vs prior. Read
+    // failure is non-fatal: a missing or unparseable prior sidecar
+    // just means we skip the cross-run comparison this round (e.g.
+    // first publish on a fresh data dir). Logged at debug because
+    // first-publish is the common case.
+    let prior_evidence = load_prior_refresh_evidence_for_comparison(index_path);
+
     write_json_pretty_atomically(&path, ledger)
         .with_context(|| format!("persisting lexical refresh ledger to {}", path.display()))?;
 
@@ -3885,7 +3895,8 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
     // calling `RefreshLedger::evidence_summary()` against the
     // persisted ledger. We log the failure at warn level so an
     // operator can investigate without losing publish progress.
-    if let Err(err) = persist_lexical_refresh_evidence(index_path, &ledger.evidence_summary()) {
+    let current_evidence = ledger.evidence_summary();
+    if let Err(err) = persist_lexical_refresh_evidence(index_path, &current_evidence) {
         tracing::warn!(
             target: "cass::indexer::lexical_refresh",
             error = %err,
@@ -3894,7 +3905,57 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
              RefreshLedger::evidence_summary()"
         );
     }
+
+    // [coding_agent_session_search-ibuuh.24] If a prior evidence
+    // snapshot was readable, emit the cross-run comparison summary
+    // so operators see "this rebuild was N% slower than the
+    // previous publish" automatically in default-level logs without
+    // running a benchmark harness. Severity is tiered to the
+    // regression magnitude inside emit_tracing_summary itself
+    // (warn ≥+25%, info ≤-10%, else debug).
+    if let Some(prior) = prior_evidence {
+        let comparison = current_evidence.compare_to(&prior);
+        comparison.emit_tracing_summary();
+    }
+
     Ok(())
+}
+
+/// Read the previously persisted `.lexical-refresh-evidence.json`
+/// sidecar so the next publish can emit a cross-run comparison.
+/// Returns `None` on any failure (missing file, parse error, IO
+/// error) — a missing prior sidecar is the EXPECTED first-publish
+/// case, so failure here is non-fatal and logged at debug.
+fn load_prior_refresh_evidence_for_comparison(
+    index_path: &Path,
+) -> Option<RefreshLedgerEvidence> {
+    let path = lexical_refresh_evidence_path(index_path);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::debug!(
+                target: "cass::indexer::lexical_refresh",
+                path = %path.display(),
+                error = %err,
+                "no prior .lexical-refresh-evidence.json sidecar to compare against \
+                 (first publish on this data dir, or sidecar pruned)"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_str::<RefreshLedgerEvidence>(&raw) {
+        Ok(prior) => Some(prior),
+        Err(err) => {
+            tracing::debug!(
+                target: "cass::indexer::lexical_refresh",
+                path = %path.display(),
+                error = %err,
+                "prior .lexical-refresh-evidence.json sidecar present but unparseable; \
+                 skipping cross-run comparison for this publish"
+            );
+            None
+        }
+    }
 }
 
 fn persist_lexical_refresh_evidence(
@@ -25792,6 +25853,149 @@ mod tests {
             parsed["aggregate_items_processed"].as_u64(),
             Some(ledger.total_items_processed()),
             "aggregate_items_processed must equal ledger.total_items_processed()"
+        );
+    }
+
+    /// `coding_agent_session_search-ibuuh.24`: pin the
+    /// publish-time cross-run tracing wiring. First publish has no
+    /// prior sidecar to compare against, so no comparison event
+    /// should fire. Second publish reads the persisted prior and
+    /// MUST emit a single tracing event under the
+    /// `cass::indexer::lexical_refresh` target carrying the
+    /// regression metrics. A regression that broke either branch
+    /// (always emits / never emits) trips here.
+    #[test]
+    fn persist_lexical_refresh_ledger_emits_cross_run_tracing_when_prior_sidecar_exists() {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::Registry;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Debug, Clone, Default)]
+        struct CapturedEvent {
+            level: String,
+            message: String,
+        }
+
+        #[derive(Clone, Default)]
+        struct ComparisonCollector {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S: Subscriber> Layer<S> for ComparisonCollector {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "cass::indexer::lexical_refresh" {
+                    return;
+                }
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                // Only capture cross-run-comparison events (the
+                // tracing target is shared with sidecar-write-failure
+                // warnings — filter by message prefix so an
+                // unrelated emission doesn't pollute the count).
+                if !visitor.message.contains("lexical refresh evidence") {
+                    return;
+                }
+                self.events.lock().expect("collector lock").push(CapturedEvent {
+                    level: event.metadata().level().to_string(),
+                    message: visitor.message,
+                });
+            }
+        }
+
+        #[derive(Default)]
+        struct MessageVisitor {
+            message: String,
+        }
+        impl Visit for MessageVisitor {
+            fn record_str(&mut self, _field: &Field, _value: &str) {}
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{:?}", value).trim_matches('"').to_string();
+                }
+            }
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let data_dir = tmp.path().join("data");
+        let index_path = index_dir(&data_dir).unwrap();
+        std::fs::create_dir_all(&index_path).expect("create index path");
+
+        // Helper: construct a ledger whose evidence_summary will
+        // produce a non-empty Scan throughput (so the comparison has
+        // something to compare).
+        fn make_ledger(scan_duration_ms: u64) -> RefreshLedger {
+            RefreshLedger {
+                version: 1,
+                started_at_ms: 1_700_000_000_000,
+                completed_at_ms: 1_700_000_000_000 + scan_duration_ms as i64,
+                total_duration_ms: scan_duration_ms,
+                full_rebuild: true,
+                corpus_family: "ibuuh.24-wiring-test".to_string(),
+                phases: vec![PhaseRecord {
+                    phase: RefreshPhase::Scan,
+                    duration_ms: scan_duration_ms,
+                    items_processed: 100,
+                    items_skipped: 0,
+                    errors: 0,
+                    counters: BTreeMap::new(),
+                    success: true,
+                    error_message: None,
+                }],
+                equivalence: refresh_ledger::EquivalenceArtifacts::default(),
+                tags: BTreeMap::new(),
+            }
+        }
+
+        // ─── First publish: no prior sidecar ─────────────────────
+        let collector = ComparisonCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            persist_lexical_refresh_ledger(&index_path, &make_ledger(100))
+                .expect("first persist must succeed");
+        });
+        let first_events = collector.events.lock().expect("lock").clone();
+        assert!(
+            first_events.is_empty(),
+            "first publish has no prior sidecar to compare against; no cross-run \
+             tracing event should fire. Got: {first_events:?}"
+        );
+
+        // Sanity: the new sidecar landed for the second publish to read.
+        assert!(
+            lexical_refresh_evidence_path(&index_path).exists(),
+            "first publish must persist a sidecar so the second publish can compare"
+        );
+
+        // ─── Second publish: prior sidecar present ───────────────
+        // Make the second ledger 200ms (vs prior 100ms) so the
+        // comparison reports a +100% slowdown — should trigger the
+        // warn tier inside emit_tracing_summary.
+        let collector = ComparisonCollector::default();
+        let subscriber = Registry::default().with(collector.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            persist_lexical_refresh_ledger(&index_path, &make_ledger(200))
+                .expect("second persist must succeed");
+        });
+        let second_events = collector.events.lock().expect("lock").clone();
+        assert_eq!(
+            second_events.len(),
+            1,
+            "second publish (with prior sidecar) must emit EXACTLY one cross-run \
+             comparison event. Got: {second_events:?}"
+        );
+        let event = &second_events[0];
+        assert_eq!(
+            event.level, "WARN",
+            "+100% duration delta vs prior must route through the warn tier \
+             (≥+25% slowdown threshold from emit_tracing_summary). Got: {event:?}"
+        );
+        assert!(
+            event.message.contains("significant slowdown"),
+            "warn-tier message must name the slowdown signal; got: {:?}",
+            event.message
         );
     }
 
