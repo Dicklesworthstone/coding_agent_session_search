@@ -51,9 +51,7 @@ fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
                 .messages(3)
                 .with_content(
                     0,
-                    format!(
-                        "metamorphic_sentinel {unique} async function alpha beta"
-                    ),
+                    format!("metamorphic_sentinel {unique} async function alpha beta"),
                 )
                 .with_content(
                     1,
@@ -63,9 +61,7 @@ fn seed_corpus(index: &mut TantivyIndex, dir: &std::path::Path, now_ms: i64) {
                 )
                 .with_content(
                     2,
-                    format!(
-                        "metamorphic_sentinel {unique} debugging epsilon zeta"
-                    ),
+                    format!("metamorphic_sentinel {unique} debugging epsilon zeta"),
                 )
                 .build_normalized();
 
@@ -102,15 +98,11 @@ impl From<&coding_agent_search::search::query::SearchHit> for HitKey {
     }
 }
 
-fn hit_keys(
-    hits: &[coding_agent_search::search::query::SearchHit],
-) -> Vec<HitKey> {
+fn hit_keys(hits: &[coding_agent_search::search::query::SearchHit]) -> Vec<HitKey> {
     hits.iter().map(HitKey::from).collect()
 }
 
-fn hit_key_set(
-    hits: &[coding_agent_search::search::query::SearchHit],
-) -> HashSet<HitKey> {
+fn hit_key_set(hits: &[coding_agent_search::search::query::SearchHit]) -> HashSet<HitKey> {
     hits.iter().map(HitKey::from).collect()
 }
 
@@ -364,16 +356,20 @@ fn mr5_days_filter_subset() {
     let all_set = hit_key_set(&all);
 
     // 30-day window
-    let mut filters_30 = SearchFilters::default();
-    filters_30.created_from = Some(now - 30 * day_ms);
+    let filters_30 = SearchFilters {
+        created_from: Some(now - 30 * day_ms),
+        ..Default::default()
+    };
     let hits_30 = client
         .search(q, filters_30, limit, 0, FieldMask::FULL)
         .unwrap();
     let set_30 = hit_key_set(&hits_30);
 
     // 7-day window
-    let mut filters_7 = SearchFilters::default();
-    filters_7.created_from = Some(now - 7 * day_ms);
+    let filters_7 = SearchFilters {
+        created_from: Some(now - 7 * day_ms),
+        ..Default::default()
+    };
     let hits_7 = client
         .search(q, filters_7, limit, 0, FieldMask::FULL)
         .unwrap();
@@ -440,29 +436,18 @@ fn mr6_case_invariance() {
 
     for &(lower, upper) in cases {
         let hits_lower = client
-            .search(
-                lower,
-                SearchFilters::default(),
-                limit,
-                0,
-                FieldMask::FULL,
-            )
+            .search(lower, SearchFilters::default(), limit, 0, FieldMask::FULL)
             .unwrap();
         let hits_upper = client
-            .search(
-                upper,
-                SearchFilters::default(),
-                limit,
-                0,
-                FieldMask::FULL,
-            )
+            .search(upper, SearchFilters::default(), limit, 0, FieldMask::FULL)
             .unwrap();
 
         let set_lower = hit_key_set(&hits_lower);
         let set_upper = hit_key_set(&hits_upper);
 
         assert_eq!(
-            set_lower, set_upper,
+            set_lower,
+            set_upper,
             "MR6 violated: {lower:?} vs {upper:?} returned different result sets \
              ({} vs {} hits)",
             set_lower.len(),
@@ -551,10 +536,7 @@ fn mr8_agent_filter_exclusivity() {
 
     for i in 0..per_agent.len() {
         for j in (i + 1)..per_agent.len() {
-            let overlap: Vec<_> = per_agent[i]
-                .1
-                .intersection(&per_agent[j].1)
-                .collect();
+            let overlap: Vec<_> = per_agent[i].1.intersection(&per_agent[j].1).collect();
             assert!(
                 overlap.is_empty(),
                 "MR8 violated: agents {:?} and {:?} share {} hits: {overlap:?}",
