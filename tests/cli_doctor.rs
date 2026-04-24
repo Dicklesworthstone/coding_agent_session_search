@@ -735,6 +735,31 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
     );
 
     let payload: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(payload["auto_fix_applied"].as_bool(), Some(true));
+    assert!(
+        payload["auto_fix_actions"]
+            .as_array()
+            .expect("auto fix actions")
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap_or_default()
+                .contains("Pruned 2 derivative cleanup artifact(s)")),
+        "doctor top-level auto_fix_actions should report derivative cleanup"
+    );
+    assert!(
+        payload["issues_fixed"].as_u64().unwrap_or(0) >= 1,
+        "doctor should count derivative cleanup as a fixed issue"
+    );
+    let derivative_cleanup = payload["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("derivative_cleanup"))
+        .expect("derivative_cleanup check");
+    assert_eq!(derivative_cleanup["status"].as_str(), Some("pass"));
+    assert_eq!(derivative_cleanup["fix_available"].as_bool(), Some(true));
+    assert_eq!(derivative_cleanup["fix_applied"].as_bool(), Some(true));
     let cleanup = &payload["cleanup_apply"];
     assert_eq!(cleanup["requested"].as_bool(), Some(true));
     assert_eq!(cleanup["applied"].as_bool(), Some(true));
@@ -1122,8 +1147,8 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
         "step 1 cass diag --json --quarantine failed: stderr={}",
         String::from_utf8_lossy(&diag_initial_out.stderr)
     );
-    let diag_initial_payload: Value = serde_json::from_slice(&diag_initial_out.stdout)
-        .expect("step 1 diag JSON parses");
+    let diag_initial_payload: Value =
+        serde_json::from_slice(&diag_initial_out.stdout).expect("step 1 diag JSON parses");
     let diag_initial_summary = diag_initial_payload["quarantine"]["summary"]
         .as_object()
         .expect("step 1 diag summary present");
@@ -1154,8 +1179,8 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
         .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
         .output()
         .expect("run doctor preview");
-    let doctor_preview_payload: Value = serde_json::from_slice(&doctor_preview_out.stdout)
-        .expect("step 2 doctor JSON parses");
+    let doctor_preview_payload: Value =
+        serde_json::from_slice(&doctor_preview_out.stdout).expect("step 2 doctor JSON parses");
     let doctor_preview_summary = doctor_preview_payload["quarantine"]["summary"]
         .as_object()
         .expect("step 2 doctor summary present");
@@ -1299,4 +1324,3 @@ fn long_running_maintenance_story_end_to_end_across_diag_doctor_fix_diag() {
          generation; initial={initial_gen_count} post={post_gen_count}"
     );
 }
-
