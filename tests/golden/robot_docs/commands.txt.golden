@@ -38,3 +38,27 @@ commands:
   cass capabilities [--json]
   cass robot-docs <topic>
   cass --robot-help
+  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
+  cass doctor [--json] [--fix]     Diagnostic checks + optional safe auto-fix (derivatives only).
+  cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).
+  cass api-version [--json]        Show crate_version + api_version + contract_version.
+  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).
+  cass models status [--json]      Semantic model acquisition + cache state.
+  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).
+  cass models remove [--model NAME]  Remove an installed semantic model from disk.
+  cass models verify [--json]      Per-file SHA-256 verification of the installed model.
+  cass models check-update [--json]  Compare installed revision against the pinned registry revision.
+  cass models backfill             Re-embed conversations against a newly acquired model.
+  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.
+  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
+  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
+  cass context <path> [--json]     Find related sessions for a given source path.
+  cass export <path> [--format markdown] [--output FILE]  Export a conversation to markdown / other formats.
+  cass export-html <path> [--output-dir DIR] [--json]  Self-contained HTML export (optional encryption).
+  cass pages [--export-only DIR] [--verify PATH] [--agents A1,A2]  Encrypted searchable archive for static hosting.
+  cass sources [agents list|exclude|include] [setup|list|sync] [--json]  Manage remote sources + agent exclusions.
+  cass analytics [status|tokens|tools|models|rebuild|validate] [--json]  Token / tool / model analytics.
+  cass import [...]                Import conversation data from external sources.
+  cass daemon [...]                Run the semantic model daemon (Unix only).
+  cass completions <shell>         Emit shell completion script for bash | zsh | fish | powershell.
+  cass man                         Emit man page (roff) for the cass binary.

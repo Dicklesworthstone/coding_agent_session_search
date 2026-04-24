@@ -32,6 +32,20 @@ schemas: (auto-generated from contract)
       - arch: string
       - os: string
     - version: string
+  doctor:
+    - auto_fix_actions: array
+    - auto_fix_applied: boolean
+    - checks: array
+    - explanation: ?
+    - failures: integer
+    - healthy: boolean
+    - initialized: boolean
+    - issues_fixed: integer
+    - issues_found: integer
+    - needs_rebuild: boolean
+    - recommended_action: ?
+    - status: string
+    - warnings: integer
   health:
     - db: object
       - conversations: ?
@@ -167,6 +181,35 @@ schemas: (auto-generated from contract)
     - contract_version: string
     - global_flags: array
     - response_schemas: object
+  models-check-update:
+    - current_revision: ?
+    - latest_revision: ?
+    - reason: string
+    - update_available: boolean
+  models-status:
+    - cache_lifecycle: object
+    - installed: boolean
+    - installed_size_bytes: integer
+    - lexical_fail_open: boolean
+    - license: string
+    - model_dir: string
+    - model_id: string
+    - next_step: string
+    - observed_file_bytes: integer
+    - policy_source: string
+    - revision: string
+    - state: string
+    - state_detail: string
+    - total_size_bytes: integer
+  models-verify:
+    - all_valid: boolean
+    - cache_lifecycle: object
+    - error: ?
+    - lexical_fail_open: boolean
+    - model_dir: string
+    - next_step: string
+    - state_detail: string
+    - status: string
   search:
     - _meta: object
       - ann_stats: ?
