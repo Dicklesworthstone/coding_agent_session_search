@@ -1,0 +1,23 @@
+{
+  "query": "matrix",
+  "limit": 3,
+  "offset": 0,
+  "count": 2,
+  "total_matches": 2,
+  "hits": [
+    {
+      "source_path": "[TEST_HOME]/.claude/projects/-test-project/agent-test123.jsonl",
+      "line_number": 1,
+      "agent": "claude_code"
+    },
+    {
+      "source_path": "[TEST_HOME]/.claude/projects/-test-project/agent-test123.jsonl",
+      "line_number": 2,
+      "agent": "claude_code"
+    }
+  ],
+  "max_tokens": null,
+  "request_id": null,
+  "cursor": null,
+  "hits_clamped": false
+}
