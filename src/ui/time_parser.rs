@@ -75,7 +75,9 @@ pub fn parse_time_input(input: &str) -> Option<i64> {
             return local_midnight_to_utc(today);
         }
         "yesterday" => {
-            let yesterday = Local::now().date_naive() - Duration::days(1);
+            let yesterday = Local::now()
+                .date_naive()
+                .checked_sub_signed(Duration::try_days(1)?)?;
             return local_midnight_to_utc(yesterday);
         }
         _ => {}
@@ -173,6 +175,30 @@ mod tests {
         let t5 = parse_time_input("2 weeks ago").unwrap();
         let diff = now - t5;
         assert!((diff - 14 * 86400 * 1000).abs() < tolerance);
+    }
+
+    #[test]
+    fn test_relative_time_overflow_returns_none() {
+        let max = i64::MAX;
+        let inputs = [
+            format!("{max}d"),
+            format!("{max}h"),
+            format!("{max}m"),
+            format!("{max}w"),
+            format!("-{max}d"),
+            format!("{max} days ago"),
+            format!("{max}h ago"),
+        ];
+
+        for input in inputs {
+            assert_eq!(parse_time_input(&input), None, "{input}");
+        }
+
+        let duration = Duration::try_milliseconds(i64::MAX).unwrap();
+        assert_eq!(
+            subtract_duration_ms(chrono::DateTime::<Utc>::MIN_UTC, duration),
+            None
+        );
     }
 
     #[test]
