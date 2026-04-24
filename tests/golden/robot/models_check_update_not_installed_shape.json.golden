@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "update_available": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "current_revision": {
+      "type": "null"
+    },
+    "latest_revision": {
+      "type": "string"
+    }
+  }
+}

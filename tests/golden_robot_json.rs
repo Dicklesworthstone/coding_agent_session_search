@@ -968,3 +968,102 @@ fn export_html_shape_matches_golden() {
         serde_json::to_string_pretty(&json_value_schema(&payload)).expect("pretty-print JSON");
     assert_golden("robot/export_html_shape.json.golden", &canonical);
 }
+
+// `coding_agent_session_search-oy4fd`: README line 103 advertises
+// sessions / models-verify / models-check-update as golden-pinned
+// JSON contract surfaces, but no goldens existed for them. The three
+// tests below close that gap with shape goldens (json_value_schema
+// diffs tolerate run-time values like timestamps while still pinning
+// the envelope keys and types). Each test seeds the minimal state
+// needed to reach a deterministic branch: sessions hits the
+// missing-db error envelope (stderr, mirrors stats_missing_db
+// convention); models verify/check-update run against an empty
+// data_dir where the model is not yet acquired, so they reach the
+// stable `not_acquired` / `model_not_installed` branches.
+
+#[test]
+fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
+    // Mirrors stats_json_missing_db_error_envelope_shape_matches_golden:
+    // no DB on a fresh data_dir ⇒ cass emits the `missing-db` error
+    // envelope on stderr with exit 3. Pinning the envelope shape lets
+    // agent harnesses branch on kind="missing-db" without worrying
+    // about silent contract drift.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args([
+            "sessions",
+            "--current",
+            "--json",
+            "--data-dir",
+            test_home.path().to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass sessions --current --json");
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stderr)
+        .expect("sessions error envelope is JSON on stderr");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden(
+        "robot/sessions_missing_db_shape.json.golden",
+        &canonical,
+    );
+}
+
+#[test]
+fn models_verify_json_not_acquired_shape_matches_golden() {
+    // Empty data_dir ⇒ model is not acquired, `cass models verify
+    // --json` emits the stable not_acquired envelope on stdout with
+    // exit 0. Shape golden pins: status, state_detail, next_step,
+    // lexical_fail_open, model_dir, all_valid, cache_lifecycle
+    // (nested), error.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args([
+            "models",
+            "verify",
+            "--json",
+            "--data-dir",
+            test_home.path().to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass models verify --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("models verify stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden(
+        "robot/models_verify_not_acquired_shape.json.golden",
+        &canonical,
+    );
+}
+
+#[test]
+fn models_check_update_json_not_installed_shape_matches_golden() {
+    // Empty data_dir ⇒ `cass models check-update --json` returns
+    // `reason=model_not_installed` with current_revision=null +
+    // latest_revision=<pinned sha>. Shape golden pins the 4-field
+    // envelope so a regression that renamed/removed any field would
+    // trip CI.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let out = cass_cmd(test_home.path())
+        .args([
+            "models",
+            "check-update",
+            "--json",
+            "--data-dir",
+            test_home.path().to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run cass models check-update --json");
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+        panic!("models check-update stdout is not JSON: {err}\nstdout:\n{stdout}")
+    });
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+    assert_golden(
+        "robot/models_check_update_not_installed_shape.json.golden",
+        &canonical,
+    );
+}

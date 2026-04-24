@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "state_detail": {
+      "type": "string"
+    },
+    "next_step": {
+      "type": "string"
+    },
+    "lexical_fail_open": {
+      "type": "boolean"
+    },
+    "model_dir": {
+      "type": "string"
+    },
+    "all_valid": {
+      "type": "boolean"
+    },
+    "cache_lifecycle": {
+      "type": "object",
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "model_dir": {
+          "type": "string"
+        },
+        "state": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string"
+            },
+            "missing_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "needs_consent": {
+              "type": "boolean"
+            }
+          }
+        },
+        "required_size_bytes": {
+          "type": "integer"
+        },
+        "installed_size_bytes": {
+          "type": "integer"
+        },
+        "policy_source": {
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "type": "string"
+    }
+  }
+}
