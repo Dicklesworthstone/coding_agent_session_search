@@ -442,6 +442,63 @@ impl ModelDaemon {
         Ok(())
     }
 
+    fn read_frame_bytes_with_shutdown(
+        &self,
+        stream: &mut UnixStream,
+        buf: &mut [u8],
+        poll_timeout: Duration,
+        request_timeout: Duration,
+        reset_timeout_on_progress: bool,
+    ) -> std::io::Result<bool> {
+        if buf.is_empty() {
+            return Ok(true);
+        }
+
+        stream.set_read_timeout(Some(poll_timeout))?;
+        let started_at = Instant::now();
+        let mut last_progress_at = started_at;
+        let mut filled = 0usize;
+
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                debug!("Shutdown requested, closing connection read");
+                return Ok(false);
+            }
+
+            match stream.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    debug!("Client disconnected");
+                    return Ok(false);
+                }
+                Ok(n) => {
+                    filled += n;
+                    last_progress_at = Instant::now();
+                    if filled == buf.len() {
+                        return Ok(true);
+                    }
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    let timeout_started_at = if reset_timeout_on_progress {
+                        last_progress_at
+                    } else {
+                        started_at
+                    };
+                    if timeout_started_at.elapsed() >= request_timeout {
+                        debug!("Connection timed out");
+                        return Ok(false);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Handle a single client connection.
     fn handle_connection(&self, mut stream: UnixStream) -> std::io::Result<()> {
         // Bounded idle-poll interval so `std::thread::scope` shutdown does
@@ -458,41 +515,15 @@ impl ModelDaemon {
             // Idle read (length prefix): short-poll so shutdown cancels
             // promptly. Track `filled` manually because `read_exact`
             // discards partial bytes on timeout.
-            stream.set_read_timeout(Some(idle_poll))?;
             let mut len_buf = [0u8; 4];
-            let mut filled = 0usize;
-            let idle_start = Instant::now();
-            loop {
-                if self.shutdown.load(Ordering::SeqCst) {
-                    debug!("Shutdown requested, closing idle connection");
-                    return Ok(());
-                }
-                match stream.read(&mut len_buf[filled..]) {
-                    Ok(0) => {
-                        debug!("Client disconnected");
-                        return Ok(());
-                    }
-                    Ok(n) => {
-                        filled += n;
-                        if filled == len_buf.len() {
-                            break;
-                        }
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        if idle_start.elapsed() >= request_timeout {
-                            debug!("Connection timed out");
-                            return Ok(());
-                        }
-                        // loop again — short timeout will re-arm
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
+            if !self.read_frame_bytes_with_shutdown(
+                &mut stream,
+                &mut len_buf,
+                idle_poll,
+                request_timeout,
+                false,
+            )? {
+                return Ok(());
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
@@ -504,14 +535,18 @@ impl ModelDaemon {
                 return Ok(());
             }
 
-            // Payload read: bytes are in flight, use the full
-            // request_timeout so a slow sender doesn't get kicked in
-            // the middle of a request frame. Shutdown is not polled
-            // mid-payload because the write below finishes the RPC
-            // shape and the handler exits cleanly immediately after.
-            stream.set_read_timeout(Some(request_timeout))?;
+            // Payload read: bytes are in flight, so keep the timeout as an
+            // idle-progress budget while still short-polling shutdown.
             let mut payload = vec![0u8; len];
-            stream.read_exact(&mut payload)?;
+            if !self.read_frame_bytes_with_shutdown(
+                &mut stream,
+                &mut payload,
+                idle_poll,
+                request_timeout,
+                true,
+            )? {
+                return Ok(());
+            }
 
             // Decode and handle request
             let response = match decode_message::<Request>(&payload) {
@@ -902,12 +937,14 @@ mod tests {
         use std::sync::Arc;
         use std::time::Instant;
 
-        let mut config = DaemonConfig::default();
         // 10s request_timeout is plenty big to catch a regression: if
         // the handler falls back to the old single-blocking-read path,
         // shutdown latency would be ~10s, not the sub-second target
         // asserted below.
-        config.request_timeout = Duration::from_secs(10);
+        let config = DaemonConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
         let models = ModelManager::new(&test_data_dir());
         let daemon = Arc::new(ModelDaemon::new(config, models));
 
@@ -958,6 +995,63 @@ mod tests {
         assert!(
             result.is_ok(),
             "handler must return Ok on shutdown-during-idle; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn handle_connection_returns_promptly_when_shutdown_set_during_partial_payload_read() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let config = DaemonConfig {
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let models = ModelManager::new(&test_data_dir());
+        let daemon = Arc::new(ModelDaemon::new(config, models));
+
+        let (server_side, mut client_side) = UnixStream::pair().expect("create socketpair");
+        client_side
+            .write_all(&4u32.to_be_bytes())
+            .expect("write length prefix only");
+
+        let handler_daemon = Arc::clone(&daemon);
+        let handler_thread =
+            std::thread::spawn(move || handler_daemon.handle_connection(server_side));
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let shutdown_requested_at = Instant::now();
+        daemon.request_shutdown();
+
+        let join_budget = Duration::from_secs(3);
+        let join_deadline = Instant::now() + join_budget;
+        let mut joined = false;
+        while Instant::now() < join_deadline {
+            if handler_thread.is_finished() {
+                joined = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            joined,
+            "handle_connection must observe shutdown while waiting for a partial payload"
+        );
+        let shutdown_latency = shutdown_requested_at.elapsed();
+        assert!(
+            shutdown_latency < Duration::from_secs(2),
+            "partial-payload shutdown latency {shutdown_latency:?} is too high"
+        );
+        let result = handler_thread
+            .join()
+            .expect("handle_connection thread panicked");
+        assert!(
+            result.is_ok(),
+            "handler must return Ok on shutdown-during-partial-payload; got {result:?}"
         );
     }
 }
