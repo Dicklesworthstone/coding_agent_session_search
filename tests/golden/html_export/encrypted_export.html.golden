@@ -2677,15 +2677,8 @@ if ('ontouchstart' in window) {
     });
 }
 
-// Initialize after DOM is ready (or immediately if already ready)
-const __cassInitAll = () => {
-    try { Search.init(); } catch (e) { console.error('Search init failed', e); }
-    try { Theme.init(); } catch (e) { console.error('Theme init failed', e); }
-    try { ToolCalls.init(); } catch (e) { console.error('ToolCalls init failed', e); }
-    try { ToolPopovers.init(); } catch (e) { console.error('ToolPopovers init failed', e); }
-    try { Crypto.init(); } catch (e) { console.error('Crypto init failed', e); }
-    try { WorldClass.init(); } catch (e) { console.error('WorldClass init failed', e); }
-    // Add copy buttons to code blocks
+// Add copy buttons to code blocks
+// Idempotent so encrypted exports can re-run this after decrypting content.
 const __cassAttachCodeCopyButtons = () => {
     $$('pre code').forEach((code) => {
         const pre = code.parentNode;
@@ -2701,7 +2694,16 @@ const __cassAttachCodeCopyButtons = () => {
         pre.appendChild(btn);
     });
 };
-__cassAttachCodeCopyButtons();
+
+// Initialize after DOM is ready (or immediately if already ready)
+const __cassInitAll = () => {
+    try { Search.init(); } catch (e) { console.error('Search init failed', e); }
+    try { Theme.init(); } catch (e) { console.error('Theme init failed', e); }
+    try { ToolCalls.init(); } catch (e) { console.error('ToolCalls init failed', e); }
+    try { ToolPopovers.init(); } catch (e) { console.error('ToolPopovers init failed', e); }
+    try { Crypto.init(); } catch (e) { console.error('Crypto init failed', e); }
+    try { WorldClass.init(); } catch (e) { console.error('WorldClass init failed', e); }
+    try { __cassAttachCodeCopyButtons(); } catch (e) { console.error('Code copy init failed', e); }
 
     // Print button handler
     const printBtn = $('#print-btn');

@@ -5649,10 +5649,22 @@ fn state_meta_json_inner(
     // open_skipped=true. The expensive FrankenStorage open is
     // elided; callers reading the JSON envelope branch on the new
     // flag if they need to know the open was assumed.
+    //
+    // counts_skipped MUST be true here regardless of `include_counts`
+    // — we never opened the DB so we never ran COUNT(*); the snapshot
+    // counts come from `..default()` (i.e. zero). Reporting
+    // counts_skipped=false alongside message_count=0 would be a lie.
+    // state_meta_json_for_health currently forces
+    // include_counts=Some(false) so `!include_counts` happened to
+    // yield true, but state_meta_json_full exposes both knobs and a
+    // future caller passing skip_db_open=true with
+    // include_counts=Some(true) (or None where the size heuristic
+    // returns true) would otherwise see `messages: 0,
+    // counts_skipped: false`.
     let db_snapshot = if skip_db_open && db_exists {
         StateDbSnapshot {
             opened: true,
-            counts_skipped: !include_counts,
+            counts_skipped: true,
             open_skipped: true,
             ..StateDbSnapshot::default()
         }
