@@ -98,3 +98,17 @@ path = "fuzz_targets/fuzz_time_parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_query_transpiler"
+path = "fuzz_targets/fuzz_query_transpiler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_robot_envelope_roundtrip"
+path = "fuzz_targets/fuzz_robot_envelope_roundtrip.rs"
+test = false
+doc = false
+bench = false

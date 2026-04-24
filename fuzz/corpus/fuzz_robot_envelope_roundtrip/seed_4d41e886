@@ -1,0 +1,1 @@
+{"error":{"code":3,"kind":"missing-db","message":"DB not found","hint":"run cass index --full","retryable":true}}
