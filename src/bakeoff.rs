@@ -504,6 +504,9 @@ impl EvaluationHarness {
         metadata: &ModelMetadata,
     ) -> Result<ValidationReport, String> {
         let corpus_hash = corpus.compute_hash();
+        if corpus.queries.is_empty() {
+            return Err("Empty query set".to_string());
+        }
 
         // Measure cold start (first embedding)
         let cold_start = Instant::now();
@@ -1027,6 +1030,28 @@ mod tests {
         corpus.add_document("d3", "new document");
         let hash3 = corpus.compute_hash();
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn evaluation_rejects_empty_query_set() {
+        let harness = EvaluationHarness::new();
+        let mut corpus = EvaluationCorpus::new("no-queries");
+        corpus.add_document("d1", "hello world");
+        let embedder = crate::search::hash_embedder::HashEmbedder::new(16);
+        let metadata = ModelMetadata {
+            id: "hash".to_string(),
+            name: "Hash".to_string(),
+            source: "test".to_string(),
+            release_date: "2025-12-01".to_string(),
+            dimension: Some(16),
+            size_bytes: Some(0),
+            is_baseline: false,
+        };
+
+        let err = harness
+            .evaluate(&embedder, &corpus, &metadata)
+            .expect_err("empty query set must not produce a successful bakeoff report");
+        assert!(err.contains("Empty query set"));
     }
 
     #[test]
