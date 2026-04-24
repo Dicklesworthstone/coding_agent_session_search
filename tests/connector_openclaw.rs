@@ -151,6 +151,35 @@ fn scan_discovers_multiple_agents() {
     assert!(slugs.contains(&"openclaw/custombot"));
 }
 
+#[test]
+fn scan_preserves_unicode_agent_directory_and_session_filename() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".openclaw/agents/研究-agent/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+
+    write_jsonl(
+        &sessions,
+        "セッション-🚀.jsonl",
+        &[r#"{"type":"message","timestamp":"2025-06-15T10:00:00.000Z","message":{"role":"user","content":"Unicode agent tag"}}"#],
+    );
+
+    let connector = OpenClawConnector::new();
+    let scan_root = ScanRoot::local(tmp.path().to_path_buf());
+    let ctx = ScanContext::with_roots(tmp.path().to_path_buf(), vec![scan_root], None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].agent_slug, "openclaw/研究-agent");
+    assert_eq!(
+        convs[0].external_id.as_deref(),
+        Some("研究-agent/セッション-🚀")
+    );
+    assert_eq!(
+        convs[0].metadata.get("agent_directory").and_then(|v| v.as_str()),
+        Some("研究-agent")
+    );
+}
+
 // ============================================================================
 // Content flattening
 // ============================================================================
