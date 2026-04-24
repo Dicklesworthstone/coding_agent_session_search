@@ -895,6 +895,141 @@ fn pct_delta(baseline: f64, current: f64) -> Option<f64> {
     Some((raw * 100.0).round() / 100.0)
 }
 
+/// CI-bench-gate threshold configuration. Project-specific values
+/// let bench harnesses tune their tolerance: a noisy benchmark
+/// runner picks looser thresholds than a deterministic CI worker.
+///
+/// `coding_agent_session_search-ibuuh.24`: complementary surface to
+/// `emit_tracing_summary` (operator-visibility soft signal) — the
+/// hard-gate consumer uses `regression_verdict` to decide whether
+/// to exit non-zero in CI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionVerdictThresholds {
+    /// Aggregate duration delta percent at which the verdict
+    /// becomes `Warning`. Inclusive (`>=` triggers).
+    /// Reasonable default: `+15.0`.
+    pub warning_duration_pct: f64,
+    /// Aggregate duration delta percent at which the verdict
+    /// becomes `Failure`. Inclusive. MUST be `>= warning_duration_pct`
+    /// or the constructor returns Err.
+    /// Reasonable default: `+30.0`.
+    pub failure_duration_pct: f64,
+}
+
+impl RegressionVerdictThresholds {
+    /// Default threshold pair calibrated for typical bench-CI
+    /// workloads on cass: 15% warning, 30% failure.
+    pub fn defaults() -> Self {
+        Self {
+            warning_duration_pct: 15.0,
+            failure_duration_pct: 30.0,
+        }
+    }
+
+    /// Custom threshold pair. Returns `Err(&'static str)` when the
+    /// configuration is internally inconsistent (warning >= failure
+    /// would never raise a warning before the failure trips).
+    pub fn try_new(warning_duration_pct: f64, failure_duration_pct: f64) -> Result<Self, &'static str> {
+        if !warning_duration_pct.is_finite() || !failure_duration_pct.is_finite() {
+            return Err("regression thresholds must be finite f64s");
+        }
+        if warning_duration_pct >= failure_duration_pct {
+            return Err(
+                "warning_duration_pct must be strictly less than failure_duration_pct, \
+                 otherwise the warning level is unreachable",
+            );
+        }
+        Ok(Self {
+            warning_duration_pct,
+            failure_duration_pct,
+        })
+    }
+}
+
+/// Hard-gate verdict for CI bench runners. `Failure` is the only
+/// signal that should cause a non-zero exit; `Warning` is for
+/// PR-comment / dashboard surfaces; `Clean` is the steady-state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "verdict")]
+pub enum RegressionVerdict {
+    /// Either no comparison data was available (e.g. baseline
+    /// missing) or the duration delta is below the warning
+    /// threshold. CI MUST treat this as pass.
+    Clean,
+    /// Warning band reached: duration delta `>= warning_duration_pct`
+    /// but `< failure_duration_pct`. CI should surface this in PR
+    /// comments / dashboards but NOT fail the build.
+    Warning {
+        duration_delta_pct: f64,
+        threshold_pct: f64,
+    },
+    /// Failure band reached: duration delta `>= failure_duration_pct`.
+    /// CI MUST exit non-zero on this verdict.
+    Failure {
+        duration_delta_pct: f64,
+        threshold_pct: f64,
+    },
+}
+
+impl RegressionVerdict {
+    /// Convenience: is this a CI-fail verdict? Lets bench-CI
+    /// harnesses write `if verdict.should_fail_build() { exit(1); }`
+    /// without matching every variant.
+    pub fn should_fail_build(&self) -> bool {
+        matches!(self, Self::Failure { .. })
+    }
+}
+
+impl RefreshLedgerEvidenceComparison {
+    /// Compute the CI hard-gate verdict for this comparison against
+    /// caller-supplied thresholds. Pure function; no I/O. Use
+    /// `emit_tracing_summary` for operator-visibility soft signaling
+    /// instead of CI gating.
+    ///
+    /// `coding_agent_session_search-ibuuh.24`: this is the
+    /// bench-CI consumer of `compare_to`. A regression test asserts
+    /// the verdict tiering matches the threshold contract exactly,
+    /// so a project tuning thresholds for its own bench harness
+    /// gets predictable behavior at the boundary cases.
+    ///
+    /// Degenerate cases:
+    /// - `aggregate_duration_delta_pct == None` (baseline missing
+    ///   or empty) ⇒ `Clean` — no measurement to gate on.
+    /// - Negative duration delta (improvement) ⇒ always `Clean`,
+    ///   regardless of threshold polarity (an improvement cannot
+    ///   trigger a regression failure).
+    pub fn regression_verdict(
+        &self,
+        thresholds: &RegressionVerdictThresholds,
+    ) -> RegressionVerdict {
+        let Some(duration_pct) = self.aggregate_duration_delta_pct else {
+            return RegressionVerdict::Clean;
+        };
+        // Improvements never trigger regression verdicts. Pin the
+        // sign explicitly rather than relying on threshold values
+        // staying positive — a future maintainer who passes a
+        // negative warning_duration_pct (e.g. to gate on
+        // improvements as a positive signal) would otherwise see
+        // every steady-state run trip.
+        if duration_pct < 0.0 {
+            return RegressionVerdict::Clean;
+        }
+        if duration_pct >= thresholds.failure_duration_pct {
+            return RegressionVerdict::Failure {
+                duration_delta_pct: duration_pct,
+                threshold_pct: thresholds.failure_duration_pct,
+            };
+        }
+        if duration_pct >= thresholds.warning_duration_pct {
+            return RegressionVerdict::Warning {
+                duration_delta_pct: duration_pct,
+                threshold_pct: thresholds.warning_duration_pct,
+            };
+        }
+        RegressionVerdict::Clean
+    }
+}
+
 impl RefreshLedgerEvidenceComparison {
     /// Emit a single structured tracing event summarizing the
     /// cross-run comparison. Operators see "this rebuild was N%
@@ -1946,5 +2081,140 @@ mod tests {
             evs[0].level, "DEBUG",
             "None duration delta defaults to steady-state (debug); got {evs:?}"
         );
+    }
+
+    /// `coding_agent_session_search-ibuuh.24` CI hard-gate
+    /// regression: pin the regression_verdict tier semantics +
+    /// boundary cases + degenerate inputs. A regression in any
+    /// of the four classes (Clean / Warning / Failure /
+    /// degenerate-clean) would silently break either the
+    /// improvement signal (false-positive failure) or the
+    /// failure gate (silent passthrough on real regression).
+    #[test]
+    fn regression_verdict_categorizes_each_band_and_handles_degenerate_cases() {
+        let thresholds = RegressionVerdictThresholds::defaults();
+        assert_eq!(thresholds.warning_duration_pct, 15.0);
+        assert_eq!(thresholds.failure_duration_pct, 30.0);
+
+        // Helper: build a comparison with a given duration delta.
+        fn comparison_with_pct(pct: Option<f64>) -> RefreshLedgerEvidenceComparison {
+            RefreshLedgerEvidenceComparison {
+                phase_deltas: Vec::new(),
+                aggregate_duration_delta_pct: pct,
+                aggregate_throughput_delta_pct: None,
+                dominant_phase_shift: None,
+            }
+        }
+
+        // ─── Clean band ────────────────────────────────────────
+        // Below warning threshold ⇒ Clean.
+        let clean = comparison_with_pct(Some(10.0)).regression_verdict(&thresholds);
+        assert_eq!(clean, RegressionVerdict::Clean);
+        assert!(!clean.should_fail_build());
+
+        // ─── Warning band ──────────────────────────────────────
+        // At threshold (inclusive) ⇒ Warning.
+        let warn_at = comparison_with_pct(Some(15.0)).regression_verdict(&thresholds);
+        assert!(matches!(
+            warn_at,
+            RegressionVerdict::Warning { duration_delta_pct, threshold_pct }
+                if (duration_delta_pct - 15.0).abs() < 0.01 && threshold_pct == 15.0
+        ), "+15% must trigger warn at the inclusive threshold; got {warn_at:?}");
+        assert!(!warn_at.should_fail_build());
+
+        // Mid-band ⇒ Warning.
+        let warn_mid = comparison_with_pct(Some(22.5)).regression_verdict(&thresholds);
+        assert!(matches!(warn_mid, RegressionVerdict::Warning { .. }));
+        assert!(!warn_mid.should_fail_build());
+
+        // ─── Failure band ──────────────────────────────────────
+        // At threshold (inclusive) ⇒ Failure.
+        let fail_at = comparison_with_pct(Some(30.0)).regression_verdict(&thresholds);
+        assert!(matches!(
+            fail_at,
+            RegressionVerdict::Failure { duration_delta_pct, threshold_pct }
+                if (duration_delta_pct - 30.0).abs() < 0.01 && threshold_pct == 30.0
+        ), "+30% must trigger failure at the inclusive threshold; got {fail_at:?}");
+        assert!(fail_at.should_fail_build(), "Failure verdict MUST cause CI to exit non-zero");
+
+        // Far past failure ⇒ still Failure (capping behavior).
+        let fail_far = comparison_with_pct(Some(150.0)).regression_verdict(&thresholds);
+        assert!(matches!(fail_far, RegressionVerdict::Failure { .. }));
+
+        // ─── Improvements never trigger a regression verdict ───
+        let improvement = comparison_with_pct(Some(-50.0)).regression_verdict(&thresholds);
+        assert_eq!(
+            improvement,
+            RegressionVerdict::Clean,
+            "improvements (negative duration delta) MUST NOT trigger regression verdicts; \
+             got {improvement:?}"
+        );
+
+        // ─── None duration delta (no comparison data) ─────────
+        let no_data = comparison_with_pct(None).regression_verdict(&thresholds);
+        assert_eq!(
+            no_data, RegressionVerdict::Clean,
+            "missing comparison data MUST NOT cause a CI failure (no signal to gate on)"
+        );
+    }
+
+    /// `coding_agent_session_search-ibuuh.24`: the threshold
+    /// constructor MUST refuse internally-inconsistent
+    /// configurations (warning >= failure would never raise a
+    /// warning before the failure trips). A project that misorders
+    /// its threshold values would otherwise get a hard CI failure
+    /// on every run.
+    #[test]
+    fn regression_verdict_thresholds_try_new_rejects_inconsistent_configurations() {
+        // Happy path.
+        assert!(RegressionVerdictThresholds::try_new(10.0, 20.0).is_ok());
+
+        // warning >= failure ⇒ Err.
+        let err = RegressionVerdictThresholds::try_new(20.0, 10.0)
+            .expect_err("warning > failure must be rejected");
+        assert!(
+            err.contains("strictly less"),
+            "rejection message must explain the constraint; got {err:?}"
+        );
+
+        // warning == failure ⇒ Err (warning would never trigger).
+        let err_eq = RegressionVerdictThresholds::try_new(15.0, 15.0)
+            .expect_err("warning == failure must be rejected");
+        assert!(err_eq.contains("strictly less"));
+
+        // Non-finite values rejected explicitly (defensive — never
+        // reachable from clean f64 arithmetic but pin the contract).
+        assert!(RegressionVerdictThresholds::try_new(f64::NAN, 30.0).is_err());
+        assert!(RegressionVerdictThresholds::try_new(15.0, f64::INFINITY).is_err());
+    }
+
+    /// `coding_agent_session_search-ibuuh.24`: RegressionVerdict
+    /// serializes through serde (CI runners persist the verdict
+    /// JSON for PR comments + dashboards). Pin the tag/snake_case
+    /// shape so a future variant addition or rename trips a clear
+    /// deserialization break in downstream consumers.
+    #[test]
+    fn regression_verdict_serializes_with_snake_case_verdict_tag() {
+        let clean_json = serde_json::to_string(&RegressionVerdict::Clean).expect("serialize");
+        assert!(
+            clean_json.contains("\"verdict\":\"clean\""),
+            "Clean must serialize with snake_case `verdict` tag; got {clean_json}"
+        );
+
+        let warning_json = serde_json::to_string(&RegressionVerdict::Warning {
+            duration_delta_pct: 18.5,
+            threshold_pct: 15.0,
+        })
+        .expect("serialize");
+        assert!(warning_json.contains("\"verdict\":\"warning\""));
+        assert!(warning_json.contains("\"duration_delta_pct\":18.5"));
+        assert!(warning_json.contains("\"threshold_pct\":15"));
+
+        let failure_json = serde_json::to_string(&RegressionVerdict::Failure {
+            duration_delta_pct: 42.0,
+            threshold_pct: 30.0,
+        })
+        .expect("serialize");
+        assert!(failure_json.contains("\"verdict\":\"failure\""));
     }
 }
