@@ -1,5 +1,6 @@
 pub mod e2e_log;
 pub mod search_asset_simulation;
+pub mod timeout;
 
 // =============================================================================
 // Verbose Logging Support
