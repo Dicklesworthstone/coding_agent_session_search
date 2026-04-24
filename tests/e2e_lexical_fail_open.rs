@@ -175,7 +175,9 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
         .get("fallback_reason")
         .and_then(Value::as_str)
         .unwrap_or_else(|| {
-            panic!("--robot-meta must populate `_meta.fallback_reason` on fail-open; meta: {meta:?}")
+            panic!(
+                "--robot-meta must populate `_meta.fallback_reason` on fail-open; meta: {meta:?}"
+            )
         });
     assert!(
         !fallback_reason.is_empty(),

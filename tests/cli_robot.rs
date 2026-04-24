@@ -4895,3 +4895,183 @@ fn cass_output_format_takes_precedence() {
         "CASS_OUTPUT_FORMAT=json should produce pretty JSON (with newlines), not compact"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-s0cmk (child of ibuuh.10):
+//
+// Pins the truthful-fallback surface of `cass search` when the
+// canonical DB is intact but the versioned lexical (Tantivy) tree has
+// been wiped — an upgrade-accident, manual rm, or partial-copy
+// condition. The existing `search_missing_index_*` tests only cover
+// the "nothing exists" case (empty --data-dir), so this code path was
+// silently un-pinned.
+//
+// The actual user-visible contract, per `SearchClient::open_with_options`
+// and the `!client.has_tantivy()` warning branch in src/lib.rs (around
+// line 7798), is:
+//
+//   - `cass search` returns exit code 0 (degraded, not a hard failure).
+//   - stderr carries a human-readable warning that names the exact
+//     lexical path and the recovery command (`cass index --full`).
+//   - stdout is still a valid JSON envelope so agents can parse it.
+//
+// This is the "fail open even when lexical itself is missing" slice of
+// ibuuh.10's core contract — cass preserves partial functionality AND
+// surfaces a truthful recovery hint instead of panicking or lying. If a
+// future refactor flips this to a hard failure, drops the warning, or
+// stops naming `cass index --full` in the recovery text, this test
+// fires immediately.
+// ========================================================================
+
+fn seed_codex_session_s0cmk(
+    codex_home: &std::path::Path,
+    filename: &str,
+    keyword: &str,
+) {
+    use serde_json::json;
+    let sessions = codex_home.join("sessions/2026/04/23");
+    fs::create_dir_all(&sessions).unwrap();
+    let ts_ms = 1_714_000_000_000_u64;
+    let iso = |offset_ms: u64| -> String {
+        chrono::DateTime::from_timestamp_millis(
+            i64::try_from(ts_ms + offset_ms).unwrap_or(i64::MAX),
+        )
+        .unwrap()
+        .to_rfc3339()
+    };
+    let workspace = codex_home.to_string_lossy().into_owned();
+    let lines = [
+        json!({
+            "timestamp": iso(0),
+            "type": "session_meta",
+            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
+        }),
+        json!({
+            "timestamp": iso(1_000),
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": keyword }],
+            },
+        }),
+    ];
+    let mut body = String::new();
+    for line in lines {
+        body.push_str(&serde_json::to_string(&line).unwrap());
+        body.push('\n');
+    }
+    fs::write(sessions.join(filename), body).unwrap();
+}
+
+fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
+    let mut cmd = Command::new(cass_bin());
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    cmd.env("HOME", temp_home);
+    cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
+    cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
+    cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    cmd
+}
+
+#[test]
+fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    seed_codex_session_s0cmk(&codex_home, "s0cmk-fixture-01.jsonl", "dbexistsprobe");
+
+    // Full index to produce BOTH the canonical DB and the lexical tree.
+    let mut idx = isolated_cass_cmd(home);
+    idx.args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let idx_out = idx.output().expect("run cass index --full");
+    assert!(
+        idx_out.status.success(),
+        "initial index must succeed. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&idx_out.stdout),
+        String::from_utf8_lossy(&idx_out.stderr),
+    );
+
+    let db_path = data_dir.join("agent_search.db");
+    assert!(
+        db_path.exists(),
+        "precondition: canonical DB must exist after index --full"
+    );
+
+    // Wipe ONLY the versioned lexical index directory; keep the DB.
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve versioned tantivy index path");
+    assert!(
+        index_path.exists(),
+        "precondition: lexical index must exist before wipe; got {}",
+        index_path.display()
+    );
+    fs::remove_dir_all(&index_path).expect("wipe lexical index directory");
+    assert!(
+        db_path.exists(),
+        "postcondition: wipe must leave canonical DB intact"
+    );
+    assert!(
+        !index_path.exists(),
+        "postcondition: wipe must remove the versioned lexical index directory"
+    );
+
+    // Run cass search against the half-torn state.
+    let mut search = isolated_cass_cmd(home);
+    search
+        .args(["search", "dbexistsprobe", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let output = search.output().expect("run cass search");
+    let exit_code = output.status.code().expect("exit code present");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // CONTRACT PIN 1: exit 0 — degraded, not a hard failure. If this
+    // flips to nonzero, either the contract intentionally changed (and
+    // this test needs to be updated alongside the src change) or a
+    // regression just broke partial-functionality for all users whose
+    // lexical tree got wiped by an upgrade/backup-restore/rm accident.
+    assert_eq!(
+        exit_code, 0,
+        "cass search with DB+missing-lexical must serve degraded results (exit 0), \
+         not hard-fail. stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // CONTRACT PIN 2: stderr must carry the truthful warning that
+    // names both (a) the missing lexical path and (b) the recovery
+    // command. Agents and humans consuming stderr need this to act.
+    assert!(
+        stderr.contains("Tantivy search index not found"),
+        "stderr must contain the 'Tantivy search index not found' warning; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("cass index --full"),
+        "stderr warning must name the blessed recovery command `cass index --full`; \
+         got: {stderr}"
+    );
+    assert!(
+        stderr.contains(index_path.display().to_string().as_str()),
+        "stderr warning must name the exact lexical path so users can verify what \
+         they need to rebuild; got: {stderr}"
+    );
+
+    // CONTRACT PIN 3: stdout is still valid JSON so agents parse it.
+    // We don't assert a specific hit count (degraded mode may return
+    // 0, depending on internal DB fallback behavior) — only that the
+    // CLI does not panic or emit garbage to stdout.
+    assert!(
+        !stdout.trim().is_empty(),
+        "stdout must not be empty in degraded mode; warning belongs on stderr. \
+         stderr: {stderr}"
+    );
+    let _: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "stdout must be valid JSON in degraded mode; got parse error {err}; \
+             stdout: {stdout}"
+        )
+    });
+}
