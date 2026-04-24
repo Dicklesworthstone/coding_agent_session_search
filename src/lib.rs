@@ -12079,7 +12079,16 @@ fn run_health(
     } else {
         None
     };
-    let recommended_action = if not_initialized {
+    let recommended_action = if rebuild_active {
+        // [coding_agent_session_search-k0bzk] An active rebuild MUST short-circuit
+        // before the !healthy stampede branch fires: previously, this selector
+        // told polling agents to run `cass index --full` while a rebuild was
+        // already in flight, encouraging them to either lock-stampede or, in
+        // the worst case, kick off a concurrent pipeline. Mirror the run_status
+        // recommendation text (src/lib.rs::run_status) so cass health and cass
+        // status agree on the same operator-facing advice.
+        Some("Index rebuild is already in progress".to_string())
+    } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string())
