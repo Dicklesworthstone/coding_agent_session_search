@@ -100,6 +100,27 @@ fn scan_multiple_sessions() {
     assert!(contents.contains(&"Second session"));
 }
 
+#[test]
+fn scan_preserves_unicode_session_directory_external_id() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    fs::create_dir_all(&sessions).unwrap();
+
+    write_session(
+        &sessions,
+        "sess-東京-🚀",
+        &[r#"{"role":"user","content":"Unicode session path","timestamp":"2025-06-15T10:00:00.000Z"}"#],
+    );
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].external_id.as_deref(), Some("sess-東京-🚀"));
+    assert!(convs[0].source_path.ends_with("sess-東京-🚀/messages.jsonl"));
+}
+
 // ============================================================================
 // Scan — edge cases
 // ============================================================================
