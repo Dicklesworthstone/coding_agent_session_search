@@ -10590,6 +10590,15 @@ struct DiagQuarantineSummary {
     gc_eligible_bytes: u64,
     inspection_required_asset_count: usize,
     inspection_required_bytes: u64,
+    cleanup_dry_run_generation_count: usize,
+    cleanup_dry_run_reclaim_candidate_count: usize,
+    cleanup_dry_run_reclaimable_bytes: u64,
+    cleanup_dry_run_retained_bytes: u64,
+    cleanup_dry_run_protected_generation_count: usize,
+    cleanup_dry_run_active_generation_count: usize,
+    cleanup_dry_run_inspection_required_count: usize,
+    cleanup_dry_run_approval_fingerprint: String,
+    cleanup_apply_allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -10598,6 +10607,10 @@ struct DiagQuarantineReport {
     failed_seed_bundle_files: Vec<DiagQuarantineArtifact>,
     retained_publish_backups: Vec<DiagQuarantineArtifact>,
     lexical_generations: Vec<DiagQuarantinedGeneration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_cleanup_dry_run: Option<crate::indexer::lexical_generation::LexicalCleanupDryRunPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lexical_cleanup_apply_gate: Option<crate::indexer::lexical_generation::LexicalCleanupApplyGate>,
     warnings: Vec<String>,
 }
 
@@ -10779,15 +10792,19 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
     let lexical_cleanup_plan = LexicalCleanupDryRunPlan::from_manifests(
         lexical_manifest_entries.iter().map(|entry| &entry.manifest),
     );
+    let lexical_cleanup_apply_gate = lexical_cleanup_plan.apply_gate(false);
     let inspection_required_ids: HashSet<String> = lexical_cleanup_plan
         .inspection_required_generation_ids()
         .into_iter()
         .collect();
     let lexical_inventory_by_generation: HashMap<_, _> = lexical_cleanup_plan
         .inventories
-        .into_iter()
-        .map(|inventory| (inventory.generation_id.clone(), inventory))
+        .iter()
+        .map(|inventory| (inventory.generation_id.clone(), inventory.clone()))
         .collect();
+    let cleanup_reclaim_candidate_count = lexical_cleanup_plan.reclaim_candidates.len();
+    let cleanup_reclaimable_bytes = lexical_cleanup_plan.total_reclaimable_bytes;
+    let cleanup_retained_bytes = lexical_cleanup_plan.total_retained_bytes;
 
     for entry in lexical_manifest_entries {
         if !matches!(
@@ -10884,7 +10901,8 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
             .lexical_generations
             .iter()
             .filter(|generation| generation.safe_to_gc)
-            .count();
+            .count()
+        + cleanup_reclaim_candidate_count;
     report.summary.gc_eligible_bytes = report
         .failed_seed_bundle_files
         .iter()
@@ -10902,7 +10920,8 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
             .iter()
             .filter(|generation| generation.safe_to_gc)
             .map(|generation| generation.artifact_bytes)
-            .sum::<u64>();
+            .sum::<u64>()
+        + cleanup_reclaimable_bytes;
     report.summary.inspection_required_asset_count = report.failed_seed_bundle_files.len()
         + report
             .lexical_generations
@@ -10920,6 +10939,21 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
             .filter(|generation| generation.inspection_required)
             .map(|generation| generation.artifact_bytes)
             .sum::<u64>();
+    report.summary.cleanup_dry_run_generation_count = lexical_cleanup_plan.generation_count;
+    report.summary.cleanup_dry_run_reclaim_candidate_count = cleanup_reclaim_candidate_count;
+    report.summary.cleanup_dry_run_reclaimable_bytes = cleanup_reclaimable_bytes;
+    report.summary.cleanup_dry_run_retained_bytes = cleanup_retained_bytes;
+    report.summary.cleanup_dry_run_protected_generation_count =
+        lexical_cleanup_plan.protected_generation_ids.len();
+    report.summary.cleanup_dry_run_active_generation_count =
+        lexical_cleanup_plan.active_generation_ids.len();
+    report.summary.cleanup_dry_run_inspection_required_count =
+        lexical_cleanup_plan.inspection_required_count;
+    report.summary.cleanup_dry_run_approval_fingerprint =
+        lexical_cleanup_plan.approval_fingerprint.clone();
+    report.summary.cleanup_apply_allowed = lexical_cleanup_apply_gate.apply_allowed;
+    report.lexical_cleanup_apply_gate = Some(lexical_cleanup_apply_gate);
+    report.lexical_cleanup_dry_run = Some(lexical_cleanup_plan);
 
     report
 }

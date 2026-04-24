@@ -177,6 +177,28 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         Some(3),
         "failed seed bundle files and quarantined lexical generation remain inspection-only"
     );
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_generation_count"].as_u64(),
+        Some(1),
+        "cleanup dry-run should inventory manifest-backed lexical generations"
+    );
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_inspection_required_count"].as_u64(),
+        Some(1),
+        "cleanup dry-run should expose inspection-required lexical artifacts"
+    );
+    assert_eq!(
+        quarantine["summary"]["cleanup_apply_allowed"].as_bool(),
+        Some(false),
+        "robot diagnostics must not imply cleanup apply is allowed without approval"
+    );
+    assert!(
+        quarantine["summary"]["cleanup_dry_run_approval_fingerprint"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("cleanup-v1-"),
+        "cleanup dry-run summary should carry the approval fingerprint"
+    );
 
     let failed_seed_entries = quarantine["failed_seed_bundle_files"]
         .as_array()
@@ -242,5 +264,36 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         generations[0].get("age_seconds").is_some()
             && generations[0].get("last_read_at_ms").is_some(),
         "lexical generation entries should expose age and last-read fields"
+    );
+
+    let dry_run = &quarantine["lexical_cleanup_dry_run"];
+    assert_eq!(dry_run["dry_run"].as_bool(), Some(true));
+    assert_eq!(dry_run["generation_count"].as_u64(), Some(1));
+    assert_eq!(dry_run["inspection_required_count"].as_u64(), Some(1));
+    assert_eq!(
+        dry_run["quarantined_generation_ids"][0].as_str(),
+        Some("gen-quarantined")
+    );
+    assert_eq!(
+        dry_run["inventories"][0]["disposition"].as_str(),
+        Some("quarantined_retained"),
+        "dry-run inventories should preserve lifecycle disposition"
+    );
+
+    let apply_gate = &quarantine["lexical_cleanup_apply_gate"];
+    assert_eq!(apply_gate["dry_run"].as_bool(), Some(true));
+    assert_eq!(apply_gate["apply_allowed"].as_bool(), Some(false));
+    assert_eq!(
+        apply_gate["inspection_required_generation_ids"][0].as_str(),
+        Some("gen-quarantined")
+    );
+    let blocker_codes = apply_gate["blocker_codes"]
+        .as_array()
+        .expect("blocker codes");
+    assert!(
+        blocker_codes
+            .iter()
+            .any(|code| code.as_str() == Some("operator_approval_required")),
+        "apply gate should make the approval blocker machine-readable"
     );
 }

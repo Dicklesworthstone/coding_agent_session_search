@@ -142,7 +142,16 @@
       "gc_eligible_asset_count": 1,
       "gc_eligible_bytes": 25,
       "inspection_required_asset_count": 3,
-      "inspection_required_bytes": 1088
+      "inspection_required_bytes": 1088,
+      "cleanup_dry_run_generation_count": 1,
+      "cleanup_dry_run_reclaim_candidate_count": 0,
+      "cleanup_dry_run_reclaimable_bytes": 0,
+      "cleanup_dry_run_retained_bytes": 512,
+      "cleanup_dry_run_protected_generation_count": 1,
+      "cleanup_dry_run_active_generation_count": 0,
+      "cleanup_dry_run_inspection_required_count": 1,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "cleanup_apply_allowed": false
     },
     "failed_seed_bundle_files": [
       {
@@ -197,6 +206,148 @@
         "gc_reason": "cleanup dry-run requires inspection before garbage collection"
       }
     ],
+    "lexical_cleanup_dry_run": {
+      "dry_run": true,
+      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "generation_count": 1,
+      "total_artifact_bytes": 512,
+      "total_reclaimable_bytes": 0,
+      "total_retained_bytes": 512,
+      "reclaim_candidates": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_retained_bytes": 512,
+      "quarantined_generation_ids": [
+        "gen-quarantined"
+      ],
+      "active_generation_ids": [],
+      "disposition_counts": {
+        "quarantined_retained": 1
+      },
+      "generation_disposition_summaries": {
+        "quarantined_retained": {
+          "generation_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "inspection_items": [
+        {
+          "generation_id": "gen-quarantined",
+          "shard_id": "shard-a",
+          "disposition": "quarantined_retained",
+          "reason": "validation_failed",
+          "retained_bytes": 512
+        }
+      ],
+      "inspection_required_count": 1,
+      "inspection_required_retained_bytes": 512,
+      "shard_disposition_summaries": {
+        "quarantined_retained": {
+          "shard_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "inventories": [
+        {
+          "generation_id": "gen-quarantined",
+          "build_state": "failed",
+          "publish_state": "quarantined",
+          "disposition": "quarantined_retained",
+          "reason": "quarantined lexical generation is retained for inspection",
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512,
+          "shards": [
+            {
+              "shard_id": "shard-a",
+              "state": "quarantined",
+              "disposition": "quarantined_retained",
+              "reason": "validation_failed",
+              "artifact_bytes": 512,
+              "reclaimable_bytes": 0,
+              "retained_bytes": 512
+            }
+          ]
+        }
+      ]
+    },
+    "lexical_cleanup_apply_gate": {
+      "apply_allowed": false,
+      "dry_run": true,
+      "explicit_operator_approval": false,
+      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "provided_approval_fingerprint": null,
+      "approval_fingerprint_status": "not_requested",
+      "approval_fingerprint_matches": false,
+      "generation_count": 1,
+      "total_artifact_bytes": 512,
+      "total_retained_bytes": 512,
+      "candidate_count": 0,
+      "reclaimable_bytes": 0,
+      "disposition_counts": {
+        "quarantined_retained": 1
+      },
+      "generation_disposition_summaries": {
+        "quarantined_retained": {
+          "generation_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "shard_disposition_summaries": {
+        "quarantined_retained": {
+          "shard_count": 1,
+          "artifact_bytes": 512,
+          "reclaimable_bytes": 0,
+          "retained_bytes": 512
+        }
+      },
+      "candidate_previews": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [
+        "gen-quarantined"
+      ],
+      "quarantined_generation_ids": [
+        "gen-quarantined"
+      ],
+      "blocker_codes": [
+        "no_reclaimable_candidates",
+        "operator_approval_required"
+      ],
+      "blocked_reasons": [
+        "no reclaimable cleanup candidates",
+        "destructive cleanup requires explicit operator approval after dry-run"
+      ],
+      "active_generation_ids": [],
+      "protected_generation_ids": [
+        "gen-quarantined"
+      ],
+      "protected_retained_bytes": 512,
+      "inspection_previews": [
+        {
+          "generation_id": "gen-quarantined",
+          "shard_id": "shard-a",
+          "disposition": "quarantined_retained",
+          "reason": "validation_failed",
+          "retained_bytes": 512
+        }
+      ],
+      "inspection_required_count": 1,
+      "inspection_required_retained_bytes": 512,
+      "inspection_required_generation_ids": [
+        "gen-quarantined"
+      ]
+    },
     "warnings": []
   }
 }

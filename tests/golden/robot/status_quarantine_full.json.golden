@@ -193,7 +193,16 @@
       "gc_eligible_asset_count": 1,
       "gc_eligible_bytes": 25,
       "inspection_required_asset_count": 3,
-      "inspection_required_bytes": 1088
+      "inspection_required_bytes": 1088,
+      "cleanup_dry_run_generation_count": 1,
+      "cleanup_dry_run_reclaim_candidate_count": 0,
+      "cleanup_dry_run_reclaimable_bytes": 0,
+      "cleanup_dry_run_retained_bytes": 512,
+      "cleanup_dry_run_protected_generation_count": 1,
+      "cleanup_dry_run_active_generation_count": 0,
+      "cleanup_dry_run_inspection_required_count": 1,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "cleanup_apply_allowed": false
     }
   },
   "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",

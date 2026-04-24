@@ -144,6 +144,18 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
         quarantine["summary"]["retained_publish_backup_retention_limit"].as_u64(),
         Some(1)
     );
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_generation_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        quarantine["summary"]["cleanup_dry_run_inspection_required_count"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        quarantine["summary"]["cleanup_apply_allowed"].as_bool(),
+        Some(false)
+    );
 
     let retained = quarantine["retained_publish_backups"]
         .as_array()
@@ -182,5 +194,18 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
             .unwrap_or_default()
             .contains("cleanup dry-run"),
         "doctor JSON should expose why quarantined lexical generations are held"
+    );
+
+    let dry_run = &quarantine["lexical_cleanup_dry_run"];
+    assert_eq!(dry_run["dry_run"].as_bool(), Some(true));
+    assert_eq!(
+        dry_run["inventories"][0]["disposition"].as_str(),
+        Some("quarantined_retained")
+    );
+    let apply_gate = &quarantine["lexical_cleanup_apply_gate"];
+    assert_eq!(apply_gate["apply_allowed"].as_bool(), Some(false));
+    assert_eq!(
+        apply_gate["inspection_required_generation_ids"][0].as_str(),
+        Some("gen-quarantined")
     );
 }

@@ -73,6 +73,33 @@
     },
     "inspection_required_bytes": {
       "type": "integer"
+    },
+    "cleanup_dry_run_generation_count": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_reclaim_candidate_count": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_reclaimable_bytes": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_retained_bytes": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_protected_generation_count": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_active_generation_count": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_inspection_required_count": {
+      "type": "integer"
+    },
+    "cleanup_dry_run_approval_fingerprint": {
+      "type": "string"
+    },
+    "cleanup_apply_allowed": {
+      "type": "boolean"
     }
   }
 }
