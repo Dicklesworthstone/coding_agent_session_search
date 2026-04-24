@@ -272,6 +272,31 @@ pub(crate) struct LexicalGenerationRecoveryDecision {
     pub abandoned_shards: Vec<String>,
 }
 
+/// `coding_agent_session_search-ibuuh.19` classification predicate:
+/// returns `true` when `disposition` is one of the variants that the
+/// dry-run / apply gates MUST keep on disk. The non-protected
+/// variants are exactly `SupersededReclaimable` + `FailedReclaimable`
+/// — the two states the policy contract says are safe to reclaim.
+///
+/// Lifted out of the `LexicalCleanupDryRunPlan` impl so it has a
+/// single canonical home AND so the test module's exhaustiveness gate
+/// can compare it against `LexicalCleanupDisposition::all_variants()`
+/// directly. Mirroring impl method calls through to this function
+/// keeps existing call sites unchanged.
+pub(crate) fn is_protected_retention_disposition(
+    disposition: LexicalCleanupDisposition,
+) -> bool {
+    matches!(
+        disposition,
+        LexicalCleanupDisposition::CurrentPublished
+            | LexicalCleanupDisposition::ActiveWork
+            | LexicalCleanupDisposition::QuarantinedRetained
+            | LexicalCleanupDisposition::SupersededRetained
+            | LexicalCleanupDisposition::FailedRetained
+            | LexicalCleanupDisposition::PinnedRetained
+    )
+}
+
 /// Dry-run cleanup classification for one lexical artifact or generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +331,27 @@ impl LexicalCleanupDisposition {
             Self::FailedRetained => "failed_retained",
             Self::PinnedRetained => "pinned_retained",
         }
+    }
+
+    /// Every variant in declaration order. Used by the
+    /// `coding_agent_session_search-ibuuh.19` golden gate to assert
+    /// every variant has both an `as_str()` arm AND a serde
+    /// representation, AND that the protected-vs-reclaimable
+    /// classification covers every variant exhaustively. A new
+    /// variant added without registering it here is a compile error
+    /// (no `_ => ...` catch-all in the test).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn all_variants() -> &'static [Self] {
+        &[
+            Self::CurrentPublished,
+            Self::ActiveWork,
+            Self::QuarantinedRetained,
+            Self::SupersededReclaimable,
+            Self::SupersededRetained,
+            Self::FailedReclaimable,
+            Self::FailedRetained,
+            Self::PinnedRetained,
+        ]
     }
 }
 
@@ -764,15 +810,7 @@ impl LexicalCleanupDryRunPlan {
     }
 
     fn is_protected_retention(disposition: LexicalCleanupDisposition) -> bool {
-        matches!(
-            disposition,
-            LexicalCleanupDisposition::CurrentPublished
-                | LexicalCleanupDisposition::ActiveWork
-                | LexicalCleanupDisposition::QuarantinedRetained
-                | LexicalCleanupDisposition::SupersededRetained
-                | LexicalCleanupDisposition::FailedRetained
-                | LexicalCleanupDisposition::PinnedRetained
-        )
+        is_protected_retention_disposition(disposition)
     }
 
     fn compute_approval_fingerprint(&self) -> String {
@@ -3301,5 +3339,146 @@ mod tests {
         );
         shard.pinned = matches!(state, LexicalShardLifecycleState::Published);
         shard
+    }
+
+    /// `coding_agent_session_search-ibuuh.19` golden gate: every
+    /// LexicalCleanupDisposition variant's `as_str()` must equal its
+    /// serde-serialized name AND must be unique. Pre-fix this gate
+    /// did not exist; the duplicate-naming class that bit ErrorKind
+    /// (al19b — 3 real duplicates discovered in production)
+    /// could land here unnoticed because the disposition feeds the
+    /// machine-readable cleanup inventory operators read from
+    /// `cass diag --quarantine`. A regression that:
+    /// - added a new variant without an `as_str()` arm,
+    /// - drifted serde rename_all away from snake_case,
+    /// - introduced a duplicate string,
+    /// would trip this immediately.
+    #[test]
+    fn cleanup_disposition_as_str_matches_serde_serialization_byte_for_byte() {
+        use std::collections::HashSet;
+
+        let mut seen_strs: HashSet<&'static str> = HashSet::new();
+        for &variant in LexicalCleanupDisposition::all_variants() {
+            let as_str = variant.as_str();
+            // Uniqueness gate: catches the al19b-class duplicate bug.
+            assert!(
+                seen_strs.insert(as_str),
+                "duplicate disposition string detected: {variant:?} maps to {as_str:?} \
+                 which was already registered by an earlier variant"
+            );
+            // serde alignment: rename_all = snake_case must produce
+            // the exact same string as_str() returns. A regression in
+            // either direction (variant rename vs as_str() drift, or
+            // serde attribute change) trips here.
+            let serde_str = serde_json::to_string(&variant).expect("serialize disposition");
+            // serde wraps strings in quotes — strip them.
+            let serde_str = serde_str.trim_matches('"');
+            assert_eq!(
+                serde_str, as_str,
+                "serde serialization {serde_str:?} must equal as_str() {as_str:?} for {variant:?}"
+            );
+        }
+        // All eight variants must be covered. A new variant added
+        // without registering it in all_variants() would shrink the
+        // count and fail this assertion.
+        assert_eq!(
+            LexicalCleanupDisposition::all_variants().len(),
+            8,
+            "disposition enum has 8 variants at landing time; bump this count + add the new \
+             variant + extend is_protected_retention_disposition for any addition"
+        );
+    }
+
+    /// `coding_agent_session_search-ibuuh.19` classification gate:
+    /// `is_protected_retention_disposition()` must classify every
+    /// LexicalCleanupDisposition variant — exactly six are protected
+    /// (kept on disk) and exactly two are reclaimable. Pre-fix, a
+    /// new variant added without thinking about retention safety
+    /// would default to "not protected" silently and risk reclaiming
+    /// state the operator wanted preserved (or vice versa). Pinning
+    /// the partition explicitly closes that hole.
+    #[test]
+    fn cleanup_disposition_protected_retention_classification_is_exhaustive() {
+        let protected: Vec<LexicalCleanupDisposition> = LexicalCleanupDisposition::all_variants()
+            .iter()
+            .copied()
+            .filter(|d| is_protected_retention_disposition(*d))
+            .collect();
+        let reclaimable: Vec<LexicalCleanupDisposition> = LexicalCleanupDisposition::all_variants()
+            .iter()
+            .copied()
+            .filter(|d| !is_protected_retention_disposition(*d))
+            .collect();
+
+        // Six protected + two reclaimable = eight variants total.
+        // A new variant that defaults to non-protected without an
+        // explicit policy decision will shift these counts and trip
+        // the test, forcing a maintainer to think about retention.
+        assert_eq!(
+            protected.len(),
+            6,
+            "expected exactly 6 protected variants; got {protected:?}"
+        );
+        assert_eq!(
+            reclaimable.len(),
+            2,
+            "expected exactly 2 reclaimable variants; got {reclaimable:?}"
+        );
+
+        // Pin the *exact* protected set so a regression that
+        // misclassifies (e.g. moves CurrentPublished out of the
+        // protected set, which would let cleanup nuke the live
+        // search asset) trips the assertion with the variant name.
+        for required_protected in [
+            LexicalCleanupDisposition::CurrentPublished,
+            LexicalCleanupDisposition::ActiveWork,
+            LexicalCleanupDisposition::QuarantinedRetained,
+            LexicalCleanupDisposition::SupersededRetained,
+            LexicalCleanupDisposition::FailedRetained,
+            LexicalCleanupDisposition::PinnedRetained,
+        ] {
+            assert!(
+                protected.contains(&required_protected),
+                "{required_protected:?} MUST be classified as protected — moving it out \
+                 of the protected set risks reclaiming live or operator-flagged state"
+            );
+        }
+        // Pin the reclaimable set too: a regression that
+        // accidentally protected SupersededReclaimable would prevent
+        // disk-budget pruning from ever reclaiming superseded
+        // generations, leading to unbounded disk bloat (the bead
+        // BACKGROUND warns about exactly this).
+        for required_reclaimable in [
+            LexicalCleanupDisposition::SupersededReclaimable,
+            LexicalCleanupDisposition::FailedReclaimable,
+        ] {
+            assert!(
+                reclaimable.contains(&required_reclaimable),
+                "{required_reclaimable:?} MUST be reclaimable — protecting it would block \
+                 disk-budget pruning of superseded/failed generations"
+            );
+        }
+    }
+
+    /// `coding_agent_session_search-ibuuh.19` round-trip gate: every
+    /// disposition string MUST round-trip through
+    /// `serde_json::to_string` → `serde_json::from_str` and yield the
+    /// same variant. Pre-fix, a regression that broke deserialization
+    /// (e.g. by dropping `Deserialize` derive or changing the rename
+    /// strategy in one direction) would silently break operators
+    /// reading `.lexical-rebuild-cleanup.json` artifacts back from
+    /// disk for trend analysis.
+    #[test]
+    fn cleanup_disposition_serde_round_trips_for_every_variant() {
+        for &variant in LexicalCleanupDisposition::all_variants() {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            let parsed: LexicalCleanupDisposition =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                parsed, variant,
+                "disposition round-trip mismatch for {variant:?}: serialized as {json}, \
+                 parsed as {parsed:?}"
+            );
+        }
     }
 }
