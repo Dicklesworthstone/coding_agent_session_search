@@ -188,3 +188,129 @@ fn mr_stats_total_equals_sum_of_by_source() {
          total: {total:#}\nby_source: {by_source:#?}"
     );
 }
+
+/// `coding_agent_session_search-pdg22` item (3): empty data-dir
+/// produces zero counters across every aggregate field. Without
+/// this pin, a regression that emits null/missing/sentinel values
+/// for the empty case would silently break agent harnesses
+/// expecting the documented contract.
+#[test]
+fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    let output = cargo_bin_cmd!("cass")
+        .args(["stats", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("HOME", home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .output()
+        .expect("run cass stats on empty dir");
+
+    if !output.status.success() {
+        // Acceptable: empty data dir errors out with the missing-db
+        // envelope (the q931h-pinned shape). Verify the envelope is
+        // structured JSON on STDOUT (per hd89i contract).
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("error envelope MUST still be valid JSON on stdout (per hd89i)");
+        assert!(
+            parsed.get("error").is_some(),
+            "non-success stats output MUST emit a structured error envelope; got: {parsed:#}"
+        );
+        return;
+    }
+
+    // Success path on empty: every counter MUST be zero.
+    let total: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("stats --json on empty dir emits valid JSON");
+    assert_eq!(
+        total["conversations"].as_i64(),
+        Some(0),
+        "empty data dir MUST report 0 conversations; got: {total:#}"
+    );
+    assert_eq!(
+        total["messages"].as_i64(),
+        Some(0),
+        "empty data dir MUST report 0 messages; got: {total:#}"
+    );
+    if let Some(by_agent) = total["by_agent"].as_array() {
+        assert!(
+            by_agent.is_empty(),
+            "empty data dir MUST emit empty by_agent array; got: {by_agent:#?}"
+        );
+    }
+}
+
+/// `coding_agent_session_search-pdg22` item (2): date_range invariant.
+/// When stats reports a date_range with both oldest + newest present,
+/// oldest MUST be ≤ newest. A regression that swaps the two (or uses
+/// MIN where MAX was intended) would produce a nonsensical "future
+/// is older than past" envelope. ISO-8601 strings sort
+/// lexicographically by chronology, so string comparison is valid.
+#[test]
+fn mr_stats_date_range_oldest_lte_newest() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    write_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-1.jsonl",
+        "first",
+        1_732_118_400_000,
+    );
+    write_codex_session(
+        &codex_home,
+        "2024/11/22",
+        "rollout-2.jsonl",
+        "second",
+        1_732_291_200_000,
+    );
+
+    cargo_bin_cmd!("cass")
+        .args(["index", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .assert()
+        .success();
+
+    let total = capture_stats_json(home, &codex_home, &data_dir, false);
+    let date_range = &total["date_range"];
+
+    let oldest_str = date_range["oldest"].as_str();
+    let newest_str = date_range["newest"].as_str();
+    match (oldest_str, newest_str) {
+        (Some(oldest), Some(newest)) => {
+            assert!(
+                oldest <= newest,
+                "metamorphic invariant violated: date_range.oldest ({oldest}) > newest ({newest}). \
+                 payload: {date_range:#}"
+            );
+        }
+        (None, None) => {
+            // Empty corpus — degenerate case, allowed.
+        }
+        (oldest, newest) => panic!(
+            "date_range MUST have both oldest + newest present OR both absent; \
+             got oldest={oldest:?}, newest={newest:?}; payload: {date_range:#}"
+        ),
+    }
+}
