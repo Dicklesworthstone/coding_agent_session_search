@@ -256,6 +256,65 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  ssh-sync-docker:
+    name: SSH Sync Docker Tests
+    needs: [no-mock-audit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Clone sibling dependencies
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
+      - name: Install SSH sync tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client rsync
+          docker version
+          docker info
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
+      - name: Run SSH sync integration tests
+        run: cargo test --features "qr encryption backtrace" --test ssh_sync_integration -- --ignored --test-threads=1 --nocapture
+        env:
+          RUST_LOG: debug
+
+      - name: Run SSH sources E2E tests
+        run: E2E_LOG=1 cargo test --features "qr encryption backtrace" --test e2e_ssh_sources -- --ignored --test-threads=1 --nocapture
+        env:
+          RUST_LOG: debug
+
+      - name: Validate SSH E2E JSONL logs
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d "test-results/e2e" ]] && ls test-results/e2e/*.jsonl 1>/dev/null 2>&1; then
+            ./scripts/validate-e2e-jsonl.sh test-results/e2e/*.jsonl
+          else
+            echo "No SSH E2E JSONL logs found to validate"
+          fi
+
+      - name: Upload SSH E2E logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: ssh-e2e-jsonl
+          path: test-results/e2e/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+
   e2e-orchestrated:
     name: E2E Orchestrator (Rust + Shell)
     runs-on: ubuntu-latest
@@ -439,7 +498,7 @@ jobs:
   # Build artifacts (verification only, not for release)
   build:
     name: Build (${{ matrix.target }})
-    needs: [lint, test-rust, crypto-vectors, security]
+    needs: [lint, test-rust, ssh-sync-docker, crypto-vectors, security]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
