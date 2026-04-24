@@ -475,3 +475,136 @@ fn watch_once_repeated_idle_cycles_stay_healthy_and_accept_new_content() {
         "new content should still be indexed after repeated idle watch cycles: {followup_hits}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-ev4f7 (child of ibuuh.10, scenario
+// "watch-mode refresh after canonical edit").
+//
+// The existing watch_once_* tests cover single-file watch, multi-
+// connector watch, idempotent replay, corrupt-file resilience, and
+// idle cycles. None pin what the readiness surface reports AFTER a
+// successful watch-once on a fresh corpus: if watch-once left the
+// system in a partial/not_initialized state, agents polling
+// `cass health --json` after every routine refresh would see confusing
+// or wrong readiness, which is the exact kind of silent-misleading
+// surface ibuuh.10's "truthful readiness" AC is meant to catch.
+//
+// Test shape:
+//   1. Seed a Codex session and run `cass index --watch --watch-once
+//      <path>` against a fresh data-dir. Bootstrap succeeds.
+//   2. Seeded content is searchable via `cass search --json`.
+//   3. `cass health --json` reports status="healthy",
+//      state.database.exists=true, state.index.exists=true. No
+//      regression to "not_initialized", no partial state.
+//   4. watch_state.json is NOT persisted — watch-once must never
+//      leave daemon state behind.
+//
+// Note on bootstrap path: `cass index --full` currently trips a
+// shard-plan-vs-doc-count invariant check on single-conversation
+// seeds (bug coding_agent_session_search-rx1ex), so this test uses
+// watch-once to get a known-good bootstrap. That's also more faithful
+// to the real production flow this AC targets (watch-mode refresh).
+// ========================================================================
+
+#[test]
+fn watch_once_bootstraps_corpus_and_health_reports_truthful_ready_state() {
+    let sandbox = TempDir::new().expect("temp dir");
+    let data_dir = sandbox.path().join("data");
+    let home_dir = sandbox.path().join("home");
+    let xdg_data = sandbox.path().join("xdg-data");
+    let xdg_config = sandbox.path().join("xdg-config");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    std::fs::create_dir_all(&home_dir).expect("home dir");
+    std::fs::create_dir_all(&xdg_data).expect("xdg data");
+    std::fs::create_dir_all(&xdg_config).expect("xdg config");
+
+    // Phase 1 — seed a single Codex session and bootstrap the
+    // corpus via watch-once. This mirrors how an operator onboards
+    // cass to a live connector path for the first time.
+    let codex_root = data_dir.join(".codex/sessions");
+    std::fs::create_dir_all(&codex_root).expect("codex root");
+    let rollout = codex_root.join("rollout-watch-bootstrap.jsonl");
+    write_codex_session(&rollout, "watchbootstrapcontent", "watch-bootstrap-sess");
+
+    let (out, stdout, stderr) = run_watch_once(
+        &[rollout.as_path()],
+        &data_dir,
+        &home_dir,
+        &xdg_data,
+        &xdg_config,
+    );
+    assert!(
+        out.status.success(),
+        "bootstrap watch-once must succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Phase 2 — seeded content is searchable.
+    let hits = run_robot_search(
+        "watchbootstrapcontent",
+        &data_dir,
+        &home_dir,
+        &xdg_data,
+        &xdg_config,
+    );
+    assert!(
+        content_hit_count(&hits, "watchbootstrapcontent") >= 1,
+        "seeded session must be searchable after watch-once: {hits}"
+    );
+
+    // Phase 3 — readiness surface is truthful. This is the ibuuh.10
+    // slice: after a normal watch-once refresh, `cass health --json`
+    // must not lie about the state. status="healthy" AND both DB and
+    // lexical index exist — not "not_initialized", not a partial
+    // state, not a rebuild-in-progress phantom.
+    let health_out = std::process::Command::new(cass_bin())
+        .arg("health")
+        .arg("--json")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .env("HOME", &home_dir)
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("CODEX_HOME", data_dir.join(".codex"))
+        .output()
+        .expect("run cass health");
+    let health_stdout = String::from_utf8_lossy(&health_out.stdout);
+    let health_json: Value = serde_json::from_str(&health_stdout)
+        .unwrap_or_else(|err| panic!("health JSON parse failed: {err}; stdout: {health_stdout}"));
+    assert_eq!(
+        health_json.get("status").and_then(Value::as_str),
+        Some("healthy"),
+        "post-watch health must report status=healthy; payload: {health_json}"
+    );
+    assert_eq!(
+        health_json.get("healthy").and_then(Value::as_bool),
+        Some(true),
+        "post-watch health.healthy must be true; payload: {health_json}"
+    );
+    assert_eq!(
+        health_json
+            .get("state")
+            .and_then(|s| s.get("database"))
+            .and_then(|db| db.get("exists"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "post-watch state.database.exists must be true; payload: {health_json}"
+    );
+    assert_eq!(
+        health_json
+            .get("state")
+            .and_then(|s| s.get("index"))
+            .and_then(|i| i.get("exists"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "post-watch state.index.exists must be true; payload: {health_json}"
+    );
+
+    // Phase 4 — watch-once must never persist daemon watch_state.
+    // Losing this invariant would cause every watch-once invocation
+    // to start a long-running background daemon even in single-shot
+    // agent usage.
+    assert!(
+        !data_dir.join("watch_state.json").exists(),
+        "watch-once must not persist watch_state.json"
+    );
+}
