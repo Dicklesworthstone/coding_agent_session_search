@@ -247,20 +247,141 @@ impl MemoizingRedactor {
     /// and downstream callers (`map_to_internal`) immediately call
     /// `.into_owned()` regardless. Skipping the Cow indirection keeps
     /// the cached-hit path branchless.
+    ///
+    /// Each cache decision emits a structured `tracing` event so
+    /// operators can audit hit / miss / insert / evict / quarantine
+    /// behavior from logs alone (per `coding_agent_session_search-ibuuh.34`
+    /// AC: "operator-auditable through structured hit, miss,
+    /// invalidation, eviction, quarantine, and budget logs").
     pub(crate) fn redact_text(&mut self, input: &str) -> String {
-        // Empty fast-path matches the uncached contract: redaction
-        // can never insert content into an empty string, so skip the
-        // cache + regex entirely.
+        let (output, _audit) = self.redact_text_with_audit(input);
+        output
+    }
+
+    /// Audit-bearing variant: returns the redacted text plus the
+    /// structured cache-decision records (lookup audit, plus insert
+    /// audit on miss). Callers that want to forward records to a
+    /// subscriber (telemetry sink, doctor diagnostics, etc.) use this
+    /// directly; the convenience `redact_text` wrapper drops them
+    /// after emitting tracing events.
+    pub(crate) fn redact_text_with_audit(
+        &mut self,
+        input: &str,
+    ) -> (
+        String,
+        Vec<crate::indexer::memoization::MemoCacheAuditRecord>,
+    ) {
+        // Empty fast-path matches the uncached contract and bypasses
+        // the cache entirely (see memoizing_redactor_empty_input_skips_cache).
         if input.is_empty() {
-            return String::new();
+            return (String::new(), Vec::new());
         }
         let key = self.key_for(input);
-        if let crate::indexer::memoization::MemoLookup::Hit { value } = self.text_cache.get(&key) {
-            return value;
+        let (lookup, lookup_audit) = self.text_cache.get_with_audit(&key);
+        Self::trace_audit(&lookup_audit);
+        match lookup {
+            crate::indexer::memoization::MemoLookup::Hit { value } => (value, vec![lookup_audit]),
+            crate::indexer::memoization::MemoLookup::Quarantined { reason } => {
+                // Quarantined entry: never serve a stale value;
+                // recompute via the legacy regex path, but DO NOT
+                // re-insert (the entry stays quarantined for operator
+                // inspection until explicitly lifted via
+                // `lift_quarantine_for`).
+                tracing::warn!(
+                    quarantine_reason = %reason,
+                    algorithm = %self.algorithm_fingerprint,
+                    "redaction memo entry is quarantined; falling back to direct regex pass"
+                );
+                let redacted = redact_text(input).into_owned();
+                (redacted, vec![lookup_audit])
+            }
+            crate::indexer::memoization::MemoLookup::Miss => {
+                let redacted = redact_text(input).into_owned();
+                let insert_audit = self.text_cache.insert_with_audit(key, redacted.clone());
+                Self::trace_audit(&insert_audit);
+                (redacted, vec![lookup_audit, insert_audit])
+            }
         }
-        let redacted = redact_text(input).into_owned();
-        let _ = self.text_cache.insert(key, redacted.clone());
-        redacted
+    }
+
+    /// Invalidate a cached redaction for the given input. Returns
+    /// `true` only when an entry was actually removed (matches the
+    /// underlying `ContentAddressedMemoCache` contract). Mostly
+    /// useful for tests and for operator tooling that wants to bust
+    /// individual cache entries without restarting the process.
+    pub(crate) fn invalidate(&mut self, input: &str) -> bool {
+        if input.is_empty() {
+            return false;
+        }
+        let key = self.key_for(input);
+        let audit = self.text_cache.invalidate_with_audit(&key);
+        Self::trace_audit(&audit);
+        audit.changed
+    }
+
+    /// Quarantine a cached entry: subsequent lookups will return
+    /// [`MemoLookup::Quarantined`] (handled by `redact_text` as a
+    /// fallthrough to the direct regex path) instead of the cached
+    /// value. The reason is preserved for operator inspection. Used
+    /// when telemetry detects a poisoned redaction (e.g. unexpected
+    /// regex behavior under a hot pattern bump that the algorithm
+    /// fingerprint didn't catch).
+    pub(crate) fn quarantine(&mut self, input: &str, reason: impl Into<String>) {
+        if input.is_empty() {
+            return;
+        }
+        let key = self.key_for(input);
+        let audit = self.text_cache.quarantine_with_audit(key, reason);
+        Self::trace_audit(&audit);
+    }
+
+    fn trace_audit(audit: &crate::indexer::memoization::MemoCacheAuditRecord) {
+        // Severity tiers match operator expectations: hits are noise
+        // (trace), misses + inserts are routine (debug), evictions
+        // are noteworthy (info), invalidations and quarantines are
+        // alarming enough to warn so they show up in default-level
+        // logs without dredging.
+        use crate::indexer::memoization::MemoCacheEvent;
+        match audit.event {
+            MemoCacheEvent::Hit => tracing::trace!(
+                target: "cass::redact::memo",
+                algorithm = %audit.key.algorithm,
+                stats = ?audit.stats,
+                "redact memo hit"
+            ),
+            MemoCacheEvent::Miss => tracing::debug!(
+                target: "cass::redact::memo",
+                algorithm = %audit.key.algorithm,
+                stats = ?audit.stats,
+                "redact memo miss"
+            ),
+            MemoCacheEvent::Insert => tracing::debug!(
+                target: "cass::redact::memo",
+                algorithm = %audit.key.algorithm,
+                live_entries = audit.stats.live_entries,
+                "redact memo insert"
+            ),
+            MemoCacheEvent::Evict { ref reason } => tracing::info!(
+                target: "cass::redact::memo",
+                evict_reason = ?reason,
+                live_entries = audit.stats.live_entries,
+                evictions_capacity = audit.stats.evictions_capacity,
+                "redact memo eviction"
+            ),
+            MemoCacheEvent::Invalidate => tracing::warn!(
+                target: "cass::redact::memo",
+                changed = audit.changed,
+                live_entries = audit.stats.live_entries,
+                invalidations = audit.stats.invalidations,
+                "redact memo invalidate"
+            ),
+            MemoCacheEvent::Quarantine { ref reason } => tracing::warn!(
+                target: "cass::redact::memo",
+                quarantine_reason = %reason,
+                quarantined_entries = audit.quarantined_entries,
+                "redact memo quarantine"
+            ),
+        }
     }
 
     /// Memoized counterpart to [`redact_json`]. Recurses through the
@@ -635,5 +756,164 @@ mod tests {
         assert_eq!(stats.misses, 0, "empty input must not count as miss");
         assert_eq!(stats.hits, 0, "empty input must not count as hit");
         assert_eq!(stats.inserts, 0, "empty input must not insert into cache");
+    }
+
+    /// `coding_agent_session_search-ibuuh.34` (operator-audit gate):
+    /// every cache decision must surface a structured
+    /// MemoCacheAuditRecord so telemetry sinks / doctor diagnostics
+    /// can reason about cache health without grepping internal stats.
+    /// First call on a new content emits Lookup(Miss) + Insert.
+    /// Second call emits Lookup(Hit). Pinning the audit shape directly
+    /// closes the bead's "operator-auditable through structured hit,
+    /// miss, invalidation, eviction, quarantine, and budget logs"
+    /// requirement for the redaction sink.
+    #[test]
+    fn memoizing_redactor_with_audit_emits_lookup_and_insert_records() {
+        use crate::indexer::memoization::{
+            MemoCacheEvent, MemoCacheOperation,
+        };
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let payload = "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+
+        let (first_output, first_audit) = redactor.redact_text_with_audit(payload);
+        assert!(!first_output.contains("eyJhbGci"));
+        assert_eq!(
+            first_audit.len(),
+            2,
+            "first call must emit a lookup audit + an insert audit"
+        );
+        assert!(matches!(
+            first_audit[0].operation,
+            MemoCacheOperation::Lookup
+        ));
+        assert!(matches!(first_audit[0].event, MemoCacheEvent::Miss));
+        assert!(matches!(
+            first_audit[1].operation,
+            MemoCacheOperation::Insert
+        ));
+        assert!(matches!(first_audit[1].event, MemoCacheEvent::Insert));
+        assert_eq!(first_audit[1].stats.live_entries, 1);
+
+        let (second_output, second_audit) = redactor.redact_text_with_audit(payload);
+        assert_eq!(first_output, second_output);
+        assert_eq!(
+            second_audit.len(),
+            1,
+            "second call must emit only the lookup audit (cache hit)"
+        );
+        assert!(matches!(second_audit[0].event, MemoCacheEvent::Hit));
+        assert_eq!(second_audit[0].stats.hits, 1);
+
+        // Algorithm key carried on every audit record so a downstream
+        // sink can disambiguate cache events when multiple
+        // ContentAddressedMemoCaches share the same logger target.
+        for record in first_audit.iter().chain(second_audit.iter()) {
+            assert_eq!(record.key.algorithm, "redact_text");
+            assert!(record.key.algorithm_version.starts_with("redact-v1:"));
+        }
+    }
+
+    /// Invalidate must remove the cached entry so the next call is a
+    /// miss + re-insert. Pin the changed/no-op semantics so a caller
+    /// can rely on the boolean return value to know whether anything
+    /// was actually evicted.
+    #[test]
+    fn memoizing_redactor_invalidate_drops_cached_entry() {
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let payload = "no secret here, just a sentence";
+
+        // Prime the cache.
+        let _ = redactor.redact_text(payload);
+        assert_eq!(redactor.stats().inserts, 1);
+        assert_eq!(redactor.stats().misses, 1);
+        let _ = redactor.redact_text(payload);
+        assert_eq!(redactor.stats().hits, 1);
+
+        // Invalidate must report the change.
+        assert!(
+            redactor.invalidate(payload),
+            "invalidate must return true when an entry was removed"
+        );
+        assert_eq!(redactor.stats().invalidations, 1);
+        // A second invalidate on the same key is a no-op.
+        assert!(
+            !redactor.invalidate(payload),
+            "second invalidate must be a no-op"
+        );
+        assert_eq!(redactor.stats().invalidations, 1);
+
+        // Empty input invalidate is a no-op (matches the empty-input
+        // fast-path: nothing was ever cached).
+        assert!(
+            !redactor.invalidate(""),
+            "invalidating empty input must be a no-op"
+        );
+
+        // Next call must miss again, not hit.
+        let _ = redactor.redact_text(payload);
+        assert_eq!(
+            redactor.stats().misses,
+            2,
+            "post-invalidate call must register as a miss"
+        );
+        assert_eq!(redactor.stats().hits, 1, "hits counter must not regress");
+    }
+
+    /// Quarantined entries must NEVER serve a cached value. After
+    /// quarantine, the redactor falls through to the direct
+    /// `redact_text` regex path and the cached value remains
+    /// quarantined for operator inspection. This satisfies the bead's
+    /// "suspected corruption or stale-entry quarantine" coverage
+    /// requirement.
+    #[test]
+    fn memoizing_redactor_quarantined_entries_fall_through_to_direct_redaction() {
+        use crate::indexer::memoization::{MemoCacheEvent, MemoCacheOperation};
+        let mut redactor = MemoizingRedactor::with_capacity(8);
+        let payload = "user=admin password=hunter2hunter2 token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+
+        // Prime + verify hit.
+        let _ = redactor.redact_text(payload);
+        let _ = redactor.redact_text(payload);
+        assert_eq!(redactor.stats().hits, 1);
+
+        // Quarantine the entry; subsequent lookup must report the
+        // Quarantined outcome via audit AND fall through to direct
+        // regex redaction (so the user-visible result is still the
+        // correct redacted text).
+        redactor.quarantine(payload, "telemetry: poisoned redaction signal");
+        assert_eq!(redactor.stats().quarantined, 1);
+
+        let (output, audit) = redactor.redact_text_with_audit(payload);
+        assert!(
+            !output.contains("ghp_ABCDE"),
+            "post-quarantine redaction must still scrub secrets via direct regex pass"
+        );
+        assert!(
+            !output.contains("password=hunter2hunter2"),
+            "post-quarantine redaction must scrub generic password assignments"
+        );
+        assert_eq!(
+            audit.len(),
+            1,
+            "quarantine fallthrough emits the lookup audit only (no insert)"
+        );
+        assert!(matches!(audit[0].operation, MemoCacheOperation::Lookup));
+        assert!(matches!(
+            audit[0].event,
+            MemoCacheEvent::Quarantine { .. }
+        ));
+
+        // Re-quarantining the same key with the same reason is a
+        // no-op for the quarantine counter (already quarantined).
+        redactor.quarantine(payload, "telemetry: poisoned redaction signal");
+        assert_eq!(
+            redactor.stats().quarantined,
+            1,
+            "re-quarantining the same key with the same reason must not double-count"
+        );
+
+        // Empty input quarantine is a no-op.
+        redactor.quarantine("", "ignored");
+        assert_eq!(redactor.stats().quarantined, 1);
     }
 }
