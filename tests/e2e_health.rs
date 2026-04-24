@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::{SCHEMA_HASH, expected_index_dir};
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use frankensqlite::compat::ConnectionExt;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use frankensqlite::params as fparams;
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -484,6 +484,25 @@ fn seed_large_health_latency_db(data_dir: &Path) {
     }
 
     conn.execute("COMMIT").expect("commit latency fixture seed");
+
+    let conversation_count: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+            row.get_typed(0)
+        })
+        .expect("count seeded latency fixture conversations");
+    assert_eq!(
+        conversation_count, LARGE_HEALTH_DB_CONVERSATIONS,
+        "health latency fixture must contain the intended large conversation corpus"
+    );
+
+    let message_count: i64 = conn
+        .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+        .expect("count seeded latency fixture messages");
+    assert_eq!(
+        message_count, LARGE_HEALTH_DB_MESSAGES,
+        "health latency fixture must contain the intended large message corpus"
+    );
+
     storage.close().expect("close latency fixture db");
 }
 
@@ -592,11 +611,6 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
                 .is_some_and(Value::is_null),
             "health MUST report messages=null when counts_skipped; payload: {payload:#}"
         );
-        // Sanity: LARGE_HEALTH_DB_* constants are still load-bearing
-        // for the seed setup (the actual rows must exist in the DB
-        // even though health doesn't read them); reference them so a
-        // future change that drops the seed fails the test loudly.
-        let _ = (LARGE_HEALTH_DB_CONVERSATIONS, LARGE_HEALTH_DB_MESSAGES);
         assert_eq!(
             payload
                 .get("state")
