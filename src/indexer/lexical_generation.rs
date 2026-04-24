@@ -327,6 +327,8 @@ pub(crate) struct LexicalGenerationCleanupInventory {
     pub publish_state: LexicalGenerationPublishState,
     pub disposition: LexicalCleanupDisposition,
     pub reason: String,
+    pub retain_until_ms: Option<i64>,
+    pub retention_reason: String,
     pub artifact_bytes: u64,
     pub reclaimable_bytes: u64,
     pub retained_bytes: u64,
@@ -1152,6 +1154,8 @@ impl LexicalGenerationManifest {
         let retained_bytes = artifact_bytes.saturating_sub(generation_reclaimable_bytes);
         let (disposition, reason) =
             self.classify_generation_for_cleanup(generation_reclaimable_bytes);
+        let (retain_until_ms, retention_reason) =
+            self.classify_generation_retention_window(disposition);
 
         LexicalGenerationCleanupInventory {
             generation_id: self.generation_id.clone(),
@@ -1159,6 +1163,8 @@ impl LexicalGenerationManifest {
             publish_state: self.publish_state,
             disposition,
             reason,
+            retain_until_ms,
+            retention_reason,
             artifact_bytes,
             reclaimable_bytes: generation_reclaimable_bytes,
             retained_bytes,
@@ -1454,6 +1460,50 @@ impl LexicalGenerationManifest {
             LexicalCleanupDisposition::PinnedRetained,
             "lexical generation is retained until cleanup policy marks it reclaimable".to_string(),
         )
+    }
+
+    fn classify_generation_retention_window(
+        &self,
+        disposition: LexicalCleanupDisposition,
+    ) -> (Option<i64>, String) {
+        match disposition {
+            LexicalCleanupDisposition::SupersededReclaimable => (
+                Some(self.updated_at_ms),
+                "superseded generation retention window has elapsed; reclaimable after dry-run approval"
+                    .to_string(),
+            ),
+            LexicalCleanupDisposition::FailedReclaimable => (
+                Some(self.updated_at_ms),
+                "failed generation retention window has elapsed; canonical SQLite can rebuild it after dry-run approval"
+                    .to_string(),
+            ),
+            LexicalCleanupDisposition::QuarantinedRetained => (
+                None,
+                "quarantined generation is retained indefinitely until operator inspection clears it"
+                    .to_string(),
+            ),
+            LexicalCleanupDisposition::CurrentPublished => (
+                None,
+                "current published lexical generation has no retention expiry".to_string(),
+            ),
+            LexicalCleanupDisposition::ActiveWork => (
+                None,
+                "active lexical generation work has no retention expiry while locks or resumable work exist"
+                    .to_string(),
+            ),
+            LexicalCleanupDisposition::SupersededRetained => (
+                None,
+                "superseded generation is retained by policy or pinned shard artifacts".to_string(),
+            ),
+            LexicalCleanupDisposition::FailedRetained => (
+                None,
+                "failed generation is retained indefinitely for inspection".to_string(),
+            ),
+            LexicalCleanupDisposition::PinnedRetained => (
+                None,
+                "pinned generation has no retention expiry until the pin is removed".to_string(),
+            ),
+        }
     }
 
     fn generation_cleanup_allows_reclaim(&self) -> bool {
@@ -2157,6 +2207,15 @@ mod tests {
         assert_eq!(inventory.reclaimable_bytes, 8192);
         assert_eq!(inventory.retained_bytes, 2048);
         assert_eq!(
+            inventory.retain_until_ms,
+            Some(4),
+            "reclaimable superseded generations should expose the retention-window boundary"
+        );
+        assert!(
+            inventory.retention_reason.contains("superseded generation"),
+            "superseded retention classification should explain why it is reclaimable"
+        );
+        assert_eq!(
             inventory.shards[0].disposition,
             LexicalCleanupDisposition::SupersededReclaimable
         );
@@ -2192,6 +2251,14 @@ mod tests {
         );
         assert_eq!(inventory.reclaimable_bytes, 0);
         assert_eq!(inventory.retained_bytes, 4096);
+        assert_eq!(
+            inventory.retain_until_ms, None,
+            "quarantined generations are retained indefinitely until inspection"
+        );
+        assert!(
+            inventory.retention_reason.contains("operator inspection"),
+            "quarantined retention classification should explain the inspection hold"
+        );
         assert_eq!(
             inventory.shards[0].reason,
             "manifest checksum mismatch".to_string()

@@ -317,6 +317,8 @@
           "publish_state": "quarantined",
           "disposition": "quarantined_retained",
           "reason": "quarantined lexical generation is retained for inspection",
+          "retain_until_ms": null,
+          "retention_reason": "quarantined generation is retained indefinitely until operator inspection clears it",
           "artifact_bytes": 512,
           "reclaimable_bytes": 0,
           "retained_bytes": 512,

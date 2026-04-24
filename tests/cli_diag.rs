@@ -330,6 +330,17 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
         Some("quarantined_retained"),
         "dry-run inventories should preserve lifecycle disposition"
     );
+    assert!(
+        dry_run["inventories"][0]["retain_until_ms"].is_null(),
+        "quarantined generations should expose an indefinite retention window"
+    );
+    assert!(
+        dry_run["inventories"][0]["retention_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator inspection"),
+        "dry-run inventories should explain the quarantine retention hold"
+    );
 
     let apply_gate = &quarantine["lexical_cleanup_apply_gate"];
     assert_eq!(apply_gate["dry_run"].as_bool(), Some(true));
