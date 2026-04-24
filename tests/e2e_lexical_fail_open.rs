@@ -276,6 +276,7 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
             "search",
             "equivprobe",
             "--json",
+            "--robot-meta",
             "--limit",
             "10",
             "--data-dir",
@@ -290,6 +291,49 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
     );
     let default_json: Value = serde_json::from_slice(&default_out.stdout)
         .unwrap_or_else(|err| panic!("default search JSON parse failed: {err}"));
+    let default_meta = default_json
+        .get("_meta")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("default search must include robot _meta: {default_json}"));
+    assert_eq!(
+        default_meta
+            .get("requested_search_mode")
+            .and_then(Value::as_str),
+        Some("hybrid"),
+        "default search intent must remain hybrid-preferred"
+    );
+    assert_eq!(
+        default_meta.get("mode_defaulted").and_then(Value::as_bool),
+        Some(true),
+        "default search must report that the search mode was not user-specified"
+    );
+    assert_eq!(
+        default_meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "default hybrid search must realize lexical mode when semantic assets are absent"
+    );
+    assert_eq!(
+        default_meta.get("fallback_tier").and_then(Value::as_str),
+        Some("lexical"),
+        "default hybrid fail-open must identify the realized fallback tier"
+    );
+    assert_eq!(
+        default_meta
+            .get("semantic_refinement")
+            .and_then(Value::as_bool),
+        Some(false),
+        "lexical-only fallback must not claim semantic refinement"
+    );
+    let default_fallback_reason = default_meta
+        .get("fallback_reason")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("default hybrid fail-open must explain why it demoted: {default_meta:?}")
+        });
+    assert!(
+        default_fallback_reason.contains("semantic") || default_fallback_reason.contains("hybrid"),
+        "fallback_reason should describe the semantic/hybrid demotion; got: {default_fallback_reason:?}"
+    );
     let default_hits = default_json
         .get("hits")
         .and_then(Value::as_array)
@@ -303,6 +347,7 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
             "search",
             "equivprobe",
             "--json",
+            "--robot-meta",
             "--mode",
             "lexical",
             "--limit",
@@ -319,6 +364,46 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
     );
     let lexical_json: Value = serde_json::from_slice(&lexical_out.stdout)
         .unwrap_or_else(|err| panic!("lexical search JSON parse failed: {err}"));
+    let lexical_meta = lexical_json
+        .get("_meta")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("explicit lexical search must include robot _meta: {lexical_json}")
+        });
+    assert_eq!(
+        lexical_meta
+            .get("requested_search_mode")
+            .and_then(Value::as_str),
+        Some("lexical"),
+        "explicit lexical search must preserve the requested intent"
+    );
+    assert_eq!(
+        lexical_meta.get("mode_defaulted").and_then(Value::as_bool),
+        Some(false),
+        "explicit --mode lexical must not be reported as defaulted"
+    );
+    assert_eq!(
+        lexical_meta.get("search_mode").and_then(Value::as_str),
+        Some("lexical"),
+        "explicit lexical search must realize lexical mode"
+    );
+    assert_eq!(
+        lexical_meta.get("fallback_tier"),
+        Some(&Value::Null),
+        "explicit lexical mode is not a fail-open path"
+    );
+    assert_eq!(
+        lexical_meta.get("fallback_reason"),
+        Some(&Value::Null),
+        "explicit lexical mode should not emit a fallback reason"
+    );
+    assert_eq!(
+        lexical_meta
+            .get("semantic_refinement")
+            .and_then(Value::as_bool),
+        Some(false),
+        "explicit lexical search must not claim semantic refinement"
+    );
     let lexical_hits = lexical_json
         .get("hits")
         .and_then(Value::as_array)
