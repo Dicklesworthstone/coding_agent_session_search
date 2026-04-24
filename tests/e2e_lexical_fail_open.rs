@@ -207,14 +207,32 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
 // reranker that lexical-mode doesn't, users see a quality regression
 // that pure _meta tests don't catch.
 fn hit_keys(hits: &[Value]) -> Vec<(String, i64)> {
+    // Fail loud on null/missing source_path or line_number instead of
+    // defaulting to "" / -1. A silently-defaulted hit would make two
+    // modes look equivalent even when both are emitting malformed
+    // hits — hollowing out the equivalence guarantee this helper
+    // exists to enforce.
     hits.iter()
         .map(|h| {
             let path = h
                 .get("source_path")
                 .and_then(Value::as_str)
-                .unwrap_or("")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "hit must have a non-null source_path string; \
+                         got hit: {h}"
+                    )
+                })
                 .to_string();
-            let line = h.get("line_number").and_then(Value::as_i64).unwrap_or(-1);
+            let line = h
+                .get("line_number")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "hit must have a non-null integer line_number; \
+                         got hit: {h}"
+                    )
+                });
             (path, line)
         })
         .collect()
