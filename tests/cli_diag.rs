@@ -53,6 +53,71 @@ fn write_quarantined_manifest(generation_dir: &Path) {
     .expect("write manifest");
 }
 
+fn seed_two_retained_publish_backups(data_dir: &Path) {
+    let index_path = expected_index_dir(data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained publish backup");
+
+    std::thread::sleep(Duration::from_millis(20));
+
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained publish backup");
+}
+
+fn run_diag_quarantine_with_retention(test_home: &Path, data_dir: &Path, retention: &str) -> Value {
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "diag",
+            "--json",
+            "--quarantine",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", retention)
+        .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home)
+        .env("HOME", test_home)
+        .output()
+        .expect("run cass diag --json --quarantine");
+    assert!(
+        out.status.success(),
+        "cass diag --json --quarantine failed for retention={retention}: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("diag JSON parse failed: {err}; stdout: {stdout}"))
+}
+
+fn retained_publish_backup_safety_counts(quarantine: &Value) -> (usize, usize) {
+    let retained = quarantine["retained_publish_backups"]
+        .as_array()
+        .expect("retained publish backups array");
+    let gc_eligible = retained
+        .iter()
+        .filter(|entry| entry["safe_to_gc"].as_bool() == Some(true))
+        .count();
+    let protected = retained
+        .iter()
+        .filter(|entry| entry["safe_to_gc"].as_bool() == Some(false))
+        .count();
+    (gc_eligible, protected)
+}
+
 #[test]
 fn diag_json_quarantine_surfaces_retained_artifacts() {
     let test_home = tempfile::tempdir().expect("tempdir");
@@ -360,6 +425,69 @@ fn diag_json_quarantine_surfaces_retained_artifacts() {
     );
 }
 
+#[test]
+fn diag_quarantine_retention_zero_marks_all_publish_backups_gc_eligible() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_two_retained_publish_backups(&data_dir);
+
+    let payload = run_diag_quarantine_with_retention(test_home.path(), &data_dir, "0");
+    let quarantine = &payload["quarantine"];
+
+    assert_eq!(
+        quarantine["summary"]["retained_publish_backup_retention_limit"].as_u64(),
+        Some(0),
+        "diag must expose retention=0 as an explicit no-retention policy"
+    );
+    assert_eq!(
+        quarantine["summary"]["retained_publish_backup_count"].as_u64(),
+        Some(2),
+        "both seeded publish backups should be inventoried"
+    );
+    assert_eq!(
+        quarantine["summary"]["gc_eligible_asset_count"].as_u64(),
+        Some(2),
+        "retention=0 should make both publish backups GC-eligible"
+    );
+
+    let (gc_eligible, protected) = retained_publish_backup_safety_counts(quarantine);
+    assert_eq!(gc_eligible, 2, "both backups should be safe to GC");
+    assert_eq!(
+        protected, 0,
+        "retention=0 should protect no publish backups"
+    );
+}
+
+#[test]
+fn diag_quarantine_retention_three_protects_two_publish_backups() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_two_retained_publish_backups(&data_dir);
+
+    let payload = run_diag_quarantine_with_retention(test_home.path(), &data_dir, "3");
+    let quarantine = &payload["quarantine"];
+
+    assert_eq!(
+        quarantine["summary"]["retained_publish_backup_retention_limit"].as_u64(),
+        Some(3),
+        "diag must expose the configured N-most-recent retention limit"
+    );
+    assert_eq!(
+        quarantine["summary"]["retained_publish_backup_count"].as_u64(),
+        Some(2),
+        "both seeded publish backups should be inventoried"
+    );
+    assert_eq!(
+        quarantine["summary"]["gc_eligible_asset_count"].as_u64(),
+        Some(0),
+        "retention=3 should protect both backups when only two exist"
+    );
+
+    let (gc_eligible, protected) = retained_publish_backup_safety_counts(quarantine);
+    assert_eq!(gc_eligible, 0, "no backup should be safe to GC");
+    assert_eq!(protected, 2, "both backups should be retained by policy");
+}
+
 // ========================================================================
 // Bead coding_agent_session_search-p1x0z (child of ibuuh.10,
 // /testing-metamorphic slice: cross-command quarantine consistency).
@@ -434,17 +562,13 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir() {
         .get("quarantine")
         .and_then(|q| q.get("summary"))
         .and_then(Value::as_object)
-        .unwrap_or_else(|| {
-            panic!("diag.quarantine.summary must be an object; diag: {diag_json}")
-        });
+        .unwrap_or_else(|| panic!("diag.quarantine.summary must be an object; diag: {diag_json}"));
     let doctor_summary = doctor_json
         .get("quarantine")
         .and_then(|q| q.get("summary"))
         .and_then(Value::as_object)
         .unwrap_or_else(|| {
-            panic!(
-                "doctor.quarantine.summary must be an object; doctor: {doctor_json}"
-            )
+            panic!("doctor.quarantine.summary must be an object; doctor: {doctor_json}")
         });
 
     // The set of fields we pin cross-command. Intentionally specific:
@@ -488,7 +612,10 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir() {
     // objects must also agree. These track the lexical generation
     // lifecycle; a regression that updated one command's source of
     // truth but not the other would mismatch here.
-    for bundle in ["lexical_generation_build_state_counts", "lexical_generation_publish_state_counts"] {
+    for bundle in [
+        "lexical_generation_build_state_counts",
+        "lexical_generation_publish_state_counts",
+    ] {
         assert_eq!(
             diag_summary.get(bundle),
             doctor_summary.get(bundle),
@@ -504,12 +631,16 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir() {
     // ever changes, update both halves together — catching the drift
     // is the whole point.
     assert_eq!(
-        diag_summary.get("lexical_generation_count").and_then(Value::as_u64),
+        diag_summary
+            .get("lexical_generation_count")
+            .and_then(Value::as_u64),
         Some(0),
         "fresh data-dir must have zero lexical generations; diag: {diag_summary:?}"
     );
     assert_eq!(
-        diag_summary.get("cleanup_apply_allowed").and_then(Value::as_bool),
+        diag_summary
+            .get("cleanup_apply_allowed")
+            .and_then(Value::as_bool),
         Some(false),
         "fresh data-dir must have cleanup_apply_allowed=false; diag: {diag_summary:?}"
     );
@@ -631,7 +762,11 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
             .expect("run cass")
     }
 
-    let diag_out = run_cass(test_home.path(), &data_dir, &["diag", "--json", "--quarantine"]);
+    let diag_out = run_cass(
+        test_home.path(),
+        &data_dir,
+        &["diag", "--json", "--quarantine"],
+    );
     assert!(
         diag_out.status.success(),
         "cass diag --json --quarantine failed on seeded state: stderr={}",
@@ -656,17 +791,13 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
         .get("quarantine")
         .and_then(|q| q.get("summary"))
         .and_then(Value::as_object)
-        .unwrap_or_else(|| {
-            panic!("diag.quarantine.summary must be an object; diag: {diag_json}")
-        });
+        .unwrap_or_else(|| panic!("diag.quarantine.summary must be an object; diag: {diag_json}"));
     let doctor_summary = doctor_json
         .get("quarantine")
         .and_then(|q| q.get("summary"))
         .and_then(Value::as_object)
         .unwrap_or_else(|| {
-            panic!(
-                "doctor.quarantine.summary must be an object; doctor: {doctor_json}"
-            )
+            panic!("doctor.quarantine.summary must be an object; doctor: {doctor_json}")
         });
 
     // Same shared-scalar set as the empty-state sibling test so a
@@ -725,13 +856,17 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
     // values from the seeded fixture so a regression that drops
     // even one counter type immediately fails.
     assert_eq!(
-        diag_summary.get("failed_seed_bundle_count").and_then(Value::as_u64),
+        diag_summary
+            .get("failed_seed_bundle_count")
+            .and_then(Value::as_u64),
         Some(2),
         "seeded state has 2 failed seed bundles (main + WAL sidecar); \
          diag={diag_summary:?}"
     );
     assert_eq!(
-        diag_summary.get("retained_publish_backup_count").and_then(Value::as_u64),
+        diag_summary
+            .get("retained_publish_backup_count")
+            .and_then(Value::as_u64),
         Some(2),
         "seeded state has 2 retained publish backups; diag={diag_summary:?}"
     );
@@ -743,12 +878,16 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
         "retention env var pins limit=1; diag={diag_summary:?}"
     );
     assert_eq!(
-        diag_summary.get("lexical_quarantined_generation_count").and_then(Value::as_u64),
+        diag_summary
+            .get("lexical_quarantined_generation_count")
+            .and_then(Value::as_u64),
         Some(1),
         "seeded state has 1 quarantined lexical generation; diag={diag_summary:?}"
     );
     assert_eq!(
-        diag_summary.get("lexical_quarantined_shard_count").and_then(Value::as_u64),
+        diag_summary
+            .get("lexical_quarantined_shard_count")
+            .and_then(Value::as_u64),
         Some(1),
         "the quarantined generation has 1 quarantined shard; diag={diag_summary:?}"
     );
@@ -756,7 +895,9 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
     // must remain false (the operator hasn't approved the apply yet,
     // and quarantined assets should never auto-reclaim regardless).
     assert_eq!(
-        diag_summary.get("cleanup_apply_allowed").and_then(Value::as_bool),
+        diag_summary
+            .get("cleanup_apply_allowed")
+            .and_then(Value::as_bool),
         Some(false),
         "seeded quarantined state must report cleanup_apply_allowed=false (no auto-apply \
          on quarantined generations); diag={diag_summary:?}"

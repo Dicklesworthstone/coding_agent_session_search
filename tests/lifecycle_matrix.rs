@@ -2127,6 +2127,151 @@ fn status_diag_and_doctor_quarantine_summaries_stay_in_lockstep() {
 }
 
 #[test]
+fn status_diag_and_doctor_cleanup_payloads_stay_in_lockstep() {
+    // ibuuh.19 lifecycle row: the summary lockstep test above proves
+    // aggregate counters agree, but cleanup approval is driven by the
+    // full lexical_cleanup_dry_run and lexical_cleanup_apply_gate
+    // payloads. If one surface emits a stale approval fingerprint or a
+    // different candidate list, a robot could approve a plan from one
+    // command and apply a different plan through another. Pin the full
+    // preview payloads across all three operator surfaces.
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let backups_dir = data_dir.join("backups");
+    fs::create_dir_all(&backups_dir).expect("create backups dir");
+    let failed_seed_root =
+        backups_dir.join("agent_search.db.20260424T120000.12345.deadbeef.failed-baseline-seed.bak");
+    fs::write(&failed_seed_root, b"seed-backup").expect("write failed seed root");
+    fs::write(
+        failed_seed_root.with_file_name(format!(
+            "{}-wal",
+            failed_seed_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("file name")
+        )),
+        b"seed-wal",
+    )
+    .expect("write failed seed wal");
+
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained backup");
+    thread::sleep(std::time::Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained backup");
+
+    let generation_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_generation_manifest(&generation_dir);
+    fs::write(
+        generation_dir.join("segment-a"),
+        b"quarantined-generation-bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    fn json_out(home: &Path, data_dir: &Path, args: &[&str]) -> serde_json::Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("XDG_DATA_HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("HOME", home)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+            .arg(data_dir)
+            .output()
+            .expect("run cass");
+        assert!(
+            out.status.success(),
+            "cass {args:?} exited non-zero; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf8");
+        serde_json::from_str(&stdout).expect("valid JSON")
+    }
+
+    let status = json_out(
+        test_home.path(),
+        &data_dir,
+        &["status", "--json", "--data-dir"],
+    );
+    let diag = json_out(
+        test_home.path(),
+        &data_dir,
+        &["diag", "--json", "--quarantine", "--data-dir"],
+    );
+    let doctor = json_out(
+        test_home.path(),
+        &data_dir,
+        &["doctor", "--json", "--data-dir"],
+    );
+
+    let status_quarantine = &status["quarantine"];
+    let diag_quarantine = &diag["quarantine"];
+    let doctor_quarantine = &doctor["quarantine"];
+
+    for key in ["lexical_cleanup_dry_run", "lexical_cleanup_apply_gate"] {
+        assert_eq!(
+            status_quarantine[key], diag_quarantine[key],
+            "status.quarantine.{key} must match diag --quarantine exactly"
+        );
+        assert_eq!(
+            doctor_quarantine[key], diag_quarantine[key],
+            "doctor.quarantine.{key} must match diag --quarantine exactly"
+        );
+    }
+
+    let dry_run = &diag_quarantine["lexical_cleanup_dry_run"];
+    let apply_gate = &diag_quarantine["lexical_cleanup_apply_gate"];
+    let fingerprint = dry_run["approval_fingerprint"]
+        .as_str()
+        .expect("dry-run approval fingerprint");
+    assert!(
+        fingerprint.starts_with("cleanup-v1-"),
+        "dry-run approval fingerprint should be versioned; got {fingerprint:?}"
+    );
+    assert_eq!(apply_gate["approval_fingerprint"], fingerprint);
+    assert_eq!(apply_gate["dry_run"].as_bool(), Some(true));
+    assert_eq!(
+        apply_gate["explicit_operator_approval"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(apply_gate["apply_allowed"].as_bool(), Some(false));
+    assert_eq!(
+        apply_gate["approval_fingerprint_status"].as_str(),
+        Some("not_requested")
+    );
+    assert_eq!(
+        dry_run["inspection_required_generation_ids"][0].as_str(),
+        Some("gen-quarantined")
+    );
+    assert!(
+        dry_run["inspection_items"]
+            .as_array()
+            .expect("inspection items")
+            .iter()
+            .any(
+                |item| item["generation_id"].as_str() == Some("gen-quarantined")
+                    && item["reason"].as_str() == Some("validation_failed")
+            ),
+        "dry-run payload should preserve quarantined generation inspection context"
+    );
+}
+
+#[test]
 fn index_subcommand_exposes_all_entrypoint_flags() {
     // tin8o migration-safety row. The bead's scope is "migrate watch,
     // import, salvage, and incremental entrypoints onto the same
