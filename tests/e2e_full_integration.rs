@@ -91,11 +91,7 @@ fn parse_search_hits(output: &[u8]) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn cass_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_cass")
-        .ok()
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
-}
+use util::cass_bin;
 
 // ============================================================================
 // 1. FULL PIPELINE: Index + Search with Multiple Agents

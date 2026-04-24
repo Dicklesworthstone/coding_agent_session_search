@@ -3,6 +3,32 @@ pub mod search_asset_simulation;
 pub mod timeout;
 
 // =============================================================================
+// Shared CLI-invocation helpers (bead coding_agent_session_search-ju50o)
+// =============================================================================
+//
+// Before consolidation, `cass_bin()` was byte-identical in cli_robot.rs,
+// e2e_full_integration.rs, and watch_e2e.rs. Housing the canonical version
+// here means a future env-isolation requirement (or a change to how the
+// runtime binary path is resolved) gets one touch instead of three.
+//
+// Scope note: the `isolated_cass_cmd(home)` duplication called out in
+// ju50o is tracked separately. Two of its four callers build
+// `assert_cmd::Command` and two build `std::process::Command`, so a
+// type-stable consolidation needs an assert_cmd-flavored variant alongside
+// the std one — deferred to a follow-up slice rather than jamming a
+// lossy `.into()` cast across the current call sites.
+
+/// Resolve the `cass` binary path. Prefers the runtime `CARGO_BIN_EXE_cass`
+/// env var (set when cargo runs integration tests) and falls back to the
+/// compile-time path from `env!()`.
+#[allow(dead_code)]
+pub fn cass_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_cass")
+        .ok()
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
+}
+
+// =============================================================================
 // Verbose Logging Support
 // =============================================================================
 

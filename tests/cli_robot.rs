@@ -13,11 +13,8 @@ use walkdir::WalkDir;
 use clap::{self, CommandFactory, Parser};
 use coding_agent_search::{Cli, Commands};
 
-fn cass_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_cass")
-        .ok()
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
-}
+mod util;
+use util::cass_bin;
 
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
