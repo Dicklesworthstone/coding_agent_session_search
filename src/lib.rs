@@ -1145,7 +1145,7 @@ pub enum SourcesCommand {
     /// # State and Resume
     ///
     /// If setup is interrupted (Ctrl+C, connection lost), state is saved to
-    /// `~/.config/cass/setup_state.json`. Resume with `cass sources setup --resume`.
+    /// `~/.cache/cass/setup_state.json`. Resume with `cass sources setup --resume`.
     ///
     /// # See Also
     ///
@@ -1175,7 +1175,7 @@ pub enum SourcesCommand {
         /// SSH connection timeout in seconds
         #[arg(long, default_value = "10")]
         timeout: u64,
-        /// Resume from previous interrupted setup (reads ~/.config/cass/setup_state.json)
+        /// Resume from previous interrupted setup (reads ~/.cache/cass/setup_state.json)
         #[arg(long)]
         resume: bool,
         /// Show detailed progress output
@@ -7142,7 +7142,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "## Flags Reference".to_string(),
             "  --hosts <names>      Only configure these hosts (comma-separated SSH aliases)".to_string(),
             "  --dry-run            Preview without making changes".to_string(),
-            "  --resume             Resume from ~/.config/cass/setup_state.json".to_string(),
+            "  --resume             Resume from ~/.cache/cass/setup_state.json".to_string(),
             "  --non-interactive    Skip prompts, use auto-detected defaults".to_string(),
             "  --skip-install       Don't install cass on remotes".to_string(),
             "  --skip-index         Don't run remote indexing".to_string(),
@@ -7157,7 +7157,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass sources setup --json --hosts css  # JSON output for parsing".to_string(),
             String::new(),
             "## State and Resume".to_string(),
-            "State saved to ~/.config/cass/setup_state.json on interruption.".to_string(),
+            "State saved to ~/.cache/cass/setup_state.json on interruption.".to_string(),
             "Resume with: cass sources setup --resume".to_string(),
             String::new(),
             "## Generated Configuration".to_string(),
