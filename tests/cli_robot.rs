@@ -4923,11 +4923,7 @@ fn cass_output_format_takes_precedence() {
 // fires immediately.
 // ========================================================================
 
-fn seed_codex_session_s0cmk(
-    codex_home: &std::path::Path,
-    filename: &str,
-    keyword: &str,
-) {
+fn seed_codex_session_s0cmk(codex_home: &std::path::Path, filename: &str, keyword: &str) {
     use serde_json::json;
     let sessions = codex_home.join("sessions/2026/04/23");
     fs::create_dir_all(&sessions).unwrap();

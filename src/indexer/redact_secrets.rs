@@ -210,11 +210,13 @@ pub fn redaction_algorithm_fingerprint() -> String {
 /// `MemoizingRedactor` is `pub(crate)` so the live persist path can
 /// adopt it without leaking the memoization vocabulary into public
 /// API. Wiring lives in the indexer crate.
+#[allow(dead_code)]
 pub(crate) struct MemoizingRedactor {
     text_cache: crate::indexer::memoization::ContentAddressedMemoCache<String>,
     algorithm_fingerprint: String,
 }
 
+#[allow(dead_code)]
 impl MemoizingRedactor {
     /// Default cache capacity for typical refresh batches. Sized to
     /// cover a few thousand distinct message bodies before LRU
@@ -598,6 +600,7 @@ mod tests {
     /// - multi-secret inputs (multiple replacement passes)
     /// - empty input (fast-path)
     /// - long boilerplate-style inputs (large blob with no secrets)
+    ///
     /// First and second invocations on the same input must agree
     /// (cache-hit invariance) AND match the uncached result.
     #[test]
@@ -769,11 +772,10 @@ mod tests {
     /// requirement for the redaction sink.
     #[test]
     fn memoizing_redactor_with_audit_emits_lookup_and_insert_records() {
-        use crate::indexer::memoization::{
-            MemoCacheEvent, MemoCacheOperation,
-        };
+        use crate::indexer::memoization::{MemoCacheEvent, MemoCacheOperation};
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload = "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+        let payload =
+            "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
 
         let (first_output, first_audit) = redactor.redact_text_with_audit(payload);
         assert!(!first_output.contains("eyJhbGci"));
@@ -869,7 +871,8 @@ mod tests {
     fn memoizing_redactor_quarantined_entries_fall_through_to_direct_redaction() {
         use crate::indexer::memoization::{MemoCacheEvent, MemoCacheOperation};
         let mut redactor = MemoizingRedactor::with_capacity(8);
-        let payload = "user=admin password=hunter2hunter2 token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let payload =
+            "user=admin password=hunter2hunter2 token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
 
         // Prime + verify hit.
         let _ = redactor.redact_text(payload);
@@ -898,10 +901,7 @@ mod tests {
             "quarantine fallthrough emits the lookup audit only (no insert)"
         );
         assert!(matches!(audit[0].operation, MemoCacheOperation::Lookup));
-        assert!(matches!(
-            audit[0].event,
-            MemoCacheEvent::Quarantine { .. }
-        ));
+        assert!(matches!(audit[0].event, MemoCacheEvent::Quarantine { .. }));
 
         // Re-quarantining the same key with the same reason is a
         // no-op for the quarantine counter (already quarantined).

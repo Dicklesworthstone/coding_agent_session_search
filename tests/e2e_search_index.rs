@@ -2861,7 +2861,8 @@ fn force_rebuild_recreates_index() {
     // same Tantivy segments in place and this assertion would fire.
     let new_fingerprint = index_fingerprint(&index_dir);
     assert_ne!(
-        initial_fingerprint, new_fingerprint,
+        initial_fingerprint,
+        new_fingerprint,
         "index tree content must change after --force-rebuild; \
          before ({} entries) == after ({} entries)",
         initial_fingerprint.len(),

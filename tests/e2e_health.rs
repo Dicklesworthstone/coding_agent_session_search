@@ -239,8 +239,7 @@ fn status_recommended_action_during_active_rebuild_says_wait_not_reindex() {
     // and humans know "wait" is the right next step.
     let lower = recommended_action.to_lowercase();
     assert!(
-        (lower.contains("rebuild") && lower.contains("in progress"))
-            || lower.contains("already"),
+        (lower.contains("rebuild") && lower.contains("in progress")) || lower.contains("already"),
         "recommended_action must signal that a rebuild is active so agents attach \
          to the in-flight work instead of starting a new one; got: \
          {recommended_action:?}"
@@ -332,8 +331,7 @@ fn health_recommended_action_during_active_rebuild_says_wait_not_reindex() {
     // the same operator-facing advice.
     let lower = recommended_action.to_lowercase();
     assert!(
-        (lower.contains("rebuild") && lower.contains("in progress"))
-            || lower.contains("already"),
+        (lower.contains("rebuild") && lower.contains("in progress")) || lower.contains("already"),
         "recommended_action must signal that a rebuild is active so agents attach \
          to the in-flight work instead of starting a new one; got: \
          {recommended_action:?}"
@@ -393,11 +391,7 @@ fn health_recommended_action_during_active_rebuild_says_wait_not_reindex() {
 //      - exit 0, ≥1 hit, stdout valid JSON
 // ========================================================================
 
-fn seed_codex_session_cold_start(
-    codex_home: &std::path::Path,
-    filename: &str,
-    keyword: &str,
-) {
+fn seed_codex_session_cold_start(codex_home: &std::path::Path, filename: &str, keyword: &str) {
     let sessions = codex_home.join("sessions/2026/04/23");
     fs::create_dir_all(&sessions).expect("create codex sessions dir");
     let ts_ms = 1_714_000_000_000_u64;
@@ -728,8 +722,9 @@ fn cass_status_reaps_stale_index_run_lock_and_reports_not_active() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let payload: Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|err| panic!("status JSON parse failed: {err}; stdout: {stdout}\nstderr: {stderr}"));
+    let payload: Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+        panic!("status JSON parse failed: {err}; stdout: {stdout}\nstderr: {stderr}")
+    });
 
     // CONTRACT PIN 1: status reports rebuild.active=false. The whole
     // point of issue #176 fix is that stale metadata must NOT be

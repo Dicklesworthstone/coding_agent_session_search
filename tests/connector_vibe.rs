@@ -109,7 +109,9 @@ fn scan_preserves_unicode_session_directory_external_id() {
     write_session(
         &sessions,
         "sess-東京-🚀",
-        &[r#"{"role":"user","content":"Unicode session path","timestamp":"2025-06-15T10:00:00.000Z"}"#],
+        &[
+            r#"{"role":"user","content":"Unicode session path","timestamp":"2025-06-15T10:00:00.000Z"}"#,
+        ],
     );
 
     let connector = VibeConnector::new();
@@ -118,7 +120,11 @@ fn scan_preserves_unicode_session_directory_external_id() {
 
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].external_id.as_deref(), Some("sess-東京-🚀"));
-    assert!(convs[0].source_path.ends_with("sess-東京-🚀/messages.jsonl"));
+    assert!(
+        convs[0]
+            .source_path
+            .ends_with("sess-東京-🚀/messages.jsonl")
+    );
 }
 
 // ============================================================================

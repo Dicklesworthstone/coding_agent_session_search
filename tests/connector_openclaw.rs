@@ -160,7 +160,9 @@ fn scan_preserves_unicode_agent_directory_and_session_filename() {
     write_jsonl(
         &sessions,
         "セッション-🚀.jsonl",
-        &[r#"{"type":"message","timestamp":"2025-06-15T10:00:00.000Z","message":{"role":"user","content":"Unicode agent tag"}}"#],
+        &[
+            r#"{"type":"message","timestamp":"2025-06-15T10:00:00.000Z","message":{"role":"user","content":"Unicode agent tag"}}"#,
+        ],
     );
 
     let connector = OpenClawConnector::new();
@@ -175,7 +177,10 @@ fn scan_preserves_unicode_agent_directory_and_session_filename() {
         Some("研究-agent/セッション-🚀")
     );
     assert_eq!(
-        convs[0].metadata.get("agent_directory").and_then(|v| v.as_str()),
+        convs[0]
+            .metadata
+            .get("agent_directory")
+            .and_then(|v| v.as_str()),
         Some("研究-agent")
     );
 }
