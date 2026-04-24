@@ -1,0 +1,429 @@
+{
+  "_meta": {
+    "description": "Canonical error kind taxonomy for cass robot-mode error envelopes",
+    "rule": "All err.kind values MUST be kebab-case per AGENTS.md",
+    "total_kinds": 81,
+    "regenerate": "UPDATE_GOLDENS=1 cargo test --test golden_error_envelope"
+  },
+  "kinds": {
+    "ambiguous-source": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "archive-analytics-rebuild": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "archive-count": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "archive-daily-stats-rebuild": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "archive-fts-rebuild": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "archive-purge": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "archive-token-daily-stats-rebuild": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "config": {
+      "exit_codes": [
+        9,
+        10,
+        11
+      ]
+    },
+    "cursor-decode": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "cursor-parse": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "daemon": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "db-error": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "db-open": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "db-query": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "doctor": {
+      "exit_codes": [
+        5,
+        9
+      ]
+    },
+    "download": {
+      "exit_codes": [
+        23
+      ]
+    },
+    "embedder-unavailable": {
+      "exit_codes": [
+        15
+      ]
+    },
+    "empty-file": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "empty-session": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "encode-json": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "export-failed": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "file-create": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "file-not-found": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "file-open": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "file-read": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "file-write": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "health": {
+      "exit_codes": [
+        1
+      ]
+    },
+    "idempotency-mismatch": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "index": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "index-busy": {
+      "exit_codes": [
+        7
+      ]
+    },
+    "index-missing": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "indexed-session-required": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "invalid-agent": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "invalid-filename": {
+      "exit_codes": [
+        4
+      ]
+    },
+    "invalid-line": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "io": {
+      "exit_codes": [
+        14,
+        15,
+        22,
+        24
+      ]
+    },
+    "io-error": {
+      "exit_codes": [
+        1
+      ]
+    },
+    "lexical-rebuild": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "line-not-found": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "line-out-of-range": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "mapping": {
+      "exit_codes": [
+        12,
+        13,
+        14
+      ]
+    },
+    "missing-db": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "missing-index": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "model": {
+      "exit_codes": [
+        20,
+        21,
+        22
+      ]
+    },
+    "not-found": {
+      "exit_codes": [
+        4,
+        13
+      ]
+    },
+    "open-index": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "opencode-parse": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "opencode-sqlite-parse": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "output-not-writable": {
+      "exit_codes": [
+        4
+      ]
+    },
+    "pages": {
+      "exit_codes": [
+        1,
+        2,
+        9
+      ]
+    },
+    "parse-error": {
+      "exit_codes": [
+        1
+      ]
+    },
+    "password-read-error": {
+      "exit_codes": [
+        6
+      ]
+    },
+    "password-required": {
+      "exit_codes": [
+        6
+      ]
+    },
+    "rebuild-error": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "repair-error": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "resume-empty-command": {
+      "exit_codes": [
+        6
+      ]
+    },
+    "resume-exec-failed": {
+      "exit_codes": [
+        7
+      ]
+    },
+    "search": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "semantic-backfill": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "semantic-manifest": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "semantic-unavailable": {
+      "exit_codes": [
+        15
+      ]
+    },
+    "serialize-message": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "session-file-unreadable": {
+      "exit_codes": [
+        4
+      ]
+    },
+    "session-id-not-found": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "session-not-found": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "session-parse": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "sessions-from": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "setup": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "source": {
+      "exit_codes": [
+        9,
+        12
+      ]
+    },
+    "ssh": {
+      "exit_codes": [
+        12
+      ]
+    },
+    "storage": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "storage-fingerprint": {
+      "exit_codes": [
+        5
+      ]
+    },
+    "timeout": {
+      "exit_codes": [
+        10
+      ]
+    },
+    "tui": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "tui-headless-once": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "tui-reset-state": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "unknown": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "unknown-agent": {
+      "exit_codes": [
+        3
+      ]
+    },
+    "update-check": {
+      "exit_codes": [
+        9
+      ]
+    },
+    "usage": {
+      "exit_codes": [
+        2
+      ]
+    },
+    "write-failed": {
+      "exit_codes": [
+        4
+      ]
+    }
+  }
+}

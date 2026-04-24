@@ -335,7 +335,7 @@ fn test_encrypted_export_requires_password() {
     let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["kind"], "password_required");
+    assert_eq!(json["error"]["kind"], "password-required");
 }
 
 // =============================================================================
@@ -434,7 +434,7 @@ fn test_cli_export_session_not_found() {
     let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["success"], false);
-    assert_eq!(json["error"]["kind"], "session_not_found");
+    assert_eq!(json["error"]["kind"], "session-not-found");
 }
 
 #[test]

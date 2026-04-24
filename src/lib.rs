@@ -5050,7 +5050,7 @@ async fn import_chatgpt_export(
     if !export_path.exists() {
         return Err(CliError {
             code: 1,
-            kind: "io_error",
+            kind: "io-error",
             message: format!("Export file not found: {}", export_path.display()),
             hint: Some(
                 "Provide the path to conversations.json from ChatGPT web export \
@@ -5087,7 +5087,7 @@ async fn import_chatgpt_export(
     let conv_dir = base_dir.join("conversations-web-export");
     std::fs::create_dir_all(&conv_dir).map_err(|e| CliError {
         code: 1,
-        kind: "io_error",
+        kind: "io-error",
         message: format!("Failed to create output directory: {e}"),
         hint: None,
         retryable: false,
@@ -5096,7 +5096,7 @@ async fn import_chatgpt_export(
     // Read and parse export file
     let content = std::fs::read_to_string(export_path).map_err(|e| CliError {
         code: 1,
-        kind: "io_error",
+        kind: "io-error",
         message: format!("Failed to read export file: {e}"),
         hint: None,
         retryable: false,
@@ -5105,7 +5105,7 @@ async fn import_chatgpt_export(
     let conversations: Vec<serde_json::Value> =
         serde_json::from_str(&content).map_err(|e| CliError {
             code: 1,
-            kind: "parse_error",
+            kind: "parse-error",
             message: format!("Failed to parse conversations.json: {e}"),
             hint: Some("Expected a JSON array of conversation objects".into()),
             retryable: false,
@@ -5135,21 +5135,21 @@ async fn import_chatgpt_export(
         // Write individual conversation file
         let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
             code: 1,
-            kind: "io_error",
+            kind: "io-error",
             message: format!("Failed to write {}: {e}", filepath.display()),
             hint: None,
             retryable: false,
         })?;
         serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
             code: 1,
-            kind: "io_error",
+            kind: "io-error",
             message: format!("Failed to serialize conversation: {e}"),
             hint: None,
             retryable: false,
         })?;
         file.flush().map_err(|e| CliError {
             code: 1,
-            kind: "io_error",
+            kind: "io-error",
             message: format!("Failed to flush: {e}"),
             hint: None,
             retryable: false,
@@ -5371,7 +5371,7 @@ impl ActiveIndexRunDetails {
 
         CliError {
             code: 7,
-            kind: "index_busy",
+            kind: "index-busy",
             message,
             hint: Some(
                 "Wait for the active run to finish or point --data-dir/--db at a different cass dataset."
@@ -14804,7 +14804,7 @@ fn run_context(
     else {
         return Err(CliError {
             code: 4,
-            kind: "not_found",
+            kind: "not-found",
             message: match source_id {
                 Some(source_id) => format!("No session found at path: {path_str} for source '{source_id}'"),
                 None => format!("No session found at path: {path_str}"),
@@ -17100,7 +17100,7 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| CliError {
             code: 9,
-            kind: "file_read",
+            kind: "file-read",
             message: format!("Failed to read session file: {e}"),
             hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
             retryable: false,
@@ -17766,7 +17766,7 @@ fn run_index_with_data(
             } else {
                 return Err(CliError {
                     code: 5,
-                    kind: "idempotency_mismatch",
+                    kind: "idempotency-mismatch",
                     message: format!(
                         "Idempotency key '{}' was used with different parameters",
                         key
@@ -18859,7 +18859,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             other => {
                 return Err(CliError {
                     code: 2,
-                    kind: "invalid_agent",
+                    kind: "invalid-agent",
                     message: format!(
                         "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
                     ),
@@ -18940,7 +18940,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
 
     Err(CliError {
         code: 3,
-        kind: "unknown_agent",
+        kind: "unknown-agent",
         message: format!(
             "could not detect the source harness from path '{}'",
             path.display()
@@ -19008,7 +19008,7 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
     const MAX_SCAN_BYTES: u64 = 1024 * 1024; // 1 MiB
     let file = std::fs::File::open(path).map_err(|err| CliError {
         code: 4,
-        kind: "session_file_unreadable",
+        kind: "session-file-unreadable",
         message: format!(
             "cannot open pi-agent session file {}: {err}",
             path.display()
@@ -19065,7 +19065,7 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
     // a confusing error. Fail explicitly so the user knows what's wrong.
     Err(CliError {
         code: 5,
-        kind: "session_id_not_found",
+        kind: "session-id-not-found",
         message: format!(
             "no session header found in pi-agent file {} (scanned first 16 non-empty lines)",
             path.display()
@@ -19096,7 +19096,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| CliError {
             code: 5,
-            kind: "session_id_not_found",
+            kind: "session-id-not-found",
             message: format!("opencode path has no final component: {}", path.display()),
             hint: None,
             retryable: false,
@@ -19114,7 +19114,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
         if !looks_like_session_path {
             return Err(CliError {
                 code: 5,
-                kind: "session_id_not_found",
+                kind: "session-id-not-found",
                 message: format!(
                     "opencode session path must live under an 'opencode.db' directory, got: {}",
                     path.display()
@@ -19135,7 +19135,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     if decoded.is_empty() || decoded == "opencode.db" {
         return Err(CliError {
             code: 5,
-            kind: "session_id_not_found",
+            kind: "session-id-not-found",
             message: format!(
                 "could not extract opencode session id from '{}'",
                 path.display()
@@ -19167,7 +19167,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "claude" => {
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
-                kind: "session_id_not_found",
+                kind: "session-id-not-found",
                 message: format!(
                     "cannot derive Claude Code session UUID from '{}'",
                     path.display()
@@ -19178,7 +19178,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
-                    kind: "session_id_not_found",
+                    kind: "session-id-not-found",
                     message: format!(
                         "filename stem '{uuid}' does not look like a Claude Code session UUID (expected 8-4-4-4-12 hex)"
                     ),
@@ -19199,7 +19199,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "codex" => {
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
-                kind: "session_id_not_found",
+                kind: "session-id-not-found",
                 message: format!("cannot derive Codex session UUID from '{}'", path.display()),
                 hint: None,
                 retryable: false,
@@ -19207,7 +19207,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
-                    kind: "session_id_not_found",
+                    kind: "session-id-not-found",
                     message: format!(
                         "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
                     ),
@@ -19277,7 +19277,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         // Unreachable: detect_resume_agent validates the slug.
         other => Err(CliError {
             code: 3,
-            kind: "unknown_agent",
+            kind: "unknown-agent",
             message: format!("internal: unhandled agent slug '{other}'"),
             hint: None,
             retryable: false,
@@ -19359,7 +19359,7 @@ fn run_resume(
         // caller's TTY is handed over to the resumed harness cleanly.
         let (program, args) = target.argv.split_first().ok_or_else(|| CliError {
             code: 6,
-            kind: "resume_empty_command",
+            kind: "resume-empty-command",
             message: "internal: resolved resume command had no program".into(),
             hint: None,
             retryable: false,
@@ -19371,7 +19371,7 @@ fn run_resume(
             // `exec` only returns on failure.
             return Err(CliError {
                 code: 7,
-                kind: "resume_exec_failed",
+                kind: "resume-exec-failed",
                 message: format!("failed to exec '{program}': {err}"),
                 hint: Some(format!(
                     "Verify that '{program}' is installed and on your PATH."
@@ -19386,7 +19386,7 @@ fn run_resume(
                 .status()
                 .map_err(|err| CliError {
                     code: 7,
-                    kind: "resume_exec_failed",
+                    kind: "resume-exec-failed",
                     message: format!("failed to spawn '{program}': {err}"),
                     hint: None,
                     retryable: false,
@@ -19734,7 +19734,7 @@ fn run_export_html(
     {
         let err = CliError {
             code: 3,
-            kind: "session_not_found",
+            kind: "session-not-found",
             message: match source_id {
                 Some(source_id) => format!(
                     "No indexed session found for source '{}' at {}",
@@ -19784,7 +19784,7 @@ fn run_export_html(
             let mut pwd = String::new();
             io::stdin().read_line(&mut pwd).map_err(|e| CliError {
                 code: 6,
-                kind: "password_read_error",
+                kind: "password-read-error",
                 message: format!("Failed to read password from stdin: {e}"),
                 hint: None,
                 retryable: false,
@@ -19793,7 +19793,7 @@ fn run_export_html(
         } else {
             let err = CliError {
                 code: 6,
-                kind: "password_required",
+                kind: "password-required",
                 message: "Password required for encryption".to_string(),
                 hint: Some("Use --password <pwd> or --password-stdin".to_string()),
                 retryable: false,
@@ -19926,7 +19926,7 @@ fn run_export_html(
                 Err(e) => {
                     let err = CliError {
                         code: 9,
-                        kind: "opencode_sqlite_parse",
+                        kind: "opencode-sqlite-parse",
                         message: format!("Failed to load OpenCode SQLite session: {e}"),
                         hint: Some(
                             "Ensure the OpenCode database exists and the session ID is valid"
@@ -19950,7 +19950,7 @@ fn run_export_html(
                 Err(e) => {
                     let err = CliError {
                         code: 9,
-                        kind: "opencode_parse",
+                        kind: "opencode-parse",
                         message: format!("Failed to parse OpenCode session: {e}"),
                         hint: Some("Ensure the session file is valid".into()),
                         retryable: false,
@@ -19989,7 +19989,7 @@ fn run_export_html(
     if raw_messages.is_empty() {
         let err = CliError {
             code: 9,
-            kind: "empty_session",
+            kind: "empty-session",
             message: format!("No messages found in: {}", session_path.display()),
             hint: None,
             retryable: false,
@@ -20222,7 +20222,7 @@ fn run_export_html(
     if filename.is_some() && !is_valid_filename(&final_filename) {
         let err = CliError {
             code: 4,
-            kind: "invalid_filename",
+            kind: "invalid-filename",
             message: format!("Invalid output filename: {final_filename}"),
             hint: Some("Avoid path separators and reserved characters".to_string()),
             retryable: false,
@@ -20306,7 +20306,7 @@ fn run_export_html(
         .map_err(|e| {
             let err = CliError {
                 code: 5,
-                kind: "export_failed",
+                kind: "export-failed",
                 message: format!("Failed to export HTML: {e}"),
                 hint: None,
                 retryable: false,
@@ -20320,7 +20320,7 @@ fn run_export_html(
     let mut file = File::create(&output_path).map_err(|e| {
         let err = CliError {
             code: 4,
-            kind: "output_not_writable",
+            kind: "output-not-writable",
             message: format!("Could not create output file: {e}"),
             hint: Some(format!(
                 "Check permissions for {}",
@@ -20334,7 +20334,7 @@ fn run_export_html(
     file.write_all(html.as_bytes()).map_err(|e| {
         let err = CliError {
             code: 4,
-            kind: "write_failed",
+            kind: "write-failed",
             message: format!("Failed to write file: {e}"),
             hint: None,
             retryable: false,
@@ -24870,7 +24870,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     let Some(stored_source_name) = stored_source_name else {
         return Err(CliError {
             code: 13,
-            kind: "not_found",
+            kind: "not-found",
             message: format!("Source '{name}' not found"),
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
@@ -25031,7 +25031,7 @@ fn run_sources_doctor(
     if sources_to_check.is_empty() {
         return Err(CliError {
             code: 13,
-            kind: "not_found",
+            kind: "not-found",
             message: format!("Source '{}' not found", source_filter.unwrap_or("unknown")),
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
@@ -26645,7 +26645,7 @@ fn run_models_backfill(
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,
-            kind: "index_missing",
+            kind: "index-missing",
             message: format!("cass database not found: {}", db_path.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,
@@ -26736,7 +26736,7 @@ fn run_models_backfill(
     let db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
             code: 5,
-            kind: "storage_fingerprint",
+            kind: "storage-fingerprint",
             message: format!(
                 "Failed to fingerprint cass database {}: {e}",
                 db_path.display()
@@ -26753,7 +26753,7 @@ fn run_models_backfill(
     })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
-        kind: "semantic_manifest",
+        kind: "semantic-manifest",
         message: format!("Failed to load semantic manifest: {e}"),
         hint: Some("Check permissions under the cass data directory".into()),
         retryable: true,
@@ -26790,7 +26790,7 @@ fn run_models_backfill(
         )
         .map_err(|e| CliError {
             code: 5,
-            kind: "semantic_backfill",
+            kind: "semantic-backfill",
             message: format!("Semantic backfill failed: {e}"),
             hint: Some(
                 "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
@@ -27128,7 +27128,7 @@ fn purge_excluded_agent_archive_data(
         .purge_agent_archive_data(&archive_agent_slug)
         .map_err(|e| CliError {
             code: 5,
-            kind: "archive_purge",
+            kind: "archive-purge",
             message: format!("Failed to purge indexed data for '{archive_agent_slug}': {e}"),
             hint: Some("The exclusion was still saved; run 'cass index --full' after fixing the archive if needed".into()),
             retryable: false,
@@ -27139,14 +27139,14 @@ fn purge_excluded_agent_archive_data(
 
     storage.rebuild_fts().map_err(|e| CliError {
         code: 5,
-        kind: "archive_fts_rebuild",
+        kind: "archive-fts-rebuild",
         message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
         hint: Some("Run 'cass index --full' to refresh derived search data".into()),
         retryable: false,
     })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
-        kind: "archive_analytics_rebuild",
+        kind: "archive-analytics-rebuild",
         message: format!(
             "Purged '{archive_agent_slug}' but failed to rebuild analytics rollups: {e}"
         ),
@@ -27155,14 +27155,14 @@ fn purge_excluded_agent_archive_data(
     })?;
     storage.rebuild_daily_stats().map_err(|e| CliError {
         code: 5,
-        kind: "archive_daily_stats_rebuild",
+        kind: "archive-daily-stats-rebuild",
         message: format!("Purged '{archive_agent_slug}' but failed to rebuild daily stats: {e}"),
         hint: Some("Run 'cass index --full' to refresh derived daily stats".into()),
         retryable: false,
     })?;
     storage.rebuild_token_daily_stats().map_err(|e| CliError {
         code: 5,
-        kind: "archive_token_daily_stats_rebuild",
+        kind: "archive-token-daily-stats-rebuild",
         message: format!(
             "Purged '{archive_agent_slug}' but failed to rebuild token_daily_stats: {e}"
         ),
@@ -27171,7 +27171,7 @@ fn purge_excluded_agent_archive_data(
     })?;
     let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
         code: 5,
-        kind: "archive_count",
+        kind: "archive-count",
         message: format!(
             "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
         ),
@@ -27183,7 +27183,7 @@ fn purge_excluded_agent_archive_data(
     crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
         .map_err(|e| CliError {
             code: 5,
-            kind: "lexical_rebuild",
+            kind: "lexical-rebuild",
             message: format!(
                 "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
             ),
