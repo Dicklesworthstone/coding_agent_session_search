@@ -7,6 +7,23 @@
 //! - Memory-constrained environments
 //!
 //! Part of bead: coding_agent_session_search-9oyj (T4.4)
+//!
+//! # Long-run policy (bead `coding_agent_session_search-3ii77`)
+//!
+//! Every `#[test]` in this file is marked `#[ignore]` so the default
+//! `cargo test --all-targets` gate completes deterministically in
+//! seconds instead of waiting several minutes for the large-dataset
+//! subprocess pipeline (per-test budgets 300s index / 30s search via
+//! the f2r5t timeout wrapper — fine for an opt-in run, too heavy for
+//! the routine green gate).
+//!
+//! Run explicitly when exercising the large-dataset pipeline:
+//! ```bash
+//! cargo test --test e2e_large_dataset -- --ignored --nocapture
+//! ```
+//!
+//! CI should route this file through a separate scheduled / nightly
+//! gate rather than the routine all-targets check.
 
 use assert_cmd::cargo::cargo_bin;
 use coding_agent_search::storage::sqlite::SqliteStorage;
@@ -156,6 +173,7 @@ fn count_conversations(db_path: &Path) -> i64 {
 /// in a single conversation without memory issues or performance degradation.
 #[test]
 #[serial]
+#[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn index_large_single_session() {
     let tracker = tracker_for("index_large_single_session");
     let _trace_guard = tracker.trace_env_guard();
@@ -262,6 +280,7 @@ fn index_large_single_session() {
 /// efficiently, including proper session boundary detection.
 #[test]
 #[serial]
+#[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn index_many_conversations() {
     let tracker = tracker_for("index_many_conversations");
     let _trace_guard = tracker.trace_env_guard();
@@ -342,6 +361,7 @@ fn index_many_conversations() {
 /// without performance degradation.
 #[test]
 #[serial]
+#[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn search_large_result_set() {
     let tracker = tracker_for("search_large_result_set");
     let _trace_guard = tracker.trace_env_guard();
@@ -467,6 +487,7 @@ fn search_large_result_set() {
 /// which would indicate a memory leak or inefficient buffering.
 #[test]
 #[serial]
+#[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn memory_bounded_during_index() {
     let tracker = tracker_for("memory_bounded_during_index");
     let _trace_guard = tracker.trace_env_guard();
@@ -546,6 +567,7 @@ fn memory_bounded_during_index() {
 /// small amounts of new data to a large existing index.
 #[test]
 #[serial]
+#[ignore = "bd-3ii77: long-run e2e; opt-in via `cargo test -- --ignored`"]
 fn incremental_index_on_large_base() {
     let tracker = tracker_for("incremental_index_on_large_base");
     let _trace_guard = tracker.trace_env_guard();
