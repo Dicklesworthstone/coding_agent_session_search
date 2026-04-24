@@ -1,0 +1,134 @@
+{
+  "query": "metamorphic_sentinel",
+  "limit_5_hits": [
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_2.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_1.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_0.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_3.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_4.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    }
+  ],
+  "limit_20_hits": [
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_2.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_1.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_0.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_3.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_4.jsonl",
+      "agent": "amp",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/codex/session_2.jsonl",
+      "agent": "codex",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/codex/session_3.jsonl",
+      "agent": "codex",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/claude/session_1.jsonl",
+      "agent": "claude",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/claude/session_4.jsonl",
+      "agent": "claude",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/claude/session_0.jsonl",
+      "agent": "claude",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/codex/session_1.jsonl",
+      "agent": "codex",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/claude/session_3.jsonl",
+      "agent": "claude",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/codex/session_0.jsonl",
+      "agent": "codex",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/codex/session_4.jsonl",
+      "agent": "codex",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/claude/session_2.jsonl",
+      "agent": "claude",
+      "line_number": 3
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_2.jsonl",
+      "agent": "amp",
+      "line_number": 1
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_1.jsonl",
+      "agent": "amp",
+      "line_number": 1
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_0.jsonl",
+      "agent": "amp",
+      "line_number": 1
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_3.jsonl",
+      "agent": "amp",
+      "line_number": 1
+    },
+    {
+      "source_path": "/tmp/.tmpMT1QdH/amp/session_4.jsonl",
+      "agent": "amp",
+      "line_number": 1
+    }
+  ],
+  "limit_5_count": 5,
+  "limit_20_count": 20
+}

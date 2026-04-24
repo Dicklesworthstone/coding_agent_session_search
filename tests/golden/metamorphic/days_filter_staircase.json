@@ -1,0 +1,8 @@
+{
+  "query": "metamorphic_sentinel",
+  "unfiltered_count": 45,
+  "days_30_count": 24,
+  "days_7_count": 6,
+  "days_7_subset_of_30": true,
+  "monotonic": true
+}

@@ -1,0 +1,9 @@
+{
+  "query": "metamorphic_sentinel",
+  "total_hits": 45,
+  "per_agent": {
+    "amp": 15,
+    "claude": 15,
+    "codex": 15
+  }
+}

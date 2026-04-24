@@ -1,0 +1,25 @@
+{
+  "case_pairs": [
+    {
+      "lower": "async",
+      "upper": "ASYNC",
+      "lower_count": 15,
+      "upper_count": 15,
+      "sets_equal": true
+    },
+    {
+      "lower": "refactoring",
+      "upper": "REFACTORING",
+      "lower_count": 15,
+      "upper_count": 15,
+      "sets_equal": true
+    },
+    {
+      "lower": "debugging",
+      "upper": "DEBUGGING",
+      "lower_count": 15,
+      "upper_count": 15,
+      "sets_equal": true
+    }
+  ]
+}

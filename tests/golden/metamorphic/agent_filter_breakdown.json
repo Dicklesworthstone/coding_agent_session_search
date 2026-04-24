@@ -1,0 +1,11 @@
+{
+  "query": "metamorphic_sentinel",
+  "unfiltered_total": 45,
+  "per_agent_filtered": {
+    "amp": 15,
+    "claude": 15,
+    "codex": 15
+  },
+  "union_count": 45,
+  "union_equals_total": true
+}
