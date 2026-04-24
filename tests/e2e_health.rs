@@ -163,7 +163,102 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
 }
 
 // ========================================================================
-// Bead coding_agent_session_search-8qet9 (child of ibuuh.10, scenario A):
+// Bead coding_agent_session_search-v0p2i (child of ibuuh.10, scenario B):
+// Attach-to-progress recommendation truthfulness.
+//
+// The sibling test above pins the numeric runtime surfaces during an
+// active rebuild (queue_depth, inflight bytes, controller mode). It
+// never looks at the USER-FACING `recommended_action` string. That
+// string is what agents and humans read off `cass status --json` to
+// decide what to do next when they see exit 1 / rebuild.active=true.
+//
+// Emitted from src/lib.rs::run_status (around line 11785) as:
+//   "Index rebuild is already in progress"
+//
+// The contract pinned here is the "attach, don't race" slice of
+// ibuuh.10: when a rebuild is already running, status must tell the
+// operator to WAIT, and must NOT tell them to run another
+// `cass index --full` (which would stampede the advisory lock at
+// src/lib.rs::probe_index_run_lock).
+//
+// KNOWN DIVERGENCE — bead coding_agent_session_search-k0bzk:
+// `cass health --json` exposes the same rebuild_progress.active=true
+// signal but its `recommended_action` currently emits the stampede
+// text "Run 'cass index --full' to rebuild the index/database." because
+// run_health (src/lib.rs:12051) forgot to add the rebuild_active arm
+// that run_status has. That's tracked as a separate bug; this test
+// pins the correct surface (status) to prevent its regression and
+// leaves the incorrect health surface to the bug fix.
+// ========================================================================
+
+#[test]
+fn status_recommended_action_during_active_rebuild_says_wait_not_reindex() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let _lock = seed_active_rebuild_runtime(&data_dir);
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args([
+            "status",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("XDG_DATA_HOME", test_home.path())
+        .env("HOME", test_home.path())
+        .output()
+        .expect("run cass status --json");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let payload: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("status JSON parse failed: {err}; stdout: {stdout}"));
+
+    // Precondition sanity: the seeded state really registered as an
+    // active rebuild. If this flips, everything else is moot.
+    assert_eq!(
+        payload
+            .get("rebuild")
+            .and_then(|r| r.get("active"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "seeded state must register as rebuild.active=true. stderr: {stderr}; \
+         payload: {payload}"
+    );
+
+    let recommended_action = payload
+        .get("recommended_action")
+        .and_then(Value::as_str)
+        .expect("status must emit recommended_action during rebuild");
+
+    // CONTRACT PIN 1: the string names the in-flight rebuild so agents
+    // and humans know "wait" is the right next step.
+    let lower = recommended_action.to_lowercase();
+    assert!(
+        (lower.contains("rebuild") && lower.contains("in progress"))
+            || lower.contains("already"),
+        "recommended_action must signal that a rebuild is active so agents attach \
+         to the in-flight work instead of starting a new one; got: \
+         {recommended_action:?}"
+    );
+
+    // CONTRACT PIN 2: NEVER tell the operator to run another index
+    // while a rebuild is active — that's what triggers lock-stampede.
+    assert!(
+        !lower.contains("cass index --full"),
+        "recommended_action must NOT tell the operator to run `cass index --full` \
+         while a rebuild is active (stampede advice); got: {recommended_action:?}"
+    );
+    assert!(
+        !lower.contains("run 'cass index'") && !lower.contains("run `cass index`"),
+        "recommended_action must NOT tell the operator to run `cass index` of any \
+         form while a rebuild is active; got: {recommended_action:?}"
+    );
+}
 // Cold-start readiness-surface progression.
 //
 // `cass health --json` is the authoritative readiness surface per
