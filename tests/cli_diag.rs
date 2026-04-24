@@ -514,3 +514,251 @@ fn diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir() {
         "fresh data-dir must have cleanup_apply_allowed=false; diag: {diag_summary:?}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-ibuuh.23 (lifecycle validation matrix:
+// cleanup/quarantine reporting on populated state).
+//
+// The sibling tests pin two halves of the surface separately:
+//   - `diag_json_quarantine_surfaces_retained_artifacts` exercises diag
+//     ALONE on a seeded quarantine state (failed seed bundles + retained
+//     publish backups + quarantined generation manifest).
+//   - `diag_and_doctor_agree_on_quarantine_summary_on_empty_data_dir`
+//     (bead p1x0z) pins diag↔doctor cross-command agreement but ONLY on
+//     a fresh empty data-dir.
+//
+// The natural gap they leave is the cartesian product: cross-command
+// agreement on a SEEDED state. An operator inspecting a real broken
+// install reads BOTH `cass diag --json --quarantine` and
+// `cass doctor --json` against the same data dir; if those surfaces
+// disagree about how many failed seed bundles / retained publish
+// backups / quarantined generations exist, or how many bytes are
+// reclaimable, they make different decisions about what to act on.
+// That exact divergence is the regression class ibuuh.23's
+// "cleanup/quarantine reporting" SCOPE bullet was created to defend
+// against.
+//
+// This test seeds the same fixture as
+// `diag_json_quarantine_surfaces_retained_artifacts` (so the two
+// tests share their factual basis) and asserts:
+//   1. Every shared scalar in `quarantine.summary` agrees byte-for-byte
+//      across diag and doctor.
+//   2. Both nested count bundles
+//      (lexical_generation_build_state_counts +
+//      lexical_generation_publish_state_counts) agree.
+//   3. The populated counts reach the expected non-zero values
+//      (catches a regression where ONE surface zeros out a counter
+//      because of a path-resolution bug — an empty-state agreement
+//      test would still pass even though both sides are
+//      zero-by-mistake).
+// ========================================================================
+
+#[test]
+fn diag_and_doctor_agree_on_quarantine_summary_on_seeded_state() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    let backups_dir = data_dir.join("backups");
+    fs::create_dir_all(&backups_dir).expect("create backups dir");
+
+    // Seed: same fixture as
+    // `diag_json_quarantine_surfaces_retained_artifacts` so the two
+    // tests share their factual basis. Two failed seed bundles
+    // (main + WAL sidecar), two retained publish backups (so
+    // retention cap of 1 reclaims one), and one quarantined
+    // lexical generation manifest with a single quarantined shard.
+    let failed_seed_root =
+        backups_dir.join("agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak");
+    fs::write(&failed_seed_root, b"seed-backup").expect("write failed seed bundle");
+    fs::write(
+        failed_seed_root.with_file_name(format!(
+            "{}-wal",
+            failed_seed_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("file name")
+        )),
+        b"seed-wal",
+    )
+    .expect("write failed seed wal");
+
+    let index_path = expected_index_dir(&data_dir);
+    fs::create_dir_all(&index_path).expect("create expected index dir");
+    let retained_publish_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join(".lexical-publish-backups");
+    fs::create_dir_all(&retained_publish_dir).expect("create retained publish dir");
+    let older_backup = retained_publish_dir.join("prior-live-older");
+    fs::create_dir_all(&older_backup).expect("create older retained backup");
+    fs::write(older_backup.join("segment-a"), b"retained-live-segment-old")
+        .expect("write older retained publish backup");
+    // The two backups must have distinct mtimes for the retention
+    // policy to pick a deterministic winner; without the sleep,
+    // filesystem-coarse timestamps tie and the test becomes flaky.
+    std::thread::sleep(Duration::from_millis(20));
+    let newer_backup = retained_publish_dir.join("prior-live-newer");
+    fs::create_dir_all(&newer_backup).expect("create newer retained backup");
+    fs::write(newer_backup.join("segment-b"), b"retained-live-segment-new")
+        .expect("write newer retained publish backup");
+
+    let generation_dir = index_path
+        .parent()
+        .expect("index parent")
+        .join("generation-quarantined");
+    write_quarantined_manifest(&generation_dir);
+    fs::write(
+        generation_dir.join("segment-a"),
+        b"quarantined-generation-bytes",
+    )
+    .expect("write quarantined generation artifact");
+
+    fn run_cass(test_home: &Path, data_dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args(args)
+            .arg("--data-dir")
+            .arg(data_dir)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            // Keep retention policy deterministic — same value as the
+            // sibling diag-only test so every cross-command field
+            // (including retained_publish_backup_retention_limit)
+            // resolves identically across both invocations.
+            .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
+            .env("XDG_DATA_HOME", test_home)
+            .env("XDG_CONFIG_HOME", test_home)
+            .env("HOME", test_home)
+            .output()
+            .expect("run cass")
+    }
+
+    let diag_out = run_cass(test_home.path(), &data_dir, &["diag", "--json", "--quarantine"]);
+    assert!(
+        diag_out.status.success(),
+        "cass diag --json --quarantine failed on seeded state: stderr={}",
+        String::from_utf8_lossy(&diag_out.stderr)
+    );
+    let diag_stdout = String::from_utf8_lossy(&diag_out.stdout);
+    let diag_json: Value = serde_json::from_str(&diag_stdout)
+        .unwrap_or_else(|err| panic!("diag JSON parse failed: {err}; stdout: {diag_stdout}"));
+
+    let doctor_out = run_cass(test_home.path(), &data_dir, &["doctor", "--json"]);
+    // doctor may exit non-zero on unhealthy state, but must still
+    // emit a parseable JSON envelope on stdout.
+    let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
+    let doctor_json: Value = serde_json::from_str(&doctor_stdout).unwrap_or_else(|err| {
+        panic!(
+            "doctor JSON parse failed: {err}; stdout: {doctor_stdout}\nstderr: {}",
+            String::from_utf8_lossy(&doctor_out.stderr)
+        )
+    });
+
+    let diag_summary = diag_json
+        .get("quarantine")
+        .and_then(|q| q.get("summary"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!("diag.quarantine.summary must be an object; diag: {diag_json}")
+        });
+    let doctor_summary = doctor_json
+        .get("quarantine")
+        .and_then(|q| q.get("summary"))
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "doctor.quarantine.summary must be an object; doctor: {doctor_json}"
+            )
+        });
+
+    // Same shared-scalar set as the empty-state sibling test so a
+    // future field addition shows up in BOTH places.
+    let shared_scalar_fields = [
+        "failed_seed_bundle_count",
+        "retained_publish_backup_count",
+        "retained_publish_backup_retention_limit",
+        "lexical_generation_count",
+        "lexical_quarantined_generation_count",
+        "lexical_quarantined_shard_count",
+        "total_retained_bytes",
+        "gc_eligible_asset_count",
+        "gc_eligible_bytes",
+        "inspection_required_asset_count",
+        "inspection_required_bytes",
+        "cleanup_dry_run_generation_count",
+        "cleanup_dry_run_reclaim_candidate_count",
+        "cleanup_dry_run_reclaimable_bytes",
+        "cleanup_dry_run_retained_bytes",
+        "cleanup_dry_run_protected_generation_count",
+        "cleanup_dry_run_active_generation_count",
+        "cleanup_dry_run_inspection_required_count",
+        "cleanup_dry_run_approval_fingerprint",
+        "cleanup_apply_allowed",
+    ];
+
+    for field in shared_scalar_fields {
+        let diag_val = diag_summary.get(field);
+        let doctor_val = doctor_summary.get(field);
+        assert_eq!(
+            diag_val, doctor_val,
+            "quarantine.summary.{field} must agree across diag and doctor on seeded \
+             state; diag={diag_val:?} doctor={doctor_val:?}"
+        );
+    }
+
+    for bundle in [
+        "lexical_generation_build_state_counts",
+        "lexical_generation_publish_state_counts",
+    ] {
+        assert_eq!(
+            diag_summary.get(bundle),
+            doctor_summary.get(bundle),
+            "quarantine.summary.{bundle} must agree across diag and doctor on seeded \
+             state; diag={:?} doctor={:?}",
+            diag_summary.get(bundle),
+            doctor_summary.get(bundle)
+        );
+    }
+
+    // Populated-state precondition: catches the failure mode where
+    // BOTH commands silently zero out a counter due to the same
+    // path-resolution bug — an empty-state agreement test would
+    // still pass under that regression. Pin the EXPECTED non-zero
+    // values from the seeded fixture so a regression that drops
+    // even one counter type immediately fails.
+    assert_eq!(
+        diag_summary.get("failed_seed_bundle_count").and_then(Value::as_u64),
+        Some(2),
+        "seeded state has 2 failed seed bundles (main + WAL sidecar); \
+         diag={diag_summary:?}"
+    );
+    assert_eq!(
+        diag_summary.get("retained_publish_backup_count").and_then(Value::as_u64),
+        Some(2),
+        "seeded state has 2 retained publish backups; diag={diag_summary:?}"
+    );
+    assert_eq!(
+        diag_summary
+            .get("retained_publish_backup_retention_limit")
+            .and_then(Value::as_u64),
+        Some(1),
+        "retention env var pins limit=1; diag={diag_summary:?}"
+    );
+    assert_eq!(
+        diag_summary.get("lexical_quarantined_generation_count").and_then(Value::as_u64),
+        Some(1),
+        "seeded state has 1 quarantined lexical generation; diag={diag_summary:?}"
+    );
+    assert_eq!(
+        diag_summary.get("lexical_quarantined_shard_count").and_then(Value::as_u64),
+        Some(1),
+        "the quarantined generation has 1 quarantined shard; diag={diag_summary:?}"
+    );
+    // Quarantined state is exactly the case where cleanup_apply_allowed
+    // must remain false (the operator hasn't approved the apply yet,
+    // and quarantined assets should never auto-reclaim regardless).
+    assert_eq!(
+        diag_summary.get("cleanup_apply_allowed").and_then(Value::as_bool),
+        Some(false),
+        "seeded quarantined state must report cleanup_apply_allowed=false (no auto-apply \
+         on quarantined generations); diag={diag_summary:?}"
+    );
+}
