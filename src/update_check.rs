@@ -237,6 +237,97 @@ pub fn open_in_browser(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn release_asset_url(version: &str, asset: &str) -> String {
+    format!("https://github.com/{GITHUB_REPO}/releases/download/{version}/{asset}")
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn unix_self_update_script() -> &'static str {
+    r#"
+set -euo pipefail
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/cass-self-update.XXXXXX")"
+cleanup() {
+    rm -r "$tmp" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+script="$tmp/install.sh"
+sums="$tmp/SHA256SUMS.txt"
+curl -fsSL "$1" -o "$script"
+curl -fsSL "$2" -o "$sums"
+
+expected="$(awk '$2 == "install.sh" { print $1; exit }' "$sums")"
+if ! printf '%s' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "install.sh checksum missing from SHA256SUMS.txt" >&2
+    exit 1
+fi
+expected_lc="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+
+if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$expected_lc" "$script" | sha256sum -c -
+elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$script" | awk '{ print $1 }' | tr '[:upper:]' '[:lower:]')"
+    if [ "$actual" != "$expected_lc" ]; then
+        echo "install.sh checksum mismatch" >&2
+        exit 1
+    fi
+elif command -v openssl >/dev/null 2>&1; then
+    actual="$(openssl dgst -sha256 "$script" | awk '{ print $NF }' | tr '[:upper:]' '[:lower:]')"
+    if [ "$actual" != "$expected_lc" ]; then
+        echo "install.sh checksum mismatch" >&2
+        exit 1
+    fi
+else
+    echo "No SHA-256 verification tool found" >&2
+    exit 1
+fi
+
+exec bash "$script" --easy-mode --verify --version "$3"
+"#
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_self_update_script() -> &'static str {
+    r#"
+$InstallUrl = $args[0]
+$ChecksumsUrl = $args[1]
+$Version = $args[2]
+$Temp = Join-Path ([IO.Path]::GetTempPath()) ("cass-self-update-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $Temp -Force | Out-Null
+try {
+    $Script = Join-Path $Temp "install.ps1"
+    $Sums = Join-Path $Temp "SHA256SUMS.txt"
+    Invoke-WebRequest -Uri $InstallUrl -OutFile $Script -UseBasicParsing
+    Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $Sums -UseBasicParsing
+
+    $Expected = $null
+    foreach ($Line in Get-Content -LiteralPath $Sums) {
+        $Parts = $Line.Trim() -split '\s+', 2
+        if ($Parts.Count -ge 2 -and $Parts[1] -eq "install.ps1" -and $Parts[0] -match '^[0-9a-fA-F]{64}$') {
+            $Expected = $Parts[0].ToLowerInvariant()
+            break
+        }
+    }
+    if (-not $Expected) {
+        Write-Error "install.ps1 checksum missing from SHA256SUMS.txt"
+        exit 1
+    }
+
+    $Actual = (Get-FileHash -LiteralPath $Script -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Actual -ne $Expected) {
+        Write-Error "install.ps1 checksum mismatch"
+        exit 1
+    }
+
+    & $Script -EasyMode -Verify -Version $Version
+    exit $LASTEXITCODE
+} finally {
+    Remove-Item -LiteralPath $Temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+"#
+}
+
 /// Run the self-update installer script interactively.
 /// This function does NOT return - it replaces the current process with the installer.
 /// The caller should ensure the terminal is in a clean state before calling.
@@ -255,15 +346,16 @@ pub fn run_self_update(version: &str) -> ! {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::process::CommandExt;
-        let install_url =
-            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/{version}/install.sh");
-        // Use positional args ($1, $2) instead of string interpolation to prevent injection
+        let install_url = release_asset_url(version, "install.sh");
+        let checksums_url = release_asset_url(version, "SHA256SUMS.txt");
+        // Use positional args instead of string interpolation to prevent injection.
         let err = std::process::Command::new("bash")
             .args([
                 "-c",
-                r#"curl -fsSL "$1" | bash -s -- --easy-mode --version "$2""#,
+                unix_self_update_script(),
                 "cass-updater",
                 &install_url,
+                &checksums_url,
                 version,
             ])
             .exec();
@@ -274,19 +366,19 @@ pub fn run_self_update(version: &str) -> ! {
 
     #[cfg(target_os = "windows")]
     {
-        let install_url =
-            format!("https://raw.githubusercontent.com/{GITHUB_REPO}/{version}/install.ps1");
-        // Version is validated above to contain only [0-9A-Za-z.+-v], safe for interpolation.
+        let install_url = release_asset_url(version, "install.ps1");
+        let checksums_url = release_asset_url(version, "SHA256SUMS.txt");
         // Windows doesn't have exec(), so we spawn and wait.
         let status = std::process::Command::new("powershell")
             .args([
                 "-ExecutionPolicy",
                 "Bypass",
+                "-NoProfile",
                 "-Command",
-                &format!(
-                    "& $([scriptblock]::Create((Invoke-WebRequest -Uri '{}' -UseBasicParsing).Content)) -EasyMode -Version {}",
-                    install_url, version
-                ),
+                windows_self_update_script(),
+                &install_url,
+                &checksums_url,
+                version,
             ])
             .status();
         match status {
@@ -308,6 +400,7 @@ pub fn run_self_update(version: &str) -> ! {
 ///   - `https://...` (any host)
 ///   - `http://127.0.0.1:<port>...` (local integration tests)
 ///   - `http://localhost:<port>...` (local integration tests)
+///
 /// Any other value falls back to the default GitHub URL with a
 /// one-shot stderr warning.
 fn release_api_base_url() -> String {
@@ -352,7 +445,7 @@ fn is_allowed_update_api_url(url: &str) -> bool {
                 || after_bracket.starts_with(':')
                 || after_bracket.starts_with('/');
         }
-        let host_end = rest.find(|c: char| c == ':' || c == '/').unwrap_or(rest.len());
+        let host_end = rest.find([':', '/']).unwrap_or(rest.len());
         let host = &rest[..host_end];
         matches!(host, "127.0.0.1" | "localhost")
     } else {
@@ -546,6 +639,39 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    #[test]
+    fn test_release_asset_url_uses_immutable_release_downloads() {
+        assert_eq!(
+            release_asset_url("v1.2.3", "install.sh"),
+            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v1.2.3/install.sh"
+        );
+        assert_eq!(
+            release_asset_url("v1.2.3", "SHA256SUMS.txt"),
+            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v1.2.3/SHA256SUMS.txt"
+        );
+    }
+
+    #[test]
+    fn test_unix_self_update_verifies_installer_script_before_running() {
+        let script = unix_self_update_script();
+        assert!(script.contains("SHA256SUMS.txt"));
+        assert!(script.contains(r#"$2 == "install.sh""#));
+        assert!(script.contains("sha256sum -c -"));
+        assert!(script.contains("shasum -a 256"));
+        assert!(script.contains("openssl dgst -sha256"));
+        assert!(script.contains(r#"exec bash "$script" --easy-mode --verify --version "$3""#));
+    }
+
+    #[test]
+    fn test_windows_self_update_verifies_installer_script_before_running() {
+        let script = windows_self_update_script();
+        assert!(script.contains("SHA256SUMS.txt"));
+        assert!(script.contains(r#"$Parts[1] -eq "install.ps1""#));
+        assert!(script.contains("Get-FileHash"));
+        assert!(script.contains("-EasyMode -Verify -Version $Version"));
+        assert!(script.contains("Remove-Item -LiteralPath $Temp"));
+    }
+
     /// `coding_agent_session_search-87sqx`: the allow-list on
     /// `CASS_UPDATE_API_BASE_URL` must reject non-https overrides
     /// against non-loopback hosts (malicious .env / shell pollution)
@@ -576,9 +702,7 @@ mod tests {
         assert!(!is_allowed_update_api_url("http://example.com/api"));
         // Prefix attack: host must match exactly, not be a prefix
         // of a longer attacker-controlled hostname.
-        assert!(!is_allowed_update_api_url(
-            "http://127.0.0.1.attacker.com"
-        ));
+        assert!(!is_allowed_update_api_url("http://127.0.0.1.attacker.com"));
         assert!(!is_allowed_update_api_url("http://localhost.attacker.com"));
     }
 

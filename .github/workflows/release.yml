@@ -258,6 +258,14 @@ jobs:
             exit 1
           fi
 
+      - name: Copy install scripts
+        run: |
+          cp install.sh artifacts/
+          cp install.ps1 artifacts/
+          cd artifacts
+          sha256sum install.sh > install.sh.sha256
+          sha256sum install.ps1 > install.ps1.sha256
+
       - name: List artifacts
         run: |
           echo "## Release Artifacts" >> $GITHUB_STEP_SUMMARY
@@ -274,11 +282,6 @@ jobs:
         run: |
           cd artifacts
           cat *.sha256 > SHA256SUMS.txt
-
-      - name: Copy install scripts
-        run: |
-          cp install.sh artifacts/
-          cp install.ps1 artifacts/
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@62ad5284b8ced813296287a0b63906cb364b73ee # v0
