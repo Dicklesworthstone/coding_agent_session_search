@@ -42,6 +42,7 @@ use tempfile::TempDir;
 
 fn cass_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.current_dir(home);
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd.env("HOME", home);
@@ -66,12 +67,17 @@ fn seed_codex_session(
 ) {
     let sessions = codex_home.join(format!("sessions/{date_path}"));
     fs::create_dir_all(&sessions).unwrap();
+    let actual_filename = if filename.starts_with("rollout-") {
+        filename.to_string()
+    } else {
+        format!("rollout-{filename}")
+    };
     let workspace = codex_home.to_string_lossy().into_owned();
     let lines = [
         json!({
             "timestamp": iso_ts(ts_ms),
             "type": "session_meta",
-            "payload": { "id": filename, "cwd": workspace, "cli_version": "0.42.0" },
+            "payload": { "id": actual_filename.clone(), "cwd": workspace, "cli_version": "0.42.0" },
         }),
         json!({
             "timestamp": iso_ts(ts_ms + 1_000),
@@ -95,7 +101,7 @@ fn seed_codex_session(
         body.push_str(&serde_json::to_string(&line).unwrap());
         body.push('\n');
     }
-    fs::write(sessions.join(filename), body).unwrap();
+    fs::write(sessions.join(actual_filename), body).unwrap();
 }
 
 fn force_federated_publish_env(cmd: &mut Command) {
@@ -364,7 +370,7 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     let base_ts = 1_700_000_000_000i64;
     seed_codex_session(
         &codex_home,
-        "2023-11-14",
+        "2023/11/14",
         "s1.jsonl",
         base_ts,
         "killrelaunch",
@@ -377,7 +383,8 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     force_federated_publish_env(&mut cmd);
     cmd.assert().success();
 
-    let index_path = data_dir.join("index/tantivy");
+    let index_path = coding_agent_search::search::tantivy::index_dir(&data_dir)
+        .expect("resolve versioned tantivy index path");
 
     // Confirm there IS a live index now.
     let before_summary =
@@ -391,7 +398,7 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     // Phase 2: seed a second session so --force-rebuild builds a NEW index.
     seed_codex_session(
         &codex_home,
-        "2023-11-15",
+        "2023/11/15",
         "s2.jsonl",
         base_ts + 86_400_000,
         "killrelaunch extra",
@@ -403,6 +410,7 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     // Spawn cass index --full --force-rebuild with the pause sentinel.
     let cass_bin = assert_cmd::cargo::cargo_bin!("cass");
     let mut child = StdCommand::new(cass_bin)
+        .current_dir(&home)
         .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
         .arg(&data_dir)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -510,7 +518,18 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
     // Search must still work and return results.
     let mut search_cmd = cass_cmd(&home);
     search_cmd
-        .args(["search", "killrelaunch", "--robot", "--data-dir"])
+        .args([
+            "search",
+            "killrelaunch",
+            "--json",
+            "--mode",
+            "lexical",
+            "--fields",
+            "minimal",
+            "--limit",
+            "5",
+            "--data-dir",
+        ])
         .arg(&data_dir);
     let search_output = search_cmd.output().expect("search after recovery");
     assert!(
@@ -528,6 +547,7 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
         });
     let results = search_json["results"]
         .as_array()
+        .or_else(|| search_json["hits"].as_array())
         .or_else(|| search_json.as_array());
     assert!(
         results.is_some_and(|r| !r.is_empty()),

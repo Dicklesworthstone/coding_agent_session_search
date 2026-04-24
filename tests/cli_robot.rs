@@ -1557,36 +1557,38 @@ fn find_arg<'a>(cmd: &'a Value, name: &str) -> &'a Value {
 
 #[test]
 fn introspect_commands_match_clap_subcommands() {
-    let json = fetch_introspect_json();
+    run_on_large_stack(|| {
+        let json = fetch_introspect_json();
 
-    let clap_cmd = Cli::command();
-    let clap_commands: HashSet<String> = clap_cmd
-        .get_subcommands()
-        .map(|c: &clap::Command| c.get_name().to_string())
-        .collect();
+        let clap_cmd = Cli::command();
+        let clap_commands: HashSet<String> = clap_cmd
+            .get_subcommands()
+            .map(|c: &clap::Command| c.get_name().to_string())
+            .collect();
 
-    let introspect_commands: HashSet<String> = json["commands"]
-        .as_array()
-        .expect("commands array")
-        .iter()
-        .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
-        .collect();
+        let introspect_commands: HashSet<String> = json["commands"]
+            .as_array()
+            .expect("commands array")
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
+            .collect();
 
-    assert_eq!(
-        clap_commands, introspect_commands,
-        "introspect should list exactly the Clap subcommands"
-    );
-
-    // Ensure no help/version pseudo-args leak into schemas
-    for cmd in json["commands"].as_array().unwrap() {
-        let args = cmd["arguments"].as_array().unwrap();
-        assert!(
-            !args
-                .iter()
-                .any(|a| a["name"] == "help" || a["name"] == "version"),
-            "help/version flags should be hidden in introspect"
+        assert_eq!(
+            clap_commands, introspect_commands,
+            "introspect should list exactly the Clap subcommands"
         );
-    }
+
+        // Ensure no help/version pseudo-args leak into schemas
+        for cmd in json["commands"].as_array().unwrap() {
+            let args = cmd["arguments"].as_array().unwrap();
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a["name"] == "help" || a["name"] == "version"),
+                "help/version flags should be hidden in introspect"
+            );
+        }
+    });
 }
 
 #[test]
