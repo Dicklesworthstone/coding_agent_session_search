@@ -10642,8 +10642,21 @@ struct DiagCleanupApplyResult {
     pruned_asset_count: usize,
     skipped_asset_count: usize,
     reclaimed_bytes: u64,
+    before_inventory: DiagCleanupApplyInventory,
+    after_inventory: DiagCleanupApplyInventory,
     actions: Vec<DiagCleanupApplyAction>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DiagCleanupApplyInventory {
+    summary: DiagQuarantineSummary,
+    failed_seed_bundle_files: Vec<DiagQuarantineArtifact>,
+    retained_publish_backups: Vec<DiagQuarantineArtifact>,
+    quarantined_artifacts: Vec<DiagQuarantineInspectionArtifact>,
+    lexical_cleanup_inventories:
+        Vec<crate::indexer::lexical_generation::LexicalGenerationCleanupInventory>,
+    reclaim_candidates: Vec<crate::indexer::lexical_generation::LexicalCleanupReclaimCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -11129,6 +11142,7 @@ fn apply_diag_quarantine_cleanup(
         before_reclaim_candidate_count: plan.reclaim_candidates.len(),
         before_reclaimable_bytes: plan.total_reclaimable_bytes,
         before_retained_bytes: plan.total_retained_bytes,
+        before_inventory: cleanup_apply_inventory_from_report(&before),
         ..DiagCleanupApplyResult::default()
     };
 
@@ -11299,11 +11313,29 @@ fn apply_diag_quarantine_cleanup(
 }
 
 fn fill_cleanup_after_summary(result: &mut DiagCleanupApplyResult, after: &DiagQuarantineReport) {
+    result.after_inventory = cleanup_apply_inventory_from_report(after);
     if let Some(plan) = after.lexical_cleanup_dry_run.as_ref() {
         result.after_generation_count = plan.generation_count;
         result.after_reclaim_candidate_count = plan.reclaim_candidates.len();
         result.after_reclaimable_bytes = plan.total_reclaimable_bytes;
         result.after_retained_bytes = plan.total_retained_bytes;
+    }
+}
+
+fn cleanup_apply_inventory_from_report(report: &DiagQuarantineReport) -> DiagCleanupApplyInventory {
+    let (lexical_cleanup_inventories, reclaim_candidates) = report
+        .lexical_cleanup_dry_run
+        .as_ref()
+        .map(|plan| (plan.inventories.clone(), plan.reclaim_candidates.clone()))
+        .unwrap_or_default();
+
+    DiagCleanupApplyInventory {
+        summary: report.summary.clone(),
+        failed_seed_bundle_files: report.failed_seed_bundle_files.clone(),
+        retained_publish_backups: report.retained_publish_backups.clone(),
+        quarantined_artifacts: report.quarantined_artifacts.clone(),
+        lexical_cleanup_inventories,
+        reclaim_candidates,
     }
 }
 

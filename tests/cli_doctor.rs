@@ -427,6 +427,71 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         cleanup["reclaimed_bytes"].as_u64().unwrap_or(0) > 0,
         "apply result should summarize reclaimed bytes"
     );
+    let before_inventory = &cleanup["before_inventory"];
+    let after_inventory = &cleanup["after_inventory"];
+    assert_eq!(
+        before_inventory["summary"]["retained_publish_backup_count"].as_u64(),
+        Some(2),
+        "before inventory should report both retained publish backups"
+    );
+    assert_eq!(
+        after_inventory["summary"]["retained_publish_backup_count"].as_u64(),
+        Some(1),
+        "after inventory should report the protected retained publish backup that remains"
+    );
+    assert!(
+        before_inventory["retained_publish_backups"]
+            .as_array()
+            .expect("before retained publish backups")
+            .iter()
+            .any(|entry| entry["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("prior-live-older")),
+        "before inventory should include the retained backup that will be pruned"
+    );
+    assert!(
+        !after_inventory["retained_publish_backups"]
+            .as_array()
+            .expect("after retained publish backups")
+            .iter()
+            .any(|entry| entry["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("prior-live-older")),
+        "after inventory should omit the pruned retained backup"
+    );
+    assert!(
+        before_inventory["lexical_cleanup_inventories"]
+            .as_array()
+            .expect("before lexical inventories")
+            .iter()
+            .any(|entry| entry["generation_id"].as_str() == Some("gen-superseded")),
+        "before inventory should include the superseded generation candidate"
+    );
+    assert!(
+        !after_inventory["lexical_cleanup_inventories"]
+            .as_array()
+            .expect("after lexical inventories")
+            .iter()
+            .any(|entry| entry["generation_id"].as_str() == Some("gen-superseded")),
+        "after inventory should omit the pruned superseded generation"
+    );
+    assert_eq!(
+        before_inventory["reclaim_candidates"]
+            .as_array()
+            .expect("before reclaim candidates")
+            .len(),
+        1,
+        "before inventory should expose the generation reclaim candidate"
+    );
+    assert!(
+        after_inventory["reclaim_candidates"]
+            .as_array()
+            .expect("after reclaim candidates")
+            .is_empty(),
+        "after inventory should show no remaining reclaim candidates"
+    );
     let actions = cleanup["actions"].as_array().expect("cleanup actions");
     assert!(
         actions.iter().any(|action| {
