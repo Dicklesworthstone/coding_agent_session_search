@@ -1135,39 +1135,37 @@ impl RefreshLedgerEvidenceComparison {
         let duration_pct = self.aggregate_duration_delta_pct.unwrap_or(0.0);
         let phase_count = self.phase_deltas.len();
 
+        // [coding_agent_session_search-urscl] Pre-fix this branch
+        // repeated the same 6-field tracing payload across three
+        // tracing::{warn,info,debug}! call sites. A field added in
+        // one branch but forgotten in another would silently ship.
+        // The local `emit_tier!` macro inlines the shared payload at
+        // each call site (no runtime cost — same code generation as
+        // before), so adding a field once propagates to all three
+        // tiers and the per-tier difference is reduced to (macro
+        // ident, message literal). Tests continue to observe the
+        // per-tier level + message exactly as before.
+        let aggregate_throughput_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0);
+        macro_rules! emit_tier {
+            ($macro:ident, $msg:literal) => {
+                tracing::$macro!(
+                    target: "cass::indexer::lexical_refresh",
+                    aggregate_duration_delta_pct = duration_pct,
+                    aggregate_throughput_delta_pct = aggregate_throughput_pct,
+                    aggregate_duration = %aggregate_duration_str,
+                    aggregate_throughput = %aggregate_throughput_str,
+                    dominant_phase_shift = %dominant_shift_str,
+                    phase_count,
+                    $msg
+                )
+            };
+        }
         if duration_pct >= SLOWDOWN_WARN_THRESHOLD_PCT {
-            tracing::warn!(
-                target: "cass::indexer::lexical_refresh",
-                aggregate_duration_delta_pct = duration_pct,
-                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
-                aggregate_duration = %aggregate_duration_str,
-                aggregate_throughput = %aggregate_throughput_str,
-                dominant_phase_shift = %dominant_shift_str,
-                phase_count,
-                "lexical refresh evidence: significant slowdown vs previous publish"
-            );
+            emit_tier!(warn, "lexical refresh evidence: significant slowdown vs previous publish");
         } else if duration_pct <= IMPROVEMENT_INFO_THRESHOLD_PCT {
-            tracing::info!(
-                target: "cass::indexer::lexical_refresh",
-                aggregate_duration_delta_pct = duration_pct,
-                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
-                aggregate_duration = %aggregate_duration_str,
-                aggregate_throughput = %aggregate_throughput_str,
-                dominant_phase_shift = %dominant_shift_str,
-                phase_count,
-                "lexical refresh evidence: notable improvement vs previous publish"
-            );
+            emit_tier!(info, "lexical refresh evidence: notable improvement vs previous publish");
         } else {
-            tracing::debug!(
-                target: "cass::indexer::lexical_refresh",
-                aggregate_duration_delta_pct = duration_pct,
-                aggregate_throughput_delta_pct = self.aggregate_throughput_delta_pct.unwrap_or(0.0),
-                aggregate_duration = %aggregate_duration_str,
-                aggregate_throughput = %aggregate_throughput_str,
-                dominant_phase_shift = %dominant_shift_str,
-                phase_count,
-                "lexical refresh evidence: cross-run comparison"
-            );
+            emit_tier!(debug, "lexical refresh evidence: cross-run comparison");
         }
     }
 }

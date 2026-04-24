@@ -820,53 +820,50 @@ impl LexicalCleanupDryRunPlan {
         // log line answers "what got pruned?" and "why was X kept?"
         // without grepping multiple sources.
         let disposition_str = inventory.disposition.as_str();
+        // [coding_agent_session_search-urscl] Pre-fix this match
+        // repeated the same 8-field tracing payload across three
+        // tracing::{debug,warn,info}! call sites. A field added in
+        // one branch but forgotten in another would silently ship.
+        // The local `emit_tier!` macro inlines the shared payload at
+        // each call site (no runtime cost — same code generation),
+        // so adding a field once propagates to all three tiers and
+        // the per-tier difference is reduced to (macro ident,
+        // message literal). The exhaustive disposition severity
+        // tests (record_inventory_emits_correct_severity_for_every_disposition_variant)
+        // continue to observe the per-tier level + message exactly
+        // as before because each branch still expands to the same
+        // tracing macro call.
+        let shard_count = inventory.shards.len();
+        macro_rules! emit_tier {
+            ($macro:ident, $msg:literal) => {
+                tracing::$macro!(
+                    target: "cass::indexer::lexical_cleanup",
+                    generation_id = %inventory.generation_id,
+                    disposition = disposition_str,
+                    reason = %inventory.reason,
+                    reclaimable_bytes = inventory.reclaimable_bytes,
+                    retained_bytes = inventory.retained_bytes,
+                    artifact_bytes = inventory.artifact_bytes,
+                    shard_count,
+                    inspection_required = inventory_requires_inspection,
+                    $msg
+                )
+            };
+        }
         match inventory.disposition {
             LexicalCleanupDisposition::SupersededReclaimable
             | LexicalCleanupDisposition::FailedReclaimable => {
-                tracing::debug!(
-                    target: "cass::indexer::lexical_cleanup",
-                    generation_id = %inventory.generation_id,
-                    disposition = disposition_str,
-                    reason = %inventory.reason,
-                    reclaimable_bytes = inventory.reclaimable_bytes,
-                    retained_bytes = inventory.retained_bytes,
-                    artifact_bytes = inventory.artifact_bytes,
-                    shard_count = inventory.shards.len(),
-                    inspection_required = inventory_requires_inspection,
-                    "lexical cleanup classified generation as reclaimable"
-                );
+                emit_tier!(debug, "lexical cleanup classified generation as reclaimable");
             }
             LexicalCleanupDisposition::QuarantinedRetained
             | LexicalCleanupDisposition::FailedRetained => {
-                tracing::warn!(
-                    target: "cass::indexer::lexical_cleanup",
-                    generation_id = %inventory.generation_id,
-                    disposition = disposition_str,
-                    reason = %inventory.reason,
-                    reclaimable_bytes = inventory.reclaimable_bytes,
-                    retained_bytes = inventory.retained_bytes,
-                    artifact_bytes = inventory.artifact_bytes,
-                    shard_count = inventory.shards.len(),
-                    inspection_required = inventory_requires_inspection,
-                    "lexical cleanup retained generation pending operator inspection"
-                );
+                emit_tier!(warn, "lexical cleanup retained generation pending operator inspection");
             }
             LexicalCleanupDisposition::ActiveWork
             | LexicalCleanupDisposition::CurrentPublished
             | LexicalCleanupDisposition::SupersededRetained
             | LexicalCleanupDisposition::PinnedRetained => {
-                tracing::info!(
-                    target: "cass::indexer::lexical_cleanup",
-                    generation_id = %inventory.generation_id,
-                    disposition = disposition_str,
-                    reason = %inventory.reason,
-                    reclaimable_bytes = inventory.reclaimable_bytes,
-                    retained_bytes = inventory.retained_bytes,
-                    artifact_bytes = inventory.artifact_bytes,
-                    shard_count = inventory.shards.len(),
-                    inspection_required = inventory_requires_inspection,
-                    "lexical cleanup retained generation by policy"
-                );
+                emit_tier!(info, "lexical cleanup retained generation by policy");
             }
         }
         // Suppress the "unused" lint for diagnostics-only locals so the
