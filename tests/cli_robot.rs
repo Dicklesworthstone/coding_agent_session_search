@@ -5476,3 +5476,231 @@ fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
         "total_matches must be invariant across --limit; small: {small}\nlarge: {large}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-pdg22 (child of ibuuh.10):
+// Metamorphic invariants for `cass stats --json`.
+//
+// `cass stats --json` aggregates counts (total conversations, total
+// messages, per-agent breakdown, top workspaces, date range) over the
+// entire canonical DB. The existing suite only asserts specific
+// fixture snapshots; nothing pins the GENERIC invariants stats
+// aggregation must preserve across any corpus:
+//
+//   1. By-agent sum == total conversations. If the sum drifts, some
+//      agent's contribution is lost or double-counted — a real bug
+//      the snapshot tests don't catch because they only inspect one
+//      frozen corpus.
+//
+//   2. date_range.oldest <= date_range.newest (when both are present).
+//      An aggregation regression that swapped min/max or produced
+//      timezone-inconsistent timestamps would trip here.
+//
+//   3. Empty DB (fresh index with no sessions) → conversations=0,
+//      messages=0, by_agent=[]. A regression that inherited cached
+//      values from a prior run or hallucinated counts would fire.
+//
+// All three seed a fresh corpus (or explicitly empty one) per test
+// via the jogco helpers already defined above, so no cross-test state
+// bleed.
+// ========================================================================
+
+#[test]
+fn stats_by_agent_counts_sum_to_total_conversations() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    // Seed 3 rollouts so the by_agent bucket has meaningful data.
+    for idx in 1..=3 {
+        let name = format!("rollout-stats-{idx:02}.jsonl");
+        seed_codex_session_s0cmk(&codex_home, &name, "statsprobe");
+    }
+
+    let mut idx_cmd = isolated_cass_cmd(home);
+    idx_cmd
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let idx_out = idx_cmd.output().expect("run cass index --full");
+    assert!(
+        idx_out.status.success(),
+        "cass index --full must succeed on seeded corpus. stderr: {}",
+        String::from_utf8_lossy(&idx_out.stderr)
+    );
+
+    let mut stats_cmd = isolated_cass_cmd(home);
+    stats_cmd
+        .args(["stats", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let stats_out = stats_cmd.output().expect("run cass stats --json");
+    assert!(
+        stats_out.status.success(),
+        "cass stats --json must succeed; stderr: {}",
+        String::from_utf8_lossy(&stats_out.stderr)
+    );
+    let stats: Value = serde_json::from_slice(&stats_out.stdout)
+        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+
+    let total = stats
+        .get("conversations")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            panic!("stats.conversations must be a non-null u64; stats: {stats}")
+        });
+    assert!(
+        total >= 1,
+        "precondition: seeded corpus must produce at least 1 conversation; \
+         stats: {stats}"
+    );
+
+    let by_agent = stats
+        .get("by_agent")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("stats.by_agent must be an array; stats: {stats}"));
+    let mut agent_sum: u64 = 0;
+    for entry in by_agent {
+        let agent = entry
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("by_agent entry must have non-null `agent`; entry: {entry}"));
+        assert!(
+            !agent.is_empty(),
+            "by_agent.agent must be non-empty; entry: {entry}"
+        );
+        let count = entry
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("by_agent entry must have non-null u64 `count`; entry: {entry}"));
+        agent_sum = agent_sum
+            .checked_add(count)
+            .unwrap_or_else(|| panic!("by_agent count overflow; accumulated {agent_sum}"));
+    }
+
+    assert_eq!(
+        agent_sum, total,
+        "sum of by_agent[].count must equal conversations total; \
+         sum={agent_sum} total={total}\nstats: {stats}"
+    );
+}
+
+#[test]
+fn stats_date_range_oldest_is_not_after_newest() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    for idx in 1..=3 {
+        let name = format!("rollout-daterange-{idx:02}.jsonl");
+        seed_codex_session_s0cmk(&codex_home, &name, "staterange");
+    }
+
+    let mut idx_cmd = isolated_cass_cmd(home);
+    idx_cmd
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    assert!(
+        idx_cmd.output().expect("run index").status.success(),
+        "seed index must succeed"
+    );
+
+    let mut stats_cmd = isolated_cass_cmd(home);
+    stats_cmd
+        .args(["stats", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let stats_out = stats_cmd.output().expect("run cass stats");
+    let stats: Value = serde_json::from_slice(&stats_out.stdout)
+        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+
+    // date_range may be absent if no messages have timestamps — but
+    // with seeded rollouts it must be present AND ordered.
+    let date_range = stats
+        .get("date_range")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("stats.date_range must be an object; stats: {stats}"));
+    let oldest = date_range
+        .get("oldest")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("stats.date_range.oldest must be a string on a seeded corpus; stats: {stats}")
+        });
+    let newest = date_range
+        .get("newest")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("stats.date_range.newest must be a string on a seeded corpus; stats: {stats}")
+        });
+
+    // Lexicographic string compare is safe for RFC3339 timestamps
+    // (they're fixed-width and zero-padded), AND the actual parsed
+    // comparison gives extra robustness against a format regression.
+    assert!(
+        oldest <= newest,
+        "date_range.oldest must lex-sort <= newest; oldest={oldest:?} newest={newest:?}"
+    );
+    let oldest_dt = chrono::DateTime::parse_from_rfc3339(oldest)
+        .unwrap_or_else(|err| panic!("oldest must be RFC3339: {err}; value: {oldest:?}"));
+    let newest_dt = chrono::DateTime::parse_from_rfc3339(newest)
+        .unwrap_or_else(|err| panic!("newest must be RFC3339: {err}; value: {newest:?}"));
+    assert!(
+        oldest_dt <= newest_dt,
+        "date_range parsed ordering must hold: {oldest_dt} <= {newest_dt}"
+    );
+}
+
+#[test]
+fn stats_on_empty_indexed_db_reports_zeroes_and_empty_by_agent() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    // Deliberately no seeded rollouts — cass index --full against an
+    // empty CODEX_HOME must produce a DB with zero user content, and
+    // stats must reflect that truthfully.
+
+    let mut idx_cmd = isolated_cass_cmd(home);
+    idx_cmd
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let idx_out = idx_cmd.output().expect("run cass index --full");
+    assert!(
+        idx_out.status.success(),
+        "cass index --full must succeed even on an empty source tree; stderr: {}",
+        String::from_utf8_lossy(&idx_out.stderr)
+    );
+
+    let mut stats_cmd = isolated_cass_cmd(home);
+    stats_cmd
+        .args(["stats", "--json", "--data-dir"])
+        .arg(&data_dir);
+    let stats_out = stats_cmd.output().expect("run cass stats");
+    assert!(
+        stats_out.status.success(),
+        "cass stats must succeed against an empty indexed DB (not error); \
+         stderr: {}",
+        String::from_utf8_lossy(&stats_out.stderr)
+    );
+    let stats: Value = serde_json::from_slice(&stats_out.stdout)
+        .unwrap_or_else(|err| panic!("stats JSON parse failed: {err}"));
+
+    assert_eq!(
+        stats.get("conversations").and_then(Value::as_u64),
+        Some(0),
+        "empty indexed DB must report conversations=0; stats: {stats}"
+    );
+    assert_eq!(
+        stats.get("messages").and_then(Value::as_u64),
+        Some(0),
+        "empty indexed DB must report messages=0; stats: {stats}"
+    );
+    let by_agent = stats
+        .get("by_agent")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("stats.by_agent must be an array; stats: {stats}"));
+    assert!(
+        by_agent.is_empty(),
+        "empty indexed DB must produce empty by_agent[]; got {} entries: {by_agent:?}",
+        by_agent.len()
+    );
+}
