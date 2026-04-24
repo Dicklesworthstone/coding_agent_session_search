@@ -26,6 +26,7 @@ use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use indexer::IndexOptions;
+use model::cli_error_kind::ErrorKind as CliErrorKind;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -1770,7 +1771,7 @@ impl CliError {
     fn usage(message: impl Into<String>, hint: Option<String>) -> Self {
         CliError {
             code: 2,
-            kind: "usage",
+            kind: CliErrorKind::Usage.kind_str(),
             message: message.into(),
             hint,
             retryable: false,
@@ -1780,7 +1781,7 @@ impl CliError {
     fn unknown(message: impl Into<String>) -> Self {
         CliError {
             code: 9,
-            kind: "unknown",
+            kind: CliErrorKind::Unknown.kind_str(),
             message: message.into(),
             hint: None,
             retryable: false,
@@ -2713,7 +2714,7 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
                         if friendly.trim().starts_with('{') {
                             return Err(CliError {
                                 code: 2,
-                                kind: "usage",
+                                kind: CliErrorKind::Usage.kind_str(),
                                 message: friendly,
                                 hint: None,
                                 retryable: false,
@@ -2728,7 +2729,7 @@ pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
                 if friendly.trim().starts_with('{') {
                     return Err(CliError {
                         code: 2,
-                        kind: "usage",
+                        kind: CliErrorKind::Usage.kind_str(),
                         message: friendly,
                         hint: None,
                         retryable: false,
@@ -2966,7 +2967,7 @@ async fn execute_cli(
                 .await
                 .map_err(|e| CliError {
                     code: 9,
-                    kind: "update-check",
+                    kind: CliErrorKind::UpdateCheck.kind_str(),
                     message: format!("update check failed: {e}"),
                     hint: None,
                     retryable: false,
@@ -3012,7 +3013,7 @@ async fn execute_cli(
                         Err(e) => {
                             return Err(CliError {
                                 code: 9,
-                                kind: "tui-reset-state",
+                                kind: CliErrorKind::TuiResetState.kind_str(),
                                 message: format!(
                                     "failed to remove persisted state {}: {e}",
                                     state_path.display()
@@ -3034,7 +3035,7 @@ async fn execute_cli(
                     prepare_headless_once_tui_artifacts(&tui_data_dir, asciicast.as_deref())
                         .map_err(|e| CliError {
                             code: 9,
-                            kind: "tui-headless-once",
+                            kind: CliErrorKind::TuiHeadlessOnce.kind_str(),
                             message: format!(
                                 "headless --once TUI bootstrap failed for {}: {e}",
                                 tui_data_dir.display()
@@ -3064,7 +3065,7 @@ async fn execute_cli(
                     if let Err(e) = run_result {
                         return Err(CliError {
                             code: 9,
-                            kind: "tui",
+                            kind: CliErrorKind::Tui.kind_str(),
                             message: format!("tui failed: {e}"),
                             hint: None,
                             retryable: false,
@@ -3378,7 +3379,7 @@ async fn execute_cli(
                         )
                         .map_err(|e| CliError {
                             code: 2,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Failed to load config: {e}"),
                             hint: Some(
                                 "Check config file syntax with --example-config".to_string(),
@@ -3412,7 +3413,7 @@ async fn execute_cli(
                         {
                             return Err(CliError {
                                 code: 2,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: format!(
                                     "Cloudflare credentials provided via CLI but deployment.target is '{target_name}'"
                                 ),
@@ -3427,7 +3428,7 @@ async fn execute_cli(
                         // Resolve environment variables
                         pages_config.resolve_env_vars().map_err(|e| CliError {
                             code: 2,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Failed to resolve env vars: {e}"),
                             hint: Some(
                                 "Ensure referenced environment variables are set".to_string(),
@@ -3447,7 +3448,7 @@ async fn execute_cli(
                             if !validation.valid {
                                 return Err(CliError {
                                     code: 2,
-                                    kind: "pages",
+                                    kind: CliErrorKind::Pages.kind_str(),
                                     message: "Configuration validation failed".to_string(),
                                     hint: Some("Review errors in JSON output".to_string()),
                                     retryable: false,
@@ -3470,7 +3471,7 @@ async fn execute_cli(
                             }
                             return Err(CliError {
                                 code: 2,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: "Configuration validation failed".to_string(),
                                 hint: Some("Fix errors listed above".to_string()),
                                 retryable: false,
@@ -3497,7 +3498,7 @@ async fn execute_cli(
                             pages_config.to_wizard_state(db_path.clone()).map_err(|e| {
                                 CliError {
                                     code: 9,
-                                    kind: "pages",
+                                    kind: CliErrorKind::Pages.kind_str(),
                                     message: format!("Failed to create wizard state: {e}"),
                                     hint: None,
                                     retryable: false,
@@ -3515,7 +3516,7 @@ async fn execute_cli(
                         )
                         .map_err(|e| CliError {
                             code: 9,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Export failed: {e}"),
                             hint: None,
                             retryable: false,
@@ -3528,7 +3529,7 @@ async fn execute_cli(
                     if validate_config {
                         return Err(CliError {
                             code: 2,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: "--validate-config requires --config".to_string(),
                             hint: Some("Use --config <path> --validate-config".to_string()),
                             retryable: false,
@@ -3546,7 +3547,7 @@ async fn execute_cli(
                             .await
                             .map_err(|e| CliError {
                                 code: 9,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: format!("Preview server failed: {e}"),
                                 hint: Some(
                                     "Check that the directory exists and port is available"
@@ -3566,7 +3567,7 @@ async fn execute_cli(
                         );
                         return Err(CliError {
                             code: crate::pages::confirmation::EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: "Unencrypted exports are not allowed in robot mode"
                                 .to_string(),
                             hint: Some(
@@ -3581,7 +3582,7 @@ async fn execute_cli(
                         let result = crate::pages::verify::verify_bundle(&verify_path, verbose)
                             .map_err(|e| CliError {
                                 code: 9,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: format!("Verification failed: {e}"),
                                 hint: None,
                                 retryable: false,
@@ -3600,7 +3601,7 @@ async fn execute_cli(
                         if result.status != "valid" {
                             return Err(CliError {
                                 code: 1,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: "Bundle verification failed".to_string(),
                                 hint: Some(
                                     "Run with --verbose for detailed error information".to_string(),
@@ -3632,7 +3633,7 @@ async fn execute_cli(
                         )
                         .map_err(|e| CliError {
                             code: 9,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Secret scan config error: {e}"),
                             hint: None,
                             retryable: false,
@@ -3647,7 +3648,7 @@ async fn execute_cli(
                         )
                         .map_err(|e| CliError {
                             code: 9,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Secret scan failed: {e}"),
                             hint: None,
                             retryable: false,
@@ -3677,7 +3678,7 @@ async fn execute_cli(
                             let mut input = String::new();
                             std::io::stdin().read_line(&mut input).map_err(|e| CliError {
                                 code: crate::pages::confirmation::EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: format!("Failed to read input: {e}"),
                                 hint: None,
                                 retryable: false,
@@ -3693,7 +3694,7 @@ async fn execute_cli(
                                     let mut confirm = String::new();
                                     std::io::stdin().read_line(&mut confirm).map_err(|e| CliError {
                                         code: crate::pages::confirmation::EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED,
-                                        kind: "pages",
+                                        kind: CliErrorKind::Pages.kind_str(),
                                         message: format!("Failed to read input: {e}"),
                                         hint: None,
                                         retryable: false,
@@ -3707,7 +3708,7 @@ async fn execute_cli(
                                         );
                                         return Err(CliError {
                                             code: crate::pages::confirmation::EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED,
-                                            kind: "pages",
+                                            kind: CliErrorKind::Pages.kind_str(),
                                             message: "Unencrypted export not confirmed".to_string(),
                                             hint: Some("Remove --no-encryption to export with encryption (recommended)".to_string()),
                                             retryable: false,
@@ -3720,7 +3721,7 @@ async fn execute_cli(
                                     eprintln!("{}", msg);
                                     return Err(CliError {
                                         code: crate::pages::confirmation::EXIT_CODE_UNENCRYPTED_NOT_CONFIRMED,
-                                        kind: "pages",
+                                        kind: CliErrorKind::Pages.kind_str(),
                                         message: "Unencrypted export not confirmed".to_string(),
                                         hint: Some("Remove --no-encryption to export with encryption (recommended)".to_string()),
                                         retryable: false,
@@ -3741,7 +3742,7 @@ async fn execute_cli(
                         )
                         .map_err(|e| CliError {
                             code: 9,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Export failed: {e}"),
                             hint: None,
                             retryable: false,
@@ -3763,7 +3764,7 @@ async fn execute_cli(
                             };
                             return Err(CliError {
                                 code: 2,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: format!(
                                     "Cloudflare credentials provided but --target is {target_label}"
                                 ),
@@ -3780,7 +3781,7 @@ async fn execute_cli(
                         {
                             return Err(CliError {
                                 code: 2,
-                                kind: "pages",
+                                kind: CliErrorKind::Pages.kind_str(),
                                 message: "Both --account-id and --api-token are required together"
                                     .to_string(),
                                 hint: Some(
@@ -3820,7 +3821,7 @@ async fn execute_cli(
                         }
                         wizard.run().map_err(|e| CliError {
                             code: 9,
-                            kind: "pages",
+                            kind: CliErrorKind::Pages.kind_str(),
                             message: format!("Wizard failed: {e}"),
                             hint: None,
                             retryable: false,
@@ -4260,7 +4261,7 @@ fn resolve_analytics_workspace_ids(
             )
             .map_err(|e| CliError {
                 code: 9,
-                kind: "db-error",
+                kind: CliErrorKind::DbError.kind_str(),
                 message: format!("Failed to resolve analytics workspace filter '{workspace}': {e}"),
                 hint: Some("Check that the workspaces table exists and is readable.".into()),
                 retryable: false,
@@ -4311,7 +4312,7 @@ fn open_franken_cli_read_db(
     if !path.exists() {
         return Err(CliError {
             code: 3,
-            kind: "missing-db",
+            kind: CliErrorKind::MissingDb.kind_str(),
             message: format!(
                 "Database not found at {}. Run 'cass index --full' first.",
                 path.display()
@@ -4342,7 +4343,7 @@ fn open_franken_cli_read_db(
                     )
                     .map_err(|raw_err| CliError {
                         code: 9,
-                        kind: "db-open",
+                        kind: CliErrorKind::DbOpen.kind_str(),
                         message: format!(
                             "Failed to open {reason} database at {}: readonly storage open failed ({err}); raw readonly open failed ({raw_readonly_err}); raw open failed ({raw_err})",
                             path.display()
@@ -4510,7 +4511,7 @@ fn run_analytics_status(
         .map(|r| r.to_json())
         .map_err(|e| CliError {
             code: 9,
-            kind: "db-error",
+            kind: CliErrorKind::DbError.kind_str(),
             message: e.to_string(),
             hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
             retryable: false,
@@ -4534,7 +4535,7 @@ fn run_analytics_tokens(
         .map(|r| r.to_cli_json())
         .map_err(|e| CliError {
             code: 9,
-            kind: "db-error",
+            kind: CliErrorKind::DbError.kind_str(),
             message: e.to_string(),
             hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
             retryable: false,
@@ -4564,7 +4565,7 @@ fn run_analytics_rebuild(
     if !db_path.exists() {
         return Err(CliError {
             code: 3,
-            kind: "missing-db",
+            kind: CliErrorKind::MissingDb.kind_str(),
             message: format!(
                 "Database not found at {}. Run 'cass index --full' first.",
                 db_path.display()
@@ -4579,7 +4580,7 @@ fn run_analytics_rebuild(
 
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
-        kind: "db-error",
+        kind: CliErrorKind::DbError.kind_str(),
         message: format!("Failed to open database: {e}"),
         hint: None,
         retryable: false,
@@ -4587,7 +4588,7 @@ fn run_analytics_rebuild(
 
     let result = storage.rebuild_analytics().map_err(|e| CliError {
         code: 9,
-        kind: "rebuild-error",
+        kind: CliErrorKind::RebuildError.kind_str(),
         message: format!("Analytics rebuild failed: {e}"),
         hint: Some("Check database integrity with 'cass health --json'.".into()),
         retryable: true,
@@ -4635,7 +4636,7 @@ fn run_analytics_tools(
         .map(|r| r.to_cli_json())
         .map_err(|e| CliError {
             code: 9,
-            kind: "db-error",
+            kind: CliErrorKind::DbError.kind_str(),
             message: e.to_string(),
             hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
             retryable: false,
@@ -4776,14 +4777,14 @@ fn run_analytics_validate(
                     if analytics_track_a_rebuild_safe(&pre_conn) {
                         let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
                             code: 9,
-                            kind: "db-error",
+                            kind: CliErrorKind::DbError.kind_str(),
                             message: format!("Failed to open database for analytics repair: {e}"),
                             hint: None,
                             retryable: false,
                         })?;
                         let rebuild = storage.rebuild_analytics().map_err(|e| CliError {
                             code: 9,
-                            kind: "repair-error",
+                            kind: CliErrorKind::RepairError.kind_str(),
                             message: format!("Analytics auto-repair failed: {e}"),
                             hint: Some(
                                 "Track A rebuild could not complete. Inspect the database and retry with 'cass analytics rebuild --json'."
@@ -4819,7 +4820,7 @@ fn run_analytics_validate(
                     // rebuild_token_daily_stats.
                     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
                         code: 9,
-                        kind: "db-error",
+                        kind: CliErrorKind::DbError.kind_str(),
                         message: format!(
                             "Failed to open database for Track B analytics repair: {e}"
                         ),
@@ -4986,7 +4987,7 @@ fn run_analytics_models(
     let filter = analytics_query_filter(&conn, common)?;
     let db_err = |e: crate::analytics::AnalyticsError| CliError {
         code: 9,
-        kind: "db-error",
+        kind: CliErrorKind::DbError.kind_str(),
         message: e.to_string(),
         hint: Some("Check that the analytics tables exist and are not corrupt.".into()),
         retryable: false,
@@ -5043,7 +5044,7 @@ async fn import_chatgpt_export(
     if !export_path.exists() {
         return Err(CliError {
             code: 1,
-            kind: "io-error",
+            kind: CliErrorKind::IoError.kind_str(),
             message: format!("Export file not found: {}", export_path.display()),
             hint: Some(
                 "Provide the path to conversations.json from ChatGPT web export \
@@ -5080,7 +5081,7 @@ async fn import_chatgpt_export(
     let conv_dir = base_dir.join("conversations-web-export");
     std::fs::create_dir_all(&conv_dir).map_err(|e| CliError {
         code: 1,
-        kind: "io-error",
+        kind: CliErrorKind::IoError.kind_str(),
         message: format!("Failed to create output directory: {e}"),
         hint: None,
         retryable: false,
@@ -5089,7 +5090,7 @@ async fn import_chatgpt_export(
     // Read and parse export file
     let content = std::fs::read_to_string(export_path).map_err(|e| CliError {
         code: 1,
-        kind: "io-error",
+        kind: CliErrorKind::IoError.kind_str(),
         message: format!("Failed to read export file: {e}"),
         hint: None,
         retryable: false,
@@ -5098,7 +5099,7 @@ async fn import_chatgpt_export(
     let conversations: Vec<serde_json::Value> =
         serde_json::from_str(&content).map_err(|e| CliError {
             code: 1,
-            kind: "parse-error",
+            kind: CliErrorKind::ParseError.kind_str(),
             message: format!("Failed to parse conversations.json: {e}"),
             hint: Some("Expected a JSON array of conversation objects".into()),
             retryable: false,
@@ -5128,21 +5129,21 @@ async fn import_chatgpt_export(
         // Write individual conversation file
         let mut file = std::fs::File::create(&filepath).map_err(|e| CliError {
             code: 1,
-            kind: "io-error",
+            kind: CliErrorKind::IoError.kind_str(),
             message: format!("Failed to write {}: {e}", filepath.display()),
             hint: None,
             retryable: false,
         })?;
         serde_json::to_writer(&mut file, conv).map_err(|e| CliError {
             code: 1,
-            kind: "io-error",
+            kind: CliErrorKind::IoError.kind_str(),
             message: format!("Failed to serialize conversation: {e}"),
             hint: None,
             retryable: false,
         })?;
         file.flush().map_err(|e| CliError {
             code: 1,
-            kind: "io-error",
+            kind: CliErrorKind::IoError.kind_str(),
             message: format!("Failed to flush: {e}"),
             hint: None,
             retryable: false,
@@ -5364,7 +5365,7 @@ impl ActiveIndexRunDetails {
 
         CliError {
             code: 7,
-            kind: "index-busy",
+            kind: CliErrorKind::IndexBusy.kind_str(),
             message,
             hint: Some(
                 "Wait for the active run to finish or point --data-dir/--db at a different cass dataset."
@@ -7731,7 +7732,7 @@ fn run_cli_search(
     )
     .map_err(|e| CliError {
         code: 9,
-        kind: "open-index",
+        kind: CliErrorKind::OpenIndex.kind_str(),
         message: format!("failed to open index: {e}"),
         hint: Some("try cass index --full".to_string()),
         retryable: true,
@@ -7781,7 +7782,7 @@ fn run_cli_search(
         };
         CliError {
             code: 3,
-            kind: "missing-index",
+            kind: CliErrorKind::MissingIndex.kind_str(),
             message,
             hint,
             retryable: true,
@@ -7825,7 +7826,7 @@ fn run_cli_search(
         {
             return Err(CliError {
                 code: 15,
-                kind: "embedder-unavailable",
+                kind: CliErrorKind::EmbedderUnavailable.kind_str(),
                 message: format!("Embedder validation failed: {e}"),
                 hint: Some("Run 'cass models list' to see available embedders".to_string()),
                 retryable: false,
@@ -7899,7 +7900,7 @@ fn run_cli_search(
                 } else {
                     return Err(CliError {
                         code: 15,
-                        kind: "semantic-unavailable",
+                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
                         message: format!("Semantic search not available: {err}"),
                         hint: Some(hint),
                         retryable: false,
@@ -7921,7 +7922,7 @@ fn run_cli_search(
             } else {
                 return Err(CliError {
                     code: 15,
-                    kind: "semantic-unavailable",
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
                     message: format!("Semantic search not available: {summary}"),
                     hint: Some(hint),
                     retryable: false,
@@ -7957,7 +7958,7 @@ fn run_cli_search(
     if let Some(ref sessions_from_arg) = sessions_from {
         let session_paths = read_session_paths(sessions_from_arg).map_err(|e| CliError {
             code: 2,
-            kind: "sessions-from",
+            kind: CliErrorKind::SessionsFrom.kind_str(),
             message: format!("failed to read session paths: {e}"),
             hint: Some("Provide a file path or '-' for stdin".to_string()),
             retryable: false,
@@ -7971,7 +7972,7 @@ fn run_cli_search(
     if let Some(ref cursor_str) = cursor {
         let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
             code: 2,
-            kind: "cursor-decode",
+            kind: CliErrorKind::CursorDecode.kind_str(),
             message: format!("invalid cursor: {e}"),
             hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
             retryable: false,
@@ -7979,7 +7980,7 @@ fn run_cli_search(
         let cursor_json: serde_json::Value =
             serde_json::from_slice(&decoded).map_err(|e| CliError {
                 code: 2,
-                kind: "cursor-parse",
+                kind: CliErrorKind::CursorParse.kind_str(),
                 message: format!("invalid cursor payload: {e}"),
                 hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
                 retryable: false,
@@ -8060,7 +8061,7 @@ fn run_cli_search(
     {
         return Err(CliError {
             code: 10,
-            kind: "timeout",
+            kind: CliErrorKind::Timeout.kind_str(),
             message: format!(
                 "Operation timed out after {}ms (before search started)",
                 timeout.as_millis()
@@ -8103,7 +8104,7 @@ fn run_cli_search(
             )
             .map_err(|e| CliError {
                 code: 9,
-                kind: "search",
+                kind: CliErrorKind::Search.kind_str(),
                 message: format!("search failed: {e}"),
                 hint: None,
                 retryable: true,
@@ -8124,7 +8125,7 @@ fn run_cli_search(
                     if err_str.contains("HNSW index") {
                         CliError {
                             code: 15,
-                            kind: "semantic-unavailable",
+                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
                             message: "Approximate search unavailable (HNSW index missing)".to_string(),
                             hint: Some(
                                 "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
@@ -8135,7 +8136,7 @@ fn run_cli_search(
                     } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                         CliError {
                             code: 15,
-                            kind: "semantic-unavailable",
+                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
                             message: "Semantic search not available".to_string(),
                             hint: Some(
                                 "Run 'cass tui' and press Alt+S to set up semantic search, or use --mode lexical"
@@ -8146,7 +8147,7 @@ fn run_cli_search(
                     } else {
                         CliError {
                             code: 9,
-                            kind: "search",
+                            kind: CliErrorKind::Search.kind_str(),
                             message: format!("semantic search failed: {e}"),
                             hint: Some("Try --mode lexical as fallback".to_string()),
                             retryable: true,
@@ -8190,7 +8191,7 @@ fn run_cli_search(
                         )
                         .map_err(|fallback_err| CliError {
                             code: 9,
-                            kind: "search",
+                            kind: CliErrorKind::Search.kind_str(),
                             message: format!(
                                 "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
                             ),
@@ -8200,7 +8201,7 @@ fn run_cli_search(
                 } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
                     return Err(CliError {
                         code: 15,
-                        kind: "semantic-unavailable",
+                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
                         message: "Hybrid search not available (requires semantic search)".to_string(),
                         hint: Some(
                             "Run 'cass tui' and press Alt+S to set up semantic search, or use --mode lexical"
@@ -8211,7 +8212,7 @@ fn run_cli_search(
                 } else {
                     return Err(CliError {
                         code: 9,
-                        kind: "search",
+                        kind: CliErrorKind::Search.kind_str(),
                         message: format!("hybrid search failed: {e}"),
                         hint: Some("Try --mode lexical as fallback".to_string()),
                         retryable: true,
@@ -8842,16 +8843,127 @@ fn filter_hit_fields(
     }
 }
 
-/// Truncate a string to `max_len` characters, UTF-8 safe, with ellipsis
-fn truncate_content(s: &str, max_len: usize) -> (String, bool) {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        (s.to_string(), false)
-    } else {
-        // Leave room for "..." (3 chars)
-        let truncate_at = max_len.saturating_sub(3);
-        let truncated: String = s.chars().take(truncate_at).collect();
-        (format!("{truncated}..."), true)
+/// Truncate a string to `max_len` characters, UTF-8 safe, with ellipsis.
+/// Returns `Some(truncated)` if truncation was needed, `None` otherwise.
+///
+/// `coding_agent_session_search-nj5eh`: pre-fix this function always
+/// walked the full string with `s.chars().count()` to decide whether
+/// truncation was needed, then walked it AGAIN with `take()` if it
+/// was. For 100KB content with max_len=200 that was ~100K wasted
+/// iterations per check. It also always cloned the string in the
+/// no-truncation case (`s.to_string()`) even though callers like
+/// `apply_content_truncation` only INSERT the result when truncation
+/// happened — so for the 1000-hit × 3-field robot path the clone
+/// produced ~MB of allocator pressure on the no-truncation hot path.
+///
+/// Post-fix: short-circuit char counting at `max_len + 1` (bounded
+/// by `max_len`, independent of total string length) AND signal
+/// "no truncation needed" via `None` so callers skip the wasted
+/// allocation entirely. The truncation path captures the cut byte
+/// index during the same walk used for short-circuit counting,
+/// turning two passes into one.
+fn truncate_content(s: &str, max_len: usize) -> Option<String> {
+    let truncate_at = max_len.saturating_sub(3);
+    let mut chars = s.char_indices();
+    // Initialize cut_byte to 0 so the `truncate_at == 0` case (max_len < 3)
+    // produces an empty prefix + "..." instead of accidentally using
+    // `s.len()` as the cut. The in-loop assignment below overwrites
+    // this when the loop reaches the truncate_at index.
+    let mut cut_byte: Option<usize> = if truncate_at == 0 { Some(0) } else { None };
+    for n in 0..max_len {
+        let Some((byte_idx, _)) = chars.next() else {
+            return None;
+        };
+        if n == truncate_at {
+            cut_byte = Some(byte_idx);
+        }
+    }
+    if chars.next().is_none() {
+        return None;
+    }
+    let cut = cut_byte.unwrap_or(s.len());
+    let mut out = String::with_capacity(cut + 3);
+    out.push_str(&s[..cut]);
+    out.push_str("...");
+    Some(out)
+}
+
+#[cfg(test)]
+mod truncate_content_tests {
+    use super::*;
+
+    /// `coding_agent_session_search-nj5eh` regression: pin behavioral
+    /// equivalence with the prior `(String, bool)` implementation
+    /// across the boundary cases that determine when truncation
+    /// fires.
+    #[test]
+    fn truncate_content_returns_none_when_chars_within_limit() {
+        // Empty
+        assert_eq!(truncate_content("", 10), None);
+        // Strictly less than max_len
+        assert_eq!(truncate_content("abc", 10), None);
+        // Exactly max_len — boundary: pre-fix `char_count <= max_len`
+        // returned (s.to_string(), false); post-fix returns None.
+        assert_eq!(truncate_content("abcdefghij", 10), None);
+    }
+
+    #[test]
+    fn truncate_content_returns_some_when_chars_exceed_limit() {
+        // max_len + 1 — first char count beyond limit
+        assert_eq!(
+            truncate_content("abcdefghijk", 10).as_deref(),
+            Some("abcdefg...")
+        );
+        // Significantly larger than max_len
+        assert_eq!(
+            truncate_content("abcdefghijklmnopqrstuvwxyz", 10).as_deref(),
+            Some("abcdefg...")
+        );
+    }
+
+    #[test]
+    fn truncate_content_handles_max_len_below_ellipsis_budget() {
+        // max_len < 3 — saturating_sub(3) yields 0; truncated prefix
+        // is empty so output is just "...".
+        assert_eq!(truncate_content("abcdef", 0).as_deref(), Some("..."));
+        assert_eq!(truncate_content("abcdef", 1).as_deref(), Some("..."));
+        assert_eq!(truncate_content("abcdef", 2).as_deref(), Some("..."));
+    }
+
+    #[test]
+    fn truncate_content_is_utf8_safe_on_multibyte_boundaries() {
+        // 4 emojis (each 4 bytes in UTF-8) + ASCII tail; max_len=4
+        // means "exactly fits" and returns None.
+        let s = "😀😀😀😀x";
+        assert_eq!(truncate_content(s, 5), None);
+        // max_len=4: 5 chars > 4 → truncate. saturating_sub(3)=1, so
+        // cut at the first multibyte boundary (byte 4) and append "..."
+        let truncated = truncate_content(s, 4).expect("must truncate when chars > max_len");
+        assert_eq!(truncated, "😀...");
+    }
+
+    #[test]
+    fn truncate_content_short_circuits_on_huge_input() {
+        // 100KB ASCII string with max_len=10 — pre-fix walked all
+        // 100K chars to count, then 7 more to take. Post-fix walks
+        // exactly 11 chars (max_len + 1) before deciding. This test
+        // doesn't measure perf but verifies CORRECTNESS on a large
+        // input that exposed the original O(N) walk.
+        let s = "a".repeat(100_000);
+        assert_eq!(truncate_content(&s, 10).as_deref(), Some("aaaaaaa..."));
+    }
+
+    /// Pin the post-fix contract that `apply_content_truncation` relies
+    /// on: `None` ↔ caller skips clone+insert. Pre-fix, the function
+    /// always returned an owned String even in the no-truncation case,
+    /// causing wasted allocations on the robot-mode hot path.
+    #[test]
+    fn truncate_content_avoids_allocation_on_no_truncation_path() {
+        // The contract is: return None when no truncation happened.
+        // Callers (apply_content_truncation) MUST be able to
+        // distinguish via `Option::is_none` without inspecting the
+        // string contents.
+        assert!(truncate_content("short", 1024).is_none());
     }
 }
 
@@ -8886,12 +8998,11 @@ fn apply_content_truncation(hit: serde_json::Value, budgets: FieldBudgets) -> se
     ];
 
     for (field, budget) in fields {
-        if let (Some(limit), Some(serde_json::Value::String(s))) = (budget, obj.get(field)) {
-            let (truncated, was_truncated) = truncate_content(s, limit);
-            if was_truncated {
-                obj.insert(field.to_string(), serde_json::Value::String(truncated));
-                obj.insert(format!("{field}_truncated"), serde_json::Value::Bool(true));
-            }
+        if let (Some(limit), Some(serde_json::Value::String(s))) = (budget, obj.get(field))
+            && let Some(truncated) = truncate_content(s, limit)
+        {
+            obj.insert(field.to_string(), serde_json::Value::String(truncated));
+            obj.insert(format!("{field}_truncated"), serde_json::Value::Bool(true));
         }
     }
 
@@ -9200,21 +9311,21 @@ fn output_robot_results(
         let mut out = BufWriter::new(stdout.lock());
         serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to encode json: {e}"),
             hint: None,
             retryable: false,
         })?;
         writeln!(&mut out).map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to write trailing newline: {e}"),
             hint: None,
             retryable: false,
         })?;
         out.flush().map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to flush buffered json output: {e}"),
             hint: None,
             retryable: false,
@@ -9326,21 +9437,21 @@ fn output_robot_results(
         let mut out = BufWriter::new(stdout.lock());
         serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to encode json: {e}"),
             hint: None,
             retryable: false,
         })?;
         writeln!(&mut out).map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to write trailing newline: {e}"),
             hint: None,
             retryable: false,
         })?;
         out.flush().map_err(|e| CliError {
             code: 9,
-            kind: "encode-json",
+            kind: CliErrorKind::EncodeJson.kind_str(),
             message: format!("failed to flush buffered json output: {e}"),
             hint: None,
             retryable: false,
@@ -9552,21 +9663,21 @@ fn output_robot_results(
             let mut out = BufWriter::new(stdout.lock());
             serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to encode json: {e}"),
                 hint: None,
                 retryable: false,
             })?;
             writeln!(&mut out).map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to write trailing newline: {e}"),
                 hint: None,
                 retryable: false,
             })?;
             out.flush().map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to flush buffered json output: {e}"),
                 hint: None,
                 retryable: false,
@@ -9674,14 +9785,14 @@ fn output_robot_results(
                 }
                 serde_json::to_writer(&mut out, &meta).map_err(|e| CliError {
                     code: 9,
-                    kind: "encode-json",
+                    kind: CliErrorKind::EncodeJson.kind_str(),
                     message: format!("failed to encode jsonl metadata: {e}"),
                     hint: None,
                     retryable: false,
                 })?;
                 writeln!(&mut out).map_err(|e| CliError {
                     code: 9,
-                    kind: "encode-json",
+                    kind: CliErrorKind::EncodeJson.kind_str(),
                     message: format!("failed to write jsonl metadata newline: {e}"),
                     hint: None,
                     retryable: false,
@@ -9691,14 +9802,14 @@ fn output_robot_results(
             for hit in &filtered_hits {
                 serde_json::to_writer(&mut out, hit).map_err(|e| CliError {
                     code: 9,
-                    kind: "encode-json",
+                    kind: CliErrorKind::EncodeJson.kind_str(),
                     message: format!("failed to encode jsonl hit: {e}"),
                     hint: None,
                     retryable: false,
                 })?;
                 writeln!(&mut out).map_err(|e| CliError {
                     code: 9,
-                    kind: "encode-json",
+                    kind: CliErrorKind::EncodeJson.kind_str(),
                     message: format!("failed to write jsonl newline: {e}"),
                     hint: None,
                     retryable: false,
@@ -9706,7 +9817,7 @@ fn output_robot_results(
             }
             out.flush().map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to flush buffered jsonl output: {e}"),
                 hint: None,
                 retryable: false,
@@ -9819,7 +9930,7 @@ fn output_robot_results(
 
             let out = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to encode json: {e}"),
                 hint: None,
                 retryable: false,
@@ -9932,7 +10043,7 @@ fn output_robot_results(
 
             let json_str = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
-                kind: "encode-json",
+                kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to encode json: {e}"),
                 hint: None,
                 retryable: false,
@@ -12568,7 +12679,7 @@ fn run_health(
     } else if rebuild_active {
         Some(CliError {
             code: 1,
-            kind: "health",
+            kind: CliErrorKind::Health.kind_str(),
             message: "Index rebuild is still in progress".to_string(),
             hint: Some("Wait for the active 'cass index' run to finish.".to_string()),
             retryable: true,
@@ -12576,7 +12687,7 @@ fn run_health(
     } else if not_initialized {
         Some(CliError {
             code: 1,
-            kind: "health",
+            kind: CliErrorKind::Health.kind_str(),
             message: "cass has not been initialized in this data dir yet".to_string(),
             hint: Some(cass_not_initialized_recommended_action()),
             retryable: true,
@@ -12584,7 +12695,7 @@ fn run_health(
     } else if db_degraded {
         Some(CliError {
             code: 1,
-            kind: "health",
+            kind: CliErrorKind::Health.kind_str(),
             message: format!(
                 "Database degraded: {}",
                 db_open_error
@@ -12599,7 +12710,7 @@ fn run_health(
     } else {
         Some(CliError {
             code: 1,
-            kind: "health",
+            kind: CliErrorKind::Health.kind_str(),
             message: "Health check failed".to_string(),
             hint: Some("Run 'cass index --full' to rebuild the index/database.".to_string()),
             retryable: true,
@@ -12623,7 +12734,7 @@ fn rebuild_tantivy_from_db(
         .map(|outcome| outcome.indexed_docs)
         .map_err(|e| CliError {
             code: 5,
-            kind: "doctor",
+            kind: CliErrorKind::Doctor.kind_str(),
             message: format!("failed to rebuild Tantivy index from database: {e}"),
             hint: None,
             retryable: true,
@@ -12806,7 +12917,7 @@ fn wait_with_progress<T>(
         Ok(result) => result,
         Err(_) => Err(CliError {
             code: 9,
-            kind: "doctor",
+            kind: CliErrorKind::Doctor.kind_str(),
             message: "doctor worker thread panicked".to_string(),
             hint: None,
             retryable: true,
@@ -15062,7 +15173,7 @@ fn run_doctor(
                         .map(|_| 0usize)
                         .map_err(|e| CliError {
                             code: 5,
-                            kind: "doctor",
+                            kind: CliErrorKind::Doctor.kind_str(),
                             message: format!("index rebuild failed: {e}"),
                             hint: None,
                             retryable: true,
@@ -15298,7 +15409,7 @@ fn run_doctor(
     } else {
         let err = CliError {
             code: 5, // Data corruption code
-            kind: "doctor",
+            kind: CliErrorKind::Doctor.kind_str(),
             message: format!("{} failure(s) remain", fail_count),
             hint: Some(
                 "Automatic safe repairs were attempted. Run 'cass index --full' \
@@ -15463,7 +15574,7 @@ fn run_sessions(
         )
         .map_err(|e| CliError {
             code: 9,
-            kind: "db-query",
+            kind: CliErrorKind::DbQuery.kind_str(),
             message: format!("Failed to list sessions: {e}"),
             hint: None,
             retryable: false,
@@ -15715,7 +15826,7 @@ fn run_context(
     else {
         return Err(CliError {
             code: 4,
-            kind: "not-found",
+            kind: CliErrorKind::NotFound.kind_str(),
             message: match source_id {
                 Some(source_id) => format!("No session found at path: {path_str} for source '{source_id}'"),
                 None => format!("No session found at path: {path_str}"),
@@ -18004,7 +18115,7 @@ fn validate_followup_source_id(source_id: &str, command: &str) -> CliResult<()> 
     if trimmed.is_empty() || matches!(keyword.as_str(), "all" | "remote") {
         return Err(CliError {
             code: 2,
-            kind: "ambiguous-source",
+            kind: CliErrorKind::AmbiguousSource.kind_str(),
             message: format!(
                 "{command} requires an exact source_id, not '{source_id}'"
             ),
@@ -18088,7 +18199,7 @@ fn serialize_indexed_view_lines(
         .map(|msg| {
             serde_json::to_string(&msg).map_err(|e| CliError {
                 code: 9,
-                kind: "serialize-message",
+                kind: CliErrorKind::SerializeMessage.kind_str(),
                 message: format!("Failed to serialize indexed message: {e}"),
                 hint: Some(
                     "The indexed conversation contains unexpected data that could not be re-rendered as JSON."
@@ -18106,7 +18217,7 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
 
     let file = File::open(path).map_err(|e| CliError {
         code: 9,
-        kind: "file-open",
+        kind: CliErrorKind::FileOpen.kind_str(),
         message: format!("Failed to open file: {e}"),
         hint: None,
         retryable: false,
@@ -18117,7 +18228,7 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| CliError {
             code: 9,
-            kind: "file-read",
+            kind: CliErrorKind::FileRead.kind_str(),
             message: format!("Failed to read session file: {e}"),
             hint: Some("The session file may be truncated or contain invalid UTF-8".into()),
             retryable: false,
@@ -18138,7 +18249,7 @@ fn parse_followup_jsonl_messages(
         }
         let msg = serde_json::from_str::<serde_json::Value>(&line).map_err(|e| CliError {
             code: 9,
-            kind: "session-parse",
+            kind: CliErrorKind::SessionParse.kind_str(),
             message: format!("Failed to parse session JSONL at line {}: {e}", line_number + 1),
             hint: Some(
                 "The local JSONL session is malformed; use the indexed copy or repair the session file."
@@ -18237,7 +18348,7 @@ fn run_view(
     } else {
         return Err(CliError {
             code: 3,
-            kind: "file-not-found",
+            kind: CliErrorKind::FileNotFound.kind_str(),
             message: match source_id {
                 Some(source_id) => format!(
                     "No indexed session found for source '{}' at {}",
@@ -18263,7 +18374,7 @@ fn run_view(
     if lines.is_empty() {
         return Err(CliError {
             code: 9,
-            kind: "empty-file",
+            kind: CliErrorKind::EmptyFile.kind_str(),
             message: format!("File is empty: {}", path.display()),
             hint: None,
             retryable: false,
@@ -18275,7 +18386,7 @@ fn run_view(
     if target_line == 0 {
         return Err(CliError {
             code: 2,
-            kind: "invalid-line",
+            kind: CliErrorKind::InvalidLine.kind_str(),
             message: "Line numbers start at 1, not 0".to_string(),
             hint: Some("Use -n 1 for the first line".to_string()),
             retryable: false,
@@ -18285,7 +18396,7 @@ fn run_view(
     if target_line > lines.len() {
         return Err(CliError {
             code: 2,
-            kind: "line-out-of-range",
+            kind: CliErrorKind::LineOutOfRange.kind_str(),
             message: format!(
                 "Line {} exceeds file length ({} lines)",
                 target_line,
@@ -18783,7 +18894,7 @@ fn run_index_with_data(
             } else {
                 return Err(CliError {
                     code: 5,
-                    kind: "idempotency-mismatch",
+                    kind: CliErrorKind::IdempotencyMismatch.kind_str(),
                     message: format!(
                         "Idempotency key '{}' was used with different parameters",
                         key
@@ -19245,7 +19356,7 @@ fn run_index_with_data(
             }
             CliError {
                 code: 9,
-                kind: "index",
+                kind: CliErrorKind::Index.kind_str(),
                 message: format!("index failed: {chain}"),
                 hint: None,
                 retryable: true,
@@ -19253,7 +19364,7 @@ fn run_index_with_data(
         }),
         Err(_) => Err(CliError {
             code: 9,
-            kind: "index",
+            kind: CliErrorKind::Index.kind_str(),
             message: "index thread panicked".to_string(),
             hint: None,
             retryable: true,
@@ -19876,7 +19987,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             other => {
                 return Err(CliError {
                     code: 2,
-                    kind: "invalid-agent",
+                    kind: CliErrorKind::InvalidAgent.kind_str(),
                     message: format!(
                         "unknown --agent value '{other}'; expected one of: claude, codex, opencode, pi_agent, pi, omp, gemini"
                     ),
@@ -19957,7 +20068,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
 
     Err(CliError {
         code: 3,
-        kind: "unknown-agent",
+        kind: CliErrorKind::UnknownAgent.kind_str(),
         message: format!(
             "could not detect the source harness from path '{}'",
             path.display()
@@ -20025,7 +20136,7 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
     const MAX_SCAN_BYTES: u64 = 1024 * 1024; // 1 MiB
     let file = std::fs::File::open(path).map_err(|err| CliError {
         code: 4,
-        kind: "session-file-unreadable",
+        kind: CliErrorKind::SessionFileUnreadable.kind_str(),
         message: format!(
             "cannot open pi-agent session file {}: {err}",
             path.display()
@@ -20082,7 +20193,7 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
     // a confusing error. Fail explicitly so the user knows what's wrong.
     Err(CliError {
         code: 5,
-        kind: "session-id-not-found",
+        kind: CliErrorKind::SessionIdNotFound.kind_str(),
         message: format!(
             "no session header found in pi-agent file {} (scanned first 16 non-empty lines)",
             path.display()
@@ -20113,7 +20224,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| CliError {
             code: 5,
-            kind: "session-id-not-found",
+            kind: CliErrorKind::SessionIdNotFound.kind_str(),
             message: format!("opencode path has no final component: {}", path.display()),
             hint: None,
             retryable: false,
@@ -20131,7 +20242,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
         if !looks_like_session_path {
             return Err(CliError {
                 code: 5,
-                kind: "session-id-not-found",
+                kind: CliErrorKind::SessionIdNotFound.kind_str(),
                 message: format!(
                     "opencode session path must live under an 'opencode.db' directory, got: {}",
                     path.display()
@@ -20152,7 +20263,7 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
     if decoded.is_empty() || decoded == "opencode.db" {
         return Err(CliError {
             code: 5,
-            kind: "session-id-not-found",
+            kind: CliErrorKind::SessionIdNotFound.kind_str(),
             message: format!(
                 "could not extract opencode session id from '{}'",
                 path.display()
@@ -20184,7 +20295,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "claude" => {
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
-                kind: "session-id-not-found",
+                kind: CliErrorKind::SessionIdNotFound.kind_str(),
                 message: format!(
                     "cannot derive Claude Code session UUID from '{}'",
                     path.display()
@@ -20195,7 +20306,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
-                    kind: "session-id-not-found",
+                    kind: CliErrorKind::SessionIdNotFound.kind_str(),
                     message: format!(
                         "filename stem '{uuid}' does not look like a Claude Code session UUID (expected 8-4-4-4-12 hex)"
                     ),
@@ -20216,7 +20327,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "codex" => {
             let uuid = extract_filename_session_id(path).ok_or_else(|| CliError {
                 code: 5,
-                kind: "session-id-not-found",
+                kind: CliErrorKind::SessionIdNotFound.kind_str(),
                 message: format!("cannot derive Codex session UUID from '{}'", path.display()),
                 hint: None,
                 retryable: false,
@@ -20224,7 +20335,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             if !is_override && !looks_like_session_uuid(&uuid) {
                 return Err(CliError {
                     code: 5,
-                    kind: "session-id-not-found",
+                    kind: CliErrorKind::SessionIdNotFound.kind_str(),
                     message: format!(
                         "filename stem '{uuid}' does not look like a Codex session UUID (expected 8-4-4-4-12 hex)"
                     ),
@@ -20294,7 +20405,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         // Unreachable: detect_resume_agent validates the slug.
         other => Err(CliError {
             code: 3,
-            kind: "unknown-agent",
+            kind: CliErrorKind::UnknownAgent.kind_str(),
             message: format!("internal: unhandled agent slug '{other}'"),
             hint: None,
             retryable: false,
@@ -20321,7 +20432,7 @@ fn run_resume(
     if exec && output_format.is_some() {
         return Err(CliError {
             code: 2,
-            kind: "usage",
+            kind: CliErrorKind::Usage.kind_str(),
             message:
                 "`--exec` cannot be combined with structured output (`--robot-format`/`--json`)"
                     .into(),
@@ -20334,7 +20445,7 @@ fn run_resume(
     if shell && output_format.is_some() {
         return Err(CliError {
             code: 2,
-            kind: "usage",
+            kind: CliErrorKind::Usage.kind_str(),
             message:
                 "`--shell` cannot be combined with structured output (`--robot-format`/`--json`)"
                     .into(),
@@ -20376,7 +20487,7 @@ fn run_resume(
         // caller's TTY is handed over to the resumed harness cleanly.
         let (program, args) = target.argv.split_first().ok_or_else(|| CliError {
             code: 6,
-            kind: "resume-empty-command",
+            kind: CliErrorKind::ResumeEmptyCommand.kind_str(),
             message: "internal: resolved resume command had no program".into(),
             hint: None,
             retryable: false,
@@ -20388,7 +20499,7 @@ fn run_resume(
             // `exec` only returns on failure.
             return Err(CliError {
                 code: 7,
-                kind: "resume-exec-failed",
+                kind: CliErrorKind::ResumeExecFailed.kind_str(),
                 message: format!("failed to exec '{program}': {err}"),
                 hint: Some(format!(
                     "Verify that '{program}' is installed and on your PATH."
@@ -20403,7 +20514,7 @@ fn run_resume(
                 .status()
                 .map_err(|err| CliError {
                     code: 7,
-                    kind: "resume-exec-failed",
+                    kind: CliErrorKind::ResumeExecFailed.kind_str(),
                     message: format!("failed to spawn '{program}': {err}"),
                     hint: None,
                     retryable: false,
@@ -20465,7 +20576,7 @@ fn run_export(
     {
         return Err(CliError {
             code: 3,
-            kind: "file-not-found",
+            kind: CliErrorKind::FileNotFound.kind_str(),
             message: format!("Session file not found: {}", path.display()),
             hint: Some("Use 'cass search' to find session paths".to_string()),
             retryable: false,
@@ -20521,7 +20632,7 @@ fn run_export(
             Err(e) => {
                 return Err(CliError {
                     code: 9,
-                    kind: "opencode-sqlite-parse",
+                    kind: CliErrorKind::OpencodeSqliteParse.kind_str(),
                     message: format!("Failed to load OpenCode SQLite session: {e}"),
                     hint: Some(
                         "Ensure the OpenCode database exists and the session ID is valid".into(),
@@ -20541,7 +20652,7 @@ fn run_export(
             Err(e) => {
                 return Err(CliError {
                     code: 9,
-                    kind: "opencode-parse",
+                    kind: CliErrorKind::OpencodeParse.kind_str(),
                     message: format!("Failed to parse OpenCode session: {e}"),
                     hint: Some(
                         "Ensure the session file is valid and message/part directories exist"
@@ -20560,7 +20671,7 @@ fn run_export(
         } else {
             return Err(CliError {
                 code: 9,
-                kind: "indexed-session-required",
+                kind: CliErrorKind::IndexedSessionRequired.kind_str(),
                 message: format!(
                     "Local export for '{}' requires an indexed conversation or a JSONL/OpenCode session",
                     path.display()
@@ -20575,7 +20686,7 @@ fn run_export(
     } else {
         return Err(CliError {
             code: 3,
-            kind: "file-not-found",
+            kind: CliErrorKind::FileNotFound.kind_str(),
             message: match source_id {
                 Some(source_id) => format!(
                     "No indexed session found for source '{}' at {}",
@@ -20620,7 +20731,7 @@ fn run_export(
     if messages.is_empty() {
         return Err(CliError {
             code: 9,
-            kind: "empty-session",
+            kind: CliErrorKind::EmptySession.kind_str(),
             message: format!("No messages found in: {}", path.display()),
             hint: if allow_direct_file && detect_opencode_sqlite_session(path) {
                 Some("This path references an OpenCode SQLite session. Use `cass sessions --json` to list available sessions and their exportable paths.".into())
@@ -20661,7 +20772,7 @@ fn run_export(
     if let Some(out_path) = output {
         let mut out_file = File::create(out_path).map_err(|e| CliError {
             code: 9,
-            kind: "file-create",
+            kind: CliErrorKind::FileCreate.kind_str(),
             message: format!("Failed to create output file: {e}"),
             hint: None,
             retryable: false,
@@ -20670,7 +20781,7 @@ fn run_export(
             .write_all(formatted.as_bytes())
             .map_err(|e| CliError {
                 code: 9,
-                kind: "file-write",
+                kind: CliErrorKind::FileWrite.kind_str(),
                 message: format!("Failed to write output: {e}"),
                 hint: None,
                 retryable: false,
@@ -20774,7 +20885,7 @@ fn run_export_html(
     {
         let err = CliError {
             code: 3,
-            kind: "session-not-found",
+            kind: CliErrorKind::SessionNotFound.kind_str(),
             message: match source_id {
                 Some(source_id) => format!(
                     "No indexed session found for source '{}' at {}",
@@ -20822,7 +20933,7 @@ fn run_export_html(
             let mut pwd = String::new();
             io::stdin().read_line(&mut pwd).map_err(|e| CliError {
                 code: 6,
-                kind: "password-read-error",
+                kind: CliErrorKind::PasswordReadError.kind_str(),
                 message: format!("Failed to read password from stdin: {e}"),
                 hint: None,
                 retryable: false,
@@ -20831,7 +20942,7 @@ fn run_export_html(
         } else {
             let err = CliError {
                 code: 6,
-                kind: "password-required",
+                kind: CliErrorKind::PasswordRequired.kind_str(),
                 message: "Password required for encryption".to_string(),
                 hint: Some("Use --password-stdin".to_string()),
                 retryable: false,
@@ -20964,7 +21075,7 @@ fn run_export_html(
                 Err(e) => {
                     let err = CliError {
                         code: 9,
-                        kind: "opencode-sqlite-parse",
+                        kind: CliErrorKind::OpencodeSqliteParse.kind_str(),
                         message: format!("Failed to load OpenCode SQLite session: {e}"),
                         hint: Some(
                             "Ensure the OpenCode database exists and the session ID is valid"
@@ -20988,7 +21099,7 @@ fn run_export_html(
                 Err(e) => {
                     let err = CliError {
                         code: 9,
-                        kind: "opencode-parse",
+                        kind: CliErrorKind::OpencodeParse.kind_str(),
                         message: format!("Failed to parse OpenCode session: {e}"),
                         hint: Some("Ensure the session file is valid".into()),
                         retryable: false,
@@ -21008,7 +21119,7 @@ fn run_export_html(
         } else {
             let err = CliError {
                 code: 9,
-                kind: "indexed-session-required",
+                kind: CliErrorKind::IndexedSessionRequired.kind_str(),
                 message: format!(
                     "Local export for '{}' requires an indexed conversation or a JSONL/OpenCode session",
                     session_path.display()
@@ -21027,7 +21138,7 @@ fn run_export_html(
     if raw_messages.is_empty() {
         let err = CliError {
             code: 9,
-            kind: "empty-session",
+            kind: CliErrorKind::EmptySession.kind_str(),
             message: format!("No messages found in: {}", session_path.display()),
             hint: None,
             retryable: false,
@@ -21260,7 +21371,7 @@ fn run_export_html(
     if filename.is_some() && !is_valid_filename(&final_filename) {
         let err = CliError {
             code: 4,
-            kind: "invalid-filename",
+            kind: CliErrorKind::InvalidFilename.kind_str(),
             message: format!("Invalid output filename: {final_filename}"),
             hint: Some("Avoid path separators and reserved characters".to_string()),
             retryable: false,
@@ -21344,7 +21455,7 @@ fn run_export_html(
         .map_err(|e| {
             let err = CliError {
                 code: 5,
-                kind: "export-failed",
+                kind: CliErrorKind::ExportFailed.kind_str(),
                 message: format!("Failed to export HTML: {e}"),
                 hint: None,
                 retryable: false,
@@ -21358,7 +21469,7 @@ fn run_export_html(
     let mut file = File::create(&output_path).map_err(|e| {
         let err = CliError {
             code: 4,
-            kind: "output-not-writable",
+            kind: CliErrorKind::OutputNotWritable.kind_str(),
             message: format!("Could not create output file: {e}"),
             hint: Some(format!(
                 "Check permissions for {}",
@@ -21372,7 +21483,7 @@ fn run_export_html(
     file.write_all(html.as_bytes()).map_err(|e| {
         let err = CliError {
             code: 4,
-            kind: "write-failed",
+            kind: CliErrorKind::WriteFailed.kind_str(),
             message: format!("Failed to write file: {e}"),
             hint: None,
             retryable: false,
@@ -24813,7 +24924,7 @@ fn run_expand(
     if line == 0 {
         return Err(CliError {
             code: 2,
-            kind: "invalid-line",
+            kind: CliErrorKind::InvalidLine.kind_str(),
             message: "Line numbers start at 1, not 0".to_string(),
             hint: Some("Use -n 1 for the first line".to_string()),
             retryable: false,
@@ -24842,7 +24953,7 @@ fn run_expand(
     } else if allow_direct_file && path.exists() {
         return Err(CliError {
             code: 9,
-            kind: "indexed-session-required",
+            kind: CliErrorKind::IndexedSessionRequired.kind_str(),
             message: format!(
                 "Local expand for '{}' requires an indexed conversation or a JSONL session",
                 path.display()
@@ -24856,7 +24967,7 @@ fn run_expand(
     } else {
         return Err(CliError {
             code: 3,
-            kind: "file-not-found",
+            kind: CliErrorKind::FileNotFound.kind_str(),
             message: match source_id {
                 Some(source_id) => format!(
                     "No indexed session found for source '{}' at {}",
@@ -24904,7 +25015,7 @@ fn run_expand(
 
     let target_idx = target_msg_idx.ok_or_else(|| CliError {
         code: 2,
-        kind: "line-not-found",
+        kind: CliErrorKind::LineNotFound.kind_str(),
         message: format!("No message found at or near line {}", line),
         hint: Some(format!("File has {} messages", messages.len())),
         retryable: false,
@@ -25223,7 +25334,7 @@ fn run_timeline(
         })
         .map_err(|e| CliError {
             code: 9,
-            kind: "db-query",
+            kind: CliErrorKind::DbQuery.kind_str(),
             message: format!("Query failed: {e}"),
             hint: None,
             retryable: false,
@@ -25545,7 +25656,7 @@ fn run_sources_list(verbose: bool, output_format: Option<RobotFormat>) -> CliRes
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: Some("Run 'cass sources add' to configure a source".into()),
         retryable: false,
@@ -25691,7 +25802,7 @@ fn run_sources_add(
     let paths = if let Some(ref preset_name) = preset {
         get_preset_paths(preset_name).map_err(|e| CliError {
             code: 10,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: format!("Invalid preset: {e}"),
             hint: Some("Valid presets: macos-defaults, linux-defaults".into()),
             retryable: false,
@@ -25701,7 +25812,7 @@ fn run_sources_add(
     } else {
         return Err(CliError {
             code: 10,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: "No paths specified".into(),
             hint: Some("Use --preset macos-defaults or --path <path> to specify paths".into()),
             retryable: false,
@@ -25718,7 +25829,7 @@ fn run_sources_add(
     // Load existing config
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -25728,7 +25839,7 @@ fn run_sources_add(
     if config.find_source(&source_id).is_some() {
         return Err(CliError {
             code: 10,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: format!("Source '{source_id}' already exists"),
             hint: Some("Use a different --name or remove the existing source first".into()),
             retryable: false,
@@ -25759,7 +25870,7 @@ fn run_sources_add(
     // Add and save
     config.add_source(source).map_err(|e| CliError {
         code: 10,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to add source: {e}"),
         hint: None,
         retryable: false,
@@ -25767,7 +25878,7 @@ fn run_sources_add(
 
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -25805,7 +25916,7 @@ fn parse_source_url(url: &str, name: Option<&str>) -> Result<(String, String), C
     {
         return Err(CliError {
             code: 10,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: "Invalid host: contains whitespace/control characters or starts with '-'"
                 .into(),
             hint: Some("Use format: user@hostname (e.g., user@laptop.local)".into()),
@@ -25817,7 +25928,7 @@ fn parse_source_url(url: &str, name: Option<&str>) -> Result<(String, String), C
     if !host.contains('@') {
         return Err(CliError {
             code: 10,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: "Invalid URL format: missing username".into(),
             hint: Some("Use format: user@hostname (e.g., user@laptop.local)".into()),
             retryable: false,
@@ -25853,7 +25964,7 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
         .output()
         .map_err(|e| CliError {
             code: 12,
-            kind: "ssh",
+            kind: CliErrorKind::Ssh.kind_str(),
             message: format!("Failed to run ssh command: {e}"),
             hint: Some("Ensure ssh is installed and in PATH".into()),
             retryable: false,
@@ -25871,7 +25982,7 @@ fn test_ssh_connectivity(host: &str) -> CliResult<()> {
         };
         return Err(CliError {
             code: 12,
-            kind: "ssh",
+            kind: CliErrorKind::Ssh.kind_str(),
             message: format!("SSH connection failed to {host}"),
             hint: Some(hint),
             retryable: true,
@@ -25890,7 +26001,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     // Load existing config
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -25901,7 +26012,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     let Some(stored_source_name) = stored_source_name else {
         return Err(CliError {
             code: 13,
-            kind: "not-found",
+            kind: CliErrorKind::NotFound.kind_str(),
             message: format!("Source '{name}' not found"),
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
@@ -25926,7 +26037,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
             .read_line(&mut input)
             .map_err(|e| CliError {
                 code: 14,
-                kind: "io",
+                kind: CliErrorKind::Io.kind_str(),
                 message: format!("Failed to read input: {e}"),
                 hint: None,
                 retryable: false,
@@ -25943,7 +26054,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
     config.remove_source(&stored_source_name);
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -25980,7 +26091,7 @@ fn run_sources_remove(name: &str, purge: bool, skip_confirm: bool) -> CliResult<
         if source_dir.exists() {
             std::fs::remove_dir_all(&source_dir).map_err(|e| CliError {
                 code: 15,
-                kind: "io",
+                kind: CliErrorKind::Io.kind_str(),
                 message: format!("Failed to delete synced data: {e}"),
                 hint: None,
                 retryable: false,
@@ -26022,7 +26133,7 @@ fn run_sources_doctor(
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: Some("Run 'cass sources add' to configure a source".into()),
         retryable: false,
@@ -26062,7 +26173,7 @@ fn run_sources_doctor(
     if sources_to_check.is_empty() {
         return Err(CliError {
             code: 13,
-            kind: "not-found",
+            kind: CliErrorKind::NotFound.kind_str(),
             message: format!("Source '{}' not found", source_filter.unwrap_or("unknown")),
             hint: Some("Run 'cass sources list' to see configured sources".into()),
             retryable: false,
@@ -26419,7 +26530,7 @@ fn run_sources_sync(
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: Some("Run 'cass sources add' to configure a source".into()),
         retryable: false,
@@ -26735,7 +26846,7 @@ fn run_sources_discover(
     // Get preset paths
     let preset_paths = get_preset_paths(preset).map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Invalid preset: {e}"),
         hint: Some("Valid presets: linux-defaults, macos-defaults".into()),
         retryable: false,
@@ -26943,7 +27054,7 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
         }
         Err(e) => Err(CliError {
             code: 9,
-            kind: "setup",
+            kind: CliErrorKind::Setup.kind_str(),
             message: format!("Setup failed: {e}"),
             hint: Some("Run with --verbose for more details".into()),
             retryable: true,
@@ -27161,7 +27272,7 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
         "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
         _ => Err(CliError {
             code: 20,
-            kind: "model",
+            kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "Unknown model '{}'. Supported: all-minilm-l6-v2 (alias minilm), \
                  snowflake-arctic-s, nomic-embed.",
@@ -27193,7 +27304,7 @@ fn run_models_install(
     let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
         CliError {
             code: 20,
-            kind: "model",
+            kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "no model directory mapping for registered embedder '{}'",
                 registry_name
@@ -27204,7 +27315,7 @@ fn run_models_install(
     })?;
     let manifest = ModelManifest::for_embedder(registry_name).ok_or_else(|| CliError {
         code: 20,
-        kind: "model",
+        kind: CliErrorKind::Model.kind_str(),
         message: format!(
             "no manifest registered for embedder '{}'",
             registry_name
@@ -27217,7 +27328,7 @@ fn run_models_install(
         .transpose()
         .map_err(|error| CliError {
             code: 21,
-            kind: "model",
+            kind: CliErrorKind::Model.kind_str(),
             message: error.to_string(),
             hint: Some(
                 "Use an absolute http(s) mirror base URL such as https://mirror.example/cache"
@@ -27233,7 +27344,7 @@ fn run_models_install(
         if !source_path.is_dir() {
             return Err(CliError {
                 code: 21,
-                kind: "model",
+                kind: CliErrorKind::Model.kind_str(),
                 message: format!(
                     "--from-file path is not a directory: {}",
                     source_path.display()
@@ -27258,7 +27369,7 @@ fn run_models_install(
             if !src.is_file() {
                 return Err(CliError {
                     code: 21,
-                    kind: "model",
+                    kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "Required file '{}' not found in {}",
                         local_name,
@@ -27281,7 +27392,7 @@ fn run_models_install(
             println!("  Verifying {}...", local_name);
             let actual_hash = compute_sha256(&src).map_err(|e| CliError {
                 code: 22,
-                kind: "io",
+                kind: CliErrorKind::Io.kind_str(),
                 message: format!("Failed to hash {}: {}", local_name, e),
                 hint: None,
                 retryable: false,
@@ -27289,7 +27400,7 @@ fn run_models_install(
             if actual_hash != mfile.sha256 {
                 return Err(CliError {
                     code: 21,
-                    kind: "model",
+                    kind: CliErrorKind::Model.kind_str(),
                     message: format!(
                         "SHA256 mismatch for '{}': expected {}, got {}",
                         local_name, mfile.sha256, actual_hash
@@ -27305,7 +27416,7 @@ fn run_models_install(
         // All verified -- copy to model directory
         std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
             code: 22,
-            kind: "io",
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to create model directory: {}", e),
             hint: None,
             retryable: false,
@@ -27317,7 +27428,7 @@ fn run_models_install(
             let dst = model_dir.join(local_name);
             std::fs::copy(&src, &dst).map_err(|e| CliError {
                 code: 22,
-                kind: "io",
+                kind: CliErrorKind::Io.kind_str(),
                 message: format!("Failed to copy {}: {}", local_name, e),
                 hint: None,
                 retryable: false,
@@ -27333,7 +27444,7 @@ fn run_models_install(
         );
         std::fs::write(&marker_path, content).map_err(|e| CliError {
             code: 22,
-            kind: "io",
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to write verified marker: {}", e),
             hint: None,
             retryable: false,
@@ -27393,7 +27504,7 @@ fn run_models_install(
     if let Some(parent) = model_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| CliError {
             code: 22,
-            kind: "io",
+            kind: CliErrorKind::Io.kind_str(),
             message: format!("Failed to create model directory: {}", e),
             hint: None,
             retryable: false,
@@ -27433,7 +27544,7 @@ fn run_models_install(
         pb.abandon_with_message("Download failed");
         CliError {
             code: 23,
-            kind: "download",
+            kind: CliErrorKind::Download.kind_str(),
             message: "Model download thread panicked".to_string(),
             hint: Some("Retry the command; if it persists, report the panic output.".into()),
             retryable: true,
@@ -27482,7 +27593,7 @@ fn run_models_install(
 
             Err(CliError {
                 code: 23,
-                kind: "download",
+                kind: CliErrorKind::Download.kind_str(),
                 message: format!("Model download failed: {}", e),
                 hint: Some(if looks_like_windows_tcp_race {
                     "Use the air-gap script printed above, then re-run with --from-file".into()
@@ -27667,7 +27778,7 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
         "quality" => Ok(TierKind::Quality),
         other => Err(CliError {
             code: 2,
-            kind: "usage",
+            kind: CliErrorKind::Usage.kind_str(),
             message: format!("Unknown semantic tier '{other}'."),
             hint: Some("Use --tier fast or --tier quality".into()),
             retryable: false,
@@ -27697,7 +27808,7 @@ fn run_models_backfill(
     if batch_conversations == 0 {
         return Err(CliError {
             code: 2,
-            kind: "usage",
+            kind: CliErrorKind::Usage.kind_str(),
             message: "--batch-conversations must be greater than zero".to_string(),
             hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
             retryable: false,
@@ -27710,7 +27821,7 @@ fn run_models_backfill(
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,
-            kind: "index-missing",
+            kind: CliErrorKind::IndexMissing.kind_str(),
             message: format!("cass database not found: {}", db_path.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,
@@ -27728,7 +27839,7 @@ fn run_models_backfill(
     if !matches!(embedder_type.as_str(), "hash" | "fastembed") {
         return Err(CliError {
             code: 20,
-            kind: "model",
+            kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
             hint: Some("Use --embedder hash or --embedder fastembed".into()),
             retryable: false,
@@ -27801,7 +27912,7 @@ fn run_models_backfill(
     let db_fingerprint =
         crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
             code: 5,
-            kind: "storage-fingerprint",
+            kind: CliErrorKind::StorageFingerprint.kind_str(),
             message: format!(
                 "Failed to fingerprint cass database {}: {e}",
                 db_path.display()
@@ -27811,14 +27922,14 @@ fn run_models_backfill(
         })?;
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 5,
-        kind: "storage",
+        kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
-        kind: "semantic-manifest",
+        kind: CliErrorKind::SemanticManifest.kind_str(),
         message: format!("Failed to load semantic manifest: {e}"),
         hint: Some("Check permissions under the cass data directory".into()),
         retryable: true,
@@ -27831,7 +27942,7 @@ fn run_models_backfill(
     };
     let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
         code: 20,
-        kind: "model",
+        kind: CliErrorKind::Model.kind_str(),
         message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
         hint: Some(if embedder_type == "fastembed" {
             "Run 'cass models install -y' or retry with --embedder hash".into()
@@ -27855,7 +27966,7 @@ fn run_models_backfill(
         )
         .map_err(|e| CliError {
             code: 5,
-            kind: "semantic-backfill",
+            kind: CliErrorKind::SemanticBackfill.kind_str(),
             message: format!("Semantic backfill failed: {e}"),
             hint: Some(
                 "Retry the command; resumable checkpoints are kept in the semantic manifest".into(),
@@ -27956,7 +28067,7 @@ fn run_models_remove(
     let model_dir = FastEmbedder::model_dir_for(&data_dir, registry_name).ok_or_else(|| {
         CliError {
             code: 20,
-            kind: "model",
+            kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "no model directory mapping for registered embedder '{}'",
                 registry_name
@@ -28007,7 +28118,7 @@ fn run_models_remove(
     // Remove the directory
     std::fs::remove_dir_all(&model_dir).map_err(|e| CliError {
         code: 24,
-        kind: "io",
+        kind: CliErrorKind::Io.kind_str(),
         message: format!("Failed to remove model directory: {}", e),
         hint: Some("Check file permissions".into()),
         retryable: false,
@@ -28191,7 +28302,7 @@ fn purge_excluded_agent_archive_data(
         .purge_agent_archive_data(&archive_agent_slug)
         .map_err(|e| CliError {
             code: 5,
-            kind: "archive-purge",
+            kind: CliErrorKind::ArchivePurge.kind_str(),
             message: format!("Failed to purge indexed data for '{archive_agent_slug}': {e}"),
             hint: Some("The exclusion was still saved; run 'cass index --full' after fixing the archive if needed".into()),
             retryable: false,
@@ -28202,14 +28313,14 @@ fn purge_excluded_agent_archive_data(
 
     storage.rebuild_fts().map_err(|e| CliError {
         code: 5,
-        kind: "archive-fts-rebuild",
+        kind: CliErrorKind::ArchiveFtsRebuild.kind_str(),
         message: format!("Purged '{archive_agent_slug}' but failed to rebuild FTS: {e}"),
         hint: Some("Run 'cass index --full' to refresh derived search data".into()),
         retryable: false,
     })?;
     storage.rebuild_analytics().map_err(|e| CliError {
         code: 5,
-        kind: "archive-analytics-rebuild",
+        kind: CliErrorKind::ArchiveAnalyticsRebuild.kind_str(),
         message: format!(
             "Purged '{archive_agent_slug}' but failed to rebuild analytics rollups: {e}"
         ),
@@ -28218,14 +28329,14 @@ fn purge_excluded_agent_archive_data(
     })?;
     storage.rebuild_daily_stats().map_err(|e| CliError {
         code: 5,
-        kind: "archive-daily-stats-rebuild",
+        kind: CliErrorKind::ArchiveDailyStatsRebuild.kind_str(),
         message: format!("Purged '{archive_agent_slug}' but failed to rebuild daily stats: {e}"),
         hint: Some("Run 'cass index --full' to refresh derived daily stats".into()),
         retryable: false,
     })?;
     storage.rebuild_token_daily_stats().map_err(|e| CliError {
         code: 5,
-        kind: "archive-token-daily-stats-rebuild",
+        kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
         message: format!(
             "Purged '{archive_agent_slug}' but failed to rebuild token_daily_stats: {e}"
         ),
@@ -28234,7 +28345,7 @@ fn purge_excluded_agent_archive_data(
     })?;
     let remaining_conversations = storage.total_conversation_count().map_err(|e| CliError {
         code: 5,
-        kind: "archive-count",
+        kind: CliErrorKind::ArchiveCount.kind_str(),
         message: format!(
             "Purged '{archive_agent_slug}' but failed to count remaining conversations: {e}"
         ),
@@ -28246,7 +28357,7 @@ fn purge_excluded_agent_archive_data(
     crate::indexer::rebuild_tantivy_from_db(&db_path, &data_dir, remaining_conversations, None)
         .map_err(|e| CliError {
             code: 5,
-            kind: "lexical-rebuild",
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
             message: format!(
                 "Purged '{archive_agent_slug}' but failed to rebuild the lexical search index: {e}"
             ),
@@ -28262,7 +28373,7 @@ fn run_agents_list(output_format: Option<RobotFormat>) -> CliResult<()> {
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28303,7 +28414,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
 
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28313,7 +28424,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
         .exclude_agent_from_indexing(agent)
         .map_err(|e| CliError {
             code: 11,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: format!("Failed to update excluded agents: {e}"),
             hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
             retryable: false,
@@ -28321,7 +28432,7 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
 
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -28370,7 +28481,7 @@ fn run_agents_include(agent: &str) -> CliResult<()> {
 
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28380,7 +28491,7 @@ fn run_agents_include(agent: &str) -> CliResult<()> {
         .include_agent_in_indexing(agent)
         .map_err(|e| CliError {
             code: 11,
-            kind: "config",
+            kind: CliErrorKind::Config.kind_str(),
             message: format!("Failed to update excluded agents: {e}"),
             hint: Some("Provide a non-empty agent slug such as 'openclaw'".into()),
             retryable: false,
@@ -28388,7 +28499,7 @@ fn run_agents_include(agent: &str) -> CliResult<()> {
 
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -28446,7 +28557,7 @@ fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> C
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28454,7 +28565,7 @@ fn run_mappings_list(source_name: &str, output_format: Option<RobotFormat>) -> C
 
     let source = config.find_source(source_name).ok_or_else(|| CliError {
         code: 12,
-        kind: "source",
+        kind: CliErrorKind::Source.kind_str(),
         message: format!("Source '{}' not found", source_name),
         hint: Some("Use 'cass sources list' to see available sources".into()),
         retryable: false,
@@ -28514,7 +28625,7 @@ fn run_mappings_add(
 
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28524,7 +28635,7 @@ fn run_mappings_add(
         .find_source_mut(source_name)
         .ok_or_else(|| CliError {
             code: 12,
-            kind: "source",
+            kind: CliErrorKind::Source.kind_str(),
             message: format!("Source '{}' not found", source_name),
             hint: Some("Use 'cass sources list' to see available sources".into()),
             retryable: false,
@@ -28546,7 +28657,7 @@ fn run_mappings_add(
     if already_exists {
         return Err(CliError {
             code: 13,
-            kind: "mapping",
+            kind: CliErrorKind::Mapping.kind_str(),
             message: "This mapping already exists".into(),
             hint: None,
             retryable: false,
@@ -28557,7 +28668,7 @@ fn run_mappings_add(
 
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -28581,7 +28692,7 @@ fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
 
     let mut config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28591,7 +28702,7 @@ fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
         .find_source_mut(source_name)
         .ok_or_else(|| CliError {
             code: 12,
-            kind: "source",
+            kind: CliErrorKind::Source.kind_str(),
             message: format!("Source '{}' not found", source_name),
             hint: Some("Use 'cass sources list' to see available sources".into()),
             retryable: false,
@@ -28600,7 +28711,7 @@ fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
     if index >= source.path_mappings.len() {
         return Err(CliError {
             code: 14,
-            kind: "mapping",
+            kind: CliErrorKind::Mapping.kind_str(),
             message: format!(
                 "Invalid index {}. Source has {} mapping(s).",
                 index,
@@ -28615,7 +28726,7 @@ fn run_mappings_remove(source_name: &str, index: usize) -> CliResult<()> {
 
     config.save().map_err(|e| CliError {
         code: 11,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to save config: {e}"),
         hint: Some("Check file permissions on config directory".into()),
         retryable: false,
@@ -28634,7 +28745,7 @@ fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliR
 
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
-        kind: "config",
+        kind: CliErrorKind::Config.kind_str(),
         message: format!("Failed to load sources config: {e}"),
         hint: None,
         retryable: false,
@@ -28642,7 +28753,7 @@ fn run_mappings_test(source_name: &str, path: &str, agent: Option<&str>) -> CliR
 
     let source = config.find_source(source_name).ok_or_else(|| CliError {
         code: 12,
-        kind: "source",
+        kind: CliErrorKind::Source.kind_str(),
         message: format!("Source '{}' not found", source_name),
         hint: Some("Use 'cass sources list' to see available sources".into()),
         retryable: false,
@@ -28801,7 +28912,7 @@ fn run_daemon(
 
     daemon.run().map_err(|e| CliError {
         code: 9,
-        kind: "daemon",
+        kind: CliErrorKind::Daemon.kind_str(),
         message: format!("Daemon failed: {e}"),
         hint: None,
         retryable: false,
