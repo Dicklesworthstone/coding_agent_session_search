@@ -898,3 +898,74 @@ fn search_robot_shape_matches_golden() {
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/search_robot_shape.json.golden", &canonical);
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-v4kz1 (child of ibuuh.10):
+// Golden-artifact freeze for `cass export-html --json` envelope.
+//
+// Existing tests/pages_export_golden.rs spot-asserts three fields on
+// the export-html JSON payload (`success`, `exported.encrypted`,
+// `exported.messages_count`) but nothing pins the ENVELOPE SHAPE.
+// Any regression that renamed / added / removed fields across the
+// `success=true` branch ships through every consumer silently.
+//
+// Freeze the schema (types + keys, values scrubbed) exactly the way
+// the sibling `capabilities_shape_matches_golden`,
+// `health_shape_matches_golden`, and `quarantine_summary_shape_matches_golden`
+// tests do. The golden file lives at
+// `tests/golden/robot/export_html_shape.json.golden` and follows the
+// standard UPDATE_GOLDENS=1 regeneration procedure documented at
+// the top of this file.
+// ========================================================================
+
+#[test]
+fn export_html_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let session_path = test_home.path().join("rollout-export-shape.jsonl");
+    // Minimal but complete Codex rollout: session_meta + one user +
+    // one assistant message. Matches the shape the main
+    // pages_export_golden.rs suite uses so the fixture mirrors real
+    // export input.
+    fs::write(
+        &session_path,
+        concat!(
+            r#"{"timestamp":"2024-04-24T00:00:00Z","type":"session_meta","payload":{"id":"export-golden","cwd":"/tmp","cli_version":"0.42.0"}}"#,
+            "\n",
+            r#"{"timestamp":"2024-04-24T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2024-04-24T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+        ),
+    )
+    .expect("write session fixture");
+
+    let output_dir = test_home.path().join("export-out");
+    fs::create_dir_all(&output_dir).expect("create output dir");
+
+    let output = cass_cmd(test_home.path())
+        .arg("export-html")
+        .arg(&session_path)
+        .arg("--json")
+        .arg("--no-cdns")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--filename")
+        .arg("shape-probe")
+        .output()
+        .expect("run cass export-html");
+
+    assert!(
+        output.status.success(),
+        "cass export-html --json must succeed on a valid rollout; status={:?}\n\
+         stdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).expect("export-html emits JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&payload)).expect("pretty-print JSON");
+    assert_golden("robot/export_html_shape.json.golden", &canonical);
+}

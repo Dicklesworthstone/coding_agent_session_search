@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "success": {
+      "type": "boolean"
+    },
+    "exported": {
+      "type": "object",
+      "properties": {
+        "session_path": {
+          "type": "string"
+        },
+        "output_path": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "encrypted": {
+          "type": "boolean"
+        },
+        "messages_count": {
+          "type": "integer"
+        },
+        "agent": {
+          "type": "null"
+        },
+        "workspace": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}
