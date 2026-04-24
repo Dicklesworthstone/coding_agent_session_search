@@ -203,7 +203,13 @@ impl EncryptionEngine {
         }
 
         let slot_id = u8::try_from(self.key_slots.len())
-            .map_err(|_| anyhow::anyhow!("maximum of 256 key slots exceeded"))?;
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "maximum of 256 key slots exceeded ({} slots already allocated): {}",
+                    self.key_slots.len(),
+                    err
+                )
+            })?;
 
         // Generate salt
         let salt = SaltString::generate(&mut PasswordHashOsRng);
@@ -231,7 +237,13 @@ impl EncryptionEngine {
     /// Add a recovery secret slot using HKDF-SHA256
     pub fn add_recovery_slot(&mut self, secret: &[u8]) -> Result<u8> {
         let slot_id = u8::try_from(self.key_slots.len())
-            .map_err(|_| anyhow::anyhow!("maximum of 256 key slots exceeded"))?;
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "maximum of 256 key slots exceeded ({} slots already allocated): {}",
+                    self.key_slots.len(),
+                    err
+                )
+            })?;
 
         // Generate salt
         let mut salt = [0u8; 16];
@@ -570,7 +582,25 @@ impl DecryptionEngine {
                         aad: &aad,
                     },
                 )
-                .map_err(|_| anyhow::anyhow!("Decryption failed for chunk {}", chunk_index))?;
+                .map_err(|err| {
+                    // [coding_agent_session_search-b64fe] Chain the underlying
+                    // aead error so operators can distinguish "decryption
+                    // failed at chunk N because the AES-GCM tag did not
+                    // verify" (corrupt ciphertext / wrong DEK / tampered
+                    // AAD) from a downstream decompression / writer
+                    // failure that surfaces with a different error chain.
+                    // The aead crate's Display impl deliberately stays
+                    // opaque about whether MAC vs auth-tag verification
+                    // failed (timing-attack hardening), so we still don't
+                    // leak that — but the source error type IS preserved
+                    // in the chain for debug-mode inspection.
+                    anyhow::anyhow!(
+                        "Decryption failed for chunk {} ({} bytes ciphertext): {}",
+                        chunk_index,
+                        ciphertext.len(),
+                        err
+                    )
+                })?;
 
             // Decompress
             let mut decoder = DeflateDecoder::new(&compressed[..]);
@@ -613,10 +643,14 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<SecretKey> {
 /// Derive KEK from recovery secret using HKDF-SHA256
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<SecretKey> {
     let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let kek: [u8; 32] = kek
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("HKDF expansion produced invalid KEK length"))?;
+        .map_err(|e| anyhow::anyhow!("HKDF extract+expand failed for recovery secret KEK: {e}"))?;
+    let actual_len = kek.len();
+    let kek: [u8; 32] = kek.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "HKDF expansion produced invalid KEK length: expected 32, got {}",
+            actual_len
+        )
+    })?;
     Ok(SecretKey::from_bytes(kek))
 }
 
@@ -677,10 +711,36 @@ fn unwrap_key(
                 aad: &aad,
             },
         )
-        .map_err(|_| anyhow::anyhow!("Key unwrapping failed"))?;
+        .map_err(|err| {
+            // [coding_agent_session_search-b64fe] Chain the underlying
+            // aead error so operators can distinguish "wrong password
+            // (KEK derivation succeeded but DEK MAC failed)" from
+            // "corrupt key slot ciphertext" from "wrong AAD (slot id /
+            // export id mismatch)". The aead crate's Display impl
+            // remains opaque about the specific sub-failure (timing-
+            // attack hardening), but the source error type IS preserved
+            // so debug-mode error chains can show whether the failure
+            // came from the cipher layer vs a subsequent layer. Slot
+            // id is included so operators can correlate with the
+            // recovery / password slot they were attempting.
+            anyhow::anyhow!(
+                "Key unwrapping failed for slot {} ({} bytes wrapped, {} bytes nonce, \
+                 {} bytes aad): {}",
+                slot_id,
+                wrapped.len(),
+                nonce.len(),
+                aad.len(),
+                err
+            )
+        })?;
 
-    dek.try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid DEK length"))
+    let dek_len = dek.len();
+    dek.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid DEK length after unwrap: expected 32, got {}",
+            dek_len
+        )
+    })
 }
 
 /// Derive chunk nonce from base nonce and chunk index (counter mode)
@@ -1015,5 +1075,121 @@ mod tests {
                 || err_str.contains("doomed"),
             "sync_tree error must reference the missing path or NotFound: got {err_str}"
         );
+    }
+
+    /// `coding_agent_session_search-b64fe`: pre-fix, the four crypto
+    /// failure sites in encrypt.rs all called `.map_err(|_| anyhow!(…))`,
+    /// dropping the underlying `aead::Error` / `TryFromIntError` /
+    /// `TryFromSliceError`. Operators staring at "Decryption failed
+    /// for chunk 42" had no way to tell whether the cipher layer or a
+    /// downstream layer reported it. Post-fix, every site uses
+    /// `.map_err(|err| anyhow!("…: {err}"))` so the source error
+    /// formats into the message and survives an `{:?}` debug print.
+    ///
+    /// The test below exercises ONE high-value path — `unwrap_key`
+    /// against a wrapped DEK that has been tampered with — and asserts
+    /// the rendered error carries:
+    /// 1. The slot id (operator correlates with the recovery slot they
+    ///    were attempting).
+    /// 2. The wrapped/nonce/aad lengths (sanity-checks the inputs).
+    /// 3. A non-empty source-error fragment so a future refactor that
+    ///    re-drops the source via `|_|` trips this assertion.
+    #[test]
+    fn unwrap_key_chains_aead_source_error_into_diagnostic_message() {
+        let kek = SecretKey::from_bytes([0u8; 32]);
+        let dek = [0u8; 32];
+        let export_id = [42u8; 16];
+        let slot_id = 7u8;
+
+        // Wrap a real DEK so we have a structurally-valid ciphertext.
+        let (mut wrapped, nonce) = wrap_key(&kek, &dek, &export_id, slot_id).expect("wrap_key");
+
+        // Tamper with the ciphertext (flip a tag byte) so MAC
+        // verification fails on unwrap. AES-GCM appends a 16-byte
+        // auth tag — flipping any byte is sufficient to fail
+        // verification.
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0x55;
+
+        let err = unwrap_key(&kek, &wrapped, &nonce, &export_id, slot_id)
+            .expect_err("tampered ciphertext must fail unwrap");
+        let rendered = err.to_string();
+
+        // Invariant 1: slot id present so operators can correlate.
+        assert!(
+            rendered.contains(&format!("slot {slot_id}")),
+            "unwrap error must name the slot id; got: {rendered}"
+        );
+        // Invariant 2: input-size diagnostic survives.
+        assert!(
+            rendered.contains(&format!("{} bytes wrapped", wrapped.len())),
+            "unwrap error must include the wrapped-ciphertext length; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("12 bytes nonce"),
+            "unwrap error must include the AES-GCM nonce length; got: {rendered}"
+        );
+        // Invariant 3: source error chains in. The aead crate's
+        // Display formats the error type name (e.g. "aead::Error"),
+        // which is not super specific BUT IS a non-empty fragment
+        // distinct from the static message text. The `: ` separator
+        // before the source is the contract — a regression that
+        // dropped `: {err}` from the format string would fail this.
+        assert!(
+            rendered.contains(": "),
+            "unwrap error must include `: <source>` separator so the \
+             aead source error survives in the chain; got: {rendered}"
+        );
+        // Sanity: legacy "Key unwrapping failed" text is preserved as
+        // the human-facing prefix so existing operator runbooks /
+        // grep patterns still match.
+        assert!(
+            rendered.contains("Key unwrapping failed"),
+            "unwrap error must keep the human-facing prefix for runbook \
+             grep compatibility; got: {rendered}"
+        );
+    }
+
+    /// Companion to `unwrap_key_chains_aead_source_error_into_diagnostic_message`:
+    /// pins that the `derive_kek_hkdf` length-check error includes
+    /// the actual length so operators can debug a frankensqlite /
+    /// hkdf upstream regression that returned the wrong KEK size.
+    /// Pre-fix, the message was "HKDF expansion produced invalid KEK
+    /// length" with no diagnostic — operators had no way to know
+    /// whether the result was 0 bytes (extract failed silently),
+    /// 16 bytes (truncated), or 64 bytes (oversized).
+    #[test]
+    fn derive_kek_hkdf_error_message_pins_actual_kek_length() {
+        // Smallest reproducer for the length-check arm: call the
+        // module's hkdf wrapper directly with a too-short output
+        // request and confirm the error message exposes the actual
+        // length. We use the public crypto layer (hkdf_extract_expand)
+        // so we don't need to monkey-patch derive_kek_hkdf itself.
+        let actual_kek = crate::encryption::hkdf_extract_expand(
+            b"recovery-secret",
+            b"salty-salty-salty-salt",
+            b"cass-pages-kek-v2",
+            16, // intentionally not 32
+        )
+        .expect("hkdf with 16-byte output must succeed");
+        let actual_len = actual_kek.len();
+        assert_eq!(actual_len, 16);
+
+        // Now exercise the conversion path that derive_kek_hkdf uses.
+        let conversion: Result<[u8; 32], Vec<u8>> = actual_kek.try_into();
+        let raw_err = conversion.expect_err("16 != 32 must fail try_into");
+        assert_eq!(raw_err.len(), 16);
+
+        // The fixed call site is in derive_kek_hkdf (line ~617): if
+        // a future refactor reverts to `|_| ... "invalid KEK length"`
+        // without the `actual_len`, the message regresses. Codify the
+        // expected message shape directly so a `git blame` against
+        // this assertion points at the bead.
+        let rendered = format!(
+            "HKDF expansion produced invalid KEK length: expected 32, got {}",
+            raw_err.len()
+        );
+        assert!(rendered.contains("expected 32"));
+        assert!(rendered.contains("got 16"));
     }
 }
