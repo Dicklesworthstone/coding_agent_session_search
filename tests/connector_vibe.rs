@@ -1,6 +1,6 @@
 use coding_agent_search::connectors::vibe::VibeConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -13,6 +13,14 @@ fn write_session(root: &Path, session_id: &str, lines: &[&str]) -> std::path::Pa
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("messages.jsonl");
     fs::write(&path, lines.join("\n")).unwrap();
+    path
+}
+
+fn write_session_bytes(root: &Path, session_id: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let dir = root.join(session_id);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("messages.jsonl");
+    fs::write(&path, bytes).unwrap();
     path
 }
 
@@ -131,6 +139,101 @@ fn scan_empty_directory_returns_empty() {
     let tmp = TempDir::new().unwrap();
     let sessions = tmp.path().join(".vibe/logs/session");
     fs::create_dir_all(&sessions).unwrap();
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_empty_messages_file_returns_empty() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    fs::create_dir_all(&sessions).unwrap();
+    write_session_bytes(&sessions, "sess-zero-byte", b"");
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_truncated_tail_preserves_complete_messages() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    fs::create_dir_all(&sessions).unwrap();
+
+    write_session(
+        &sessions,
+        "sess-truncated-tail",
+        &[
+            r#"{"role":"user","content":"Complete before truncation","timestamp":"2025-06-15T10:00:00.000Z"}"#,
+            r#"{"role":"assistant","content":"unterminated tail""#,
+        ],
+    );
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert_eq!(convs.len(), 1);
+    assert_eq!(convs[0].messages.len(), 1);
+    assert_eq!(convs[0].messages[0].content, "Complete before truncation");
+    assert_eq!(convs[0].started_at, Some(1_749_981_600_000));
+    assert_eq!(convs[0].ended_at, Some(1_749_981_600_000));
+}
+
+#[test]
+fn scan_non_utf8_messages_file_returns_empty_without_panic() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    fs::create_dir_all(&sessions).unwrap();
+    write_session_bytes(&sessions, "sess-non-utf8", &[0xff, 0xfe, b'\n', 0xfd, 0x80]);
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_oversized_sparse_messages_file_returns_empty_without_panic() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    let session_dir = sessions.join("sess-huge");
+    fs::create_dir_all(&session_dir).unwrap();
+    let path = session_dir.join("messages.jsonl");
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(101 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let connector = VibeConnector::new();
+    let ctx = ScanContext::local_default(sessions.clone(), None);
+    let convs = connector.scan(&ctx).unwrap();
+
+    assert!(convs.is_empty());
+}
+
+#[test]
+fn scan_ignores_non_messages_jsonl_files() {
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join(".vibe/logs/session");
+    let session_dir = sessions.join("sess-wrong-file");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(
+        session_dir.join("events.jsonl"),
+        r#"{"role":"user","content":"wrong file name","timestamp":"2025-06-15T10:00:00.000Z"}"#,
+    )
+    .unwrap();
 
     let connector = VibeConnector::new();
     let ctx = ScanContext::local_default(sessions.clone(), None);
