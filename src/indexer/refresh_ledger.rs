@@ -2342,6 +2342,51 @@ mod tests {
         assert!(RegressionVerdictThresholds::try_new(15.0, f64::INFINITY).is_err());
     }
 
+    /// `coding_agent_session_search-whnja`: the non-negative-thresholds
+    /// fix (commit 5cb0038f) pinned the try_new rejection path and the
+    /// fail-open behavior for struct-update bypass, but nothing
+    /// directly asserted that a 0% steady-state delta evaluates as
+    /// Clean under a *valid* non-default threshold pair — the common
+    /// case for bench harnesses that tune tolerance away from the
+    /// 15/30 defaults. Pin it here so a future refactor of the
+    /// `>= warning` / `>= failure` ordering can't silently flip a
+    /// no-op bench run into a Warning under a tighter profile.
+    #[test]
+    fn regression_verdict_zero_change_under_valid_custom_thresholds_is_clean() {
+        fn zero_delta_comparison() -> RefreshLedgerEvidenceComparison {
+            RefreshLedgerEvidenceComparison {
+                phase_deltas: Vec::new(),
+                aggregate_duration_delta_pct: Some(0.0),
+                aggregate_throughput_delta_pct: None,
+                dominant_phase_shift: None,
+            }
+        }
+
+        // Strict CI profile — 5% warn / 20% fail. 0% change is a
+        // steady-state bench run and must not trigger any band.
+        let strict = RegressionVerdictThresholds::try_new(5.0, 20.0)
+            .expect("valid strict thresholds must construct");
+        let steady_state = zero_delta_comparison().regression_verdict(&strict);
+        assert_eq!(
+            steady_state,
+            RegressionVerdict::Clean,
+            "0% steady-state delta must be Clean under any valid \
+             threshold pair — tight CI profiles must not flag no-op runs"
+        );
+
+        // Extra-loose profile — 50% warn / 200% fail. Same 0% delta
+        // must still be Clean; tight vs loose is a policy knob on the
+        // warning band, not the zero-crossing.
+        let loose = RegressionVerdictThresholds::try_new(50.0, 200.0)
+            .expect("valid loose thresholds must construct");
+        let steady_state_loose = zero_delta_comparison().regression_verdict(&loose);
+        assert_eq!(
+            steady_state_loose,
+            RegressionVerdict::Clean,
+            "0% steady-state delta must be Clean under loose thresholds too"
+        );
+    }
+
     /// `coding_agent_session_search-ibuuh.24`: RegressionVerdict
     /// serializes through serde (CI runners persist the verdict
     /// JSON for PR comments + dashboards). Pin the tag/snake_case
