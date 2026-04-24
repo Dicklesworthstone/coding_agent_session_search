@@ -91,3 +91,10 @@ path = "fuzz_targets/fuzz_redact_secrets.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_time_parser"
+path = "fuzz_targets/fuzz_time_parser.rs"
+test = false
+doc = false
+bench = false
