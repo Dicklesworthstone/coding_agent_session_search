@@ -3588,7 +3588,7 @@ mod tests {
         use tracing_subscriber::Registry;
         use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
-        #[derive(Clone, Default)]
+        #[derive(Debug, Clone, Default)]
         struct CapturedEvent {
             level: String,
             target: String,
@@ -3662,10 +3662,12 @@ mod tests {
         ));
         manifest.transition_publish(LexicalGenerationPublishState::Quarantined, 4);
 
-        // Drive record_inventory under our collector subscriber.
+        // Drive record_inventory under our collector subscriber via
+        // the existing public `from_manifests` entrypoint, which calls
+        // record_inventory internally — same code path operators
+        // exercise via cass diag/doctor.
         tracing::subscriber::with_default(subscriber, || {
-            let mut plan = LexicalCleanupDryRunPlan::default();
-            plan.record_inventory(manifest.cleanup_inventory());
+            let _plan = LexicalCleanupDryRunPlan::from_manifests([&manifest]);
         });
 
         let captured = collector.events.lock().expect("collector lock").clone();
