@@ -1,30 +1,30 @@
-use anyhow::{Context, Result, bail};
-use console::{Term, style};
-use dialoguer::{Confirm, Input, MultiSelect, Password, Select, theme::ColorfulTheme};
+use anyhow::{bail, Context, Result};
+use console::{style, Term};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::pages::bundle::{BundleBuilder, BundleConfig};
 use crate::pages::confirmation::{
-    ConfirmationConfig, ConfirmationFlow, ConfirmationStep, PasswordStrengthAction, StepValidation,
-    UNENCRYPTED_ACK_PHRASE, unencrypted_warning_lines, validate_unencrypted_ack,
+    unencrypted_warning_lines, validate_unencrypted_ack, ConfirmationConfig, ConfirmationFlow,
+    ConfirmationStep, PasswordStrengthAction, StepValidation, UNENCRYPTED_ACK_PHRASE,
 };
 use crate::pages::deploy_cloudflare::{CloudflareConfig, CloudflareDeployer};
 use crate::pages::deploy_github::GitHubDeployer;
 use crate::pages::docs::{DocConfig, DocumentationGenerator};
 use crate::pages::encrypt::EncryptionEngine;
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
-use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
+use crate::pages::password::{format_strength_inline, validate_password, PasswordStrength};
 use crate::pages::secret_scan::{
-    SecretScanConfig, SecretScanFilters, print_human_report, wizard_secret_scan,
+    print_human_report, wizard_secret_scan, SecretScanConfig, SecretScanFilters,
 };
 use crate::pages::size::{BundleVerifier, SizeEstimate, SizeLimitResult};
 use crate::pages::summary::{
-    ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator, format_size,
+    format_size, ExclusionSet, PrePublishSummary, SummaryFilters, SummaryGenerator,
 };
 use crate::storage::sqlite::FrankenStorage;
 use frankensqlite::Connection;
@@ -170,6 +170,14 @@ impl Default for WizardState {
             cloudflare_api_token: None,
             final_site_dir: None,
         }
+    }
+}
+
+fn truncate_sample_title(title: &str) -> String {
+    if title.len() > 30 {
+        format!("{}...", &title[..title.floor_char_boundary(27)])
+    } else {
+        title.to_string()
     }
 }
 
@@ -840,13 +848,7 @@ impl PagesWizard {
                     .sample_titles
                     .iter()
                     .take(2)
-                    .map(|t| {
-                        if t.len() > 30 {
-                            format!("{}...", &t[..t.floor_char_boundary(27)])
-                        } else {
-                            t.clone()
-                        }
-                    })
+                    .map(|t| truncate_sample_title(t))
                     .collect();
                 writeln!(
                     term,
@@ -2345,6 +2347,40 @@ mod tests {
         assert_eq!(state.recovery_secret, Some(vec![1, 2, 3, 4]));
         assert!(!state.generate_recovery);
         assert!(state.generate_qr);
+    }
+
+    #[test]
+    fn wizard_state_debug_redacts_sensitive_fields() {
+        let state = WizardState {
+            password: Some("test_password".to_string()),
+            recovery_secret: Some(vec![1, 2, 3, 4]),
+            cloudflare_api_token: Some("cf-secret-token".to_string()),
+            ..Default::default()
+        };
+
+        let debug = format!("{state:?}");
+        assert!(debug.contains("password"));
+        assert!(debug.contains("recovery_secret"));
+        assert!(debug.contains("cloudflare_api_token"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("test_password"));
+        assert!(!debug.contains("cf-secret-token"));
+        assert!(!debug.contains("[1, 2, 3, 4]"));
+    }
+
+    #[test]
+    fn sample_title_truncation_is_utf8_boundary_safe() {
+        let ascii = "abcdefghijklmnopqrstuvwxyz0123456789";
+        assert_eq!(
+            truncate_sample_title(ascii),
+            "abcdefghijklmnopqrstuvwxyz0..."
+        );
+
+        let unicode = format!("{}{}", "日本語".repeat(12), "suffix");
+        let truncated = truncate_sample_title(&unicode);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.len() <= 30);
     }
 
     #[test]
