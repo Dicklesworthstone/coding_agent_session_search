@@ -5611,13 +5611,11 @@ fn state_meta_json_for_health(
 /// behavior because it explicitly surfaces totals to operators.
 ///
 /// `include_counts_override`:
-///   - `None`         → existing size-based logic (≤256 MB → counts).
-///   - `Some(false)`  → unconditionally skip; envelope reports 0/0
-///                      with `counts_skipped=true` (already in
-///                      StateDbSnapshot).
-///   - `Some(true)`   → unconditionally run counts (no caller uses
-///                      this today; reserved for future paths that
-///                      MUST have totals regardless of cost).
+/// - `None`         → existing size-based logic (≤256 MB → counts).
+/// - `Some(false)`  → unconditionally skip; envelope reports 0/0
+///   with `counts_skipped=true` (already in StateDbSnapshot).
+/// - `Some(true)`   → unconditionally run counts (no caller uses
+///   this today; reserved for future paths that MUST have totals regardless of cost).
 fn state_meta_json_inner(
     data_dir: &Path,
     db_path: &Path,
@@ -17564,10 +17562,7 @@ fn response_schema_search() -> serde_json::Value {
             serde_json::json!({ "type": ["string", "null"] }),
         ),
         ("_meta", response_schema_search_meta()),
-        (
-            "suggestions",
-            response_schema_opaque_object_array(),
-        ),
+        ("suggestions", response_schema_opaque_object_array()),
         (
             "explanation",
             serde_json::json!({
@@ -17865,6 +17860,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     "items": {
                         "type": "object",
                         "properties": {
+                            "line": { "type": "integer" },
                             "number": { "type": "integer" },
                             "content": { "type": "string" },
                             "highlighted": { "type": "boolean" }

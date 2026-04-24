@@ -171,15 +171,7 @@ fn assert_runtime_shape_covered(surface: &str, path: &str, runtime: &Value, adve
                 let advertised_child = advertised_props.get(key).unwrap_or_else(|| {
                     panic!("{surface}{child_path}: runtime field is missing from introspect schema")
                 });
-                let runtime_child_type = runtime_child
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                assert!(
-                    schema_allows_type(advertised_child, runtime_child_type),
-                    "{surface}{child_path}: runtime type {runtime_child_type:?} is not allowed by introspect schema {}",
-                    serde_json::to_string_pretty(advertised_child).expect("schema pretty-print"),
-                );
+                assert_runtime_shape_covered(surface, &child_path, runtime_child, advertised_child);
             }
         }
         "array" => {
