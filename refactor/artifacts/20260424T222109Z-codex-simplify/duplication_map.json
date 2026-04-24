@@ -1,0 +1,23 @@
+{
+  "run_id": "20260424T222109Z-codex-simplify",
+  "generated_at": "2026-04-24T22:21:56Z",
+  "tools_run": [""]
+  ,
+  "candidates": [
+    {
+      "id": "D1",
+      "kind": "hand-written error trait boilerplate",
+      "locations": [
+        "src/html_export/encryption.rs",
+        "src/html_export/template.rs",
+        "src/html_export/renderer.rs"
+      ],
+      "clone_type": "II",
+      "loc_score": 3,
+      "confidence": 5,
+      "risk": 1,
+      "score": 15.0,
+      "decision": "accept"
+    }
+  ]
+}

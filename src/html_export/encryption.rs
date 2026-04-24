@@ -3,8 +3,6 @@
 //! Uses Web Crypto API compatible encryption (AES-GCM) with PBKDF2 key derivation.
 //! The encryption happens in Rust, decryption happens in the browser via JavaScript.
 
-use std::fmt;
-
 #[cfg(feature = "encryption")]
 use std::num::NonZeroU32;
 #[cfg(feature = "encryption")]
@@ -16,27 +14,18 @@ use tracing::{debug, warn};
 #[cfg(feature = "encryption")]
 use tracing::info;
 /// Errors that can occur during encryption.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EncryptionError {
     /// Key derivation failed
+    #[error("key derivation failed: {0}")]
     KeyDerivation(String),
     /// Encryption operation failed
+    #[error("encryption failed: {0}")]
     EncryptionFailed(String),
     /// Invalid passphrase
+    #[error("invalid passphrase")]
     InvalidPassphrase,
 }
-
-impl fmt::Display for EncryptionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EncryptionError::KeyDerivation(msg) => write!(f, "key derivation failed: {}", msg),
-            EncryptionError::EncryptionFailed(msg) => write!(f, "encryption failed: {}", msg),
-            EncryptionError::InvalidPassphrase => write!(f, "invalid passphrase"),
-        }
-    }
-}
-
-impl std::error::Error for EncryptionError {}
 
 /// Encrypted content bundle ready for embedding in HTML.
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +289,22 @@ fn html_escape_for_content(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encryption_error_display_strings() {
+        assert_eq!(
+            EncryptionError::KeyDerivation("bad params".to_string()).to_string(),
+            "key derivation failed: bad params"
+        );
+        assert_eq!(
+            EncryptionError::EncryptionFailed("cipher failed".to_string()).to_string(),
+            "encryption failed: cipher failed"
+        );
+        assert_eq!(
+            EncryptionError::InvalidPassphrase.to_string(),
+            "invalid passphrase"
+        );
+    }
 
     #[test]
     #[cfg(feature = "encryption")]

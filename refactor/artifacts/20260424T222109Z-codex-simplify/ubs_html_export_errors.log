@@ -1,0 +1,475 @@
+ℹ Ignoring paths from /data/projects/coding_agent_session_search/.ubsignore → target .aider.chat.history.md .aider.input.history .aider.tags.cache.v3 temp_*.rs tests/fixtures tests/golden/html_export/*.golden Cargo.lock .idea .vscode *.swp *.swo .env .venv .claude .local_backup_*
+ℹ Preparing shadow workspace for 3 specified file(s)
+ℹ Scanning shadow workspace at /tmp/tmp.ao9KGSlX9P/files_scan
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ██╗   ██╗██╗  ████████╗██╗███╗   ███╗ █████╗ ████████╗███████╗              ║
+║  ██║   ██║██║  ╚══██╔══╝██║████╗ ████║██╔══██╗╚══██╔══╝██╔════╝              ║
+║  ██║   ██║██║     ██║   ██║██╔████╔██║███████║   ██║   █████╗                ║
+║  ██║   ██║██║     ██║   ██║██║╚██╔╝██║██╔══██║   ██║   ██╔══╝                ║
+║  ╚██████╔╝███████╗██║   ██║██║ ╚═╝ ██║██║  ██║   ██║   ███████╗              ║
+║   ╚═════╝ ╚══════╝╚═╝   ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝              ║
+║                                                                              ║
+║  ██████╗ ██╗   ██╗ ██████╗         __       __                               ║
+║  ██╔══██╗██║   ██║██╔════╝         \ `-'"-'` /                               ║
+║  ██████╔╝██║   ██║██║  ███╗        / \_   _/ \                               ║
+║  ██╔══██╗██║   ██║██║   ██║        |  d\_/b  |                               ║
+║  ██████╔╝╚██████╔╝╚██████╔╝       .'\   V   /'.                              ║
+║  ╚═════╝  ╚═════╝  ╚═════╝        /   '-...-'   \                            ║
+║                                  | /         \ |                             ║
+║                                  \/\         /\/                             ║
+║                                  ==(||)---(||)==                             ║
+║                                                                              ║
+║  ███████╗  ██████╗   █████╗ ███╗   ██╗███╗   ██╗███████╗██████╗              ║
+║  ██╔════╝  ██╔═══╝  ██╔══██╗████╗  ██║████╗  ██║██╔════╝██╔══██╗             ║
+║  ███████╗  ██║      ███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝             ║
+║  ╚════██║  ██║      ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗             ║
+║  ███████║  ██████╗  ██║  ██║██║ ╚████║██║ ╚████║███████╗██║  ██║             ║
+║  ╚══════╝  ╚═════╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝                  ║
+║                                                                              ║
+║   JS / TS • PYTHON • C / C++ • RUST • GO • JAVA • RUBY • SWIFT • C#          ║
+║                    UBS: ULTIMATE BUG SCANNER • SARIF FUSION ☄️               ║
+║                                                                              ║
+║                                                                              ║
+║                     Night Owl QA                                             ║
+║                     “We see bugs before you do.”                             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+UBS Meta-Runner v5.0.7  2026-04-24 18:24:02
+Project: /data/projects/coding_agent_session_search
+Format:  text
+Detected: rust
+Scanning rust...
+Finished rust (5s)
+
+──────── rust ────────
+
+╔═══════════════════════════════════════════════════════════════════╗ 
+║  ██╗   ██╗██╗  ████████╗██╗███╗   ███╗ █████╗ ████████╗███████╗   ║ 
+║  ██║   ██║██║  ╚══██╔══╝██║████╗ ████║██╔══██╗╚══██╔══╝██╔════╝   ║ 
+║  ██║   ██║██║     ██║   ██║██╔████╔██║███████║   ██║   █████╗     ║ 
+║  ██║   ██║██║     ██║   ██║██║╚██╔╝██║██╔══██║   ██║   ██╔══╝     ║ 
+║  ╚██████╔╝███████╗██║   ██║██║ ╚═╝ ██║██║  ██║   ██║   ███████╗   ║ 
+║   ╚═════╝ ╚══════╝╚═╝   ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ║ 
+║                                            /\                     ║ 
+║  ██████╗ ██╗   ██╗ ██████╗                ( /   @ @    ()         ║ 
+║  ██╔══██╗██║   ██║██╔════╝                 \  __| |__  /          ║ 
+║  ██████╔╝██║   ██║██║  ███╗                 -/   "   \-           ║ 
+║  ██╔══██╗██║   ██║██║   ██║                /-|       |-\          ║ 
+║  ██████╔╝╚██████╔╝╚██████╔╝               / /-\     /-\ \         ║ 
+║  ╚═════╝  ╚═════╝  ╚═════╝                 / /-`---'-\\ \          ║ 
+║                                             /         \           ║ 
+║                                                                   ║ 
+║  ███████╗  ██████╗   █████╗ ███╗   ██╗███╗   ██╗███████╗██████╗   ║ 
+║  ██╔════╝  ██╔═══╝  ██╔══██╗████╗  ██║████╗  ██║██╔════╝██╔══██╗  ║ 
+║  ███████╗  ██║      ███████║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝  ║ 
+║  ╚════██║  ██║      ██╔══██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗  ║ 
+║  ███████║  ██████╗  ██║  ██║██║ ╚████║██║ ╚████║███████╗██║  ██║  ║ 
+║  ╚══════╝  ╚═════╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝       ║ 
+║                                                                   ║ 
+║  Rust module • ownership sanity, unsafe & async spotlights        ║ 
+║  UBS module: rust • cargo-aware targeting, low-noise caching      ║ 
+║  ASCII homage: Ferris crab (ASCII Art Archive)                    ║ 
+║  Run standalone: modules/ubs-rust.sh --help                       ║ 
+║                                                                   ║ 
+║  Night Owl QA                                                     ║ 
+║  “We see bugs before you do.”                                     ║ 
+╚═══════════════════════════════════════════════════════════════════╝ 
+                                                                      
+
+Project:  /data/projects/coding_agent_session_search
+Started:  2026-04-24 18:24:02
+Files:    3 source files (rs)
+
+✓ ast-grep available (ast-grep) - full AST analysis enabled
+✓ cargo detected
+  ✓ clippy available
+  ✓ rustfmt available
+  ✓ cargo-audit available
+  ✓ cargo-deny available
+  ⚠ cargo-udeps not installed
+  ✓ cargo-outdated available
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. OWNERSHIP & ERROR HANDLING MACROS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: unwrap/expect, panic/unreachable/todo/unimplemented, dbg/println
+Panic-prone and debug macros frequently leak into production and cause crashes
+
+• unwrap()/expect() usage
+  ⚠ Warning (66 found)
+    Potential panics via unwrap/expect
+    Prefer `?` or match to propagate/handle errors
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:348 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L348)
+              let encrypted = encrypt_content(plaintext, &test_phrase, &params).expect("encrypt");
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:353 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L353)
+                  .expect("salt b64");
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:356 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L356)
+                  .expect("iv b64");
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:359 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L359)
+                  .expect("ciphertext b64");
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:364 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L364)
+                  NonZeroU32::new(params.iterations).expect("test iterations should be non-zero"),
+
+• panic!/unreachable!/todo!/unimplemented!
+  ✓ OK No panic! macros
+
+• dbg!/println!/eprintln!
+
+• Guard clauses that still unwrap later
+  ✓ OK No guard/unwrap mismatches detected
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. UNSAFE & MEMORY OPERATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: unsafe blocks, transmute/uninitialized/zeroed/forget, raw ffi hazards
+These patterns may introduce UB, memory leaks, or hard-to-debug crashes
+
+• unsafe { ... } blocks
+  ✓ OK No unsafe blocks detected
+
+• transmute, uninitialized, zeroed, forget
+
+• CStr::from_bytes_with_nul_unchecked
+
+• get_unchecked / from_utf8_unchecked / from_raw_parts
+
+• Unsafe Send/Sync impls
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CONCURRENCY & ASYNC PITFALLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: Arc<Mutex>, Rc<RefCell>, blocking ops in async, await-in-loop, spawn misuse
+Concurrency misuse leads to deadlocks, head-of-line blocking, and performance issues
+
+• Arc<Mutex<..>> / Rc<RefCell<..>> / RwLock
+  ℹ Info (1 found)
+    Arc<Mutex<..>> detected - verify contention
+
+• Mutex::lock().unwrap()/expect()
+  ⚠ Warning (4 found)
+    Poisoned lock handling via unwrap/expect
+      /data/projects/coding_agent_session_search/src/html_export/template.rs:772 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/template.rs#L772)
+                  let mut inner = self.0.lock().expect("log buffer lock");
+      /data/projects/coding_agent_session_search/src/html_export/template.rs:794 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/template.rs#L794)
+              let bytes = buf.lock().expect("log buffer lock").clone();
+
+• await inside loops (sequentialism)
+
+• Blocking ops inside async (thread::sleep, std::fs)
+
+• block_on within async context
+
+• std::thread::spawn within async
+
+• tokio::spawn usage (heuristic for detached tasks)
+
+• Async error path coverage
+  ✓ OK No tokio::spawn usage detected
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. NUMERIC & FLOATING-POINT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: float equality, division/modulo by variable, potential overflow hints
+Numeric bugs cause subtle logic errors or panics in debug builds (overflow)
+
+• Floating-point equality comparisons
+  ℹ Info (1 found)
+    Float equality/inequality check
+    Consider epsilon comparisons
+
+• Division/modulo by variable (verify non-zero)
+  ℹ Info (107 found)
+    Division by variables - guard zero divisors
+  ℹ Info (5 found)
+    Modulo by variables - guard zero divisors
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. COLLECTIONS & ITERATORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: clone in loops, collect then iterate, nth(0), length checks
+Iterator misuse often leads to unnecessary allocations or slow paths
+
+• clone() occurrences & clone() in loops
+  ℹ Info (12 found)
+    clone() usages - audit for necessity
+
+• collect::<Vec<_>>() then for
+  ℹ Info (2 found)
+    Collecting to Vec before iterate - consider streaming
+
+• nth(0) → next()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. STRING & ALLOCATION SMELLS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: needless allocations, format!(literal), to_owned().to_string()
+Unnecessary allocations and conversions reduce performance
+
+• to_owned().to_string() chain
+
+• format!("literal") with no placeholders
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. FILESYSTEM & PROCESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: blocking std::fs in async, process::Command usage heuristics
+I/O misuse or command construction from untrusted input can be risky
+
+• std::fs usage (general inventory)
+
+• std::process::Command usage
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. SECURITY FINDINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: TLS verification disabled, weak hash algos, HTTP URLs, secrets
+Security misconfigurations can lead to credential leaks and MITM attacks
+
+• Weak hash algorithms (MD5/SHA1)
+  ✓ OK No MD5/SHA1 found
+
+• TLS verification disabled
+
+• Plain http:// URLs
+  ℹ Info (16 found)
+    Plain HTTP URL(s) detected
+
+• Hardcoded secrets/credentials (heuristic)
+  🔥 CRITICAL (1 found)
+    Possible hardcoded secrets
+      /data/projects/coding_agent_session_search/src/html_export/template.rs:674 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/template.rs#L674)
+                  let password = match password {
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. CODE QUALITY MARKERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: TODO, FIXME, HACK, NOTE
+Technical debt markers indicate incomplete or problematic code
+  ✓ OK No TODO/FIXME/HACK markers found
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. MODULE & VISIBILITY ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: pub use wildcards, glob imports, re-exports
+Overly broad visibility complicates API stability and encapsulation
+
+• Wildcard imports (use crate::* or ::*)
+  ℹ Info (3 found)
+    Wildcard imports found; prefer explicit names
+      /data/projects/coding_agent_session_search/src/html_export/encryption.rs:291 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/encryption.rs#L291)
+          use super::*;
+      /data/projects/coding_agent_session_search/src/html_export/template.rs:762 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/template.rs#L762)
+          use super::*;
+      /data/projects/coding_agent_session_search/src/html_export/renderer.rs:1330 (https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b0c1ec0ccd37a0c6eddc2fe3c19a1984bf8e8d96/src/html_export/renderer.rs#L1330)
+          use super::*;
+
+• pub use re-exports (inventory)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. TESTS & BENCHES HYGIENE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: ignored tests, todo! in tests, println!/dbg! in tests
+Ensure tests do not hide failures or produce noisy output
+
+• #[ignore] tests
+
+• todo!/unimplemented! in tests
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. LINTS & STYLE (fmt/clippy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo fmt -- --check, cargo clippy
+Formatter and lints help maintain consistent style and catch many issues
+  ✓ OK Formatting is clean
+  ✓ OK No clippy warnings/errors
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. BUILD HEALTH (check/test)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo check, cargo test --no-run
+Ensures the project compiles and tests build
+  ✓ OK cargo check clean
+  ✓ OK Tests build clean
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. DEPENDENCY HYGIENE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Runs: cargo audit, cargo deny check, cargo udeps, cargo outdated
+Keeps dependencies safe, minimal, and up-to-date
+  ✓ OK No known advisories (cargo-audit)
+  ✓ OK cargo-deny clean
+  ℹ Info (1 found)
+    cargo-udeps not installed; skipping unused dep scan
+  ✓ OK Dependencies up-to-date
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. API MISUSE (COMMON)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: nth(0), DefaultHasher, expect_err/unwrap_err, Option::unwrap_or_default in hot paths
+Common footguns and readability hazards
+
+• std::collections::hash_map::DefaultHasher
+
+• unwrap_err()/expect_err() usage inventory
+
+• Option::unwrap_or_default inventory
+  ℹ Info (3 found)
+    unwrap_or_default present - validate default semantics
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+16. DOMAIN-SPECIFIC HEURISTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: reqwest builder, SQL string concatenation (heuristic), serde_json::from_str without context
+Domain patterns that often hint at bugs
+
+• reqwest::ClientBuilder inventory
+
+• serde_json::from_str without error context (heuristic)
+  ℹ Info (1 found)
+    serde_json::from_str uses - ensure error context and validation
+
+• SQL string concatenation (heuristic)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. AST-GREP RULE PACK FINDINGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ℹ Info (0 found)
+    AST rule pack staged
+    Run with --format=sarif to emit SARIF from the rule pack
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+18. META STATISTICS & INVENTORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: crate counts, bin/lib targets, feature flags (Cargo.toml heuristic)
+High-level view of the project layout
+
+• Cargo.toml features (heuristic count)
+  ℹ Info (1 found)
+    No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+19. RESOURCE LIFECYCLE CORRELATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: std::thread::spawn without join, tokio::spawn without await, TcpStream without shutdown
+Rust relies on explicit joins/shutdowns even with RAII—leaks create zombie work
+
+• Resource lifecycle correlation
+  ✓ OK All tracked resource acquisitions have matching cleanups
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+20. ASYNC LOCKING ACROSS AWAIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: locks acquired in async fns and potentially held across await
+Holding locks across await can deadlock, starve tasks, and cause latency spikes; std::sync locks can block executor threads
+
+• std::sync lock usage inside async fn (blocking risk)
+  ✓ OK No obvious std::sync lock usage inside async fns
+
+• Potential std::sync guard held across await (heuristic)
+
+• Potential async lock guard held across await (tokio/async locks heuristic)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+21. PANIC SURFACES & UNWINDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: assert macros, unreachable_unchecked/unwrap_unchecked, panic/unwrap inside Drop
+Panics in destructors or UB hints can crash/abort in subtle ways; these can slip past linting depending on cfg/features
+
+• assert!/assert_eq!/assert_ne! inventory
+  ⚠ Warning (180 found)
+    assert! macros present (panic surface)
+    If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input
+
+• unreachable_unchecked / unwrap_unchecked
+
+• panic!/unwrap/expect inside Drop
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+22. SUSPICIOUS CASTS & TRUNCATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: pervasive `as` casts, try_into().unwrap, numeric narrowing patterns
+`as` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths
+
+• `as` cast inventory
+  ✓ OK No obvious `as` casts detected
+
+• try_into().unwrap()/expect() (panic on conversion failure)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+23. PARSING & VALIDATION ROBUSTNESS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: parse/from_str/env-var unwraps, decode unwraps, missing error context
+Parsing and decoding failures often happen in prod on edge inputs; unwrap/expect turns them into panics
+
+• parse::<T>().unwrap()/expect()
+
+• serde_json::from_str(...).unwrap()/expect()
+
+• std::env::var(...).unwrap()/expect()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+24. PERF/DoS HOTSPOTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+▓▓▓ Detects: regex compilation in loops, chars().nth(n), format!/allocations in loops
+Some perf pitfalls become DoS risks on large inputs or hot paths; these often evade linting in non-bench builds
+
+• Regex::new occurrences and in-loop compilation
+  ✓ OK No regex::Regex::new detected
+
+• chars().nth(n) (O(n))
+
+• format!/to_string/allocations inside loops (heuristic)
+
+═══════════════════════════════════════════════════════════════════════════
+                    🎯 SCAN COMPLETE 🎯                                  
+═══════════════════════════════════════════════════════════════════════════
+
+Summary Statistics:
+  Files scanned:    3
+  Critical issues:  1
+  Warning issues:   250
+  Info items:       153
+
+Priority Actions:
+  🔥 FIX CRITICAL ISSUES IMMEDIATELY
+  These cause crashes, security vulnerabilities, or data corruption
+  ⚠ Review and fix WARNING items
+  These cause bugs, performance issues, or maintenance problems
+  ℹ Consider INFO suggestions
+  Code quality improvements and best practices
+
+Scan completed at: 2026-04-24 18:24:07
+
+Tip: Run with -v/--verbose for more code samples per finding.
+Add to CI: ./ubs --ci --fail-on-warning . > rust-bug-scan.txt
+
+
+──────── Combined Summary ────────
+Files: 3
+Critical: 1
+Warning: 250
+Info: 153

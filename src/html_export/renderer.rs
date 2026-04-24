@@ -13,7 +13,6 @@
 //! - **XSS prevention**: All user content is properly escaped
 //! - **Accessible**: Semantic HTML with ARIA attributes
 
-use std::fmt;
 use std::time::Instant;
 
 use super::template::html_escape;
@@ -22,24 +21,15 @@ use serde_json;
 use tracing::{debug, info, trace};
 
 /// Errors that can occur during rendering.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RenderError {
     /// Invalid message data
+    #[error("invalid message: {0}")]
     InvalidMessage(String),
     /// Content parsing failed
+    #[error("parse error: {0}")]
     ParseError(String),
 }
-
-impl fmt::Display for RenderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RenderError::InvalidMessage(msg) => write!(f, "invalid message: {}", msg),
-            RenderError::ParseError(msg) => write!(f, "parse error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for RenderError {}
 
 /// Options for rendering conversations.
 #[derive(Debug, Clone)]
@@ -1338,6 +1328,18 @@ fn byte_index_for_char_count(s: &str, max_chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_error_display_strings() {
+        assert_eq!(
+            RenderError::InvalidMessage("missing role".to_string()).to_string(),
+            "invalid message: missing role"
+        );
+        assert_eq!(
+            RenderError::ParseError("bad markdown".to_string()).to_string(),
+            "parse error: bad markdown"
+        );
+    }
 
     fn test_message(role: &str, content: &str) -> Message {
         Message {

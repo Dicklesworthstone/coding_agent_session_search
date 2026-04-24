@@ -1,0 +1,5 @@
+  [2m2026-04-24T22:28:28.251030Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: env 'CARGO_TARGET_DIR=/tmp/rch_target_cass_simplify' cargo clippy --all-targets -- -D warnings -A clippy::doc-overindented-list-items[0m
+    [2;3mat[0m rch/src/hook.rs:187 [2;3mon[0m ThreadId(1)
+
+   Compiling coding-agent-search v0.3.7 (/data/projects/coding_agent_session_search)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 54.39s

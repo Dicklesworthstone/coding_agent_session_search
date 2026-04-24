@@ -1,0 +1,238 @@
+Diff in /data/projects/coding_agent_session_search/src/html_export/scripts.rs:1218:
+         assert!(bundle.inline_js.contains("addEventListener('blur'"));
+ 
+         // Click support (mobile/touch)
+-        assert!(bundle
+-            .inline_js
+-            .contains("this.toggle(badge, getPopover())"));
++        assert!(
++            bundle
++                .inline_js
++                .contains("this.toggle(badge, getPopover())")
++        );
+ 
+         // Escape key support
+         assert!(bundle.inline_js.contains("e.key === 'Escape'"));
+Diff in /data/projects/coding_agent_session_search/src/html_export/scripts.rs:1255:
+         assert!(bundle.inline_js.contains("ToolCalls.init()"));
+         assert!(bundle.inline_js.contains("ToolPopovers.init()"));
+         assert!(bundle.inline_js.contains("__cassAttachCodeCopyButtons();"));
+-        assert!(bundle
+-            .inline_js
+-            .contains("const __cassAttachCodeCopyButtons"));
+-        assert!(bundle
+-            .inline_js
+-            .contains("pre.querySelector('.copy-code-btn')"));
++        assert!(
++            bundle
++                .inline_js
++                .contains("const __cassAttachCodeCopyButtons")
++        );
++        assert!(
++            bundle
++                .inline_js
++                .contains("pre.querySelector('.copy-code-btn')")
++        );
+     }
+ }
+ 
+Diff in /data/projects/coding_agent_session_search/tests/cli_doctor.rs:989:
+          cleanup_apply: {cleanup_apply:#}"
+     );
+     assert_eq!(
+-        cleanup_apply["pruned_asset_count"].as_u64().unwrap_or(u64::MAX),
++        cleanup_apply["pruned_asset_count"]
++            .as_u64()
++            .unwrap_or(u64::MAX),
+         0,
+         "second --fix MUST prune zero additional assets; cleanup_apply: {cleanup_apply:#}"
+     );
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_docs.rs:128:
+ 
+ #[test]
+ fn robot_docs_commands_matches_golden() {
+-    assert_golden(
+-        "robot_docs/commands.txt.golden",
+-        &capture_docs("commands"),
+-    );
++    assert_golden("robot_docs/commands.txt.golden", &capture_docs("commands"));
+ }
+ 
+ #[test]
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_docs.rs:141:
+ 
+ #[test]
+ fn robot_docs_examples_matches_golden() {
+-    assert_golden(
+-        "robot_docs/examples.txt.golden",
+-        &capture_docs("examples"),
+-    );
++    assert_golden("robot_docs/examples.txt.golden", &capture_docs("examples"));
+ }
+ 
+ #[test]
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_json.rs:860:
+         ])
+         .output()
+         .expect("run cass stats --json");
+-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+-        .expect("stats error envelope is JSON on stdout");
++    let parsed: serde_json::Value =
++        serde_json::from_slice(&out.stdout).expect("stats error envelope is JSON on stdout");
+     let canonical =
+         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+     assert_golden("robot/stats_missing_db_shape.json.golden", &canonical);
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_json.rs:1068:
+ #[test]
+ fn doctor_json_matches_golden() {
+     let test_home = tempfile::tempdir().expect("create temp home");
+-    let scrubbed =
+-        capture_robot_json(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
++    let scrubbed = capture_robot_json(
++        test_home.path(),
++        &["doctor", "--json"],
++        ExpectStatus::ExitOk,
++    );
+     assert_golden("robot/doctor.json.golden", &scrubbed);
+ }
+ 
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_json.rs:1076:
+ #[test]
+ fn status_shape_matches_golden() {
+     let test_home = tempfile::tempdir().expect("create temp home");
+-    let status =
+-        capture_robot_json_value(test_home.path(), &["status", "--json"], ExpectStatus::ExitOk);
++    let status = capture_robot_json_value(
++        test_home.path(),
++        &["status", "--json"],
++        ExpectStatus::ExitOk,
++    );
+     let canonical =
+         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
+     assert_golden("robot/status_shape.json.golden", &canonical);
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_json.rs:1086:
+ #[test]
+ fn doctor_shape_matches_golden() {
+     let test_home = tempfile::tempdir().expect("create temp home");
+-    let doctor =
+-        capture_robot_json_value(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
++    let doctor = capture_robot_json_value(
++        test_home.path(),
++        &["doctor", "--json"],
++        ExpectStatus::ExitOk,
++    );
+     let canonical =
+         serde_json::to_string_pretty(&json_value_schema(&doctor)).expect("pretty-print JSON");
+     assert_golden("robot/doctor_shape.json.golden", &canonical);
+Diff in /data/projects/coding_agent_session_search/tests/golden_robot_json.rs:1112:
+         ])
+         .output()
+         .expect("run cass sessions --current --json");
+-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+-        .expect("sessions error envelope is JSON on stdout");
++    let parsed: serde_json::Value =
++        serde_json::from_slice(&out.stdout).expect("sessions error envelope is JSON on stdout");
+     let canonical =
+         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
+-    assert_golden(
+-        "robot/sessions_missing_db_shape.json.golden",
+-        &canonical,
+-    );
++    assert_golden("robot/sessions_missing_db_shape.json.golden", &canonical);
+ }
+ 
+ #[test]
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_agent_detection.rs:106:
+         &data_dir,
+     );
+     let order_ba = scan_codex_collected(
+-        vec![ScanRoot::local(root_b.clone()), ScanRoot::local(root_a.clone())],
++        vec![
++            ScanRoot::local(root_b.clone()),
++            ScanRoot::local(root_a.clone()),
++        ],
+         &data_dir,
+     );
+ 
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_agent_detection.rs:121:
+         "expected to detect at least 4 codex sessions across both roots in order [A,B]; \
+          got {} sessions: {:?}",
+         order_ab.len(),
+-        order_ab.iter().map(|c| c.source_path.display().to_string()).collect::<Vec<_>>()
++        order_ab
++            .iter()
++            .map(|c| c.source_path.display().to_string())
++            .collect::<Vec<_>>()
+     );
+     assert!(
+         order_ba.len() >= 4,
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_agent_detection.rs:128:
+         "expected to detect at least 4 codex sessions across both roots in order [B,A]; \
+          got {} sessions: {:?}",
+         order_ba.len(),
+-        order_ba.iter().map(|c| c.source_path.display().to_string()).collect::<Vec<_>>()
++        order_ba
++            .iter()
++            .map(|c| c.source_path.display().to_string())
++            .collect::<Vec<_>>()
+     );
+ 
+     // The metamorphic relation: SET equality of stable identity
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_agent_detection.rs:138:
+     let set_ab: HashSet<ConversationKey> = order_ab.iter().map(key).collect();
+     let set_ba: HashSet<ConversationKey> = order_ba.iter().map(key).collect();
+     assert_eq!(
+-        set_ab, set_ba,
++        set_ab,
++        set_ba,
+         "metamorphic invariant violated: codex scan(roots=[A,B]) detected a different \
+          SET of sessions than scan(roots=[B,A]).\n\
+          only in [A,B]: {:?}\nonly in [B,A]: {:?}",
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_html_export.rs:79:
+ fn scrub_transient(html: &str) -> String {
+     let mut scrubbed = html.to_string();
+     // ISO timestamps in `rendered_at` / `generated_at` meta tags.
+-    let rendered_at = regex::Regex::new(
+-        r#"(?P<key>(rendered|generated)_at)="[^"]*""#,
+-    )
+-    .expect("scrub regex compiles");
++    let rendered_at = regex::Regex::new(r#"(?P<key>(rendered|generated)_at)="[^"]*""#)
++        .expect("scrub regex compiles");
+     scrubbed = rendered_at
+         .replace_all(&scrubbed, "$key=\"[SCRUBBED]\"")
+         .into_owned();
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_stats.rs:46:
+     fs::write(file, sample).unwrap();
+ }
+ 
+-fn capture_stats_json(home: &Path, codex_home: &Path, data_dir: &Path, by_source: bool) -> serde_json::Value {
++fn capture_stats_json(
++    home: &Path,
++    codex_home: &Path,
++    data_dir: &Path,
++    by_source: bool,
++) -> serde_json::Value {
+     let mut args: Vec<&str> = vec!["stats", "--json"];
+     if by_source {
+         args.push("--by-source");
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_stats.rs:70:
+         String::from_utf8_lossy(&output.stdout),
+         String::from_utf8_lossy(&output.stderr),
+     );
+-    serde_json::from_slice(&output.stdout)
+-        .expect("cass stats --json output is valid JSON")
++    serde_json::from_slice(&output.stdout).expect("cass stats --json output is valid JSON")
+ }
+ 
+ /// `coding_agent_session_search-5v5b4`: pin the metamorphic relation
+Diff in /data/projects/coding_agent_session_search/tests/metamorphic_stats.rs:230:
+     }
+ 
+     // Success path on empty: every counter MUST be zero.
+-    let total: serde_json::Value = serde_json::from_slice(&output.stdout)
+-        .expect("stats --json on empty dir emits valid JSON");
++    let total: serde_json::Value =
++        serde_json::from_slice(&output.stdout).expect("stats --json on empty dir emits valid JSON");
+     assert_eq!(
+         total["conversations"].as_i64(),
+         Some(0),

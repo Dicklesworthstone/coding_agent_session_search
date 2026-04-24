@@ -9,36 +9,24 @@
 //! - **Progressive enhancement**: Basic layout works without JS
 //! - **Semantic HTML**: Proper use of article, section, header elements
 
-use std::fmt;
 use std::time::Instant;
 
 use super::{encryption, filename, renderer, scripts, styles};
 use tracing::{debug, info, trace, warn};
 
 /// Errors that can occur during template generation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TemplateError {
     /// Invalid input data
+    #[error("invalid input: {0}")]
     InvalidInput(String),
     /// Rendering failed
+    #[error("render failed: {0}")]
     RenderFailed(String),
     /// Encryption required but not provided
+    #[error("encryption required but no key provided")]
     EncryptionRequired,
 }
-
-impl fmt::Display for TemplateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TemplateError::InvalidInput(msg) => write!(f, "invalid input: {}", msg),
-            TemplateError::RenderFailed(msg) => write!(f, "render failed: {}", msg),
-            TemplateError::EncryptionRequired => {
-                write!(f, "encryption required but no key provided")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TemplateError {}
 
 /// Options for HTML export.
 #[derive(Debug, Clone)]
@@ -805,6 +793,22 @@ mod tests {
 
         let bytes = buf.lock().expect("log buffer lock").clone();
         String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[test]
+    fn test_template_error_display_strings() {
+        assert_eq!(
+            TemplateError::InvalidInput("missing title".to_string()).to_string(),
+            "invalid input: missing title"
+        );
+        assert_eq!(
+            TemplateError::RenderFailed("bad markdown".to_string()).to_string(),
+            "render failed: bad markdown"
+        );
+        assert_eq!(
+            TemplateError::EncryptionRequired.to_string(),
+            "encryption required but no key provided"
+        );
     }
 
     #[test]
