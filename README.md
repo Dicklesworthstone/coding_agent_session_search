@@ -86,7 +86,7 @@ cass sources agents include openclaw
 - Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
 - Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
-- Semantic model acquisition is **opt-in**: `cass models install` downloads the MiniLM model (~90 MB) on explicit request; cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
+- Semantic model acquisition is **opt-in**: `cass models install` downloads the requested embedder on explicit request; cass never auto-downloads. Three embedders are supported via `--model <name>`: `all-minilm-l6-v2` (alias `minilm`, ~90 MB; the default), `snowflake-arctic-s` (~120 MB), and `nomic-embed` (~270 MB). Air-gapped installs use `--from-file <dir>`. While the chosen model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
 - `cass health --json` and `cass status --json` are the truth surface for readiness, active rebuilds, and recommended action. Prefer their `recommended_action` over hard-coded repair rituals.
 
 **Lexical publish durability (atomic-swap)**
@@ -215,9 +215,15 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 
 ### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
-- **Local inference**: Uses a MiniLM model via FastEmbed. Once the model is installed, no network traffic is required to answer queries; the model runs entirely on-device.
-- **Opt-in acquisition**: `cass models install` downloads the MiniLM model (~90 MB) from Hugging Face on explicit request and verifies checksums. Nothing is fetched until you run the install command.
-- **Air-gapped install**: `cass models install --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
+- **Local inference**: Uses a FastEmbed embedder running ONNX on-device. Once the chosen model is installed, no network traffic is required to answer queries.
+- **Opt-in acquisition**: `cass models install` downloads the requested embedder from Hugging Face on explicit request and verifies SHA256 checksums. Nothing is fetched until you run the install command. Three embedders are supported:
+  - `all-minilm-l6-v2` — `cass models install --model all-minilm-l6-v2` (alias: `minilm`). 384-dim. ~90 MB. The default; fastest. Best for general English semantic similarity.
+  - `snowflake-arctic-s` — `cass models install --model snowflake-arctic-s`. 384-dim. ~120 MB. Stronger MTEB scores than MiniLM at similar cost; good drop-in replacement for code-heavy corpora.
+  - `nomic-embed` — `cass models install --model nomic-embed` (alias: `nomic-embed-text-v1.5`). 768-dim. ~270 MB. Highest recall on long-context queries; trade off larger index footprint.
+
+  Removal mirrors install: `cass models remove --model <name>` accepts the same alias set. The same alias map is honored by the daemon embedding worker (see `src/daemon/worker.rs::resolve_embedder_kind`) so background indexing accepts whatever the operator installed.
+
+- **Air-gapped install**: `cass models install --model <name> --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
 - **Required files** (all must be present after install; `cass models verify` checks them):
   - `model.onnx`
   - `tokenizer.json`
