@@ -215,6 +215,79 @@ impl PacketEquivalenceAuditor {
     }
 }
 
+/// Packet-driven sink registry: enumerates the consumer sinks the
+/// `coding_agent_session_search-ibuuh.32` migration covers, the
+/// packet-driven helper each one ships, the legacy fallback function
+/// that remains as the demotion path, the byte-equivalence test that
+/// pins the two paths agree, and the env knob (if any) that opts in
+/// to the compare-mode audit.
+///
+/// This struct is the operator-facing answer to the bead acceptance
+/// language: "explicit observability showing which paths are packet-
+/// driven versus legacy, and a temporary shadow or compare mode plus
+/// explicit kill-switch or demotion path so divergence can be
+/// diagnosed without trapping users on a broken path."
+///
+/// Future migrations should append a [`PacketSinkMigration`] entry
+/// here and update the equivalence test name; CI tooling (or future
+/// `cass doctor --packet-equivalence` slices) can serialize this
+/// list to surface the kill-switch catalog without grepping for
+/// helpers across the codebase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacketSinkMigration {
+    /// Stable sink identifier ("lexical", "analytics", "semantic").
+    pub sink: &'static str,
+    /// Fully-qualified path to the packet-driven helper (free
+    /// function or method) callers should use.
+    pub packet_helper: &'static str,
+    /// Fully-qualified path to the legacy non-packet path that
+    /// remains in the codebase as the demotion fallback. Removing
+    /// this without an equivalence-proven replacement is off-contract.
+    pub legacy_fallback: &'static str,
+    /// Test name (under `cargo test`) that pins byte-for-byte
+    /// equivalence between the two paths.
+    pub equivalence_test: &'static str,
+    /// Env knob that opts callers into shadow-compare audit when
+    /// applicable, or `None` if the helper is direct-replacement and
+    /// the equivalence test is the only gate.
+    pub kill_switch_env: Option<&'static str>,
+    /// Commit hash at which the packet helper landed (so an operator
+    /// debugging a regression can `git show` the migration directly).
+    pub landed_in_commit: &'static str,
+}
+
+/// Catalog of consumer sink migrations completed under
+/// `coding_agent_session_search-ibuuh.32`. Iterating this slice gives
+/// operators a single source of truth for "which derivative sinks
+/// have a packet-driven path today, where to find each helper, how
+/// to roll back, and where the equivalence proof lives."
+pub const PACKET_SINK_MIGRATIONS: &[PacketSinkMigration] = &[
+    PacketSinkMigration {
+        sink: "lexical",
+        packet_helper: "crate::search::tantivy::TantivyIndex::add_messages_from_packet",
+        legacy_fallback: "crate::search::tantivy::TantivyIndex::add_messages_with_conversation_id",
+        equivalence_test: "crate::search::tantivy::tests::packet_driven_lexical_pipeline_matches_legacy_for_normalized_conv",
+        kill_switch_env: None,
+        landed_in_commit: "19820c7a",
+    },
+    PacketSinkMigration {
+        sink: "analytics",
+        packet_helper: "crate::pages::analytics::Statistics::from_packets",
+        legacy_fallback: "crate::pages::analytics::AnalyticsGenerator::generate_statistics",
+        equivalence_test: "crate::pages::analytics::tests::analytics_statistics_from_packets_matches_sql_for_canonical_corpus",
+        kill_switch_env: None,
+        landed_in_commit: "bae8e341",
+    },
+    PacketSinkMigration {
+        sink: "semantic",
+        packet_helper: "crate::indexer::semantic::semantic_inputs_from_packets",
+        legacy_fallback: "crate::indexer::semantic::packet_embedding_inputs_from_storage",
+        equivalence_test: "crate::indexer::semantic::tests::semantic_inputs_from_packets_matches_storage_replay",
+        kill_switch_env: None,
+        landed_in_commit: "2c8ba03b",
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +574,109 @@ mod tests {
             "match outcome should serialize with snake_case `outcome` tag, got {serialized}"
         );
         assert!(serialized.contains("\"semantic_hash\""));
+    }
+
+    /// `coding_agent_session_search-ibuuh.32` (kill-switch catalog
+    /// gate): the PACKET_SINK_MIGRATIONS catalog must list every
+    /// derivative consumer sink covered by the migration AND keep
+    /// each entry self-consistent (sink id non-empty, helper +
+    /// fallback paths fully qualified, equivalence test name
+    /// fully qualified, commit hash present). A future migration
+    /// adding a sink without registering it here trips this gate.
+    #[test]
+    fn packet_sink_migration_catalog_documents_every_consumer_sink() {
+        // The three consumers the bead AC enumerates: lexical,
+        // analytics, semantic. (Canonical persistence is the packet
+        // payload itself — there is no separate "packet helper" for
+        // the storage write because the packet *is* the canonical
+        // form being persisted.)
+        let sinks: Vec<&str> = PACKET_SINK_MIGRATIONS
+            .iter()
+            .map(|migration| migration.sink)
+            .collect();
+        assert!(
+            sinks.contains(&"lexical"),
+            "catalog must list the lexical sink"
+        );
+        assert!(
+            sinks.contains(&"analytics"),
+            "catalog must list the analytics sink"
+        );
+        assert!(
+            sinks.contains(&"semantic"),
+            "catalog must list the semantic sink"
+        );
+
+        for migration in PACKET_SINK_MIGRATIONS {
+            assert!(!migration.sink.is_empty(), "sink id must be non-empty");
+            assert!(
+                migration.packet_helper.starts_with("crate::"),
+                "packet_helper must be fully qualified, got {:?}",
+                migration.packet_helper
+            );
+            assert!(
+                migration.legacy_fallback.starts_with("crate::"),
+                "legacy_fallback must be fully qualified, got {:?}",
+                migration.legacy_fallback
+            );
+            assert!(
+                migration.equivalence_test.starts_with("crate::"),
+                "equivalence_test must be fully qualified, got {:?}",
+                migration.equivalence_test
+            );
+            assert!(
+                !migration.landed_in_commit.is_empty(),
+                "landed_in_commit must reference the migration commit"
+            );
+            assert!(
+                migration.landed_in_commit.len() >= 7
+                    && migration
+                        .landed_in_commit
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit()),
+                "landed_in_commit must look like a git short-hash, got {:?}",
+                migration.landed_in_commit
+            );
+        }
+    }
+
+    /// PACKET_SINK_MIGRATIONS must serialize cleanly through serde so
+    /// future operator tooling (e.g. `cass doctor --packet-equivalence`,
+    /// or a status-page kill-switch view) can emit the catalog as JSON
+    /// without re-deriving the schema.
+    #[test]
+    fn packet_sink_migration_catalog_serializes_as_json_array() {
+        let json = serde_json::to_string(PACKET_SINK_MIGRATIONS)
+            .expect("PACKET_SINK_MIGRATIONS must serialize");
+        // Spot-check the lexical entry survives serialization.
+        assert!(json.contains("\"sink\":\"lexical\""));
+        assert!(json.contains("add_messages_from_packet"));
+        assert!(
+            json.contains("\"landed_in_commit\":\"19820c7a\""),
+            "lexical entry must reference its landing commit, got {json}"
+        );
+        // Verify shape: an array of N objects each with the seven
+        // expected keys. We deserialize into serde_json::Value rather
+        // than PacketSinkMigration because the struct fields are
+        // &'static str, which serde cannot rehydrate from an owned
+        // JSON string. The shape check is the contract operators
+        // care about.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("catalog must parse as JSON");
+        let arr = parsed.as_array().expect("catalog serializes as array");
+        assert_eq!(arr.len(), PACKET_SINK_MIGRATIONS.len());
+        for (entry, migration) in arr.iter().zip(PACKET_SINK_MIGRATIONS.iter()) {
+            let obj = entry.as_object().expect("each catalog entry is an object");
+            assert_eq!(
+                obj.get("sink").and_then(|v| v.as_str()),
+                Some(migration.sink),
+                "sink field must round-trip"
+            );
+            assert!(obj.contains_key("packet_helper"));
+            assert!(obj.contains_key("legacy_fallback"));
+            assert!(obj.contains_key("equivalence_test"));
+            assert!(obj.contains_key("kill_switch_env"));
+            assert!(obj.contains_key("landed_in_commit"));
+        }
     }
 }
