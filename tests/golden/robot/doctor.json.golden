@@ -1,0 +1,175 @@
+{
+  "status": "not_initialized",
+  "healthy": false,
+  "initialized": false,
+  "explanation": "No cass database or search index exists in [TEST_HOME]/coding-agent-search yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+  "recommended_action": "Run 'cass index --full' once to discover local sessions and build the initial archive.",
+  "issues_found": 3,
+  "issues_fixed": 0,
+  "failures": 0,
+  "warnings": 3,
+  "needs_rebuild": false,
+  "auto_fix_applied": false,
+  "auto_fix_actions": [],
+  "checks": [
+    {
+      "name": "data_directory",
+      "status": "pass",
+      "message": "Data directory not created yet: [TEST_HOME]/coding-agent-search (it will be created on the first index run)",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "lock_file",
+      "status": "pass",
+      "message": "No stale lock files",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "database",
+      "status": "warn",
+      "message": "Database not initialized yet - no archive has been created in this data dir",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "index",
+      "status": "warn",
+      "message": "Search index not initialized yet - run the first index to build Tantivy metadata",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "config",
+      "status": "pass",
+      "message": "No config file (using defaults)",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "sources_config",
+      "status": "pass",
+      "message": "No remote sources configured",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "sessions",
+      "status": "warn",
+      "message": "No agent session directories found",
+      "fix_available": false,
+      "fix_applied": false
+    }
+  ],
+  "quarantine": {
+    "summary": {
+      "failed_seed_bundle_count": 0,
+      "retained_publish_backup_count": 0,
+      "retained_publish_backup_retention_limit": 1,
+      "lexical_generation_count": 0,
+      "lexical_generation_build_state_counts": {
+        "building": 0,
+        "built": 0,
+        "failed": 0,
+        "scratch": 0,
+        "validated": 0,
+        "validating": 0
+      },
+      "lexical_generation_publish_state_counts": {
+        "published": 0,
+        "quarantined": 0,
+        "staged": 0,
+        "superseded": 0
+      },
+      "lexical_quarantined_generation_count": 0,
+      "lexical_quarantined_shard_count": 0,
+      "total_retained_bytes": 0,
+      "gc_eligible_asset_count": 0,
+      "gc_eligible_bytes": 0,
+      "inspection_required_asset_count": 0,
+      "inspection_required_bytes": 0,
+      "cleanup_dry_run_generation_count": 0,
+      "cleanup_dry_run_reclaim_candidate_count": 0,
+      "cleanup_dry_run_reclaimable_bytes": 0,
+      "cleanup_dry_run_retained_bytes": 0,
+      "cleanup_dry_run_protected_generation_count": 0,
+      "cleanup_dry_run_active_generation_count": 0,
+      "cleanup_dry_run_inspection_required_count": 0,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
+      "cleanup_apply_allowed": false
+    },
+    "quarantined_artifacts": [],
+    "failed_seed_bundle_files": [],
+    "retained_publish_backups": [],
+    "lexical_generations": [],
+    "lexical_cleanup_dry_run": {
+      "dry_run": true,
+      "approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
+      "generation_count": 0,
+      "total_artifact_bytes": 0,
+      "total_reclaimable_bytes": 0,
+      "total_retained_bytes": 0,
+      "reclaim_candidates": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [],
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "quarantined_generation_ids": [],
+      "active_generation_ids": [],
+      "disposition_counts": {},
+      "generation_disposition_summaries": {},
+      "inspection_items": [],
+      "inspection_required_generation_ids": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "shard_disposition_summaries": {},
+      "inventories": []
+    },
+    "lexical_cleanup_apply_gate": {
+      "apply_allowed": false,
+      "dry_run": true,
+      "explicit_operator_approval": false,
+      "approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
+      "provided_approval_fingerprint": null,
+      "approval_fingerprint_status": "not_requested",
+      "approval_fingerprint_matches": false,
+      "generation_count": 0,
+      "total_artifact_bytes": 0,
+      "total_retained_bytes": 0,
+      "candidate_count": 0,
+      "reclaimable_bytes": 0,
+      "disposition_counts": {},
+      "generation_disposition_summaries": {},
+      "shard_disposition_summaries": {},
+      "candidate_previews": [],
+      "reclaimable_generation_ids": [],
+      "fully_retained_generation_ids": [],
+      "quarantined_generation_ids": [],
+      "blocker_codes": [
+        "no_reclaimable_candidates",
+        "operator_approval_required"
+      ],
+      "blocked_reasons": [
+        "no reclaimable cleanup candidates",
+        "destructive cleanup requires explicit operator approval after dry-run"
+      ],
+      "active_generation_ids": [],
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "inspection_previews": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "inspection_required_generation_ids": []
+    },
+    "warnings": [
+      "failed to walk quarantine roots under [TEST_HOME]/coding-agent-search: IO error for operation on [TEST_HOME]/coding-agent-search: No such file or directory (os error 2)"
+    ]
+  },
+  "_meta": {
+    "elapsed_ms": 0,
+    "data_dir": "[TEST_HOME]/coding-agent-search",
+    "db_path": "[TEST_HOME]/coding-agent-search/agent_search.db",
+    "fix_mode": false
+  }
+}

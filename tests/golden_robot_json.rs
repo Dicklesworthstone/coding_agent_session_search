@@ -996,6 +996,23 @@ fn export_html_shape_matches_golden() {
 // close that gap via json_value_schema diffs (same pattern as
 // health_shape_matches_golden / diag_shape_matches_golden).
 
+// `coding_agent_session_search-ut3v8`: the --quarantine subset of
+// cass doctor --json is frozen via doctor_quarantine.json.golden,
+// but the DEFAULT base-state invocation (no --quarantine, no seeded
+// fixture) had no instance freeze. Regressions to the top-level
+// status / recommended_action / checks[] envelope on the fresh
+// empty data_dir — the shape agent harnesses see before any index
+// exists — would not fail at golden time. Closes the instance-side
+// of the pin; the shape-side lives in doctor_shape.json.golden
+// (bead q931h).
+#[test]
+fn doctor_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed =
+        capture_robot_json(test_home.path(), &["doctor", "--json"], ExpectStatus::ExitOk);
+    assert_golden("robot/doctor.json.golden", &scrubbed);
+}
+
 #[test]
 fn status_shape_matches_golden() {
     let test_home = tempfile::tempdir().expect("create temp home");

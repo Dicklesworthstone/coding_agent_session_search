@@ -17693,6 +17693,112 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
         }),
     );
 
+    // `coding_agent_session_search-0h4cx`: extend response_schemas to
+    // cover every advertised JSON surface from README line 103. The
+    // four below — doctor / models-status / models-verify /
+    // models-check-update — were absent pre-fix even though their
+    // goldens live under tests/golden/robot/. An agent reading
+    // response_schemas to drive schema-aware parsing now finds a
+    // pinned schema for every surface cass commits to.
+    schemas.insert(
+        "doctor".to_string(),
+        json!({
+            "type": "object",
+            "description": "cass doctor --json: diagnostic checks + optional auto-fix audit.",
+            "properties": {
+                "status": { "type": "string" },
+                "healthy": { "type": "boolean" },
+                "initialized": { "type": "boolean" },
+                "explanation": { "type": ["string", "null"] },
+                "recommended_action": { "type": ["string", "null"] },
+                "issues_found": { "type": "integer" },
+                "issues_fixed": { "type": "integer" },
+                "failures": { "type": "integer" },
+                "warnings": { "type": "integer" },
+                "needs_rebuild": { "type": "boolean" },
+                "auto_fix_applied": { "type": "boolean" },
+                "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
+                "checks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "status": { "type": "string", "description": "pass | warn | fail" },
+                            "message": { "type": "string" },
+                            "fix_available": { "type": "boolean" },
+                            "fix_applied": { "type": "boolean" }
+                        },
+                        "required": ["name", "status", "message", "fix_available", "fix_applied"]
+                    }
+                }
+            },
+            "required": ["status", "healthy", "initialized", "checks"]
+        }),
+    );
+
+    schemas.insert(
+        "models-status".to_string(),
+        json!({
+            "type": "object",
+            "description": "cass models status --json: semantic-model acquisition + cache state.",
+            "properties": {
+                "model_id": { "type": "string" },
+                "model_dir": { "type": "string" },
+                "installed": { "type": "boolean" },
+                "state": { "type": "string", "description": "not_acquired | downloading | ready | needs_update" },
+                "state_detail": { "type": "string" },
+                "next_step": { "type": "string" },
+                "lexical_fail_open": { "type": "boolean" },
+                "revision": { "type": "string" },
+                "license": { "type": "string" },
+                "total_size_bytes": { "type": "integer" },
+                "installed_size_bytes": { "type": "integer" },
+                "observed_file_bytes": { "type": "integer" },
+                "policy_source": { "type": "string" },
+                "cache_lifecycle": {
+                    "type": "object",
+                    "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
+                }
+            },
+            "required": ["model_id", "model_dir", "installed", "state", "lexical_fail_open"]
+        }),
+    );
+
+    schemas.insert(
+        "models-verify".to_string(),
+        json!({
+            "type": "object",
+            "description": "cass models verify --json: per-file SHA-256 verification of the installed semantic model.",
+            "properties": {
+                "status": { "type": "string" },
+                "state_detail": { "type": "string" },
+                "next_step": { "type": "string" },
+                "lexical_fail_open": { "type": "boolean" },
+                "model_dir": { "type": "string" },
+                "all_valid": { "type": "boolean" },
+                "cache_lifecycle": { "type": "object" },
+                "error": { "type": ["string", "null"] }
+            },
+            "required": ["status", "all_valid", "lexical_fail_open"]
+        }),
+    );
+
+    schemas.insert(
+        "models-check-update".to_string(),
+        json!({
+            "type": "object",
+            "description": "cass models check-update --json: compares installed model revision against the pinned registry revision.",
+            "properties": {
+                "update_available": { "type": "boolean" },
+                "reason": { "type": "string", "description": "model_not_installed | up_to_date | newer_revision_available | registry_check_failed" },
+                "current_revision": { "type": ["string", "null"] },
+                "latest_revision": { "type": ["string", "null"] }
+            },
+            "required": ["update_available", "reason"]
+        }),
+    );
+
     schemas
 }
 
