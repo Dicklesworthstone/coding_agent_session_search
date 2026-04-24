@@ -706,6 +706,7 @@ fn fetch_canonical_embedding_conversations(
 /// flows, etc.) it can pair them with their canonical
 /// agent_id/workspace_id and drive the semantic preparation consumer
 /// without a second storage round-trip.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SemanticPacketContext {
     pub conversation_id: i64,
@@ -732,6 +733,7 @@ pub(crate) struct SemanticPacketContext {
 /// identical to what the legacy storage-side replay returns for the
 /// same canonical corpus, so callers that already hold packets can
 /// switch to this helper without changing semantic-index output.
+#[allow(dead_code)]
 pub(crate) fn semantic_inputs_from_packets(
     packets: &[ConversationPacket],
     contexts: &[SemanticPacketContext],

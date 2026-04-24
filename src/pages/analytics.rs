@@ -90,9 +90,7 @@ impl Statistics {
     /// derivation; equivalence comparisons should stamp the SQL-path
     /// `computed_at` onto the packet-path result before equality
     /// checks (or compare every other field individually).
-    pub fn from_packets(
-        packets: &[crate::model::conversation_packet::ConversationPacket],
-    ) -> Self {
+    pub fn from_packets(packets: &[crate::model::conversation_packet::ConversationPacket]) -> Self {
         let mut total_messages: usize = 0;
         let mut total_characters: usize = 0;
         let mut agents: BTreeMap<String, AgentStats> = BTreeMap::new();
@@ -116,43 +114,25 @@ impl Statistics {
             total_messages = total_messages.saturating_add(conv_message_count);
             agent_entry.messages = agent_entry.messages.saturating_add(conv_message_count);
 
-            // Char totals follow SUM(LENGTH(content)) which counts bytes,
-            // not Unicode code points (LENGTH on TEXT in SQLite returns
-            // byte length); ConversationPacketMessage.content is a `String`
-            // and `.len()` returns bytes, so the two paths agree.
+            // Char totals follow SUM(LENGTH(content)). SQLite LENGTH()
+            // on TEXT counts Unicode scalar values, not UTF-8 bytes; use
+            // `.chars().count()` so multibyte content stays equivalent.
             for message in &payload.messages {
-                total_characters = total_characters.saturating_add(message.content.len());
+                total_characters = total_characters.saturating_add(message.content.chars().count());
             }
 
-            // Role counts: use the analytics projection so any future
-            // change to role normalization (e.g. canonicalising "agent"
-            // to "assistant") flows through one place. Match the legacy
-            // SQL "SELECT role, COUNT(*) FROM messages GROUP BY role"
-            // which counts *every* message including roles outside the
-            // canonical four — preserved here under the "other" bucket
-            // is **not** applicable: the SQL version preserves the raw
-            // role string verbatim, while the packet projection bucket
-            // collapses non-canonical roles into `other_messages`. This
-            // method emits the canonical-four mapping (user / assistant
-            // / tool / system) plus a single "other" bucket that
-            // mirrors the projection. Tests fix their fixture rows to
-            // canonical roles so equivalence holds for the public
-            // contract.
-            let analytics = &packet.projections.analytics;
-            if analytics.user_messages > 0 {
-                *roles.entry("user".to_string()).or_insert(0) += analytics.user_messages;
-            }
-            if analytics.assistant_messages > 0 {
-                *roles.entry("assistant".to_string()).or_insert(0) += analytics.assistant_messages;
-            }
-            if analytics.tool_messages > 0 {
-                *roles.entry("tool".to_string()).or_insert(0) += analytics.tool_messages;
-            }
-            if analytics.system_messages > 0 {
-                *roles.entry("system".to_string()).or_insert(0) += analytics.system_messages;
-            }
-            if analytics.other_messages > 0 {
-                *roles.entry("other".to_string()).or_insert(0) += analytics.other_messages;
+            // Role counts mirror the SQL path's raw GROUP BY role
+            // surface. Packet canonical replay normalizes Agent turns to
+            // "assistant", while storage writes MessageRole::Agent as
+            // "agent"; map that spelling back and preserve every other
+            // role string instead of collapsing it into "other".
+            for message in &payload.messages {
+                let role = if message.role == "assistant" {
+                    "agent"
+                } else {
+                    message.role.as_str()
+                };
+                *roles.entry(role.to_string()).or_insert(0) += 1;
             }
 
             if let Some(started_at) = payload.timestamps.started_at {
@@ -965,10 +945,20 @@ mod tests {
                 _ => 0,
             };
             for idx in 0..msg_count {
-                let role = if idx % 2 == 0 { "user" } else { "assistant" };
+                let role = if conv_id == 3 && idx == 3 {
+                    "narrator"
+                } else if idx % 2 == 0 {
+                    "user"
+                } else {
+                    "agent"
+                };
                 let created_at =
                     1700000000000i64 + (conv_id as i64 * 100000000) + (idx as i64 * 1000);
-                let content = format!("Message {} for conv {}", idx, conv_id);
+                let content = if conv_id == 3 && idx == 1 {
+                    format!("Message {} for conv {} with caf\u{00e9}", idx, conv_id)
+                } else {
+                    format!("Message {} for conv {}", idx, conv_id)
+                };
                 conn.execute_compat(
                     "INSERT INTO messages (conversation_id, idx, role, content, created_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1025,8 +1015,9 @@ mod tests {
 
         // Re-derive the same corpus as a Vec<ConversationPacket> by
         // building each packet from canonical replay equivalents. The
-        // test fixture inserts canonical roles ("user"/"assistant"),
-        // matching the projection's user/assistant buckets directly.
+        // fixture uses the real storage role spelling ("agent") plus a
+        // multibyte message so role buckets and LENGTH() semantics both
+        // stay pinned to the SQL surface.
         let mut packets: Vec<ConversationPacket> = Vec::new();
         let conv_rows: Vec<(i64, String, Option<String>, Option<i64>)> = conn
             .query_map_collect(
@@ -1099,7 +1090,7 @@ mod tests {
                         idx,
                         role: match role.as_str() {
                             "user" => MessageRole::User,
-                            "assistant" => MessageRole::Agent,
+                            "agent" | "assistant" => MessageRole::Agent,
                             "tool" => MessageRole::Tool,
                             "system" => MessageRole::System,
                             other => MessageRole::Other(other.to_string()),
