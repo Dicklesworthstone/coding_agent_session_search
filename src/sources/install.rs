@@ -545,56 +545,8 @@ impl RemoteInstaller {
             elapsed: start.elapsed(),
         });
 
-        let archive_name = url.split('/').next_back().unwrap_or("cass-prebuilt.tar.gz");
-
-        // Download into a secure mktemp directory (not predictable /tmp/), verify
-        // checksum BEFORE extracting/installing, and clean up temp files on exit.
-        let download_tool = if self.system_info.has_curl {
-            format!(r#"curl -fsSL "{url}" -o "${{archive_path}}""#)
-        } else {
-            format!(r#"wget -q "{url}" -O "${{archive_path}}""#)
-        };
-        let checksum_verify = if let Some(expected) = checksum {
-            format!(
-                r#"
-if command -v sha256sum >/dev/null 2>&1; then
-    actual_sum="$(sha256sum "${{archive_path}}" | cut -d' ' -f1)"
-elif command -v shasum >/dev/null 2>&1; then
-    actual_sum="$(shasum -a 256 "${{archive_path}}" | cut -d' ' -f1)"
-else
-    echo "WARNING: no sha256sum or shasum found, skipping checksum"
-    actual_sum="{expected_lower}"
-fi
-if [ "${{actual_sum}}" != "{expected_lower}" ]; then
-    echo "CHECKSUM_MISMATCH: expected {expected_lower} got ${{actual_sum}}"
-    exit 1
-fi
-"#,
-                expected_lower = expected.to_lowercase()
-            )
-        } else {
-            String::new()
-        };
-        let download_cmd = format!(
-            r#"
-set -euo pipefail
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
-archive_path="${{tmp_dir}}/{archive_name}"
-mkdir -p ~/.local/bin
-{download_tool}
-{checksum_verify}
-tar -xzf "${{archive_path}}" -C "${{tmp_dir}}"
-if [ ! -f "${{tmp_dir}}/cass" ]; then
-    echo "EXTRACT_FAILED"
-    exit 1
-fi
-mv "${{tmp_dir}}/cass" ~/.local/bin/cass
-chmod +x ~/.local/bin/cass
-# Add to PATH only if not already present
-grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-"#
-        );
+        let download_cmd =
+            Self::build_prebuilt_binary_install_script(url, checksum, self.system_info.has_curl);
 
         self.run_ssh_command(&download_cmd, Duration::from_secs(60))?;
 
@@ -625,6 +577,75 @@ grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bi
             duration: start.elapsed(),
             install_path: Some("~/.local/bin/cass".into()),
         })
+    }
+
+    #[cfg(test)]
+    fn prebuilt_archive_member_is_allowed(member: &str) -> bool {
+        matches!(member, "cass" | "./cass")
+    }
+
+    fn build_prebuilt_binary_install_script(
+        url: &str,
+        checksum: Option<&str>,
+        has_curl: bool,
+    ) -> String {
+        // Download into a secure mktemp directory (not predictable /tmp/), verify
+        // checksum BEFORE extracting/installing, validate the archive layout, and
+        // clean up temp files on exit.
+        let download_tool = if has_curl {
+            format!(r#"curl -fsSL "{url}" -o "${{archive_path}}""#)
+        } else {
+            format!(r#"wget -q "{url}" -O "${{archive_path}}""#)
+        };
+        let checksum_verify = if let Some(expected) = checksum {
+            format!(
+                r#"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_sum="$(sha256sum "${{archive_path}}" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+    actual_sum="$(shasum -a 256 "${{archive_path}}" | cut -d' ' -f1)"
+else
+    echo "WARNING: no sha256sum or shasum found, skipping checksum"
+    actual_sum="{expected_lower}"
+fi
+if [ "${{actual_sum}}" != "{expected_lower}" ]; then
+    echo "CHECKSUM_MISMATCH: expected {expected_lower} got ${{actual_sum}}"
+    exit 1
+fi
+"#,
+                expected_lower = expected.to_lowercase()
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            r#"
+set -euo pipefail
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+archive_path="${{tmp_dir}}/cass-prebuilt.tar.gz"
+mkdir -p ~/.local/bin
+{download_tool}
+{checksum_verify}
+tar -tzf "${{archive_path}}" | while IFS= read -r tar_member; do
+    case "${{tar_member}}" in
+        cass|./cass) ;;
+        *)
+            echo "EXTRACT_UNSAFE: ${{tar_member}}"
+            exit 1
+            ;;
+    esac
+done
+tar -xzf "${{archive_path}}" -C "${{tmp_dir}}" cass 2>/dev/null || tar -xzf "${{archive_path}}" -C "${{tmp_dir}}" ./cass
+if [ ! -f "${{tmp_dir}}/cass" ] || [ -L "${{tmp_dir}}/cass" ]; then
+    echo "EXTRACT_FAILED"
+    exit 1
+fi
+install -m 0755 "${{tmp_dir}}/cass" ~/.local/bin/cass
+# Add to PATH only if not already present
+grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+"#
+        )
     }
 
     /// Compute SHA256 checksum of a file on the remote host.
@@ -1245,6 +1266,50 @@ mod tests {
         // Invalid characters
         let invalid = "g".repeat(64); // 'g' is not hex
         assert!(!invalid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_prebuilt_archive_member_policy_rejects_path_traversal() {
+        assert!(RemoteInstaller::prebuilt_archive_member_is_allowed("cass"));
+        assert!(RemoteInstaller::prebuilt_archive_member_is_allowed(
+            "./cass"
+        ));
+
+        for member in [
+            "../cass",
+            "payload/../cass",
+            "/cass",
+            "bin/cass",
+            "cass/../../.ssh/authorized_keys",
+            "./../cass",
+            "cass\n../escape",
+        ] {
+            assert!(
+                !RemoteInstaller::prebuilt_archive_member_is_allowed(member),
+                "member should be rejected: {member:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prebuilt_install_script_validates_tar_members_before_extract() {
+        let script = RemoteInstaller::build_prebuilt_binary_install_script(
+            "https://example.com/cass.tar.gz",
+            Some(&"a".repeat(64)),
+            true,
+        );
+        let list_index = script.find("tar -tzf").expect("tar listing validation");
+        let extract_index = script.find("tar -xzf").expect("tar extraction");
+
+        assert!(
+            list_index < extract_index,
+            "archive members must be listed and validated before extraction"
+        );
+        assert!(script.contains("EXTRACT_UNSAFE"));
+        assert!(script.contains("cass|./cass"));
+        assert!(script.contains(r#"[ -L "${tmp_dir}/cass" ]"#));
+        assert!(script.contains(r#"install -m 0755 "${tmp_dir}/cass""#));
+        assert!(!script.contains("tar -xzf \"${archive_path}\" -C \"${tmp_dir}\"\n"));
     }
 
     #[test]
