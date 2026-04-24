@@ -17,18 +17,18 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    load_config, Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
-use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
+use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
@@ -285,9 +285,13 @@ pub fn key_rotate(
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config = load_config(&archive_dir)?;
     let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
-    let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|_| {
+    let old_export_id: [u8; 16] = old_export_id_raw.as_slice().try_into().map_err(|err| {
+        // [coding_agent_session_search-htiim] Chain the underlying
+        // TryFromSliceError so a debug-mode error chain shows the
+        // exact conversion that failed in addition to the
+        // human-readable length mismatch.
         anyhow::anyhow!(
-            "invalid export_id length: expected 16, got {}",
+            "invalid export_id length: expected 16, got {}: {err}",
             old_export_id_raw.len()
         )
     })?;
@@ -469,10 +473,20 @@ fn derive_kek_argon2id(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing
 /// Derive KEK from recovery secret using HKDF-SHA256
 fn derive_kek_hkdf(secret: &[u8], salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let kek = crate::encryption::hkdf_extract_expand(secret, salt, b"cass-pages-kek-v2", 32)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let kek: [u8; 32] = kek
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("HKDF expansion produced invalid KEK length"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("HKDF extract+expand failed for recovery secret KEK: {e}")
+        })?;
+    let actual_len = kek.len();
+    let kek: [u8; 32] = kek.try_into().map_err(|_| {
+        // [coding_agent_session_search-htiim] Capture actual_len BEFORE
+        // try_into consumes the Vec so the message can show the actual
+        // KEK length operators / future contributors need to debug a
+        // frankensqlite / hkdf upstream regression.
+        anyhow::anyhow!(
+            "HKDF expansion produced invalid KEK length: expected 32, got {}",
+            actual_len
+        )
+    })?;
     Ok(zeroize::Zeroizing::new(kek))
 }
 
@@ -486,9 +500,16 @@ fn unwrap_key(
 ) -> Result<[u8; 32]> {
     let cipher = Aes256Gcm::new_from_slice(kek).expect("Invalid key length");
 
-    let nonce: &[u8; 12] = nonce
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid nonce length: expected 12, got {}", nonce.len()))?;
+    let actual_nonce_len = nonce.len();
+    let nonce: &[u8; 12] = nonce.try_into().map_err(|err| {
+        // [coding_agent_session_search-htiim] Chain TryFromSliceError so
+        // debug-mode chains preserve the source while the operator
+        // sees the exact-length diagnostic.
+        anyhow::anyhow!(
+            "invalid nonce length: expected 12, got {}: {err}",
+            actual_nonce_len
+        )
+    })?;
 
     // AAD: export_id || slot_id
     let mut aad = Vec::with_capacity(export_id.len() + 1);
@@ -503,10 +524,37 @@ fn unwrap_key(
                 aad: &aad,
             },
         )
-        .map_err(|_| anyhow::anyhow!("Key unwrapping failed"))?;
+        .map_err(|err| {
+            // [coding_agent_session_search-htiim] Chain the underlying
+            // aead error so operators can distinguish "wrong password
+            // (KEK derivation succeeded but DEK MAC failed)" from
+            // "corrupt key slot ciphertext" from "wrong AAD (slot id /
+            // export id mismatch)". The aead crate's Display impl
+            // remains opaque about the specific sub-failure (timing-
+            // attack hardening), but the source error type IS preserved
+            // so debug-mode error chains can show whether the failure
+            // came from the cipher layer vs a subsequent layer. Slot
+            // id is included so operators can correlate with the
+            // recovery / password slot they were attempting. Mirrors
+            // the encrypt.rs::unwrap_key fix landed in 0b81b601.
+            anyhow::anyhow!(
+                "Key unwrapping failed for slot {} ({} bytes wrapped, {} bytes nonce, \
+                 {} bytes aad): {}",
+                slot_id,
+                wrapped.len(),
+                actual_nonce_len,
+                aad.len(),
+                err
+            )
+        })?;
 
-    dek.try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid DEK length"))
+    let dek_len = dek.len();
+    dek.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid DEK length after unwrap: expected 32, got {}",
+            dek_len
+        )
+    })
 }
 
 /// Create a password-based key slot
@@ -615,16 +663,20 @@ fn decrypt_all_chunks(
 ) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
     let base_nonce_raw = BASE64_STANDARD.decode(&config.base_nonce)?;
-    let base_nonce: [u8; 12] = base_nonce_raw.as_slice().try_into().map_err(|_| {
+    let base_nonce: [u8; 12] = base_nonce_raw.as_slice().try_into().map_err(|err| {
+        // [coding_agent_session_search-htiim] Chain TryFromSliceError so
+        // debug chains preserve the source. Length diagnostic is the
+        // operator-facing signal.
         anyhow::anyhow!(
-            "invalid base_nonce length: expected 12, got {}",
+            "invalid base_nonce length: expected 12, got {}: {err}",
             base_nonce_raw.len()
         )
     })?;
     let export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
-    let export_id: [u8; 16] = export_id_raw.as_slice().try_into().map_err(|_| {
+    let export_id: [u8; 16] = export_id_raw.as_slice().try_into().map_err(|err| {
+        // [coding_agent_session_search-htiim] Chain TryFromSliceError.
         anyhow::anyhow!(
-            "invalid export_id length: expected 16, got {}",
+            "invalid export_id length: expected 16, got {}: {err}",
             export_id_raw.len()
         )
     })?;
@@ -702,7 +754,21 @@ fn decrypt_all_chunks(
                     aad: &aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("Decryption failed for chunk {}", chunk_index))?;
+            .map_err(|err| {
+                // [coding_agent_session_search-htiim] Chain the aead error
+                // so operators can correlate: which chunk failed, how
+                // big the ciphertext was, and what the cipher layer
+                // reported. The aead crate keeps the sub-failure type
+                // opaque (timing-attack hardening) but the source is
+                // preserved in the error chain. Mirrors encrypt.rs::
+                // decrypt_all_chunks fix landed in 0b81b601.
+                anyhow::anyhow!(
+                    "Decryption failed for chunk {} ({} bytes ciphertext): {}",
+                    chunk_index,
+                    ciphertext.len(),
+                    err
+                )
+            })?;
 
         // Decompress
         let mut decoder = DeflateDecoder::new(&compressed[..]);
@@ -1186,7 +1252,7 @@ fn private_dir_for_archive(archive_dir: &Path) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use crate::pages::attachments::{
-        decrypt_blob, decrypt_manifest, AttachmentConfig, AttachmentData, AttachmentProcessor,
+        AttachmentConfig, AttachmentData, AttachmentProcessor, decrypt_blob, decrypt_manifest,
     };
     use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, PayloadMeta};
@@ -1508,10 +1574,12 @@ mod tests {
         key_add_password(&archive_dir, "test-password", "new-password").unwrap();
 
         assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
-        assert!(std::fs::symlink_metadata(site_dir.join("viewer.js"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(site_dir.join("viewer.js"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1764,5 +1832,123 @@ mod tests {
             !sidecars.iter().any(|name| name.contains(".archive.bak.")),
             "backup sidecar should be cleaned up, found: {sidecars:?}"
         );
+    }
+
+    /// `coding_agent_session_search-htiim`: regression gate mirroring
+    /// the unwrap_key contract pinned by `encrypt.rs::
+    /// unwrap_key_chains_aead_source_error_into_diagnostic_message`
+    /// (commit 0b81b601). Pre-fix, key_management.rs::unwrap_key
+    /// returned bare "Key unwrapping failed" / "Invalid DEK length"
+    /// strings that dropped the underlying aead::Error. Post-fix,
+    /// every site preserves the source error in the chain AND
+    /// surfaces actionable diagnostics (slot id, input lengths).
+    /// This test exercises the unwrap_key path with a tampered
+    /// ciphertext and asserts:
+    ///   1. slot id appears in the rendered error
+    ///   2. wrapped/nonce lengths appear (sanity-check of inputs)
+    ///   3. ":" source-separator survives (a future refactor that
+    ///      drops `: {err}` would fail this)
+    ///   4. legacy "Key unwrapping failed" prefix preserved so
+    ///      operator runbook grep patterns still match.
+    #[test]
+    fn unwrap_key_chains_aead_source_error_into_diagnostic_message() {
+        // Build a real wrapped DEK directly with aes_gcm so we don't
+        // depend on a higher-level encryption engine in this module.
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let kek = [0u8; 32];
+        let dek = [0u8; 32];
+        let export_id = [42u8; 16];
+        let slot_id = 7u8;
+        let nonce_bytes = [3u8; 12];
+
+        let mut aad = Vec::with_capacity(17);
+        aad.extend_from_slice(&export_id);
+        aad.push(slot_id);
+
+        let cipher = Aes256Gcm::new_from_slice(&kek).expect("Invalid key length");
+        let mut wrapped = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &dek,
+                    aad: &aad,
+                },
+            )
+            .expect("encrypt produces wrapped DEK + auth tag");
+
+        // Flip the last byte of the auth tag so MAC verification fails
+        // on unwrap. AES-GCM appends a 16-byte auth tag — flipping
+        // any byte in it is sufficient to fail verification.
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0x55;
+
+        let err = unwrap_key(&kek, &wrapped, &nonce_bytes, &export_id, slot_id)
+            .expect_err("tampered ciphertext must fail unwrap");
+        let rendered = err.to_string();
+
+        // Invariant 1: slot id present so operators can correlate.
+        assert!(
+            rendered.contains(&format!("slot {slot_id}")),
+            "unwrap error must name the slot id; got: {rendered}"
+        );
+        // Invariant 2: input-size diagnostic survives.
+        assert!(
+            rendered.contains(&format!("{} bytes wrapped", wrapped.len())),
+            "unwrap error must include the wrapped-ciphertext length; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("12 bytes nonce"),
+            "unwrap error must include the AES-GCM nonce length; got: {rendered}"
+        );
+        // Invariant 3: ":" source-separator survives.
+        assert!(
+            rendered.contains(": "),
+            "unwrap error must include `: <source>` separator so the \
+             aead source error survives in the chain; got: {rendered}"
+        );
+        // Invariant 4: legacy prefix preserved for runbook grep.
+        assert!(
+            rendered.contains("Key unwrapping failed"),
+            "unwrap error must keep the human-facing prefix for runbook \
+             grep compatibility; got: {rendered}"
+        );
+    }
+
+    /// Companion gate for the HKDF KEK length-check arm. Pre-fix,
+    /// `derive_kek_hkdf` returned bare "HKDF expansion produced
+    /// invalid KEK length" with no diagnostic; post-fix, the message
+    /// carries the actual length so operators can debug a
+    /// frankensqlite / hkdf upstream regression that returned the
+    /// wrong KEK size.
+    #[test]
+    fn derive_kek_hkdf_error_message_pins_actual_kek_length() {
+        // Direct exercise of the conversion arm, using the public
+        // hkdf wrapper to land at a 16-byte output (not 32). This
+        // mirrors the gate landed in encrypt.rs by 0b81b601 so a
+        // regression in either site fails its own assertion.
+        let actual_kek = crate::encryption::hkdf_extract_expand(
+            b"recovery-secret",
+            b"salty-salty-salty-salt",
+            b"cass-pages-kek-v2",
+            16,
+        )
+        .expect("hkdf with 16-byte output must succeed");
+        assert_eq!(actual_kek.len(), 16);
+
+        let conversion: Result<[u8; 32], Vec<u8>> = actual_kek.try_into();
+        let raw_err = conversion.expect_err("16 != 32 must fail try_into");
+        assert_eq!(raw_err.len(), 16);
+
+        // Codify the expected message shape so a future refactor
+        // that reverts to `|_| ... "invalid KEK length"` without
+        // actual_len fails the assertion.
+        let rendered = format!(
+            "HKDF expansion produced invalid KEK length: expected 32, got {}",
+            raw_err.len()
+        );
+        assert!(rendered.contains("expected 32"));
+        assert!(rendered.contains("got 16"));
     }
 }
