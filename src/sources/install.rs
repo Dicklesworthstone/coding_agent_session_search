@@ -392,16 +392,21 @@ impl RemoteInstaller {
         format!("{}.sha256", binary_url)
     }
 
+    fn shell_quote_arg(value: &str) -> String {
+        format!("'{}'", value.replace('\'', r#"'\''"#))
+    }
+
     /// Fetch checksum from remote URL via SSH.
     ///
     /// Returns the SHA256 hex string if successful, None if checksum unavailable.
     /// This is non-blocking - if checksum can't be fetched, installation proceeds without verification.
     fn fetch_remote_checksum(&self, checksum_url: &str) -> Option<String> {
         // Use curl or wget to fetch the checksum file
+        let checksum_url_arg = Self::shell_quote_arg(checksum_url);
         let fetch_cmd = if self.system_info.has_curl {
-            format!(r#"curl -fsSL "{}" 2>/dev/null | head -1"#, checksum_url)
+            format!("curl -fsSL {checksum_url_arg} 2>/dev/null | head -1")
         } else if self.system_info.has_wget {
-            format!(r#"wget -qO- "{}" 2>/dev/null | head -1"#, checksum_url)
+            format!("wget -qO- {checksum_url_arg} 2>/dev/null | head -1")
         } else {
             return None;
         };
@@ -592,28 +597,31 @@ impl RemoteInstaller {
         // Download into a secure mktemp directory (not predictable /tmp/), verify
         // checksum BEFORE extracting/installing, validate the archive layout, and
         // clean up temp files on exit.
+        let url_arg = Self::shell_quote_arg(url);
         let download_tool = if has_curl {
-            format!(r#"curl -fsSL "{url}" -o "${{archive_path}}""#)
+            format!(r#"curl -fsSL {url_arg} -o "${{archive_path}}""#)
         } else {
-            format!(r#"wget -q "{url}" -O "${{archive_path}}""#)
+            format!(r#"wget -q {url_arg} -O "${{archive_path}}""#)
         };
         let checksum_verify = if let Some(expected) = checksum {
+            let expected_lower = expected.to_lowercase();
+            let expected_arg = Self::shell_quote_arg(&expected_lower);
             format!(
                 r#"
+expected_sum={expected_arg}
 if command -v sha256sum >/dev/null 2>&1; then
     actual_sum="$(sha256sum "${{archive_path}}" | cut -d' ' -f1)"
 elif command -v shasum >/dev/null 2>&1; then
     actual_sum="$(shasum -a 256 "${{archive_path}}" | cut -d' ' -f1)"
 else
-    echo "WARNING: no sha256sum or shasum found, skipping checksum"
-    actual_sum="{expected_lower}"
-fi
-if [ "${{actual_sum}}" != "{expected_lower}" ]; then
-    echo "CHECKSUM_MISMATCH: expected {expected_lower} got ${{actual_sum}}"
+    echo "CHECKSUM_TOOL_MISSING: no sha256sum or shasum found"
     exit 1
 fi
-"#,
-                expected_lower = expected.to_lowercase()
+if [ "${{actual_sum}}" != "${{expected_sum}}" ]; then
+    echo "CHECKSUM_MISMATCH: expected ${{expected_sum}} got ${{actual_sum}}"
+    exit 1
+fi
+"#
             )
         } else {
             String::new()
@@ -1229,6 +1237,18 @@ mod tests {
     }
 
     #[test]
+    fn test_shell_quote_arg_suppresses_command_substitution() {
+        assert_eq!(
+            RemoteInstaller::shell_quote_arg("https://example.com/cass$(id).tar.gz"),
+            "'https://example.com/cass$(id).tar.gz'"
+        );
+        assert_eq!(
+            RemoteInstaller::shell_quote_arg("https://example.com/it's.tar.gz"),
+            "'https://example.com/it'\\''s.tar.gz'"
+        );
+    }
+
+    #[test]
     fn test_checksum_mismatch_error_display() {
         let err = InstallError::ChecksumMismatch {
             expected: "abc123".to_string(),
@@ -1310,6 +1330,24 @@ mod tests {
         assert!(script.contains(r#"[ -L "${tmp_dir}/cass" ]"#));
         assert!(script.contains(r#"install -m 0755 "${tmp_dir}/cass""#));
         assert!(!script.contains("tar -xzf \"${archive_path}\" -C \"${tmp_dir}\"\n"));
+    }
+
+    #[test]
+    fn test_prebuilt_install_script_quotes_url_and_fails_without_checksum_tool() {
+        let script = RemoteInstaller::build_prebuilt_binary_install_script(
+            "https://example.com/cass'$(touch /tmp/pwned)'.tar.gz",
+            Some(&"a".repeat(64)),
+            true,
+        );
+
+        assert!(
+            script.contains(
+                "curl -fsSL 'https://example.com/cass'\\''$(touch /tmp/pwned)'\\''.tar.gz'"
+            )
+        );
+        assert!(script.contains("CHECKSUM_TOOL_MISSING"));
+        assert!(!script.contains("skipping checksum"));
+        assert!(!script.contains("actual_sum=\"aaaaaaaa"));
     }
 
     #[test]
