@@ -288,12 +288,6 @@ impl HtmlTemplate {
                 r#"<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin="anonymous">"#
                     .to_string(),
             );
-            // Tailwind CSS v4 browser CDN - compiles in browser, no build step needed
-            tags.push(
-                r#"<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>"#
-                    .to_string(),
-            );
-
             if options.syntax_highlighting {
                 tags.push(format!(
                     r#"<link rel="stylesheet" href="{url}" integrity="{sri}" crossorigin="anonymous" media="print" onload="this.media='all'" onerror="document.documentElement.classList.add('no-prism')">"#,
@@ -844,6 +838,7 @@ mod tests {
 
         // Note: Tailwind CDN removed - Tailwind v3+/v4 requires compilation.
         // Our inline critical CSS provides complete styling.
+        assert!(!html.contains("tailwindcss"));
         assert!(html.contains(PRISM_CORE_URL));
         assert!(html.contains(PRISM_CORE_SRI));
         assert!(html.contains("document.documentElement.classList.add('no-prism')"));

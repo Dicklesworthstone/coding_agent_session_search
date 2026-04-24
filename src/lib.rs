@@ -5524,6 +5524,34 @@ fn state_meta_json(
     stale_threshold: u64,
     allow_db_open: bool,
 ) -> serde_json::Value {
+    state_meta_json_with_counts(data_dir, db_path, stale_threshold, allow_db_open, None)
+}
+
+/// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
+/// that lets the caller force-skip the COUNT(*) queries on the
+/// canonical DB. Pre-fix the size-based heuristic (≤256 MB → run
+/// counts) made `cass health --json` ~6× over its <50ms documented
+/// budget on real corpora because COUNT(*) on conversations +
+/// messages is a full table scan. Health doesn't need exact
+/// counts to compute its readiness verdict (DB exists + opened +
+/// index fresh + not rebuilding); status keeps the size-based
+/// behavior because it explicitly surfaces totals to operators.
+///
+/// `include_counts_override`:
+///   - `None`         → existing size-based logic (≤256 MB → counts).
+///   - `Some(false)`  → unconditionally skip; envelope reports 0/0
+///                      with `counts_skipped=true` (already in
+///                      StateDbSnapshot).
+///   - `Some(true)`   → unconditionally run counts (no caller uses
+///                      this today; reserved for future paths that
+///                      MUST have totals regardless of cost).
+fn state_meta_json_with_counts(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+    allow_db_open: bool,
+    include_counts_override: Option<bool>,
+) -> serde_json::Value {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5536,9 +5564,11 @@ fn state_meta_json(
         .unwrap_or(0);
 
     let db_size_bytes = fs::metadata(db_path).map(|m| m.len()).ok();
-    let include_counts = db_size_bytes
-        .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
-        .unwrap_or(false);
+    let include_counts = include_counts_override.unwrap_or_else(|| {
+        db_size_bytes
+            .map(|size| size <= STATUS_COUNT_SCAN_MAX_DB_BYTES)
+            .unwrap_or(false)
+    });
     let db_snapshot = if allow_db_open && db_exists {
         probe_state_db(db_path, "state-meta", STATE_DB_OPEN_TIMEOUT, include_counts)
     } else {
@@ -12485,7 +12515,14 @@ fn run_health(
     let start = Instant::now();
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
+    // [coding_agent_session_search-d0rmo] health is the documented
+    // <50ms fast surface; force-skip the canonical-DB COUNT(*)
+    // queries that dominate runtime on real corpora. Counts in the
+    // envelope become 0 with counts_skipped=true; status / diag
+    // (which surface totals as a primary signal) keep the existing
+    // size-based default.
+    let state =
+        state_meta_json_with_counts(&data_dir, &db_path, stale_threshold, true, Some(false));
 
     let index_exists = state
         .get("index")

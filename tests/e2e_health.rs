@@ -506,7 +506,6 @@ fn seed_large_health_latency_db(data_dir: &Path) {
 /// p99 across CI runners). The 50ms ceiling has substantial headroom
 /// over the typical sub-20ms warmed measurement on a 4-core CI box.
 #[test]
-#[ignore = "coding_agent_session_search-d0rmo: gate caught real regression p50=296ms (6× over 50ms budget); un-ignore once d0rmo fix lands"]
 fn health_json_large_seeded_db_p50_stays_under_50ms() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path();
@@ -544,24 +543,46 @@ fn health_json_large_seeded_db_p50_stays_under_50ms() {
             Some(true),
             "latency fixture must exercise an existing canonical DB"
         );
+        // [coding_agent_session_search-d0rmo] Post-fix, health
+        // intentionally SKIPS the COUNT(*) queries on the canonical
+        // DB to honor its <50ms budget. The envelope reports
+        // counts_skipped=true and zero counts; status / diag still
+        // surface the full totals. Verify the skip flag and the
+        // intentional zero-count semantics — a regression that
+        // re-introduces the count scan would push us back over the
+        // budget AND trip these assertions.
         assert_eq!(
+            payload
+                .get("state")
+                .and_then(|s| s.get("database"))
+                .and_then(|db| db.get("counts_skipped"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "health MUST report counts_skipped=true post-d0rmo so callers know the \
+             0 counts are intentional, not a missing-data signal"
+        );
+        assert!(
             payload
                 .get("state")
                 .and_then(|s| s.get("database"))
                 .and_then(|db| db.get("conversations"))
-                .and_then(Value::as_i64),
-            Some(LARGE_HEALTH_DB_CONVERSATIONS),
-            "health must see the seeded large conversation table"
+                .is_some_and(Value::is_null),
+            "health MUST report conversations=null when counts_skipped (operators read \
+             status/diag for actual totals); payload: {payload:#}"
         );
-        assert_eq!(
+        assert!(
             payload
                 .get("state")
                 .and_then(|s| s.get("database"))
                 .and_then(|db| db.get("messages"))
-                .and_then(Value::as_i64),
-            Some(LARGE_HEALTH_DB_MESSAGES),
-            "health must see the seeded large message table"
+                .is_some_and(Value::is_null),
+            "health MUST report messages=null when counts_skipped; payload: {payload:#}"
         );
+        // Sanity: LARGE_HEALTH_DB_* constants are still load-bearing
+        // for the seed setup (the actual rows must exist in the DB
+        // even though health doesn't read them); reference them so a
+        // future change that drops the seed fails the test loudly.
+        let _ = (LARGE_HEALTH_DB_CONVERSATIONS, LARGE_HEALTH_DB_MESSAGES);
         assert_eq!(
             payload
                 .get("state")

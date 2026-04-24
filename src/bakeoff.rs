@@ -504,13 +504,13 @@ impl EvaluationHarness {
         metadata: &ModelMetadata,
     ) -> Result<ValidationReport, String> {
         let corpus_hash = corpus.compute_hash();
+        let first_doc = corpus.documents.first().ok_or("Empty corpus")?;
         if corpus.queries.is_empty() {
             return Err("Empty query set".to_string());
         }
 
         // Measure cold start (first embedding)
         let cold_start = Instant::now();
-        let first_doc = corpus.documents.first().ok_or("Empty corpus")?;
         embedder
             .embed_sync(&first_doc.content)
             .map_err(|e| e.to_string())?;
