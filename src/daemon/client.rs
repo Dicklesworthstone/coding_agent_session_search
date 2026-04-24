@@ -192,12 +192,7 @@ impl UdsDaemonClient {
             return Ok(());
         }
 
-        // Remove existing socket if present (ignore NotFound — avoids TOCTOU race)
-        if let Err(e) = std::fs::remove_file(&self.config.socket_path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(error = %e, "failed to remove stale daemon socket");
-        }
+        remove_stale_daemon_socket(&self.config.socket_path)?;
 
         // Spawn daemon in background
         let result = Command::new(&binary)
@@ -626,6 +621,32 @@ impl DaemonClient for UdsDaemonClient {
     }
 }
 
+fn remove_stale_daemon_socket(socket_path: &std::path::Path) -> Result<(), DaemonError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(socket_path)
+            .map_err(|error| {
+                DaemonError::Unavailable(format!(
+                    "failed to remove stale daemon socket {}: {}",
+                    socket_path.display(),
+                    error
+                ))
+            }),
+        Ok(metadata) => Err(DaemonError::Unavailable(format!(
+            "refusing to remove non-socket daemon path {} (file type: {:?})",
+            socket_path.display(),
+            metadata.file_type()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DaemonError::Unavailable(format!(
+            "failed to inspect daemon socket path {}: {}",
+            socket_path.display(),
+            error
+        ))),
+    }
+}
+
 /// Connect to an existing daemon or spawn a new one.
 pub fn connect_or_spawn() -> Result<Arc<UdsDaemonClient>, DaemonError> {
     let client = UdsDaemonClient::with_defaults();
@@ -694,6 +715,26 @@ mod tests {
         assert_eq!(
             crate::daemon::daemon_spawn_guard_lock_path(&socket),
             PathBuf::from("/tmp/cass-semantic.spawn-guard.lock")
+        );
+    }
+
+    #[test]
+    fn stale_socket_cleanup_refuses_to_remove_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("cass-daemon.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("write regular file");
+
+        let err = remove_stale_daemon_socket(&socket_path)
+            .expect_err("regular files must not be removed as stale sockets");
+
+        assert!(
+            socket_path.exists(),
+            "regular file at daemon socket path must be preserved"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to remove non-socket daemon path"),
+            "error should explain the protected path type; got {message:?}"
         );
     }
 }
