@@ -16,3 +16,11 @@
 [cm]   curl -sS -X POST http://127.0.0.1:32689 -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 [cm] Example (call cm_context):
 [cm]   curl -sS -X POST http://127.0.0.1:32689 -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cm_context","arguments":{"task":"fix auth timeout","limit":5,"history":3}}}'
+[cm] MCP HTTP server listening on http://127.0.0.1:20505
+[cm] WARNING: Transport is HTTP-only; stdio/SSE are intentionally disabled.
+[cm] Tools: cm_context, cm_feedback, cm_outcome, memory_search, memory_reflect
+[cm] Resources: cm://playbook, cm://diary, cm://outcomes, cm://stats, memory://stats
+[cm] Example (list tools):
+[cm]   curl -sS -X POST http://127.0.0.1:20505 -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+[cm] Example (call cm_context):
+[cm]   curl -sS -X POST http://127.0.0.1:20505 -H "content-type: application/json" -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cm_context","arguments":{"task":"fix auth timeout","limit":5,"history":3}}}'
