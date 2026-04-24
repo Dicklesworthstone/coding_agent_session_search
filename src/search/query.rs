@@ -6199,6 +6199,17 @@ impl SearchClient {
     }
 }
 
+/// Fuzz-only re-export of `transpile_to_fts5` so
+/// `fuzz_targets/fuzz_query_transpiler.rs` can exercise the
+/// user-reachable query-rewriting path (bead
+/// `coding_agent_session_search-ugp09`). `#[doc(hidden)]` keeps it
+/// off the public API surface — callers outside the fuzz harness
+/// should go through `QueryExplanation::analyze` or `SearchClient`.
+#[doc(hidden)]
+pub fn fuzz_transpile_to_fts5(raw_query: &str) -> Option<String> {
+    transpile_to_fts5(raw_query)
+}
+
 /// Transpile a raw query string into an FTS5-compatible query string.
 /// Preserves custom precedence (OR > AND) by adding parentheses.
 /// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
