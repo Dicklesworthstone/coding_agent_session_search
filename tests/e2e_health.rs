@@ -766,3 +766,199 @@ fn cass_status_reaps_stale_index_run_lock_and_reports_not_active() {
          metadata; was {original_lock_len} bytes before, {reaped_len} after"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-yc4h7 (child of ibuuh.10, scenario F:
+// interrupt + recover across restart, end-to-end).
+//
+// k9jb9 pinned the reaping surface using a synthetic stale lock file
+// written by the test. This test covers the REAL user-visible arc: an
+// operator starts `cass index --full`, the process is killed
+// (crash, signal, OOM), they re-run it, and the index completes
+// successfully with content searchable — no manual `rm index-run.lock`
+// needed.
+//
+// Contract pinned:
+//   1. After SIGKILL on an in-flight `cass index --full`, a subsequent
+//      `cass status --json` reports `rebuild.active == false`. The
+//      reaper at src/search/asset_state.rs::read_search_maintenance_snapshot
+//      must handle a REAL killed-process-held lock the same way as
+//      synthetic metadata — flock ownership is the authoritative
+//      signal, not pid liveness.
+//   2. A subsequent `cass index --full` exits success — no
+//      lock-stampede error, no leftover staged generation corruption.
+//   3. Content seeded before the kill IS searchable after the re-run.
+//
+// Timing strategy: seed 12 rollouts so index --full takes long enough
+// to be reliably interruptible. Poll for the lock file to appear with
+// non-empty content (up to ~5s), SIGKILL once seen. Fall back
+// gracefully if the child completes before the poll catches it — in
+// that case the post-completion invariants are still meaningful
+// regression signal.
+// ========================================================================
+
+fn seed_yc4h7_corpus(codex_home: &Path) {
+    let day = codex_home.join("sessions/2026/04/23");
+    fs::create_dir_all(&day).expect("create codex sessions dir");
+    for i in 1..=12 {
+        let body = format!(
+            "{{\"timestamp\":\"2024-04-24T00:{:02}:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"yc4h7-{i:02}\",\"cwd\":\"/tmp/ws\",\"cli_version\":\"0.42.0\"}}}}\n\
+             {{\"timestamp\":\"2024-04-24T00:{:02}:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"yc4h7keyword-{i:02} with extra context so each message carries a bit more to index\"}}]}}}}\n\
+             {{\"timestamp\":\"2024-04-24T00:{:02}:02Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"acknowledged the request and provided a detailed response that adds some length to the fixture\"}}]}}}}\n",
+            i, i, i
+        );
+        fs::write(
+            day.join(format!("rollout-yc4h7-{i:02}.jsonl")),
+            body.as_bytes(),
+        )
+        .expect("write yc4h7 fixture");
+    }
+}
+
+#[test]
+fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recover() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let home = test_home.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    seed_yc4h7_corpus(&codex_home);
+
+    // Spawn cass index --full as a child via std::process::Command
+    // (not assert_cmd, which blocks until completion) so we can kill
+    // it mid-rebuild.
+    let cass = assert_cmd::cargo::cargo_bin!("cass");
+    let mut child = std::process::Command::new(&cass)
+        .arg("index")
+        .arg("--full")
+        .arg("--json")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CODEX_HOME", &codex_home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cass index --full child");
+
+    // Poll for the lock file to appear non-empty. acquire_index_run_lock
+    // writes the metadata very early in the pipeline, so even a fast
+    // index should be catchable in the window.
+    let lock_path = data_dir.join("index-run.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut caught_mid_run = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(meta) = fs::metadata(&lock_path) {
+            if meta.len() > 0 {
+                caught_mid_run = true;
+                break;
+            }
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    if caught_mid_run {
+        // std::process::Child::kill sends SIGKILL on Unix so the
+        // child cannot run graceful lock-cleanup Drop impls.
+        let _ = child.kill();
+    }
+    // Reap the child in either branch so we don't leave zombies and
+    // so subsequent cass invocations don't race a still-alive holder.
+    let _ = child.wait();
+
+    // CONTRACT PIN 1: cass status must report rebuild.active=false.
+    // If the lock was held by the killed child, the reaper in
+    // read_search_maintenance_snapshot must acquire flock (released
+    // on process exit) and clean up in-place.
+    let status_out = Command::new(&cass)
+        .args([
+            "status",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .expect("run cass status");
+    let status_stdout = String::from_utf8_lossy(&status_out.stdout);
+    let status_json: Value = serde_json::from_str(&status_stdout).unwrap_or_else(|err| {
+        panic!(
+            "status JSON parse failed: {err}\ncaught_mid_run={caught_mid_run}\nstdout: {status_stdout}"
+        )
+    });
+    assert_eq!(
+        status_json
+            .get("rebuild")
+            .and_then(|r| r.get("active"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "post-kill cass status must report rebuild.active=false; \
+         caught_mid_run={caught_mid_run}; payload: {status_json}"
+    );
+
+    // CONTRACT PIN 2: a subsequent cass index --full must succeed
+    // cleanly — no lock-stampede, no corruption bail-out.
+    let rerun = Command::new(&cass)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .expect("run cass index --full rerun");
+    assert!(
+        rerun.status.success(),
+        "re-run cass index --full after SIGKILL must succeed; \
+         caught_mid_run={caught_mid_run}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rerun.stdout),
+        String::from_utf8_lossy(&rerun.stderr),
+    );
+
+    // CONTRACT PIN 3: at least one seeded keyword is searchable post-
+    // recovery. Proves the rerun actually populated the lexical
+    // index, not just exited-success silently.
+    let search_out = Command::new(&cass)
+        .args(["search", "yc4h7keyword-01", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("CODEX_HOME", &codex_home)
+        .output()
+        .expect("run cass search");
+    assert!(
+        search_out.status.success(),
+        "post-recovery cass search must succeed; stderr: {}",
+        String::from_utf8_lossy(&search_out.stderr)
+    );
+    let search_stdout = String::from_utf8_lossy(&search_out.stdout);
+    let search_json: Value = serde_json::from_str(&search_stdout)
+        .unwrap_or_else(|err| panic!("search JSON parse failed: {err}\nstdout: {search_stdout}"));
+    let hits = search_json
+        .get("hits")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("search must have hits[]; payload: {search_json}"));
+    assert!(
+        !hits.is_empty(),
+        "post-recovery search must return >=1 hit for a seeded keyword; \
+         caught_mid_run={caught_mid_run}; payload: {search_json}"
+    );
+}
