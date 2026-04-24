@@ -41,6 +41,40 @@ fn scan_db(path: &Path) -> Vec<coding_agent_search::connectors::NormalizedConver
     connector.scan(&ctx).expect("crush scan should not panic")
 }
 
+fn insert_crush_session(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cost: f64,
+) {
+    conn.execute_compat(
+        "INSERT INTO sessions (id, title, prompt_tokens, completion_tokens, cost)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, title, prompt_tokens, completion_tokens, cost],
+    )
+    .expect("insert crush session");
+}
+
+fn insert_crush_message(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+    text: &str,
+    created_at: i64,
+    model: Option<&str>,
+    provider: Option<&str>,
+) {
+    let parts = format!(r#"[{{"type":"text","text":"{text}"}}]"#);
+    conn.execute_compat(
+        "INSERT INTO messages (session_id, role, parts, created_at, model, provider)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, role, parts, created_at, model, provider],
+    )
+    .expect("insert crush message");
+}
+
 #[test]
 fn crush_happy_path_preserves_sqlite_session_fields() {
     let tmp = TempDir::new().unwrap();
@@ -107,6 +141,95 @@ fn crush_happy_path_preserves_sqlite_session_fields() {
     );
     assert!(conv.messages[1].content.contains("SQLite"));
     assert!(!conv.messages[1].content.contains("ignored"));
+}
+
+#[test]
+fn crush_multiple_sessions_ignore_orphans_and_preserve_metadata_ownership() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("crush-multi.db");
+    let conn = create_crush_db(&db_path);
+
+    // Insert sessions in reverse lexical order; the connector contract sorts
+    // by session id and then message timestamp.
+    insert_crush_session(&conn, "sess-b", "Second Crush fixture", 22, 9, 0.22);
+    insert_crush_session(&conn, "sess-a", "First Crush fixture", 11, 4, 0.11);
+
+    insert_crush_message(
+        &conn,
+        "sess-b",
+        "assistant",
+        "response owned by session b",
+        1_700_000_003_000,
+        Some("claude-3-opus"),
+        Some("anthropic"),
+    );
+    insert_crush_message(
+        &conn,
+        "sess-a",
+        "user",
+        "request owned by session a",
+        1_700_000_001_000,
+        None,
+        None,
+    );
+    insert_crush_message(
+        &conn,
+        "sess-a",
+        "assistant",
+        "response owned by session a",
+        1_700_000_002_000,
+        Some("claude-3-5-sonnet"),
+        Some("anthropic"),
+    );
+    insert_crush_message(
+        &conn,
+        "orphan-session",
+        "user",
+        "orphan message must not create a phantom conversation",
+        1_700_000_000_000,
+        None,
+        None,
+    );
+    drop(conn);
+
+    let convs = scan_db(&db_path);
+    assert_eq!(
+        convs.len(),
+        2,
+        "orphan messages must not synthesize sessions"
+    );
+
+    let first = &convs[0];
+    assert_eq!(first.external_id.as_deref(), Some("sess-a"));
+    assert_eq!(first.title.as_deref(), Some("First Crush fixture"));
+    assert_eq!(first.metadata["prompt_tokens"], 11);
+    assert_eq!(first.metadata["completion_tokens"], 4);
+    assert_eq!(first.metadata["cost"], 0.11);
+    assert_eq!(first.messages.len(), 2);
+    assert_eq!(first.messages[0].idx, 0);
+    assert_eq!(first.messages[0].role, "user");
+    assert!(first.messages[0].content.contains("session a"));
+    assert_eq!(first.messages[1].idx, 1);
+    assert_eq!(first.messages[1].role, "assistant");
+    assert_eq!(
+        first.messages[1].author.as_deref(),
+        Some("claude-3-5-sonnet")
+    );
+    assert!(!first.messages[0].content.contains("orphan"));
+    assert!(!first.messages[1].content.contains("orphan"));
+
+    let second = &convs[1];
+    assert_eq!(second.external_id.as_deref(), Some("sess-b"));
+    assert_eq!(second.title.as_deref(), Some("Second Crush fixture"));
+    assert_eq!(second.metadata["prompt_tokens"], 22);
+    assert_eq!(second.metadata["completion_tokens"], 9);
+    assert_eq!(second.metadata["cost"], 0.22);
+    assert_eq!(second.messages.len(), 1);
+    assert_eq!(second.messages[0].idx, 0);
+    assert_eq!(second.messages[0].role, "assistant");
+    assert_eq!(second.messages[0].author.as_deref(), Some("claude-3-opus"));
+    assert!(second.messages[0].content.contains("session b"));
+    assert!(!second.messages[0].content.contains("orphan"));
 }
 
 #[test]
