@@ -5588,6 +5588,25 @@ fn persist_pending_lexical_rebuild_progress_with_base_meta_fingerprint(
         Some(base_meta_fingerprint) => Some(base_meta_fingerprint.to_string()),
         None => index_meta_fingerprint(index_path)?,
     };
+    let current_processed_conversations = state.reported_processed_conversations();
+    let current_indexed_docs = state.reported_indexed_docs();
+    if processed_conversations < current_processed_conversations
+        || indexed_docs < current_indexed_docs
+    {
+        tracing::warn!(
+            requested_next_conversation_id = ?next_conversation_id,
+            requested_processed_conversations = processed_conversations,
+            current_processed_conversations,
+            requested_indexed_docs = indexed_docs,
+            current_indexed_docs,
+            "ignoring stale lexical rebuild progress checkpoint update while preserving runtime telemetry"
+        );
+        if state.runtime != *runtime {
+            state.set_runtime(runtime);
+            persist_lexical_rebuild_state(index_path, state)?;
+        }
+        return Ok(());
+    }
     let already_recorded = state.pending.as_ref().is_some_and(|pending| {
         pending.next_conversation_id == next_conversation_id
             && pending.processed_conversations == processed_conversations
@@ -30037,6 +30056,81 @@ mod tests {
                 .map(|pending| pending.next_conversation_id),
             Some(Some(6))
         );
+    }
+
+    #[test]
+    fn stale_stage_heartbeat_does_not_rewind_rebuild_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        let mut state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: "/tmp/agent_search.db".to_string(),
+                total_conversations: 12,
+                total_messages: 24,
+                storage_fingerprint: "seed:12".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.committed_offset = 4;
+        state.committed_conversation_id = Some(4);
+        state.processed_conversations = 4;
+        state.indexed_docs = 8;
+        let stable_meta = index_meta_fingerprint(&index_path).unwrap();
+        state.record_pending_commit(Some(6), 6, 12, stable_meta);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        let stale_stage_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 2,
+            inflight_message_bytes: 2_048,
+            max_message_bytes_in_flight: 8_192,
+            pending_batch_conversations: 1,
+            pending_batch_message_bytes: 4_096,
+            page_prep_workers: 2,
+            active_page_prep_jobs: 1,
+            producer_handoff_wait_count: 1,
+            producer_handoff_wait_ms: 5,
+            controller_mode: "startup".to_string(),
+            controller_reason: "stale-stage-heartbeat".to_string(),
+            updated_at_ms: 1_733_000_777_000_i64,
+            ..Default::default()
+        };
+
+        persist_pending_lexical_rebuild_progress(
+            &index_path,
+            &mut state,
+            Some(5),
+            5,
+            10,
+            &stale_stage_runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.reported_processed_conversations(),
+            6,
+            "stale stage heartbeat must not move the restart checkpoint backwards"
+        );
+        assert_eq!(state.reported_indexed_docs(), 12);
+        assert_eq!(
+            state.reported_committed_conversation_id(),
+            Some(6),
+            "stale next_conversation_id must not replace the monotone pending cursor"
+        );
+        assert_eq!(
+            state.runtime, stale_stage_runtime,
+            "runtime telemetry should still refresh for attach/status visibility"
+        );
+
+        let persisted = load_lexical_rebuild_state(&index_path)
+            .unwrap()
+            .expect("monotone checkpoint should remain persisted");
+        assert_eq!(persisted.reported_processed_conversations(), 6);
+        assert_eq!(persisted.reported_indexed_docs(), 12);
+        assert_eq!(persisted.reported_committed_conversation_id(), Some(6));
+        assert_eq!(persisted.runtime, stale_stage_runtime);
     }
 
     #[test]
