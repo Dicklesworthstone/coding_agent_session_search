@@ -962,3 +962,167 @@ fn sigkill_mid_index_run_still_allows_cass_status_and_subsequent_index_to_recove
          caught_mid_run={caught_mid_run}; payload: {search_json}"
     );
 }
+
+// ========================================================================
+// Bead coding_agent_session_search-k2jr8 (child of ibuuh.10,
+// /testing-metamorphic slice: cross-command consistency).
+//
+// `cass health --json` and `cass status --json` are two different JSON
+// surfaces over the SAME underlying cass state. Operators and agents
+// use them interchangeably — health for fast readiness probes, status
+// for a fuller snapshot — and expect the two to agree on every shared
+// field. A regression that updated one code path but not the other
+// would silently make polling loops observe contradictory state.
+//
+// This test seeds a rebuild-active state (matching the sibling
+// `health_json_surfaces_runtime_queue_and_byte_budget_headroom` fixture
+// shape), invokes both `cass health --json` and `cass status --json`
+// against the same data-dir within a single test scope, and asserts
+// the four fields where parity actually holds today:
+//
+//   1. rebuild-active flag: status.rebuild.active ==
+//      health.rebuild_progress.active == health.state.rebuild.active
+//   2. semantic tier status: status.semantic.status ==
+//      health.state.semantic.status
+//   3. database presence: status.database.exists ==
+//      health.state.database.exists
+//   4. lexical index presence: status.index.exists ==
+//      health.state.index.exists
+//
+// Recommended_action divergence between the two commands is a known
+// bug tracked separately by coding_agent_session_search-k0bzk and is
+// deliberately NOT asserted here — this test's purpose is to lock in
+// the CORRECT shared-field parity so a future regression that drags
+// a currently-agreeing field out of sync (e.g. cached staleness flag
+// that only one command updates) trips immediately.
+//
+// The invariant is intentionally one-directional: both commands must
+// report the SAME value for each shared field. If a schema change
+// intentionally renames or moves a field, the test needs to be
+// updated alongside the src change — the diff makes the intent
+// reviewable.
+// ========================================================================
+
+#[test]
+fn health_and_status_agree_on_shared_fields_during_active_rebuild() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+    let _lock = seed_active_rebuild_runtime(&data_dir);
+
+    // Helper: run a cass subcommand against the seeded data dir and
+    // parse stdout as JSON. Uses the same env-isolation shape as the
+    // sibling tests in this file so the real corpus never leaks in.
+    let run_json = |subcommand: &str| -> Value {
+        let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args([
+                subcommand,
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--json",
+            ])
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("XDG_DATA_HOME", test_home.path())
+            .env("HOME", test_home.path())
+            .output()
+            .unwrap_or_else(|err| panic!("run cass {subcommand}: {err}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+            panic!(
+                "cass {subcommand} --json must emit valid JSON: {err}\n\
+                 stdout: {stdout}"
+            )
+        })
+    };
+
+    let status = run_json("status");
+    let health = run_json("health");
+
+    // CONTRACT PIN 1: rebuild-active flag agrees across all three
+    // surfaces that expose it. The test is INTENTIONALLY not allowed
+    // to pass with one surface reporting false and another true.
+    let status_rebuild_active = status
+        .get("rebuild")
+        .and_then(|r| r.get("active"))
+        .and_then(Value::as_bool);
+    let health_progress_active = health
+        .get("rebuild_progress")
+        .and_then(|r| r.get("active"))
+        .and_then(Value::as_bool);
+    let health_state_rebuild_active = health
+        .get("state")
+        .and_then(|s| s.get("rebuild"))
+        .and_then(|r| r.get("active"))
+        .and_then(Value::as_bool);
+    assert_eq!(
+        status_rebuild_active,
+        Some(true),
+        "precondition: seeded state must make status.rebuild.active=true; \
+         got {status_rebuild_active:?}\nstatus: {status}"
+    );
+    assert_eq!(
+        health_progress_active, status_rebuild_active,
+        "health.rebuild_progress.active must agree with status.rebuild.active; \
+         status={status_rebuild_active:?} health={health_progress_active:?}"
+    );
+    assert_eq!(
+        health_state_rebuild_active, status_rebuild_active,
+        "health.state.rebuild.active must agree with status.rebuild.active; \
+         status={status_rebuild_active:?} health.state={health_state_rebuild_active:?}"
+    );
+
+    // CONTRACT PIN 2: semantic tier status agrees.
+    let status_semantic = status
+        .get("semantic")
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let health_semantic = health
+        .get("state")
+        .and_then(|s| s.get("semantic"))
+        .and_then(|sem| sem.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    assert!(
+        status_semantic.is_some(),
+        "precondition: status.semantic.status must be present; status: {status}"
+    );
+    assert_eq!(
+        status_semantic, health_semantic,
+        "semantic tier status must agree between surfaces; \
+         status={status_semantic:?} health={health_semantic:?}"
+    );
+
+    // CONTRACT PIN 3: database presence flag agrees.
+    let status_db = status
+        .get("database")
+        .and_then(|d| d.get("exists"))
+        .and_then(Value::as_bool);
+    let health_db = health
+        .get("state")
+        .and_then(|s| s.get("database"))
+        .and_then(|d| d.get("exists"))
+        .and_then(Value::as_bool);
+    assert_eq!(
+        status_db, health_db,
+        "database.exists must agree between surfaces; \
+         status={status_db:?} health={health_db:?}"
+    );
+
+    // CONTRACT PIN 4: lexical index presence flag agrees.
+    let status_idx = status
+        .get("index")
+        .and_then(|i| i.get("exists"))
+        .and_then(Value::as_bool);
+    let health_idx = health
+        .get("state")
+        .and_then(|s| s.get("index"))
+        .and_then(|i| i.get("exists"))
+        .and_then(Value::as_bool);
+    assert_eq!(
+        status_idx, health_idx,
+        "index.exists must agree between surfaces; \
+         status={status_idx:?} health={health_idx:?}"
+    );
+}
