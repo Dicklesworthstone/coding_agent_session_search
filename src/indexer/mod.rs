@@ -7,7 +7,8 @@ pub(crate) mod responsiveness;
 pub mod semantic;
 
 use self::refresh_ledger::{
-    EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger, RefreshPhase,
+    EquivalenceArtifacts as RefreshEquivalenceArtifacts, PhaseRecord, RefreshLedger,
+    RefreshLedgerEvidence, RefreshPhase,
 };
 
 use std::any::Any;
@@ -3828,6 +3829,18 @@ fn lexical_refresh_ledger_path(index_path: &Path) -> PathBuf {
     index_path.join(".lexical-refresh-ledger.json")
 }
 
+/// Companion sidecar to `.lexical-refresh-ledger.json` shipped under
+/// `coding_agent_session_search-ibuuh.24` SCOPE bullet 1: a small
+/// derived-evidence JSON (throughput / phase share / dominant phase /
+/// aggregate items+s) that benchmark gates and operator dashboards
+/// can diff across runs without re-running the math at every call
+/// site. Computed by `RefreshLedger::evidence_summary()` and written
+/// alongside the raw ledger so consumers always see both views in
+/// the same publish.
+fn lexical_refresh_evidence_path(index_path: &Path) -> PathBuf {
+    index_path.join(".lexical-refresh-evidence.json")
+}
+
 fn persist_lexical_rebuild_equivalence_evidence(
     index_path: &Path,
     evidence: &LexicalRebuildEquivalenceEvidence,
@@ -3860,7 +3873,45 @@ fn persist_lexical_refresh_ledger(index_path: &Path, ledger: &RefreshLedger) -> 
         })?;
     }
     write_json_pretty_atomically(&path, ledger)
-        .with_context(|| format!("persisting lexical refresh ledger to {}", path.display()))
+        .with_context(|| format!("persisting lexical refresh ledger to {}", path.display()))?;
+
+    // [coding_agent_session_search-ibuuh.24] Always emit the derived
+    // evidence sidecar alongside the raw ledger so benchmark gates
+    // and operator dashboards have the headline metrics
+    // (throughput, dominant phase, phase share) without having to
+    // re-derive them. Failure here MUST NOT abort the publish — the
+    // raw ledger is the source of truth; the evidence sidecar is a
+    // convenience derived view that can be re-computed offline by
+    // calling `RefreshLedger::evidence_summary()` against the
+    // persisted ledger. We log the failure at warn level so an
+    // operator can investigate without losing publish progress.
+    if let Err(err) = persist_lexical_refresh_evidence(index_path, &ledger.evidence_summary()) {
+        tracing::warn!(
+            target: "cass::indexer::lexical_refresh",
+            error = %err,
+            "failed to persist .lexical-refresh-evidence.json sidecar; raw ledger \
+             persisted OK and evidence can be re-derived offline via \
+             RefreshLedger::evidence_summary()"
+        );
+    }
+    Ok(())
+}
+
+fn persist_lexical_refresh_evidence(
+    index_path: &Path,
+    evidence: &RefreshLedgerEvidence,
+) -> Result<()> {
+    let path = lexical_refresh_evidence_path(index_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating lexical refresh evidence parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    write_json_pretty_atomically(&path, evidence)
+        .with_context(|| format!("persisting lexical refresh evidence to {}", path.display()))
 }
 
 struct AuthoritativeLexicalRefreshLedgerInput<'a> {
@@ -25659,6 +25710,92 @@ mod tests {
         assert!(
             logs.contains("lexical refresh ledger published"),
             "expected refresh ledger publish log, got:\n{logs}"
+        );
+    }
+
+    /// `coding_agent_session_search-ibuuh.24` evidence-sidecar wiring:
+    /// every authoritative lexical publish MUST also write
+    /// `.lexical-refresh-evidence.json` next to the raw ledger so
+    /// benchmark gates and operator dashboards can diff derived
+    /// metrics across runs without re-running the math. Pin both:
+    /// 1. The sidecar file exists at the expected path.
+    /// 2. Its JSON shape matches the RefreshLedgerEvidence contract
+    ///    (presence of every documented field).
+    /// 3. The values are internally consistent with the raw ledger
+    ///    (aggregate_duration_ms == ledger.total_duration_ms,
+    ///    aggregate_items_processed == ledger.total_items_processed()).
+    /// A regression that drops the sidecar OR breaks the ledger ↔
+    /// evidence consistency invariant trips this test immediately.
+    #[test]
+    fn authoritative_publish_emits_lexical_refresh_evidence_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("evidence-sidecar.db");
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+
+        rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
+
+        let index_path = index_dir(&data_dir).unwrap();
+        let ledger_path = lexical_refresh_ledger_path(&index_path);
+        let evidence_path = lexical_refresh_evidence_path(&index_path);
+
+        // Invariant 1: the sidecar lands next to the ledger.
+        assert!(
+            evidence_path.exists(),
+            "evidence sidecar must be written at {} after publish",
+            evidence_path.display()
+        );
+
+        // Invariant 2: shape matches the documented contract.
+        let evidence_raw = std::fs::read_to_string(&evidence_path)
+            .expect("evidence sidecar must be readable after publish");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&evidence_raw).expect("evidence sidecar must be valid JSON");
+        for required in [
+            "throughput",
+            "phase_share",
+            "dominant_phase",
+            "aggregate_items_processed",
+            "aggregate_duration_ms",
+            "aggregate_items_per_second",
+        ] {
+            assert!(
+                parsed.get(required).is_some(),
+                "evidence sidecar missing required field {required}; got: {parsed}"
+            );
+        }
+
+        // Invariant 3: ledger ↔ evidence are internally consistent.
+        // Pre-fix, a regression that swapped the sidecar's source
+        // (e.g. computed evidence from a different ledger snapshot)
+        // would silently desync. Pinning the equality directly
+        // surfaces that.
+        let ledger_raw = std::fs::read_to_string(&ledger_path)
+            .expect("raw ledger must also be persisted");
+        let ledger: refresh_ledger::RefreshLedger =
+            serde_json::from_str(&ledger_raw).expect("raw ledger must be valid JSON");
+        let computed_evidence = ledger.evidence_summary();
+        let serialized_computed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&computed_evidence).unwrap()).unwrap();
+        assert_eq!(
+            parsed, serialized_computed,
+            "persisted evidence sidecar must equal evidence_summary() of the persisted ledger; \
+             a divergence here means the sidecar was computed from a different ledger snapshot"
+        );
+
+        // Sanity: aggregate fields agree with the raw ledger.
+        assert_eq!(
+            parsed["aggregate_duration_ms"].as_u64(),
+            Some(ledger.total_duration_ms),
+            "aggregate_duration_ms must equal ledger.total_duration_ms"
+        );
+        assert_eq!(
+            parsed["aggregate_items_processed"].as_u64(),
+            Some(ledger.total_items_processed()),
+            "aggregate_items_processed must equal ledger.total_items_processed()"
         );
     }
 
