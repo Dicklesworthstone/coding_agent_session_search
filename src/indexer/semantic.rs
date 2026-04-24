@@ -696,6 +696,86 @@ fn fetch_canonical_embedding_conversations(
         })
 }
 
+/// Per-packet semantic context that supplies the database-internal
+/// agent / workspace ids the canonical embedding row carries but the
+/// `ConversationPacket` does not (those ids are storage-internal,
+/// not part of the packet contract).
+///
+/// `coding_agent_session_search-ibuuh.32` (sink #3): when a caller
+/// already holds packets (rebuild pipeline, salvage replay, repair
+/// flows, etc.) it can pair them with their canonical
+/// agent_id/workspace_id and drive the semantic preparation consumer
+/// without a second storage round-trip.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SemanticPacketContext {
+    pub conversation_id: i64,
+    pub agent_id: u32,
+    pub workspace_id: u32,
+}
+
+/// Packet-driven counterpart to
+/// [`packet_embedding_inputs_from_storage`]: derives the same
+/// `EmbeddingInput` list a fresh storage replay would produce, but
+/// without re-querying canonical conversation rows.
+///
+/// Invariants:
+/// - The `i`th element of `contexts` describes the `i`th packet.
+/// - Returns `Err` if the lengths disagree, so a callsite cannot
+///   silently mis-correlate packets and contexts.
+/// - `source_id_hash` is derived from `packet.payload.provenance.source_id`
+///   the same way `embedding_inputs_from_conversation_packet` derives
+///   it from the canonical row, so the produced `EmbeddingInput.source_id`
+///   matches both paths byte-for-byte.
+///
+/// The `semantic_inputs_from_packets_matches_storage_replay`
+/// equivalence test pins every produced `EmbeddingInput` field is
+/// identical to what the legacy storage-side replay returns for the
+/// same canonical corpus, so callers that already hold packets can
+/// switch to this helper without changing semantic-index output.
+pub(crate) fn semantic_inputs_from_packets(
+    packets: &[ConversationPacket],
+    contexts: &[SemanticPacketContext],
+) -> Result<Vec<EmbeddingInput>> {
+    if packets.len() != contexts.len() {
+        anyhow::bail!(
+            "semantic_inputs_from_packets length mismatch: {} packets vs {} contexts",
+            packets.len(),
+            contexts.len()
+        );
+    }
+    let mut inputs = Vec::new();
+    for (packet, context) in packets.iter().zip(contexts.iter()) {
+        let source_id_hash =
+            crc32fast::hash(packet.payload.provenance.source_id.as_bytes());
+        for &message_index in &packet.projections.semantic.message_indices {
+            let Some(message) = packet.payload.messages.get(message_index) else {
+                anyhow::bail!(
+                    "packet semantic projection references missing message index {} \
+                     (packet has {} messages)",
+                    message_index,
+                    packet.payload.messages.len()
+                );
+            };
+            if let Some(input) = embedding_input_from_packet_message(
+                context.conversation_id,
+                context.agent_id,
+                context.workspace_id,
+                source_id_hash,
+                message,
+            ) {
+                inputs.push(input);
+            }
+        }
+    }
+    tracing::debug!(
+        packets = packets.len(),
+        packet_driven = true,
+        semantic_inputs = inputs.len(),
+        "built semantic inputs from in-memory ConversationPacket batch"
+    );
+    Ok(inputs)
+}
+
 fn fetch_canonical_embedding_batch(
     storage: &FrankenStorage,
     after_conversation_id: i64,
@@ -2788,5 +2868,212 @@ mod tests {
                 std::env::set_var("CASS_SEMANTIC_BATCH_SIZE", v);
             }
         }
+    }
+
+    /// `coding_agent_session_search-ibuuh.32` (sink #3 equivalence gate):
+    /// the packet-driven `semantic_inputs_from_packets` helper must
+    /// produce the same `EmbeddingInput` list a fresh storage replay
+    /// returns for the same canonical corpus. Once this passes, callers
+    /// that already hold packets (rebuild pipeline, salvage replay,
+    /// repair flows) can drive the semantic preparation consumer
+    /// without a second canonical-row round-trip.
+    #[test]
+    fn semantic_inputs_from_packets_matches_storage_replay() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path)?;
+
+        let agent_id_codex = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let agent_id_claude = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace_id =
+            storage.ensure_workspace(Path::new("/tmp/semantic-equivalence-ws"), None)?;
+
+        // Two conversations on different agents, mixed roles, including
+        // an empty-content system message that the semantic projection
+        // must filter (matches the legacy storage replay).
+        storage.insert_conversation_tree(
+            agent_id_codex,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "packet-equiv-1",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(1_700_000_000_500),
+                        content: "first user prompt".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_000_600),
+                        content: "first assistant reply".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 2,
+                        role: MessageRole::System,
+                        author: None,
+                        created_at: Some(1_700_000_000_700),
+                        // Empty content is filtered by both paths.
+                        content: String::new(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+        storage.insert_conversation_tree(
+            agent_id_claude,
+            Some(workspace_id),
+            &test_conversation_with_messages(
+                "packet-equiv-2",
+                vec![
+                    Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::Tool,
+                        author: Some("ripgrep".to_string()),
+                        created_at: Some(1_700_000_001_500),
+                        content: "tool output line".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                    Message {
+                        id: None,
+                        idx: 1,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: Some(1_700_000_001_600),
+                        content: "second assistant reply".to_string(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    },
+                ],
+            ),
+        )?;
+
+        // Legacy path: the storage-driven replay that the rebuild
+        // pipeline currently uses.
+        let storage_inputs = packet_embedding_inputs_from_storage(&storage)?;
+
+        // Packet-driven path: re-fetch the canonical envelopes (so we
+        // get the storage-internal agent/workspace ids the rebuild path
+        // would normally pair with packets), then convert those rows
+        // into ConversationPackets via canonical replay and feed them
+        // through `semantic_inputs_from_packets`.
+        let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+            "SELECT DISTINCT m.conversation_id
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             ORDER BY m.conversation_id ASC",
+            &[] as &[ParamValue],
+            |row| row.get_typed(0),
+        )?;
+        let envelopes = fetch_canonical_embedding_conversations(&storage, &conversation_ids)?;
+        let mut grouped_messages =
+            storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+        let mut packets: Vec<ConversationPacket> = Vec::with_capacity(envelopes.len());
+        let mut contexts: Vec<SemanticPacketContext> = Vec::with_capacity(envelopes.len());
+        for envelope in &envelopes {
+            let messages = grouped_messages
+                .remove(&envelope.conversation_id)
+                .unwrap_or_default();
+            let provenance = canonical_embedding_packet_provenance(envelope);
+            let canonical = canonical_embedding_conversation(envelope, &provenance, messages);
+            packets.push(ConversationPacket::from_canonical_replay(
+                &canonical,
+                provenance,
+            ));
+            contexts.push(SemanticPacketContext {
+                conversation_id: envelope.conversation_id,
+                agent_id: saturating_u32_from_i64(envelope.agent_id),
+                workspace_id: saturating_u32_from_i64(envelope.workspace_id.unwrap_or(0)),
+            });
+        }
+        let packet_inputs = semantic_inputs_from_packets(&packets, &contexts)?;
+
+        // The two paths must produce the same EmbeddingInput list
+        // (sortable comparison normalizes ordering across the two
+        // helpers' iteration orders).
+        assert!(
+            !storage_inputs.is_empty(),
+            "fixture should produce non-empty semantic inputs (sanity)"
+        );
+        assert_eq!(
+            comparable_semantic_inputs(storage_inputs.clone()),
+            comparable_semantic_inputs(packet_inputs.clone()),
+            "packet-driven semantic preparation must match storage replay byte-for-byte"
+        );
+
+        // Sanity-pin a couple of contract details so a regression in
+        // either path (e.g. role normalization or empty-content
+        // filtering) trips a clear assertion rather than a generic
+        // length mismatch.
+        let storage_count = storage_inputs.len();
+        let packet_count = packet_inputs.len();
+        assert_eq!(
+            storage_count, packet_count,
+            "storage and packet semantic input counts must agree exactly"
+        );
+        // Empty-content system message must NOT appear in the output.
+        assert!(
+            packet_inputs
+                .iter()
+                .all(|input| !input.content.is_empty()),
+            "empty content must be filtered by the packet semantic projection"
+        );
+        // The remote-host source_id pins the cross-path provenance hash.
+        let normalized_source_id =
+            normalized_index_source_id(Some("remote-laptop"), None, Some("builder-host"));
+        let expected_hash = crc32fast::hash(normalized_source_id.as_bytes());
+        assert!(
+            packet_inputs.iter().all(|input| input.source_id == expected_hash),
+            "every emitted EmbeddingInput must hash provenance via the packet's normalized source_id"
+        );
+
+        Ok(())
+    }
+
+    /// Length-mismatch defense: if a caller hands `semantic_inputs_from_packets`
+    /// a packet/context slice pair of different lengths, the helper must
+    /// return an error rather than silently mis-correlating ids. Pinning
+    /// this is part of the bead's "shadow / compare mode plus explicit
+    /// kill-switch" acceptance language.
+    #[test]
+    fn semantic_inputs_from_packets_rejects_length_mismatch() {
+        let provenance = ConversationPacketProvenance::local();
+        let canonical = test_conversation("packet-mismatch", "hello");
+        let packet = ConversationPacket::from_canonical_replay(&canonical, provenance);
+        let result = semantic_inputs_from_packets(&[packet], &[]);
+        assert!(
+            result.is_err(),
+            "expected error on packet/context length mismatch"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("length mismatch"),
+            "error should mention length mismatch, got: {err}"
+        );
     }
 }
