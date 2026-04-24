@@ -921,7 +921,7 @@ fn pct_delta(baseline: f64, current: f64) -> Option<f64> {
 /// `emit_tracing_summary` (operator-visibility soft signal) — the
 /// hard-gate consumer uses `regression_verdict` to decide whether
 /// to exit non-zero in CI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegressionVerdictThresholds {
     /// Aggregate duration delta percent at which the verdict
     /// becomes `Warning`. Inclusive (`>=` triggers).
@@ -954,6 +954,9 @@ impl RegressionVerdictThresholds {
         if !warning_duration_pct.is_finite() || !failure_duration_pct.is_finite() {
             return Err("regression thresholds must be finite f64s");
         }
+        if warning_duration_pct < 0.0 || failure_duration_pct < 0.0 {
+            return Err("regression thresholds must be non-negative percentages");
+        }
         if warning_duration_pct >= failure_duration_pct {
             return Err(
                 "warning_duration_pct must be strictly less than failure_duration_pct, \
@@ -964,6 +967,31 @@ impl RegressionVerdictThresholds {
             warning_duration_pct,
             failure_duration_pct,
         })
+    }
+
+    fn is_valid(&self) -> bool {
+        self.warning_duration_pct.is_finite()
+            && self.failure_duration_pct.is_finite()
+            && self.warning_duration_pct >= 0.0
+            && self.failure_duration_pct >= 0.0
+            && self.warning_duration_pct < self.failure_duration_pct
+    }
+}
+
+impl<'de> Deserialize<'de> for RegressionVerdictThresholds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawThresholds {
+            warning_duration_pct: f64,
+            failure_duration_pct: f64,
+        }
+
+        let raw = RawThresholds::deserialize(deserializer)?;
+        Self::try_new(raw.warning_duration_pct, raw.failure_duration_pct)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1023,6 +1051,9 @@ impl RefreshLedgerEvidenceComparison {
         &self,
         thresholds: &RegressionVerdictThresholds,
     ) -> RegressionVerdict {
+        if !thresholds.is_valid() {
+            return RegressionVerdict::Clean;
+        }
         let Some(duration_pct) = self.aggregate_duration_delta_pct else {
             return RegressionVerdict::Clean;
         };
@@ -2251,6 +2282,18 @@ mod tests {
             RegressionVerdict::Clean,
             "missing comparison data MUST NOT cause a CI failure (no signal to gate on)"
         );
+
+        let invalid_negative = RegressionVerdictThresholds {
+            warning_duration_pct: -20.0,
+            failure_duration_pct: -10.0,
+        };
+        let steady_state = comparison_with_pct(Some(0.0)).regression_verdict(&invalid_negative);
+        assert_eq!(
+            steady_state,
+            RegressionVerdict::Clean,
+            "invalid negative thresholds must fail open instead of turning a 0% \
+             steady-state comparison into a CI failure"
+        );
     }
 
     /// `coding_agent_session_search-ibuuh.24`: the threshold
@@ -2276,6 +2319,22 @@ mod tests {
         let err_eq = RegressionVerdictThresholds::try_new(15.0, 15.0)
             .expect_err("warning == failure must be rejected");
         assert!(err_eq.contains("strictly less"));
+
+        // Negative thresholds make steady-state (0%) compare greater
+        // than the failure threshold, so reject them up front.
+        let negative_warning = RegressionVerdictThresholds::try_new(-20.0, 10.0)
+            .expect_err("negative warning threshold must be rejected");
+        assert!(negative_warning.contains("non-negative"));
+        let negative_failure = RegressionVerdictThresholds::try_new(10.0, -20.0)
+            .expect_err("negative failure threshold must be rejected");
+        assert!(negative_failure.contains("non-negative"));
+        let invalid_json = r#"{"warning_duration_pct":-30.0,"failure_duration_pct":-10.0}"#;
+        let deser = serde_json::from_str::<RegressionVerdictThresholds>(invalid_json)
+            .expect_err("serde-loaded negative thresholds must be rejected too");
+        assert!(
+            deser.to_string().contains("non-negative"),
+            "serde validation error must explain the threshold polarity; got {deser}"
+        );
 
         // Non-finite values rejected explicitly (defensive — never
         // reachable from clean f64 arithmetic but pin the contract).
