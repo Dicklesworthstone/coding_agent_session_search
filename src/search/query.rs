@@ -66,6 +66,20 @@ type TantivyHydratedContentMaps = (
     HashMap<TantivyContentExactKey, String>,
     HashMap<TantivyContentFallbackKey, String>,
 );
+type SqliteFtsHydratedRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
@@ -101,33 +115,6 @@ where
     loop {
         match conn.query_map_collect(sql, params, |row| map(row)) {
             Ok(values) => return Ok(values),
-            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(err);
-                }
-                let remaining = deadline.saturating_duration_since(now);
-                crate::storage::sqlite::sleep_with_franken_retry_backoff(
-                    &mut backoff,
-                    remaining,
-                    Duration::from_millis(64),
-                );
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-fn franken_query_rows_retry(
-    conn: &Connection,
-    sql: &str,
-    params: &[frankensqlite::SqliteValue],
-) -> Result<Vec<frankensqlite::Row>, frankensqlite::FrankenError> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut backoff = Duration::from_millis(4);
-    loop {
-        match conn.query_with_params(sql, params) {
-            Ok(rows) => return Ok(rows),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = Instant::now();
                 if now >= deadline {
@@ -5734,87 +5721,33 @@ impl SearchClient {
             .unwrap_or(false))
     }
 
-    fn search_sqlite_fts5(
-        &self,
-        _db_path: &Path,
-        raw_query: &str,
-        filters: SearchFilters,
+    fn sqlite_fts5_rank_query(
+        fts_query: &str,
+        filters: &SearchFilters,
         limit: usize,
         offset: usize,
-        field_mask: FieldMask,
-    ) -> Result<Vec<SearchHit>> {
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
-        let sqlite_guard = self.sqlite_guard()?;
-        let Some(conn) = sqlite_guard.as_ref() else {
-            return Ok(Vec::new());
-        };
-
-        let empty_params: [ParamValue; 0] = [];
-        let has_fts = franken_query_map_collect_retry(
-            conn,
-            "SELECT 1 FROM sqlite_master WHERE name = 'fts_messages'",
-            &empty_params,
-            |row| row.get_typed::<i64>(0),
-        )
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
-        if !has_fts {
-            return Ok(Vec::new());
-        }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let message_join =
-            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
-                if uses_message_id {
-                    "CAST(fts_messages.message_id AS INTEGER) = m.id"
-                } else {
-                    "fts_messages.rowid = m.id"
-                }
-            } else {
-                tracing::warn!(
-                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
-                );
-                return Ok(Vec::new());
-            };
-
-        let title_expr = if field_mask.wants_title() {
-            "fts_messages.title"
-        } else {
-            "''"
-        };
-        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
-            "fts_messages.content"
-        } else {
-            "''"
-        };
+        uses_message_id: bool,
+    ) -> (String, Vec<ParamValue>) {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
+        let message_key_expr = if uses_message_id {
+            "CAST(fts_messages.message_id AS INTEGER)"
+        } else {
+            "fts_messages.rowid"
+        };
+
         let mut sql = format!(
-            "SELECT {title_expr},
-                    {content_expr},
-                    fts_messages.agent,
-                    COALESCE(fts_messages.workspace, ''),
-                    fts_messages.source_path,
-                    {created_at_expr},
-                    m.idx,
-                    c.id,
-                    {normalized_source_sql},
-                    c.origin_host,
-                    s.kind,
+            "SELECT fts_messages.rowid,
                     bm25(fts_messages)
              FROM fts_messages
-             LEFT JOIN messages m ON {message_join}
+             LEFT JOIN messages m ON {message_key_expr} = m.id
              LEFT JOIN conversations c ON m.conversation_id = c.id
              LEFT JOIN sources s ON c.source_id = s.id
              WHERE fts_messages MATCH ?"
         );
         let mut params = Vec::with_capacity(filters.agents.len() + filters.workspaces.len() + 5);
-        params.push(ParamValue::from(fts_query.as_str()));
+        params.push(ParamValue::from(fts_query));
 
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
@@ -5859,40 +5792,180 @@ impl SearchClient {
             }
         }
 
-        sql.push_str(" ORDER BY bm25(fts_messages), m.id LIMIT ? OFFSET ?");
+        sql.push_str(&format!(
+            " ORDER BY bm25(fts_messages), {message_key_expr}, fts_messages.rowid LIMIT ? OFFSET ?"
+        ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
 
-        let params = params_from_iter(params);
-        let rows = match franken_query_rows_retry(conn, &sql, &params) {
-            Ok(rows) => rows,
-            Err(err) => {
+        (sql, params)
+    }
+
+    fn sqlite_fts5_hydrate_query(
+        row_count: usize,
+        field_mask: FieldMask,
+        uses_message_id: bool,
+    ) -> String {
+        let title_expr = if field_mask.wants_title() {
+            "fts_messages.title"
+        } else {
+            "''"
+        };
+        let content_expr = if field_mask.needs_content() || field_mask.wants_snippet() {
+            "fts_messages.content"
+        } else {
+            "''"
+        };
+        let normalized_source_sql =
+            normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        let created_at_expr = "CAST(fts_messages.created_at AS INTEGER)";
+        let message_key_expr = if uses_message_id {
+            "CAST(fts_messages.message_id AS INTEGER)"
+        } else {
+            "fts_messages.rowid"
+        };
+        let placeholders = sql_placeholders(row_count);
+
+        format!(
+            "SELECT fts_messages.rowid,
+                    {title_expr},
+                    {content_expr},
+                    fts_messages.agent,
+                    COALESCE(fts_messages.workspace, ''),
+                    fts_messages.source_path,
+                    {created_at_expr},
+                    m.idx,
+                    c.id,
+                    {normalized_source_sql},
+                    c.origin_host,
+                    s.kind
+             FROM fts_messages
+             LEFT JOIN messages m ON {message_key_expr} = m.id
+             LEFT JOIN conversations c ON m.conversation_id = c.id
+             LEFT JOIN sources s ON c.source_id = s.id
+             WHERE fts_messages.rowid IN ({placeholders})"
+        )
+    }
+
+    fn search_sqlite_fts5(
+        &self,
+        _db_path: &Path,
+        raw_query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
+        let fts_query = match transpile_to_fts5(raw_query) {
+            Some(q) if !q.trim().is_empty() => q,
+            _ => return Ok(Vec::new()),
+        };
+
+        let sqlite_guard = self.sqlite_guard()?;
+        let Some(conn) = sqlite_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let empty_params: [ParamValue; 0] = [];
+        let has_fts = franken_query_map_collect_retry(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE name = 'fts_messages'",
+            &empty_params,
+            |row| row.get_typed::<i64>(0),
+        )
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false);
+        if !has_fts {
+            return Ok(Vec::new());
+        }
+
+        let query_match_type = dominant_match_type(raw_query);
+        let uses_message_id =
+            if let Ok(uses_message_id) = Self::sqlite_fts_uses_message_id_column(conn) {
+                uses_message_id
+            } else {
                 tracing::warn!(
-                    error = %err,
-                    "sqlite FTS fallback query failed; returning no fallback hits"
+                    "sqlite FTS fallback is present but not queryable; skipping fallback search"
                 );
                 return Ok(Vec::new());
-            }
-        };
-        let mut hits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let title: String = row.get_typed(0)?;
-            let raw_content: String = row.get_typed(1)?;
-            let agent: String = row.get_typed(2)?;
-            let workspace: String = row.get_typed(3)?;
-            let source_path: String = row.get_typed(4)?;
-            let created_at: Option<i64> = row.get_typed(5)?;
-            let idx: Option<i64> = row.get_typed(6)?;
-            let conversation_id: Option<i64> = row.get_typed(7)?;
-            let raw_source_id: String = row
-                .get_typed::<Option<String>>(8)?
-                .unwrap_or_else(default_source_id);
-            let origin_host: Option<String> = row.get_typed(9)?;
-            let raw_origin_kind: Option<String> = row.get_typed(10)?;
-            let bm25_score = match row.get_typed::<Option<f64>>(11)? {
-                Some(score) => score,
-                None => continue,
             };
+        let (rank_sql, rank_params) = Self::sqlite_fts5_rank_query(
+            fts_query.as_str(),
+            &filters,
+            limit,
+            offset,
+            uses_message_id,
+        );
+        let ranked_rows: Vec<(i64, f64)> =
+            match franken_query_map_collect_retry(conn, &rank_sql, &rank_params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            }) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "sqlite FTS fallback rank query failed; returning no fallback hits"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+        if ranked_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hydrate_sql =
+            Self::sqlite_fts5_hydrate_query(ranked_rows.len(), field_mask, uses_message_id);
+        let hydrate_params = ranked_rows
+            .iter()
+            .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
+            .collect::<Vec<_>>();
+        let rows: Vec<SqliteFtsHydratedRow> =
+            match franken_query_map_collect_retry(conn, &hydrate_sql, &hydrate_params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                    row.get_typed(7)?,
+                    row.get_typed(8)?,
+                    row.get_typed::<Option<String>>(9)?,
+                    row.get_typed(10)?,
+                    row.get_typed(11)?,
+                ))
+            }) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "sqlite FTS fallback hydration query failed; returning no fallback hits"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+        let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
+        let mut hits_by_rowid = HashMap::with_capacity(rows.len());
+        for (
+            fts_rowid,
+            title,
+            raw_content,
+            agent,
+            workspace,
+            source_path,
+            created_at,
+            idx,
+            conversation_id,
+            raw_source_id,
+            origin_host,
+            raw_origin_kind,
+        ) in rows
+        {
+            let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
+                continue;
+            };
+            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
 
             let source_id = normalized_search_hit_source_id_parts(
                 raw_source_id.as_str(),
@@ -5921,7 +5994,7 @@ impl SearchClient {
                 stable_hit_hash(&content, &source_path, line_number, created_at)
             };
 
-            hits.push(SearchHit {
+            let hit = SearchHit {
                 title,
                 snippet,
                 content,
@@ -5938,7 +6011,15 @@ impl SearchClient {
                 source_id,
                 origin_kind,
                 origin_host,
-            });
+            };
+            hits_by_rowid.insert(fts_rowid, hit);
+        }
+
+        let mut hits = Vec::with_capacity(ranked_rows.len());
+        for (fts_rowid, _) in ranked_rows {
+            if let Some(hit) = hits_by_rowid.remove(&fts_rowid) {
+                hits.push(hit);
+            }
         }
         Ok(hits)
     }
@@ -10020,6 +10101,31 @@ mod tests {
         assert!(hits[0].score > hits[1].score);
 
         Ok(())
+    }
+
+    #[test]
+    fn sqlite_fts5_ranked_phase_defers_content_decode_until_after_limit() {
+        let (rank_sql, params) =
+            SearchClient::sqlite_fts5_rank_query("auth", &SearchFilters::default(), 50, 0, false);
+        let hydrate_sql = SearchClient::sqlite_fts5_hydrate_query(
+            2,
+            FieldMask::new(true, true, true, true),
+            false,
+        );
+
+        assert!(
+            !rank_sql.contains("fts_messages.content"),
+            "rank query must not decode large content rows before LIMIT"
+        );
+        assert!(
+            hydrate_sql.contains("fts_messages.content"),
+            "hydration query should still provide requested content"
+        );
+        assert!(
+            rank_sql.contains("LIMIT ? OFFSET ?"),
+            "rank query must apply page bounds before hydration"
+        );
+        assert_eq!(params.len(), 3, "fts query plus limit and offset params");
     }
 
     #[test]
