@@ -20238,6 +20238,30 @@ fn run_export(
     Ok(())
 }
 
+fn strip_stdin_line_ending(mut input: String) -> String {
+    while input.ends_with('\n') || input.ends_with('\r') {
+        input.pop();
+    }
+    input
+}
+
+#[cfg(test)]
+mod export_html_password_tests {
+    use super::strip_stdin_line_ending;
+
+    #[test]
+    fn stdin_password_preserves_significant_surrounding_space() {
+        assert_eq!(
+            strip_stdin_line_ending("  pass phrase  \n".to_string()),
+            "  pass phrase  "
+        );
+        assert_eq!(
+            strip_stdin_line_ending("\tpass phrase\t\r\n".to_string()),
+            "\tpass phrase\t"
+        );
+    }
+}
+
 /// Export a session as a beautiful, self-contained HTML file with optional encryption.
 #[allow(clippy::too_many_arguments)]
 fn run_export_html(
@@ -20358,7 +20382,7 @@ fn run_export_html(
                 hint: None,
                 retryable: false,
             })?;
-            Some(pwd.trim().to_string())
+            Some(strip_stdin_line_ending(pwd))
         } else {
             let err = CliError {
                 code: 6,
