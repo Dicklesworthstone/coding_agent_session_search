@@ -81,6 +81,12 @@ type SqliteFtsHydratedRow = (
     Option<String>,
 );
 
+// Frankensqlite follows SQLite's bind-variable ceiling. Keep fallback
+// hydration IN-lists below that ceiling so large pages do not turn into
+// empty fallback result sets.
+const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
+const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+
 // Safety: Rc fields inside Connection are not cloned or shared externally.
 // The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
 unsafe impl Send for SendConnection {}
@@ -5847,6 +5853,13 @@ impl SearchClient {
         )
     }
 
+    fn sqlite_fts5_hydrate_row_chunks(
+        ranked_rows: &[(i64, f64)],
+    ) -> impl Iterator<Item = &[(i64, f64)]> {
+        debug_assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
+        ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
+    }
+
     fn search_sqlite_fts5(
         &self,
         _db_path: &Path,
@@ -5913,106 +5926,110 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        let hydrate_sql =
-            Self::sqlite_fts5_hydrate_query(ranked_rows.len(), field_mask, uses_message_id);
-        let hydrate_params = ranked_rows
-            .iter()
-            .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
-            .collect::<Vec<_>>();
-        let rows: Vec<SqliteFtsHydratedRow> =
-            match franken_query_map_collect_retry(conn, &hydrate_sql, &hydrate_params, |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    row.get_typed(1)?,
-                    row.get_typed(2)?,
-                    row.get_typed(3)?,
-                    row.get_typed(4)?,
-                    row.get_typed(5)?,
-                    row.get_typed(6)?,
-                    row.get_typed(7)?,
-                    row.get_typed(8)?,
-                    row.get_typed::<Option<String>>(9)?,
-                    row.get_typed(10)?,
-                    row.get_typed(11)?,
-                ))
-            }) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "sqlite FTS fallback hydration query failed; returning no fallback hits"
-                    );
-                    return Ok(Vec::new());
-                }
-            };
         let bm25_by_rowid: HashMap<i64, f64> = ranked_rows.iter().copied().collect();
-        let mut hits_by_rowid = HashMap::with_capacity(rows.len());
-        for (
-            fts_rowid,
-            title,
-            raw_content,
-            agent,
-            workspace,
-            source_path,
-            created_at,
-            idx,
-            conversation_id,
-            raw_source_id,
-            origin_host,
-            raw_origin_kind,
-        ) in rows
-        {
-            let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
-                continue;
-            };
-            let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
-
-            let source_id = normalized_search_hit_source_id_parts(
-                raw_source_id.as_str(),
-                raw_origin_kind.as_deref().unwrap_or_default(),
-                origin_host.as_deref(),
-            );
-            let origin_kind =
-                normalized_search_hit_origin_kind(source_id.as_str(), raw_origin_kind.as_deref())
-                    .to_string();
-            let line_number = idx
-                .and_then(|i| usize::try_from(i).ok())
-                .map(|i| i.saturating_add(1));
-            let snippet = if field_mask.wants_snippet() {
-                snippet_from_content(&raw_content)
-            } else {
-                String::new()
-            };
-            let content = if field_mask.needs_content() {
-                raw_content
-            } else {
-                String::new()
-            };
-            let content_hash = if content.is_empty() {
-                stable_hit_hash(&snippet, &source_path, line_number, created_at)
-            } else {
-                stable_hit_hash(&content, &source_path, line_number, created_at)
-            };
-
-            let hit = SearchHit {
+        let mut hits_by_rowid = HashMap::with_capacity(ranked_rows.len());
+        for rank_chunk in Self::sqlite_fts5_hydrate_row_chunks(&ranked_rows) {
+            let hydrate_sql =
+                Self::sqlite_fts5_hydrate_query(rank_chunk.len(), field_mask, uses_message_id);
+            let hydrate_params = rank_chunk
+                .iter()
+                .map(|(fts_rowid, _)| ParamValue::from(*fts_rowid))
+                .collect::<Vec<_>>();
+            let rows: Vec<SqliteFtsHydratedRow> =
+                match franken_query_map_collect_retry(conn, &hydrate_sql, &hydrate_params, |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                        row.get_typed(8)?,
+                        row.get_typed::<Option<String>>(9)?,
+                        row.get_typed(10)?,
+                        row.get_typed(11)?,
+                    ))
+                }) {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "sqlite FTS fallback hydration query failed; returning no fallback hits"
+                        );
+                        return Ok(Vec::new());
+                    }
+                };
+            for (
+                fts_rowid,
                 title,
-                snippet,
-                content,
-                content_hash,
-                conversation_id,
-                score: (-bm25_score) as f32,
-                source_path,
+                raw_content,
                 agent,
                 workspace,
-                workspace_original: None,
+                source_path,
                 created_at,
-                line_number,
-                match_type: query_match_type,
-                source_id,
-                origin_kind,
+                idx,
+                conversation_id,
+                raw_source_id,
                 origin_host,
-            };
-            hits_by_rowid.insert(fts_rowid, hit);
+                raw_origin_kind,
+            ) in rows
+            {
+                let Some(&bm25_score) = bm25_by_rowid.get(&fts_rowid) else {
+                    continue;
+                };
+                let raw_source_id = raw_source_id.unwrap_or_else(default_source_id);
+
+                let source_id = normalized_search_hit_source_id_parts(
+                    raw_source_id.as_str(),
+                    raw_origin_kind.as_deref().unwrap_or_default(),
+                    origin_host.as_deref(),
+                );
+                let origin_kind = normalized_search_hit_origin_kind(
+                    source_id.as_str(),
+                    raw_origin_kind.as_deref(),
+                )
+                .to_string();
+                let line_number = idx
+                    .and_then(|i| usize::try_from(i).ok())
+                    .map(|i| i.saturating_add(1));
+                let snippet = if field_mask.wants_snippet() {
+                    snippet_from_content(&raw_content)
+                } else {
+                    String::new()
+                };
+                let content = if field_mask.needs_content() {
+                    raw_content
+                } else {
+                    String::new()
+                };
+                let content_hash = if content.is_empty() {
+                    stable_hit_hash(&snippet, &source_path, line_number, created_at)
+                } else {
+                    stable_hit_hash(&content, &source_path, line_number, created_at)
+                };
+
+                let hit = SearchHit {
+                    title,
+                    snippet,
+                    content,
+                    content_hash,
+                    conversation_id,
+                    score: (-bm25_score) as f32,
+                    source_path,
+                    agent,
+                    workspace,
+                    workspace_original: None,
+                    created_at,
+                    line_number,
+                    match_type: query_match_type,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                };
+                hits_by_rowid.insert(fts_rowid, hit);
+            }
         }
 
         let mut hits = Vec::with_capacity(ranked_rows.len());
@@ -10137,6 +10154,39 @@ mod tests {
             "rank query must apply page bounds before hydration"
         );
         assert_eq!(params.len(), 3, "fts query plus limit and offset params");
+    }
+
+    #[test]
+    fn sqlite_fts5_hydration_chunks_stay_below_bind_variable_limit() {
+        let oversized_row_count = SQLITE_MAX_VARIABLE_NUMBER + 1;
+        let unchunked_sql = SearchClient::sqlite_fts5_hydrate_query(
+            oversized_row_count,
+            FieldMask::new(true, true, true, true),
+            false,
+        );
+        assert!(
+            unchunked_sql.matches('?').count() > SQLITE_MAX_VARIABLE_NUMBER,
+            "the pre-fix one-shot hydration query would exceed frankensqlite's bind limit"
+        );
+
+        let ranked_rows: Vec<(i64, f64)> = (0..(SQLITE_FTS5_HYDRATE_PARAM_CHUNK + 17))
+            .map(|idx| (idx as i64, idx as f64))
+            .collect();
+        let chunk_sizes: Vec<usize> = SearchClient::sqlite_fts5_hydrate_row_chunks(&ranked_rows)
+            .map(<[(i64, f64)]>::len)
+            .collect();
+
+        assert_eq!(
+            chunk_sizes,
+            vec![SQLITE_FTS5_HYDRATE_PARAM_CHUNK, 17],
+            "large fallback pages must hydrate in bounded chunks while preserving rank windows"
+        );
+        assert!(
+            chunk_sizes
+                .iter()
+                .all(|chunk_size| *chunk_size <= SQLITE_MAX_VARIABLE_NUMBER),
+            "every hydration chunk must fit under frankensqlite's bind-variable ceiling"
+        );
     }
 
     #[test]
