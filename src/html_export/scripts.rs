@@ -934,6 +934,9 @@ const Crypto = {
             if (typeof WorldClass !== 'undefined') {
                 WorldClass.init();
             }
+            if (typeof __cassAttachCodeCopyButtons === 'function') {
+                __cassAttachCodeCopyButtons();
+            }
 
         } catch (e) {
             this.errorEl.textContent = 'Decryption failed. Wrong password?';
@@ -980,10 +983,17 @@ fn generate_init_js(options: &ExportOptions) -> String {
         "try { WorldClass.init(); } catch (e) { console.error('WorldClass init failed', e); }",
     );
 
-    // Always add code block copy buttons and print button handler
-    inits.push(r#"// Add copy buttons to code blocks
+    // Always add code block copy buttons and print button handler.
+    inits.push(
+        "try { __cassAttachCodeCopyButtons(); } catch (e) { console.error('Code copy init failed', e); }",
+    );
+
+    let copy_button_helpers = r#"// Add copy buttons to code blocks
+// Idempotent so encrypted exports can re-run this after decrypting content.
+const __cassAttachCodeCopyButtons = () => {
     $$('pre code').forEach((code) => {
         const pre = code.parentNode;
+        if (!pre || pre.querySelector('.copy-code-btn')) return;
         const btn = document.createElement('button');
         btn.className = 'copy-code-btn';
         btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
@@ -994,7 +1004,10 @@ fn generate_init_js(options: &ExportOptions) -> String {
         pre.style.position = 'relative';
         pre.appendChild(btn);
     });
+};"#;
 
+    inits.push(
+        r#"
     // Print button handler
     const printBtn = $('#print-btn');
     if (printBtn) printBtn.addEventListener('click', printConversation);
@@ -1005,10 +1018,13 @@ fn generate_init_js(options: &ExportOptions) -> String {
             e.preventDefault();
             printConversation();
         }
-    });"#);
+    });"#,
+    );
 
     format!(
-        r#"// Initialize after DOM is ready (or immediately if already ready)
+        r#"{}
+
+// Initialize after DOM is ready (or immediately if already ready)
 const __cassInitAll = () => {{
     {}
 }};
@@ -1018,6 +1034,7 @@ if (document.readyState === 'loading') {{
 }} else {{
     __cassInitAll();
 }}"#,
+        copy_button_helpers,
         inits.join("\n    ")
     )
 }
@@ -1201,11 +1218,9 @@ mod tests {
         assert!(bundle.inline_js.contains("addEventListener('blur'"));
 
         // Click support (mobile/touch)
-        assert!(
-            bundle
-                .inline_js
-                .contains("this.toggle(badge, getPopover())")
-        );
+        assert!(bundle
+            .inline_js
+            .contains("this.toggle(badge, getPopover())"));
 
         // Escape key support
         assert!(bundle.inline_js.contains("e.key === 'Escape'"));
@@ -1239,5 +1254,12 @@ mod tests {
         // After decryption, both ToolCalls and ToolPopovers should be reinitialized
         assert!(bundle.inline_js.contains("ToolCalls.init()"));
         assert!(bundle.inline_js.contains("ToolPopovers.init()"));
+        assert!(bundle.inline_js.contains("__cassAttachCodeCopyButtons();"));
+        assert!(bundle
+            .inline_js
+            .contains("const __cassAttachCodeCopyButtons"));
+        assert!(bundle
+            .inline_js
+            .contains("pre.querySelector('.copy-code-btn')"));
     }
 }
