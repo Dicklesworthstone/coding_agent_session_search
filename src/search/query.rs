@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use frankensqlite::Connection;
 #[cfg(test)]
 use frankensqlite::compat::OptionalExtension;
-use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
+use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 #[cfg(test)]
 use frankensqlite::params;
 
@@ -6975,7 +6975,7 @@ mod tests {
     use crate::search::tantivy::TantivyIndex;
     use crate::storage::sqlite::FrankenStorage;
     use frankensqlite::Connection as FrankenConnection;
-    use frankensqlite::compat::ParamValue;
+    use frankensqlite::compat::{ParamValue, params_from_iter};
     use serde_json::json;
     use tempfile::TempDir;
 
