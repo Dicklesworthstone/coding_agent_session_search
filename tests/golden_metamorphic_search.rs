@@ -185,16 +185,28 @@ fn golden_limit_prefix_ordering() {
         )
         .unwrap();
 
+    let dir_prefix = dir.path().to_string_lossy().to_string();
+    let strip = |p: &str| -> String {
+        p.strip_prefix(&dir_prefix)
+            .unwrap_or(p)
+            .trim_start_matches('/')
+            .to_string()
+    };
+
     let extract = |hits: &[coding_agent_search::search::query::SearchHit]| -> Vec<serde_json::Value> {
-        hits.iter()
+        let mut entries: Vec<_> = hits
+            .iter()
             .map(|h| {
-                serde_json::json!({
-                    "source_path": h.source_path,
+                let rel = strip(&h.source_path);
+                (rel.clone(), h.agent.clone(), h.line_number, serde_json::json!({
+                    "source_path": rel,
                     "agent": h.agent,
                     "line_number": h.line_number,
-                })
+                }))
             })
-            .collect()
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        entries.into_iter().map(|e| e.3).collect()
     };
 
     let snapshot = serde_json::json!({
