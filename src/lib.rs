@@ -13116,7 +13116,7 @@ mode=index",
 
         let err = details.to_cli_error();
         assert_eq!(err.code, 7);
-        assert_eq!(err.kind, "index_busy");
+        assert_eq!(err.kind, "index-busy");
         assert!(err.retryable);
         assert!(
             err.message
@@ -13208,7 +13208,7 @@ mode=index",
         let path = PathBuf::from("/Users/ellis/.config/opencode/config.json");
         let err = resolve_resume_target(&path, None).expect_err("must reject non-session path");
         assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session_id_not_found");
+        assert_eq!(err.kind, "session-id-not-found");
         assert!(
             err.message.contains("opencode.db"),
             "error should explain the expected shape: {}",
@@ -13338,7 +13338,7 @@ mode=index",
         let path = PathBuf::from("/tmp/whatever/xyz.jsonl");
         let err = resolve_resume_target(&path, Some("bogus")).expect_err("must reject");
         assert_eq!(err.code, 2);
-        assert_eq!(err.kind, "invalid_agent");
+        assert_eq!(err.kind, "invalid-agent");
     }
 
     #[test]
@@ -13346,7 +13346,7 @@ mode=index",
         let path = PathBuf::from("/tmp/somewhere/random/file.txt");
         let err = resolve_resume_target(&path, None).expect_err("must error");
         assert_eq!(err.code, 3);
-        assert_eq!(err.kind, "unknown_agent");
+        assert_eq!(err.kind, "unknown-agent");
     }
 
     #[test]
@@ -13357,7 +13357,7 @@ mode=index",
         let path = PathBuf::from("/home/user/projects/my_claude_code_extension/notes.jsonl");
         let err = resolve_resume_target(&path, None).expect_err("must not false-match claude");
         assert_eq!(err.code, 3);
-        assert_eq!(err.kind, "unknown_agent");
+        assert_eq!(err.kind, "unknown-agent");
     }
 
     #[test]
@@ -13415,7 +13415,7 @@ mode=index",
         let err = resolve_resume_target(&path, None)
             .expect_err("auto-detected non-UUID claude path must be rejected");
         assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session_id_not_found");
+        assert_eq!(err.kind, "session-id-not-found");
         assert!(
             err.message.contains("notes"),
             "error should include the bad stem: {}",
@@ -13449,7 +13449,7 @@ mode=index",
         let err = resolve_resume_target(&path, None)
             .expect_err("auto-detected non-UUID codex path must be rejected");
         assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session_id_not_found");
+        assert_eq!(err.kind, "session-id-not-found");
         assert!(
             err.message.contains("Codex"),
             "error should name the harness: {}",
@@ -13514,7 +13514,7 @@ mode=index",
         .expect("write");
         let err = extract_pi_agent_session_id(&f).expect_err("must fail without header");
         assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session_id_not_found");
+        assert_eq!(err.kind, "session-id-not-found");
         assert!(
             err.hint
                 .as_deref()
@@ -21042,7 +21042,7 @@ mod export_timestamp_tests {
         )
         .expect_err("invalid utf-8 should fail explicitly");
 
-        assert_eq!(err.kind, "file_read");
+        assert_eq!(err.kind, "file-read");
         assert!(
             err.message.contains("Failed to read session file"),
             "unexpected error: {}",
@@ -21078,7 +21078,7 @@ mod export_timestamp_tests {
         )
         .expect_err("invalid virtual sqlite session should fail after path acceptance");
 
-        assert_eq!(err.kind, "opencode_sqlite_parse");
+        assert_eq!(err.kind, "opencode-sqlite-parse");
     }
 }
 
