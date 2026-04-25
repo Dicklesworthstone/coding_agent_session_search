@@ -1218,9 +1218,11 @@ mod tests {
         assert!(bundle.inline_js.contains("addEventListener('blur'"));
 
         // Click support (mobile/touch)
-        assert!(bundle
-            .inline_js
-            .contains("this.toggle(badge, getPopover())"));
+        assert!(
+            bundle
+                .inline_js
+                .contains("this.toggle(badge, getPopover())")
+        );
 
         // Escape key support
         assert!(bundle.inline_js.contains("e.key === 'Escape'"));
@@ -1255,11 +1257,15 @@ mod tests {
         assert!(bundle.inline_js.contains("ToolCalls.init()"));
         assert!(bundle.inline_js.contains("ToolPopovers.init()"));
         assert!(bundle.inline_js.contains("__cassAttachCodeCopyButtons();"));
-        assert!(bundle
-            .inline_js
-            .contains("const __cassAttachCodeCopyButtons"));
-        assert!(bundle
-            .inline_js
-            .contains("pre.querySelector('.copy-code-btn')"));
+        assert!(
+            bundle
+                .inline_js
+                .contains("const __cassAttachCodeCopyButtons")
+        );
+        assert!(
+            bundle
+                .inline_js
+                .contains("pre.querySelector('.copy-code-btn')")
+        );
     }
 }
