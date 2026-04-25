@@ -639,14 +639,7 @@ impl PagesConfig {
 
     /// Parse path mode from config.
     pub fn path_mode(&self) -> PathMode {
-        let normalized = self
-            .filters
-            .path_mode
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase);
-
-        match normalized.as_deref() {
+        match self.normalized_path_mode().as_deref() {
             Some("basename") => PathMode::Basename,
             Some("full") => PathMode::Full,
             Some("hash") => PathMode::Hash,
@@ -892,6 +885,9 @@ mod tests {
 
         config.filters.path_mode = Some(" FULL ".to_string());
         assert!(matches!(config.path_mode(), PathMode::Full));
+
+        config.filters.path_mode = Some("   ".to_string());
+        assert!(matches!(config.path_mode(), PathMode::Relative));
     }
 
     #[test]
