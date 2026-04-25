@@ -273,6 +273,15 @@ struct RollupStats {
     last_updated: Option<i64>,
 }
 
+fn rollup_stats_from_summary_row(row: &Row) -> RollupStats {
+    RollupStats {
+        row_count: row.get_typed::<i64>(0).unwrap_or(0),
+        min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
+        max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
+        last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
+    }
+}
+
 /// Time-column kind for analytics filter application.
 #[derive(Clone, Copy)]
 enum AnalyticsTimeColumn<'a> {
@@ -606,12 +615,7 @@ fn query_table_stats_from_source<'a>(
     );
 
     conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(RollupStats {
-            row_count: row.get_typed::<i64>(0).unwrap_or(0),
-            min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
-            max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
-            last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
-        })
+        Ok(rollup_stats_from_summary_row(row))
     })
     .unwrap_or_default()
 }
@@ -923,12 +927,7 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
     );
 
     conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(RollupStats {
-            row_count: row.get_typed::<i64>(0).unwrap_or(0),
-            min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
-            max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
-            last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
-        })
+        Ok(rollup_stats_from_summary_row(row))
     })
     .unwrap_or_default()
 }
@@ -984,12 +983,7 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
     );
 
     conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(RollupStats {
-            row_count: row.get_typed::<i64>(0).unwrap_or(0),
-            min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
-            max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
-            last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
-        })
+        Ok(rollup_stats_from_summary_row(row))
     })
     .unwrap_or_default()
 }
