@@ -20760,6 +20760,7 @@ fn run_resume(
 }
 
 /// Export a conversation to markdown or other formats
+#[allow(clippy::too_many_arguments)]
 fn run_export(
     path: &Path,
     db_override: Option<PathBuf>,
@@ -21007,7 +21008,7 @@ fn run_export(
     } else if clipboard {
         match copy_to_system_clipboard(&formatted) {
             Ok(tool) => {
-                let bytes = formatted.as_bytes().len();
+                let bytes = formatted.len();
                 eprintln!(
                     "Copied {bytes} bytes to clipboard via {tool}. Paste into your coding agent's chat to resume the conversation."
                 );
@@ -21072,12 +21073,12 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
                 continue;
             }
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(text.as_bytes()) {
-                last_err = Some(format!("{program}: write stdin: {e}"));
-                let _ = child.wait();
-                continue;
-            }
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(text.as_bytes())
+        {
+            last_err = Some(format!("{program}: write stdin: {e}"));
+            let _ = child.wait();
+            continue;
         }
         match child.wait_with_output() {
             Ok(out) if out.status.success() => return Ok(program),
@@ -21100,7 +21101,9 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
         .collect::<Vec<_>>()
         .join(", ");
     Err(match last_err {
-        Some(detail) => format!("no clipboard tool succeeded (tried {tried}; last error: {detail})"),
+        Some(detail) => {
+            format!("no clipboard tool succeeded (tried {tried}; last error: {detail})")
+        }
         None => format!("no clipboard tool found on PATH (tried {tried})"),
     })
 }
@@ -21159,12 +21162,10 @@ mod clipboard_helper_tests {
             std::env::set_var("PATH", "");
         }
 
-        let err = copy_to_system_clipboard("hello").expect_err(
-            "with PATH cleared, no clipboard tool should be findable",
-        );
+        let err = copy_to_system_clipboard("hello")
+            .expect_err("with PATH cleared, no clipboard tool should be findable");
         assert!(
-            err.contains("no clipboard tool")
-                || err.contains("tried"),
+            err.contains("no clipboard tool") || err.contains("tried"),
             "error should describe what was tried, got: {err}"
         );
 
