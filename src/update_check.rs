@@ -395,9 +395,11 @@ pub fn run_self_update(version: &str) -> ! {
 /// `CASS_UPDATE_API_BASE_URL` env var, but the override is validated
 /// against an allow-list of schemes + hosts so a malicious `.env` or
 /// shell environment can't redirect the release-metadata fetch to an
-/// attacker-controlled server (bead
-/// `coding_agent_session_search-87sqx`). Allowed forms:
-///   - `https://...` (any host)
+/// attacker-controlled server (beads
+/// `coding_agent_session_search-87sqx`,
+/// `coding_agent_session_search-6bvx8`). Allowed forms:
+///   - `https://api.github.com/...`
+///   - `https://github.com/...`
 ///   - `http://127.0.0.1:<port>...` (local integration tests)
 ///   - `http://localhost:<port>...` (local integration tests)
 ///
@@ -413,7 +415,7 @@ fn release_api_base_url() -> String {
     } else {
         eprintln!(
             "warning: CASS_UPDATE_API_BASE_URL={override_url:?} ignored \
-             (only https:// URLs or http://localhost/127.0.0.1 test endpoints allowed). \
+             (only GitHub HTTPS URLs or http://localhost/127.0.0.1 test endpoints allowed). \
              Falling back to the default GitHub release API."
         );
         default()
@@ -425,31 +427,17 @@ fn release_api_base_url() -> String {
 /// bottom of this module can pin every accept/reject case
 /// independently of the env-var plumbing.
 fn is_allowed_update_api_url(url: &str) -> bool {
-    if let Some(rest) = url.strip_prefix("https://") {
-        // Any non-empty host after https:// is acceptable at this
-        // layer — network-level reachability + TLS validate it
-        // downstream. Reject empty-host (`https:///path`) to avoid
-        // reqwest interpreting it as a malformed-but-parseable URL.
-        !rest.is_empty() && !rest.starts_with('/')
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        // Plaintext is only allowed for local integration-test
-        // endpoints (rustup, cargo, npm all treat localhost as a
-        // trusted MitM-free zone). Match the host *before* the first
-        // `:` / `/` so `http://127.0.0.1:8080/foo` is allowed but
-        // `http://127.0.0.1.attacker.com/` is not.
-        // Handle the `[::1]` IPv6 bracket form first (it contains
-        // `:` inside the brackets, so a naive find(':') would split
-        // mid-literal); otherwise split on the first `:` or `/`.
-        if let Some(after_bracket) = rest.strip_prefix("[::1]") {
-            return after_bracket.is_empty()
-                || after_bracket.starts_with(':')
-                || after_bracket.starts_with('/');
-        }
-        let host_end = rest.find([':', '/']).unwrap_or(rest.len());
-        let host = &rest[..host_end];
-        matches!(host, "127.0.0.1" | "localhost")
-    } else {
-        false
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    match parsed.scheme() {
+        "https" => matches!(host, "api.github.com" | "github.com"),
+        "http" => matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]"),
+        _ => false,
     }
 }
 
@@ -672,19 +660,33 @@ mod tests {
         assert!(script.contains("Remove-Item -LiteralPath $Temp"));
     }
 
-    /// `coding_agent_session_search-87sqx`: the allow-list on
+    /// `coding_agent_session_search-87sqx` / `coding_agent_session_search-6bvx8`: the allow-list on
     /// `CASS_UPDATE_API_BASE_URL` must reject non-https overrides
-    /// against non-loopback hosts (malicious .env / shell pollution)
+    /// against non-loopback hosts and non-GitHub HTTPS hosts (malicious .env / shell pollution)
     /// while still permitting the `http://127.0.0.1:<port>` form the
     /// integration tests below use.
     #[test]
-    fn test_is_allowed_update_api_url_allows_https_any_host() {
+    fn test_is_allowed_update_api_url_allows_trusted_https_hosts() {
         assert!(is_allowed_update_api_url(
             "https://api.github.com/repos/foo"
         ));
-        assert!(is_allowed_update_api_url("https://example.internal"));
         assert!(is_allowed_update_api_url(
             "https://api.github.com/repos/bar/baz"
+        ));
+        assert!(is_allowed_update_api_url(
+            "https://github.com/Dicklesworthstone/coding_agent_session_search/releases"
+        ));
+    }
+
+    #[test]
+    fn test_is_allowed_update_api_url_rejects_untrusted_https_hosts() {
+        assert!(!is_allowed_update_api_url("https://attacker.example.com"));
+        assert!(!is_allowed_update_api_url("https://example.internal"));
+        assert!(!is_allowed_update_api_url(
+            "https://api.github.com.attacker.example/repos/foo"
+        ));
+        assert!(!is_allowed_update_api_url(
+            "https://github.com.attacker.example/releases"
         ));
     }
 
@@ -713,7 +715,7 @@ mod tests {
         assert!(!is_allowed_update_api_url("gopher://example.com"));
         assert!(!is_allowed_update_api_url(""));
         assert!(!is_allowed_update_api_url("api.github.com"));
-        // Empty-host https:// — reject so reqwest doesn't see a
+        // Empty-host https:// — reject so the URL parser doesn't see a
         // malformed-but-parseable URL.
         assert!(!is_allowed_update_api_url("https://"));
         assert!(!is_allowed_update_api_url("https:///path"));
