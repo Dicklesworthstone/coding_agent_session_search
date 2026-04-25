@@ -140,7 +140,7 @@ impl DocumentationGenerator {
         );
 
         let slot_count = self.summary.key_slots.len();
-        let date = Utc::now().format("%Y-%m-%d");
+        let date = Utc::now().format(DOC_DATE_FORMAT);
 
         let content = README_TEMPLATE
             .replace("{url}", url_display)
@@ -250,7 +250,7 @@ impl DocumentationGenerator {
         let url_display = self.target_url_display();
 
         let conversation_count = self.summary.total_conversations.to_string();
-        let date = Utc::now().format("%Y-%m-%d");
+        let date = Utc::now().format(DOC_DATE_FORMAT);
 
         let content = ABOUT_TXT_TEMPLATE
             .replace("{url}", url_display)
