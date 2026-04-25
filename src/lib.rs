@@ -711,6 +711,39 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// Check for a newer cass release and (optionally) install it.
+    ///
+    /// Without flags, prompts y/N before running the same checksum-
+    /// verified installer the TUI uses. Useful in headless environments
+    /// where `cass tui` would never fire its own update prompt.
+    ///
+    /// Examples:
+    ///
+    ///   cass upgrade                      # interactive prompt
+    ///   cass upgrade --check              # print versions, exit non-zero if outdated
+    ///   cass upgrade --yes                # install without asking
+    ///   cass upgrade --force --check      # skip the 1-hour cadence
+    Upgrade {
+        /// Print current vs latest version and exit. No install.
+        /// Exits 0 when up to date, 1 when an update is available.
+        #[arg(long, default_value_t = false, conflicts_with = "yes")]
+        check: bool,
+        /// Bypass the 1-hour update-check cadence and re-fetch the
+        /// GitHub release API immediately. Combine with `--check`
+        /// to refresh status without installing.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Skip the interactive prompt and run the installer
+        /// immediately. Suitable for scripts; mutually exclusive
+        /// with `--check`.
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Output as JSON (for automation). Combines naturally with
+        /// `--check`; ignored when an install actually runs because
+        /// the installer execs over the current process.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Export a conversation to markdown or other formats
     Export {
         /// Path to session file
@@ -3974,6 +4007,15 @@ async fn execute_cli(
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_resume(&path, agent.as_deref(), exec, shell, structured_format)?;
                 }
+                Commands::Upgrade {
+                    check,
+                    force,
+                    yes,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_upgrade(check, force, yes, structured_format).await?;
+                }
                 Commands::Export {
                     path,
                     source,
@@ -6684,6 +6726,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Sessions { .. }) => "sessions".to_string(),
         Some(Commands::Resume { .. }) => "resume".to_string(),
+        Some(Commands::Upgrade { .. }) => "upgrade".to_string(),
         Some(Commands::Export { .. }) => "export".to_string(),
         Some(Commands::ExportHtml { .. }) => "export-html".to_string(),
         Some(Commands::Expand { .. }) => "expand".to_string(),
@@ -6735,6 +6778,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Resume { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Upgrade { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::ExportHtml { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -20627,6 +20671,153 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             retryable: false,
         }),
     }
+}
+
+/// `cass upgrade` — discover newer cass releases and (optionally) run
+/// the same checksum-verified installer the TUI prompts to launch.
+///
+/// The TUI was already wired into `crate::update_check`, but the only
+/// way to trigger an upgrade was to enter the TUI and respond to the
+/// prompt — useless for headless / SSH / scripted environments
+/// (issue #200). This subcommand re-uses every primitive already in
+/// `update_check.rs`; the new code is just plumbing.
+async fn run_upgrade(
+    check_only: bool,
+    force: bool,
+    yes: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let current = env!("CARGO_PKG_VERSION");
+
+    // `force_check` bypasses the 1-hour cadence; otherwise honor the
+    // standard interval so repeated `cass upgrade --check` invocations
+    // don't hammer the GitHub API. Either way we only need a single
+    // round-trip — no need to cycle through the prompt path.
+    let info = if force {
+        crate::update_check::force_check(current).await
+    } else {
+        crate::update_check::check_for_updates(current).await
+    };
+
+    // No `UpdateInfo` means: cadence skipped (only with !force), updates
+    // disabled by env, or the GitHub API was unreachable. Communicate
+    // each cleanly instead of pretending we're "up to date".
+    let Some(info) = info else {
+        if let Some(fmt) = output_format {
+            let payload = serde_json::json!({
+                "current_version": current,
+                "latest_version": null,
+                "is_newer": false,
+                "is_skipped": false,
+                "checked": false,
+                "reason": if force {
+                    "github_api_unreachable_or_disabled"
+                } else {
+                    "checked_recently_or_unreachable"
+                },
+            });
+            output_structured_value(payload, fmt)?;
+        } else if force {
+            eprintln!(
+                "Could not reach GitHub or update checks are disabled. Try again with network access."
+            );
+        } else {
+            eprintln!(
+                "No update check performed (recent check is still cached, or update checks are disabled)."
+            );
+            eprintln!("Re-run with `--force` to fetch the GitHub release API immediately.");
+        }
+        // `--check` exit semantics: 0 when there's nothing to install
+        // (and we have no information saying otherwise), so this is
+        // the conservative answer.
+        return Ok(());
+    };
+
+    if let Some(fmt) = output_format {
+        let payload = serde_json::json!({
+            "current_version": current,
+            "latest_version": info.latest_version,
+            "tag_name": info.tag_name,
+            "is_newer": info.is_newer,
+            "is_skipped": info.is_skipped,
+            "release_url": info.release_url,
+            "checked": true,
+        });
+        output_structured_value(payload, fmt)?;
+        if check_only && info.is_newer {
+            // Mirror the documented `--check` exit-code contract.
+            std::process::exit(1);
+        }
+        if check_only || !info.is_newer || (!yes && !io::stdin().is_terminal()) {
+            // In structured mode and not actually installing: we're done.
+            return Ok(());
+        }
+        // Fall through to the install path below — but only if we have
+        // a TTY and the caller passed --yes; otherwise structured mode
+        // can't safely prompt.
+    }
+
+    if !info.is_newer {
+        if output_format.is_none() {
+            println!(
+                "cass {current} is up to date (latest release: {}).",
+                info.tag_name
+            );
+        }
+        return Ok(());
+    }
+
+    if check_only {
+        if output_format.is_none() {
+            println!(
+                "Update available: {current} → {}.\nView the release notes: {}",
+                info.tag_name, info.release_url,
+            );
+        }
+        // Document the contract: --check exits non-zero when an update
+        // exists, so wrappers can `cass upgrade --check && echo current
+        // || cass upgrade --yes`.
+        std::process::exit(1);
+    }
+
+    // Decide whether to run the installer.
+    let should_install = if yes {
+        true
+    } else if !io::stdin().is_terminal() {
+        // No TTY → can't prompt → don't silently install. Tell the
+        // caller exactly what to add.
+        eprintln!(
+            "Update available: {current} → {}, but no TTY is attached so I can't ask.\nRe-run with `--yes` to install non-interactively, or `--check` to print status.",
+            info.tag_name
+        );
+        return Ok(());
+    } else {
+        print!(
+            "A newer version is available: current v{}, latest {}. Update now? (y/N): ",
+            current, info.tag_name
+        );
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return Ok(());
+        }
+        matches!(input.trim(), "y" | "Y" | "yes" | "YES")
+    };
+
+    if !should_install {
+        return Ok(());
+    }
+
+    info!(
+        target: "upgrade",
+        "starting self-update from {current} to {}",
+        info.tag_name
+    );
+    // run_self_update returns `!` — it execs the installer over the
+    // current process. Anything beyond this point is unreachable on
+    // success, but reachable on a malformed version string (which the
+    // function itself rejects with exit(1)).
+    crate::update_check::run_self_update(&info.tag_name);
 }
 
 /// `cass resume <path>` — resolve and optionally execute the native
