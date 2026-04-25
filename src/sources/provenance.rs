@@ -428,31 +428,19 @@ mod tests {
     // =================================================================
 
     #[test]
-    fn test_source_filter_cycle_all_to_local() {
-        // F11 press from All should go to Local
-        let filter = SourceFilter::All;
-        assert_eq!(filter.cycle(), SourceFilter::Local);
-    }
-
-    #[test]
-    fn test_source_filter_cycle_local_to_remote() {
-        // F11 press from Local should go to Remote
-        let filter = SourceFilter::Local;
-        assert_eq!(filter.cycle(), SourceFilter::Remote);
-    }
-
-    #[test]
-    fn test_source_filter_cycle_remote_to_all() {
-        // F11 press from Remote should go back to All
-        let filter = SourceFilter::Remote;
-        assert_eq!(filter.cycle(), SourceFilter::All);
-    }
-
-    #[test]
-    fn test_source_filter_cycle_specific_to_all() {
-        // F11 press from a specific source should reset to All
-        let filter = SourceFilter::SourceId("laptop".to_string());
-        assert_eq!(filter.cycle(), SourceFilter::All);
+    fn test_source_filter_cycle_transitions() {
+        for (case, filter, expected) in [
+            ("all to local", SourceFilter::All, SourceFilter::Local),
+            ("local to remote", SourceFilter::Local, SourceFilter::Remote),
+            ("remote to all", SourceFilter::Remote, SourceFilter::All),
+            (
+                "specific to all",
+                SourceFilter::SourceId("laptop".to_string()),
+                SourceFilter::All,
+            ),
+        ] {
+            assert_eq!(filter.cycle(), expected, "{case}");
+        }
     }
 
     #[test]
