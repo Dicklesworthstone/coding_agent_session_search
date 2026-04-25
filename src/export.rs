@@ -224,46 +224,51 @@ fn export_json(hits: &[SearchHit], options: &ExportOptions) -> String {
         "query": options.query,
         "count": hits.len(),
         "exported_at": Utc::now().to_rfc3339(),
-        "hits": hits.iter().map(|hit| {
-            let mut obj = serde_json::json!({
-                "title": hit.title,
-                "agent": hit.agent,
-                "workspace": hit.workspace,
-                "snippet": truncate_text(&hit.snippet, options.max_snippet_len),
-            });
-
-            if options.include_score {
-                let score = if hit.score.is_finite() {
-                    hit.score
-                } else {
-                    0.0
-                };
-                obj["score"] = serde_json::json!(score);
-            }
-
-            if options.include_path {
-                obj["source_path"] = serde_json::json!(hit.source_path);
-                if let Some(line) = hit.line_number {
-                    obj["line_number"] = serde_json::json!(line);
-                }
-            }
-
-            if let Some(ts) = hit.created_at {
-                obj["created_at"] = serde_json::json!(ts);
-                if let Some(dt) = DateTime::from_timestamp_millis(ts) {
-                    obj["created_at_formatted"] = serde_json::json!(dt.to_rfc3339());
-                }
-            }
-
-            if options.include_content && !hit.content.is_empty() {
-                obj["content"] = serde_json::json!(hit.content);
-            }
-
-            obj
-        }).collect::<Vec<_>>()
+        "hits": hits
+            .iter()
+            .map(|hit| export_hit_json(hit, options))
+            .collect::<Vec<_>>()
     });
 
     serde_json::to_string_pretty(&export_data).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn export_hit_json(hit: &SearchHit, options: &ExportOptions) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "title": hit.title,
+        "agent": hit.agent,
+        "workspace": hit.workspace,
+        "snippet": truncate_text(&hit.snippet, options.max_snippet_len),
+    });
+
+    if options.include_score {
+        let score = if hit.score.is_finite() {
+            hit.score
+        } else {
+            0.0
+        };
+        obj["score"] = serde_json::json!(score);
+    }
+
+    if options.include_path {
+        obj["source_path"] = serde_json::json!(hit.source_path);
+        if let Some(line) = hit.line_number {
+            obj["line_number"] = serde_json::json!(line);
+        }
+    }
+
+    if let Some(ts) = hit.created_at {
+        obj["created_at"] = serde_json::json!(ts);
+        if let Some(dt) = DateTime::from_timestamp_millis(ts) {
+            obj["created_at_formatted"] = serde_json::json!(dt.to_rfc3339());
+        }
+    }
+
+    if options.include_content && !hit.content.is_empty() {
+        obj["content"] = serde_json::json!(hit.content);
+    }
+
+    obj
 }
 
 /// Export to plain text format
@@ -434,6 +439,39 @@ mod tests {
 
         assert!(output.contains("\"count\": 1"));
         assert!(output.contains("\"agent\": \"claude_code\""));
+    }
+
+    #[test]
+    fn test_export_hit_json_shape() {
+        let mut hit = sample_hit();
+        hit.score = f32::NAN;
+        let options = ExportOptions {
+            include_content: true,
+            include_score: true,
+            include_path: true,
+            max_snippet_len: 10,
+            query: Some("ignored by hit projection".to_string()),
+        };
+
+        let projected = export_hit_json(&hit, &options);
+
+        assert_eq!(projected["title"], serde_json::json!("Test Result"));
+        assert_eq!(projected["agent"], serde_json::json!("claude_code"));
+        assert_eq!(projected["workspace"], serde_json::json!("/projects/test"));
+        assert_eq!(projected["snippet"], serde_json::json!("This is..."));
+        assert_eq!(projected["score"], serde_json::json!(0.0));
+        assert_eq!(
+            projected["source_path"],
+            serde_json::json!("/path/to/file.jsonl")
+        );
+        assert_eq!(projected["line_number"], serde_json::json!(42));
+        assert_eq!(projected["created_at"], serde_json::json!(1700000000000i64));
+        assert_eq!(
+            projected["created_at_formatted"],
+            serde_json::json!("2023-11-14T22:13:20+00:00")
+        );
+        assert_eq!(projected["content"], serde_json::json!("Full content here"));
+        assert_eq!(projected.as_object().expect("object").len(), 10);
     }
 
     #[test]
