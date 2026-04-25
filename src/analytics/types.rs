@@ -5,35 +5,22 @@
 //! one place.
 
 use serde::Serialize;
+use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
 /// Analytics-specific error.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum AnalyticsError {
     /// The required table does not exist — caller should suggest `cass analytics rebuild`.
+    #[error("table '{0}' does not exist — run 'cass analytics rebuild'")]
     MissingTable(String),
     /// A database query failed.
+    #[error("analytics db error: {0}")]
     Db(String),
 }
-
-impl std::fmt::Display for AnalyticsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingTable(t) => {
-                write!(
-                    f,
-                    "table '{t}' does not exist — run 'cass analytics rebuild'"
-                )
-            }
-            Self::Db(msg) => write!(f, "analytics db error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for AnalyticsError {}
 
 /// Convenience alias.
 pub type AnalyticsResult<T> = std::result::Result<T, AnalyticsError>;
@@ -678,6 +665,20 @@ pub struct DerivedMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analytics_error_display_and_sources_are_preserved() {
+        let missing = AnalyticsError::MissingTable("usage_daily".to_string());
+        assert_eq!(
+            missing.to_string(),
+            "table 'usage_daily' does not exist — run 'cass analytics rebuild'"
+        );
+        assert!(std::error::Error::source(&missing).is_none());
+
+        let db = AnalyticsError::Db("query failed".to_string());
+        assert_eq!(db.to_string(), "analytics db error: query failed");
+        assert!(std::error::Error::source(&db).is_none());
+    }
 
     #[test]
     fn usage_bucket_merge_is_additive() {
