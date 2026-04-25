@@ -1,11 +1,13 @@
-//! Integration regression benchmarks: SqliteStorage (rusqlite) vs FrankenStorage (frankensqlite).
+//! Integration regression benchmarks for cass ingestion/storage paths.
 //!
-//! Compares pre-integration vs post-integration performance across critical paths:
-//! - Database open time
-//! - Bulk conversation insertion
-//! - Query operations (list, fetch, count)
-//! - FTS rebuild
-//! - Concurrent write throughput via FrankenConnectionManager
+//! `SqliteStorage` is now a compatibility alias for `FrankenStorage`, so this
+//! benchmark suite no longer compares rusqlite/legacy SQLite against
+//! frankensqlite. Instead it compares two distinct cass-owned paths:
+//! - `persist_conversation`: normalized ingestion + lexical index updates
+//! - direct `FrankenStorage` calls: pre-resolved IDs + storage-only writes
+//!
+//! The intent is to quantify cass application-path overheads honestly. Engine-
+//! level comparison against legacy C SQLite must use a separate harness.
 //!
 //! Bead: coding_agent_session_search-9ma8q
 //!
@@ -20,11 +22,10 @@ use coding_agent_search::indexer::persist::persist_conversation;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::{
-    ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage, SqliteStorage,
+    ConnectionManagerConfig, FrankenConnectionManager, FrankenStorage,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankensqlite::FrankenError;
-use frankensqlite::compat::RowExt;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -127,13 +128,13 @@ fn make_agent(id: i64) -> Agent {
 // Setup helpers
 // =============================================================================
 
-/// Set up a SqliteStorage (rusqlite) database with test data.
-fn setup_sqlite_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SqliteStorage) {
+/// Seed a database through the normalized `persist_conversation` pipeline.
+fn setup_persist_seeded_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenStorage) {
     let temp = TempDir::new().expect("create tempdir");
-    let db_path = temp.path().join("sqlite.db");
+    let db_path = temp.path().join("persist.db");
     let index_path = index_dir(temp.path()).expect("index path");
 
-    let storage = SqliteStorage::open(&db_path).expect("open sqlite db");
+    let storage = FrankenStorage::open(&db_path).expect("open persist-seeded db");
     let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
 
     for i in 0..conv_count {
@@ -145,12 +146,12 @@ fn setup_sqlite_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, SqliteStora
     (temp, storage)
 }
 
-/// Set up a FrankenStorage (frankensqlite) database with test data.
-fn setup_franken_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenStorage) {
+/// Seed a database through direct `FrankenStorage` calls only.
+fn setup_direct_seeded_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenStorage) {
     let temp = TempDir::new().expect("create tempdir");
-    let db_path = temp.path().join("franken.db");
+    let db_path = temp.path().join("direct.db");
 
-    let fs = FrankenStorage::open(&db_path).expect("open franken db");
+    let fs = FrankenStorage::open(&db_path).expect("open direct-seeded db");
 
     // Pre-create all agents and workspaces to avoid ON CONFLICT overhead
     let mut agent_ids = std::collections::HashMap::new();
@@ -187,40 +188,30 @@ fn setup_franken_db(conv_count: i64, msgs_per_conv: i64) -> (TempDir, FrankenSto
 fn bench_db_open_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("db_open");
 
-    // Empty databases
-    let sqlite_temp = TempDir::new().unwrap();
-    let sqlite_path = sqlite_temp.path().join("sqlite.db");
+    // Empty database
+    let empty_temp = TempDir::new().unwrap();
+    let empty_path = empty_temp.path().join("empty.db");
     {
-        SqliteStorage::open(&sqlite_path).unwrap();
+        FrankenStorage::open(&empty_path).unwrap();
     }
 
-    let franken_temp = TempDir::new().unwrap();
-    let franken_path = franken_temp.path().join("franken.db");
-    {
-        FrankenStorage::open(&franken_path).unwrap();
-    }
-
-    group.bench_function("sqlite_empty", |b| {
-        b.iter(|| black_box(SqliteStorage::open(&sqlite_path).unwrap()))
+    group.bench_function("empty_db", |b| {
+        b.iter(|| black_box(FrankenStorage::open(&empty_path).unwrap()))
     });
 
-    group.bench_function("franken_empty", |b| {
-        b.iter(|| black_box(FrankenStorage::open(&franken_path).unwrap()))
+    // Databases with 100 conversations (reduced for benchmark setup speed).
+    let (persist_data_temp, _) = setup_persist_seeded_db(100, 10);
+    let persist_data_path = persist_data_temp.path().join("persist.db");
+
+    let (direct_data_temp, _) = setup_direct_seeded_db(100, 10);
+    let direct_data_path = direct_data_temp.path().join("direct.db");
+
+    group.bench_function("persist_seeded_100_convs", |b| {
+        b.iter(|| black_box(FrankenStorage::open(&persist_data_path).unwrap()))
     });
 
-    // Databases with 100 conversations (reduced for benchmark setup speed)
-    let (sqlite_data_temp, _) = setup_sqlite_db(100, 10);
-    let sqlite_data_path = sqlite_data_temp.path().join("sqlite.db");
-
-    let (franken_data_temp, _) = setup_franken_db(100, 10);
-    let franken_data_path = franken_data_temp.path().join("franken.db");
-
-    group.bench_function("sqlite_100_convs", |b| {
-        b.iter(|| black_box(SqliteStorage::open(&sqlite_data_path).unwrap()))
-    });
-
-    group.bench_function("franken_100_convs", |b| {
-        b.iter(|| black_box(FrankenStorage::open(&franken_data_path).unwrap()))
+    group.bench_function("direct_seeded_100_convs", |b| {
+        b.iter(|| black_box(FrankenStorage::open(&direct_data_path).unwrap()))
     });
 
     group.finish();
@@ -237,15 +228,15 @@ fn bench_insert_comparison(c: &mut Criterion) {
     for &msg_count in &[5i64, 20, 50] {
         group.throughput(Throughput::Elements(msg_count as u64));
 
-        // SqliteStorage (rusqlite) path
+        // Normalized ingest pipeline: adapter + storage + lexical index update.
         group.bench_with_input(
-            BenchmarkId::new("sqlite", format!("{msg_count}_msgs")),
+            BenchmarkId::new("persist", format!("{msg_count}_msgs")),
             &msg_count,
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
                 let db_path = temp.path().join("bench.db");
                 let index_path = index_dir(temp.path()).expect("index path");
-                let storage = SqliteStorage::open(&db_path).unwrap();
+                let storage = FrankenStorage::open(&db_path).unwrap();
                 let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                 let mut conv_id = 0i64;
 
@@ -257,9 +248,9 @@ fn bench_insert_comparison(c: &mut Criterion) {
             },
         );
 
-        // FrankenStorage path
+        // Direct storage path: pre-resolved IDs + storage-only write.
         group.bench_with_input(
-            BenchmarkId::new("franken", format!("{msg_count}_msgs")),
+            BenchmarkId::new("direct", format!("{msg_count}_msgs")),
             &msg_count,
             |b, &msg_count| {
                 let temp = TempDir::new().unwrap();
@@ -302,63 +293,63 @@ fn bench_insert_comparison(c: &mut Criterion) {
 fn bench_query_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_ops");
 
-    // Setup: both backends with 100 conversations × 10 messages
-    let (_sqlite_temp, sqlite_storage) = setup_sqlite_db(100, 10);
-    let (_franken_temp, franken_storage) = setup_franken_db(100, 10);
+    // Setup: both datasets contain 100 conversations × 10 messages, but were
+    // produced by different cass-owned ingestion paths.
+    let (_persist_temp, persist_storage) = setup_persist_seeded_db(100, 10);
+    let (_direct_temp, direct_storage) = setup_direct_seeded_db(100, 10);
 
     // list_agents
-    group.bench_function("sqlite_list_agents", |b| {
-        b.iter(|| black_box(sqlite_storage.list_agents().unwrap()))
+    group.bench_function("persist_seeded_list_agents", |b| {
+        b.iter(|| black_box(persist_storage.list_agents().unwrap()))
     });
-    group.bench_function("franken_list_agents", |b| {
-        b.iter(|| black_box(franken_storage.list_agents().unwrap()))
+    group.bench_function("direct_seeded_list_agents", |b| {
+        b.iter(|| black_box(direct_storage.list_agents().unwrap()))
     });
 
     // list_conversations (paginated)
-    group.bench_function("sqlite_list_convs_50", |b| {
-        b.iter(|| black_box(sqlite_storage.list_conversations(50, 0).unwrap()))
+    group.bench_function("persist_seeded_list_convs_50", |b| {
+        b.iter(|| black_box(persist_storage.list_conversations(50, 0).unwrap()))
     });
-    // FrankenStorage list_conversations uses `ORDER BY x IS NULL` which
-    // frankensqlite doesn't yet support. Skip this sub-benchmark.
-    // group.bench_function("franken_list_convs_50", ...);
+    group.bench_function("direct_seeded_list_convs_50", |b| {
+        b.iter(|| black_box(direct_storage.list_conversations(50, 0).unwrap()))
+    });
 
     // fetch_messages for first conversation
-    let sqlite_convs = sqlite_storage.list_conversations(1, 0).unwrap();
-    // For franken, get a conversation ID via raw query to avoid the ORDER BY issue
-    let franken_conv_id: Option<i64> = franken_storage
-        .raw()
-        .query("SELECT id FROM conversations LIMIT 1")
-        .ok()
-        .and_then(|rows| rows.first().and_then(|r| r.get_typed(0).ok()));
+    let persist_convs = persist_storage.list_conversations(1, 0).unwrap();
+    let direct_conv_id = direct_storage
+        .list_conversations(1, 0)
+        .unwrap()
+        .first()
+        .and_then(|conv| conv.id);
 
-    if let Some(sc) = sqlite_convs.first() {
+    if let Some(sc) = persist_convs.first() {
         let sid = sc.id.unwrap();
-        group.bench_function("sqlite_fetch_messages", |b| {
-            b.iter(|| black_box(sqlite_storage.fetch_messages(sid).unwrap()))
+        group.bench_function("persist_seeded_fetch_messages", |b| {
+            b.iter(|| black_box(persist_storage.fetch_messages(sid).unwrap()))
         });
     }
-    if let Some(fid) = franken_conv_id {
-        group.bench_function("franken_fetch_messages", |b| {
-            b.iter(|| black_box(franken_storage.fetch_messages(fid).unwrap()))
+    if let Some(fid) = direct_conv_id {
+        group.bench_function("direct_seeded_fetch_messages", |b| {
+            b.iter(|| black_box(direct_storage.fetch_messages(fid).unwrap()))
         });
     }
 
-    // count_sessions_in_range (aggregate)
-    group.bench_function("sqlite_count_sessions", |b| {
+    // count_sessions_in_range (aggregate) on a persist-seeded dataset.
+    group.bench_function("persist_seeded_count_sessions", |b| {
         b.iter(|| {
             black_box(
-                sqlite_storage
+                persist_storage
                     .count_sessions_in_range(None, None, None, None)
                     .unwrap(),
             )
         })
     });
-    // FrankenStorage count_sessions_in_range uses mixed aggregate/non-aggregate
-    // columns which frankensqlite doesn't yet support. Use raw COUNT instead.
-    group.bench_function("franken_count_sessions", |b| {
+    // Raw COUNT(*) on a direct-seeded dataset gives a storage-floor reference
+    // for the same archive shape without extra aggregate logic above it.
+    group.bench_function("direct_seeded_raw_count", |b| {
         b.iter(|| {
             black_box(
-                franken_storage
+                direct_storage
                     .raw()
                     .query("SELECT COUNT(*) FROM conversations")
                     .unwrap(),
@@ -517,13 +508,13 @@ fn bench_insert_scaling(c: &mut Criterion) {
     for &count in &[50usize, 100, 250, 500] {
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(BenchmarkId::new("sqlite", count), &count, |b, &count| {
+        group.bench_with_input(BenchmarkId::new("persist", count), &count, |b, &count| {
             b.iter_with_setup(
                 || {
                     let temp = TempDir::new().unwrap();
                     let db_path = temp.path().join("bench.db");
                     let index_path = index_dir(temp.path()).expect("index path");
-                    let storage = SqliteStorage::open(&db_path).unwrap();
+                    let storage = FrankenStorage::open(&db_path).unwrap();
                     let t_index = TantivyIndex::open_or_create(&index_path).unwrap();
                     let convs: Vec<_> = (0..count as i64)
                         .map(|i| generate_conversation(i, 10))
@@ -539,7 +530,7 @@ fn bench_insert_scaling(c: &mut Criterion) {
             );
         });
 
-        group.bench_with_input(BenchmarkId::new("franken", count), &count, |b, &count| {
+        group.bench_with_input(BenchmarkId::new("direct", count), &count, |b, &count| {
             b.iter_with_setup(
                 || {
                     let temp = TempDir::new().unwrap();
