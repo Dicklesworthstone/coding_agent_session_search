@@ -10,6 +10,10 @@ use coding_agent_search::pages::deploy_cloudflare::{
 use std::fs;
 use tempfile::TempDir;
 
+fn temp_cloudflare_deployer() -> Result<(TempDir, CloudflareDeployer)> {
+    Ok((TempDir::new()?, CloudflareDeployer::default()))
+}
+
 // ============================================
 // Prerequisites Tests
 // ============================================
@@ -141,8 +145,7 @@ fn test_deployer_default_creation() {
 
 #[test]
 fn test_generate_headers_file() -> Result<()> {
-    let temp = TempDir::new()?;
-    let deployer = CloudflareDeployer::default();
+    let (temp, deployer) = temp_cloudflare_deployer()?;
 
     deployer.generate_headers_file(temp.path())?;
 
@@ -170,8 +173,7 @@ fn test_generate_headers_file() -> Result<()> {
 
 #[test]
 fn test_generate_headers_file_cache_exceptions() -> Result<()> {
-    let temp = TempDir::new()?;
-    let deployer = CloudflareDeployer::default();
+    let (temp, deployer) = temp_cloudflare_deployer()?;
 
     deployer.generate_headers_file(temp.path())?;
 
@@ -187,8 +189,7 @@ fn test_generate_headers_file_cache_exceptions() -> Result<()> {
 
 #[test]
 fn test_generate_redirects_file() -> Result<()> {
-    let temp = TempDir::new()?;
-    let deployer = CloudflareDeployer::default();
+    let (temp, deployer) = temp_cloudflare_deployer()?;
 
     deployer.generate_redirects_file(temp.path())?;
 
@@ -209,8 +210,7 @@ fn test_generate_redirects_file() -> Result<()> {
 
 #[test]
 fn test_cloudflare_bundle_structure() -> Result<()> {
-    let temp = TempDir::new()?;
-    let deployer = CloudflareDeployer::default();
+    let (temp, deployer) = temp_cloudflare_deployer()?;
 
     // Create minimal bundle
     fs::write(temp.path().join("index.html"), "<html></html>")?;
@@ -231,8 +231,7 @@ fn test_cloudflare_bundle_structure() -> Result<()> {
 
 #[test]
 fn test_cloudflare_headers_dont_overwrite_existing() -> Result<()> {
-    let temp = TempDir::new()?;
-    let deployer = CloudflareDeployer::default();
+    let (temp, deployer) = temp_cloudflare_deployer()?;
 
     // Pre-create a _headers file
     fs::write(temp.path().join("_headers"), "# Custom headers")?;
