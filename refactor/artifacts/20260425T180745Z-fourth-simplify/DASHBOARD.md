@@ -19,7 +19,7 @@ Completed 10 serial applications of `simplify-and-refactor-code-isomorphically`.
 | 7. Local Error Constructor Helper | `key_slot_id_for_len()` shares slot overflow construction. | `80e09660` |
 | 8. Assertion Helper Pass | `assert_file_bytes()` shares decrypted-byte test assertions. | `9861e0b4` |
 | 9. Wrapper/Forwarder Census | Removed one-call key-management staged-site backup wrapper. | `0092dd26` |
-| 10. Final Rescan and Dashboard | Final rescan plus clippy-preserving export/clipboard cleanup. | pending |
+| 10. Final Rescan and Dashboard | Final rescan plus clippy-preserving export/clipboard cleanup. | `5a9b68c6` |
 
 ## Verification
 
