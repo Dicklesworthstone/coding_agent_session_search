@@ -15,53 +15,26 @@ use std::time::Instant;
 use tracing::debug;
 
 /// Error type for preview server operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PreviewError {
     /// Failed to bind to the specified port.
+    #[error("Failed to bind to port {port}: {source}")]
     BindFailed { port: u16, source: std::io::Error },
     /// The site directory does not exist.
+    #[error("Site directory not found: {}", .0.display())]
     SiteDirectoryNotFound(PathBuf),
     /// Failed to read a file.
+    #[error("Failed to read file {}: {source}", path.display())]
     FileReadError {
         path: PathBuf,
         source: std::io::Error,
     },
     /// Failed to open browser.
+    #[error("Failed to open browser: {0}")]
     BrowserOpenFailed(String),
     /// Server error.
+    #[error("Server error: {0}")]
     ServerError(String),
-}
-
-impl std::fmt::Display for PreviewError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BindFailed { port, source } => {
-                write!(f, "Failed to bind to port {}: {}", port, source)
-            }
-            Self::SiteDirectoryNotFound(path) => {
-                write!(f, "Site directory not found: {}", path.display())
-            }
-            Self::FileReadError { path, source } => {
-                write!(f, "Failed to read file {}: {}", path.display(), source)
-            }
-            Self::BrowserOpenFailed(msg) => {
-                write!(f, "Failed to open browser: {}", msg)
-            }
-            Self::ServerError(msg) => {
-                write!(f, "Server error: {}", msg)
-            }
-        }
-    }
-}
-
-impl std::error::Error for PreviewError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BindFailed { source, .. } => Some(source),
-            Self::FileReadError { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 /// Configuration for the preview server.
@@ -562,6 +535,54 @@ mod tests {
         let config = PreviewConfig::default();
         assert_eq!(config.port, 8080);
         assert!(config.open_browser);
+    }
+
+    #[test]
+    fn test_preview_error_display_and_source_are_preserved() {
+        let bind = PreviewError::BindFailed {
+            port: 8081,
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "busy"),
+        };
+        assert_eq!(bind.to_string(), "Failed to bind to port 8081: busy");
+        assert_eq!(
+            std::error::Error::source(&bind)
+                .expect("bind source")
+                .to_string(),
+            "busy"
+        );
+
+        let missing = PreviewError::SiteDirectoryNotFound(PathBuf::from("/tmp/missing-site"));
+        assert_eq!(
+            missing.to_string(),
+            "Site directory not found: /tmp/missing-site"
+        );
+        assert!(std::error::Error::source(&missing).is_none());
+
+        let read = PreviewError::FileReadError {
+            path: PathBuf::from("/tmp/site/app.js"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert_eq!(
+            read.to_string(),
+            "Failed to read file /tmp/site/app.js: denied"
+        );
+        assert_eq!(
+            std::error::Error::source(&read)
+                .expect("file read source")
+                .to_string(),
+            "denied"
+        );
+
+        let browser = PreviewError::BrowserOpenFailed("missing opener".to_string());
+        assert_eq!(
+            browser.to_string(),
+            "Failed to open browser: missing opener"
+        );
+        assert!(std::error::Error::source(&browser).is_none());
+
+        let server = PreviewError::ServerError("worker stopped".to_string());
+        assert_eq!(server.to_string(), "Server error: worker stopped");
+        assert!(std::error::Error::source(&server).is_none());
     }
 
     #[test]
