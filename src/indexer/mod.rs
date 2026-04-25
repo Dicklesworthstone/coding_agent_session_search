@@ -760,27 +760,52 @@ impl IndexingProgress {
                 } else {
                     serde_json::json!(rebuild_pipeline_controller_reason)
                 },
-                "staged_merge_workers_max": rebuild_pipeline_staged_merge_workers_max,
-                "staged_merge_allowed_jobs": rebuild_pipeline_staged_merge_allowed_jobs,
-                "staged_merge_active_jobs": rebuild_pipeline_staged_merge_active_jobs,
-                "staged_merge_ready_artifacts": rebuild_pipeline_staged_merge_ready_artifacts,
-                "staged_merge_ready_groups": rebuild_pipeline_staged_merge_ready_groups,
-                "staged_merge_controller_reason": if rebuild_pipeline_staged_merge_controller_reason.is_empty() {
+                // The staged-merge / staged-shard-build controllers
+                // only run during the lexical rebuild pipeline. Outside
+                // that window (incremental scan, post-rebuild small-N
+                // pass, idle indexer) `capture_lexical_rebuild_pipeline_runtime`
+                // emits its initialization defaults — i.e. literal zeros —
+                // for every staged_* counter. Surfacing those zeros to
+                // operators looks identical to the #196-class "broken to
+                // zero workers_max" semaphore bug and triages exactly
+                // wrong (see #201). Emit `null` instead when the rebuild
+                // pipeline isn't the source of these values; consumers
+                // can keep their existing "is the field set?" check
+                // and the JSON shape remains stable.
+                "staged_merge_workers_max": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_workers_max),
+                "staged_merge_allowed_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_allowed_jobs),
+                "staged_merge_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_active_jobs),
+                "staged_merge_ready_artifacts": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_ready_artifacts),
+                "staged_merge_ready_groups": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_merge_ready_groups),
+                "staged_merge_controller_reason": if !is_rebuilding || rebuild_pipeline_staged_merge_controller_reason.is_empty() {
                     serde_json::Value::Null
                 } else {
                     serde_json::json!(rebuild_pipeline_staged_merge_controller_reason)
                 },
-                "staged_shard_build_workers_max": rebuild_pipeline_staged_shard_build_workers_max,
-                "staged_shard_build_allowed_jobs": rebuild_pipeline_staged_shard_build_allowed_jobs,
-                "staged_shard_build_active_jobs": rebuild_pipeline_staged_shard_build_active_jobs,
-                "staged_shard_build_pending_jobs": rebuild_pipeline_staged_shard_build_pending_jobs,
-                "staged_shard_build_controller_reason": if rebuild_pipeline_staged_shard_build_controller_reason.is_empty() {
+                "staged_shard_build_workers_max": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_workers_max),
+                "staged_shard_build_allowed_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_allowed_jobs),
+                "staged_shard_build_active_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_active_jobs),
+                "staged_shard_build_pending_jobs": staged_field_or_null(is_rebuilding, rebuild_pipeline_staged_shard_build_pending_jobs),
+                "staged_shard_build_controller_reason": if !is_rebuilding || rebuild_pipeline_staged_shard_build_controller_reason.is_empty() {
                     serde_json::Value::Null
                 } else {
                     serde_json::json!(rebuild_pipeline_staged_shard_build_controller_reason)
                 },
             },
         })
+    }
+}
+
+/// Helper for the JSON snapshot above. Returns the staged-pipeline
+/// counter as a JSON number when the lexical rebuild pipeline is
+/// actually running, and `null` otherwise — so a stalled incremental
+/// scan no longer surfaces the post-init zeros and trick operators
+/// into chasing a non-existent worker-pool sizing bug (issue #201).
+fn staged_field_or_null(is_rebuilding: bool, value: usize) -> serde_json::Value {
+    if is_rebuilding {
+        serde_json::json!(value)
+    } else {
+        serde_json::Value::Null
     }
 }
 
