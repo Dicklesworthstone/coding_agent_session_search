@@ -109,6 +109,10 @@ fn breakdown_row_with_value(key: String, bucket: UsageBucket, value: i64) -> Bre
     }
 }
 
+fn analytics_query_error(context: &str, err: impl std::fmt::Display) -> AnalyticsError {
+    AnalyticsError::Db(format!("{context}: {err}"))
+}
+
 fn normalized_analytics_source_id_sql_expr(column: &str) -> String {
     format!(
         "CASE WHEN TRIM(COALESCE({column}, '')) = '' THEN '{local}'          WHEN LOWER(TRIM(COALESCE({column}, ''))) = '{local}' THEN '{local}'          ELSE TRIM(COALESCE({column}, '')) END",
@@ -1350,7 +1354,7 @@ pub fn query_tokens_timeseries(
                 },
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Analytics query failed", e))?;
 
     // Re-bucket by week or month if needed.
     let final_buckets: Vec<(String, UsageBucket)> = match group_by {
@@ -1441,7 +1445,7 @@ fn query_track_a_timeseries_from_raw(
                 (row.get_typed::<String>(1)?, row.get_typed::<String>(2)?),
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?
+        .map_err(|e| analytics_query_error("Analytics query failed", e))?
         .into_iter()
         .collect();
 
@@ -1601,7 +1605,7 @@ fn query_track_a_timeseries_from_raw(
 
             Ok((conversation_id, bucket_id, bucket))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Analytics query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Analytics query failed", e))?;
 
     let mut grouped_buckets: BTreeMap<i64, UsageBucket> = BTreeMap::new();
     for (conversation_id, bucket_id, bucket) in row_buckets {
@@ -1830,7 +1834,7 @@ fn query_cost_timeseries_from_token_usage(
                 },
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Cost timeseries query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Cost timeseries query failed", e))?;
 
     let mut grouped_buckets: BTreeMap<i64, UsageBucket> = BTreeMap::new();
     for (bucket_id, bucket) in raw_rows {
@@ -1996,7 +2000,7 @@ pub fn query_cost_timeseries(
                 },
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Cost timeseries query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Cost timeseries query failed", e))?;
 
     // Re-bucket by day/week/month (Track B has no hourly, so Hour falls back to Day).
     let final_buckets: Vec<(String, UsageBucket)> = match group_by {
@@ -2216,7 +2220,7 @@ fn query_track_b_breakdown_from_token_usage(
             };
             Ok((key, bucket))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
     let rows = raw_rows
         .into_iter()
@@ -2287,7 +2291,7 @@ fn query_track_a_breakdown_from_raw(
                 (row.get_typed::<String>(1)?, row.get_typed::<String>(2)?),
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?
+        .map_err(|e| analytics_query_error("Breakdown query failed", e))?
         .into_iter()
         .collect();
 
@@ -2443,7 +2447,7 @@ fn query_track_a_breakdown_from_raw(
                 + api_thinking_tokens;
             Ok((conversation_id, dim_key, bucket))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
     let mut grouped_buckets: BTreeMap<String, UsageBucket> = BTreeMap::new();
     for (conversation_id, dim_key, bucket) in row_buckets {
@@ -2812,7 +2816,7 @@ fn read_breakdown_rows_track_a(
             let sort_value: i64 = row.get_typed(18)?;
             Ok((key, bucket, sort_value))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
     let mut result = Vec::new();
     for (key, bucket, sort_value) in raw_rows {
@@ -2884,7 +2888,7 @@ fn read_breakdown_rows_track_b(
 
             Ok((key, bucket, sort_value))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Breakdown query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
     let mut result = Vec::new();
     for (key, bucket, sort_value) in raw_rows {
@@ -2942,7 +2946,7 @@ fn query_tools_from_raw(
                 (row.get_typed::<String>(1)?, row.get_typed::<String>(2)?),
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Tool report query failed: {e}")))?
+        .map_err(|e| analytics_query_error("Tool report query failed", e))?
         .into_iter()
         .collect();
 
@@ -3032,7 +3036,7 @@ fn query_tools_from_raw(
                 row.get_typed::<i64>(4)?,
             ))
         })
-        .map_err(|e| AnalyticsError::Db(format!("Tool report query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Tool report query failed", e))?;
 
     let mut grouped_rows: BTreeMap<String, (i64, i64, i64, i64)> = BTreeMap::new();
     for (conversation_id, key, tool_call_count, content_tokens_est_total, api_tokens_total) in
@@ -3223,7 +3227,7 @@ pub fn query_tools(
                 tool_calls_per_1k_content_tokens: tool_calls_per_1k_content,
             })
         })
-        .map_err(|e| AnalyticsError::Db(format!("Tool report query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Tool report query failed", e))?;
 
     let mut rows = Vec::new();
     let mut total_tool_calls: i64 = 0;
@@ -3502,7 +3506,7 @@ pub fn query_session_scatter(
                 api_tokens_total: row.get_typed::<Option<i64>>(3)?.unwrap_or(0),
             })
         })
-        .map_err(|e| AnalyticsError::Db(format!("Session scatter query failed: {e}")))?;
+        .map_err(|e| analytics_query_error("Session scatter query failed", e))?;
 
     Ok(points)
 }
