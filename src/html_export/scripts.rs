@@ -1043,6 +1043,12 @@ if (document.readyState === 'loading') {{
 mod tests {
     use super::*;
 
+    macro_rules! assert_inline_js_contains {
+        ($bundle:expr, $needle:literal) => {
+            assert!($bundle.inline_js.contains($needle));
+        };
+    }
+
     #[test]
     fn test_generate_scripts_includes_search() {
         let opts = ExportOptions {
@@ -1051,8 +1057,8 @@ mod tests {
         };
         let bundle = generate_scripts(&opts);
 
-        assert!(bundle.inline_js.contains("const Search"));
-        assert!(bundle.inline_js.contains("Search.init()"));
+        assert_inline_js_contains!(bundle, "const Search");
+        assert_inline_js_contains!(bundle, "Search.init()");
     }
 
     #[test]
@@ -1074,8 +1080,8 @@ mod tests {
         };
         let bundle = generate_scripts(&opts);
 
-        assert!(bundle.inline_js.contains("const Theme"));
-        assert!(bundle.inline_js.contains("localStorage.getItem"));
+        assert_inline_js_contains!(bundle, "const Theme");
+        assert_inline_js_contains!(bundle, "localStorage.getItem");
     }
 
     #[test]
@@ -1086,8 +1092,8 @@ mod tests {
         };
         let bundle = generate_scripts(&opts);
 
-        assert!(bundle.inline_js.contains("const Crypto"));
-        assert!(bundle.inline_js.contains("crypto.subtle"));
+        assert_inline_js_contains!(bundle, "const Crypto");
+        assert_inline_js_contains!(bundle, "crypto.subtle");
     }
 
     #[test]
@@ -1096,15 +1102,15 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // Toast notifications
-        assert!(bundle.inline_js.contains("const Toast"));
-        assert!(bundle.inline_js.contains("Toast.show"));
+        assert_inline_js_contains!(bundle, "const Toast");
+        assert_inline_js_contains!(bundle, "Toast.show");
 
         // Copy to clipboard
-        assert!(bundle.inline_js.contains("copyToClipboard"));
-        assert!(bundle.inline_js.contains("navigator.clipboard"));
+        assert_inline_js_contains!(bundle, "copyToClipboard");
+        assert_inline_js_contains!(bundle, "navigator.clipboard");
 
         // Fallback for older browsers
-        assert!(bundle.inline_js.contains("execCommand"));
+        assert_inline_js_contains!(bundle, "execCommand");
     }
 
     #[test]
@@ -1112,8 +1118,8 @@ mod tests {
         let opts = ExportOptions::default();
         let bundle = generate_scripts(&opts);
 
-        assert!(bundle.inline_js.contains("printConversation"));
-        assert!(bundle.inline_js.contains("window.print"));
+        assert_inline_js_contains!(bundle, "printConversation");
+        assert_inline_js_contains!(bundle, "window.print");
     }
 
     #[test]
@@ -1125,11 +1131,11 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // Ctrl+F for search
-        assert!(bundle.inline_js.contains("e.key === 'f'"));
+        assert_inline_js_contains!(bundle, "e.key === 'f'");
         // Ctrl+P for print
-        assert!(bundle.inline_js.contains("e.key === 'p'"));
+        assert_inline_js_contains!(bundle, "e.key === 'p'");
         // Escape to clear
-        assert!(bundle.inline_js.contains("'Escape'"));
+        assert_inline_js_contains!(bundle, "'Escape'");
     }
 
     #[test]
@@ -1137,8 +1143,8 @@ mod tests {
         let opts = ExportOptions::default();
         let bundle = generate_scripts(&opts);
 
-        assert!(bundle.inline_js.contains("copy-code-btn"));
-        assert!(bundle.inline_js.contains("copyCodeBlock"));
+        assert_inline_js_contains!(bundle, "copy-code-btn");
+        assert_inline_js_contains!(bundle, "copyCodeBlock");
     }
 
     #[test]
@@ -1147,34 +1153,34 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // WorldClass object and initialization
-        assert!(bundle.inline_js.contains("const WorldClass"));
-        assert!(bundle.inline_js.contains("WorldClass.init()"));
+        assert_inline_js_contains!(bundle, "const WorldClass");
+        assert_inline_js_contains!(bundle, "WorldClass.init()");
 
         // Scroll progress indicator
-        assert!(bundle.inline_js.contains("scroll-progress"));
+        assert_inline_js_contains!(bundle, "scroll-progress");
 
         // Floating navigation
-        assert!(bundle.inline_js.contains("initFloatingNav"));
-        assert!(bundle.inline_js.contains("scroll-top"));
+        assert_inline_js_contains!(bundle, "initFloatingNav");
+        assert_inline_js_contains!(bundle, "scroll-top");
 
         // Keyboard navigation (vim-style j/k)
-        assert!(bundle.inline_js.contains("initKeyboardNav"));
-        assert!(bundle.inline_js.contains("case 'j':"));
-        assert!(bundle.inline_js.contains("case 'k':"));
+        assert_inline_js_contains!(bundle, "initKeyboardNav");
+        assert_inline_js_contains!(bundle, "case 'j':");
+        assert_inline_js_contains!(bundle, "case 'k':");
 
         // Message link copying
-        assert!(bundle.inline_js.contains("initMessageLinks"));
-        assert!(bundle.inline_js.contains("message-link"));
+        assert_inline_js_contains!(bundle, "initMessageLinks");
+        assert_inline_js_contains!(bundle, "message-link");
 
         // Intersection observer for animations
-        assert!(bundle.inline_js.contains("IntersectionObserver"));
-        assert!(bundle.inline_js.contains("in-view"));
+        assert_inline_js_contains!(bundle, "IntersectionObserver");
+        assert_inline_js_contains!(bundle, "in-view");
 
         // Native share API support
-        assert!(bundle.inline_js.contains("navigator.share"));
+        assert_inline_js_contains!(bundle, "navigator.share");
 
         // Touch ripple effect
-        assert!(bundle.inline_js.contains("createRipple"));
+        assert_inline_js_contains!(bundle, "createRipple");
     }
 
     #[test]
@@ -1183,18 +1189,18 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // Vim-style navigation
-        assert!(bundle.inline_js.contains("navigateMessage(1)")); // j - next
-        assert!(bundle.inline_js.contains("navigateMessage(-1)")); // k - previous
+        assert_inline_js_contains!(bundle, "navigateMessage(1)"); // j - next
+        assert_inline_js_contains!(bundle, "navigateMessage(-1)"); // k - previous
 
         // Jump to first/last (g/G)
-        assert!(bundle.inline_js.contains("case 'g':"));
+        assert_inline_js_contains!(bundle, "case 'g':");
 
         // Search shortcut (/)
-        assert!(bundle.inline_js.contains("case '/':"));
+        assert_inline_js_contains!(bundle, "case '/':");
 
         // Help shortcut (?)
-        assert!(bundle.inline_js.contains("case '?':"));
-        assert!(bundle.inline_js.contains("showShortcutsHint"));
+        assert_inline_js_contains!(bundle, "case '?':");
+        assert_inline_js_contains!(bundle, "showShortcutsHint");
     }
 
     #[test]
@@ -1206,16 +1212,16 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // ToolPopovers object exists
-        assert!(bundle.inline_js.contains("const ToolPopovers"));
-        assert!(bundle.inline_js.contains("ToolPopovers.init()"));
+        assert_inline_js_contains!(bundle, "const ToolPopovers");
+        assert_inline_js_contains!(bundle, "ToolPopovers.init()");
 
         // Hover support (desktop)
-        assert!(bundle.inline_js.contains("mouseenter"));
-        assert!(bundle.inline_js.contains("mouseleave"));
+        assert_inline_js_contains!(bundle, "mouseenter");
+        assert_inline_js_contains!(bundle, "mouseleave");
 
         // Focus support (keyboard accessibility)
-        assert!(bundle.inline_js.contains("addEventListener('focus'"));
-        assert!(bundle.inline_js.contains("addEventListener('blur'"));
+        assert_inline_js_contains!(bundle, "addEventListener('focus'");
+        assert_inline_js_contains!(bundle, "addEventListener('blur'");
 
         // Click support (mobile/touch)
         assert!(
@@ -1225,23 +1231,23 @@ mod tests {
         );
 
         // Escape key support
-        assert!(bundle.inline_js.contains("e.key === 'Escape'"));
+        assert_inline_js_contains!(bundle, "e.key === 'Escape'");
 
         // aria-expanded updates
-        assert!(bundle.inline_js.contains("setAttribute('aria-expanded'"));
+        assert_inline_js_contains!(bundle, "setAttribute('aria-expanded'");
 
         // Viewport positioning
-        assert!(bundle.inline_js.contains("getBoundingClientRect"));
-        assert!(bundle.inline_js.contains("viewportWidth"));
-        assert!(bundle.inline_js.contains("viewportHeight"));
+        assert_inline_js_contains!(bundle, "getBoundingClientRect");
+        assert_inline_js_contains!(bundle, "viewportWidth");
+        assert_inline_js_contains!(bundle, "viewportHeight");
 
         // Overflow badge expansion
-        assert!(bundle.inline_js.contains("initOverflowBadges"));
-        assert!(bundle.inline_js.contains("tool-overflow"));
+        assert_inline_js_contains!(bundle, "initOverflowBadges");
+        assert_inline_js_contains!(bundle, "tool-overflow");
 
         // Outside click to close
-        assert!(bundle.inline_js.contains("initOutsideClick"));
-        assert!(bundle.inline_js.contains("hideAll"));
+        assert_inline_js_contains!(bundle, "initOutsideClick");
+        assert_inline_js_contains!(bundle, "hideAll");
     }
 
     #[test]
@@ -1254,18 +1260,10 @@ mod tests {
         let bundle = generate_scripts(&opts);
 
         // After decryption, both ToolCalls and ToolPopovers should be reinitialized
-        assert!(bundle.inline_js.contains("ToolCalls.init()"));
-        assert!(bundle.inline_js.contains("ToolPopovers.init()"));
-        assert!(bundle.inline_js.contains("__cassAttachCodeCopyButtons();"));
-        assert!(
-            bundle
-                .inline_js
-                .contains("const __cassAttachCodeCopyButtons")
-        );
-        assert!(
-            bundle
-                .inline_js
-                .contains("pre.querySelector('.copy-code-btn')")
-        );
+        assert_inline_js_contains!(bundle, "ToolCalls.init()");
+        assert_inline_js_contains!(bundle, "ToolPopovers.init()");
+        assert_inline_js_contains!(bundle, "__cassAttachCodeCopyButtons();");
+        assert_inline_js_contains!(bundle, "const __cassAttachCodeCopyButtons");
+        assert_inline_js_contains!(bundle, "pre.querySelector('.copy-code-btn')");
     }
 }
