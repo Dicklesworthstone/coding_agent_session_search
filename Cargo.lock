@@ -937,7 +937,7 @@ checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
 
 [[package]]
 name = "coding-agent-search"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -982,7 +982,7 @@ dependencies = [
  "image",
  "indicatif",
  "insta",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "itoa",
  "lru 0.16.4",
  "memmap2",

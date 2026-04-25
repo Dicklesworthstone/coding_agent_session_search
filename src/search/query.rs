@@ -5856,7 +5856,7 @@ impl SearchClient {
     fn sqlite_fts5_hydrate_row_chunks(
         ranked_rows: &[(i64, f64)],
     ) -> impl Iterator<Item = &[(i64, f64)]> {
-        debug_assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
+        const _: () = assert!(SQLITE_FTS5_HYDRATE_PARAM_CHUNK <= SQLITE_MAX_VARIABLE_NUMBER);
         ranked_rows.chunks(SQLITE_FTS5_HYDRATE_PARAM_CHUNK)
     }
 
