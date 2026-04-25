@@ -782,6 +782,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn assert_file_bytes(path: &Path, expected: &[u8]) {
+        let actual = std::fs::read(path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        assert_eq!(
+            actual.as_slice(),
+            expected,
+            "unexpected bytes in {}",
+            path.display()
+        );
+    }
+
     #[test]
     fn test_argon2id_key_derivation() {
         let password = "test-password-123";
@@ -882,8 +893,7 @@ mod tests {
             .unwrap();
 
         // Verify
-        let decrypted = std::fs::read(&decrypted_path).unwrap();
-        assert_eq!(decrypted, test_data);
+        assert_file_bytes(&decrypted_path, test_data);
     }
 
     #[test]
@@ -912,20 +922,20 @@ mod tests {
         let d1 = DecryptionEngine::unlock_with_password(config.clone(), "password1").unwrap();
         d1.decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .unwrap();
-        assert_eq!(std::fs::read(&decrypted_path).unwrap(), test_data);
+        assert_file_bytes(&decrypted_path, test_data);
 
         // Decrypt with second password
         let d2 = DecryptionEngine::unlock_with_password(config.clone(), "password2").unwrap();
         d2.decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .unwrap();
-        assert_eq!(std::fs::read(&decrypted_path).unwrap(), test_data);
+        assert_file_bytes(&decrypted_path, test_data);
 
         // Decrypt with recovery secret
         let d3 =
             DecryptionEngine::unlock_with_recovery(config.clone(), b"recovery-secret").unwrap();
         d3.decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
             .unwrap();
-        assert_eq!(std::fs::read(&decrypted_path).unwrap(), test_data);
+        assert_file_bytes(&decrypted_path, test_data);
 
         // Wrong password should fail
         assert!(DecryptionEngine::unlock_with_password(config, "wrong").is_err());
@@ -965,7 +975,7 @@ mod tests {
             .decrypt_to_file(&bundle_root, &decrypted_path, |_, _| {})
             .unwrap();
 
-        assert_eq!(std::fs::read(&decrypted_path).unwrap(), test_data);
+        assert_file_bytes(&decrypted_path, test_data);
     }
 
     #[test]
