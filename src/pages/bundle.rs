@@ -54,6 +54,9 @@ const PAGES_ASSETS: &[(&str, &[u8])] = &[
     ("settings.js", include_bytes!("../pages_assets/settings.js")),
 ];
 
+const MASTER_KEY_BACKUP_NOTE: &str =
+    "This file contains the wrapped DEK. Keep it with your recovery secret.";
+
 /// Integrity entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityEntry {
@@ -812,7 +815,7 @@ fn master_key_backup_json(
     serde_json::json!({
         "export_id": &enc_config.export_id,
         "key_slots": &enc_config.key_slots,
-        "note": "This file contains the wrapped DEK. Keep it with your recovery secret.",
+        "note": MASTER_KEY_BACKUP_NOTE,
         "generated_at": generated_at,
     })
 }
@@ -1053,10 +1056,7 @@ mod tests {
 
         assert_eq!(backup["export_id"], "export-123");
         assert_eq!(backup["key_slots"], serde_json::json!([]));
-        assert_eq!(
-            backup["note"],
-            "This file contains the wrapped DEK. Keep it with your recovery secret."
-        );
+        assert_eq!(backup["note"], MASTER_KEY_BACKUP_NOTE);
         assert_eq!(backup["generated_at"], "2026-04-25T19:08:00Z");
     }
 
