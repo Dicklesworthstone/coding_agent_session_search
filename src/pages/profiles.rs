@@ -130,13 +130,12 @@ impl std::str::FromStr for ShareProfile {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "public" => Ok(Self::Public),
-            "team" => Ok(Self::Team),
-            "personal" => Ok(Self::Personal),
-            "custom" => Ok(Self::Custom),
-            _ => Err(format!("Unknown profile: {}", s)),
-        }
+        let normalized = s.to_ascii_lowercase();
+        Self::all()
+            .iter()
+            .copied()
+            .find(|profile| profile.label() == normalized)
+            .ok_or_else(|| format!("Unknown profile: {}", s))
     }
 }
 
@@ -543,6 +542,15 @@ mod tests {
         );
         assert_eq!(ShareProfile::from_str("custom"), Ok(ShareProfile::Custom));
         assert!(ShareProfile::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_profile_labels_are_parse_spellings() {
+        use std::str::FromStr;
+
+        for profile in ShareProfile::all() {
+            assert_eq!(ShareProfile::from_str(profile.label()), Ok(*profile));
+        }
     }
 
     #[test]
