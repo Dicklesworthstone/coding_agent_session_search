@@ -675,6 +675,31 @@ pub struct DerivedMetrics {
 mod tests {
     use super::*;
 
+    const GROUP_BY_CASES: [(GroupBy, &str, &str, GroupBy, GroupBy); 4] = [
+        (
+            GroupBy::Hour,
+            "hour",
+            "Hourly",
+            GroupBy::Day,
+            GroupBy::Month,
+        ),
+        (GroupBy::Day, "day", "Daily", GroupBy::Week, GroupBy::Hour),
+        (
+            GroupBy::Week,
+            "week",
+            "Weekly",
+            GroupBy::Month,
+            GroupBy::Day,
+        ),
+        (
+            GroupBy::Month,
+            "month",
+            "Monthly",
+            GroupBy::Hour,
+            GroupBy::Week,
+        ),
+    ];
+
     #[test]
     fn analytics_error_display_and_sources_are_preserved() {
         let missing = AnalyticsError::MissingTable("usage_daily".to_string());
@@ -752,34 +777,30 @@ mod tests {
 
     #[test]
     fn group_by_display() {
-        assert_eq!(GroupBy::Hour.to_string(), "hour");
-        assert_eq!(GroupBy::Day.to_string(), "day");
-        assert_eq!(GroupBy::Week.to_string(), "week");
-        assert_eq!(GroupBy::Month.to_string(), "month");
+        for (group_by, expected_display, _, _, _) in GROUP_BY_CASES {
+            assert_eq!(group_by.to_string(), expected_display, "{group_by:?}");
+        }
     }
 
     #[test]
     fn group_by_next_cycles_through_all() {
-        assert_eq!(GroupBy::Hour.next(), GroupBy::Day);
-        assert_eq!(GroupBy::Day.next(), GroupBy::Week);
-        assert_eq!(GroupBy::Week.next(), GroupBy::Month);
-        assert_eq!(GroupBy::Month.next(), GroupBy::Hour);
+        for (group_by, _, _, expected_next, _) in GROUP_BY_CASES {
+            assert_eq!(group_by.next(), expected_next, "{group_by:?}");
+        }
     }
 
     #[test]
     fn group_by_prev_cycles_through_all() {
-        assert_eq!(GroupBy::Hour.prev(), GroupBy::Month);
-        assert_eq!(GroupBy::Day.prev(), GroupBy::Hour);
-        assert_eq!(GroupBy::Week.prev(), GroupBy::Day);
-        assert_eq!(GroupBy::Month.prev(), GroupBy::Week);
+        for (group_by, _, _, _, expected_prev) in GROUP_BY_CASES {
+            assert_eq!(group_by.prev(), expected_prev, "{group_by:?}");
+        }
     }
 
     #[test]
     fn group_by_label() {
-        assert_eq!(GroupBy::Hour.label(), "Hourly");
-        assert_eq!(GroupBy::Day.label(), "Daily");
-        assert_eq!(GroupBy::Week.label(), "Weekly");
-        assert_eq!(GroupBy::Month.label(), "Monthly");
+        for (group_by, _, expected_label, _, _) in GROUP_BY_CASES {
+            assert_eq!(group_by.label(), expected_label, "{group_by:?}");
+        }
     }
 
     #[test]
