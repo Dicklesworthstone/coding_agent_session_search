@@ -13,9 +13,16 @@
 //! - **about.txt**: Simple text explanation for non-technical users
 
 use crate::pages::summary::{KeySlotType, PrePublishSummary};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 const CASS_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DOC_DATE_FORMAT: &str = "%Y-%m-%d";
+
+fn format_optional_doc_date(value: Option<DateTime<Utc>>, fallback: &str) -> String {
+    value
+        .map(|dt| dt.format(DOC_DATE_FORMAT).to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
 
 /// Location where a generated document should be placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +126,8 @@ impl DocumentationGenerator {
             .as_deref()
             .unwrap_or("[deployment URL]");
 
-        let start_date = self
-            .summary
-            .earliest_timestamp
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-
-        let end_date = self
-            .summary
-            .latest_timestamp
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+        let start_date = format_optional_doc_date(self.summary.earliest_timestamp, "Unknown");
+        let end_date = format_optional_doc_date(self.summary.latest_timestamp, "Unknown");
 
         let argon_params = format!(
             "m={}KB, t={}, p={}",
@@ -174,10 +172,7 @@ impl DocumentationGenerator {
                     KeySlotType::QrCode => "QR code (direct key)",
                     KeySlotType::Recovery => "Recovery phrase",
                 };
-                let created_str = slot
-                    .created_at
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "N/A".to_string());
+                let created_str = format_optional_doc_date(slot.created_at, "N/A");
                 format!(
                     "- Slot {}: {} (created {})",
                     slot.slot_index + 1,
