@@ -171,6 +171,24 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// Stable snake_case string used in CLI/JSON display surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiTotal => "api_total",
+            Self::ApiInput => "api_input",
+            Self::ApiOutput => "api_output",
+            Self::CacheRead => "cache_read",
+            Self::CacheCreation => "cache_creation",
+            Self::Thinking => "thinking",
+            Self::ContentEstTotal => "content_est_total",
+            Self::ToolCalls => "tool_calls",
+            Self::PlanCount => "plan_count",
+            Self::CoveragePct => "coverage_pct",
+            Self::MessageCount => "message_count",
+            Self::EstimatedCostUsd => "estimated_cost_usd",
+        }
+    }
+
     /// Return the SQL column name in the `usage_daily`/`usage_hourly` rollup
     /// tables that corresponds to this metric, or `None` if the metric is
     /// derived and not stored directly.
@@ -194,20 +212,7 @@ impl Metric {
 
 impl std::fmt::Display for Metric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ApiTotal => write!(f, "api_total"),
-            Self::ApiInput => write!(f, "api_input"),
-            Self::ApiOutput => write!(f, "api_output"),
-            Self::CacheRead => write!(f, "cache_read"),
-            Self::CacheCreation => write!(f, "cache_creation"),
-            Self::Thinking => write!(f, "thinking"),
-            Self::ContentEstTotal => write!(f, "content_est_total"),
-            Self::ToolCalls => write!(f, "tool_calls"),
-            Self::PlanCount => write!(f, "plan_count"),
-            Self::CoveragePct => write!(f, "coverage_pct"),
-            Self::MessageCount => write!(f, "message_count"),
-            Self::EstimatedCostUsd => write!(f, "estimated_cost_usd"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -771,6 +776,29 @@ mod tests {
         assert_eq!(GroupBy::Day.label(), "Daily");
         assert_eq!(GroupBy::Week.label(), "Weekly");
         assert_eq!(GroupBy::Month.label(), "Monthly");
+    }
+
+    #[test]
+    fn metric_as_str_matches_display_for_all_variants() {
+        let cases = [
+            (Metric::ApiTotal, "api_total"),
+            (Metric::ApiInput, "api_input"),
+            (Metric::ApiOutput, "api_output"),
+            (Metric::CacheRead, "cache_read"),
+            (Metric::CacheCreation, "cache_creation"),
+            (Metric::Thinking, "thinking"),
+            (Metric::ContentEstTotal, "content_est_total"),
+            (Metric::ToolCalls, "tool_calls"),
+            (Metric::PlanCount, "plan_count"),
+            (Metric::CoveragePct, "coverage_pct"),
+            (Metric::MessageCount, "message_count"),
+            (Metric::EstimatedCostUsd, "estimated_cost_usd"),
+        ];
+
+        for (metric, expected) in cases {
+            assert_eq!(metric.as_str(), expected);
+            assert_eq!(metric.to_string(), expected);
+        }
     }
 
     #[test]
